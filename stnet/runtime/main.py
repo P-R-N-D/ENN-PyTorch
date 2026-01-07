@@ -146,11 +146,8 @@ _NVML_LOCK = threading.Lock()
 _NVML_QUERY_LOCK = threading.Lock()
 _NVML_HANDLE_CACHE = {}
 _NVML_UTIL_CACHE = {}
-_NVML_MIN_INTERVAL_S = None
 _NVML_FAIL_COUNT = 0
 _NVML_BACKOFF_UNTIL = 0.0
-_NVML_BACKOFF_S = None
-_NVML_FAIL_MAX = None
 
 _COMPILE_SAFE_DONE = False
 _COMPILE_SAFE_LOCK = threading.Lock()
@@ -183,86 +180,34 @@ _DL_STATE_FILE = "dataloader.json"
 
 @lru_cache(maxsize=4)
 def _is_nvml_disabled() -> bool:
-    if env_bool("STNET_NVML_DISABLE", False):
-        return True
-    if not env_bool("STNET_NVML", True):
-        return True
-    return False
+    return env_bool("STNET_NVML_DISABLE", False) or not env_bool("STNET_NVML", True)
 
 
-def _nvml_max_retry() -> object:
-    global _NVML_FAIL_MAX
-    if _NVML_FAIL_MAX is not None:
-        return int(_NVML_FAIL_MAX)
-    v = env_first_int(("STNET_NVML_FAIL_MAX", "STNET_NVML_FAILURES"), default=3)
-    _NVML_FAIL_MAX = max(1, int(v))
-    return int(_NVML_FAIL_MAX)
-
-
-def _nvml_blocking_interval() -> object:
-    global _NVML_BACKOFF_S
-    if _NVML_BACKOFF_S is not None:
-        return float(_NVML_BACKOFF_S)
-    raw = env_first(("STNET_NVML_BACKOFF_S", "STNET_NVML_BACKOFF"))
-    if raw is not None:
-        with contextlib.suppress(Exception):
-            _NVML_BACKOFF_S = max(0.0, float(raw))
-            return float(_NVML_BACKOFF_S)
-    try:
-        from ..core.system import Thread
-
-        _NVML_BACKOFF_S = 30.0 if bool(Thread.is_optimized_for_no_gil()) else 10.0
-    except Exception:
-        _NVML_BACKOFF_S = 10.0
-    return float(_NVML_BACKOFF_S)
+def _nvml_cfg(key: str, default: object, cast_fn: type = int) -> object:
+    return cast_fn(
+        env_first((f"STNET_NVML_{key}", f"STNET_NVML_{key}_S"), default=default)
+    )
 
 
 def _is_nvml_blocked(now: object | None = None) -> object:
-    if now is None:
-        now = float(time.perf_counter())
+    now = float(now or time.perf_counter())
     with _NVML_LOCK:
         until = float(_NVML_BACKOFF_UNTIL or 0.0)
     return bool(until > 0.0 and float(now) < until)
 
 
-def _nvml_min_interval_s() -> object:
-    global _NVML_MIN_INTERVAL_S
-    if _NVML_MIN_INTERVAL_S is not None:
-        return float(_NVML_MIN_INTERVAL_S)
-    raw = env_first(("STNET_NVML_MIN_INTERVAL_S", "STNET_NVML_MIN_INTERVAL"))
-    if raw is not None:
-        with contextlib.suppress(Exception):
-            _NVML_MIN_INTERVAL_S = max(0.0, float(raw))
-            return float(_NVML_MIN_INTERVAL_S)
-    try:
-        from ..core.system import Thread
-
-        _NVML_MIN_INTERVAL_S = 0.1 if bool(Thread.is_optimized_for_no_gil()) else 0.0
-    except Exception:
-        _NVML_MIN_INTERVAL_S = 0.0
-    return float(_NVML_MIN_INTERVAL_S)
-
-
 def _is_nvml_available() -> object:
     global _nvml, _NVML_READY, _NVML_TRIED
-    if _is_nvml_blocked():
-        return False
+    if _is_nvml_blocked() or _NVML_TRIED:
+        return bool(_NVML_READY)
     if _is_nvml_disabled():
         _NVML_TRIED = True
         _NVML_READY = False
         _nvml = None
         return False
-    if _NVML_READY:
-        return True
-    if _NVML_TRIED:
-        return False
     with _NVML_LOCK:
-        if _is_nvml_blocked():
-            return False
-        if _NVML_READY:
-            return True
-        if _NVML_TRIED:
-            return False
+        if _is_nvml_blocked() or _NVML_TRIED:
+            return bool(_NVML_READY)
         _NVML_TRIED = True
         try:
             with warnings.catch_warnings():
@@ -275,9 +220,7 @@ def _is_nvml_available() -> object:
             _nvml = None
             _NVML_READY = False
             if env_bool("STNET_DEBUG", False):
-                logging.getLogger(__name__).debug(
-                    "NVML init failed: %s", exc, exc_info=True
-                )
+                _LOGGER.debug("NVML init failed: %s", exc, exc_info=True)
     return bool(_NVML_READY)
 
 
@@ -300,15 +243,7 @@ def _is_clock_synchronized(dev_type: str) -> bool:
     ):
         return True
     dt = str(dev_type or "cpu")
-    if dt == "mps":
-        return bool(
-            _env_flag("STNET_MPS_TIMER_SYNC", _env_flag("STNET_MPS_SYNC_TIMER", False))
-        )
-    if dt == "xpu":
-        return bool(_env_flag("STNET_XPU_TIMER_SYNC", False))
-    if dt == "cuda":
-        return bool(_env_flag("STNET_CUDA_TIMER_SYNC", False))
-    return False
+    return _env_flag(f"STNET_{dt.upper()}_TIMER_SYNC", False)
 
 
 def _is_event_timer_available(device: torch.device) -> bool:
@@ -522,12 +457,8 @@ def _is_batch_skippable(phase: object) -> bool:
 
 def _get_scale_rate_down(attempt: object) -> object:
     seq = (0.8, 0.7, 0.6, 0.5)
-    i = max(1, int(attempt)) - 1
-    if i < 0:
-        i = 0
-    if i >= len(seq):
-        i = len(seq) - 1
-    return float(seq[i])
+    idx = min(3, max(0, int(attempt) - 1))
+    return float(seq[idx])
 
 
 def _is_scale_rate_logged(
@@ -587,16 +518,11 @@ def _get_oom_blocking_time(oom_try: int, phase: str | None = None) -> float:
     if base_ms <= 0.0:
         return 0.0
     try:
-        max_ms = float(_env_float("STNET_OOM_BACKOFF_MAX_MS", 50.0))
+        max_ms = max(0.0, float(_env_float("STNET_OOM_BACKOFF_MAX_MS", 50.0)))
     except Exception:
         max_ms = 50.0
-    if max_ms < 0.0:
-        max_ms = 0.0
     p = max(0, int(oom_try) - 2)
-    try:
-        sleep_ms = min(float(max_ms), float(base_ms) * (2.0 ** float(p)))
-    except Exception:
-        sleep_ms = float(base_ms)
+    sleep_ms = min(float(max_ms), float(base_ms) * (2.0 ** float(p)))
     return max(0.0, float(sleep_ms) / 1000.0)
 
 
@@ -615,62 +541,24 @@ def _recover_oom(
     ph = str(phase).strip().lower()
     oom_try = _oom_retries(loader, ph, int(step_idx))
     max_tries = _oom_max_retries(ph)
-    if ph == "train":
-        if global_step is not None and oom_try <= 1:
-            _LOGGER.error(
-                "[epochs] OOM during train step %d (global_step=%d). Trying to reduce microbatch / grad_accum and retry same batch. (try=%d/%d)",
-                int(step_idx),
-                int(global_step),
-                int(oom_try),
-                int(max_tries),
-            )
-        elif global_step is not None:
-            _LOGGER.warning(
-                "[epochs] OOM during train step %d (global_step=%d). Retrying. (try=%d/%d)",
-                int(step_idx),
-                int(global_step),
-                int(oom_try),
-                int(max_tries),
-            )
-        elif oom_try <= 1:
-            _LOGGER.error(
-                "[epochs] OOM during train step %d. Trying to reduce microbatch / grad_accum and retry same batch. (try=%d/%d)",
-                int(step_idx),
-                int(oom_try),
-                int(max_tries),
-            )
-        else:
-            _LOGGER.warning(
-                "[epochs] OOM during train step %d. Retrying. (try=%d/%d)",
-                int(step_idx),
-                int(oom_try),
-                int(max_tries),
-            )
-    else:
-        if oom_try <= 1:
-            _LOGGER.error(
-                "[epochs] OOM during %s step %d. Trying to reduce microbatch and retry same batch. (try=%d/%d)",
-                str(ph),
-                int(step_idx),
-                int(oom_try),
-                int(max_tries),
-            )
-        else:
-            _LOGGER.warning(
-                "[epochs] OOM during %s step %d. Retrying. (try=%d/%d)",
-                str(ph),
-                int(step_idx),
-                int(oom_try),
-                int(max_tries),
-            )
+    log_fn = _LOGGER.error if oom_try <= 1 else _LOGGER.warning
+    context = "Reducing MB/GA" if oom_try <= 1 else "Retrying"
+    gs_info = f" (global_step={global_step})" if global_step is not None else ""
+    log_fn(
+        "[epochs] OOM in %s step %d%s. %s. (try=%d/%d)",
+        str(ph),
+        int(step_idx),
+        gs_info,
+        context,
+        int(oom_try),
+        int(max_tries),
+    )
     if max_tries > 0 and oom_try > max_tries:
         if _is_batch_skippable(ph):
             _LOGGER.error(
-                "[epochs] OOM storm: exceeded retry budget (try=%d/%d) at %s step %d. Skipping this batch.",
+                "[epochs] OOM storm: exceeded budget (%d/%d). Skipping.",
                 int(oom_try),
                 int(max_tries),
-                str(ph),
-                int(step_idx),
             )
             with contextlib.suppress(Exception):
                 _clear_oom_retries(loader, ph, int(step_idx))
@@ -681,39 +569,22 @@ def _recover_oom(
                     optimizer.zero_grad(set_to_none=True)
             return ("skip", grad_accum_steps)
         return ("raise", grad_accum_steps)
-    try:
-        scale_ctl = _get_sampler_scaler(loader)
-        if scale_ctl is not None:
-            prev = None
-            with contextlib.suppress(Exception):
-                prev = float(scale_ctl.get())
-            with contextlib.suppress(Exception):
-                scale_ctl.request_scale_down(_get_scale_rate_down(oom_try))
-            with contextlib.suppress(Exception):
-                cur = float(scale_ctl.get())
-                if prev is not None and cur < prev:
-                    _is_scale_rate_logged(
-                        logger=_LOGGER,
-                        scale_ctl=scale_ctl,
-                        tag=f"oom-{ph}-scale-down",
-                        msg="[epochs] reduced sampler scale from %.4f to %.4f after OOM (factor=%.2f, try=%d/%d)"
-                        % (
-                            prev,
-                            cur,
-                            _get_scale_rate_down(oom_try),
-                            oom_try,
-                            max_tries,
-                        ),
-                        level="info",
-                    )
-    except Exception:
-        pass
+    scale_ctl = _get_sampler_scaler(loader)
+    if scale_ctl is not None:
+        with contextlib.suppress(Exception):
+            prev = float(scale_ctl.get())
+            scale_ctl.request_scale_down(_get_scale_rate_down(oom_try))
+            cur = float(scale_ctl.get())
+            if cur < prev:
+                _is_scale_rate_logged(
+                    logger=_LOGGER,
+                    scale_ctl=scale_ctl,
+                    tag=f"oom-{ph}-scale-down",
+                    msg=f"[epochs] scale down: {prev:.4f}->{cur:.4f}",
+                    level="info",
+                )
     with contextlib.suppress(Exception):
-        ec_min = (
-            0.0
-            if oom_try <= 1
-            else _env_float("STNET_OOM_EMPTY_CACHE_MIN_INTERVAL_S", 0.05)
-        )
+        ec_min = 0.0 if oom_try <= 1 else 0.05
         empty_device_cache(device=device, do_gc=False, min_interval_s=ec_min)
     if optimizer is not None:
         with contextlib.suppress(Exception):
@@ -722,22 +593,19 @@ def _recover_oom(
     inst_pressure = to_submodule(model) or (
         model.module if hasattr(model, "module") else model
     )
-    if inst_pressure is not None:
+    if inst_pressure is not None and int(oom_try) <= 1:
         cur_step_total = int(getattr(inst_pressure, "_stnet_step_total", 0) or 0)
-        if int(oom_try) <= 1:
-            applied = to_checkpoint(
-                model,
-                device=device,
-                step_total=cur_step_total,
-                ttl_steps=64,
-                min_bytes=0,
-            )
-            if applied:
-                sleep_s = _get_oom_blocking_time(oom_try, ph)
-                if sleep_s > 0.0:
-                    with contextlib.suppress(Exception):
-                        time.sleep(float(sleep_s))
-                return ("retry", grad_accum_steps)
+        if to_checkpoint(
+            model,
+            device=device,
+            step_total=cur_step_total,
+            ttl_steps=64,
+            min_bytes=0,
+        ):
+            sleep_s = _get_oom_blocking_time(oom_try, ph)
+            if sleep_s > 0.0:
+                time.sleep(float(sleep_s))
+            return ("retry", grad_accum_steps)
 
     reduced_any = False
     inst = to_submodule(model)
@@ -756,10 +624,7 @@ def _recover_oom(
                     inst.microbatch = int(new_mb)
                     inst._auto_microbatch_pending = False
                 _LOGGER.info(
-                    "[epochs] reduced Model.microbatch from %d to %d after OOM%s",
-                    int(cur_mb),
-                    int(new_mb),
-                    " in validation" if ph != "train" else "",
+                    "[epochs] reduced microbatch %d->%d", int(cur_mb), int(new_mb)
                 )
                 reduced_any = True
     if ph == "train" and grad_accum_steps is not None:
@@ -775,18 +640,13 @@ def _recover_oom(
                 pass
             if int(new_ga) != int(cur_ga):
                 _LOGGER.info(
-                    "[epochs] reduced grad_accum_steps from %d to %d after OOM",
-                    int(cur_ga),
-                    int(new_ga),
+                    "[epochs] reduced grad_accum %d->%d", int(cur_ga), int(new_ga)
                 )
                 grad_accum_steps = int(new_ga)
                 reduced_any = True
     if not reduced_any:
         if _is_batch_skippable(ph):
-            _LOGGER.error(
-                "[epochs] OOM in %s and no more knobs to reduce. Skipping this batch.",
-                str(ph),
-            )
+            _LOGGER.error("[epochs] OOM in %s, no knobs. Skipping.", str(ph))
             with contextlib.suppress(Exception):
                 _clear_oom_retries(loader, ph, int(step_idx))
             with contextlib.suppress(Exception):
@@ -795,10 +655,7 @@ def _recover_oom(
                 with contextlib.suppress(Exception):
                     optimizer.zero_grad(set_to_none=True)
             return ("skip", grad_accum_steps)
-        _LOGGER.error(
-            "[epochs] OOM in %s and no more knobs to reduce; giving up on recovery.",
-            str(ph),
-        )
+        _LOGGER.error("[epochs] OOM in %s, no knobs. Giving up.", str(ph))
         return ("raise", grad_accum_steps)
     sleep_s = _get_oom_blocking_time(oom_try, ph)
     if sleep_s > 0.0:
@@ -1552,14 +1409,22 @@ def _gpu_nvml_utils(device: TorchDeviceLike) -> object:
         return (None, None)
     idx = device.index if device.index is not None else get_accelerator_index("cuda")
     idx_i = int(idx)
-    global _NVML_FAIL_COUNT, _NVML_BACKOFF_UNTIL
     gpu_util = None
     mem_util = None
     if _is_nvml_available() and _nvml is not None:
-        min_interval = float(_nvml_min_interval_s())
-        now = float(time.perf_counter())
-        if _is_nvml_blocked(now):
+        if _is_nvml_blocked(now := time.perf_counter()):
             return (None, None)
+        try:
+            from ..core.system import Thread
+        except Exception:
+            Thread = None
+        min_interval = float(
+            _nvml_cfg(
+                "MIN_INTERVAL",
+                0.0 if not Thread or Thread.is_optimized_for_no_gil() else 0.0,
+                float,
+            )
+        )
         if min_interval > 0.0:
             cached = _NVML_UTIL_CACHE.get(idx_i)
             if cached is not None:
@@ -1576,16 +1441,16 @@ def _gpu_nvml_utils(device: TorchDeviceLike) -> object:
                     if now - float(ts) < min_interval:
                         return (cg, cm)
             try:
-                h = _NVML_HANDLE_CACHE.get(idx_i)
-                if h is None:
-                    h = _nvml.nvmlDeviceGetHandleByIndex(idx_i)
-                    _NVML_HANDLE_CACHE[idx_i] = h
+                h = _NVML_HANDLE_CACHE.setdefault(
+                    idx_i, _nvml.nvmlDeviceGetHandleByIndex(idx_i)
+                )
                 u = _nvml.nvmlDeviceGetUtilizationRates(h)
                 mi = _nvml.nvmlDeviceGetMemoryInfo(h)
                 gpu_util = float(getattr(u, "gpu", 0.0))
                 if getattr(mi, "total", 0):
                     mem_util = 100.0 * float(mi.used) / float(mi.total)
                 with _NVML_LOCK:
+                    global _NVML_FAIL_COUNT, _NVML_BACKOFF_UNTIL
                     _NVML_FAIL_COUNT = 0
                     _NVML_BACKOFF_UNTIL = 0.0
             except Exception:
@@ -1593,8 +1458,14 @@ def _gpu_nvml_utils(device: TorchDeviceLike) -> object:
                     _NVML_HANDLE_CACHE.pop(idx_i, None)
                 with contextlib.suppress(Exception):
                     _NVML_UTIL_CACHE.pop(idx_i, None)
-                fail_max = int(_nvml_max_retry())
-                backoff_s = float(_nvml_blocking_interval())
+                fail_max = int(_nvml_cfg("FAIL_MAX", 3))
+                backoff_s = float(
+                    _nvml_cfg(
+                        "BACKOFF",
+                        30.0 if not Thread or Thread.is_optimized_for_no_gil() else 10.0,
+                        float,
+                    )
+                )
                 trigger_backoff = False
                 with _NVML_LOCK:
                     _NVML_FAIL_COUNT = int(_NVML_FAIL_COUNT) + 1
@@ -1610,10 +1481,7 @@ def _gpu_nvml_utils(device: TorchDeviceLike) -> object:
                     with contextlib.suppress(Exception):
                         _NVML_UTIL_CACHE.clear()
                     with contextlib.suppress(Exception):
-                        _LOGGER.warning(
-                            "[NVML] repeated failures; backing off NVML queries for %.1fs (override: STNET_NVML_BACKOFF_S, STNET_NVML_FAIL_MAX).",
-                            float(backoff_s),
-                        )
+                        _LOGGER.warning("[NVML] backing off %.1fs", float(backoff_s))
                 gpu_util = None
                 mem_util = None
             if gpu_util is not None or mem_util is not None:
@@ -2289,6 +2157,93 @@ def update_progress_bar(
         bar.update(inc)
 
 
+def _warmup_scaler_stats(model: object, train_loader: object, ops: object) -> None:
+    model_for_scaler = model.module if hasattr(model, "module") else model
+    dev_x = model_for_scaler.scaler.x_mean.device
+    dev_y = model_for_scaler.scaler.y_mean.device
+    dt_x = model_for_scaler.scaler.x_mean.dtype
+    dt_y = model_for_scaler.scaler.y_mean.dtype
+
+    try:
+        stats = Storage.load_scaler_stats(ops.sources)
+    except Exception:
+        stats = None
+
+    if stats:
+        x_cnt = int(stats.get("train_count") or 0)
+        y_cnt = int(stats.get("train_count") or 0)
+        x_sum = stats["x_sum"].to(dev_x)
+        x_ss = stats["x_sum_sq"].to(dev_x)
+        y_sum = stats["y_sum"].to(dev_y)
+        y_ss = stats["y_sum_sq"].to(dev_y)
+        y_min = stats.get("y_min")
+        y_max = stats.get("y_max")
+        if y_min is not None:
+            y_min = y_min.to(dev_y)
+        if y_max is not None:
+            y_max = y_max.to(dev_y)
+    else:
+        x_cnt = 0
+        y_cnt = 0
+        x_sum = None
+        x_ss = None
+        y_sum = None
+        y_ss = None
+        y_min = None
+        y_max = None
+        for batch in train_loader:
+            fx, ly = get_row(batch, labels_required=True)
+            with inference_mode(torch.nn.Identity()):
+                xf = fx.reshape(-1, fx.shape[-1]).to(dev_x, dt_x)
+                yf = ly.reshape(-1, ly.shape[-1]).to(dev_y, dt_y)
+                if xf.shape[0] > 0:
+                    x_cnt += int(xf.shape[0])
+                    s = xf.sum(0)
+                    s2 = (xf**2).sum(0)
+                    x_sum = s if x_sum is None else x_sum + s
+                    x_ss = s2 if x_ss is None else x_ss + s2
+                if yf.shape[0] > 0:
+                    y_cnt += int(yf.shape[0])
+                    s = yf.sum(0)
+                    s2 = (yf**2).sum(0)
+                    y_sum = s if y_sum is None else y_sum + s
+                    y_ss = s2 if y_ss is None else y_ss + s2
+                    mn = yf.amin(0)
+                    mx = yf.amax(0)
+                    y_min = mn if y_min is None else torch.minimum(y_min, mn)
+                    y_max = mx if y_max is None else torch.maximum(y_max, mx)
+
+        if is_distributed():
+            for tensor in (x_sum, x_ss, y_sum, y_ss):
+                if tensor is not None:
+                    torch.distributed.all_reduce(tensor, torch.distributed.ReduceOp.SUM)
+            for tensor, op in (
+                (y_min, torch.distributed.ReduceOp.MIN),
+                (y_max, torch.distributed.ReduceOp.MAX),
+            ):
+                if tensor is not None:
+                    torch.distributed.all_reduce(tensor, op)
+            counts = torch.tensor([x_cnt, y_cnt], device=dev_x)
+            torch.distributed.all_reduce(counts, torch.distributed.ReduceOp.SUM)
+            x_cnt = int(counts[0])
+            y_cnt = int(counts[1])
+
+    eps = float(model_for_scaler.scaler.eps)
+    for cnt, sm, ss, mean_buf, std_buf in (
+        (x_cnt, x_sum, x_ss, model_for_scaler.scaler.x_mean, model_for_scaler.scaler.x_std),
+        (y_cnt, y_sum, y_ss, model_for_scaler.scaler.y_mean, model_for_scaler.scaler.y_std),
+    ):
+        if cnt > 0 and sm is not None and ss is not None:
+            mean = sm / cnt
+            mean_buf.resize_(mean.shape).copy_(mean)
+            std_buf.resize_(mean.shape).copy_((ss / cnt - mean**2).clamp_min(eps).sqrt())
+
+    if y_min is not None:
+        model_for_scaler.scaler.y_min.resize_(y_min.shape).copy_(y_min)
+    if y_max is not None:
+        model_for_scaler.scaler.y_max.resize_(y_max.shape).copy_(y_max)
+
+
 def epochs(
     model: nn.Module,
     device: torch.device,
@@ -2611,279 +2566,8 @@ def epochs(
             python_version=py_ver,
             backends=backend_list,
         )
-    model_for_scaler = model.module if hasattr(model, "module") else model
-    scaler_x_device = model_for_scaler.scaler.x_mean.device
-    scaler_y_device = model_for_scaler.scaler.y_mean.device
-    scaler_x_dtype = (
-        model_for_scaler.scaler.x_mean.dtype
-        if model_for_scaler.scaler.x_mean.dtype in (torch.float64, torch.int64)
-        else torch.float64
-    )
-    scaler_y_dtype = (
-        model_for_scaler.scaler.y_mean.dtype
-        if model_for_scaler.scaler.y_mean.dtype in (torch.float64, torch.int64)
-        else torch.float64
-    )
     with torch.no_grad():
-        used_memmap_stats = False
-        x_count = 0
-        x_sum = None
-        x_sum_sq = None
-        y_count = 0
-        y_sum = None
-        y_sum_sq = None
-        y_min = None
-        y_max = None
-        y_q_low = None
-        y_q_high = None
-        want_y_quantiles = bool(
-            getattr(model_for_scaler, "p_gate_bounds_use_quantile", False)
-        )
-        q_low = float(getattr(model_for_scaler, "p_gate_bounds_q_low", 0.005))
-        q_high = float(getattr(model_for_scaler, "p_gate_bounds_q_high", 0.995))
-        q_max = int(getattr(model_for_scaler, "p_gate_bounds_q_max_samples", 8192) or 0)
-        want_y_quantiles = bool(
-            want_y_quantiles and q_max > 0 and (0.0 < q_low < q_high < 1.0)
-        )
-        y_q_samples = None
-        scaler_stats = None
-        with contextlib.suppress(Exception):
-            scaler_stats = Storage.load_scaler_stats(ops.sources)
-        if scaler_stats is not None:
-            used_memmap_stats = True
-            x_count = int(scaler_stats.get("train_count") or 0)
-            y_count = int(x_count)
-            x_sum = scaler_stats["x_sum"].to(device=scaler_x_device)
-            x_sum_sq = scaler_stats["x_sum_sq"].to(device=scaler_x_device)
-            y_sum = scaler_stats["y_sum"].to(device=scaler_y_device)
-            y_sum_sq = scaler_stats["y_sum_sq"].to(device=scaler_y_device)
-            y_min = scaler_stats.get("y_min")
-            y_max = scaler_stats.get("y_max")
-            y_q_low = scaler_stats.get("y_q_low")
-            y_q_high = scaler_stats.get("y_q_high")
-            if y_min is not None and y_max is not None:
-                y_min = y_min.to(device=scaler_y_device)
-                y_max = y_max.to(device=scaler_y_device)
-            if y_q_low is not None and y_q_high is not None:
-                y_q_low = y_q_low.to(device=scaler_y_device)
-                y_q_high = y_q_high.to(device=scaler_y_device)
-        else:
-            sx_tmp = None
-            sx2_tmp = None
-            sy_tmp = None
-            sy2_tmp = None
-            sy_min_tmp = None
-            sy_max_tmp = None
-            scaler_x_dtype = model_for_scaler.scaler.x_mean.dtype
-            scaler_y_dtype = model_for_scaler.scaler.y_mean.dtype
-            for batch in train_loader:
-                feats, labs = get_row(batch, labels_required=True)
-                if feats.ndim > 2:
-                    feats = feats.reshape(feats.shape[0], -1)
-                with inference_mode(torch.nn.Identity()):
-                    xf = feats.to(device=scaler_x_device, dtype=scaler_x_dtype)
-                    if xf.ndim > 2:
-                        xf = xf.reshape(xf.shape[0], -1)
-                    n_x = int(xf.shape[0])
-                    if n_x > 0:
-                        x_count += n_x
-                        if x_sum is None:
-                            x_sum = torch.zeros(
-                                xf.shape[1],
-                                device=scaler_x_device,
-                                dtype=scaler_x_dtype,
-                            )
-                            x_sum_sq = torch.zeros_like(x_sum)
-                            sx_tmp = torch.empty_like(x_sum)
-                            sx2_tmp = torch.empty_like(x_sum)
-                        assert x_sum is not None and x_sum_sq is not None
-                        assert sx_tmp is not None and sx2_tmp is not None
-                        torch.sum(xf, dim=0, out=sx_tmp)
-                        x_sum.add_(sx_tmp)
-                        sx2_tmp.copy_(torch.einsum("ni,ni->i", xf, xf))
-                        x_sum_sq.add_(sx2_tmp)
-                    yf = labs.to(device=scaler_y_device, dtype=scaler_y_dtype)
-                    if yf.ndim > 2:
-                        yf = yf.reshape(yf.shape[0], -1)
-                    n_y = int(yf.shape[0])
-                    if n_y > 0:
-                        y_count += n_y
-                        if y_sum is None:
-                            y_sum = torch.zeros(
-                                yf.shape[1],
-                                device=scaler_y_device,
-                                dtype=scaler_y_dtype,
-                            )
-                            y_sum_sq = torch.zeros_like(y_sum)
-                            sy_tmp = torch.empty_like(y_sum)
-                            sy2_tmp = torch.empty_like(y_sum)
-                            sy_min_tmp = torch.empty_like(y_sum)
-                            sy_max_tmp = torch.empty_like(y_sum)
-                            y_min = torch.full_like(y_sum, float("inf"))
-                            y_max = torch.full_like(y_sum, float("-inf"))
-                        assert y_sum is not None and y_sum_sq is not None
-                        assert sy_tmp is not None and sy2_tmp is not None
-                        torch.sum(yf, dim=0, out=sy_tmp)
-                        y_sum.add_(sy_tmp)
-                        sy2_tmp.copy_(torch.einsum("ni,ni->i", yf, yf))
-                        y_sum_sq.add_(sy2_tmp)
-                        if y_min is not None and y_max is not None:
-                            assert sy_min_tmp is not None and sy_max_tmp is not None
-                            torch.amin(yf, dim=0, out=sy_min_tmp)
-                            torch.minimum(y_min, sy_min_tmp, out=y_min)
-                            torch.amax(yf, dim=0, out=sy_max_tmp)
-                            torch.maximum(y_max, sy_max_tmp, out=y_max)
-                        if want_y_quantiles and q_max > 0:
-
-                            y_take = yf
-                            if int(y_take.shape[0]) > int(q_max):
-                                idx = torch.randperm(
-                                    int(y_take.shape[0]), device=y_take.device
-                                )[: int(q_max)]
-                                y_take = y_take.index_select(0, idx)
-                            if y_q_samples is None:
-                                y_q_samples = y_take
-                            else:
-                                y_q_samples = torch.cat([y_q_samples, y_take], dim=0)
-                            if int(y_q_samples.shape[0]) > int(q_max):
-                                idx = torch.randperm(
-                                    int(y_q_samples.shape[0]), device=y_q_samples.device
-                                )[: int(q_max)]
-                                y_q_samples = y_q_samples.index_select(0, idx)
-            if is_distributed() and (not used_memmap_stats):
-                x_count_t = torch.tensor(
-                    float(x_count), device=scaler_x_device, dtype=scaler_x_dtype
-                )
-                torch.distributed.all_reduce(
-                    x_count_t, op=torch.distributed.ReduceOp.SUM
-                )
-                x_count = int(x_count_t.item())
-                if x_sum is not None:
-                    torch.distributed.all_reduce(
-                        x_sum, op=torch.distributed.ReduceOp.SUM
-                    )
-                if x_sum_sq is not None:
-                    torch.distributed.all_reduce(
-                        x_sum_sq, op=torch.distributed.ReduceOp.SUM
-                    )
-                y_count_t = torch.tensor(
-                    float(y_count), device=scaler_y_device, dtype=scaler_y_dtype
-                )
-                torch.distributed.all_reduce(
-                    y_count_t, op=torch.distributed.ReduceOp.SUM
-                )
-                y_count = int(y_count_t.item())
-                if y_sum is not None:
-                    torch.distributed.all_reduce(
-                        y_sum, op=torch.distributed.ReduceOp.SUM
-                    )
-                if y_sum_sq is not None:
-                    torch.distributed.all_reduce(
-                        y_sum_sq, op=torch.distributed.ReduceOp.SUM
-                    )
-                if y_min is not None:
-                    torch.distributed.all_reduce(
-                        y_min, op=torch.distributed.ReduceOp.MIN
-                    )
-                if y_max is not None:
-                    torch.distributed.all_reduce(
-                        y_max, op=torch.distributed.ReduceOp.MAX
-                    )
-        if want_y_quantiles and (y_q_low is None or y_q_high is None):
-            if y_q_samples is None:
-                for batch in train_loader:
-                    _, labs = get_row(batch, labels_required=True)
-                    with inference_mode(torch.nn.Identity()):
-                        yf = labs.to(device=scaler_y_device, dtype=torch.float64)
-                        if yf.ndim > 2:
-                            yf = yf.reshape(yf.shape[0], -1)
-                        if int(yf.shape[0]) <= 0:
-                            continue
-                        y_take = yf
-                        if int(y_take.shape[0]) > int(q_max):
-                            idx2 = torch.randperm(
-                                int(y_take.shape[0]), device=y_take.device
-                            )[: int(q_max)]
-                            y_take = y_take.index_select(0, idx2)
-                        if y_q_samples is None:
-                            y_q_samples = y_take
-                        else:
-                            y_q_samples = torch.cat([y_q_samples, y_take], dim=0)
-                        if int(y_q_samples.shape[0]) > int(q_max):
-                            idx2 = torch.randperm(
-                                int(y_q_samples.shape[0]), device=y_q_samples.device
-                            )[: int(q_max)]
-                            y_q_samples = y_q_samples.index_select(0, idx2)
-            if y_q_samples is not None and int(y_q_samples.shape[0]) > 0:
-                y_all = y_q_samples
-                if is_distributed():
-                    world = int(torch.distributed.get_world_size())
-                    n_local = torch.tensor(
-                        [int(y_all.shape[0])], device=y_all.device, dtype=torch.int64
-                    )
-                    counts = [torch.zeros_like(n_local) for _ in range(world)]
-                    torch.distributed.all_gather(counts, n_local)
-                    counts_i = [int(c.item()) for c in counts]
-                    n_max = int(max(counts_i) if counts_i else 0)
-                    if n_max > 0:
-                        if int(y_all.shape[0]) < n_max:
-                            pad = torch.zeros(
-                                (n_max - int(y_all.shape[0]), int(y_all.shape[1])),
-                                device=y_all.device,
-                                dtype=y_all.dtype,
-                            )
-                            y_pad = torch.cat([y_all, pad], dim=0)
-                        else:
-                            y_pad = y_all
-                        gathered = [torch.empty_like(y_pad) for _ in range(world)]
-                        torch.distributed.all_gather(gathered, y_pad)
-                        parts = []
-                        for gi, c in zip(gathered, counts_i):
-                            if int(c) > 0:
-                                parts.append(gi[: int(c)])
-                        if len(parts) > 0:
-                            y_all = torch.cat(parts, dim=0)
-                try:
-                    y_q_low = torch.quantile(y_all, float(q_low), dim=0)
-                    y_q_high = torch.quantile(y_all, float(q_high), dim=0)
-                except Exception:
-                    y_q_low = None
-                    y_q_high = None
-        eps = float(model_for_scaler.scaler.eps)
-        if x_count > 0 and x_sum is not None and (x_sum_sq is not None):
-            mean_x = x_sum / float(x_count)
-            var_x = x_sum_sq / float(x_count) - mean_x * mean_x
-            std_x = torch.sqrt(var_x.clamp_min(eps))
-            if model_for_scaler.scaler.x_mean.shape != mean_x.shape:
-                model_for_scaler.scaler.x_mean.resize_(mean_x.shape)
-            if model_for_scaler.scaler.x_std.shape != std_x.shape:
-                model_for_scaler.scaler.x_std.resize_(std_x.shape)
-            model_for_scaler.scaler.x_mean.copy_(mean_x)
-            model_for_scaler.scaler.x_std.copy_(std_x)
-        if y_count > 0 and y_sum is not None and (y_sum_sq is not None):
-            mean_y = y_sum / float(y_count)
-            var_y = y_sum_sq / float(y_count) - mean_y * mean_y
-            std_y = torch.sqrt(var_y.clamp_min(eps))
-            if model_for_scaler.scaler.y_mean.shape != mean_y.shape:
-                model_for_scaler.scaler.y_mean.resize_(mean_y.shape)
-            if model_for_scaler.scaler.y_std.shape != std_y.shape:
-                model_for_scaler.scaler.y_std.resize_(std_y.shape)
-            model_for_scaler.scaler.y_mean.copy_(mean_y)
-            model_for_scaler.scaler.y_std.copy_(std_y)
-            if y_min is not None and y_max is not None:
-                if model_for_scaler.scaler.y_min.shape != y_min.shape:
-                    model_for_scaler.scaler.y_min.resize_(y_min.shape)
-                if model_for_scaler.scaler.y_max.shape != y_max.shape:
-                    model_for_scaler.scaler.y_max.resize_(y_max.shape)
-                model_for_scaler.scaler.y_min.copy_(y_min)
-                model_for_scaler.scaler.y_max.copy_(y_max)
-            if y_q_low is not None and y_q_high is not None:
-                if model_for_scaler.scaler.y_q_low.shape != y_q_low.shape:
-                    model_for_scaler.scaler.y_q_low.resize_(y_q_low.shape)
-                if model_for_scaler.scaler.y_q_high.shape != y_q_high.shape:
-                    model_for_scaler.scaler.y_q_high.resize_(y_q_high.shape)
-                model_for_scaler.scaler.y_q_low.copy_(y_q_low)
-                model_for_scaler.scaler.y_q_high.copy_(y_q_high)
+        _warmup_scaler_stats(model, train_loader, ops)
     in_dim = int(ops.in_dim)
     dev_type = str(getattr(device, "type", "cpu"))
     non_blocking_ok = bool(dev_type in ("cuda", "xpu"))
@@ -5125,9 +4809,7 @@ class _PredictionWriter:
 
     def flush(self) -> None:
         if self.use_buffer:
-            if self.buf_fill <= 0:
-                return
-            if self.rows_buf is None or self.pred_buf is None:
+            if self.buf_fill <= 0 or self.rows_buf is None or self.pred_buf is None:
                 return
             rows = self.rows_buf[: self.buf_fill].clone()
             preds = self.pred_buf[: self.buf_fill]
@@ -5153,14 +4835,11 @@ class _PredictionWriter:
         rows_path = os.path.join(
             self.chunk_dir, f"part-r{self.rank:05d}-c{self.chunk_idx:06d}-rows.pt"
         )
-        if self.use_buffer and self.use_mmt_pred_parts:
-            pred_path = os.path.join(
-                self.chunk_dir, f"part-r{self.rank:05d}-c{self.chunk_idx:06d}-pred.mmt"
-            )
-        else:
-            pred_path = os.path.join(
-                self.chunk_dir, f"part-r{self.rank:05d}-c{self.chunk_idx:06d}-pred.pt"
-            )
+        pred_ext = "mmt" if self.use_buffer and self.use_mmt_pred_parts else "pt"
+        pred_path = os.path.join(
+            self.chunk_dir,
+            f"part-r{self.rank:05d}-c{self.chunk_idx:06d}-pred.{pred_ext}",
+        )
 
         if self.cache is not None:
             self.cache.submit(rows, path=rows_path)

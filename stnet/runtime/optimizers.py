@@ -41,53 +41,34 @@ _OPT_LOGGED_LOCK = threading.Lock()
 
 
 def _is_hashable(x: object) -> bool:
-    try:
+    with contextlib.suppress(Exception):
         hash(x)
-    except Exception:
-        return False
-    return True
+        return True
+    return False
 
 
 def _to_immutable(x: Any) -> Any:
     if x is None or isinstance(x, (bool, int, float, str)):
         return x
-    if isinstance(x, torch.dtype):
+    if isinstance(x, (torch.dtype, torch.device)):
         return str(x)
-    if isinstance(x, torch.device):
-        return str(x)
-    try:
-        if isinstance(x, (list, tuple)):
-            return tuple(_to_immutable(v) for v in x)
-        if isinstance(x, dict):
-            items = tuple(sorted((str(k), _to_immutable(v)) for k, v in x.items()))
-            return items
-    except Exception:
-        pass
-    try:
-        s = str(x)
-        return s
-    except Exception:
-        return repr(x)
+    if isinstance(x, (list, tuple)):
+        return tuple(_to_immutable(v) for v in x)
+    if isinstance(x, dict):
+        return tuple(sorted((str(k), _to_immutable(v)) for k, v in x.items()))
+    return str(x)
 
 
 def _iter_batch(items: Iterable[Any], key: str) -> Iterator[torch.Tensor]:
     for item in items:
-        tensor: Optional[torch.Tensor] = None
-        match item:
-            case TensorDictBase():
-                maybe = item.get(key, None)
-                tensor = maybe if torch.is_tensor(maybe) else None
-            case torch.Tensor():
-                tensor = item
-            case dict():
-                maybe = item.get(key)
-                tensor = maybe if torch.is_tensor(maybe) else None
-            case tuple() | list():
-                if item and torch.is_tensor(item[0]):
-                    tensor = item[0]
-            case _:
-                tensor = None
-        if tensor is not None:
+        tensor = None
+        if isinstance(item, (TensorDictBase, dict)):
+            tensor = item.get(key)
+        elif isinstance(item, torch.Tensor):
+            tensor = item
+        elif isinstance(item, (tuple, list)) and item and torch.is_tensor(item[0]):
+            tensor = item[0]
+        if isinstance(tensor, torch.Tensor):
             yield tensor
 
 
@@ -98,78 +79,64 @@ def _log_optimizer(
     *args: Any,
     level: str = "info",
 ) -> None:
-    if logger is None:
-        lvl = logging.DEBUG if str(level).lower() == "debug" else logging.INFO
-        try:
-            if not _LOGGER.isEnabledFor(lvl):
-                return
-        except Exception:
-            pass
-    if key is None:
-        key = (
-            "opt",
-            payload.get("mode"),
-            payload.get("device"),
-            payload.get("selected"),
+    if (
+        logger is None
+        and not _LOGGER.isEnabledFor(
+            logging.DEBUG if str(level).lower() == "debug" else logging.INFO
         )
+    ):
+        return
+    key = key or ("opt", payload.get("mode"), payload.get("device"), payload.get("selected"))
     if not _is_hashable(key):
         key = _to_immutable(key)
     with _OPT_LOGGED_LOCK:
         if key in _OPT_LOGGED_KEYS:
-            with contextlib.suppress(Exception):
-                _OPT_LOGGED_KEYS.move_to_end(key)
+            _OPT_LOGGED_KEYS.move_to_end(key)
             return
         _OPT_LOGGED_KEYS[key] = None
-        try:
-            while len(_OPT_LOGGED_KEYS) > int(_OPT_LOGGED_MAX):
-                _OPT_LOGGED_KEYS.popitem(last=False)
-        except Exception:
-            pass
+        if len(_OPT_LOGGED_KEYS) > _OPT_LOGGED_MAX:
+            _OPT_LOGGED_KEYS.popitem(last=False)
     try:
         msg = "[OPT][DECISION] " + json.dumps(payload, sort_keys=True, default=str)
     except Exception:
         msg = f"[OPT][DECISION] {payload}"
     if logger is not None:
-        try:
-            logger(msg)
-        except Exception:
-            pass
+        logger(msg)
         return
-    if str(level).lower() == "debug":
-        _LOGGER.debug(msg)
-    else:
-        _LOGGER.info(msg)
+    log_fn = getattr(_LOGGER, str(level).lower(), _LOGGER.info)
+    log_fn(msg)
 
 
 @lru_cache(maxsize=256)
 def _get_expected_args(ctor: Any) -> Optional[frozenset[str]]:
     try:
         sig = inspect.signature(ctor)
-    except (TypeError, ValueError):
+        return (
+            None
+            if any(
+                p.kind == inspect.Parameter.VAR_KEYWORD
+                for p in sig.parameters.values()
+            )
+            else frozenset(sig.parameters.keys())
+        )
+    except Exception:
         return None
-    for p in sig.parameters.values():
-        if p.kind == inspect.Parameter.VAR_KEYWORD:
-            return None
-    return frozenset(sig.parameters.keys())
 
 
 def _coerce_kwargs(ctor: Any, kwargs: Dict[str, Any]) -> Dict[str, Any]:
     if not kwargs:
         return {}
-    allowed: Optional[frozenset[str]] = None
-    try:
-        allowed = _get_expected_args(ctor)
-    except TypeError:
-        allowed = None
+    allowed = _get_expected_args(ctor)
     if allowed is None:
         try:
             sig = inspect.signature(ctor)
-        except (TypeError, ValueError):
-            return dict(kwargs)
-        for p in sig.parameters.values():
-            if p.kind == inspect.Parameter.VAR_KEYWORD:
+            if any(
+                p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()
+            ):
                 return dict(kwargs)
-        allowed = frozenset(sig.parameters.keys())
+            allowed = frozenset(sig.parameters.keys())
+        except Exception:
+            return dict(kwargs)
     return {k: v for k, v in kwargs.items() if k in allowed}
 
 
@@ -180,34 +147,33 @@ def _dataset_for_device(
     ref_tensor: Optional[torch.Tensor] = None
     if isinstance(model_or_params, nn.Module):
         ref_tensor = ModelPolicy._peek_layer(model_or_params)
-    elif metadata is None:
+    elif metadata is None and isinstance(model_or_params, Sequence) and model_or_params:
         try:
-            if isinstance(model_or_params, Sequence) and model_or_params:
-                first = model_or_params[0]
-                if isinstance(first, dict):
-                    for group in model_or_params:
-                        if not isinstance(group, dict):
-                            continue
-                        ps = group.get("params", None)
-                        if isinstance(ps, Sequence) and ps:
-                            p0 = ps[0]
-                            if torch.is_tensor(p0):
-                                ref_tensor = p0
-                                break
-                else:
-                    if torch.is_tensor(first):
-                        ref_tensor = first
+            first = model_or_params[0]
+            if isinstance(first, dict):
+                ref_tensor = next(
+                    (
+                        p
+                        for g in model_or_params
+                        if isinstance(g, dict)
+                        for p in g.get("params", [])
+                        if torch.is_tensor(p)
+                    ),
+                    None,
+                )
+            elif torch.is_tensor(first):
+                ref_tensor = first
         except Exception:
             ref_tensor = None
-    if metadata is not None:
-        dev = torch.device(metadata.device)
-    elif ref_tensor is not None:
-        dev = ref_tensor.device
-    else:
-        dev = get_device()
+    dev = (
+        torch.device(metadata.device)
+        if metadata
+        else ref_tensor.device
+        if ref_tensor is not None
+        else get_device()
+    )
     meta = Autocast.coerce_metadata(dev, metadata=metadata)
-    dev = torch.device(meta.device)
-    return dev, meta
+    return torch.device(meta.device), meta
 
 
 def _coerce_params(
@@ -220,15 +186,11 @@ def _coerce_params(
         and model_or_params
         and isinstance(model_or_params[0], dict)
     ):
-        groups: List[Dict[str, Any]] = []
-        for g in model_or_params:
-            if not isinstance(g, dict):
-                continue
-            gg = dict(g)
-            ps = gg.get("params", [])
-            gg["params"] = list(ps)
-            groups.append(gg)
-        return groups
+        return [
+            dict(g, params=list(g.get("params", [])))
+            for g in model_or_params
+            if isinstance(g, dict)
+        ]
     return list(model_or_params)
 
 
@@ -236,102 +198,62 @@ def _master_cpu_dtypes(
     device: torch.device,
     meta: Optional["Dataset[Any]"] = None,
 ) -> Tuple[torch.dtype, torch.dtype]:
-    master_int = torch.int64
-    if PrecisionPolicy is None:
-        return (torch.float32, master_int)
-    try:
-        policy = PrecisionPolicy.from_metadata(device, meta)
-        master_float = getattr(policy, "master_float", torch.float32)
-        if not isinstance(master_float, torch.dtype):
-            master_float = torch.float32
-        if master_float not in (torch.float32, torch.float64):
-            master_float = torch.float32
-        return (master_float, master_int)
-    except Exception:
-        return (torch.float32, master_int)
+    master_float, master_int = torch.float32, torch.int64
+    if PrecisionPolicy:
+        try:
+            master_float = getattr(
+                PrecisionPolicy.from_metadata(device, meta),
+                "master_float",
+                torch.float32,
+            )
+            if master_float not in (torch.float32, torch.float64):
+                master_float = torch.float32
+        except Exception:
+            pass
+    return master_float, master_int
 
 
-def _cpu_master_tensor(
+def _cpu_offload(
     t: torch.Tensor,
-    *args: Any,
-    master_float: torch.dtype,
-    master_int: torch.dtype,
+    dtype: torch.dtype,
     pin_memory: bool = False,
     non_blocking: Optional[bool] = None,
 ) -> torch.Tensor:
     if not torch.is_tensor(t):
-        raise TypeError("Expected a torch.Tensor")
-    if t.is_floating_point():
-        target_dtype = master_float
-    elif t.is_complex():
-        target_dtype = (
-            torch.complex128 if master_float == torch.float64 else torch.complex64
-        )
-    else:
-        target_dtype = master_int
+        raise TypeError(f"Expected Tensor, got {type(t)}")
     nb = bool(non_blocking) if non_blocking is not None else bool(pin_memory)
     src = t.detach()
-    if src.dtype != target_dtype:
+    if src.dtype != dtype:
         with contextlib.suppress(Exception):
-            src = src.to(dtype=target_dtype)
+            src = src.to(dtype=dtype)
     if src.device.type == "cpu":
         if pin_memory:
             with contextlib.suppress(Exception):
-                out = torch.empty(
-                    src.shape, device="cpu", dtype=target_dtype, pin_memory=True
-                )
-                out.copy_(src)
+                out = torch.empty(src.shape, device="cpu", dtype=dtype, pin_memory=True)
+                out.copy_(src, non_blocking=nb)
                 return out
             with contextlib.suppress(Exception):
                 return src.clone().pin_memory()
         return src.clone()
     if pin_memory:
         with contextlib.suppress(Exception):
-            out = torch.empty(
-                src.shape, device="cpu", dtype=target_dtype, pin_memory=True
-            )
-            out.copy_(src, non_blocking=nb)
-            return out
-    return src.to(device="cpu", dtype=target_dtype)
-
-
-def _to_cpu_detached(
-    t: torch.Tensor,
-    *args: Any,
-    dtype: torch.dtype,
-    pin_memory: bool,
-    non_blocking: bool,
-) -> torch.Tensor:
-    if not torch.is_tensor(t):
-        raise TypeError("Expected a torch.Tensor")
-    src = t.detach()
-    if src.dtype != dtype:
-        with contextlib.suppress(Exception):
-            src = src.to(dtype=dtype)
-    if src.device.type == "cpu":
-        return src
-    if pin_memory:
-        with contextlib.suppress(Exception):
             out = torch.empty(src.shape, device="cpu", dtype=dtype, pin_memory=True)
-            out.copy_(src, non_blocking=bool(non_blocking))
+            out.copy_(src, non_blocking=nb)
             return out
     return src.to(device="cpu", dtype=dtype)
 
 
-def _copy_tensor_into_(dst: torch.Tensor, src: torch.Tensor) -> None:
-    if not (torch.is_tensor(dst) and torch.is_tensor(src)):
-        return
-    if dst.data_ptr() == src.data_ptr():
-        return
-    try:
-        dst.copy_(src)
-        return
-    except Exception:
-        pass
-    try:
-        dst.copy_(src.to(device=dst.device, dtype=dst.dtype))
-    except Exception:
-        pass
+def _safe_copy(dst: torch.Tensor, src: torch.Tensor) -> None:
+    if (
+        torch.is_tensor(dst)
+        and torch.is_tensor(src)
+        and dst.data_ptr() != src.data_ptr()
+    ):
+        with contextlib.suppress(Exception):
+            dst.copy_(src)
+            return
+        with contextlib.suppress(Exception):
+            dst.copy_(src.to(device=dst.device, dtype=dst.dtype))
 
 
 def _sync_optimizer_state(optimizer: optim.Optimizer) -> None:
@@ -434,12 +356,20 @@ class ExponentialMovingAverage(nn.Module):
         with torch.no_grad():
             for k, v in model.state_dict().items():
                 if torch.is_tensor(v):
-                    self.shadow[k] = _cpu_master_tensor(
+                    target_dtype = (
+                        self.master_float
+                        if v.is_floating_point()
+                        else torch.complex128
+                        if self.master_float == torch.float64 and v.is_complex()
+                        else torch.complex64
+                        if v.is_complex()
+                        else self.master_int
+                    )
+                    self.shadow[k] = _cpu_offload(
                         v,
-                        master_float=self.master_float,
-                        master_int=self.master_int,
-                        pin_memory=self.pin_memory,
-                        non_blocking=self.non_blocking,
+                        target_dtype,
+                        self.pin_memory,
+                        self.non_blocking,
                     )
         self.collected: Dict[str, torch.Tensor] = {}
         self.optim_shadow: Optional[Dict[str, Any]] = None
@@ -454,56 +384,63 @@ class ExponentialMovingAverage(nn.Module):
         decay = self.decay
         one_m = 1.0 - decay
         self._step += 1
-        do_update = (self.update_every <= 1) or (self._step % self.update_every == 0)
-        if not do_update:
+        if (self.update_every > 1) and (self._step % self.update_every != 0):
             return
-        for name, tensor in model.state_dict().items():
-            if not torch.is_tensor(tensor):
-                continue
-            s = self.shadow.get(name)
-            if s is None or (not torch.is_tensor(s)) or s.shape != tensor.shape:
-                self.shadow[name] = _cpu_master_tensor(
-                    tensor,
-                    master_float=self.master_float,
-                    master_int=self.master_int,
-                    pin_memory=self.pin_memory,
-                    non_blocking=self.non_blocking,
+
+        def _get_target_dtype(t: torch.Tensor) -> torch.dtype:
+            if t.is_floating_point():
+                return self.master_float
+            if t.is_complex():
+                return (
+                    torch.complex128
+                    if self.master_float == torch.float64
+                    else torch.complex64
                 )
-                continue
-            if tensor.is_floating_point():
-                try:
-                    t_cpu = _to_cpu_detached(
-                        tensor,
-                        dtype=s.dtype,
-                        pin_memory=self.pin_memory,
-                        non_blocking=self.non_blocking,
+            return self.master_int
+
+        def _update_dict(shadow_dict: Dict[Any, Any], source_dict: Dict[Any, Any]) -> None:
+            for key, value in source_dict.items():
+                if not torch.is_tensor(value):
+                    if isinstance(value, dict):
+                        _update_dict(shadow_dict.setdefault(key, {}), value)
+                    else:
+                        shadow_dict[key] = copy.deepcopy(value)
+                    continue
+                target_dtype = _get_target_dtype(value)
+                current = shadow_dict.get(key)
+                if (
+                    current is None
+                    or not torch.is_tensor(current)
+                    or current.shape != value.shape
+                    or current.dtype != target_dtype
+                ):
+                    shadow_dict[key] = _cpu_offload(
+                        value,
+                        target_dtype,
+                        self.pin_memory,
+                        self.non_blocking,
                     )
-                    s.mul_(decay).add_(t_cpu, alpha=one_m)
-                except Exception:
-                    self.shadow[name] = _cpu_master_tensor(
-                        tensor,
-                        master_float=self.master_float,
-                        master_int=self.master_int,
-                        pin_memory=self.pin_memory,
-                        non_blocking=self.non_blocking,
-                    )
-            else:
-                try:
-                    t_cpu = _to_cpu_detached(
-                        tensor,
-                        dtype=s.dtype,
-                        pin_memory=self.pin_memory,
-                        non_blocking=self.non_blocking,
-                    )
-                    s.copy_(t_cpu)
-                except Exception:
-                    self.shadow[name] = _cpu_master_tensor(
-                        tensor,
-                        master_float=self.master_float,
-                        master_int=self.master_int,
-                        pin_memory=self.pin_memory,
-                        non_blocking=self.non_blocking,
-                    )
+                else:
+                    try:
+                        src_cpu = _cpu_offload(
+                            value,
+                            current.dtype,
+                            self.pin_memory,
+                            self.non_blocking,
+                        )
+                        if value.is_floating_point():
+                            current.mul_(decay).add_(src_cpu, alpha=one_m)
+                        else:
+                            current.copy_(src_cpu)
+                    except Exception:
+                        shadow_dict[key] = _cpu_offload(
+                            value,
+                            target_dtype,
+                            self.pin_memory,
+                            self.non_blocking,
+                        )
+
+        _update_dict(self.shadow, model.state_dict())
         if optimizer is None:
             return
         state = optimizer.state_dict()
@@ -512,77 +449,13 @@ class ExponentialMovingAverage(nn.Module):
             if "param_groups" in state:
                 shadow["param_groups"] = copy.deepcopy(state["param_groups"])
             if "state" in state:
-                shadow_state: Dict[Any, Any] = {}
-                for pid, slot in state["state"].items():
-                    s_slot: Dict[str, Any] = {}
-                    if isinstance(slot, dict):
-                        for sk, sv in slot.items():
-                            if torch.is_tensor(sv):
-                                s_slot[sk] = _cpu_master_tensor(
-                                    sv,
-                                    master_float=self.master_float,
-                                    master_int=self.master_int,
-                                    pin_memory=self.pin_memory,
-                                    non_blocking=self.non_blocking,
-                                )
-                            else:
-                                s_slot[sk] = copy.deepcopy(sv)
-                    else:
-                        s_slot = copy.deepcopy(slot)
-                    shadow_state[pid] = s_slot
-                shadow["state"] = shadow_state
+                _update_dict(shadow.setdefault("state", {}), state["state"])
             self.optim_shadow = shadow
             return
-        shadow = self.optim_shadow
         if "param_groups" in state:
-            shadow["param_groups"] = copy.deepcopy(state["param_groups"])
+            self.optim_shadow["param_groups"] = copy.deepcopy(state["param_groups"])
         if "state" in state:
-            shadow_state = shadow.setdefault("state", {})
-            for pid, slot in state["state"].items():
-                if not isinstance(slot, dict):
-                    shadow_state[pid] = copy.deepcopy(slot)
-                    continue
-                s_slot = shadow_state.setdefault(pid, {})
-                if not isinstance(s_slot, dict):
-                    s_slot = {}
-                    shadow_state[pid] = s_slot
-                for sk, sv in slot.items():
-                    if torch.is_tensor(sv):
-                        if sv.is_floating_point():
-                            prev = s_slot.get(sk)
-                            if (
-                                torch.is_tensor(prev)
-                                and prev.is_floating_point()
-                                and prev.shape == sv.shape
-                            ):
-                                try:
-                                    sv_cpu = _to_cpu_detached(
-                                        sv,
-                                        dtype=prev.dtype,
-                                        pin_memory=self.pin_memory,
-                                        non_blocking=self.non_blocking,
-                                    )
-                                    prev.mul_(decay).add_(sv_cpu, alpha=one_m)
-                                    continue
-                                except Exception:
-                                    pass
-                            s_slot[sk] = _cpu_master_tensor(
-                                sv,
-                                master_float=self.master_float,
-                                master_int=self.master_int,
-                                pin_memory=self.pin_memory,
-                                non_blocking=self.non_blocking,
-                            )
-                        else:
-                            s_slot[sk] = _cpu_master_tensor(
-                                sv,
-                                master_float=self.master_float,
-                                master_int=self.master_int,
-                                pin_memory=self.pin_memory,
-                                non_blocking=self.non_blocking,
-                            )
-                    else:
-                        s_slot[sk] = copy.deepcopy(sv)
+            _update_dict(self.optim_shadow.setdefault("state", {}), state["state"])
 
     @torch.no_grad()
     def apply(
@@ -592,9 +465,7 @@ class ExponentialMovingAverage(nn.Module):
     ) -> None:
         model_state = model.state_dict()
         for name, buf in self.shadow.items():
-            dst = model_state.get(name)
-            if torch.is_tensor(dst) and torch.is_tensor(buf):
-                _copy_tensor_into_(dst, buf)
+            _safe_copy(model_state.get(name), buf)
         if optimizer is not None and self.optim_shadow is not None:
             optimizer.load_state_dict(self.optim_shadow)
             _sync_optimizer_state(optimizer)
@@ -605,43 +476,39 @@ class ExponentialMovingAverage(nn.Module):
         model: nn.Module,
         optimizer: Optional[optim.Optimizer] = None,
     ) -> None:
-        collected: Dict[str, torch.Tensor] = {}
-        with torch.no_grad():
-            for k, v in model.state_dict().items():
+        def _dump_tensors(state_dict: Dict[str, Any]) -> Dict[str, Any]:
+            out: Dict[str, Any] = {}
+            for k, v in state_dict.items():
                 if torch.is_tensor(v):
-                    collected[k] = _cpu_master_tensor(
-                        v,
-                        master_float=self.master_float,
-                        master_int=self.master_int,
-                        pin_memory=self.pin_memory,
-                        non_blocking=self.non_blocking,
+                    target_dtype = (
+                        self.master_float
+                        if v.is_floating_point()
+                        else torch.complex128
+                        if self.master_float == torch.float64 and v.is_complex()
+                        else torch.complex64
+                        if v.is_complex()
+                        else self.master_int
                     )
-        self.collected = collected
+                    out[k] = _cpu_offload(
+                        v,
+                        target_dtype,
+                        self.pin_memory,
+                        self.non_blocking,
+                    )
+                elif isinstance(v, dict):
+                    out[k] = _dump_tensors(v)
+                else:
+                    out[k] = copy.deepcopy(v)
+            return out
+
+        self.collected = _dump_tensors(model.state_dict())
         if optimizer is not None:
             state = optimizer.state_dict()
             off: Dict[str, Any] = {}
             if "param_groups" in state:
                 off["param_groups"] = copy.deepcopy(state["param_groups"])
             if "state" in state:
-                off_state: Dict[Any, Any] = {}
-                for pid, slot in state["state"].items():
-                    if isinstance(slot, dict):
-                        s2: Dict[str, Any] = {}
-                        for sk, sv in slot.items():
-                            if torch.is_tensor(sv):
-                                s2[sk] = _cpu_master_tensor(
-                                    sv,
-                                    master_float=self.master_float,
-                                    master_int=self.master_int,
-                                    pin_memory=self.pin_memory,
-                                    non_blocking=self.non_blocking,
-                                )
-                            else:
-                                s2[sk] = copy.deepcopy(sv)
-                        off_state[pid] = s2
-                    else:
-                        off_state[pid] = copy.deepcopy(slot)
-                off["state"] = off_state
+                off["state"] = _dump_tensors(state["state"])
             self.optim_collected = off
 
     @torch.no_grad()
@@ -682,251 +549,9 @@ class AdamW:
         logger: Optional[Callable[[str], None]] = None,
         **kwargs: Any,
     ) -> optim.Optimizer:
-        params = _coerce_params(model_or_params)
-        dev, meta = _dataset_for_device(
-            model_or_params if isinstance(model_or_params, nn.Module) else params,
-            metadata,
+        return AdamW._try_backends(
+            model_or_params, lr, weight_decay, metadata, logger, kwargs, mode="float"
         )
-        dev_index = (
-            int(getattr(dev, "index", -1))
-            if getattr(dev, "index", None) is not None
-            else -1
-        )
-        scale_key = (
-            bool(getattr(meta, "has_scale", False)),
-            bool(getattr(meta, "has_nonfinite", False)),
-            _to_immutable(getattr(meta, "scale_max_abs", None)),
-            _to_immutable(getattr(meta, "scale_min_positive", None)),
-            _to_immutable(getattr(meta, "scale_min_value", None)),
-            _to_immutable(getattr(meta, "scale_max_value", None)),
-            str(getattr(meta, "underflow_action", "")),
-            _to_immutable(getattr(meta, "int_quant_bits", None)),
-        )
-        decision_key = (
-            "opt",
-            "adamw-float",
-            str(getattr(dev, "type", "")),
-            dev_index,
-            scale_key,
-        )
-        attempts: List[Dict[str, Any]] = []
-        common_kwargs: Dict[str, Any] = {
-            "lr": lr,
-            "weight_decay": weight_decay,
-            **kwargs,
-        }
-        if getattr(dev, "type", None) == "cuda":
-            try:
-                from transformer_engine.pytorch.optimizers import (
-                    FusedAdam as TEFusedAdam,
-                )
-
-                opt = TEFusedAdam(params, **_coerce_kwargs(TEFusedAdam, common_kwargs))
-                attempts.append({"backend": "te.FusedAdam", "ok": True})
-                _log_optimizer(
-                    logger,
-                    decision_key,
-                    {
-                        "mode": "adamw-float",
-                        "device": f"{dev.type}:{dev_index}",
-                        "selected": "te.FusedAdam",
-                        "attempts": attempts,
-                        "scale": {
-                            "has_scale": bool(getattr(meta, "has_scale", False)),
-                            "has_nonfinite": bool(
-                                getattr(meta, "has_nonfinite", False)
-                            ),
-                            "max_abs": _to_immutable(
-                                getattr(meta, "scale_max_abs", None)
-                            ),
-                            "min_positive": _to_immutable(
-                                getattr(meta, "scale_min_positive", None)
-                            ),
-                            "min_value": _to_immutable(
-                                getattr(meta, "scale_min_value", None)
-                            ),
-                            "max_value": _to_immutable(
-                                getattr(meta, "scale_max_value", None)
-                            ),
-                            "underflow_action": str(
-                                getattr(meta, "underflow_action", "")
-                            ),
-                            "int_quant_bits": _to_immutable(
-                                getattr(meta, "int_quant_bits", None)
-                            ),
-                        },
-                    },
-                    level="info",
-                )
-                return opt
-            except Exception as exc:
-                attempts.append(
-                    {"backend": "te.FusedAdam", "ok": False, "error": str(exc)}
-                )
-        if getattr(dev, "type", None) == "cuda":
-            fp8_allowed = True
-            if getattr(meta, "has_scale", False):
-                float8_dtypes = Autocast.float8_formats()
-                if not any(
-                    is_scale_safe(dtype, meta, safety_margin=2.0)
-                    for dtype in float8_dtypes
-                ):
-                    fp8_allowed = False
-                    attempts.append(
-                        {
-                            "backend": "fp8",
-                            "ok": False,
-                            "reason": "data scale exceeds float8 range",
-                        }
-                    )
-            fp8_hw_ok, fp8_hw_reason = Dataset.is_float8_supported(dev)
-            if fp8_allowed and fp8_hw_ok:
-                try:
-                    with contextlib.suppress(Exception):
-                        __import__("torchao.float8")
-                    AdamWFp8 = None
-                    with contextlib.suppress(Exception):
-                        from torchao.optim import AdamWFp8
-                    if AdamWFp8 is None:
-                        from torchao.prototype.float8.optim import AdamWFp8
-                    opt = AdamWFp8(params, **_coerce_kwargs(AdamWFp8, common_kwargs))
-                    attempts.append(
-                        {
-                            "backend": "torchao.AdamWFp8",
-                            "ok": True,
-                            "reason": str(fp8_hw_reason),
-                        }
-                    )
-                    _log_optimizer(
-                        logger,
-                        decision_key,
-                        {
-                            "mode": "adamw-float",
-                            "device": f"{dev.type}:{dev_index}",
-                            "selected": "torchao.AdamWFp8",
-                            "attempts": attempts,
-                            "fp8_reason": str(fp8_hw_reason),
-                            "scale": {
-                                "has_scale": bool(getattr(meta, "has_scale", False)),
-                                "has_nonfinite": bool(
-                                    getattr(meta, "has_nonfinite", False)
-                                ),
-                                "max_abs": _to_immutable(
-                                    getattr(meta, "scale_max_abs", None)
-                                ),
-                                "min_positive": _to_immutable(
-                                    getattr(meta, "scale_min_positive", None)
-                                ),
-                                "min_value": _to_immutable(
-                                    getattr(meta, "scale_min_value", None)
-                                ),
-                                "max_value": _to_immutable(
-                                    getattr(meta, "scale_max_value", None)
-                                ),
-                                "underflow_action": str(
-                                    getattr(meta, "underflow_action", "")
-                                ),
-                                "int_quant_bits": _to_immutable(
-                                    getattr(meta, "int_quant_bits", None)
-                                ),
-                            },
-                        },
-                        level="info",
-                    )
-                    return opt
-                except Exception as exc:
-                    attempts.append(
-                        {
-                            "backend": "torchao.AdamWFp8",
-                            "ok": False,
-                            "error": str(exc),
-                            "reason": str(fp8_hw_reason),
-                        }
-                    )
-            else:
-                attempts.append(
-                    {"backend": "fp8", "ok": False, "reason": str(fp8_hw_reason)}
-                )
-        quant_bits = getattr(meta, "int_quant_bits", None)
-        if quant_bits in (4, 8):
-            try:
-                try:
-                    from torchao.optim import AdamW4bit, AdamW8bit
-                except ImportError:
-                    from torchao.prototype.low_bit_optim import AdamW4bit, AdamW8bit
-                if int(quant_bits) == 8:
-                    opt = AdamW8bit(params, **_coerce_kwargs(AdamW8bit, common_kwargs))
-                    selected = "torchao.AdamW8bit"
-                else:
-                    opt = AdamW4bit(params, **_coerce_kwargs(AdamW4bit, common_kwargs))
-                    selected = "torchao.AdamW4bit"
-                attempts.append(
-                    {"backend": selected, "ok": True, "bits": int(quant_bits)}
-                )
-                _log_optimizer(
-                    logger,
-                    decision_key,
-                    {
-                        "mode": "adamw-float",
-                        "device": f"{dev.type}:{dev_index}",
-                        "selected": selected,
-                        "attempts": attempts,
-                        "scale": {
-                            "has_scale": bool(getattr(meta, "has_scale", False)),
-                            "has_nonfinite": bool(
-                                getattr(meta, "has_nonfinite", False)
-                            ),
-                            "max_abs": _to_immutable(
-                                getattr(meta, "scale_max_abs", None)
-                            ),
-                            "min_positive": _to_immutable(
-                                getattr(meta, "scale_min_positive", None)
-                            ),
-                            "min_value": _to_immutable(
-                                getattr(meta, "scale_min_value", None)
-                            ),
-                            "max_value": _to_immutable(
-                                getattr(meta, "scale_max_value", None)
-                            ),
-                            "underflow_action": str(
-                                getattr(meta, "underflow_action", "")
-                            ),
-                            "int_quant_bits": _to_immutable(
-                                getattr(meta, "int_quant_bits", None)
-                            ),
-                        },
-                    },
-                    level="info",
-                )
-                return opt
-            except Exception as exc:
-                attempts.append(
-                    {
-                        "backend": "torchao.AdamW(lowbit)",
-                        "ok": False,
-                        "error": str(exc),
-                        "bits": quant_bits,
-                    }
-                )
-        flags: Dict[str, bool] = optimal_optimizer_params(
-            dev, use_foreach=None, use_fused=False
-        )
-        fallback_kwargs = dict(flags)
-        fallback_kwargs.update(common_kwargs)
-        opt = optim.AdamW(params, **_coerce_kwargs(optim.AdamW, fallback_kwargs))
-        attempts.append({"backend": "torch.optim.AdamW", "ok": True, "flags": flags})
-        _log_optimizer(
-            logger,
-            decision_key,
-            {
-                "mode": "adamw-float",
-                "device": f"{dev.type}:{dev_index}",
-                "selected": "torch.optim.AdamW",
-                "attempts": attempts,
-            },
-            level="info",
-        )
-        return opt
 
     @staticmethod
     def integer(
@@ -940,180 +565,133 @@ class AdamW:
         logger: Optional[Callable[[str], None]] = None,
         **kwargs: Any,
     ) -> optim.Optimizer:
+        return AdamW._try_backends(
+            model_or_params, lr, weight_decay, metadata, logger, kwargs, mode="integer"
+        )
+
+    @staticmethod
+    def _try_backends(
+        model_or_params: Union[
+            nn.Module, Iterable[nn.Parameter], Sequence[Dict[str, Any]]
+        ],
+        lr: float,
+        weight_decay: float,
+        metadata: Optional[Dataset[Any]],
+        logger: Optional[Callable[[str], None]],
+        kwargs: Dict[str, Any],
+        mode: str,
+    ) -> optim.Optimizer:
         params = _coerce_params(model_or_params)
         dev, meta = _dataset_for_device(
             model_or_params if isinstance(model_or_params, nn.Module) else params,
             metadata,
         )
-        dev_index = (
-            int(getattr(dev, "index", -1))
-            if getattr(dev, "index", None) is not None
-            else -1
-        )
-        scale_key = (
-            bool(getattr(meta, "has_scale", False)),
-            bool(getattr(meta, "has_nonfinite", False)),
-            _to_immutable(getattr(meta, "scale_max_abs", None)),
-            _to_immutable(getattr(meta, "scale_min_positive", None)),
-            _to_immutable(getattr(meta, "scale_min_value", None)),
-            _to_immutable(getattr(meta, "scale_max_value", None)),
-            bool(getattr(meta, "scale_is_integral", False)),
-            str(getattr(meta, "underflow_action", "")),
-            _to_immutable(getattr(meta, "int_quant_bits", None)),
-        )
-        decision_key = (
-            "opt",
-            "adamw-integer",
-            str(getattr(dev, "type", "")),
-            dev_index,
-            scale_key,
-        )
-        decision: Dict[str, Any] = {
-            "mode": "adamw-integer",
-            "device": f"{dev.type}:{dev_index}",
-            "selected": None,
-            "attempts": [],
-            "scale": {
-                "has_scale": bool(getattr(meta, "has_scale", False)),
-                "has_nonfinite": bool(getattr(meta, "has_nonfinite", False)),
-                "is_integral": _to_immutable(getattr(meta, "scale_is_integral", None)),
-                "max_abs": _to_immutable(getattr(meta, "scale_max_abs", None)),
-                "min": _to_immutable(getattr(meta, "scale_min_value", None)),
-                "max": _to_immutable(getattr(meta, "scale_max_value", None)),
-                "int_quant_bits": _to_immutable(getattr(meta, "int_quant_bits", None)),
-            },
-        }
+
+        def _attempt_load(
+            mod_name: str,
+            cls_name: str,
+            extra: List[Dict[str, Any]],
+        ) -> Optional[optim.Optimizer]:
+            try:
+                mod = __import__(mod_name, fromlist=[cls_name])
+                cls = getattr(mod, cls_name)
+                return cls(params, **_coerce_kwargs(cls, common_kwargs))
+            except Exception as exc:
+                extra.append(
+                    {
+                        "name": f"{mod_name}.{cls_name}",
+                        "ok": False,
+                        "error": str(exc),
+                    }
+                )
+                return None
+
+        attempts: List[Dict[str, Any]] = []
+        selected_opt: Optional[optim.Optimizer] = None
+        selected_name: Optional[str] = None
         common_kwargs: Dict[str, Any] = {
             "lr": lr,
             "weight_decay": weight_decay,
             **kwargs,
         }
-        opt: Optional[optim.Optimizer] = None
-        selected: Optional[str] = None
-        if getattr(dev, "type", None) == "cuda":
-            try:
-                from transformer_engine.pytorch.optimizers import (
-                    FusedAdam as TEFusedAdam,
-                )
 
-                opt = TEFusedAdam(params, **_coerce_kwargs(TEFusedAdam, common_kwargs))
-                selected = "transformer_engine.FusedAdam"
-                decision["attempts"].append({"name": "TE.FusedAdam", "ok": True})
-            except Exception as exc:
-                decision["attempts"].append(
-                    {"name": "TE.FusedAdam", "ok": False, "error": str(exc)}
-                )
-        quant_choice: Optional[str] = None
-        quant_reason: Optional[str] = None
-        explicit_bits = getattr(meta, "int_quant_bits", None)
-        if opt is None and explicit_bits in (4, 8):
-            quant_choice = "int8" if int(explicit_bits) == 8 else "int4"
-            quant_reason = "requested-by-metadata"
-            decision["attempts"].append(
-                {"name": f"{quant_choice}-requested", "ok": True}
+        if dev.type == "cuda":
+            selected_opt = _attempt_load(
+                "transformer_engine.pytorch.optimizers", "FusedAdam", attempts
             )
-        if (
-            opt is None
-            and quant_choice is None
-            and bool(getattr(meta, "has_scale", False))
-        ):
-            if getattr(meta, "scale_is_integral", None) is False:
-                decision["attempts"].append(
-                    {"name": "lowbit", "ok": False, "reason": "non-integral"}
-                )
-            else:
-                min_v = getattr(meta, "scale_min_value", None)
-                max_v = getattr(meta, "scale_max_value", None)
-                try:
-                    min_f = float(min_v) if min_v is not None else None
-                except Exception:
-                    min_f = None
-                try:
-                    max_f = float(max_v) if max_v is not None else None
-                except Exception:
-                    max_f = None
-                try:
-                    max_abs = float(abs(getattr(meta, "scale_max_abs", 0.0)))
-                except Exception:
-                    max_abs = 0.0
-                candidates: List[
-                    Tuple[str, Callable[[Optional[torch.device]], Tuple[bool, str]]]
-                ] = []
-                if (min_f is not None) and (max_f is not None):
-                    if (min_f >= -8.0) and (max_f <= 7.0):
-                        candidates.append(("int4", Dataset.is_int4_supported))
-                    if (min_f >= -128.0) and (max_f <= 127.0):
-                        candidates.append(("int8", Dataset.is_int8_supported))
-                else:
-                    if max_abs <= 7.0:
-                        candidates.append(("int4", Dataset.is_int4_supported))
-                    if max_abs <= 127.0:
-                        candidates.append(("int8", Dataset.is_int8_supported))
-                for name, checker in candidates:
-                    ok, reason = checker(dev)
-                    decision["attempts"].append(
-                        {
-                            "name": f"{name}-supported",
-                            "ok": bool(ok),
-                            "reason": str(reason),
-                        }
-                    )
-                    if ok:
-                        quant_choice = name
-                        quant_reason = str(reason)
+            if selected_opt:
+                selected_name = "te.FusedAdam"
+
+        if not selected_opt and mode == "float" and dev.type == "cuda":
+            float8_dtypes = Autocast.float8_formats()
+            safe_fp8 = not getattr(meta, "has_scale", False) or any(
+                is_scale_safe(dtype, meta, safety_margin=2.0) for dtype in float8_dtypes
+            )
+            hw_ok, _ = Dataset.is_float8_supported(dev)
+            if safe_fp8 and hw_ok:
+                for pkg in ("torchao.optim", "torchao.prototype.float8.optim"):
+                    selected_opt = _attempt_load(pkg, "AdamWFp8", attempts)
+                    if selected_opt:
+                        selected_name = "torchao.AdamWFp8"
                         break
-                if not candidates:
-                    decision["attempts"].append(
-                        {
-                            "name": "lowbit",
-                            "ok": False,
-                            "reason": f"magnitude>{max_abs}",
-                        }
-                    )
-        if opt is None and quant_choice in {"int8", "int4"}:
-            try:
-                try:
-                    from torchao.optim import AdamW4bit, AdamW8bit
-                except ImportError:
-                    from torchao.prototype.low_bit_optim import AdamW4bit, AdamW8bit
-                if quant_choice == "int8":
-                    opt = AdamW8bit(params, **_coerce_kwargs(AdamW8bit, common_kwargs))
-                    selected = "torchao.optim.AdamW8bit"
-                    decision["attempts"].append(
-                        {
-                            "name": "AO.AdamW8bit",
-                            "ok": True,
-                            "reason": str(quant_reason),
-                        }
-                    )
-                else:
-                    opt = AdamW4bit(params, **_coerce_kwargs(AdamW4bit, common_kwargs))
-                    selected = "torchao.optim.AdamW4bit"
-                    decision["attempts"].append(
-                        {
-                            "name": "AO.AdamW4bit",
-                            "ok": True,
-                            "reason": str(quant_reason),
-                        }
-                    )
-            except Exception as exc:
-                decision["attempts"].append(
-                    {"name": "AO.AdamW(lowbit)", "ok": False, "error": str(exc)}
+
+        if not selected_opt:
+            quant_bits = getattr(meta, "int_quant_bits", None)
+            use_int = (
+                quant_bits in (4, 8)
+                or (
+                    mode == "integer"
+                    and getattr(meta, "has_scale", False)
+                    and getattr(meta, "scale_is_integral", None) is not False
                 )
-        if opt is None:
-            flags: Dict[str, bool] = optimal_optimizer_params(
-                dev, use_foreach=None, use_fused=False
             )
-            fallback_kwargs = dict(flags)
-            fallback_kwargs.update(common_kwargs)
-            opt = optim.AdamW(params, **_coerce_kwargs(optim.AdamW, fallback_kwargs))
-            selected = f"torch.optim.AdamW(flags={flags})"
-            decision["attempts"].append(
-                {"name": "torch.optim.AdamW", "ok": True, "flags": flags}
+            if use_int:
+                target_bits = (
+                    8
+                    if quant_bits == 8 or (not quant_bits and Dataset.is_int8_supported(dev)[0])
+                    else 4
+                )
+                cls_name = f"AdamW{target_bits}bit"
+                for pkg in ("torchao.optim", "torchao.prototype.low_bit_optim"):
+                    selected_opt = _attempt_load(pkg, cls_name, attempts)
+                    if selected_opt:
+                        selected_name = f"torchao.{cls_name}"
+                        break
+
+        if not selected_opt:
+            flags = optimal_optimizer_params(dev, use_foreach=None, use_fused=False)
+            selected_opt = optim.AdamW(
+                params, **_coerce_kwargs(optim.AdamW, {**common_kwargs, **flags})
             )
-        decision["selected"] = selected
-        _log_optimizer(logger, decision_key, decision)
-        return opt
+            selected_name = "torch.optim.AdamW"
+
+        scale_info = {
+            k: _to_immutable(getattr(meta, k, None))
+            for k in (
+                "has_scale",
+                "has_nonfinite",
+                "scale_max_abs",
+                "scale_min_positive",
+                "scale_min_value",
+                "scale_max_value",
+                "underflow_action",
+                "int_quant_bits",
+                "scale_is_integral",
+            )
+        }
+        payload = {
+            "mode": f"adamw-{mode}",
+            "device": f"{dev.type}:{dev.index}",
+            "selected": selected_name,
+            "attempts": attempts,
+            "scale": scale_info,
+        }
+        _log_optimizer(
+            logger,
+            ("opt", f"adamw-{mode}", dev.type, dev.index, tuple(scale_info.values())),
+            payload,
+        )
+        return selected_opt
 
 
 class StochasticWeightAverage:
@@ -1162,13 +740,13 @@ class StochasticWeightAverage:
                     if avg_param is None:
                         continue
                     backup[name] = param.detach().clone()
-                    _copy_tensor_into_(param, avg_param)
+                    _safe_copy(param, avg_param)
                 yield
             finally:
                 for name, param in model.named_parameters():
                     buf = backup.get(name)
                     if buf is not None:
-                        _copy_tensor_into_(param, buf)
+                        _safe_copy(param, buf)
 
     def update_batch_norm(
         self,
