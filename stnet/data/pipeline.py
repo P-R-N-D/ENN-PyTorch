@@ -120,9 +120,11 @@ def _to_safe_tensor(
     if obj is None:
         return None
     t = obj if isinstance(obj, torch.Tensor) else torch.as_tensor(obj)
+    if dtype is None:
+        return t
     return (
         t.to(dtype=dtype, copy=False)
-        if dtype and isinstance(t, torch.Tensor) and t.dtype != dtype
+        if isinstance(t, torch.Tensor) and t.dtype != dtype
         else t
     )
 

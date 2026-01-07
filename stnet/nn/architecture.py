@@ -1139,7 +1139,8 @@ class TokenFuser(nn.Module):
 
 
 class Model(nn.Module):
-    def _get_cfg(self, cfg, name, default, type_=float):
+    @staticmethod
+    def _get_cfg(cfg, name, default, type_=float):
         return type_(getattr(cfg, name, default))
 
     def __init__(
