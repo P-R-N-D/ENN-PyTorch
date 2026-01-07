@@ -579,7 +579,7 @@ class _OnnxLayer:
             base = inspect.signature(torch.onnx.export).parameters
             return {k: v for k, v in common_kwargs.items() if k in base}
 
-        def _onnx_export(*, use_dynamo: bool, call_kwargs: dict[str, Any]) -> None:
+        def _onnx_export(*args: Any, use_dynamo: bool, call_kwargs: dict[str, Any]) -> None:
             with warnings.catch_warnings():
                 warnings.filterwarnings(
                     "ignore",
