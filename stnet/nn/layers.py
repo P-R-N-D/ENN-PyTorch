@@ -1071,17 +1071,18 @@ class DilatedAttention(nn.Module):
                         is_causal=bool(is_causal),
                     )
                 else:
+                    base4 = base_mask[None, None, :, :]
                     if key_mask is None:
                         y = self._call_dot_attn(
                             qh,
                             kh,
                             vh,
-                            attn_mask=base_mask,
+                            attn_mask=base4,
                             dropout_p=dropout_p,
                             is_causal=False,
                         )
                     elif key_mask.shape[0] == 1:
-                        attn_mask = base_mask[None, None, :, :] | key_mask
+                        attn_mask = base4 | key_mask
                         y = self._call_dot_attn(
                             qh,
                             kh,
@@ -1104,7 +1105,6 @@ class DilatedAttention(nn.Module):
                             else:
                                 group = int(B)
                         group = max(1, min(int(B), int(group)))
-                        base4 = base_mask[None, None, :, :]
                         out_full = qh.new_empty((B, H, L_q, Dh))
                         last_oom: Optional[RuntimeError] = None
                         while group >= 1:
