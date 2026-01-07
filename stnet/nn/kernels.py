@@ -80,6 +80,7 @@ def _flatten_attn_mask(
 ) -> tuple[torch.Tensor, int, int, int]:
     del args
     tracing_or_export = bool(is_tracing_or_exporting())
+    symbolic_shapes = tracing_or_export and (not all(isinstance(x, int) for x in (B, H, L, S)))
 
     if mask.dim() == 0:
         m = mask.to(device=device).view(1, 1, 1, 1)
@@ -90,22 +91,20 @@ def _flatten_attn_mask(
             raise RuntimeError(
                 f"attn_mask shape {tuple(mask.shape)} incompatible with key length S={int(S)}"
             )
+        if (tracing_or_export and (not symbolic_shapes)) and mask.shape[0] != S:
+            raise RuntimeError(
+                f"attn_mask shape {tuple(mask.shape)} incompatible with key length S={int(S)}"
+            )
         m = mask.to(device=device).view(1, 1, 1, mask.shape[0])
         return m, 1, 1, 1
     if mask.dim() == 2:
+        if tracing_or_export and symbolic_shapes:
+            raise RuntimeError(
+                "2D attn_mask is ambiguous under symbolic-shape export. "
+                "Pass a 4D mask with explicit semantics instead: "
+                "padding (B,1,1,S) or attn (1,1,L,S)."
+            )
         a, b = mask.shape
-        if tracing_or_export:
-            if a == B:
-                m = mask.to(device=device).view(B, 1, 1, b)
-                return m, B, 1, 1
-            if a == L:
-                m = mask.to(device=device).view(1, 1, L, b)
-                return m, 1, 1, L
-            if a == 1:
-                m = mask.to(device=device).view(1, 1, 1, b)
-                return m, 1, 1, 1
-            m = mask.to(device=device).view(1, 1, a, b)
-            return m, 1, 1, a
         if b != S:
             raise RuntimeError(
                 f"attn_mask trailing dim {b} does not match expected S={int(S)}"
@@ -123,22 +122,13 @@ def _flatten_attn_mask(
             f"unsupported 2D attn_mask shape {tuple(mask.shape)} for (B={int(B)}, L={int(L)}, S={int(S)})"
         )
     if mask.dim() == 3:
+        if tracing_or_export and symbolic_shapes:
+            raise RuntimeError(
+                "3D attn_mask is ambiguous under symbolic-shape export. "
+                "Pass a 4D mask with explicit semantics instead: "
+                "(B,1,L,S), (B,1,1,S), (1,H,L,S), or (B,H,1,S)."
+            )
         a, b, c = mask.shape
-        if tracing_or_export:
-            if (a == B) and (b == L):
-                m = mask.to(device=device).view(B, 1, L, c)
-                return m, B, 1, L
-            if (a == B) and (b == 1):
-                m = mask.to(device=device).view(B, 1, 1, c)
-                return m, B, 1, 1
-            if (a == H) and (b == L):
-                m = mask.to(device=device).view(1, H, L, c)
-                return m, 1, H, L
-            if (a == B) and (b == H):
-                m = mask.to(device=device).view(B, H, 1, c)
-                return m, B, H, 1
-            m = mask.to(device=device).view(a, 1, b, c)
-            return m, a, 1, b
         if c != S:
             raise RuntimeError(
                 f"attn_mask trailing dim {c} does not match expected S={int(S)}"
@@ -171,6 +161,10 @@ def _flatten_attn_mask(
         if (not tracing_or_export) and l0 not in (1, L):
             raise RuntimeError(
                 f"attn_mask query dim {l0} incompatible with L={int(L)} (broadcast 1 or L allowed)"
+            )
+        if (tracing_or_export and (not symbolic_shapes)) and s0 != S:
+            raise RuntimeError(
+                f"attn_mask trailing dim {s0} does not match expected S={int(S)}"
             )
         m = mask.to(device=device)
         return m, b0, h0, l0
