@@ -883,7 +883,7 @@ class MultiScaleRetention(nn.Module):
             tracing = bool(torch.jit.is_tracing() or torch.jit.is_scripting())
         except Exception:
             tracing = False
-        if (not tracing) and L <= 0:
+        if L <= 0:
             return v.new_zeros(v.shape)
         calc_dtype = (
             torch.float32 if v.dtype in (torch.float16, torch.bfloat16) else v.dtype
