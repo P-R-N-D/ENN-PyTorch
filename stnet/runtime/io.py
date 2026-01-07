@@ -26,7 +26,6 @@ from torch.distributed.checkpoint.state_dict import (
 from tensordict import TensorDictBase
 
 from ..core.compat import is_meta_or_fake_tensor
-from ..core.graph import inference_mode
 from ..data.schemas import save_temp, write_json, coerce_json
 from ..nn.layers import Recorder
 
@@ -419,7 +418,8 @@ def _get_tensor_shape(model: object, sample_input: object) -> object:
             (p.device for p in model.parameters() if p is not None), torch.device("cpu")
         )
         sample = sample_input.to(dev)
-        with inference_mode(model.eval()):
+        model.eval()
+        with torch.no_grad():
             if sample.ndim == 1:
                 sample = sample.unsqueeze(0)
             y_flat = _extract_tensor(_forward(model, sample))
@@ -557,10 +557,7 @@ class _OnnxLayer:
             dynamic_axes = {"features": {0: "batch"}, "preds_flat": {0: "batch"}}
             with contextlib.suppress(Exception):
                 if hasattr(torch, "export") and hasattr(torch.export, "Dim"):
-                    dynamic_shapes = (
-                        {"features": {0: torch.export.Dim("batch")}},
-                        {"preds_flat": {0: torch.export.Dim("batch")}},
-                    )
+                    dynamic_shapes = {"features": {0: torch.export.Dim("batch")}}
 
         training_mode = None
         with contextlib.suppress(Exception):
@@ -581,6 +578,41 @@ class _OnnxLayer:
                 common_kwargs["dynamic_axes"] = dynamic_axes
             base = inspect.signature(torch.onnx.export).parameters
             return {k: v for k, v in common_kwargs.items() if k in base}
+
+        def _onnx_export(*, use_dynamo: bool, call_kwargs: dict[str, Any]) -> None:
+            with warnings.catch_warnings():
+                warnings.filterwarnings(
+                    "ignore",
+                    message=r"torchvision is not installed\. Skipping torchvision::nms",
+                )
+                warnings.filterwarnings(
+                    "ignore",
+                    message=r"Setting ONNX exporter to use operator set version .*",
+                )
+                if use_dynamo:
+                    torch.onnx.export(
+                        wrapper,
+                        sample,
+                        str(onnx_path),
+                        dynamo=True,
+                        **call_kwargs,
+                    )
+                else:
+                    if "dynamo" in inspect.signature(torch.onnx.export).parameters:
+                        torch.onnx.export(
+                            wrapper,
+                            sample,
+                            str(onnx_path),
+                            dynamo=False,
+                            **call_kwargs,
+                        )
+                    else:
+                        torch.onnx.export(
+                            wrapper,
+                            sample,
+                            str(onnx_path),
+                            **call_kwargs,
+                        )
 
         supports_dynamo = bool(
             "dynamo" in inspect.signature(torch.onnx.export).parameters
@@ -610,24 +642,19 @@ class _OnnxLayer:
                             dyn_kwargs = dict(base_kwargs)
                             if dynamic_shapes is not None:
                                 dyn_kwargs["dynamic_shapes"] = dynamic_shapes
-                            torch.onnx.export(
-                                wrapper,
-                                sample,
-                                str(onnx_path),
-                                dynamo=True,
-                                **dyn_kwargs,
+                            _onnx_export(
+                                use_dynamo=True,
+                                call_kwargs=dyn_kwargs,
                             )
                         else:
-                            torch.onnx.export(
-                                wrapper,
-                                sample,
-                                str(onnx_path),
-                                dynamo=False,
-                                **base_kwargs,
+                            _onnx_export(
+                                use_dynamo=False,
+                                call_kwargs=base_kwargs,
                             )
                     else:
-                        torch.onnx.export(
-                            wrapper, sample, str(onnx_path), **base_kwargs
+                        _onnx_export(
+                            use_dynamo=False,
+                            call_kwargs=base_kwargs,
                         )
                     if bool(simplify):
                         with contextlib.suppress(Exception):
@@ -1122,7 +1149,7 @@ class CoreML(Format):
         with _onnx_model(model) as serving_model:
             sample = _pad_sample(serving_model, kwargs.get("sample_input"))
             wrapper = _CompatLayer(serving_model).eval()
-            with inference_mode(wrapper):
+            with torch.no_grad():
                 scripted = torch.jit.trace(
                     wrapper,
                     sample,
@@ -1274,7 +1301,7 @@ class TorchScript(Format):
             if method == "trace":
                 if sample is None:
                     sample = _pad_sample(serving_model, None)
-                with inference_mode(wrapper):
+                with torch.no_grad():
                     scripted = torch.jit.trace(
                         wrapper,
                         sample,
@@ -1283,7 +1310,7 @@ class TorchScript(Format):
                     )
             else:
                 try:
-                    with inference_mode(wrapper):
+                    with torch.no_grad():
                         scripted = torch.jit.script(wrapper)
                 except Exception as exc:
                     if sample is None:
@@ -1292,7 +1319,7 @@ class TorchScript(Format):
                         f"TorchScript scripting failed ({type(exc).__name__}: {exc}); falling back to tracing.",
                         RuntimeWarning,
                     )
-                    with inference_mode(wrapper):
+                    with torch.no_grad():
                         scripted = torch.jit.trace(
                             wrapper,
                             sample,
@@ -1339,7 +1366,7 @@ class ExecuTorch(Format):
             sample = kwargs.get("sample_input")
             sample = _pad_sample(serving_model, sample)
             wrapper = _CompatLayer(serving_model).eval()
-            with inference_mode(wrapper):
+            with torch.no_grad():
                 try:
                     exported = torch_export(wrapper, (sample,))
                 except Exception as exc:

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import contextlib
+import io
 import logging
 import math
 import threading
@@ -70,25 +71,12 @@ from .layers import (
     SigmoidGate,
 )
 
-try:
-    from torchao.quantization.quant_api import (
-        Int8DynamicActivationInt8WeightConfig as _Int8DynamicActivationInt8WeightConfig,
-        Int8WeightOnlyConfig as _Int8WeightOnlyConfig,
-        quantize_,
-    )
-
-    try:
-        from torchao.quantization import quant_primitives
-    except Exception:
-        quant_primitives = None
-    _qp = quant_primitives
-    _PTQ_IMPL = quantize_
-except Exception:
-    _Int8DynamicActivationInt8WeightConfig = None
-    _Int8WeightOnlyConfig = None
-    _PTQ_IMPL = None
-    _qp = None
-
+_Int8DynamicActivationInt8WeightConfig = None
+_Int8WeightOnlyConfig = None
+_PTQ_IMPL = None
+_qp = None
+_TORCHAO_IMPORT_TRIED = False
+_TORCHAO_IMPORT_LOCK = threading.Lock()
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -96,6 +84,39 @@ _Int8DynamicActivationInt8WeightConfig: Any | None
 _Int8WeightOnlyConfig: Any | None
 
 _PTQ_IMPL: Callable[..., tuple[nn.Module, bool, str]] | None
+
+
+def _import_torchao_quantization() -> None:
+    global _Int8DynamicActivationInt8WeightConfig
+    global _Int8WeightOnlyConfig
+    global _PTQ_IMPL
+    global _qp
+    global _TORCHAO_IMPORT_TRIED
+    if _TORCHAO_IMPORT_TRIED:
+        return
+    with _TORCHAO_IMPORT_LOCK:
+        if _TORCHAO_IMPORT_TRIED:
+            return
+        _TORCHAO_IMPORT_TRIED = True
+        buf = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
+                from torchao.quantization.quant_api import (
+                    Int8DynamicActivationInt8WeightConfig as _Int8DynamicActivationInt8WeightConfig,
+                    Int8WeightOnlyConfig as _Int8WeightOnlyConfig,
+                    quantize_ as _quantize_,
+                )
+                try:
+                    from torchao.quantization import quant_primitives as _quant_primitives
+                except Exception:
+                    _quant_primitives = None
+            _PTQ_IMPL = _quantize_
+            _qp = _quant_primitives
+        except Exception:
+            _Int8DynamicActivationInt8WeightConfig = None
+            _Int8WeightOnlyConfig = None
+            _PTQ_IMPL = None
+            _qp = None
 
 
 def _prod_int(shape: Sequence[int]) -> int:
@@ -732,7 +753,7 @@ class TokenCollector(nn.Module):
         with self._runtime_lock:
             mb_cur = int(self.microbatch) if self.microbatch else B
         mb = max(1, min(B, mb_cur))
-        infer_mode = not torch.is_grad_enabled()
+        infer_mode = (not torch.is_grad_enabled()) and (not is_export_or_trace())
         controller_ctx = (
             inference_mode(self.backbone) if infer_mode else contextlib.nullcontext()
         )
@@ -1935,7 +1956,7 @@ class Model(nn.Module):
         if not isinstance(return_aux, bool):
             raise TypeError("return_aux must be a bool")
         grad_enabled = torch.is_grad_enabled()
-        infer_mode = not grad_enabled
+        infer_mode = (not grad_enabled) and (not is_export_or_trace())
         sanitize_enabled = bool(sanitize_nan)
         sanitize_inplace = bool(sanitize_enabled and infer_mode)
         td_input: TensorDictBase | None = None
@@ -3371,10 +3392,12 @@ class LossWeightPolicy(Protocol):
 class Quantization:
     @staticmethod
     def is_qat_available() -> bool:
+        _import_torchao_quantization()
         return bool(_qp is not None)
 
     @staticmethod
     def is_ptq_available() -> bool:
+        _import_torchao_quantization()
         return bool(
             _PTQ_IMPL is not None and _Int8DynamicActivationInt8WeightConfig is not None
         )
@@ -3388,6 +3411,7 @@ class Quantization:
         logger: Optional[Callable[[str], None]] = None,
         **kwargs: Any,
     ) -> Any:
+        _import_torchao_quantization()
         if _qp is None:
             raise RuntimeError("torchao.quantization.quant_primitives unavailable")
         _log_debug(
@@ -3421,6 +3445,7 @@ class Quantization:
         logger: Optional[Callable[[str], None]] = None,
         **kwargs: Any,
     ) -> tuple[nn.Module, bool, str]:
+        _import_torchao_quantization()
         if _PTQ_IMPL is None:
             return _is_ptq_unavailable(model)
         if _Int8DynamicActivationInt8WeightConfig is None:

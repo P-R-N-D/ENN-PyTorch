@@ -319,7 +319,8 @@ def is_nvidia_te_available(model: torch.nn.Module) -> bool:
 
 def inference_mode(model: torch.nn.Module) -> AbstractContextManager[None]:
     if (
-        is_nvidia_te_available(model)
+        is_export_or_trace()
+        or is_nvidia_te_available(model)
         or _is_compiled_for_inference(model)
         or _is_aot_autograd_enabled(model)
     ):

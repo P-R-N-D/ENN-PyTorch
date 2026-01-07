@@ -2196,16 +2196,14 @@ class Scaler(nn.Module):
                 if self.pw_x.numel() > 0 and self.pw_y.numel() > 0:
                     return self._piecewise(z_raw)
                 return z_raw
-            case "affine" | "none":
-                if self.affine_a.numel() > 0:
-                    return self.affine(z_raw)
+            case "affine":
+                return self.affine(z_raw)
+            case "none":
                 return z_raw
             case _:
                 return z_raw
 
     def affine(self, z_raw: torch.Tensor) -> torch.Tensor:
-        if self.affine_a.numel() == 0:
-            return z_raw
         a = self.affine_a.to(device=z_raw.device, dtype=z_raw.dtype)
         b = self.affine_b.to(device=z_raw.device, dtype=z_raw.dtype)
         return z_raw * a + b

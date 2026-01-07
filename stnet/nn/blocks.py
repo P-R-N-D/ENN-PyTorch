@@ -286,7 +286,7 @@ class RetNet(nn.Module):
         state: Optional[dict] = None,
         mode: Optional[str] = None,
     ) -> Tuple[torch.Tensor, Optional[dict]]:
-        if is_meta_or_fake_tensor(x):
+        if is_meta_or_fake_tensor(x) and (not is_export_or_trace()):
             raise RuntimeError("meta/fake tensor reached RetNet.forward")
         x = x.contiguous()
         if causal_mask is not None:
