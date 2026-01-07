@@ -256,7 +256,13 @@ def is_tracing_or_exporting() -> bool:
 
 
 def is_export_or_trace() -> bool:
-    return bool(is_compiling() or is_tracing_or_exporting())
+    if torch.jit.is_tracing() or torch.jit.is_scripting():
+        return True
+    with suppress(Exception):
+        comp = getattr(torch, "compiler", None)
+        if comp is not None and bool(getattr(comp, "is_compiling", lambda: False)()):
+            return True
+    return False
 
 
 def canonicalize_compile_mode(mode: object | None) -> str:
@@ -815,25 +821,13 @@ def coerce_checkpoint(
 ) -> Any:
     if _torch_checkpoint is None:
         return fn(*args)
-    for t in args:
-        if isinstance(t, torch.Tensor) and t.requires_grad:
-            return _torch_checkpoint(fn, *args, **ckpt_kwargs)
-    base = next(
-        (
-            t
-            for t in args
-            if isinstance(t, torch.Tensor) and (t.is_floating_point() or t.is_complex())
-        ),
-        None,
-    )
-    if base is None:
-        return fn(*args)
-    try:
-        dummy = base.new_zeros((), requires_grad=True)
-    except Exception:
+    if is_export_or_trace() or not any(isinstance(a, torch.Tensor) and a.requires_grad for a in args):
         return fn(*args)
 
-    def _fn_with_dummy(*inps: Any) -> Any:
-        return fn(*inps[:-1])
-
-    return _torch_checkpoint(_fn_with_dummy, *args, dummy, **ckpt_kwargs)
+    use_reentrant = ckpt_kwargs.pop("use_reentrant", None)
+    preserve_rng_state = ckpt_kwargs.pop("preserve_rng_state", None)
+    ck_opts = {k: v for k, v in [("use_reentrant", use_reentrant), ("preserve_rng_state", preserve_rng_state)] if v is not None}
+    for opts in [ck_opts, {k: v for k, v in ck_opts.items() if k != "use_reentrant"}, {}]:
+        with suppress(TypeError):
+            return _torch_checkpoint(fn, *args, **opts, **ckpt_kwargs)
+    return _torch_checkpoint(fn, *args, **ckpt_kwargs)
