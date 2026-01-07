@@ -97,34 +97,34 @@ def _flatten_attn_mask(
             )
         if a == L:
             m = mask.to(device=device).view(1, 1, L, S)
-            return m, 1, 1, int(L)
+            return m, 1, 1, L
         if a == 1:
             m = mask.to(device=device).view(1, 1, 1, S)
             return m, 1, 1, 1
-        if a == int(B):
+        if a == B:
             m = mask.to(device=device).view(B, 1, 1, S)
-            return m, int(B), 1, 1
+            return m, B, 1, 1
         raise RuntimeError(
             f"unsupported 2D attn_mask shape {tuple(mask.shape)} for (B={int(B)}, L={int(L)}, S={int(S)})"
         )
     if mask.dim() == 3:
-        a, b, c = int(mask.shape[0]), int(mask.shape[1]), int(mask.shape[2])
-        if c != int(S):
+        a, b, c = mask.shape
+        if c != S:
             raise RuntimeError(
                 f"attn_mask trailing dim {c} does not match expected S={int(S)}"
             )
-        if (a == int(B)) and (b == int(L)):
-            m = mask.to(device=device).view(int(B), 1, int(L), int(S))
-            return m, int(B), 1, int(L)
-        if (a == int(B)) and (b == 1):
+        if (a == B) and (b == L):
+            m = mask.to(device=device).view(B, 1, L, S)
+            return m, B, 1, L
+        if (a == B) and (b == 1):
             m = mask.to(device=device).view(B, 1, 1, S)
-            return m, int(B), 1, 1
-        if (a == int(H)) and (b == int(L)):
-            m = mask.to(device=device).view(1, int(H), int(L), int(S))
-            return m, 1, int(H), int(L)
-        if (a == int(B)) and (b == int(H)):
-            m = mask.to(device=device).view(int(B), int(H), 1, int(S))
-            return m, int(B), int(H), 1
+            return m, B, 1, 1
+        if (a == H) and (b == L):
+            m = mask.to(device=device).view(1, H, L, S)
+            return m, 1, H, L
+        if (a == B) and (b == H):
+            m = mask.to(device=device).view(B, H, 1, S)
+            return m, B, H, 1
         raise RuntimeError(
             f"unsupported 3D attn_mask shape {tuple(mask.shape)} for (B={int(B)}, H={int(H)}, L={int(L)}, S={int(S)})"
         )
@@ -796,7 +796,7 @@ class MultiScaleRetention(nn.Module):
         H = int(self.nhead)
         calc_dtype = dtype if dtype in (torch.float32, torch.float64) else torch.float32
         beta_param = getattr(self, "_beta", None)
-        if isinstance(beta_param, torch.Tensor) and int(beta_param.numel()) == int(H):
+        if isinstance(beta_param, torch.Tensor) and beta_param.numel() == H:
             beta_h = beta_param.to(device=device, dtype=calc_dtype)
         else:
             heads = torch.arange(H, device=device, dtype=calc_dtype)
