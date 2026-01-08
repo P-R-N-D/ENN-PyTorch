@@ -14,7 +14,7 @@ import torch.nn.functional as F
 from ..core.casting import env_bool, env_int
 from ..core.compat import StochasticDepth
 from ..core.system import empty_device_cache, is_oom_error
-from ..core.graph import coerce_checkpoint, torch_compiler_disable, is_symbolic
+from ..core.graph import coerce_checkpoint, torch_compiler_disable, is_symbolic, is_checkpoint
 from .kernels import DotProductAttention, MultiHeadAttention, MultiScaleRetention
 
 _Norm = nn.LayerNorm
@@ -31,6 +31,8 @@ except Exception:
 
 if env_bool("STNET_DISABLE_FLEX_ATTENTION", False):
     _HAS_FLEX_ATTENTION = False
+
+_GATE_STATS_CKPT_FWD = env_bool("STNET_GATE_STATS_CKPT_FWD", False)
 
 _FLEX_ATTENTION_KWARGS: set[str] = set()
 if _HAS_FLEX_ATTENTION and flex_attention is not None:
@@ -1348,6 +1350,10 @@ class SigmoidGate(nn.Module):
             self._fb_edge_high_sum.zero_()
             return stats
 
+    @torch.no_grad()
+    def consume_fallback_stats(self) -> torch.Tensor:
+        return self.consume_fallback_tensor_stats()
+
     @torch_compiler_disable(reason="SigmoidGate fallback stats update", recursive=False)
     def _fb_add_stats(
         self,
@@ -1588,7 +1594,14 @@ class SigmoidGate(nn.Module):
             max=float(p_ceil) - clip,
         )
 
-        if bool(fallback_bounds):
+        if (
+            bool(fallback_bounds)
+            and self.training
+            and (
+                (not is_checkpoint() and torch.is_grad_enabled())
+                or (_GATE_STATS_CKPT_FWD and is_checkpoint() and (not torch.is_grad_enabled()))
+            )
+        ):
             self._update_stats(
                 p_tile,
                 p_low,
@@ -1753,7 +1766,18 @@ class SigmoidGate(nn.Module):
                 else float(self.p_floor),
                 max=float(self.p_ceil) - clip,
             )
-            if bool(fallback_bounds):
+            if (
+                bool(fallback_bounds)
+                and self.training
+                and (
+                    (not is_checkpoint() and torch.is_grad_enabled())
+                    or (
+                        _GATE_STATS_CKPT_FWD
+                        and is_checkpoint()
+                        and (not torch.is_grad_enabled())
+                    )
+                )
+            ):
                 self._update_stats(
                     p,
                     p_low,

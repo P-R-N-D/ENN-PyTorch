@@ -26,6 +26,10 @@ import torch
 import torch.distributed
 import torch.nn as nn
 from tensordict import TensorDictBase
+try:
+    from tensordict.nn import CudaGraphModule as TD_CudaGraphModule
+except Exception:
+    TD_CudaGraphModule = None
 from torch.distributed.checkpoint import FileSystemReader, FileSystemWriter, load, save
 from torch.distributed.checkpoint.state_dict import (
     StateDictOptions,
@@ -3530,6 +3534,13 @@ def infer(
     module_eval = run_model.module if hasattr(run_model, "module") else run_model
     distributed_sync(module_eval, device=device)
     cg_enabled = bool(dev_type == "cuda" and getattr(module_eval, "_compile_cudagraphs", False))
+    td_cg_candidate = bool(
+        (not cg_enabled)
+        and dev_type == "cuda"
+        and (TD_CudaGraphModule is not None)
+        and bool(getattr(torch.cuda, "is_available", lambda: False)())
+        and hasattr(torch.cuda, "CUDAGraph")
+    )
     non_blocking_ok = bool(dev_type in ("cuda", "xpu"))
     pinned_ok = bool(is_pin_supported(dev_type))
     backend = accelerator_type(dev_type)
@@ -3609,6 +3620,72 @@ def infer(
     )
     try:
         with inference_mode(run_model), Autocast.float(device):
+            def _td_predict(x: torch.Tensor) -> torch.Tensor:
+                out = run_model(x, calibrate_output=True, return_loss=False)
+                if isinstance(out, tuple):
+                    out = out[0]
+                if not isinstance(out, torch.Tensor):
+                    raise RuntimeError("infer: unexpected model output type")
+                return out.detach()
+
+            td_cg_active = False
+            td_cg_disabled = not bool(td_cg_candidate)
+            td_cg_mb = None
+            td_cg_mod = None
+            td_cg_pad_buf = None
+            td_cg_seen = 0
+            td_cg_max_bs = 0
+            td_cg_target = None
+            td_cg_x_inner_shape = None
+
+            def _td_benchmark(bs_now: int) -> int:
+                mb_cfg = int(getattr(model, "microbatch", 0) or 0)
+                dl_bs = int(getattr(data_loader, "batch_size", 0) or 0)
+                mb_target = int(mb_cfg) if int(mb_cfg) > 0 else (int(dl_bs) if int(dl_bs) > 0 else int(bs_now))
+                if int(dl_bs) > 0:
+                    mb_target = min(int(mb_target), int(dl_bs))
+                return int(max(1, int(mb_target)))
+
+            def _td_cudagraph(bs_now: int, X_now: torch.Tensor) -> None:
+                nonlocal td_cg_active, td_cg_disabled, td_cg_mb, td_cg_mod
+                nonlocal td_cg_pad_buf, td_cg_seen, td_cg_max_bs, td_cg_target, td_cg_x_inner_shape
+                if td_cg_disabled or td_cg_active or (TD_CudaGraphModule is None) or (td_cg_mod is not None):
+                    return
+                td_cg_seen += 1
+                td_cg_max_bs = max(int(td_cg_max_bs), int(bs_now))
+                if td_cg_target is None:
+                    td_cg_target = _td_benchmark(int(bs_now))
+                mb_cap = None
+                if int(bs_now) >= int(td_cg_target):
+                    mb_cap = int(td_cg_target)
+                elif int(td_cg_seen) >= 4 and int(td_cg_max_bs) > 0:
+                    mb_cap = int(min(int(td_cg_target), int(td_cg_max_bs)))
+                if mb_cap is None:
+                    return
+                mb_cap = int(max(1, int(mb_cap)))
+                td_cg_x_inner_shape = tuple(int(d) for d in tuple(X_now.shape[1:]))
+                td_cg_mb = int(mb_cap)
+                td_cg_pad_buf = X_now.new_empty((int(td_cg_mb),) + tuple(td_cg_x_inner_shape))
+                td_cg_mod = TD_CudaGraphModule(_td_predict, warmup=2, device=device)
+                n0 = int(min(int(bs_now), int(td_cg_mb)))
+                td_cg_pad_buf[:n0].copy_(X_now[:n0])
+                if n0 < int(td_cg_mb):
+                    td_cg_pad_buf[n0:].copy_(
+                        X_now[n0 - 1 : n0].expand(int(td_cg_mb) - n0, *tuple(td_cg_x_inner_shape))
+                    )
+                try:
+                    for _ in range(3):
+                        _ = td_cg_mod(td_cg_pad_buf)
+                    td_cg_active = True
+                    with contextlib.suppress(Exception):
+                        setattr(model, "microbatch", int(td_cg_mb))
+                except Exception:
+                    td_cg_disabled = True
+                    td_cg_active = False
+                    td_cg_mb = None
+                    td_cg_mod = None
+                    td_cg_pad_buf = None
+                    td_cg_x_inner_shape = None
             row_ids_buf = None
             for batch in data_loader:
                 if batch is None:
@@ -3642,6 +3719,8 @@ def infer(
                     if status_bar is not None:
                         status_bar.update(1)
                     continue
+                if (not td_cg_disabled) and (not td_cg_active):
+                    _td_cudagraph(int(bs), X)
                 if row_ids is None:
                     if row_ids_buf is None or int(row_ids_buf.numel()) < bs:
                         row_ids_buf = torch.empty((bs,), device="cpu", dtype=torch.int64)
@@ -3666,10 +3745,25 @@ def infer(
                 row_cursor += bs
                 if row_ids.device.type != "cpu":
                     row_ids = row_ids.to(device="cpu")
-                mb = int(getattr(model, "microbatch", 0) or 0)
-                if mb <= 0:
-                    mb = bs
-                mb = max(1, min(bs, mb))
+                mb_cfg = int(getattr(model, "microbatch", 0) or 0)
+                if mb_cfg <= 0:
+                    mb_eager = bs
+                else:
+                    mb_eager = min(bs, int(mb_cfg))
+                mb_eager = max(1, int(mb_eager))
+
+                use_td_cg = bool(td_cg_active and (td_cg_mod is not None) and (td_cg_mb is not None))
+                if use_td_cg and (td_cg_x_inner_shape is not None):
+                    if tuple(int(d) for d in tuple(X.shape[1:])) != tuple(td_cg_x_inner_shape):
+                        td_cg_active = False
+                        td_cg_disabled = True
+                        td_cg_mb = None
+                        td_cg_mod = None
+                        td_cg_pad_buf = None
+                        td_cg_x_inner_shape = None
+                        use_td_cg = False
+                mb = int(td_cg_mb) if use_td_cg else int(mb_eager)
+                predict_fn = td_cg_mod if use_td_cg else _td_predict
                 start = 0
                 while start < bs:
                     end = min(bs, start + mb)
@@ -3680,13 +3774,21 @@ def infer(
                     Xi_pad = None
                     pad_n = 0
                     Xi_run = Xi
-                    if cg_enabled and n_i < mb:
+                    if (cg_enabled or use_td_cg) and n_i < mb:
                         pad_n = int(mb - n_i)
                         try:
-                            Xi_pad = Xi.new_empty((int(mb),) + tuple(Xi.shape[1:]))
-                            Xi_pad[:n_i].copy_(Xi)
-                            Xi_pad[n_i:].copy_(Xi[-1:].expand(pad_n, *tuple(Xi.shape[1:])))
-                            Xi_run = Xi_pad
+                            if use_td_cg and (td_cg_pad_buf is not None) and (td_cg_x_inner_shape is not None):
+                                if tuple(int(d) for d in tuple(Xi.shape[1:])) != tuple(td_cg_x_inner_shape):
+                                    raise RuntimeError("infer: input shape changed during td-cudagraph run")
+                                Xi_pad = td_cg_pad_buf
+                                Xi_pad[:n_i].copy_(Xi)
+                                Xi_pad[n_i:].copy_(Xi[-1:].expand(pad_n, *tuple(Xi.shape[1:])))
+                                Xi_run = Xi_pad
+                            else:
+                                Xi_pad = Xi.new_empty((int(mb),) + tuple(Xi.shape[1:]))
+                                Xi_pad[:n_i].copy_(Xi)
+                                Xi_pad[n_i:].copy_(Xi[-1:].expand(pad_n, *tuple(Xi.shape[1:])))
+                                Xi_run = Xi_pad
                         except Exception:
                             Xi_pad = None
                             pad_n = 0
@@ -3694,7 +3796,7 @@ def infer(
                     try:
                         if cg_enabled:
                             cudagraph_mark_step_begin()
-                        out = run_model(Xi_run, calibrate_output=True, return_loss=False)
+                        out = predict_fn(Xi_run)
                     except RuntimeError as e:
                         if is_oom_error(e) and mb > 1:
                             with contextlib.suppress(Exception):
@@ -3706,23 +3808,28 @@ def infer(
                                 pass
                             with contextlib.suppress(Exception):
                                 del Xi, Xi_pad
+                            if td_cg_active:
+                                td_cg_active = False
+                                td_cg_disabled = True
+                                td_cg_mb = None
+                                td_cg_mod = None
+                                td_cg_pad_buf = None
+                                td_cg_x_inner_shape = None
+                                predict_fn = _td_predict
+                                use_td_cg = False
                             continue
                         raise
                     finally:
                         if cg_enabled:
                             cudagraph_mark_step_end()
-                    if isinstance(out, tuple):
-                        y_hat = out[0]
-                    else:
-                        y_hat = out
-                    if not isinstance(y_hat, torch.Tensor):
+                    preds = out
+                    if not isinstance(preds, torch.Tensor):
                         raise RuntimeError("infer: unexpected model output type")
-                    preds = y_hat.detach()
                     if pad_n > 0:
                         preds = preds[:n_i]
                     rows_cpu = rows_i if rows_i.device.type == "cpu" else rows_i.to(device="cpu")
                     writer.append(rows_cpu, preds)
-                    del Xi, Xi_pad, rows_i, out, y_hat, preds, rows_cpu
+                    del Xi, Xi_pad, rows_i, out, preds, rows_cpu
                     start = end
                 if torch_prof is not None:
                     torch_prof.step()

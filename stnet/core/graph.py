@@ -813,11 +813,28 @@ def from_checkpoint(model: nn.Module, *args: Any, step_total: int) -> None:
         setattr(inst, "_stnet_ckpt_pressure_min_bytes", 0)
 
 
+_CKPT_TL = threading.local()
+
+
+def is_checkpoint() -> bool:
+    return bool(getattr(_CKPT_TL, "depth", 0) or 0)
+
+
 @torch_compiler_disable(reason="torch.utils.checkpoint", recursive=False)
 def _checkpoint_call(fn, *args, **kwargs):
     if _torch_checkpoint is None:
         return fn(*args, **kwargs)
-    return _torch_checkpoint(fn, *args, **kwargs)
+    tl = _CKPT_TL
+
+    def _state(*a, **k):
+        depth = int(getattr(tl, "depth", 0) or 0)
+        setattr(tl, "depth", depth + 1)
+        try:
+            return fn(*a, **k)
+        finally:
+            setattr(tl, "depth", depth)
+
+    return _torch_checkpoint(_state, *args, **kwargs)
 
 
 def coerce_checkpoint(
