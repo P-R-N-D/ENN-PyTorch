@@ -620,13 +620,14 @@ class AdamW:
                 and getattr(meta, "scale_is_integral", None) is not False
             )
             if use_int:
-                def _scale_safe_int4(meta: Any) -> bool:
+                def _scale_safe_int(meta: Any, bits: int) -> bool:
                     if not getattr(meta, "has_scale", False):
                         return True
                     if getattr(meta, "has_nonfinite", False):
                         return False
                     if getattr(meta, "scale_is_integral", None) is False:
                         return False
+                    lo, hi = (-128.0, 127.0) if bits == 8 else (-8.0, 7.0)
                     if (mn := getattr(meta, "scale_min_value", None)) is not None and (
                         mx := getattr(meta, "scale_max_value", None)
                     ) is not None:
@@ -636,18 +637,18 @@ class AdamW:
                             return False
                         if not (math.isfinite(mn_f) and math.isfinite(mx_f)):
                             return False
-                        return mn_f >= -8.0 and mx_f <= 7.0
+                        return mn_f >= lo and mx_f <= hi
                     max_abs = getattr(meta, "scale_max_abs", None)
                     if max_abs is None:
-                        return True
+                        return False
                     try:
                         max_abs_f = float(abs(max_abs))
                     except Exception:
                         return False
-                    return math.isfinite(max_abs_f) and max_abs_f <= 7.0
+                    return math.isfinite(max_abs_f) and max_abs_f <= hi
 
-                safe_int8 = not getattr(meta, "has_scale", False) or is_scale_safe(torch.int8, meta)
-                safe_int4 = _scale_safe_int4(meta)
+                safe_int8 = _scale_safe_int(meta, 8)
+                safe_int4 = _scale_safe_int(meta, 4)
                 target_bits: Optional[int] = None
                 if quant_bits == 8:
                     if safe_int8:

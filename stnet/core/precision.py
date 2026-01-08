@@ -120,13 +120,24 @@ def _validate_dtype_safety(
 
     max_abs = getattr(meta, "scale_max_abs", None)
     if max_abs is None:
-        return True, "no-max-abs"
-    try:
-        max_abs_f = float(abs(max_abs))
-    except:
-        return False, "max-abs-not-float"
-    if not math.isfinite(max_abs_f):
-        return False, "max-abs-nonfinite"
+        mn = getattr(meta, "scale_min_value", None)
+        mx = getattr(meta, "scale_max_value", None)
+        if mn is None or mx is None:
+            return False, "no-scale-range"
+        try:
+            mn_f, mx_f = float(mn), float(mx)
+        except:
+            return False, "minmax-not-float"
+        if not (math.isfinite(mn_f) and math.isfinite(mx_f)):
+            return False, "minmax-nonfinite"
+        max_abs_f = max(abs(mn_f), abs(mx_f))
+    else:
+        try:
+            max_abs_f = float(abs(max_abs))
+        except:
+            return False, "max-abs-not-float"
+        if not math.isfinite(max_abs_f):
+            return False, "max-abs-nonfinite"
 
     action = normalize_underflow_action(
         underflow_action or getattr(meta, "underflow_action", None),
