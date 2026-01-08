@@ -83,10 +83,10 @@ def _flatten_attn_mask(
         a, b = mask.shape
         if trace_like:
             torch._assert(mask.size(1) == S, "attn_mask S mismatch")
-            if isinstance(a, int) and isinstance(B, int) and a == B and not (
-                isinstance(L, int) and a == L
-            ):
-                return mask.view(B, 1, 1, S), B, 1, 1
+            torch._assert(
+                (mask.size(0) == 1) | (mask.size(0) == L),
+                "2D attn_mask must be (1,S) or (L,S) under symbolic shapes",
+            )
             out = mask.view(1, 1, a, S).expand(1, 1, L, S)
             return out, 1, 1, L
         if b != S:
