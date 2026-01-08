@@ -26,10 +26,6 @@ import torch
 import torch.distributed
 import torch.nn as nn
 from tensordict import TensorDictBase
-try:
-    from tensordict.nn import CudaGraphModule as TD_CudaGraphModule
-except Exception:
-    TD_CudaGraphModule = None
 from torch.distributed.checkpoint import FileSystemReader, FileSystemWriter, load, save
 from torch.distributed.checkpoint.state_dict import (
     StateDictOptions,
@@ -133,6 +129,11 @@ except Exception:
         from torch.distributed.fsdp import MixedPrecisionPolicy
     except Exception:
         MixedPrecisionPolicy = None
+
+try:
+    from tensordict.nn import CudaGraphModule as TD_CudaGraphModule
+except Exception:
+    TD_CudaGraphModule = None
 
 
 MB_DIV = 1024.0 * 1024.0
