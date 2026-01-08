@@ -114,10 +114,7 @@ def build_dataset(xlsx_path: str) -> Dict[str, Any]:
         raise RuntimeError("No valid sheets found in workbook")
     long_df = pd.concat(frames, axis=0, ignore_index=True)
     long_df["시간"] = (
-        long_df["시간"]
-        .astype(str)
-        .str.replace(HOUR_SUFFIX, "", regex=False)
-        .astype(int)
+        long_df["시간"].astype(str).str.replace(HOUR_SUFFIX, "", regex=False).astype(int)
     )
     long_df["지표"] = long_df["지표"].astype(float)
     long_df["요일타입_id"] = long_df["일종"].map(DAY_MAP).astype(int)
@@ -137,15 +134,8 @@ def build_dataset(xlsx_path: str) -> Dict[str, Any]:
     S_orig = int(seg_meta.shape[0])
     T_orig = 24
     group_cols = ["월", "요일타입_id", "방향_id"]
-    groups_df = (
-        long_df[group_cols]
-        .drop_duplicates()
-        .sort_values(group_cols)
-        .reset_index(drop=True)
-    )
-    X_keys: List[Tuple[int, int, int]] = [
-        tuple(map(int, row)) for row in groups_df.to_numpy()
-    ]
+    groups_df = long_df[group_cols].drop_duplicates().sort_values(group_cols).reset_index(drop=True)
+    X_keys: List[Tuple[int, int, int]] = [tuple(map(int, row)) for row in groups_df.to_numpy()]
     B = len(X_keys)
     full_grid = groups_df.merge(seg_meta[["seg_idx"]], how="cross")
     pivot = (
@@ -166,9 +156,7 @@ def build_dataset(xlsx_path: str) -> Dict[str, Any]:
     )
     y_vals = y_full[list(range(T_orig))].to_numpy(dtype=np.float32)
     Y_np = y_vals.reshape(B, S_orig, T_orig)
-    row_map = (
-        long_df.groupby(group_cols + ["seg_idx"])["row_in_sheet"].min().reset_index()
-    )
+    row_map = long_df.groupby(group_cols + ["seg_idx"])["row_in_sheet"].min().reset_index()
     row_full = (
         full_grid.merge(row_map, on=group_cols + ["seg_idx"], how="left")
         .fillna(-1)
@@ -183,9 +171,7 @@ def build_dataset(xlsx_path: str) -> Dict[str, Any]:
     X_tensor = torch.tensor(X_keys, dtype=torch.float32)
     Y_tensor = torch.from_numpy(Y_pad)
     row_ids_tensor = torch.from_numpy(row_ids_pad)
-    td_train = TensorDict(
-        {"X": X_tensor, "Y": Y_tensor, "row_ids": row_ids_tensor}, batch_size=[B]
-    )
+    td_train = TensorDict({"X": X_tensor, "Y": Y_tensor, "row_ids": row_ids_tensor}, batch_size=[B])
     return {
         "td_train": td_train,
         "S": grid_dim,
@@ -262,9 +248,7 @@ def main():
     td_train = info["td_train"]
     S, T, B = info["S"], info["T"], info["B"]
     S_orig, T_orig = info["S_orig"], info["T_orig"]
-    print(
-        f"Dataset built: B={B} groups, S_orig={S_orig}, T_orig={T_orig}, padded_grid={S}x{T}"
-    )
+    print(f"Dataset built: B={B} groups, S_orig={S_orig}, T_orig={T_orig}, padded_grid={S}x{T}")
     print(
         f"td_train batch_size={td_train.batch_size}, X shape={tuple(td_train['X'].shape)}, Y shape={tuple(td_train['Y'].shape)}"
     )
@@ -290,9 +274,7 @@ def main():
         modeling_type="spatiotemporal",
         compile_mode="disabled",
     )
-    model = new_model(
-        in_dim=td_train["X"].shape[1], out_shape=(S, T), config=config
-    ).to(device)
+    model = new_model(in_dim=td_train["X"].shape[1], out_shape=(S, T), config=config).to(device)
     train_epochs = 6
     print("[train] starting... (elastic_launch inside stnet.api.train)")
     trained_model, train_metrics = monitor_run(

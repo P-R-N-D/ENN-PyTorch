@@ -12,12 +12,16 @@ from torch import nn
 from .graph import compile_distributed_safe
 
 try:
-    import torchdistx.fake; _tdx_is_fake = getattr(torchdistx.fake, "is_fake", None)
-except: _tdx_is_fake = None
+    import torchdistx.fake
+
+    _tdx_is_fake = getattr(torchdistx.fake, "is_fake", None)
+except:
+    _tdx_is_fake = None
 
 try:
     from torch._subclasses.fake_tensor import FakeTensor
-except: FakeTensor = tuple()
+except:
+    FakeTensor = tuple()
 
 _PATCH_LOCK = threading.RLock()
 _TORCH_COMPAT: TorchCompat | None = None
@@ -29,6 +33,7 @@ def _fmin_impl(tm, a, b):
     an, bn = tm.isnan(a), tm.isnan(b)
     return tm.where(an & ~bn, b, tm.where(bn & ~an, a, tm.minimum(a, b)))
 
+
 def _nan_mm_impl(tm, x, dim, keepdim, op, fill):
     if isinstance(x, torch.Tensor) and not tm.is_floating_point(x):
         return getattr(x, op)(**({"dim": dim, "keepdim": keepdim} if dim is not None else {}))
@@ -39,35 +44,65 @@ def _nan_mm_impl(tm, x, dim, keepdim, op, fill):
         return tm.where(mask.any(), res, tm.full_like(res, float("nan")))
     val, idx = getattr(xp, op)(dim=dim, keepdim=keepdim)
     valid = mask.any(dim=dim, keepdim=keepdim)
-    return tm.where(valid, val, tm.full_like(val, float("nan"))), tm.where(valid, idx, tm.zeros_like(idx))
+    return tm.where(valid, val, tm.full_like(val, float("nan"))), tm.where(
+        valid, idx, tm.zeros_like(idx)
+    )
 
-def _nanmin_impl(tm, x, dim=None, keepdim=False): return _nan_mm_impl(tm, x, dim, keepdim, "min", "inf")
-def _nanmax_impl(tm, x, dim=None, keepdim=False): return _nan_mm_impl(tm, x, dim, keepdim, "max", "-inf")
+
+def _nanmin_impl(tm, x, dim=None, keepdim=False):
+    return _nan_mm_impl(tm, x, dim, keepdim, "min", "inf")
+
+
+def _nanmax_impl(tm, x, dim=None, keepdim=False):
+    return _nan_mm_impl(tm, x, dim, keepdim, "max", "-inf")
+
 
 def _nansum_impl(tm, x, dim=None, keepdim=False, *args, dtype=None, **kwargs):
     if dtype and not isinstance(dtype, torch.dtype):
-        with suppress(Exception): dtype = getattr(torch, str(dtype).split(".")[-1], None)
+        with suppress(Exception):
+            dtype = getattr(torch, str(dtype).split(".")[-1], None)
     x_cast = x.to(dtype) if dtype is not None else x
-    if isinstance(x_cast, torch.Tensor) and not tm.is_floating_point(x_cast): return tm.sum(x_cast, dim=dim, keepdim=keepdim, **kwargs)
+    if isinstance(x_cast, torch.Tensor) and not tm.is_floating_point(x_cast):
+        return tm.sum(x_cast, dim=dim, keepdim=keepdim, **kwargs)
     if callable(n2n := getattr(tm, "nan_to_num", None)):
-        with suppress(Exception): return tm.sum(n2n(x_cast, nan=0.0, posinf=0.0, neginf=0.0), dim=dim, keepdim=keepdim, **kwargs)
-    return tm.sum(tm.where(tm.isfinite(x_cast), x_cast, tm.zeros((), device=x_cast.device, dtype=x_cast.dtype)), dim=dim, keepdim=keepdim, **kwargs)
+        with suppress(Exception):
+            return tm.sum(
+                n2n(x_cast, nan=0.0, posinf=0.0, neginf=0.0), dim=dim, keepdim=keepdim, **kwargs
+            )
+    return tm.sum(
+        tm.where(
+            tm.isfinite(x_cast), x_cast, tm.zeros((), device=x_cast.device, dtype=x_cast.dtype)
+        ),
+        dim=dim,
+        keepdim=keepdim,
+        **kwargs,
+    )
+
 
 def is_fake_tensor(value: Any) -> bool:
-    if not isinstance(value, torch.Tensor): return False
-    if _tdx_is_fake and (res := _tdx_is_fake(value)): return bool(res)
+    if not isinstance(value, torch.Tensor):
+        return False
+    if _tdx_is_fake and (res := _tdx_is_fake(value)):
+        return bool(res)
     return isinstance(value, FakeTensor) or getattr(value, "fake_mode", None) is not None
+
 
 def is_meta_tensor(value: Any) -> bool:
     return isinstance(value, torch.Tensor) and getattr(value, "is_meta", False)
 
+
 def is_meta_or_fake_tensor(value: Any) -> bool:
     return is_meta_tensor(value) or is_fake_tensor(value)
+
 
 def torch_compat(module: Any | None = None, nn_module: Any | None = None) -> TorchCompat:
     global _TORCH_COMPAT
     with _PATCH_LOCK:
-        compat = TorchCompat(module=module, nn_module=nn_module) if _TORCH_COMPAT is None or module or nn_module else _TORCH_COMPAT
+        compat = (
+            TorchCompat(module=module, nn_module=nn_module)
+            if _TORCH_COMPAT is None or module or nn_module
+            else _TORCH_COMPAT
+        )
         compat.apply()
         _TORCH_COMPAT = compat
         return compat
@@ -89,9 +124,13 @@ class _StochasticDepthFallback(nn.Module):
         self.p, self.mode = float(p), str(mode)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if not self.training or self.p <= 0.0: return x
-        if (keep := 1.0 - self.p) <= 0.0: return torch.zeros_like(x)
-        shape = (x.shape[0],) + (1,) * (x.dim() - 1) if self.mode == "row" and x.dim() >= 2 else x.shape
+        if not self.training or self.p <= 0.0:
+            return x
+        if (keep := 1.0 - self.p) <= 0.0:
+            return torch.zeros_like(x)
+        shape = (
+            (x.shape[0],) + (1,) * (x.dim() - 1) if self.mode == "row" and x.dim() >= 2 else x.shape
+        )
         return x * x.new_empty(shape).bernoulli_(keep).div_(keep)
 
 
@@ -107,12 +146,19 @@ class TorchCompat:
     def apply(self) -> None:
         with _PATCH_LOCK:
             global RMSNorm
-            if not hasattr(self.nn_module, "RMSNorm"): setattr(self.nn_module, "RMSNorm", _RMSNormFallback)
+            if not hasattr(self.nn_module, "RMSNorm"):
+                setattr(self.nn_module, "RMSNorm", _RMSNormFallback)
             RMSNorm = getattr(self.nn_module, "RMSNorm", None)
 
-            patches = [("fmin", _fmin_impl), ("nanmin", _nanmin_impl), ("nanmax", _nanmax_impl), ("nansum", _nansum_impl)]
+            patches = [
+                ("fmin", _fmin_impl),
+                ("nanmin", _nanmin_impl),
+                ("nanmax", _nanmax_impl),
+                ("nansum", _nansum_impl),
+            ]
             for name, impl in patches:
-                if not hasattr(self.module, name): setattr(self.module, name, partial(impl, self.module))
+                if not hasattr(self.module, name):
+                    setattr(self.module, name, partial(impl, self.module))
             compile_distributed_safe()
 
 
@@ -125,5 +171,6 @@ except Exception:
     def sdpa_kernel(*backends: Any) -> Iterator[None]:
         _ = backends
         yield
+
 
 StochasticDepth = getattr(nn, "StochasticDepth", None) or _StochasticDepthFallback

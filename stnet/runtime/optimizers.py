@@ -79,11 +79,8 @@ def _log_optimizer(
     *args: Any,
     level: str = "info",
 ) -> None:
-    if (
-        logger is None
-        and not _LOGGER.isEnabledFor(
-            logging.DEBUG if str(level).lower() == "debug" else logging.INFO
-        )
+    if logger is None and not _LOGGER.isEnabledFor(
+        logging.DEBUG if str(level).lower() == "debug" else logging.INFO
     ):
         return
     key = key or ("opt", payload.get("mode"), payload.get("device"), payload.get("selected"))
@@ -113,10 +110,7 @@ def _get_expected_args(ctor: Any) -> Optional[frozenset[str]]:
         sig = inspect.signature(ctor)
         return (
             None
-            if any(
-                p.kind == inspect.Parameter.VAR_KEYWORD
-                for p in sig.parameters.values()
-            )
+            if any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values())
             else frozenset(sig.parameters.keys())
         )
     except Exception:
@@ -130,9 +124,7 @@ def _coerce_kwargs(ctor: Any, kwargs: Dict[str, Any]) -> Dict[str, Any]:
     if allowed is None:
         try:
             sig = inspect.signature(ctor)
-            if any(
-                p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()
-            ):
+            if any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()):
                 return dict(kwargs)
             allowed = frozenset(sig.parameters.keys())
         except Exception:
@@ -244,11 +236,7 @@ def _cpu_offload(
 
 
 def _safe_copy(dst: torch.Tensor, src: torch.Tensor) -> None:
-    if (
-        torch.is_tensor(dst)
-        and torch.is_tensor(src)
-        and dst.data_ptr() != src.data_ptr()
-    ):
+    if torch.is_tensor(dst) and torch.is_tensor(src) and dst.data_ptr() != src.data_ptr():
         with contextlib.suppress(Exception):
             dst.copy_(src)
             return
@@ -347,9 +335,7 @@ class ExponentialMovingAverage(nn.Module):
         self._step: int = 0
         self.metadata = metadata
         self.master_float, self.master_int = _master_cpu_dtypes(
-            torch.device(
-                Autocast.coerce_metadata(get_device(), metadata=metadata).device
-            ),
+            torch.device(Autocast.coerce_metadata(get_device(), metadata=metadata).device),
             metadata,
         )
         self.shadow: Dict[str, torch.Tensor] = {}
@@ -391,11 +377,7 @@ class ExponentialMovingAverage(nn.Module):
             if t.is_floating_point():
                 return self.master_float
             if t.is_complex():
-                return (
-                    torch.complex128
-                    if self.master_float == torch.float64
-                    else torch.complex64
-                )
+                return torch.complex128 if self.master_float == torch.float64 else torch.complex64
             return self.master_int
 
         def _update_dict(shadow_dict: Dict[Any, Any], source_dict: Dict[Any, Any]) -> None:
@@ -539,9 +521,7 @@ class _TensorDictCompat(nn.Module):
 class AdamW:
     @staticmethod
     def float(
-        model_or_params: Union[
-            nn.Module, Iterable[nn.Parameter], Sequence[Dict[str, Any]]
-        ],
+        model_or_params: Union[nn.Module, Iterable[nn.Parameter], Sequence[Dict[str, Any]]],
         lr: float,
         *args: Any,
         weight_decay: float = 0.0,
@@ -555,9 +535,7 @@ class AdamW:
 
     @staticmethod
     def integer(
-        model_or_params: Union[
-            nn.Module, Iterable[nn.Parameter], Sequence[Dict[str, Any]]
-        ],
+        model_or_params: Union[nn.Module, Iterable[nn.Parameter], Sequence[Dict[str, Any]]],
         lr: float,
         *args: Any,
         weight_decay: float = 0.0,
@@ -571,9 +549,7 @@ class AdamW:
 
     @staticmethod
     def _try_backends(
-        model_or_params: Union[
-            nn.Module, Iterable[nn.Parameter], Sequence[Dict[str, Any]]
-        ],
+        model_or_params: Union[nn.Module, Iterable[nn.Parameter], Sequence[Dict[str, Any]]],
         lr: float,
         weight_decay: float,
         metadata: Optional[Dataset[Any]],
@@ -637,13 +613,10 @@ class AdamW:
 
         if not selected_opt:
             quant_bits = getattr(meta, "int_quant_bits", None)
-            use_int = (
-                quant_bits in (4, 8)
-                or (
-                    mode == "integer"
-                    and getattr(meta, "has_scale", False)
-                    and getattr(meta, "scale_is_integral", None) is not False
-                )
+            use_int = quant_bits in (4, 8) or (
+                mode == "integer"
+                and getattr(meta, "has_scale", False)
+                and getattr(meta, "scale_is_integral", None) is not False
             )
             if use_int:
                 target_bits = (
@@ -705,9 +678,7 @@ class StochasticWeightAverage:
         **kwargs: Any,
     ) -> None:
         self._source = model
-        self._averaged = AveragedModel(
-            model, device=device, use_buffers=use_buffers, avg_fn=avg_fn
-        )
+        self._averaged = AveragedModel(model, device=device, use_buffers=use_buffers, avg_fn=avg_fn)
 
     @property
     def module(self) -> nn.Module:
@@ -720,9 +691,7 @@ class StochasticWeightAverage:
     def update_weight(self, model: Optional[nn.Module] = None) -> None:
         target = model if model is not None else self._source
         if target is None:
-            raise RuntimeError(
-                "StochasticWeightAverage was initialised without a source model"
-            )
+            raise RuntimeError("StochasticWeightAverage was initialised without a source model")
         with torch.no_grad():
             try:
                 self._averaged.update_parameters(target)

@@ -51,6 +51,7 @@ def _register_safe_globals():
     with contextlib.suppress(Exception):
         if add_safe_globals:
             from torch.torch_version import TorchVersion
+
             add_safe_globals([TorchVersion])
 
 
@@ -60,18 +61,14 @@ def _filtered_warnings(sentences: Sequence[str] | None = None) -> Iterator[None]
         _IGNORED_RE
         if sentences is None
         else (
-            r".*(?:" + "|".join(re.escape(str(s)) for s in sentences) + r").*"
-            if sentences
-            else ""
+            r".*(?:" + "|".join(re.escape(str(s)) for s in sentences) + r").*" if sentences else ""
         )
     )
     if not msg_re:
         yield
         return
     guard = _WARNINGS_FILTER_LOCK
-    if sys.version_info >= (3, 14) and getattr(
-        sys.flags, "context_aware_warnings", False
-    ):
+    if sys.version_info >= (3, 14) and getattr(sys.flags, "context_aware_warnings", False):
         guard = contextlib.nullcontext()
     with guard:
         with warnings.catch_warnings():
@@ -114,6 +111,7 @@ def _save_lock(path: PathLike | None = None) -> threading.RLock:
 def _dist_op(op_name: str) -> object:
     try:
         import torch.distributed as dist
+
         if dist.is_available() and dist.is_initialized():
             return getattr(dist, op_name)()
     except Exception:
@@ -130,9 +128,7 @@ def _dist_barrier() -> None:
 
 
 @contextlib.contextmanager
-def _save_sync(
-    path: PathLike | None = None, *args: Any, barrier: bool = False
-) -> None:
+def _save_sync(path: PathLike | None = None, *args: Any, barrier: bool = False) -> None:
     with _save_lock(path):
         if barrier:
             _dist_barrier()
@@ -146,6 +142,7 @@ def _save_sync(
 def _load_model_config(model: object) -> object:
     try:
         from ..config import _extract_model_config_dict
+
         return _extract_model_config_dict(model)
     except Exception:
         return {}
@@ -169,9 +166,7 @@ def _to_tensor(
         return t
     if isinstance(value, (list, tuple)):
         out = [
-            _to_tensor(
-                v, materialize_meta=materialize_meta, make_contiguous=make_contiguous
-            )
+            _to_tensor(v, materialize_meta=materialize_meta, make_contiguous=make_contiguous)
             for v in value
         ]
         return type(value)(*out) if hasattr(value, "_fields") else type(value)(out)
@@ -179,9 +174,7 @@ def _to_tensor(
         return type(value)(
             (
                 k,
-                _to_tensor(
-                    v, materialize_meta=materialize_meta, make_contiguous=make_contiguous
-                ),
+                _to_tensor(v, materialize_meta=materialize_meta, make_contiguous=make_contiguous),
             )
             for k, v in value.items()
         )
@@ -192,9 +185,7 @@ def _torch_load_checkpoint(
     path: PathLike, *args: Any, map_location: object = None, weights_only: bool = True
 ) -> object:
     try:
-        return torch.load(
-            str(path), map_location=map_location or "cpu", weights_only=weights_only
-        )
+        return torch.load(str(path), map_location=map_location or "cpu", weights_only=weights_only)
     except TypeError:
         return torch.load(str(path), map_location=map_location or "cpu")
     except Exception as exc:
@@ -232,16 +223,14 @@ def _onnx_model(model: object) -> None:
     with contextlib.suppress(Exception):
         for module in model.modules():
             for attr in ("logger", "history"):
-                if hasattr(module, attr) and isinstance(
-                    v := getattr(module, attr), Recorder
-                ):
+                if hasattr(module, attr) and isinstance(v := getattr(module, attr), Recorder):
                     with contextlib.suppress(Exception):
                         removed_sub.append((module, attr, v))
                         delattr(module, attr)
     try:
         with _temp_environ({"STNET_MSR_FORCE_TORCH": "1"}, only_if_unset=True):
             eager_ctx = getattr(model, "eager_for_export", None)
-            with (eager_ctx() if callable(eager_ctx) else contextlib.nullcontext()):
+            with eager_ctx() if callable(eager_ctx) else contextlib.nullcontext():
                 yield model
     finally:
         for module, attr, v in removed_sub:
@@ -309,14 +298,10 @@ def _forward(model: object, x: object) -> object:
 def _get_tensor_shape(model: object, sample_input: object) -> object:
     in_dim = int(getattr(model, "in_dim")) if hasattr(model, "in_dim") else None
     out_shape = (
-        tuple(int(x) for x in getattr(model, "out_shape"))
-        if hasattr(model, "out_shape")
-        else None
+        tuple(int(x) for x in getattr(model, "out_shape")) if hasattr(model, "out_shape") else None
     )
     if (in_dim is None or out_shape is None) and sample_input is not None:
-        dev = next(
-            (p.device for p in model.parameters() if p is not None), torch.device("cpu")
-        )
+        dev = next((p.device for p in model.parameters() if p is not None), torch.device("cpu"))
         sample = sample_input.to(dev)
         model.eval()
         with torch.no_grad():
@@ -336,9 +321,7 @@ def _pad_sample(model: object, sample_input: object) -> object:
     in_dim, _ = _get_tensor_shape(model, sample_input)
     param = next(model.parameters(), None)
     dtype, device = (
-        (param.dtype, param.device)
-        if param is not None
-        else (torch.float32, torch.device("cpu"))
+        (param.dtype, param.device) if param is not None else (torch.float32, torch.device("cpu"))
     )
     return torch.zeros(1, in_dim, dtype=dtype, device=device)
 
@@ -481,9 +464,7 @@ class _OnnxLayer:
         raise RuntimeError("ONNX export failed. " + "; ".join(errors[-6:]))
 
     @staticmethod
-    def coerce(
-        model: nn.Module, onnx_path: PathLike, *args: Any, **kwargs: Any
-    ) -> object:
+    def coerce(model: nn.Module, onnx_path: PathLike, *args: Any, **kwargs: Any) -> object:
         if not onnx_path.exists():
             return Exporter._OnnxLayer.export(model, onnx_path, **kwargs)
         return onnx_path
@@ -510,14 +491,11 @@ class _OrtLayer:
             "extended": ort.GraphOptimizationLevel.ORT_ENABLE_EXTENDED,
             "all": ort.GraphOptimizationLevel.ORT_ENABLE_ALL,
         }
-        level = opt_map.get(
-            optimization_level.lower(), ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-        )
+        level = opt_map.get(optimization_level.lower(), ort.GraphOptimizationLevel.ORT_ENABLE_ALL)
         platform = (target_platform or "").lower()
         disabled_optimizers = (
             ["NchwcTransformer"]
-            if level == ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-            and platform not in {"", "amd64"}
+            if level == ort.GraphOptimizationLevel.ORT_ENABLE_ALL and platform not in {"", "amd64"}
             else None
         )
         optimized_onnx_path = None
@@ -541,9 +519,7 @@ class _OrtLayer:
         so.graph_optimization_level = level
         so.add_session_config_entry("session.save_model_format", "ORT")
         if optimization_style.lower() == "runtime":
-            so.add_session_config_entry(
-                "optimization.minimal_build_optimizations", "save"
-            )
+            so.add_session_config_entry("optimization.minimal_build_optimizations", "save")
         ort.InferenceSession(
             str(onnx_path),
             sess_options=so,
@@ -556,9 +532,7 @@ class _OrtLayer:
 class Format(Protocol):
     name = None
 
-    def save(
-        self, model: nn.Module, dst: PathLike, *args: Any, **kwargs: Any
-    ) -> None: ...
+    def save(self, model: nn.Module, dst: PathLike, *args: Any, **kwargs: Any) -> None: ...
 
 
 class Builder:
@@ -578,6 +552,7 @@ class Builder:
         **opts: Any,
     ) -> object:
         p = Path(path)
+
         def _make_meta() -> dict[str, Any]:
             return {
                 "version": 1,
@@ -602,9 +577,7 @@ class Builder:
                     storage_writer=FileSystemWriter(str(p)),
                 )
                 if _is_rank0_global():
-                    write_json(
-                        p / "meta.json", {**_make_meta(), "format": "dcp-dir-v1"}, indent=2
-                    )
+                    write_json(p / "meta.json", {**_make_meta(), "format": "dcp-dir-v1"}, indent=2)
             return p
         if not p.suffix:
             p = p.with_suffix(".pt")
@@ -709,9 +682,7 @@ class Onnx(Format):
         **kwargs: Any,
     ) -> object:
         with _onnx_model(model) as serving:
-            out = Exporter._OnnxLayer.export(
-                serving, dst, **_onnx_options(kwargs, target="onnx")
-            )
+            out = Exporter._OnnxLayer.export(serving, dst, **_onnx_options(kwargs, target="onnx"))
         return (out,)
 
 
@@ -737,9 +708,7 @@ class Ort(Format):
                 optimization_level=str(kwargs.get("optimization_level", "all")),
                 optimization_style=str(kwargs.get("optimization_style", "fixed")),
                 target_platform=kwargs.get("target_platform"),
-                save_optimized_onnx_model=bool(
-                    kwargs.get("save_optimized_onnx_model", False)
-                ),
+                save_optimized_onnx_model=bool(kwargs.get("save_optimized_onnx_model", False)),
             )
         return (ort_path, optimized) if optimized is not None else (ort_path,)
 
@@ -768,16 +737,12 @@ class TensorRT(Format):
             trt_logger = trt.Logger(trt.Logger.WARNING)
             explicit_batch_flag = 0
             with contextlib.suppress(Exception):
-                explicit_batch_flag = 1 << int(
-                    trt.NetworkDefinitionCreationFlag.EXPLICIT_BATCH
-                )
+                explicit_batch_flag = 1 << int(trt.NetworkDefinitionCreationFlag.EXPLICIT_BATCH)
             with contextlib.ExitStack() as stack:
                 builder = stack.enter_context(trt.Builder(trt_logger))
                 create_network = getattr(builder, "create_network", None)
                 if not callable(create_network):
-                    raise RuntimeError(
-                        "TensorRT builder.create_network is not available."
-                    )
+                    raise RuntimeError("TensorRT builder.create_network is not available.")
                 try:
                     network = stack.enter_context(create_network(explicit_batch_flag))
                 except TypeError:
@@ -788,9 +753,7 @@ class TensorRT(Format):
 
                 workspace_size_bytes = int(kwargs.get("workspace_size_bytes", 1 << 30))
                 if hasattr(config, "set_memory_pool_limit"):
-                    config.set_memory_pool_limit(
-                        trt.MemoryPoolType.WORKSPACE, workspace_size_bytes
-                    )
+                    config.set_memory_pool_limit(trt.MemoryPoolType.WORKSPACE, workspace_size_bytes)
                 else:
                     config.max_workspace_size = workspace_size_bytes
                 with open(onnx_path, "rb") as handle:
@@ -878,9 +841,7 @@ class Nnef(Format):
 
                 importlib.import_module("nnef_tools.convert")
             except ImportError as exc:
-                raise ImportError(
-                    "nnef-tools[onnx] is required for this export."
-                ) from exc
+                raise ImportError("nnef-tools[onnx] is required for this export.") from exc
             input_shapes = kwargs.get("input_shapes")
             if input_shapes is None:
                 sample = _pad_sample(serving_model, kwargs.get("sample_input"))
@@ -1041,9 +1002,7 @@ class LiteRT(Format):
             with TemporaryDirectory() as tmpd:
                 saved_model_dir = Path(tmpd) / "saved_model"
                 prepare(model_onnx).export_graph(str(saved_model_dir))
-                converter = tf.lite.TFLiteConverter.from_saved_model(
-                    str(saved_model_dir)
-                )
+                converter = tf.lite.TFLiteConverter.from_saved_model(str(saved_model_dir))
                 if bool(kwargs.get("allow_fp16", False)):
                     converter.target_spec.supported_types = [tf.float16]
                     converter.optimizations = [tf.lite.Optimize.DEFAULT]
@@ -1055,9 +1014,7 @@ class LiteRT(Format):
                         )
                     converter.optimizations = [tf.lite.Optimize.DEFAULT]
                     converter.representative_dataset = rep_ds
-                    converter.target_spec.supported_ops = [
-                        tf.lite.OpsSet.TFLITE_BUILTINS_INT8
-                    ]
+                    converter.target_spec.supported_ops = [tf.lite.OpsSet.TFLITE_BUILTINS_INT8]
                     converter.inference_input_type = tf.int8
                     converter.inference_output_type = tf.int8
                 tflite_model = converter.convert()

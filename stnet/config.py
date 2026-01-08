@@ -197,8 +197,10 @@ def _coerce_weights_spec(
 
 
 def _is_source_spec(obj: Any) -> bool:
-    return isinstance(obj, Mapping) and isinstance(obj.get("format"), str) and isinstance(
-        obj.get("path"), (str, os.PathLike)
+    return (
+        isinstance(obj, Mapping)
+        and isinstance(obj.get("format"), str)
+        and isinstance(obj.get("path"), (str, os.PathLike))
     )
 
 
@@ -220,9 +222,7 @@ def _validate_out_shape_dims(out_shape: Tuple[int, ...]) -> Tuple[int, ...]:
     return out_shape
 
 
-def _coerce_device(
-    value: Any, *args: Any, name: str = "device"
-) -> Optional[torch.device]:
+def _coerce_device(value: Any, *args: Any, name: str = "device") -> Optional[torch.device]:
     if not value or (isinstance(value, str) and not value.strip()):
         return None
     if isinstance(value, torch.device):
@@ -255,9 +255,7 @@ def _validate_equal_dims(
 
 
 def _extract_model_config_dict(model: Any) -> Dict[str, Any]:
-    cfg_obj = getattr(model, "config", None) or getattr(
-        model, "__stnet_instance_config__", None
-    )
+    cfg_obj = getattr(model, "config", None) or getattr(model, "__stnet_instance_config__", None)
     if not cfg_obj:
         for submodule in model.modules():
             cfg_obj = getattr(submodule, "config", None) or getattr(
@@ -445,8 +443,7 @@ def coerce_model_config(config: ModelConfig | Dict[str, Any] | None) -> ModelCon
         p_gate_tile_shape = (raw_tile_shape,)
     elif isinstance(raw_tile_shape, (list, tuple)):
         p_gate_tile_shape = tuple(
-            _coerce_int(v, name="p_gate_tile_shape", minimum=1)
-            for v in raw_tile_shape
+            _coerce_int(v, name="p_gate_tile_shape", minimum=1) for v in raw_tile_shape
         )
     elif isinstance(raw_tile_shape, str):
         parts = [
@@ -757,9 +754,7 @@ class RuntimeConfig:
         "loss_skew",
     )
     PRED_POS_ORDER: ClassVar[Tuple[str, ...]] = ("seed",)
-    _COMMON_KEYS: ClassVar[frozenset[str]] = frozenset(
-        {"in_dim", "out_shape", "cfg_dict"}
-    )
+    _COMMON_KEYS: ClassVar[frozenset[str]] = frozenset({"in_dim", "out_shape", "cfg_dict"})
     _TRAIN_KEYS: ClassVar[frozenset[str]] = _COMMON_KEYS | frozenset(
         {
             "sources",
@@ -808,9 +803,7 @@ class RuntimeConfig:
         if mode_norm not in ("train", "predict", "infer"):
             raise ValueError(f"Invalid mode {mode}")
         order = (
-            RuntimeConfig.TRAIN_POS_ORDER
-            if mode_norm == "train"
-            else RuntimeConfig.PRED_POS_ORDER
+            RuntimeConfig.TRAIN_POS_ORDER if mode_norm == "train" else RuntimeConfig.PRED_POS_ORDER
         )
         if len(args) > len(order):
             raise TypeError(f"Too many args for {mode_norm}")
@@ -829,9 +822,7 @@ class RuntimeConfig:
             _coerce_int_sequence(data["out_shape"], name="out_shape", minimum=1)
         )
         cfg_dict = (
-            data["cfg_dict"]
-            if isinstance(data["cfg_dict"], dict)
-            else dict(data["cfg_dict"])
+            data["cfg_dict"] if isinstance(data["cfg_dict"], dict) else dict(data["cfg_dict"])
         )
 
         def _get_val(
@@ -842,6 +833,7 @@ class RuntimeConfig:
             def_: Any = None,
         ) -> Any:
             return _coerce_num(data.get(key, def_), typ, key, min, max)
+
         if mode_norm == "train":
             for k in ("sources", "ckpt_dir"):
                 if k not in data or data[k] is None:
@@ -876,9 +868,7 @@ class RuntimeConfig:
                 cfg_dict=cfg_dict,
                 sources=data["sources"],
                 ckpt_dir=str(data["ckpt_dir"]),
-                init_ckpt_dir=str(data.get("init_ckpt_dir"))
-                if data.get("init_ckpt_dir")
-                else None,
+                init_ckpt_dir=str(data.get("init_ckpt_dir")) if data.get("init_ckpt_dir") else None,
                 epochs=_get_val("epochs", int, 1, def_=5),
                 val_frac=_get_val("val_frac", float, 0.0, 1.0, 0.1),
                 base_lr=_get_val("base_lr", float, 0.0, def_=1e-3),
@@ -887,17 +877,11 @@ class RuntimeConfig:
                 eta_min=_get_val("eta_min", float, 0.0, def_=0.0),
                 seed=_get_val("seed", int, def_=42),
                 shuffle=_coerce_bool(data.get("shuffle", True), name="shuffle"),
-                deterministic=_coerce_bool(
-                    data.get("deterministic", False), name="deterministic"
-                ),
-                train_weights=_coerce_weights_spec(
-                    data.get("train_weights"), name="train_weights"
-                )
+                deterministic=_coerce_bool(data.get("deterministic", False), name="deterministic"),
+                train_weights=_coerce_weights_spec(data.get("train_weights"), name="train_weights")
                 if src_n > 1
                 else None,
-                val_weights=_coerce_weights_spec(
-                    data.get("val_weights"), name="val_weights"
-                )
+                val_weights=_coerce_weights_spec(data.get("val_weights"), name="val_weights")
                 if src_n > 1
                 else None,
                 loss_tile_dim=_get_val("loss_tile_dim", int, 1)
@@ -910,9 +894,7 @@ class RuntimeConfig:
                 loss_mask_value=_get_val("loss_mask_value", float)
                 if data.get("loss_mask_value")
                 else None,
-                swa_enabled=_coerce_bool(
-                    data.get("swa_enabled", False), name="swa_enabled"
-                ),
+                swa_enabled=_coerce_bool(data.get("swa_enabled", False), name="swa_enabled"),
                 swa_start_epoch=_get_val("swa_start_epoch", int, 0)
                 if data.get("swa_start_epoch")
                 else None,
@@ -935,21 +917,15 @@ class RuntimeConfig:
             cfg_dict=cfg_dict,
             sources=data["sources"],
             ckpt_dir=str(data["ckpt_dir"]),
-            model_ckpt_dir=str(data["model_ckpt_dir"])
-            if data.get("model_ckpt_dir")
-            else None,
+            model_ckpt_dir=str(data["model_ckpt_dir"]) if data.get("model_ckpt_dir") else None,
             keys=data.get("keys"),
             seed=_get_val("seed", int, def_=7),
             shuffle=_coerce_bool(data.get("shuffle", False), name="shuffle"),
             loss_skew=_coerce_bool(data.get("loss_skew", True), name="loss_skew"),
-            train_weights=_coerce_weights_spec(
-                data.get("train_weights"), name="train_weights"
-            )
+            train_weights=_coerce_weights_spec(data.get("train_weights"), name="train_weights")
             if src_n > 1
             else None,
-            val_weights=_coerce_weights_spec(
-                data.get("val_weights"), name="val_weights"
-            )
+            val_weights=_coerce_weights_spec(data.get("val_weights"), name="val_weights")
             if src_n > 1
             else None,
         )

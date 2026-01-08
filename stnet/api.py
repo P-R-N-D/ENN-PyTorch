@@ -158,9 +158,7 @@ def _parse_meta(p: PathLike) -> Mapping[str, Any]:
 
 @lru_cache(maxsize=1)
 def _is_execution_time_logged() -> bool:
-    return env_bool(
-        ("STNET_LOG_TIMINGS", "STNET_TIMINGS", "STNET_DEBUG_TIMINGS"), default=False
-    )
+    return env_bool(("STNET_LOG_TIMINGS", "STNET_TIMINGS", "STNET_DEBUG_TIMINGS"), default=False)
 
 
 def _timed_invoke(
@@ -284,9 +282,7 @@ def _get_label_shape(
     return (first_in_dim, first_label_shape)
 
 
-def _adapt_source(
-    d: Any, allow_columns: bool = True
-) -> Tuple[int, Optional[Callable], bool]:
+def _adapt_source(d: Any, allow_columns: bool = True) -> Tuple[int, Optional[Callable], bool]:
     def _value_len(value: object) -> Optional[int]:
         if isinstance(value, (str, bytes, bytearray)):
             return None
@@ -327,9 +323,7 @@ def _adapt_source(
             else:
                 slices.append((key, value))
         slices_t = tuple(slices)
-        constants = {
-            key: value for key, value in constants.items() if key not in dict(slices_t)
-        }
+        constants = {key: value for key, value in constants.items() if key not in dict(slices_t)}
         return count, _MappingSlicer(constants, slices_t), False
     if isinstance(d, (list, tuple)):
         return len(d), (lambda s, e: {"features": d[int(s) : int(e)]}), False
@@ -361,6 +355,7 @@ def _save_dataset(
 
                 get_by_indices = _td_indexer
             elif isinstance(getter, _MappingSlicer):
+
                 def _can_index(value: object) -> bool:
                     if isinstance(value, (list, tuple)):
                         return True
@@ -478,9 +473,7 @@ def _reduce_batch_stats(recs: object) -> Optional[Mapping[str, Any]]:
         out.update(
             {
                 f"sampled_{axis}_mean": mean,
-                f"sampled_{axis}_var": max(
-                    0.0, sums[f"{axis}2"] / sums["bs"] - mean * mean
-                ),
+                f"sampled_{axis}_var": max(0.0, sums[f"{axis}2"] / sums["bs"] - mean * mean),
                 f"sampled_{axis}_min": ext[f"{axis}_min"],
                 f"sampled_{axis}_max": ext[f"{axis}_max"],
             }
@@ -488,19 +481,18 @@ def _reduce_batch_stats(recs: object) -> Optional[Mapping[str, Any]]:
     return out
 
 
-def _update_batch_stats(
-    prev: object, n_prev: object, inc: object, n_inc: object
-) -> Any:
+def _update_batch_stats(prev: object, n_prev: object, inc: object, n_inc: object) -> Any:
     if inc is None or n_inc <= 0:
         return prev
     if prev is None or n_prev <= 0:
         return {
-            f"reduced_{key[len('sampled_'):]}": float(val)
+            f"reduced_{key[len('sampled_') :]}": float(val)
             for key, val in inc.items()
             if key.startswith("sampled_")
         }
     out = {}
     for axis in ("x", "y"):
+
         def _get(dct: Mapping[str, Any], prefix: str, suffix: str, default: float) -> float:
             return float(dct.get(f"{prefix}_{axis}_{suffix}", default))
 
@@ -512,8 +504,7 @@ def _update_batch_stats(
         m_new = (m_prev * n_prev + m_inc * n_inc) / n_new
         v_new = max(
             0.0,
-            ((v_prev + m_prev * m_prev) * n_prev + (v_inc + m_inc * m_inc) * n_inc)
-            / n_new
+            ((v_prev + m_prev * m_prev) * n_prev + (v_inc + m_inc * m_inc) * n_inc) / n_new
             - m_new * m_new,
         )
         out.update(
@@ -627,9 +618,7 @@ def _get_prediction_dtype(
                         return dt
         if os.path.isfile(pred_path):
             try:
-                preds_t = _torch_load_checkpoint(
-                    pred_path, map_location="cpu", weights_only=True
-                )
+                preds_t = _torch_load_checkpoint(pred_path, map_location="cpu", weights_only=True)
             except Exception:
                 preds_t = None
             if isinstance(preds_t, torch.Tensor):
@@ -694,7 +683,6 @@ def get_execution_time(
     log: logging.Logger,
     fn_name: str = "",
 ) -> Callable[[Callable[P, R]], Callable[P, R]]:
-
     def _decorator(fn: Callable[P, R]) -> Callable[P, R]:
         name = fn_name or getattr(fn, "__name__", "call")
         wrapped = partial(_timed_invoke, fn, log, str(name))
@@ -723,18 +711,12 @@ def load_model(
     weights_only: bool = True,
 ) -> Model:
     p = Path(checkpoint_path)
-    load_dev = (
-        torch.device(map_location) if map_location is not None else torch.device("cpu")
-    )
+    load_dev = torch.device(map_location) if map_location is not None else torch.device("cpu")
     if p.is_dir():
         meta = _parse_meta(p)
         use_in_dim = int(in_dim if in_dim is not None else meta.get("in_dim") or 0)
-        out_shape_meta = (
-            out_shape if out_shape is not None else meta.get("out_shape") or ()
-        )
-        use_out_shape = (
-            tuple((int(x) for x in out_shape_meta)) if out_shape_meta else ()
-        )
+        out_shape_meta = out_shape if out_shape is not None else meta.get("out_shape") or ()
+        use_out_shape = tuple((int(x) for x in out_shape_meta)) if out_shape_meta else ()
         user_provided_config = config is not None
         raw_cfg = config if user_provided_config else meta.get("config")
         use_config = coerce_model_config(raw_cfg)
@@ -759,25 +741,17 @@ def load_model(
     if suffix == ".safetensors":
         meta_path = p.with_suffix(".json")
         if not meta_path.exists():
-            raise RuntimeError(
-                "Missing sidecar JSON file for the safetensors checkpoint."
-            )
+            raise RuntimeError("Missing sidecar JSON file for the safetensors checkpoint.")
         meta = read_json(meta_path)
         if not isinstance(meta, dict):
             raise RuntimeError(
                 f"Invalid sidecar JSON file for the safetensors checkpoint: {str(meta_path)!r}"
             )
         use_in_dim = int(in_dim if in_dim is not None else meta.get("in_dim"))
-        out_shape_meta = (
-            out_shape if out_shape is not None else meta.get("out_shape") or ()
-        )
-        use_out_shape = (
-            tuple((int(x) for x in out_shape_meta)) if out_shape_meta else ()
-        )
+        out_shape_meta = out_shape if out_shape is not None else meta.get("out_shape") or ()
+        use_out_shape = tuple((int(x) for x in out_shape_meta)) if out_shape_meta else ()
         user_provided_config = config is not None
-        use_config = coerce_model_config(
-            config if user_provided_config else meta.get("config")
-        )
+        use_config = coerce_model_config(config if user_provided_config else meta.get("config"))
         if not user_provided_config:
             use_config.device = load_dev
         elif map_location is not None and use_config.device is None:
@@ -802,9 +776,7 @@ def load_model(
         resize_scaler_buffer(model, sd)
         model.load_state_dict(sd, strict=False)
         return model
-    obj = _torch_load_checkpoint(
-        p, map_location=map_location or "cpu", weights_only=weights_only
-    )
+    obj = _torch_load_checkpoint(p, map_location=map_location or "cpu", weights_only=weights_only)
     if isinstance(obj, dict):
         meta_in_dim = obj.get("in_dim")
         meta_out_shape = obj.get("out_shape")
@@ -861,9 +833,7 @@ def save_model(
         if swa_averager is not None and hasattr(swa_averager, "state_dict"):
             with contextlib.suppress(Exception):
                 merged_extra["swa_averager_state"] = swa_averager.state_dict()
-        out = Builder.save(
-            model, p, optimizer=optimizer, extra=merged_extra or None, **kwargs
-        )
+        out = Builder.save(model, p, optimizer=optimizer, extra=merged_extra or None, **kwargs)
         return str(out)
     conv = Exporter.for_export(p.suffix)
     if conv is None:
@@ -895,23 +865,13 @@ def _update_history(
         run_stats = _reduce_batch_stats(records)
         sampled_n = int(meta.get("sampled_n", 0)) if isinstance(meta, dict) else 0
         if sampled_n <= 0:
-            epochs_val = (
-                int(meta.get("epochs", epochs)) if isinstance(meta, dict) else int(epochs)
-            )
+            epochs_val = int(meta.get("epochs", epochs)) if isinstance(meta, dict) else int(epochs)
             frac_val = (
-                float(meta.get("val_frac", val_frac))
-                if isinstance(meta, dict)
-                else float(val_frac)
+                float(meta.get("val_frac", val_frac)) if isinstance(meta, dict) else float(val_frac)
             )
             frac_val = max(0.0, min(1.0, frac_val))
             sampled_n = (
-                int(
-                    round(
-                        num_samples_dataset
-                        * max(0.0, 1.0 - frac_val)
-                        * max(1, epochs_val)
-                    )
-                )
+                int(round(num_samples_dataset * max(0.0, 1.0 - frac_val) * max(1, epochs_val)))
                 or num_samples_dataset
             )
         prev_n = int(getattr(model, "_history_total_samples", 0))
@@ -999,17 +959,13 @@ def train(
                 underflow_action=underflow_action,
                 shuffle=bool(shuffle),
             )
-            first_in_dim, label_shape = _get_label_shape(
-                first_in_dim, in_dim, label_shape, lshape
-            )
+            first_in_dim, label_shape = _get_label_shape(first_in_dim, in_dim, label_shape, lshape)
             num_samples_dataset += int(n)
         if first_in_dim is None or not label_shape:
             raise RuntimeError("No training data")
         if manifest is not None:
             payload = manifest if isinstance(manifest, dict) else list(manifest)
-            Storage.write_json(
-                os.path.join(memmap_dir, "multinode.json"), payload, indent=None
-            )
+            Storage.write_json(os.path.join(memmap_dir, "multinode.json"), payload, indent=None)
         if env_bool("STNET_SAVE_DCP", True) or env_bool("STNET_SAVE_MODEL_PT", True):
             init_dir = new_dir("init_dcp")
             _save_model_checkpoint(
@@ -1026,9 +982,7 @@ def train(
         _wp = WorkerPolicy.optimize()
         _wp.set_thread_setting()
         cfg_raw = _extract_model_config_dict(model)
-        cfg_dict = (
-            coerce_model_config(cfg_raw).to_dict() if cfg_raw else ModelConfig().to_dict()
-        )
+        cfg_dict = coerce_model_config(cfg_raw).to_dict() if cfg_raw else ModelConfig().to_dict()
         lc = LaunchConfig(
             min_nodes=1,
             max_nodes=max_nodes,
@@ -1124,8 +1078,7 @@ def predict(
         raise ValueError("predict: model must not be None")
     _init_distributed()
     out_shape = tuple(
-        int(x)
-        for x in (kwargs.pop("out_shape", getattr(model, "out_shape", None)) or ())
+        int(x) for x in (kwargs.pop("out_shape", getattr(model, "out_shape", None)) or ())
     )
     if not out_shape or any(x <= 0 for x in out_shape):
         raise ValueError(f"Invalid out_shape {out_shape}")
@@ -1142,12 +1095,7 @@ def predict(
         out_multi: dict[str, TensorDictBase] = {}
         for k, td in multi_sources.items():
             key = str(k)
-            safe = (
-                str(k)
-                .replace(os.sep, "_")
-                .replace(os.altsep or os.sep, "_")
-                or "0"
-            )
+            safe = str(k).replace(os.sep, "_").replace(os.altsep or os.sep, "_") or "0"
             per_run_id = f"{base_run_id}-{safe}" if safe else base_run_id
             per_path: PathLike | None = path
             if output_mode0 == "file" and path_n0 is not None:
@@ -1214,9 +1162,7 @@ def predict(
             raise FileExistsError(f"predict: destination already exists: {out_path!r}")
     writer_chunk_size = int(chunk_size) if chunk_size is not None else 8192
     master_dtype = _get_float_precision(data)
-    ds = Dataset.for_device(
-        "cpu", feature_dtype=master_dtype, label_float_dtype=master_dtype
-    )
+    ds = Dataset.for_device("cpu", feature_dtype=master_dtype, label_float_dtype=master_dtype)
     ds.underflow_action = underflow_action
     tmp_dir = new_dir("infer")
     ckpt_dir = os.path.join(tmp_dir, "ckpt")
@@ -1253,9 +1199,7 @@ def predict(
             )
             cfg_raw = _extract_model_config_dict(model)
             cfg_dict = (
-                coerce_model_config(cfg_raw).to_dict()
-                if cfg_raw
-                else ModelConfig().to_dict()
+                coerce_model_config(cfg_raw).to_dict() if cfg_raw else ModelConfig().to_dict()
             )
             base = {
                 "sources": {"kind": "memmap", "path": memmap_dir},
@@ -1275,9 +1219,7 @@ def predict(
             master_addr, _ = initialize_master_addr(rdzv)
             lc = LaunchConfig(
                 min_nodes=1,
-                max_nodes=int(max_nodes)
-                if max_nodes is not None
-                else int(_wp.nproc_per_node),
+                max_nodes=int(max_nodes) if max_nodes is not None else int(_wp.nproc_per_node),
                 nproc_per_node=int(_wp.nproc_per_node),
                 rdzv_backend=str(rdzv_backend or "c10d"),
                 rdzv_endpoint=rdzv,
@@ -1322,12 +1264,8 @@ def predict(
                 )
                 cleanup_ok = True
                 return out_td
-            X_t = Storage.copy_mmt_to_cpu_tensor(
-                X_mmt, count=count, chunk_size=writer_chunk_size
-            )
-            Y_t = Storage.copy_mmt_to_cpu_tensor(
-                Y_mmt, count=count, chunk_size=writer_chunk_size
-            )
+            X_t = Storage.copy_mmt_to_cpu_tensor(X_mmt, count=count, chunk_size=writer_chunk_size)
+            Y_t = Storage.copy_mmt_to_cpu_tensor(Y_mmt, count=count, chunk_size=writer_chunk_size)
             td_out = TensorDict({"X": X_t, "Y": Y_t}, batch_size=[int(count)])
             cleanup_ok = True
             return td_out
@@ -1351,18 +1289,14 @@ def get_prediction(
             raise ValueError("get_prediction: 'source' must be a non-empty path")
         src = _coerce_path(source)
         if src is None:
-            raise ValueError(
-                "get_prediction: 'source' is empty/None after normalization"
-            )
+            raise ValueError("get_prediction: 'source' is empty/None after normalization")
         output_mode = _coerce_prediction_output(output)
         overwrite_mode = _coerce_prediction_overwrite(overwrite)
         out_path = None
         path_n = _coerce_path(path) if path is not None else None
         if output_mode == "file":
             if path_n is not None:
-                run_id = (
-                    os.path.basename(src.rstrip(os.sep)) or f"prediction-{os.getpid()}"
-                )
+                run_id = os.path.basename(src.rstrip(os.sep)) or f"prediction-{os.getpid()}"
                 out_path = _coerce_prediction_path(path_n, run_id=run_id)
                 if out_path is None:
                     logger.warning(
@@ -1386,9 +1320,7 @@ def get_prediction(
                 Storage.validate_predictions_h5(os.fspath(out_path))
                 return PersistentTensorDict(filename=out_path, mode="r")
             if overwrite_mode == "error":
-                raise FileExistsError(
-                    f"get_prediction: destination already exists: {out_path!r}"
-                )
+                raise FileExistsError(f"get_prediction: destination already exists: {out_path!r}")
         if (src.endswith(".h5") or src.endswith(".hdf5")) and os.path.isfile(src):
             if output_mode == "file":
                 if out_path is None:
@@ -1507,9 +1439,7 @@ def get_prediction(
 class _MappingSlicer:
     __slots__ = ("const_items", "slice_items")
 
-    def __init__(
-        self, const_items: Mapping[Any, Any], slice_items: Tuple[Any, ...]
-    ) -> None:
+    def __init__(self, const_items: Mapping[Any, Any], slice_items: Tuple[Any, ...]) -> None:
         self.const_items = dict(const_items)
         self.slice_items = tuple(slice_items)
 

@@ -61,9 +61,66 @@ _DEVICE_STATS_LOCK = threading.Lock()
 _TLB_SINGLETON: Optional[Thread] = None
 _TLB_SINGLETON_LOCK = Lock()
 
-_TZ_ALIASES = {k: v for k, v in [
-    ("Z", "UTC"), ("UTC", "UTC"), ("GMT", "Etc/GMT"), ("KST", "Asia/Seoul"), ("JST", "Asia/Tokyo"), ("HKT", "Asia/Hong_Kong"), ("SGT", "Asia/Singapore"), ("ICT", "Asia/Bangkok"), ("WIB", "Asia/Jakarta"), ("WITA", "Asia/Makassar"), ("WIT", "Asia/Jayapura"), ("PHT", "Asia/Manila"), ("MYT", "Asia/Kuala_Lumpur"), ("AEST", "Australia/Sydney"), ("AEDT", "Australia/Sydney"), ("ACST", "Australia/Adelaide"), ("ACDT", "Australia/Adelaide"), ("AWST", "Australia/Perth"), ("NZST", "Pacific/Auckland"), ("NZDT", "Pacific/Auckland"), ("CET", "Europe/Berlin"), ("CEST", "Europe/Berlin"), ("EET", "Europe/Athens"), ("EEST", "Europe/Athens"), ("WET", "Europe/Lisbon"), ("WEST", "Europe/Lisbon"), ("BST", "Europe/London"), ("IST", "Europe/Dublin"), ("MSK", "Europe/Moscow"), ("TRT", "Europe/Istanbul"), ("ET", "America/New_York"), ("CT", "America/Chicago"), ("MT", "America/Denver"), ("PT", "America/Los_Angeles"), ("EST", "America/New_York"), ("EDT", "America/New_York"), ("CST", "America/Chicago"), ("CDT", "America/Chicago"), ("MST", "America/Denver"), ("MDT", "America/Denver"), ("PST", "America/Los_Angeles"), ("PDT", "America/Los_Angeles"), ("AKST", "America/Anchorage"), ("AKDT", "America/Anchorage"), ("HST", "Pacific/Honolulu"), ("AST", "America/Halifax"), ("ADT", "America/Halifax"), ("NST", "America/St_Johns"), ("NDT", "America/St_Johns"), ("BRT", "America/Sao_Paulo"), ("ART", "America/Argentina/Buenos_Aires"), ("SAST", "Africa/Johannesburg"), ("EAT", "Africa/Nairobi"), ("CAT", "Africa/Maputo"), ("WAT", "Africa/Lagos")
-]}
+_TZ_ALIASES = {
+    k: v
+    for k, v in [
+        ("Z", "UTC"),
+        ("UTC", "UTC"),
+        ("GMT", "Etc/GMT"),
+        ("KST", "Asia/Seoul"),
+        ("JST", "Asia/Tokyo"),
+        ("HKT", "Asia/Hong_Kong"),
+        ("SGT", "Asia/Singapore"),
+        ("ICT", "Asia/Bangkok"),
+        ("WIB", "Asia/Jakarta"),
+        ("WITA", "Asia/Makassar"),
+        ("WIT", "Asia/Jayapura"),
+        ("PHT", "Asia/Manila"),
+        ("MYT", "Asia/Kuala_Lumpur"),
+        ("AEST", "Australia/Sydney"),
+        ("AEDT", "Australia/Sydney"),
+        ("ACST", "Australia/Adelaide"),
+        ("ACDT", "Australia/Adelaide"),
+        ("AWST", "Australia/Perth"),
+        ("NZST", "Pacific/Auckland"),
+        ("NZDT", "Pacific/Auckland"),
+        ("CET", "Europe/Berlin"),
+        ("CEST", "Europe/Berlin"),
+        ("EET", "Europe/Athens"),
+        ("EEST", "Europe/Athens"),
+        ("WET", "Europe/Lisbon"),
+        ("WEST", "Europe/Lisbon"),
+        ("BST", "Europe/London"),
+        ("IST", "Europe/Dublin"),
+        ("MSK", "Europe/Moscow"),
+        ("TRT", "Europe/Istanbul"),
+        ("ET", "America/New_York"),
+        ("CT", "America/Chicago"),
+        ("MT", "America/Denver"),
+        ("PT", "America/Los_Angeles"),
+        ("EST", "America/New_York"),
+        ("EDT", "America/New_York"),
+        ("CST", "America/Chicago"),
+        ("CDT", "America/Chicago"),
+        ("MST", "America/Denver"),
+        ("MDT", "America/Denver"),
+        ("PST", "America/Los_Angeles"),
+        ("PDT", "America/Los_Angeles"),
+        ("AKST", "America/Anchorage"),
+        ("AKDT", "America/Anchorage"),
+        ("HST", "Pacific/Honolulu"),
+        ("AST", "America/Halifax"),
+        ("ADT", "America/Halifax"),
+        ("NST", "America/St_Johns"),
+        ("NDT", "America/St_Johns"),
+        ("BRT", "America/Sao_Paulo"),
+        ("ART", "America/Argentina/Buenos_Aires"),
+        ("SAST", "Africa/Johannesburg"),
+        ("EAT", "Africa/Nairobi"),
+        ("CAT", "Africa/Maputo"),
+        ("WAT", "Africa/Lagos"),
+    ]
+}
 
 _RUNTIME_CFG = SimpleNamespace(
     deterministic=False,
@@ -77,15 +134,26 @@ _RUNTIME_CFG_LOCK = threading.Lock()
 
 
 def _log_msg(logger, msg, level):
-    try: (logger(msg) if callable(logger) else getattr(logger, level)(msg)) if logger else getattr(_LOGGER, level)(msg)
-    except: getattr(_LOGGER, level)(msg)
+    try:
+        (logger(msg) if callable(logger) else getattr(logger, level)(msg)) if logger else getattr(
+            _LOGGER, level
+        )(msg)
+    except:
+        getattr(_LOGGER, level)(msg)
 
-def _log_info(logger, msg): _log_msg(logger, msg, "info")
-def _log_debug(logger, msg): _log_msg(logger, msg, "debug")
+
+def _log_info(logger, msg):
+    _log_msg(logger, msg, "info")
+
+
+def _log_debug(logger, msg):
+    _log_msg(logger, msg, "debug")
+
 
 def _call(fn: Any, *args: Any, **kwargs: Any) -> Any:
     with contextlib.suppress(Exception):
-        if callable(fn): return fn(*args, **kwargs)
+        if callable(fn):
+            return fn(*args, **kwargs)
     return None
 
 
@@ -149,10 +217,12 @@ def _get_thread_limit(default: int) -> int:
     return max(1, min(8, int(v)))
 
 
-def _default_thread_limit(
-    ncpu_raw: int, *args: Any, is_accel: bool, nogil: bool
-) -> int:
-    cap_mult = (3 if nogil and is_accel else (2 if is_accel else 1)) if ncpu_raw > 8 else (min(3 if nogil and is_accel else 2, 2) if ncpu_raw > 4 else 1)
+def _default_thread_limit(ncpu_raw: int, *args: Any, is_accel: bool, nogil: bool) -> int:
+    cap_mult = (
+        (3 if nogil and is_accel else (2 if is_accel else 1))
+        if ncpu_raw > 8
+        else (min(3 if nogil and is_accel else 2, 2) if ncpu_raw > 4 else 1)
+    )
     return _get_thread_limit(int(cap_mult))
 
 
@@ -182,9 +252,7 @@ def _get_allowed_cpu_linux() -> Optional[float]:
         root = "/sys/fs/cgroup"
         if os.path.exists(os.path.join(root, "cgroup.controllers")):
             rel = "/"
-            with open(
-                "/proc/self/cgroup", "r", encoding="utf-8", errors="ignore"
-            ) as fh:
+            with open("/proc/self/cgroup", "r", encoding="utf-8", errors="ignore") as fh:
                 for ln in fh:
                     parts = ln.strip().split(":")
                     if len(parts) >= 3 and parts[0] == "0":
@@ -262,9 +330,7 @@ def _get_allowed_cpu_darwin() -> Optional[int]:
         try:
             val = ctypes.c_int(0)
             size = ctypes.c_size_t(ctypes.sizeof(val))
-            ret = int(
-                sysctlbyname(name, ctypes.byref(val), ctypes.byref(size), None, 0)
-            )
+            ret = int(sysctlbyname(name, ctypes.byref(val), ctypes.byref(size), None, 0))
             if ret == 0:
                 n = int(val.value)
                 if n > 0:
@@ -298,18 +364,24 @@ def _get_allowed_cpu_windows() -> Optional[list[int]]:
     try:
         get_group_cnt = getattr(k32, "GetActiveProcessorGroupCount", None)
         get_group_procs = getattr(k32, "GetActiveProcessorCount", None)
-        if not (callable(get_group_cnt) and callable(get_group_procs)): return None
+        if not (callable(get_group_cnt) and callable(get_group_procs)):
+            return None
         group_count = int(get_group_cnt())
-        if group_count <= 0: return None
-        
+        if group_count <= 0:
+            return None
+
         counts = []
         for i in range(group_count):
             c = _call(get_group_procs, ctypes.c_ushort(i)) or _call(get_group_procs, i) or 0
             counts.append(max(0, int(c)))
-            
+
         groups = None
         if callable(get_pg_aff := getattr(k32, "GetProcessGroupAffinity", None)):
-            h, cnt, arr = k32.GetCurrentProcess(), ctypes.c_ushort(0), (ctypes.c_ushort * group_count)()
+            h, cnt, arr = (
+                k32.GetCurrentProcess(),
+                ctypes.c_ushort(0),
+                (ctypes.c_ushort * group_count)(),
+            )
             if get_pg_aff(h, ctypes.byref(cnt), arr) and cnt.value > 0:
                 groups = [int(arr[i]) for i in range(cnt.value)]
         if not groups:
@@ -450,22 +522,14 @@ def empty_device_cache(
             gc.collect()
     with contextlib.suppress(Exception):
         accelerator = getattr(torch, "accelerator", None)
-        memory_mod = (
-            getattr(accelerator, "memory", None) if accelerator is not None else None
-        )
-        empty_cache = (
-            getattr(memory_mod, "empty_cache", None) if memory_mod is not None else None
-        )
+        memory_mod = getattr(accelerator, "memory", None) if accelerator is not None else None
+        empty_cache = getattr(memory_mod, "empty_cache", None) if memory_mod is not None else None
         if callable(empty_cache):
             empty_cache()
     target = None
     with contextlib.suppress(Exception):
         if device is not None:
-            target = (
-                device
-                if isinstance(device, torch.device)
-                else torch.device(str(device))
-            )
+            target = device if isinstance(device, torch.device) else torch.device(str(device))
     dt = getattr(target, "type", None) if target is not None else None
     match str(dt or "all"):
         case "cuda" | "all":
@@ -481,9 +545,7 @@ def empty_device_cache(
         case "xpu" | "all":
             xpu_mod = getattr(torch, "xpu", None)
             if _call(getattr(xpu_mod, "empty_cache", None)) is None:
-                memory_mod = (
-                    getattr(xpu_mod, "memory", None) if xpu_mod is not None else None
-                )
+                memory_mod = getattr(xpu_mod, "memory", None) if xpu_mod is not None else None
                 _call(getattr(memory_mod, "empty_cache", None))
         case _:
             pass
@@ -492,34 +554,45 @@ def empty_device_cache(
 def _acc_mod(dt: str):
     return getattr(torch, dt, None) if dt in ("cuda", "xpu", "mps") else accelerator_type(dt)
 
+
 def accelerator_type(dev_type: str) -> Optional[ModuleType]:
     dt = str(dev_type or "cpu").strip().lower()
-    if dt in ("cuda", "xpu", "mps"): return getattr(torch, dt, None)
+    if dt in ("cuda", "xpu", "mps"):
+        return getattr(torch, dt, None)
     acc = getattr(torch, "accelerator", None)
     return acc if acc and getattr(acc, "device_type", None) == dt else None
+
 
 def _acc_op(dt, op, default=None):
     return _call(getattr(_acc_mod(dt), op, None)) or default
 
+
 @lru_cache(maxsize=8)
 def is_accelerator_available(dev_type: str) -> bool:
     dt = str(dev_type or "cpu").strip().lower()
-    if dt == "mps": return bool(_call(getattr(torch.backends.mps, "is_available", None)) or _acc_op(dt, "is_available"))
+    if dt == "mps":
+        return bool(
+            _call(getattr(torch.backends.mps, "is_available", None)) or _acc_op(dt, "is_available")
+        )
     return bool(_acc_op(dt, "is_available"))
 
 
 @lru_cache(maxsize=8)
 def get_num_accelerators(dev_type: str) -> int:
     dt = str(dev_type or "cpu").strip().lower()
-    if not is_accelerator_available(dt): return 0
-    if dt == "mps": return 1
+    if not is_accelerator_available(dt):
+        return 0
+    if dt == "mps":
+        return 1
     return max(0, int(_acc_op(dt, "device_count") or 0))
 
 
 def get_accelerator_index(dev_type: str) -> int:
     dt = str(dev_type or "cpu").strip().lower()
-    if not is_accelerator_available(dt): return -1
-    if dt == "mps": return 0
+    if not is_accelerator_available(dt):
+        return -1
+    if dt == "mps":
+        return 0
     v = _acc_op(dt, "current_device")
     return int(v) if v is not None else 0
 
@@ -549,8 +622,9 @@ def available_device_memory(device: Union[torch.device, str]) -> Optional[float]
         if total_b is not None and int(total_b) > 0 and free_b is not None:
             used_b = max(0, int(total_b) - int(free_b))
             return 100.0 * float(used_b) / float(total_b)
-    except: pass
-    
+    except:
+        pass
+
     try:
         mod = _acc_mod(dev.type)
         if dev.type == "cuda":
@@ -561,9 +635,11 @@ def available_device_memory(device: Union[torch.device, str]) -> Optional[float]
             total, used = getattr(props, "total_memory", 0), _call(mod.memory_allocated, dev)
         elif dev.type == "mps":
             total, used = _call(mod.recommended_max_memory), _call(mod.current_allocated_memory)
-        else: return None
+        else:
+            return None
         return (100.0 * used / total) if total and used is not None else None
-    except: return None
+    except:
+        return None
     return None
 
 
@@ -573,16 +649,20 @@ def available_accelerator_memory(device: Union[torch.device, str]) -> Optional[i
     except Exception:
         return None
     v = _call(getattr(Memory, "device_mem_get_info", None), dev)
-    if isinstance(v, tuple) and len(v) >= 2 and v[1]: return int(v[1])
+    if isinstance(v, tuple) and len(v) >= 2 and v[1]:
+        return int(v[1])
 
-    if not is_accelerator_available(dev.type): return None
+    if not is_accelerator_available(dev.type):
+        return None
     mod = _acc_mod(dev.type)
     try:
         if dev.type in ("cuda", "xpu"):
             props = _call(mod.get_device_properties, dev.index if dev.index is not None else 0)
             return int(props.total_memory) if props else None
-        if dev.type == "mps": return int(_call(mod.recommended_max_memory))
-    except: pass
+        if dev.type == "mps":
+            return int(_call(mod.recommended_max_memory))
+    except:
+        pass
     return None
 
 
@@ -591,12 +671,15 @@ def allocated_accelerator_memory(device: Union[torch.device, str]) -> Optional[i
         dev = device if isinstance(device, torch.device) else torch.device(str(device))
     except Exception:
         return None
-    if not is_accelerator_available(dev.type): return None
-    
+    if not is_accelerator_available(dev.type):
+        return None
+
     mod = _acc_mod(dev.type)
-    if dev.type == "mps": v = _call(mod.current_allocated_memory)
-    else: v = _call(mod.memory_allocated, dev)
-    
+    if dev.type == "mps":
+        v = _call(mod.current_allocated_memory)
+    else:
+        v = _call(mod.memory_allocated, dev)
+
     return max(0, int(v)) if v is not None else None
     return None
 
@@ -606,11 +689,14 @@ def flush_accelerator_memory_stats(device: Union[torch.device, str]) -> None:
         dev = device if isinstance(device, torch.device) else torch.device(str(device))
     except Exception:
         return
-    if not is_accelerator_available(dev.type): return
+    if not is_accelerator_available(dev.type):
+        return
 
     mod = _acc_mod(dev.type)
-    if dev.type == "mps": _call(mod.reset_peak_memory_stats)
-    else: _call(mod.reset_peak_memory_stats, dev)
+    if dev.type == "mps":
+        _call(mod.reset_peak_memory_stats)
+    else:
+        _call(mod.reset_peak_memory_stats, dev)
 
 
 def accelerator_max_allocated_memory(device: Union[torch.device, str]) -> Optional[int]:
@@ -618,11 +704,14 @@ def accelerator_max_allocated_memory(device: Union[torch.device, str]) -> Option
         dev = device if isinstance(device, torch.device) else torch.device(str(device))
     except Exception:
         return None
-    if not is_accelerator_available(dev.type): return None
+    if not is_accelerator_available(dev.type):
+        return None
 
     mod = _acc_mod(dev.type)
-    if dev.type == "mps": v = _call(mod.max_memory_allocated)
-    else: v = _call(mod.max_memory_allocated, dev)
+    if dev.type == "mps":
+        v = _call(mod.max_memory_allocated)
+    else:
+        v = _call(mod.max_memory_allocated, dev)
 
     return max(0, int(v)) if v is not None else None
     return None
@@ -650,9 +739,12 @@ def sync_accelerator(device: Union[torch.device, str]) -> None:
         dev = device if isinstance(device, torch.device) else torch.device(str(device))
         if is_accelerator_available(dev.type):
             mod = _acc_mod(dev.type)
-            if dev.type == "mps": _call(mod.synchronize)
-            else: _call(mod.synchronize, dev)
-    except: pass
+            if dev.type == "mps":
+                _call(mod.synchronize)
+            else:
+                _call(mod.synchronize, dev)
+    except:
+        pass
 
 
 @lru_cache(maxsize=8)
@@ -693,7 +785,8 @@ def new_accelerator_event(
         return None
     dt = str(getattr(dev, "type", "cpu") or "cpu")
     mod = _acc_mod(dt)
-    if not mod or not hasattr(mod, "Event"): return None
+    if not mod or not hasattr(mod, "Event"):
+        return None
     return _call(mod.Event, enable_timing=enable_timing) or _call(mod.Event)
 
 
@@ -714,12 +807,7 @@ def is_stream_supported(dev_type: str) -> bool:
     Event = getattr(backend, "Event", None)
     stream_cm = getattr(backend, "stream", None)
     cur = getattr(backend, "current_stream", None)
-    return bool(
-        callable(Stream)
-        and (Event is not None)
-        and callable(stream_cm)
-        and callable(cur)
-    )
+    return bool(callable(Stream) and (Event is not None) and callable(stream_cm) and callable(cur))
 
 
 @lru_cache(maxsize=8)
@@ -742,9 +830,7 @@ def is_pin_supported(dev_type: str) -> bool:
             return False
 
 
-def accelerator_stream(
-    stream: object, dev_type: str
-) -> contextlib.AbstractContextManager[None]:
+def accelerator_stream(stream: object, dev_type: str) -> contextlib.AbstractContextManager[None]:
     mod = _acc_mod(dev_type)
     return mod.stream(stream) if mod and hasattr(mod, "stream") else contextlib.nullcontext()
 
@@ -764,7 +850,8 @@ def current_accelerator_stream(device: torch.device) -> object | None:
         dev = device if isinstance(device, torch.device) else torch.device(str(device))
         mod = _acc_mod(dev.type)
         return mod.current_stream(device=dev) if mod and hasattr(mod, "current_stream") else None
-    except: return None
+    except:
+        return None
 
 
 def set_float32_precision(
@@ -849,7 +936,8 @@ def system_info() -> Tuple[str, str, str, str]:
             for idx in range(get_num_accelerators(dt)):
                 name = _call(getattr(_acc_mod(dt), "get_device_name", None), idx) or dt.upper()
                 accelerators.append(f"{dt}:{idx}={name}")
-    if is_accelerator_available("mps"): accelerators.append("mps=Apple MPS")
+    if is_accelerator_available("mps"):
+        accelerators.append("mps=Apple MPS")
     return os_name, kernel, arch, ";".join(accelerators)
 
 
@@ -867,9 +955,7 @@ def cpu_info(max_bytes: Optional[int] = None) -> str:
         pass
     if not brand and os.path.exists("/proc/cpuinfo"):
         try:
-            with open(
-                "/proc/cpuinfo", "r", encoding="utf-8", errors="ignore"
-            ) as handle:
+            with open("/proc/cpuinfo", "r", encoding="utf-8", errors="ignore") as handle:
                 lines = [ln.strip() for ln in handle.readlines() if "model name" in ln]
             if lines:
                 names = [ln.split(":", 1)[1].strip() for ln in lines]
@@ -908,9 +994,7 @@ def cpu_info(max_bytes: Optional[int] = None) -> str:
     if not names:
         fallback = brand or platform.processor() or "CPU"
         names = [fallback] * total
-    pairs = [
-        f"{idx}:{names[idx] if idx < len(names) else names[0]}" for idx in range(total)
-    ]
+    pairs = [f"{idx}:{names[idx] if idx < len(names) else names[0]}" for idx in range(total)]
     result = ";".join(pairs)
     if max_bytes is not None and max_bytes > 0:
         encoded = result.encode("utf-8")
@@ -934,11 +1018,7 @@ def is_main_loadable() -> bool:
         main_path = os.fspath(main_path)
     except TypeError:
         return False
-    if (
-        isinstance(main_path, str)
-        and main_path.startswith("<")
-        and main_path.endswith(">")
-    ):
+    if isinstance(main_path, str) and main_path.startswith("<") and main_path.endswith(">"):
         return False
     return os.path.exists(main_path)
 
@@ -1023,9 +1103,7 @@ def optimal_start_method() -> str:
         except ValueError:
             continue
         return method
-    raise RuntimeError(
-        "No supported multiprocessing start method (tried forkserver, spawn)."
-    )
+    raise RuntimeError("No supported multiprocessing start method (tried forkserver, spawn).")
 
 
 def init_start_method() -> None:
@@ -1126,9 +1204,7 @@ def is_cpu_bf16_supported() -> bool:
         mkldnn = getattr(torch.backends, "mkldnn", None)
         if mkldnn is None:
             return False
-        if not bool(mkldnn.is_available()) or not bool(
-            getattr(mkldnn, "enabled", True)
-        ):
+        if not bool(mkldnn.is_available()) or not bool(getattr(mkldnn, "enabled", True)):
             return False
         mkldnn_ops = getattr(torch.ops, "mkldnn", None)
         f = (
@@ -1238,9 +1314,7 @@ def get_device_stats(device: Optional[Union[torch.device, str]] = None) -> Devic
         float_dtypes = tuple(dict.fromkeys(floats))
     if not int_dtypes:
         int_dtypes = (torch.int8, torch.int16, torch.int32, torch.int64)
-    bits = env_first_int(
-        ("STNET_DATA_INT_QUANT_BITS", "STNET_INT_QUANT_BITS"), default=0
-    )
+    bits = env_first_int(("STNET_DATA_INT_QUANT_BITS", "STNET_INT_QUANT_BITS"), default=0)
     quant_bits = int(bits) if int(bits) > 0 else 8
     stats = Device(
         device=dev,
@@ -1352,9 +1426,7 @@ def optimal_optimizer_params(
 ) -> dict[str, bool]:
     devt = device.type
     flags: dict[str, bool] = {}
-    flags["foreach"] = (
-        devt in {"cuda", "xpu"} if use_foreach is None else bool(use_foreach)
-    )
+    flags["foreach"] = devt in {"cuda", "xpu"} if use_foreach is None else bool(use_foreach)
     if use_fused and devt in {"cuda", "xpu"}:
         flags["fused"] = True
         flags["foreach"] = False
@@ -1377,20 +1449,12 @@ def num_accelerators() -> int:
                 return int(cuda_iface.device_count()) or 0
     with contextlib.suppress(Exception):
         xpu = getattr(torch, "xpu", None)
-        if (
-            xpu is not None
-            and callable(getattr(xpu, "is_available", None))
-            and xpu.is_available()
-        ):
+        if xpu is not None and callable(getattr(xpu, "is_available", None)) and xpu.is_available():
             count = int(getattr(xpu, "device_count", lambda: 1)()) or 1
             return max(count, 1)
     with contextlib.suppress(Exception):
         mps = getattr(getattr(torch, "backends", None), "mps", None)
-        if (
-            mps is not None
-            and callable(getattr(mps, "is_available", None))
-            and mps.is_available()
-        ):
+        if mps is not None and callable(getattr(mps, "is_available", None)) and mps.is_available():
             return 1
     with contextlib.suppress(Exception):
         if hasattr(torch, "is_vulkan_available") and torch.is_vulkan_available():
@@ -1421,9 +1485,7 @@ def get_affinity(io_workers: Optional[int] = None) -> Thread:
         with _TLB_SINGLETON_LOCK:
             if _TLB_SINGLETON is None:
                 default_workers = (
-                    io_workers
-                    if io_workers is not None
-                    else max(1, process_cpu_count() // 2)
+                    io_workers if io_workers is not None else max(1, process_cpu_count() // 2)
                 )
                 _TLB_SINGLETON = Thread(io_workers=int(default_workers))
     tlb = _TLB_SINGLETON
@@ -1551,11 +1613,7 @@ class WorkerPolicy:
         n = 0
         try:
             accel = getattr(torch, "accelerator", None)
-            if (
-                accel is not None
-                and hasattr(accel, "is_available")
-                and accel.is_available()
-            ):
+            if accel is not None and hasattr(accel, "is_available") and accel.is_available():
                 current = getattr(accel, "current_accelerator", None)
                 if callable(current):
                     dev = current(False)
@@ -1619,9 +1677,7 @@ class WorkerPolicy:
             _nogil = bool(Thread.is_optimized_for_no_gil())
         cap_mult = _default_thread_limit(ncpu_raw, is_accel=is_accel, nogil=_nogil)
         distribute_default = int(local_world_guess) > 1
-        distribute = bool(
-            env_first_int(("STNET_DISTRIBUTE_THREAD_CAP",), int(distribute_default))
-        )
+        distribute = bool(env_first_int(("STNET_DISTRIBUTE_THREAD_CAP",), int(distribute_default)))
         thread_cap = _optimal_threads(
             ncpu=ncpu_raw,
             cap_mult=cap_mult,
@@ -1637,9 +1693,7 @@ class WorkerPolicy:
             hard = int(lp.hard_inflight_batches(dev_type))
             soft_inflight = max(1, int(hard * max(1, int(lp.soft_cap_multiplier))))
         soft_auto_enabled = bool(env_first_int(("STNET_SOFT_INFLIGHT_AUTO",), 1))
-        soft_inflight_max_default = (
-            (32 if is_accel else 24) if _nogil else (16 if is_accel else 12)
-        )
+        soft_inflight_max_default = (32 if is_accel else 24) if _nogil else (16 if is_accel else 12)
         soft_inflight_max = max(
             8, env_first_int(("STNET_SOFT_INFLIGHT_MAX",), soft_inflight_max_default)
         )
@@ -1650,9 +1704,7 @@ class WorkerPolicy:
             soft_base = max(0, env_first_int(("STNET_SOFT_INFLIGHT_BASE",), 2))
             soft_div = max(1, env_first_int(("STNET_SOFT_INFLIGHT_DIV",), 4))
             auto_soft = int(soft_base) + max(0, int(eff_cores) // int(soft_div))
-            soft_inflight = max(
-                int(soft_inflight), min(int(auto_soft), int(soft_inflight_max))
-            )
+            soft_inflight = max(int(soft_inflight), min(int(auto_soft), int(soft_inflight_max)))
         soft_inflight = max(1, min(int(soft_inflight), int(thread_cap)))
         if is_accel:
             if eff_cores <= 4:
@@ -1675,9 +1727,7 @@ class WorkerPolicy:
             else:
                 model_ratio = 0.85
         with contextlib.suppress(Exception):
-            env_key = (
-                "STNET_MODEL_CORE_RATIO_ACCEL" if is_accel else "STNET_MODEL_CORE_RATIO"
-            )
+            env_key = "STNET_MODEL_CORE_RATIO_ACCEL" if is_accel else "STNET_MODEL_CORE_RATIO"
             model_ratio = float(env_float(env_key, float(model_ratio)))
         model_ratio = float(max(0.25, min(1.0, model_ratio)))
         model_budget = max(2, int(round(float(eff_cores) * model_ratio)))
@@ -1712,9 +1762,7 @@ class WorkerPolicy:
             1,
             int((int(soft_inflight) - int(prebatch)) // max(1, int(prefetch_factor))),
         )
-        num_workers = max(
-            1, min(int(base_workers), int(max_workers), int(soft_inflight))
-        )
+        num_workers = max(1, min(int(base_workers), int(max_workers), int(soft_inflight)))
         max_concurrency = max(1, int(num_workers))
         total_threads = int(intra_ops) + int(inter_ops) + int(num_workers)
         if total_threads > int(thread_cap):
@@ -1764,9 +1812,7 @@ class WorkerPolicy:
             if _TORCH_NUM_THREADS_SET != int(intra):
                 _call(getattr(torch, "set_num_threads", None), int(intra))
                 _TORCH_NUM_THREADS_SET = int(intra)
-            if hasattr(torch, "set_num_interop_threads") and not bool(
-                _TORCH_INTEROP_LOCKED
-            ):
+            if hasattr(torch, "set_num_interop_threads") and not bool(_TORCH_INTEROP_LOCKED):
                 if _TORCH_INTEROP_THREADS_SET is None:
                     try:
                         torch.set_num_interop_threads(int(inter))
@@ -1823,18 +1869,14 @@ class Thread:
             1,
             min(
                 1024,
-                env_first_int(
-                    ("STNET_TLB_FLUSH_EVERY", "STNET_TLB_FLUSH"), flush_default
-                ),
+                env_first_int(("STNET_TLB_FLUSH_EVERY", "STNET_TLB_FLUSH"), flush_default),
             ),
         )
         self._sample_every = max(
             1,
             min(
                 1024,
-                env_first_int(
-                    ("STNET_TLB_SAMPLE_EVERY", "STNET_TLB_SAMPLE"), sample_default
-                ),
+                env_first_int(("STNET_TLB_SAMPLE_EVERY", "STNET_TLB_SAMPLE"), sample_default),
             ),
         )
         self.tune_threads(io_workers, initial=True)
@@ -1853,9 +1895,15 @@ class Thread:
     def _windows_group_segments(k32: Any) -> Tuple[list[Tuple[int, int]], int]:
         get_group_cnt = getattr(k32, "GetActiveProcessorGroupCount", None)
         get_group_procs = getattr(k32, "GetActiveProcessorCount", None)
-        if not (callable(get_group_cnt) and callable(get_group_procs)): return ([], 0)
+        if not (callable(get_group_cnt) and callable(get_group_procs)):
+            return ([], 0)
         group_count = int(get_group_cnt()) if get_group_cnt else 0
-        counts = [max(0, int(_call(get_group_procs, ctypes.c_ushort(i)) or _call(get_group_procs, i) or 0)) for i in range(group_count)]
+        counts = [
+            max(
+                0, int(_call(get_group_procs, ctypes.c_ushort(i)) or _call(get_group_procs, i) or 0)
+            )
+            for i in range(group_count)
+        ]
         groups: list[int] | None = None
         get_pg_aff = getattr(k32, "GetProcessGroupAffinity", None)
         if callable(get_pg_aff):
@@ -1897,9 +1945,7 @@ class Thread:
                     h = get_proc()
                     proc_mask = ctypes.c_size_t(0)
                     sys_mask = ctypes.c_size_t(0)
-                    ok = int(
-                        get_mask(h, ctypes.byref(proc_mask), ctypes.byref(sys_mask))
-                    )
+                    ok = int(get_mask(h, ctypes.byref(proc_mask), ctypes.byref(sys_mask)))
                     if ok:
                         m = int(proc_mask.value)
                         if m:
@@ -1923,14 +1969,36 @@ class Thread:
                     group = int(g)
                     break
             within -= int(cnt)
-        thread = GetCurrentThread()
-        class GROUP_AFFINITY(ctypes.Structure): _fields_ = [("Mask", ctypes.c_ulonglong), ("Group", ctypes.c_ushort), ("Reserved", ctypes.c_ushort * 3)]
-        affinity = GROUP_AFFINITY(ctypes.c_ulonglong(1 << int(within)), ctypes.c_ushort(int(group)), (ctypes.c_ushort * 3)(0, 0, 0))
-        ok = bool(SetThreadGroupAffinity(thread, ctypes.byref(affinity), None))
-        if ok and SetThreadIdealProcessorEx is not None:
-            with contextlib.suppress(Exception):
-                class PROCESSOR_NUMBER(ctypes.Structure): _fields_ = [("Group", ctypes.c_ushort), ("Number", ctypes.c_ubyte), ("Reserved", ctypes.c_ubyte)]
-                SetThreadIdealProcessorEx(thread, ctypes.byref(PROCESSOR_NUMBER(int(group), int(within), 0)), None)
+            thread = GetCurrentThread()
+
+            class GROUP_AFFINITY(ctypes.Structure):
+                _fields_ = [
+                    ("Mask", ctypes.c_ulonglong),
+                    ("Group", ctypes.c_ushort),
+                    ("Reserved", ctypes.c_ushort * 3),
+                ]
+
+            affinity = GROUP_AFFINITY(
+                ctypes.c_ulonglong(1 << int(within)),
+                ctypes.c_ushort(int(group)),
+                (ctypes.c_ushort * 3)(0, 0, 0),
+            )
+            ok = bool(SetThreadGroupAffinity(thread, ctypes.byref(affinity), None))
+            if ok and SetThreadIdealProcessorEx is not None:
+                with contextlib.suppress(Exception):
+
+                    class PROCESSOR_NUMBER(ctypes.Structure):
+                        _fields_ = [
+                            ("Group", ctypes.c_ushort),
+                            ("Number", ctypes.c_ubyte),
+                            ("Reserved", ctypes.c_ubyte),
+                        ]
+
+                    SetThreadIdealProcessorEx(
+                        thread,
+                        ctypes.byref(PROCESSOR_NUMBER(int(group), int(within), 0)),
+                        None,
+                    )
             return bool(ok)
         except Exception:
             return False
@@ -1963,14 +2031,10 @@ class Thread:
         workers = max(1, self._io_workers)
         dev_type, nacc = WorkerPolicy._available_accelerator()
         is_accel = bool(nacc and int(nacc) > 0)
-        cap_mult = _default_thread_limit(
-            cpus, is_accel=is_accel, nogil=bool(self._nogil)
-        )
+        cap_mult = _default_thread_limit(cpus, is_accel=is_accel, nogil=bool(self._nogil))
         local_world = _optimal_local_worlds(1)
         distribute_default = local_world > 1
-        distribute = bool(
-            env_first_int(("STNET_DISTRIBUTE_THREAD_CAP",), int(distribute_default))
-        )
+        distribute = bool(env_first_int(("STNET_DISTRIBUTE_THREAD_CAP",), int(distribute_default)))
         thread_cap = _optimal_threads(
             ncpu=cpus,
             cap_mult=cap_mult,
@@ -2096,9 +2160,7 @@ class Thread:
                     ]
                     port = lib.mach_thread_self()
                     ok = (
-                        lib.thread_policy_set(
-                            port, THREAD_AFFINITY_POLICY, ctypes.byref(policy), 1
-                        )
+                        lib.thread_policy_set(port, THREAD_AFFINITY_POLICY, ctypes.byref(policy), 1)
                         == 0
                     )
         self._tls.pinned = bool(ok)
@@ -2109,9 +2171,7 @@ class Thread:
             self._enabled = False
 
     @staticmethod
-    def optimize_threads(
-        intra: Optional[int] = None, inter: Optional[int] = None
-    ) -> None:
+    def optimize_threads(intra: Optional[int] = None, inter: Optional[int] = None) -> None:
         optimize_threads(intra=intra, inter=inter)
 
     def tune_threads(
@@ -2135,9 +2195,7 @@ class Thread:
             self._io_workers = tuned_workers
             dev_type, nacc = WorkerPolicy._available_accelerator()
             is_accel = bool(nacc and int(nacc) > 0)
-            cap_mult = _default_thread_limit(
-                cpus, is_accel=is_accel, nogil=bool(self._nogil)
-            )
+            cap_mult = _default_thread_limit(cpus, is_accel=is_accel, nogil=bool(self._nogil))
             local_world = _optimal_local_worlds(1)
             distribute_default = local_world > 1
             distribute = bool(
@@ -2156,17 +2214,13 @@ class Thread:
             want_inter = max(1, min(tuned_workers // 2, 4))
             total = int(intra_now) + int(want_inter) + int(tuned_workers)
             if total > int(thread_cap):
-                new_intra = max(
-                    1, int(thread_cap) - int(want_inter) - int(tuned_workers)
-                )
+                new_intra = max(1, int(thread_cap) - int(want_inter) - int(tuned_workers))
                 if int(new_intra) != int(intra_now):
                     optimize_threads(intra=int(new_intra))
                     intra_now = int(new_intra)
                 total = int(intra_now) + int(want_inter) + int(tuned_workers)
                 if total > int(thread_cap):
-                    want_inter = max(
-                        1, int(thread_cap) - int(tuned_workers) - int(intra_now)
-                    )
+                    want_inter = max(1, int(thread_cap) - int(tuned_workers) - int(intra_now))
             optimize_threads(inter=int(want_inter))
             return
         self._retune_threads()
@@ -2211,12 +2265,8 @@ class Memory:
                 with contextlib.suppress(Exception):
                     total = int(info[1])
         elif isinstance(info, dict):
-            free_v = (
-                info.get("free") or info.get("free_memory") or info.get("free_bytes")
-            )
-            total_v = (
-                info.get("total") or info.get("total_memory") or info.get("total_bytes")
-            )
+            free_v = info.get("free") or info.get("free_memory") or info.get("free_bytes")
+            total_v = info.get("total") or info.get("total_memory") or info.get("total_bytes")
             if total_v is None and info.get("bytes_limit", None) is not None:
                 total_v = info.get("bytes_limit", None)
             if free_v is None and total_v is not None:
@@ -2254,9 +2304,7 @@ class Memory:
             pass
         try:
             if sys.platform.startswith("linux"):
-                with open(
-                    "/proc/meminfo", "r", encoding="utf-8", errors="ignore"
-                ) as fh:
+                with open("/proc/meminfo", "r", encoding="utf-8", errors="ignore") as fh:
                     for line in fh:
                         if line.startswith("MemAvailable:"):
                             parts = line.split()
@@ -2283,7 +2331,19 @@ class Memory:
                     return int((free + inactive + (speculative or 0)) * page)
             elif os.name == "nt" or sys.platform.startswith("win"):
 
-                class MEMORYSTATUSEX(ctypes.Structure): _fields_ = [("dwLength", ctypes.c_ulong), ("dwMemoryLoad", ctypes.c_ulong), ("ullTotalPhys", ctypes.c_ulonglong), ("ullAvailPhys", ctypes.c_ulonglong), ("ullTotalPageFile", ctypes.c_ulonglong), ("ullAvailPageFile", ctypes.c_ulonglong), ("ullTotalVirtual", ctypes.c_ulonglong), ("ullAvailVirtual", ctypes.c_ulonglong), ("ullAvailExtendedVirtual", ctypes.c_ulonglong)]
+                class MEMORYSTATUSEX(ctypes.Structure):
+                    _fields_ = [
+                        ("dwLength", ctypes.c_ulong),
+                        ("dwMemoryLoad", ctypes.c_ulong),
+                        ("ullTotalPhys", ctypes.c_ulonglong),
+                        ("ullAvailPhys", ctypes.c_ulonglong),
+                        ("ullTotalPageFile", ctypes.c_ulonglong),
+                        ("ullAvailPageFile", ctypes.c_ulonglong),
+                        ("ullTotalVirtual", ctypes.c_ulonglong),
+                        ("ullAvailVirtual", ctypes.c_ulonglong),
+                        ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+                    ]
+
                 stat = MEMORYSTATUSEX()
                 stat.dwLength = ctypes.sizeof(MEMORYSTATUSEX)
                 if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(stat)):
@@ -2300,9 +2360,7 @@ class Memory:
             root = "/sys/fs/cgroup"
             if os.path.exists(os.path.join(root, "cgroup.controllers")):
                 rel = "/"
-                with open(
-                    "/proc/self/cgroup", "r", encoding="utf-8", errors="ignore"
-                ) as fh:
+                with open("/proc/self/cgroup", "r", encoding="utf-8", errors="ignore") as fh:
                     for ln in fh:
                         parts = ln.strip().split(":")
                         if len(parts) >= 3 and parts[0] == "0":
@@ -2313,10 +2371,21 @@ class Memory:
                 cur = _read_int_file(os.path.join(grp, "memory.current"))
                 if lim is not None and cur is not None:
                     return max(0, lim - cur)
-            if (mem_rel := next((ln.strip().split(":")[2] for ln in open("/proc/self/cgroup") if "memory" in ln.split(":")[1].split(",")), None)):
+            if mem_rel := next(
+                (
+                    ln.strip().split(":")[2]
+                    for ln in open("/proc/self/cgroup")
+                    if "memory" in ln.split(":")[1].split(",")
+                ),
+                None,
+            ):
                 grp = os.path.join("/sys/fs/cgroup/memory", mem_rel.lstrip("/"))
-                lim, use = _read_int_file(os.path.join(grp, "memory.limit_in_bytes")), _read_int_file(os.path.join(grp, "memory.usage_in_bytes"))
-                if lim and use and lim < (1 << 60): return max(0, lim - use)
+                lim, use = (
+                    _read_int_file(os.path.join(grp, "memory.limit_in_bytes")),
+                    _read_int_file(os.path.join(grp, "memory.usage_in_bytes")),
+                )
+                if lim and use and lim < (1 << 60):
+                    return max(0, lim - use)
         except Exception:
             return None
         return None
@@ -2338,10 +2407,41 @@ class Memory:
             if not IsProcessInJob(hProc, None, ctypes.byref(inJob)) or not inJob.value:
                 return None
 
-            class LARGE_INTEGER(ctypes.Union): _fields_ = [("QuadPart", ctypes.c_longlong)]
-            class IO_COUNTERS(ctypes.Structure): _fields_ = [("ReadOperationCount", ctypes.c_ulonglong), ("WriteOperationCount", ctypes.c_ulonglong), ("OtherOperationCount", ctypes.c_ulonglong), ("ReadTransferCount", ctypes.c_ulonglong), ("WriteTransferCount", ctypes.c_ulonglong), ("OtherTransferCount", ctypes.c_ulonglong)]
-            class JOBOBJECT_BASIC_LIMIT_INFORMATION(ctypes.Structure): _fields_ = [("PerProcessUserTimeLimit", LARGE_INTEGER), ("PerJobUserTimeLimit", LARGE_INTEGER), ("LimitFlags", ctypes.c_uint), ("MinimumWorkingSetSize", ctypes.c_size_t), ("MaximumWorkingSetSize", ctypes.c_size_t), ("ActiveProcessLimit", ctypes.c_uint), ("Affinity", ctypes.c_size_t), ("PriorityClass", ctypes.c_uint), ("SchedulingClass", ctypes.c_uint)]
-            class JOBOBJECT_EXTENDED_LIMIT_INFORMATION(ctypes.Structure): _fields_ = [("BasicLimitInformation", JOBOBJECT_BASIC_LIMIT_INFORMATION), ("IoInfo", IO_COUNTERS), ("ProcessMemoryLimit", ctypes.c_size_t), ("JobMemoryLimit", ctypes.c_size_t), ("PeakProcessMemoryUsed", ctypes.c_size_t), ("PeakJobMemoryUsed", ctypes.c_size_t)]
+            class LARGE_INTEGER(ctypes.Union):
+                _fields_ = [("QuadPart", ctypes.c_longlong)]
+
+            class IO_COUNTERS(ctypes.Structure):
+                _fields_ = [
+                    ("ReadOperationCount", ctypes.c_ulonglong),
+                    ("WriteOperationCount", ctypes.c_ulonglong),
+                    ("OtherOperationCount", ctypes.c_ulonglong),
+                    ("ReadTransferCount", ctypes.c_ulonglong),
+                    ("WriteTransferCount", ctypes.c_ulonglong),
+                    ("OtherTransferCount", ctypes.c_ulonglong),
+                ]
+
+            class JOBOBJECT_BASIC_LIMIT_INFORMATION(ctypes.Structure):
+                _fields_ = [
+                    ("PerProcessUserTimeLimit", LARGE_INTEGER),
+                    ("PerJobUserTimeLimit", LARGE_INTEGER),
+                    ("LimitFlags", ctypes.c_uint),
+                    ("MinimumWorkingSetSize", ctypes.c_size_t),
+                    ("MaximumWorkingSetSize", ctypes.c_size_t),
+                    ("ActiveProcessLimit", ctypes.c_uint),
+                    ("Affinity", ctypes.c_size_t),
+                    ("PriorityClass", ctypes.c_uint),
+                    ("SchedulingClass", ctypes.c_uint),
+                ]
+
+            class JOBOBJECT_EXTENDED_LIMIT_INFORMATION(ctypes.Structure):
+                _fields_ = [
+                    ("BasicLimitInformation", JOBOBJECT_BASIC_LIMIT_INFORMATION),
+                    ("IoInfo", IO_COUNTERS),
+                    ("ProcessMemoryLimit", ctypes.c_size_t),
+                    ("JobMemoryLimit", ctypes.c_size_t),
+                    ("PeakProcessMemoryUsed", ctypes.c_size_t),
+                    ("PeakJobMemoryUsed", ctypes.c_size_t),
+                ]
 
             JobObjectExtendedLimitInformation = 9
             QueryInformationJobObject = kernel32.QueryInformationJobObject
@@ -2421,9 +2521,7 @@ class Memory:
             pass
         try:
             if sys.platform.startswith("linux"):
-                with open(
-                    "/proc/meminfo", "r", encoding="utf-8", errors="ignore"
-                ) as fh:
+                with open("/proc/meminfo", "r", encoding="utf-8", errors="ignore") as fh:
                     for line in fh:
                         if line.startswith("MemTotal:"):
                             parts = line.split()
@@ -2461,9 +2559,7 @@ class Memory:
         cgroup = Memory._linux_limit()
         winjob = Memory._windows_limit()
         rlim = Memory._bsd_limit()
-        candidates = [
-            x for x in (base, cgroup, winjob, rlim) if isinstance(x, int) and x >= 0
-        ]
+        candidates = [x for x in (base, cgroup, winjob, rlim) if isinstance(x, int) and x >= 0]
         return max(0, min(candidates)) if candidates else 0
 
     @staticmethod
@@ -2480,9 +2576,7 @@ class Memory:
                 if free is None or total is None:
                     mem_mod = getattr(acc, "memory", None)
                     mem_get_info = (
-                        getattr(mem_mod, "mem_get_info", None)
-                        if mem_mod is not None
-                        else None
+                        getattr(mem_mod, "mem_get_info", None) if mem_mod is not None else None
                     )
                     if callable(mem_get_info):
                         info = mem_get_info(device)
@@ -2504,9 +2598,7 @@ class Memory:
                 with contextlib.suppress(Exception):
                     mem_mod = getattr(torch.xpu, "memory", None)
                     mem_get_info = (
-                        getattr(mem_mod, "mem_get_info", None)
-                        if mem_mod is not None
-                        else None
+                        getattr(mem_mod, "mem_get_info", None) if mem_mod is not None else None
                     )
                     if not callable(mem_get_info):
                         mem_get_info = getattr(torch.xpu, "mem_get_info", None)

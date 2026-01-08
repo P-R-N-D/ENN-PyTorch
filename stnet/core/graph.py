@@ -386,12 +386,8 @@ def compile(
                         )
                         if int(local_world) > 1:
                             cpu_count = int(process_cpu_count() or 1)
-                            per_rank = max(
-                                1, int(cpu_count) // max(1, int(local_world))
-                            )
-                            _inductor_config.compile_threads = max(
-                                1, min(4, int(per_rank) // 2)
-                            )
+                            per_rank = max(1, int(cpu_count) // max(1, int(local_world)))
+                            _inductor_config.compile_threads = max(1, min(4, int(per_rank) // 2))
             except Exception:
                 pass
             if canonical_mode in {"max-autotune", "max-autotune-no-cudagraphs"}:
@@ -403,17 +399,12 @@ def compile(
                     _inductor_config.autotune_remote_cache = None
                 with suppress(Exception):
                     if (
-                        getattr(
-                            _inductor_config, "max_autotune_gemm_search_space", None
-                        )
+                        getattr(_inductor_config, "max_autotune_gemm_search_space", None)
                         is not None
                     ):
                         _inductor_config.max_autotune_gemm_search_space = "DEFAULT"
                 with suppress(Exception):
-                    if (
-                        getattr(_inductor_config, "max_autotune_pointwise", None)
-                        is not None
-                    ):
+                    if getattr(_inductor_config, "max_autotune_pointwise", None) is not None:
                         _inductor_config.max_autotune_pointwise = False
                 with suppress(Exception):
                     if getattr(_inductor_config, "max_autotune_gemm", None) is not None:
@@ -459,9 +450,7 @@ def compile(
         compile_kwargs["options"] = options_merged
     if mode_value is not None and isinstance(compile_kwargs.get("options", None), dict):
         inductor_cfg = _get_inductor_config()
-        patch = (
-            getattr(inductor_cfg, "patch", None) if inductor_cfg is not None else None
-        )
+        patch = getattr(inductor_cfg, "patch", None) if inductor_cfg is not None else None
 
         def _has_cfg_key(cfg: Any, key: str) -> bool:
             obj = cfg
@@ -597,9 +586,7 @@ def torch_compiler_disable(
     return decorator
 
 
-def compile_distributed_safe(
-    *args: Any, collectives: tuple[str, ...] = _COLLECTIVE_NAMES
-) -> bool:
+def compile_distributed_safe(*args: Any, collectives: tuple[str, ...] = _COLLECTIVE_NAMES) -> bool:
     if _TORCH_DYNAMO is None or not hasattr(_TORCH_DYNAMO, "disallow_in_graph"):
         return False
     try:
@@ -636,9 +623,7 @@ def compile_safe(
             with suppress(Exception):
                 layers_module = importlib.import_module(mod_name)
                 break
-    scaler_cls = (
-        getattr(layers_module, "Scaler", None) if layers_module is not None else None
-    )
+    scaler_cls = getattr(layers_module, "Scaler", None) if layers_module is not None else None
     if scaler_cls is None:
         for mod_name in ("stnet.nn.layers", "stnet.nn.blocks"):
             with suppress(Exception):
@@ -661,9 +646,7 @@ def compile_safe(
                 reason="Scaler uses Python-side caches/loops; keep eager",
                 recursive=False,
             )
-    history_cls = (
-        getattr(layers_module, "Recorder", None) if layers_module is not None else None
-    )
+    history_cls = getattr(layers_module, "Recorder", None) if layers_module is not None else None
     if history_cls is None:
         for mod_name in ("stnet.nn.layers", "stnet.nn.blocks"):
             with suppress(Exception):
@@ -773,9 +756,7 @@ def to_checkpoint(
         if prev_mb <= 0:
             setattr(inst, "_stnet_ckpt_pressure_min_bytes", int(min_bytes))
         else:
-            setattr(
-                inst, "_stnet_ckpt_pressure_min_bytes", int(min(prev_mb, min_bytes))
-            )
+            setattr(inst, "_stnet_ckpt_pressure_min_bytes", int(min(prev_mb, min_bytes)))
     return bool(changed)
 
 
@@ -821,12 +802,18 @@ def coerce_checkpoint(
 ) -> Any:
     if _torch_checkpoint is None:
         return fn(*args)
-    if is_export_or_trace() or not any(isinstance(a, torch.Tensor) and a.requires_grad for a in args):
+    if is_export_or_trace() or not any(
+        isinstance(a, torch.Tensor) and a.requires_grad for a in args
+    ):
         return fn(*args)
 
     use_reentrant = ckpt_kwargs.pop("use_reentrant", None)
     preserve_rng_state = ckpt_kwargs.pop("preserve_rng_state", None)
-    ck_opts = {k: v for k, v in [("use_reentrant", use_reentrant), ("preserve_rng_state", preserve_rng_state)] if v is not None}
+    ck_opts = {
+        k: v
+        for k, v in [("use_reentrant", use_reentrant), ("preserve_rng_state", preserve_rng_state)]
+        if v is not None
+    }
     for opts in [ck_opts, {k: v for k, v in ck_opts.items() if k != "use_reentrant"}, {}]:
         with suppress(TypeError):
             return _torch_checkpoint(fn, *args, **opts, **ckpt_kwargs)
