@@ -355,9 +355,18 @@ def coerce_model_config(config: ModelConfig | Dict[str, Any] | None) -> ModelCon
     device = _coerce_device(get("device", _MODEL_DEFAULTS.device), name="device")
     params: Dict[str, Any] = {}
 
-    def _f(key: str, min: float = 0.0, max: Optional[float] = None) -> None:
+    def _f(
+        key: str,
+        min: float = 0.0,
+        max: Optional[float] = None,
+        allow_none: bool = False,
+    ) -> None:
+        value = get(key, getattr(_MODEL_DEFAULTS, key))
+        if allow_none and value is None:
+            params[key] = None
+            return
         params[key] = _coerce_float(
-            get(key, getattr(_MODEL_DEFAULTS, key)),
+            value,
             name=key,
             minimum=min,
             maximum=max,
@@ -461,8 +470,8 @@ def coerce_model_config(config: ModelConfig | Dict[str, Any] | None) -> ModelCon
             )
 
     _f("p_gate_fallback_k")
-    _f("p_gate_fallback_k_low")
-    _f("p_gate_fallback_k_high")
+    _f("p_gate_fallback_k_low", allow_none=True)
+    _f("p_gate_fallback_k_high", allow_none=True)
     _i("p_gate_auto_k_interval")
     _i("p_gate_auto_k_warmup")
     _f("p_gate_auto_k_ema_alpha", max=1.0)
@@ -488,8 +497,8 @@ def coerce_model_config(config: ModelConfig | Dict[str, Any] | None) -> ModelCon
     _f("p_gate_clip_eps", max=0.49)
     _f("p_gate_eps", max=1.0)
     _f("p_gate_edge_reg_weight")
-    _f("p_gate_edge_reg_weight_low")
-    _f("p_gate_edge_reg_weight_high")
+    _f("p_gate_edge_reg_weight_low", allow_none=True)
+    _f("p_gate_edge_reg_weight_high", allow_none=True)
     _b("p_gate_edge_reg_fallback_only")
     _f("p_gate_edge_reg_frac", max=0.49)
     _f("p_gate_edge_reg_min_width_frac", max=1.0)

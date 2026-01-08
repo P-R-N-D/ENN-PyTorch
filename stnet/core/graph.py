@@ -263,6 +263,26 @@ def is_symbolic() -> bool:
     return bool(is_tracing_or_exporting() or is_compiling())
 
 
+def assert_trace(condition: object, message: str = "") -> None:
+    fn = getattr(torch, "_assert_scalar", None)
+    if callable(fn):
+        fn(condition, message)
+        return
+
+    try:
+        if isinstance(condition, torch.Tensor):
+            if condition.numel() == 1:
+                ok = bool(condition.item())
+            else:
+                ok = bool(condition.all().item())
+        else:
+            ok = bool(condition)
+    except Exception:
+        ok = False
+    if not ok:
+        raise RuntimeError(str(message))
+
+
 def canonicalize_compile_mode(mode: object | None) -> str:
     if not isinstance(mode, str):
         return "disabled"

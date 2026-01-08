@@ -55,7 +55,7 @@ from ..core.system import (
 from .schemas import (
     _FEATURE_KEY_ALIASES,
     _LABEL_KEY_ALIASES,
-    _casefold_str,
+    _resolve_key,
     canonicalize_keys_,
     default_underflow_action,
     get_row,
@@ -1511,15 +1511,10 @@ class Dataset(Generic[TExtra]):
             if bool(return_keys):
                 keys = data.get("row_ids", None) or data.get("keys", None) or ()
         elif isinstance(data, Mapping):
-            has_column_keys = False
-            for k in data.keys():
-                ck = _casefold_str(k)
-                if ck is None:
-                    continue
-                if ck in _FEATURE_KEY_ALIASES or ck in _LABEL_KEY_ALIASES:
-                    has_column_keys = True
-                    break
-            if has_column_keys:
+            if (
+                _resolve_key(data, _FEATURE_KEY_ALIASES, "feature", False) is not None
+                or _resolve_key(data, _LABEL_KEY_ALIASES, "label", False) is not None
+            ):
                 fkey = get_feature_key(data)
                 features = data.get(fkey, None)
                 lkey = get_label_key(data, required=False)

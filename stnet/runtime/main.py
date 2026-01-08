@@ -3215,6 +3215,7 @@ def epochs(
             prev_samples += float(train_samples_epoch)
     model_for_scaler = model.module if hasattr(model, "module") else model
     scaler_y_device = model_for_scaler.scaler.y_mean.device
+    scaler_y_dtype = model_for_scaler.scaler.y_mean.dtype
     with torch.no_grad():
         sum_x = None
         sum_y = None
