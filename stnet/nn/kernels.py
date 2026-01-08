@@ -84,11 +84,11 @@ def _flatten_attn_mask(
         if trace_like:
             torch._assert(mask.size(1) == S, "attn_mask S mismatch")
             torch._assert(
-                (mask.size(0) == 1) | (mask.size(0) == L),
-                "2D attn_mask must be (1,S) or (L,S) under symbolic shapes",
+                mask.size(0) == 1,
+                "2D attn_mask under symbolic shapes must be (1,S). Use 4D attn_mask for batch/len-specific masks.",
             )
-            out = mask.view(1, 1, a, S).expand(1, 1, L, S)
-            return out, 1, 1, L
+            out = mask.reshape(1, 1, 1, S)
+            return out, 1, 1, 1
         if b != S:
             raise RuntimeError(f"attn_mask S mismatch: {b} != {S}")
         if a == L:
@@ -103,13 +103,12 @@ def _flatten_attn_mask(
         a, b, c = mask.shape
         if trace_like:
             torch._assert(mask.size(2) == S, "attn_mask S mismatch")
-            if isinstance(a, int) and isinstance(H, int) and a == H and not (
-                isinstance(B, int) and a == B
-            ):
-                out = mask.view(1, H, b, S).expand(1, H, L, S)
-                return out, 1, H, L
-            out = mask.view(a, 1, b, S).expand(B, 1, L, S)
-            return out, B, 1, L
+            torch._assert(
+                (mask.size(0) == 1) & (mask.size(1) == 1),
+                "3D attn_mask under symbolic shapes must be (1,1,S). Use 4D attn_mask for batch/head/len-specific masks.",
+            )
+            out = mask.reshape(1, 1, 1, S)
+            return out, 1, 1, 1
         if c != S:
             raise RuntimeError(f"attn_mask S mismatch: {c} != {S}")
         if a == B and b == L:

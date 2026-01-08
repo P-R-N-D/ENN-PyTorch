@@ -453,7 +453,12 @@ class _OnnxLayer:
                             call_kw["dynamo"] = use_dyn
                         call_kw.pop("model", None)
                         call_kw.pop("args", None)
-                        args = sample if isinstance(sample, (list, tuple)) else (sample,)
+                        if isinstance(sample, tuple):
+                            args = sample
+                        elif isinstance(sample, list):
+                            args = tuple(sample)
+                        else:
+                            args = (sample,)
                         torch.onnx.export(model=wrapper, args=args, **call_kw)
                     if simplify:
                         with contextlib.suppress(Exception):
