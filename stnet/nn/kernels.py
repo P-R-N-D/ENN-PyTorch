@@ -16,6 +16,7 @@ from ..core.graph import (
     is_compiling,
     is_tracing_or_exporting,
     is_symbolic,
+    assert_trace,
 )
 from ..core.profiler import FLOP_PROFILER, capture
 from ..core.system import get_device, get_dpa_backends, get_runtime_config
@@ -73,7 +74,10 @@ def _flatten_attn_mask(
 
     if dim == 1:
         if trace_like:
-            torch._assert(mask.size(0) == S, "attn_mask S mismatch")
+            assert_trace(
+                mask.size(0) == S,
+                "attn_mask S mismatch",
+            )
         else:
             if mask.shape[0] != S:
                 raise RuntimeError(f"attn_mask S mismatch: {mask.shape} != {S}")
@@ -82,8 +86,11 @@ def _flatten_attn_mask(
     if dim == 2:
         a, b = mask.shape
         if trace_like:
-            torch._assert(mask.size(1) == S, "attn_mask S mismatch")
-            torch._assert(
+            assert_trace(
+                mask.size(1) == S,
+                "attn_mask S mismatch",
+            )
+            assert_trace(
                 mask.size(0) == 1,
                 "2D attn_mask under symbolic shapes must be (1,S). Use 4D attn_mask for batch/len-specific masks.",
             )
@@ -102,8 +109,11 @@ def _flatten_attn_mask(
     if dim == 3:
         a, b, c = mask.shape
         if trace_like:
-            torch._assert(mask.size(2) == S, "attn_mask S mismatch")
-            torch._assert(
+            assert_trace(
+                mask.size(2) == S,
+                "attn_mask S mismatch",
+            )
+            assert_trace(
                 (mask.size(0) == 1) & (mask.size(1) == 1),
                 "3D attn_mask under symbolic shapes must be (1,1,S). Use 4D attn_mask for batch/head/len-specific masks.",
             )
@@ -124,7 +134,10 @@ def _flatten_attn_mask(
     if dim == 4:
         b0, h0, l0, s0 = mask.shape
         if trace_like:
-            torch._assert(mask.size(3) == S, "attn_mask S mismatch")
+            assert_trace(
+                mask.size(3) == S,
+                "attn_mask S mismatch",
+            )
             _ = mask.expand(B, H, L, S)
         else:
             if s0 != S:
@@ -421,13 +434,34 @@ class DotProductAttention(nn.Module):
 
         tracing = bool(is_symbolic())
         if tracing:
-            torch._assert(q.size(0) == k.size(0), "Batch mismatch")
-            torch._assert(q.size(0) == v.size(0), "Batch mismatch")
-            torch._assert(q.size(1) == k.size(1), "Head mismatch")
-            torch._assert(q.size(1) == v.size(1), "Head mismatch")
-            torch._assert(k.size(2) == v.size(2), "K/V length mismatch")
-            torch._assert(q.size(3) == k.size(3), "Embed dim mismatch")
-            torch._assert(k.size(3) == v.size(3), "Embed dim mismatch")
+            assert_trace(
+                q.size(0) == k.size(0),
+                "Batch mismatch",
+            )
+            assert_trace(
+                q.size(0) == v.size(0),
+                "Batch mismatch",
+            )
+            assert_trace(
+                q.size(1) == k.size(1),
+                "Head mismatch",
+            )
+            assert_trace(
+                q.size(1) == v.size(1),
+                "Head mismatch",
+            )
+            assert_trace(
+                k.size(2) == v.size(2),
+                "K/V length mismatch",
+            )
+            assert_trace(
+                q.size(3) == k.size(3),
+                "Embed dim mismatch",
+            )
+            assert_trace(
+                k.size(3) == v.size(3),
+                "Embed dim mismatch",
+            )
         else:
             if not (
                 q.size(0) == k.size(0) == v.size(0)
@@ -703,8 +737,14 @@ class MultiScaleRetention(nn.Module):
             if attn_mask.shape != (B, L):
                 return v
         else:
-            torch._assert(attn_mask.shape[0] == v.shape[0], "attn_mask batch mismatch")
-            torch._assert(attn_mask.shape[1] == v.shape[1], "attn_mask length mismatch")
+            assert_trace(
+                attn_mask.shape[0] == v.shape[0],
+                "attn_mask batch mismatch",
+            )
+            assert_trace(
+                attn_mask.shape[1] == v.shape[1],
+                "attn_mask length mismatch",
+            )
 
         mask = attn_mask.to(device=v.device, non_blocking=True).unsqueeze(-1).unsqueeze(-1)
         return torch.where(mask, torch.zeros_like(v), v)
@@ -730,8 +770,14 @@ class MultiScaleRetention(nn.Module):
         if st.dim() != 3:
             return None
         if trace_like:
-            torch._assert(st.shape[0] == B, "state batch mismatch")
-            torch._assert(st.shape[1] == H, "state head mismatch")
+            assert_trace(
+                st.shape[0] == B,
+                "state batch mismatch",
+            )
+            assert_trace(
+                st.shape[1] == H,
+                "state head mismatch",
+            )
         else:
             if tuple(st.shape[:2]) != (int(B), int(H)):
                 return None
@@ -748,15 +794,24 @@ class MultiScaleRetention(nn.Module):
         B, L, H, Dh = state_tensor.shape
         trace_like = bool(is_symbolic())
         if trace_like:
-            torch._assert(L > 0, "empty sequence")
+            assert_trace(
+                L > 0,
+                "empty sequence",
+            )
         else:
             if L <= 0:
                 return state_tensor.new_zeros((B, H, Dh))
 
         if isinstance(attn_mask, torch.Tensor) and attn_mask.dim() == 2 and attn_mask.dtype is torch.bool:
             if trace_like:
-                torch._assert(attn_mask.shape[0] == B, "attn_mask batch mismatch")
-                torch._assert(attn_mask.shape[1] == L, "attn_mask length mismatch")
+                assert_trace(
+                    attn_mask.shape[0] == B,
+                    "attn_mask batch mismatch",
+                )
+                assert_trace(
+                    attn_mask.shape[1] == L,
+                    "attn_mask length mismatch",
+                )
             else:
                 if tuple(attn_mask.shape) != (B, L):
                     return state_tensor[:, -1]
@@ -771,7 +826,10 @@ class MultiScaleRetention(nn.Module):
         B, L, H, Dh = v.shape
         trace_like = bool(is_symbolic())
         if trace_like:
-            torch._assert(L > 0, "empty sequence")
+            assert_trace(
+                L > 0,
+                "empty sequence",
+            )
         else:
             if L <= 0:
                 return v.new_zeros(v.shape)
@@ -909,7 +967,10 @@ class MultiScaleRetention(nn.Module):
         if isinstance(decay_arg, torch.Tensor):
             if decay_arg.dim() == 1:
                 if trace_like:
-                    torch._assert(decay_arg.shape[0] == self.nhead, "decay[H] shape mismatch")
+                    assert_trace(
+                        decay_arg.shape[0] == self.nhead,
+                        "decay[H] shape mismatch",
+                    )
                 else:
                     if int(decay_arg.shape[0]) != int(self.nhead):
                         decay_arg = None
@@ -917,7 +978,10 @@ class MultiScaleRetention(nn.Module):
                     lam_h = decay_arg.to(dtype=v.dtype, device=v.device)
             elif decay_arg.dim() == 3:
                 if trace_like:
-                    torch._assert(decay_arg.shape[0] == self.nhead, "decay[H,*,*] shape mismatch")
+                    assert_trace(
+                        decay_arg.shape[0] == self.nhead,
+                        "decay[H,*,*] shape mismatch",
+                    )
                 else:
                     if int(decay_arg.shape[0]) != int(self.nhead):
                         decay_arg = None
