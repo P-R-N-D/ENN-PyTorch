@@ -30,6 +30,8 @@ _TORCH_COMPILER = getattr(torch, "compiler", None)
 
 _INDUCTOR_CONFIG_LOCK = threading.RLock()
 
+_CKPT_TL = threading.local()
+
 _SAFE_DIST_LOCK = threading.Lock()
 _SAFE_DIST_PATCHED: set[str] = set()
 
@@ -46,6 +48,25 @@ _NO_COMPILE_SENTINEL = "__stnet_no_compile_wrapped__"
 
 _GRAPH_BREAK_FN: Callable[[], None] | None = None
 _GRAPH_BREAK_LOCK = threading.Lock()
+
+
+@torch_compiler_disable(reason="torch.utils.checkpoint", recursive=False)
+def _checkpoint_call(
+    fn: Callable[..., Any], *args: Any, **kwargs: Any
+) -> Callable[..., Any]:
+    if _torch_checkpoint is None:
+        return fn(*args, **kwargs)
+    tl = _CKPT_TL
+
+    def _state(*a: Any, **k: Any) -> Callable[..., Any]:
+        depth = int(getattr(tl, "depth", 0) or 0)
+        setattr(tl, "depth", depth + 1)
+        try:
+            return fn(*a, **k)
+        finally:
+            setattr(tl, "depth", depth)
+
+    return _torch_checkpoint(_state, *args, **kwargs)
 
 
 def _is_compiled_for_inference(model: torch.nn.Module) -> bool:
@@ -813,28 +834,8 @@ def from_checkpoint(model: nn.Module, *args: Any, step_total: int) -> None:
         setattr(inst, "_stnet_ckpt_pressure_min_bytes", 0)
 
 
-_CKPT_TL = threading.local()
-
-
 def is_checkpoint() -> bool:
     return bool(getattr(_CKPT_TL, "depth", 0) or 0)
-
-
-@torch_compiler_disable(reason="torch.utils.checkpoint", recursive=False)
-def _checkpoint_call(fn, *args, **kwargs):
-    if _torch_checkpoint is None:
-        return fn(*args, **kwargs)
-    tl = _CKPT_TL
-
-    def _state(*a, **k):
-        depth = int(getattr(tl, "depth", 0) or 0)
-        setattr(tl, "depth", depth + 1)
-        try:
-            return fn(*a, **k)
-        finally:
-            setattr(tl, "depth", depth)
-
-    return _torch_checkpoint(_state, *args, **kwargs)
 
 
 def coerce_checkpoint(
@@ -848,16 +849,13 @@ def coerce_checkpoint(
         isinstance(a, torch.Tensor) and a.requires_grad for a in args
     ):
         return fn(*args)
-
     use_reentrant = ckpt_kwargs.pop("use_reentrant", None)
     preserve_rng_state = ckpt_kwargs.pop("preserve_rng_state", None)
     determinism_check = ckpt_kwargs.pop("determinism_check", None)
-
     if use_reentrant is None:
         use_reentrant = True
     if preserve_rng_state is None:
         preserve_rng_state = True
-
     ck_opts = {
         k: v
         for k, v in [
