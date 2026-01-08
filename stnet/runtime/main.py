@@ -42,6 +42,7 @@ from ..core.system import (
     get_affinity,
     get_device,
     init_python_path,
+    is_oom_error,
     is_cuda_bf16_supported,
     set_float32_precision,
 )
@@ -199,12 +200,15 @@ def _is_nvml_available() -> object:
     if _is_nvml_blocked() or _NVML_TRIED:
         return bool(_NVML_READY)
     if _is_nvml_disabled():
-        _NVML_TRIED = True
-        _NVML_READY = False
-        _nvml = None
+        with _NVML_LOCK:
+            _NVML_TRIED = True
+            _NVML_READY = False
+            _nvml = None
         return False
     with _NVML_LOCK:
-        if _is_nvml_blocked() or _NVML_TRIED:
+        now = float(time.perf_counter())
+        until = float(_NVML_BACKOFF_UNTIL or 0.0)
+        if (until > 0.0 and now < until) or _NVML_TRIED:
             return bool(_NVML_READY)
         _NVML_TRIED = True
         try:
@@ -2583,6 +2587,7 @@ def epochs(
                 for step_idx, _raw in enumerate(train_loader):
                     train_accum_since_last += 1
                     while True:
+                        mark_cudagraph = False
                         try:
                             with contextlib.suppress(Exception):
                                 flush_accelerator_memory_stats(device)
@@ -2629,6 +2634,7 @@ def epochs(
                                         getattr(model, "_compile_cudagraphs", False)
                                     ):
                                         cudagraph_mark_step_begin()
+                                        mark_cudagraph = True
                                     with Autocast.float(device):
                                         Y_flat = Y.reshape(Y.shape[0], -1)
                                         if Y_flat.device != device or Y_flat.dtype != param_dtype:
@@ -2908,10 +2914,6 @@ def epochs(
                                 if timer_sync:
                                     sync_accelerator(device)
                                 comp_time += (time.perf_counter_ns() - t_comp_s) / 1000000000.0
-                            if getattr(device, "type", None) == "cuda" and bool(
-                                getattr(model, "_compile_cudagraphs", False)
-                            ):
-                                cudagraph_mark_step_end()
                             if local_rank == 0 and should_sync:
                                 io_elapsed = prev_io_time + float(io_time)
                                 io_transferred = prev_io_bytes + float(io_bytes)
@@ -2977,8 +2979,7 @@ def epochs(
                                 _clear_oom_retries(train_loader, "train", step_idx)
                             break
                         except RuntimeError as e:
-                            msg = str(e).lower()
-                            if "out of memory" in msg:
+                            if is_oom_error(e):
                                 decision, grad_accum_steps = _recover_oom(
                                     phase="train",
                                     loader=train_loader,
@@ -2995,6 +2996,9 @@ def epochs(
                                 if decision == "skip":
                                     break
                             raise
+                        finally:
+                            if mark_cudagraph:
+                                cudagraph_mark_step_end()
             if lw_count > 0:
                 top_avg_t = lw_top_sum / float(lw_count) if lw_top_sum is not None else None
                 bottom_avg_t = (
@@ -3022,6 +3026,7 @@ def epochs(
                         t_fetch_start = time.perf_counter_ns()
                         for _vstep, _raw in enumerate(val_loader):
                             while True:
+                                mark_cudagraph = False
                                 try:
                                     X, Y_opt, t_ready, h2d_s = _pin(
                                         meta,
@@ -3069,6 +3074,7 @@ def epochs(
                                             getattr(model, "_compile_cudagraphs", False)
                                         ):
                                             cudagraph_mark_step_begin()
+                                            mark_cudagraph = True
                                         with Autocast.float(device):
                                             Yv_flat = Y.reshape(Y.shape[0], -1).to(
                                                 device,
@@ -3088,10 +3094,6 @@ def epochs(
                                             and _loss_val.ndim > 0
                                         ):
                                             _loss_val = _loss_val.mean()
-                                        if getattr(device, "type", None) == "cuda" and bool(
-                                            getattr(model, "_compile_cudagraphs", False)
-                                        ):
-                                            cudagraph_mark_step_end()
                                     if _loss_val is None:
                                         raise RuntimeError(
                                             "Model returned no loss value during validation. Ensure loss functions are configured correctly."
@@ -3155,8 +3157,7 @@ def epochs(
                                         _clear_oom_retries(val_loader, "val", _vstep)
                                     break
                                 except RuntimeError as e:
-                                    msg = str(e).lower()
-                                    if "out of memory" in msg:
+                                    if is_oom_error(e):
                                         decision, _ = _recover_oom(
                                             phase="val",
                                             loader=val_loader,
@@ -3173,6 +3174,9 @@ def epochs(
                                         if decision == "skip":
                                             break
                                     raise
+                                finally:
+                                    if mark_cudagraph:
+                                        cudagraph_mark_step_end()
             if is_distributed():
                 stats_dtype = (
                     param_dtype
@@ -3524,6 +3528,7 @@ def infer(
     run_model.eval()
     module_eval = run_model.module if hasattr(run_model, "module") else run_model
     distributed_sync(module_eval, device=device)
+    cg_enabled = bool(dev_type == "cuda" and getattr(module_eval, "_compile_cudagraphs", False))
     non_blocking_ok = bool(dev_type in ("cuda", "xpu"))
     pinned_ok = bool(is_pin_supported(dev_type))
     backend = accelerator_type(dev_type)
@@ -3670,11 +3675,27 @@ def infer(
                     sl = slice(start, end)
                     Xi = X[sl]
                     rows_i = row_ids[sl]
+                    n_i = int(end - start)
+                    Xi_pad = None
+                    pad_n = 0
+                    Xi_run = Xi
+                    if cg_enabled and n_i < mb:
+                        pad_n = int(mb - n_i)
+                        try:
+                            Xi_pad = Xi.new_empty((int(mb),) + tuple(Xi.shape[1:]))
+                            Xi_pad[:n_i].copy_(Xi)
+                            Xi_pad[n_i:].copy_(Xi[-1:].expand(pad_n, *tuple(Xi.shape[1:])))
+                            Xi_run = Xi_pad
+                        except Exception:
+                            Xi_pad = None
+                            pad_n = 0
+                            Xi_run = Xi
                     try:
-                        out = run_model(Xi, calibrate_output=True, return_loss=False)
+                        if cg_enabled:
+                            cudagraph_mark_step_begin()
+                        out = run_model(Xi_run, calibrate_output=True, return_loss=False)
                     except RuntimeError as e:
-                        msg = str(e).lower()
-                        if "out of memory" in msg and mb > 1:
+                        if is_oom_error(e) and mb > 1:
                             with contextlib.suppress(Exception):
                                 empty_device_cache(device=device, do_gc=False, min_interval_s=0.0)
                             mb = max(1, mb // 2)
@@ -3683,9 +3704,12 @@ def infer(
                             except Exception:
                                 pass
                             with contextlib.suppress(Exception):
-                                del Xi
+                                del Xi, Xi_pad
                             continue
                         raise
+                    finally:
+                        if cg_enabled:
+                            cudagraph_mark_step_end()
                     if isinstance(out, tuple):
                         y_hat = out[0]
                     else:
@@ -3693,9 +3717,11 @@ def infer(
                     if not isinstance(y_hat, torch.Tensor):
                         raise RuntimeError("infer: unexpected model output type")
                     preds = y_hat.detach()
+                    if pad_n > 0:
+                        preds = preds[:n_i]
                     rows_cpu = rows_i if rows_i.device.type == "cpu" else rows_i.to(device="cpu")
                     writer.append(rows_cpu, preds)
-                    del Xi, rows_i, out, y_hat, preds, rows_cpu
+                    del Xi, Xi_pad, rows_i, out, y_hat, preds, rows_cpu
                     start = end
                 if torch_prof is not None:
                     torch_prof.step()
