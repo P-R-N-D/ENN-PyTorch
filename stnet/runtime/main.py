@@ -3620,14 +3620,6 @@ def infer(
     )
     try:
         with inference_mode(run_model), Autocast.float(device):
-            def _td_predict(x: torch.Tensor) -> torch.Tensor:
-                out = run_model(x, calibrate_output=True, return_loss=False)
-                if isinstance(out, tuple):
-                    out = out[0]
-                if not isinstance(out, torch.Tensor):
-                    raise RuntimeError("infer: unexpected model output type")
-                return out.detach()
-
             td_cg_active = False
             td_cg_disabled = not bool(td_cg_candidate)
             td_cg_mb = None
@@ -3637,6 +3629,14 @@ def infer(
             td_cg_max_bs = 0
             td_cg_target = None
             td_cg_x_inner_shape = None
+        
+            def _td_predict(x: torch.Tensor) -> torch.Tensor:
+                out = run_model(x, calibrate_output=True, return_loss=False)
+                if isinstance(out, tuple):
+                    out = out[0]
+                if not isinstance(out, torch.Tensor):
+                    raise RuntimeError("infer: unexpected model output type")
+                return out.detach()
 
             def _td_benchmark(bs_now: int) -> int:
                 mb_cfg = int(getattr(model, "microbatch", 0) or 0)
@@ -3686,6 +3686,7 @@ def infer(
                     td_cg_mod = None
                     td_cg_pad_buf = None
                     td_cg_x_inner_shape = None
+
             row_ids_buf = None
             for batch in data_loader:
                 if batch is None:
