@@ -11,7 +11,13 @@ import torch._dynamo
 from torch import nn
 
 from ..core.casting import env_str, env_bool
-from ..core.graph import torch_compiler_disable, is_compiling, is_tracing_or_exporting
+from ..core.graph import (
+    torch_compiler_disable,
+    is_compiling,
+    is_tracing_or_exporting,
+    is_symbolic,
+    assert_trace,
+)
 from ..core.profiler import FLOP_PROFILER, capture
 from ..core.system import get_device, get_dpa_backends, get_runtime_config
 
@@ -20,20 +26,18 @@ try:
     import triton.language as tl
 
     _HAS_TRITON_LIB = True
+    _HAS_TRITON_MSR = bool(torch.cuda.is_available())
 except Exception:
     _HAS_TRITON_LIB = False
+    _HAS_TRITON_MSR = False
 
     class _TritonStub:
         def jit(self, fn=None, **kwargs):
-            if fn is None:
-                return lambda f: f
-            return fn
+            return fn if fn else lambda f: f
 
         @staticmethod
-        def cdiv(a: int, b: int) -> int:
-            a_i = int(a)
-            b_i = int(b)
-            return (a_i + b_i - 1) // max(1, b_i)
+        def cdiv(a, b):
+            return (int(a) + int(b) - 1) // max(1, int(b))
 
     class _TLStub:
         constexpr = object()
@@ -41,32 +45,14 @@ except Exception:
     triton = _TritonStub()
     tl = _TLStub()
 
-_HAS_TRITON_MSR = bool(_HAS_TRITON_LIB and torch.cuda.is_available())
-_HAS_TE: bool
-
-te = None
-
-_should_import_te = True
-
-if not torch.cuda.is_available():
-    _should_import_te = False
-else:
-    try:
-        device = get_device()
-    except Exception:
-        device = torch.device("cuda", 0)
-    if getattr(device, "type", "cpu") != "cuda":
-        _should_import_te = False
-if _should_import_te:
+_HAS_TE, te = False, None
+if torch.cuda.is_available() and getattr(get_device(), "type", "cpu") == "cuda":
     try:
         import transformer_engine.pytorch as te
 
         _HAS_TE = True
     except Exception:
-        te = None
-        _HAS_TE = False
-else:
-    _HAS_TE = False
+        pass
 
 
 def _flatten_attn_mask(
@@ -79,103 +65,92 @@ def _flatten_attn_mask(
     S: int,
 ) -> tuple[torch.Tensor, int, int, int]:
     del args
-    tracing_or_export = bool(is_tracing_or_exporting())
-    has_symbolic_expected = not all(isinstance(x, int) for x in (B, H, L, S))
-    has_symbolic_mask = False
-    if tracing_or_export:
-        try:
-            has_symbolic_mask = not all(isinstance(d, int) for d in mask.shape)
-        except Exception:
-            has_symbolic_mask = True
-    symbolic_shapes = bool(tracing_or_export and (has_symbolic_expected or has_symbolic_mask))
+    trace_like = bool(is_symbolic())
+    mask = mask.to(device)
+    dim = mask.dim()
 
-    if mask.dim() == 0:
-        m = mask.to(device=device).view(1, 1, 1, 1)
-        m = m.expand(1, 1, 1, S)
-        return m, 1, 1, 1
-    if mask.dim() == 1:
-        if (not tracing_or_export) and mask.shape[0] != S:
-            raise RuntimeError(
-                f"attn_mask shape {tuple(mask.shape)} incompatible with key length S={int(S)}"
+    if dim == 0:
+        return mask.view(1, 1, 1, 1).expand(1, 1, 1, S), 1, 1, 1
+
+    if dim == 1:
+        if trace_like:
+            assert_trace(
+                mask.size(0) == S,
+                "attn_mask S mismatch",
             )
-        if (tracing_or_export and (not symbolic_shapes)) and mask.shape[0] != S:
-            raise RuntimeError(
-                f"attn_mask shape {tuple(mask.shape)} incompatible with key length S={int(S)}"
-            )
-        m = mask.to(device=device).view(1, 1, 1, mask.shape[0])
-        return m, 1, 1, 1
-    if mask.dim() == 2:
-        if tracing_or_export and symbolic_shapes:
-            raise RuntimeError(
-                "2D attn_mask is ambiguous under symbolic-shape export. "
-                "Pass a 4D mask with explicit semantics instead: "
-                "padding (B,1,1,S) or attn (1,1,L,S)."
-            )
+        else:
+            if mask.shape[0] != S:
+                raise RuntimeError(f"attn_mask S mismatch: {mask.shape} != {S}")
+        return mask.view(1, 1, 1, mask.shape[0]), 1, 1, 1
+
+    if dim == 2:
         a, b = mask.shape
+        if trace_like:
+            assert_trace(
+                mask.size(1) == S,
+                "attn_mask S mismatch",
+            )
+            assert_trace(
+                mask.size(0) == 1,
+                "2D attn_mask under symbolic shapes must be (1,S). Use 4D attn_mask for batch/len-specific masks.",
+            )
+            out = mask.reshape(1, 1, 1, S)
+            return out, 1, 1, 1
         if b != S:
-            raise RuntimeError(
-                f"attn_mask trailing dim {b} does not match expected S={int(S)}"
-            )
+            raise RuntimeError(f"attn_mask S mismatch: {b} != {S}")
         if a == L:
-            m = mask.to(device=device).view(1, 1, L, S)
-            return m, 1, 1, L
+            return mask.view(1, 1, L, S), 1, 1, L
         if a == 1:
-            m = mask.to(device=device).view(1, 1, 1, S)
-            return m, 1, 1, 1
+            return mask.view(1, 1, 1, S), 1, 1, 1
         if a == B:
-            m = mask.to(device=device).view(B, 1, 1, S)
-            return m, B, 1, 1
-        raise RuntimeError(
-            f"unsupported 2D attn_mask shape {tuple(mask.shape)} for (B={int(B)}, L={int(L)}, S={int(S)})"
-        )
-    if mask.dim() == 3:
-        if tracing_or_export and symbolic_shapes:
-            raise RuntimeError(
-                "3D attn_mask is ambiguous under symbolic-shape export. "
-                "Pass a 4D mask with explicit semantics instead: "
-                "(B,1,L,S), (B,1,1,S), (1,H,L,S), or (B,H,1,S)."
-            )
+            return mask.view(B, 1, 1, S), B, 1, 1
+        raise RuntimeError(f"Unsupported 2D mask {mask.shape} for B={B},L={L}")
+
+    if dim == 3:
         a, b, c = mask.shape
+        if trace_like:
+            assert_trace(
+                mask.size(2) == S,
+                "attn_mask S mismatch",
+            )
+            assert_trace(
+                (mask.size(0) == 1) & (mask.size(1) == 1),
+                "3D attn_mask under symbolic shapes must be (1,1,S). Use 4D attn_mask for batch/head/len-specific masks.",
+            )
+            out = mask.reshape(1, 1, 1, S)
+            return out, 1, 1, 1
         if c != S:
-            raise RuntimeError(
-                f"attn_mask trailing dim {c} does not match expected S={int(S)}"
-            )
-        if (a == B) and (b == L):
-            m = mask.to(device=device).view(B, 1, L, S)
-            return m, B, 1, L
-        if (a == B) and (b == 1):
-            m = mask.to(device=device).view(B, 1, 1, S)
-            return m, B, 1, 1
-        if (a == H) and (b == L):
-            m = mask.to(device=device).view(1, H, L, S)
-            return m, 1, H, L
-        if (a == B) and (b == H):
-            m = mask.to(device=device).view(B, H, 1, S)
-            return m, B, H, 1
-        raise RuntimeError(
-            f"unsupported 3D attn_mask shape {tuple(mask.shape)} for (B={int(B)}, H={int(H)}, L={int(L)}, S={int(S)})"
-        )
-    if mask.dim() == 4:
+            raise RuntimeError(f"attn_mask S mismatch: {c} != {S}")
+        if a == B and b == L:
+            return mask.view(B, 1, L, S), B, 1, L
+        if a == B and b == 1:
+            return mask.view(B, 1, 1, S), B, 1, 1
+        if a == H and b == L:
+            return mask.view(1, H, L, S), 1, H, L
+        if a == B and b == H:
+            return mask.view(B, H, 1, S), B, H, 1
+        raise RuntimeError(f"Unsupported 3D mask {mask.shape}")
+
+    if dim == 4:
         b0, h0, l0, s0 = mask.shape
-        if (not tracing_or_export) and s0 != S:
-            raise RuntimeError(
-                f"attn_mask trailing dim {s0} does not match expected S={int(S)}"
+        if trace_like:
+            assert_trace(
+                mask.size(3) == S,
+                "attn_mask S mismatch",
             )
-        if (not tracing_or_export) and b0 not in (1, B):
-            raise RuntimeError(f"attn_mask batch dim {b0} incompatible with B={int(B)}")
-        if (not tracing_or_export) and h0 not in (1, H):
-            raise RuntimeError(f"attn_mask head dim {h0} incompatible with H={int(H)}")
-        if (not tracing_or_export) and l0 not in (1, L):
-            raise RuntimeError(
-                f"attn_mask query dim {l0} incompatible with L={int(L)} (broadcast 1 or L allowed)"
-            )
-        if (tracing_or_export and (not symbolic_shapes)) and s0 != S:
-            raise RuntimeError(
-                f"attn_mask trailing dim {s0} does not match expected S={int(S)}"
-            )
-        m = mask.to(device=device)
-        return m, b0, h0, l0
-    raise RuntimeError(f"attn_mask rank {int(mask.dim())} not supported")
+            _ = mask.expand(B, H, L, S)
+        else:
+            if s0 != S:
+                raise RuntimeError(f"attn_mask S mismatch: {s0} != {S}")
+            if b0 not in (1, B):
+                raise RuntimeError(f"Batch mismatch {b0} != {B}")
+            if h0 not in (1, H):
+                raise RuntimeError(f"Head mismatch {h0} != {H}")
+            if l0 not in (1, L):
+                raise RuntimeError(f"Len mismatch {l0} != {L}")
+        return mask, b0, h0, l0
+
+    raise RuntimeError(f"attn_mask rank {dim} not supported")
 
 
 def _compute_flops_msr(
@@ -204,48 +179,31 @@ def _compute_flops_mha(
     label: str = "MultiHeadAttention",
 ) -> None:
     try:
-        if FLOP_PROFILER is None:
+        if FLOP_PROFILER is None or torch.jit.is_tracing() or torch.jit.is_scripting():
             return
-        if torch.jit.is_tracing() or torch.jit.is_scripting():
+        if torch.compiler.is_compiling():
             return
-        try:
-            if torch.compiler.is_compiling():
-                return
-        except Exception:
-            pass
-    except Exception:
-        pass
+    except:
+        return
+
     try:
-        if batch_first:
-            if query.dim() < 3 or key.dim() < 3:
-                return
-            B = query.size(0)
-            Lq = query.size(1)
-            Sk = key.size(1)
-        else:
-            if query.dim() < 3 or key.dim() < 3:
-                return
-            Lq = query.size(0)
-            B = query.size(1)
-            Sk = key.size(0)
-        H = int(num_heads)
-        E = int(embed_dim)
-        if B <= 0 or Lq <= 0 or Sk <= 0 or H <= 0 or E <= 0:
+        if query.dim() < 3 or key.dim() < 3:
             return
-        if E % H != 0:
+        B, Lq, Sk = (
+            (query.size(0), query.size(1), key.size(1))
+            if batch_first
+            else (query.size(1), query.size(0), key.size(0))
+        )
+        H, E = int(num_heads), int(embed_dim)
+        if B <= 0 or Lq <= 0 or Sk <= 0 or H <= 0 or E <= 0 or E % H != 0:
             return
+
         Dh = E // H
         core = 2.0 * B * H * Lq * Dh * Sk + 2.0 * B * H * Lq * Sk * Dh
         proj = 0.0
         if include_projections:
-            q_tokens = float(B * Lq)
-            k_tokens = float(B * Sk)
-            v_tokens = float(B * Sk)
-            out_tokens = float(B * Lq)
-            proj = 2.0 * q_tokens * E * E
-            proj += 2.0 * k_tokens * E * E
-            proj += 2.0 * v_tokens * E * E
-            proj += 2.0 * out_tokens * E * E
+            tokens = float(B) * torch.tensor([Lq, Sk, Sk, Lq], dtype=torch.float32).sum()
+            proj = 2.0 * float(tokens) * E * E
         FLOP_PROFILER.add(label, float(core + proj))
     except Exception:
         pass
@@ -267,19 +225,15 @@ def _call_mha_compat(
     kw_variants: tuple[dict[str, Any], ...] = (call_kwargs,)
     if "average_attn_weights" in call_kwargs:
         no_avg = dict(call_kwargs)
-        no_avg.pop("average_attn_weights", None)
+        del no_avg["average_attn_weights"]
         kw_variants = (call_kwargs, no_avg)
-    if is_causal is not None:
-        for kw in kw_variants:
-            try:
-                return mha(q, k, v, is_causal=is_causal, **kw)
-            except TypeError:
-                pass
+
+    is_causal_arg = {"is_causal": is_causal} if is_causal is not None else {}
     for kw in kw_variants:
-        try:
+        with contextlib.suppress(TypeError):
+            return mha(q, k, v, **is_causal_arg, **kw)
+        with contextlib.suppress(TypeError):
             return mha(q, k, v, **kw)
-        except TypeError:
-            pass
     return mha(q, k, v, **call_kwargs)
 
 
@@ -401,14 +355,8 @@ def reshape_for_mha(
     head_dim: int,
 ) -> torch.Tensor:
     if x.dim() != 3:
-        raise ValueError(
-            f"reshape_for_mha expects a 3D tensor (B,N,E), got shape={tuple(x.shape)}"
-        )
-    return (
-        x.reshape(int(batch), -1, int(heads), int(head_dim))
-        .transpose(1, 2)
-        .contiguous()
-    )
+        raise ValueError(f"reshape_for_mha expects a 3D tensor (B,N,E), got shape={tuple(x.shape)}")
+    return x.reshape(int(batch), -1, int(heads), int(head_dim)).transpose(1, 2).contiguous()
 
 
 class DotProductAttention(nn.Module):
@@ -423,56 +371,37 @@ class DotProductAttention(nn.Module):
         self.hd = int(head_dim) if head_dim is not None else None
         cfg = get_runtime_config()
         self.te_first = bool(cfg.te_first) if te_first is None else bool(te_first)
-        ok, te_mod = self._is_nvidia_te_available()
         self._te_ok = bool(
-            ok
+            _HAS_TE
             and torch.cuda.is_available()
             and _is_nvidia_te_supported()
-            and (self.nh is not None)
-            and (self.hd is not None)
+            and self.nh
+            and self.hd
         )
         self._force_pt: bool = False
-        self._te_attn: Any = None
-        self._te_forward_signature: inspect.Signature | None = None
-        self._te_mask_param: str | None = None
-        self._te_mask_type_param: str | None = None
-        self._te_core_bias_param: str | None = None
-        self._te_core_bias_type_param: str | None = None
-        self._te_supports_mask = False
-        self._te_supports_mask_type = False
-        self._te_supports_core_bias = False
-        self._te_supports_core_bias_type = False
-        self._te_supports_attention_dropout = False
-        self._te_supports_is_causal = False
-        self._te_supports_training = False
+        self._te_attn, self._te_mask_param, self._te_mask_type_param = None, None, None
+
         if self._te_ok:
-            self._te = te_mod
+            self._te = te
             try:
-                self._te_attn = te_mod.DotProductAttention(
+                self._te_attn = te.DotProductAttention(
                     num_attention_heads=self.nh,
                     kv_channels=self.hd,
                     qkv_format="bshd",
                     attention_dropout=0.0,
                 )
             except Exception:
-                self._te_attn = None
-                self._force_pt = True
+                self._te_attn, self._force_pt = None, True
+
             if self._te_attn is not None:
                 _forward = getattr(
-                    self._te_attn,
-                    "forward",
-                    getattr(self._te_attn, "__call__", None),
+                    self._te_attn, "forward", getattr(self._te_attn, "__call__", None)
                 )
-                if _forward is not None:
-                    try:
-                        self._te_forward_signature = inspect.signature(_forward)
-                    except (TypeError, ValueError):
-                        self._te_forward_signature = None
-                params = (
-                    self._te_forward_signature.parameters
-                    if self._te_forward_signature
-                    else {}
-                )
+                try:
+                    self._te_forward_signature = inspect.signature(_forward) if _forward else None
+                except:
+                    self._te_forward_signature = None
+                params = self._te_forward_signature.parameters if self._te_forward_signature else {}
                 if "attention_mask" in params:
                     self._te_mask_param = "attention_mask"
                 elif "attn_mask" in params:
@@ -481,28 +410,11 @@ class DotProductAttention(nn.Module):
                     self._te_mask_type_param = "attn_mask_type"
                 elif "attention_mask_type" in params:
                     self._te_mask_type_param = "attention_mask_type"
-                if "core_attention_bias" in params:
-                    self._te_core_bias_param = "core_attention_bias"
-                if "core_attention_bias_type" in params:
-                    self._te_core_bias_type_param = "core_attention_bias_type"
                 self._te_supports_mask = self._te_mask_param is not None
                 self._te_supports_mask_type = self._te_mask_type_param is not None
-                self._te_supports_core_bias = self._te_core_bias_param is not None
-                self._te_supports_core_bias_type = (
-                    self._te_core_bias_type_param is not None
-                )
                 self._te_supports_attention_dropout = "attention_dropout" in params
                 self._te_supports_is_causal = "is_causal" in params
                 self._te_supports_training = "training" in params
-
-    @staticmethod
-    def _is_nvidia_te_available() -> Any:
-        try:
-            import transformer_engine.pytorch as te_mod
-
-            return (True, te_mod)
-        except Exception:
-            return (False, None)
 
     def forward(
         self,
@@ -518,136 +430,124 @@ class DotProductAttention(nn.Module):
     ) -> torch.Tensor:
         training = bool(training) if training is not None else self.training
         if q.dim() != 4 or k.dim() != 4 or v.dim() != 4:
-            raise ValueError(
-                f"DotProductAttention expects q/k/v to be 4D (B,H,L,D), got "
-                f"q={tuple(q.shape)}, k={tuple(k.shape)}, v={tuple(v.shape)}"
+            raise ValueError(f"DPA expects 4D inputs, got {q.shape}, {k.shape}, {v.shape}")
+
+        tracing = bool(is_symbolic())
+        if tracing:
+            assert_trace(
+                q.size(0) == k.size(0),
+                "Batch mismatch",
             )
-        Bq, Hq, Lq, Dq = q.shape
-        Bk, Hk, Lk, Dk = k.shape
-        Bv, Hv, Lv, Dv = v.shape
-        tracing = bool(is_tracing_or_exporting())
-        if (not tracing) and (Bq != Bk or Hq != Hk or Bq != Bv or Hq != Hv):
-            raise ValueError(
-                "DotProductAttention expects matching batch and head dims for q/k/v, "
-                f"got q={tuple(q.shape)}, k={tuple(k.shape)}, v={tuple(v.shape)}"
+            assert_trace(
+                q.size(0) == v.size(0),
+                "Batch mismatch",
             )
-        if (not tracing) and Lk != Lv:
-            raise ValueError(
-                "DotProductAttention expects matching sequence length for k and v, "
-                f"got k={tuple(k.shape)}, v={tuple(v.shape)}"
+            assert_trace(
+                q.size(1) == k.size(1),
+                "Head mismatch",
             )
-        if (not tracing) and (Dq != Dk):
-            raise ValueError(
-                "DotProductAttention expects matching embedding dims for q and k, "
-                f"got q={tuple(q.shape)}, k={tuple(k.shape)}"
+            assert_trace(
+                q.size(1) == v.size(1),
+                "Head mismatch",
             )
-        if (not tracing) and Dk != Dv:
-            raise ValueError(
-                "DotProductAttention expects matching embedding dims for k and v, "
-                f"got k={tuple(k.shape)}, v={tuple(v.shape)}"
+            assert_trace(
+                k.size(2) == v.size(2),
+                "K/V length mismatch",
             )
-        q = self._negotiate_dtype(q)
-        k = self._negotiate_dtype(k)
-        v = self._negotiate_dtype(v)
-        q_bshd = q.contiguous()
-        k_bshd = k.contiguous()
-        v_bshd = v.contiguous()
-        if (not tracing) and _is_bshd_contiguous(q_bshd) and _is_bshd_contiguous(k_bshd):
-            try:
+            assert_trace(
+                q.size(3) == k.size(3),
+                "Embed dim mismatch",
+            )
+            assert_trace(
+                k.size(3) == v.size(3),
+                "Embed dim mismatch",
+            )
+        else:
+            if not (
+                q.size(0) == k.size(0) == v.size(0)
+                and q.size(1) == k.size(1) == v.size(1)
+            ):
+                raise ValueError("Batch/Head mismatch")
+            if k.size(2) != v.size(2):
+                raise ValueError("K/V length mismatch")
+            if q.size(3) != k.size(3) or k.size(3) != v.size(3):
+                raise ValueError("Embed dim mismatch")
+
+        q_bshd, k_bshd, v_bshd = [self._negotiate_dtype(t).contiguous() for t in (q, k, v)]
+        if not tracing and _is_bshd_contiguous(q_bshd) and _is_bshd_contiguous(k_bshd):
+            with contextlib.suppress(Exception):
                 capture(
                     q_bshd,
                     bwd_factor=2.0 if training else 0.0,
                     dropout_p=float(dropout_p),
                     training=training,
                 )
-            except Exception:
-                pass
+
         dropout_val = float(dropout_p) if training else 0.0
         B, H, L, D = q_bshd.shape
         S = k_bshd.shape[2]
-        mask_bool: torch.Tensor | None = None
-        bias_float: torch.Tensor | None = None
+        mask_bool, bias_float = None, None
+
         if attn_mask is not None:
             m = attn_mask
             if m.dtype == torch.bool:
                 mask_bool = m
             elif torch.is_floating_point(m):
                 bias_float = m
-            elif m.dtype in (
-                torch.int8,
-                torch.int16,
-                torch.int32,
-                torch.int64,
-                torch.uint8,
-            ):
-                try:
-                    sampled = m if m.numel() <= 4096 else m.reshape(-1)[:4096]
-                    uniq = torch.unique(sampled)
-                except Exception:
-                    uniq = torch.tensor([], device=m.device, dtype=m.dtype)
-                if uniq.numel() <= 2 and bool(((uniq == 0) | (uniq == 1)).all().item()):
+            else:
+                if tracing:
                     mask_bool = m != 0
                 else:
-                    bias_float = m.to(dtype=q_bshd.dtype)
-            else:
-                mask_bool = m.to(torch.bool)
+                    try:
+                        uniq = torch.unique(m if m.numel() <= 4096 else m.reshape(-1)[:4096])
+                    except Exception:
+                        uniq = torch.tensor([], device=m.device, dtype=m.dtype)
+                    if uniq.numel() <= 2 and bool(((uniq == 0) | (uniq == 1)).all().item()):
+                        mask_bool = m != 0
+                    else:
+                        bias_float = m.to(dtype=q_bshd.dtype)
+
         mb = mh = mL = 0
-        bb = bh = bL = 0
         if mask_bool is not None:
-            mask_bool = mask_bool.to(
-                device=q_bshd.device, dtype=torch.bool, non_blocking=True
-            )
+            mask_bool = mask_bool.to(device=q_bshd.device, dtype=torch.bool, non_blocking=True)
             mask_bool, mb, mh, mL = _flatten_attn_mask(
-                mask_bool,
-                device=q_bshd.device,
-                B=B,
-                H=H,
-                L=L,
-                S=S,
+                mask_bool, device=q_bshd.device, B=B, H=H, L=L, S=S
             )
-            if (not tracing) and int(mh) == 1 and int(mL) == int(L):
-                try:
+            if not tracing and int(mh) == 1 and int(mL) == int(L):
+                with contextlib.suppress(Exception):
                     if int(mask_bool.stride(-2)) == 0:
-                        mask_bool = mask_bool[..., :1, :]
-                        mL = 1
-                except Exception:
-                    pass
+                        mask_bool, mL = mask_bool[..., :1, :], 1
+
         if bias_float is not None:
-            bias_float = bias_float.to(
-                device=q_bshd.device, dtype=q_bshd.dtype, non_blocking=True
+            bias_float = bias_float.to(device=q_bshd.device, dtype=q_bshd.dtype, non_blocking=True)
+            bias_float, _, _, _ = _flatten_attn_mask(
+                bias_float, device=q_bshd.device, B=B, H=H, L=L, S=S
             )
-            bias_float, bb, bh, bL = _flatten_attn_mask(
-                bias_float,
-                device=q_bshd.device,
-                B=B,
-                H=H,
-                L=L,
-                S=S,
-            )
+
         try:
             is_compiling = torch.compiler.is_compiling()
-        except Exception:
+        except:
             is_compiling = False
+
         use_te = (
             self._te_ok
             and self.te_first
             and not self._force_pt
-            and (self._te_attn is not None)
+            and self._te_attn is not None
             and not is_compiling
-            and (not tracing)
+            and not tracing
             and q_bshd.is_cuda
             and q_bshd.dtype in (torch.float16, torch.bfloat16)
         )
-        te_mask: torch.Tensor | None = None
-        te_mask_type: str | None = None
+        te_mask, te_mask_type = None, None
+
         if use_te:
             if bias_float is not None:
                 use_te = False
             elif mask_bool is None:
                 te_mask_type = "causal" if bool(is_causal) else "no_mask"
             else:
-                is_padding_like = (int(mh) == 1) and (int(mL) == 1)
-                if not is_padding_like:
+                if not (int(mh) == 1 and int(mL) == 1):
                     use_te = False
                 else:
                     te_mask = mask_bool
@@ -655,18 +555,20 @@ class DotProductAttention(nn.Module):
                         te_mask = te_mask.expand(int(B), 1, 1, int(S))
                     te_mask = te_mask.contiguous()
                     te_mask_type = "padding_causal" if bool(is_causal) else "padding"
-            if use_te and (te_mask is not None):
-                if not self._te_supports_mask:
-                    use_te = False
-                elif te_mask_type is not None and te_mask_type.startswith("padding"):
-                    if not (
-                        self._te_supports_mask_type
-                        and (self._te_mask_type_param is not None)
-                    ):
-                        use_te = False
+            if use_te and te_mask is not None and not self._te_supports_mask:
+                use_te = False
+            if (
+                use_te
+                and te_mask is not None
+                and te_mask_type
+                and te_mask_type.startswith("padding")
+                and not (self._te_supports_mask_type and self._te_mask_type_param)
+            ):
+                use_te = False
             if use_te and (te_mask is None) and bool(is_causal):
                 if not (self._te_supports_mask_type or self._te_supports_is_causal):
                     use_te = False
+
         if use_te:
             q_te = q_bshd.transpose(1, 2).contiguous()
             k_te = k_bshd.transpose(1, 2).contiguous()
@@ -695,13 +597,13 @@ class DotProductAttention(nn.Module):
                 out_te = out_te.transpose(1, 2).contiguous()
                 try:
                     B_, H_, L_, D_ = q_bshd.shape
-                    S_ = k_bshd.shape[2]
-                    flops = 2.0 * B_ * H_ * L_ * D_ * S_ + 2.0 * B_ * H_ * L_ * S_ * D_
-                    if (FLOP_PROFILER is not None) and (not tracing):
+                    flops = 4.0 * B_ * H_ * L_ * k_bshd.shape[2] * D_
+                    if FLOP_PROFILER is not None and not tracing:
                         FLOP_PROFILER.add("DotProductAttention", float(flops))
-                except Exception:
+                except:
                     pass
                 return out_te
+
         final_mask: torch.Tensor | None = None
         sdpa_is_causal = bool(is_causal)
         if bias_float is None:
@@ -714,72 +616,58 @@ class DotProductAttention(nn.Module):
             if mask_bool is None:
                 final_mask = bias_float
             else:
-                finfo = torch.finfo(q_bshd.dtype)
-                zero = torch.zeros((), dtype=q_bshd.dtype, device=q_bshd.device)
-                neg_inf = torch.full(
-                    (), finfo.min, dtype=q_bshd.dtype, device=q_bshd.device
+                mask_bias = torch.where(
+                    mask_bool,
+                    torch.full(
+                        (), torch.finfo(q_bshd.dtype).min, dtype=q_bshd.dtype, device=q_bshd.device
+                    ),
+                    torch.zeros((), dtype=q_bshd.dtype, device=q_bshd.device),
                 )
-                mask_bias = torch.where(mask_bool, neg_inf, zero)
                 final_mask = (mask_bias + bias_float).contiguous()
             sdpa_is_causal = False
+
         sdpa_kwargs = {
             "attn_mask": final_mask,
             "dropout_p": dropout_val,
             "is_causal": bool(sdpa_is_causal),
         }
-        q_bhsd = q_bshd.contiguous()
-        k_bhsd = k_bshd.contiguous()
-        v_bhsd = v_bshd.contiguous()
-        B, H, _, _ = q_bhsd.shape
-        L2 = q_bhsd.shape[2]
-        S2 = k_bhsd.shape[2]
-        fm = sdpa_kwargs["attn_mask"]
+        fm = final_mask
         if fm is not None:
-            if fm.dtype is torch.bool:
-                fm = fm.to(device=q_bhsd.device, non_blocking=True)
-            else:
-                fm = fm.to(device=q_bhsd.device, dtype=q_bhsd.dtype, non_blocking=True)
-            fm, batch_dim, head_count, _qdim = _flatten_attn_mask(
-                fm,
-                device=q_bhsd.device,
-                B=B,
-                H=H,
-                L=L2,
-                S=S2,
+            fm = fm.to(
+                device=q_bshd.device,
+                dtype=q_bshd.dtype if not fm.dtype is torch.bool else torch.bool,
+                non_blocking=True,
             )
-            if (not tracing) and batch_dim not in (1, B):
-                raise RuntimeError(
-                    f"attn_mask batch dimension {batch_dim} incompatible with batch {B}"
-                )
-            if (not tracing) and head_count not in (1, H):
-                raise RuntimeError(
-                    f"attn_mask head count {head_count} incompatible with num_heads {H}"
-                )
-            sdpa_kwargs["attn_mask"] = fm
+            sdpa_kwargs["attn_mask"], bd, hd, _ = _flatten_attn_mask(
+                fm, device=q_bshd.device, B=B, H=H, L=q_bshd.shape[2], S=k_bshd.shape[2]
+            )
+            if not tracing and (bd not in (1, B) or hd not in (1, H)):
+                raise RuntimeError("Attn mask mismatch")
             sdpa_kwargs["is_causal"] = False
-        backends = get_dpa_backends()
-        sdpa_out: Optional[torch.Tensor] = None
-        if backends:
-            try:
-                from torch.nn.attention import sdpa_kernel
-            except Exception:
-                backends = []
-        if backends:
-            with sdpa_kernel(backends):
-                sdpa_out = torch.nn.functional.scaled_dot_product_attention(
-                    q_bhsd, k_bhsd, v_bhsd, **sdpa_kwargs
-                )
+
+        sdpa_out = None
+        backends = get_dpa_backends() or []
+        try:
+            from torch.nn.attention import sdpa_kernel
+
+            if backends:
+                with sdpa_kernel(backends):
+                    sdpa_out = torch.nn.functional.scaled_dot_product_attention(
+                        q_bshd, k_bshd, v_bshd, **sdpa_kwargs
+                    )
+        except:
+            pass
+
         if sdpa_out is None:
             sdpa_out = torch.nn.functional.scaled_dot_product_attention(
-                q_bhsd, k_bhsd, v_bhsd, **sdpa_kwargs
+                q_bshd, k_bshd, v_bshd, **sdpa_kwargs
             )
+
         try:
-            B_, H_, L_, D_ = q_bhsd.shape
-            S_ = k_bhsd.shape[2]
-            flops = 2.0 * B_ * H_ * L_ * D_ * S_ + 2.0 * B_ * H_ * L_ * S_ * D_
-            if (FLOP_PROFILER is not None) and (not tracing):
+            flops = 4.0 * B * H * q_bshd.shape[2] * k_bshd.shape[2] * D
+            if FLOP_PROFILER is not None and not tracing:
                 FLOP_PROFILER.add("DotProductAttention", float(flops))
-        except Exception:
+        except:
             pass
         return sdpa_out
 
@@ -807,9 +695,7 @@ class MultiScaleRetention(nn.Module):
         self.q_proj = nn.Linear(self.d_model, self.d_model, bias=False)
         self.v_proj = nn.Linear(self.d_model, self.d_model, bias=False)
         self.o_proj = nn.Linear(self.d_model, self.d_model, bias=False)
-        self.g_proj = (
-            nn.Linear(self.d_model, self.d_model, bias=False) if self.use_gate else None
-        )
+        self.g_proj = nn.Linear(self.d_model, self.d_model, bias=False) if self.use_gate else None
         self.norm = nn.LayerNorm(self.d_model)
         self._triton_ok = bool(_HAS_TRITON_MSR and torch.cuda.is_available())
         self._decay_init = 5.0
@@ -823,40 +709,48 @@ class MultiScaleRetention(nn.Module):
     def _decay_lambda(self, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
         H = int(self.nhead)
         calc_dtype = dtype if dtype in (torch.float32, torch.float64) else torch.float32
-        beta_param = getattr(self, "_beta", None)
-        tracing = bool(is_tracing_or_exporting())
-        if isinstance(beta_param, torch.Tensor) and (tracing or beta_param.numel() == H):
-            beta_h = beta_param.to(device=device, dtype=calc_dtype)
-        else:
-            heads = torch.arange(H, device=device, dtype=calc_dtype)
-            denom = float(max(H, 1))
-            beta_h = float(self._decay_init) + float(self._decay_range) * (
-                heads / denom
+
+        beta = getattr(self, "_beta", None)
+        if not (
+            isinstance(beta, torch.Tensor) and (is_tracing_or_exporting() or beta.numel() == H)
+        ):
+            beta = float(self._decay_init) + float(self._decay_range) * (
+                torch.arange(H, device=device, dtype=calc_dtype) / float(max(H, 1))
             )
-        gammas = 1.0 - torch.pow(2.0, -beta_h)
-        gammas = gammas.clamp(min=torch.finfo(calc_dtype).tiny, max=1.0 - 1e-9)
+
+        gammas = (1.0 - torch.pow(2.0, -beta.to(device=device, dtype=calc_dtype))).clamp(
+            min=torch.finfo(calc_dtype).tiny, max=1.0 - 1e-9
+        )
         if calc_dtype != dtype:
             gammas = gammas.to(dtype=dtype)
         return gammas
 
     @staticmethod
-    def _apply_kpm_to_v(
-        v: torch.Tensor, attn_mask: torch.Tensor | None
-    ) -> torch.Tensor:
+    def _apply_kpm_to_v(v: torch.Tensor, attn_mask: torch.Tensor | None) -> torch.Tensor:
         if not isinstance(attn_mask, torch.Tensor):
             return v
         if attn_mask.dim() != 2 or attn_mask.dtype is not torch.bool:
             return v
-        B, L = int(v.shape[0]), int(v.shape[1])
-        if attn_mask.shape != (B, L):
-            return v
-        mask = attn_mask.to(device=v.device).unsqueeze(-1).unsqueeze(-1)
+        trace_like = bool(is_symbolic())
+        if not trace_like:
+            B, L = int(v.shape[0]), int(v.shape[1])
+            if attn_mask.shape != (B, L):
+                return v
+        else:
+            assert_trace(
+                attn_mask.shape[0] == v.shape[0],
+                "attn_mask batch mismatch",
+            )
+            assert_trace(
+                attn_mask.shape[1] == v.shape[1],
+                "attn_mask length mismatch",
+            )
+
+        mask = attn_mask.to(device=v.device, non_blocking=True).unsqueeze(-1).unsqueeze(-1)
         return torch.where(mask, torch.zeros_like(v), v)
 
     @staticmethod
-    def _extract_state_tensor(
-        state: Any, *args: Any, B: int, H: int
-    ) -> Optional[torch.Tensor]:
+    def _extract_state_tensor(state: Any, *args: Any, B: int, H: int) -> Optional[torch.Tensor]:
         if state is None:
             return None
         st: Optional[torch.Tensor] = None
@@ -870,12 +764,23 @@ class MultiScaleRetention(nn.Module):
                     break
         if st is None:
             return None
-        if st.dim() == 4 and int(st.shape[2]) == 1:
-            st = st[:, :, 0, :]
+        trace_like = bool(is_symbolic())
+        if st.dim() == 4:
+            st = st.squeeze(2)
         if st.dim() != 3:
             return None
-        if tuple(st.shape[:2]) != (int(B), int(H)):
-            return None
+        if trace_like:
+            assert_trace(
+                st.shape[0] == B,
+                "state batch mismatch",
+            )
+            assert_trace(
+                st.shape[1] == H,
+                "state head mismatch",
+            )
+        else:
+            if tuple(st.shape[:2]) != (int(B), int(H)):
+                return None
         return st
 
     @staticmethod
@@ -887,17 +792,31 @@ class MultiScaleRetention(nn.Module):
                 f"_select_last_state expects (B,L,H,Dh), got {tuple(state_tensor.shape)}"
             )
         B, L, H, Dh = state_tensor.shape
-        tracing = bool(is_tracing_or_exporting())
-        if (not tracing) and L <= 0:
-            return state_tensor.new_zeros((B, H, Dh))
-        if (
-            isinstance(attn_mask, torch.Tensor)
-            and attn_mask.dim() == 2
-            and attn_mask.dtype is torch.bool
-            and tuple(attn_mask.shape) == (B, L)
-        ):
+        trace_like = bool(is_symbolic())
+        if trace_like:
+            assert_trace(
+                L > 0,
+                "empty sequence",
+            )
+        else:
+            if L <= 0:
+                return state_tensor.new_zeros((B, H, Dh))
+
+        if isinstance(attn_mask, torch.Tensor) and attn_mask.dim() == 2 and attn_mask.dtype is torch.bool:
+            if trace_like:
+                assert_trace(
+                    attn_mask.shape[0] == B,
+                    "attn_mask batch mismatch",
+                )
+                assert_trace(
+                    attn_mask.shape[1] == L,
+                    "attn_mask length mismatch",
+                )
+            else:
+                if tuple(attn_mask.shape) != (B, L):
+                    return state_tensor[:, -1]
             lengths = (~attn_mask).to(dtype=torch.int64).sum(dim=1).clamp(min=1)
-            idx = (lengths - 1).clamp(min=0, max=max(0, L - 1))
+            idx = (lengths - 1).clamp(min=0, max=L - 1)
             gather_idx = idx.view(B, 1, 1, 1).expand(B, 1, H, Dh)
             return torch.gather(state_tensor, dim=1, index=gather_idx).squeeze(1)
         return state_tensor[:, -1]
@@ -905,12 +824,16 @@ class MultiScaleRetention(nn.Module):
     @staticmethod
     def _scan_causal_torch(v: torch.Tensor, lam_h: torch.Tensor) -> torch.Tensor:
         B, L, H, Dh = v.shape
-        tracing = bool(is_tracing_or_exporting())
-        if (not tracing) and L <= 0:
-            return v.new_zeros(v.shape)
-        calc_dtype = (
-            torch.float32 if v.dtype in (torch.float16, torch.bfloat16) else v.dtype
-        )
+        trace_like = bool(is_symbolic())
+        if trace_like:
+            assert_trace(
+                L > 0,
+                "empty sequence",
+            )
+        else:
+            if L <= 0:
+                return v.new_zeros(v.shape)
+        calc_dtype = torch.float32 if v.dtype in (torch.float16, torch.bfloat16) else v.dtype
         lam_calc = lam_h.to(dtype=calc_dtype, device=v.device).view(1, 1, H, 1)
         t = torch.arange(L, device=v.device, dtype=calc_dtype).view(1, L, 1, 1)
         p = torch.pow(lam_calc, t)
@@ -927,9 +850,7 @@ class MultiScaleRetention(nn.Module):
     @torch_compiler_disable(recursive=False, reason="Triton retention scan")
     def _scan_causal_triton(self, v: torch.Tensor, lam_h: torch.Tensor) -> torch.Tensor:
         if v.dim() != 4:
-            raise ValueError(
-                f"_scan_causal_triton expects (B,L,H,Dh), got {tuple(v.shape)}"
-            )
+            raise ValueError(f"_scan_causal_triton expects (B,L,H,Dh), got {tuple(v.shape)}")
         if v.device.type != "cuda":
             raise RuntimeError("_scan_causal_triton requires CUDA tensor")
         B, L, H, Dh = v.shape
@@ -1015,19 +936,14 @@ class MultiScaleRetention(nn.Module):
         del kwargs
         restore_dtype: torch.dtype | None = None
         x_in = x
-        if (
-            getattr(x_in.device, "type", "cpu") == "mps"
-            and x_in.dtype == torch.bfloat16
-        ):
+        if getattr(x_in.device, "type", "cpu") == "mps" and x_in.dtype == torch.bfloat16:
             restore_dtype = x_in.dtype
             x_in = x.to(torch.float16)
         if x_in.dim() != 3:
-            raise ValueError(
-                f"MultiScaleRetention expects (B,L,D), got {tuple(x_in.shape)}"
-            )
+            raise ValueError(f"MultiScaleRetention expects (B,L,D), got {tuple(x_in.shape)}")
         B, L, D = x_in.shape
-        tracing = bool(is_tracing_or_exporting())
-        if (not tracing) and L <= 0:
+        trace_like = bool(is_symbolic())
+        if (not trace_like) and L <= 0:
             out0 = x_in.new_zeros(x_in.shape)
             if bool(return_state):
                 st0 = x_in.new_zeros((B, self.nhead, int(self.head_dim)))
@@ -1036,10 +952,8 @@ class MultiScaleRetention(nn.Module):
                     st0 = st0.to(restore_dtype)
                 return out0, st0
             return out0.to(restore_dtype) if restore_dtype is not None else out0
-        if (not tracing) and D != int(self.d_model):
-            raise ValueError(
-                f"Last dimension {D} must equal d_model={int(self.d_model)}"
-            )
+        if (not trace_like) and D != int(self.d_model):
+            raise ValueError(f"Last dimension {D} must equal d_model={int(self.d_model)}")
         decay_arg = None
         if args:
             decay_arg = args[0]
@@ -1049,19 +963,30 @@ class MultiScaleRetention(nn.Module):
         q = self.q_proj(x_in).view(B, L, self.nhead, head_dim)
         v = self.v_proj(x_in).view(B, L, self.nhead, head_dim)
         v = self._apply_kpm_to_v(v, attn_mask)
-        if isinstance(decay_arg, torch.Tensor) and decay_arg.numel() > 0:
-            if decay_arg.dim() == 1 and int(decay_arg.shape[0]) == int(self.nhead):
-                lam_h = decay_arg.to(dtype=v.dtype, device=v.device)
-            elif decay_arg.dim() == 3 and int(decay_arg.shape[0]) == int(self.nhead):
-                lam_h = decay_arg[:, 1, 0].to(dtype=v.dtype, device=v.device)
-            else:
-                lam_h = self._decay_lambda(v.device, v.dtype).to(
-                    dtype=v.dtype, device=v.device
-                )
-        else:
-            lam_h = self._decay_lambda(v.device, v.dtype).to(
-                dtype=v.dtype, device=v.device
-            )
+        lam_h = self._decay_lambda(v.device, v.dtype).to(dtype=v.dtype, device=v.device)
+        if isinstance(decay_arg, torch.Tensor):
+            if decay_arg.dim() == 1:
+                if trace_like:
+                    assert_trace(
+                        decay_arg.shape[0] == self.nhead,
+                        "decay[H] shape mismatch",
+                    )
+                else:
+                    if int(decay_arg.shape[0]) != int(self.nhead):
+                        decay_arg = None
+                if decay_arg is not None:
+                    lam_h = decay_arg.to(dtype=v.dtype, device=v.device)
+            elif decay_arg.dim() == 3:
+                if trace_like:
+                    assert_trace(
+                        decay_arg.shape[0] == self.nhead,
+                        "decay[H,*,*] shape mismatch",
+                    )
+                else:
+                    if int(decay_arg.shape[0]) != int(self.nhead):
+                        decay_arg = None
+                if decay_arg is not None:
+                    lam_h = decay_arg[:, 1, 0].to(dtype=v.dtype, device=v.device)
         st_bhd = self._extract_state_tensor(state, B=B, H=int(self.nhead))
         if st_bhd is not None:
             v = v.clone()
@@ -1080,20 +1005,21 @@ class MultiScaleRetention(nn.Module):
             last_state = self._select_last_state(state_tensor, attn_mask).contiguous()
             if not torch.is_grad_enabled():
                 last_state = last_state.detach()
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore")
-            try:
-                fl = _compute_flops_msr(
-                    B,
-                    L,
-                    num_heads=int(self.nhead),
-                    head_dim=int(head_dim),
-                    use_gate=bool(self.use_gate and self.g_proj is not None),
-                )
-                if fl > 0.0:
-                    FLOP_PROFILER.add("MultiScaleRetention", float(fl))
-            except Exception:
-                pass
+        if (FLOP_PROFILER is not None) and (not trace_like):
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                try:
+                    fl = _compute_flops_msr(
+                        B,
+                        L,
+                        num_heads=int(self.nhead),
+                        head_dim=int(head_dim),
+                        use_gate=bool(self.use_gate and self.g_proj is not None),
+                    )
+                    if fl > 0.0:
+                        FLOP_PROFILER.add("MultiScaleRetention", float(fl))
+                except Exception:
+                    pass
         if restore_dtype is not None:
             out = out.to(restore_dtype)
             if last_state is not None:
@@ -1117,6 +1043,11 @@ class MultiHeadAttention(nn.Module):
         **kwargs: Any,
     ) -> None:
         super().__init__()
+        self._backend = "torch"
+        self.impl = _MultiHeadAttentionCompat(
+            embed_dim, num_heads, bias=bias, dropout=dropout, batch_first=batch_first, **kwargs
+        )
+
         if _is_nvidia_mha_preferred():
             try:
                 impl = _MultiHeadAttentionNvidia(
@@ -1127,42 +1058,11 @@ class MultiHeadAttention(nn.Module):
                     batch_first=batch_first,
                     **kwargs,
                 )
-                if (
-                    isinstance(impl, _MultiHeadAttentionNvidia)
-                    and impl._te_mha is not None
-                ):
-                    self.impl = impl
-                    self._backend = "te"
-                else:
-                    self.impl = _MultiHeadAttentionCompat(
-                        embed_dim,
-                        num_heads,
-                        bias=bias,
-                        dropout=dropout,
-                        batch_first=batch_first,
-                        **kwargs,
-                    )
-                    self._backend = "torch"
+                if impl._te_mha is not None:
+                    self.impl, self._backend = impl, "te"
             except Exception:
-                self.impl = _MultiHeadAttentionCompat(
-                    embed_dim,
-                    num_heads,
-                    bias=bias,
-                    dropout=dropout,
-                    batch_first=batch_first,
-                    **kwargs,
-                )
-                self._backend = "torch"
-        else:
-            self.impl = _MultiHeadAttentionCompat(
-                embed_dim,
-                num_heads,
-                bias=bias,
-                dropout=dropout,
-                batch_first=batch_first,
-                **kwargs,
-            )
-            self._backend = "torch"
+                pass
+
         if isinstance(self.impl, _MultiHeadAttentionNvidia):
             self.impl._fallback = _MultiHeadAttentionCompat(
                 embed_dim,
@@ -1230,21 +1130,14 @@ class _MultiHeadAttentionNvidia(nn.Module):
         self._te_supports_is_causal: bool = False
         self._te_supports_training: bool = False
         self._te_supports_tuple_mask: bool = True
+
         if self._te_mha is not None:
-            _fwd = getattr(
-                self._te_mha, "forward", getattr(self._te_mha, "__call__", None)
-            )
-            with torch.no_grad():
-                if _fwd is not None:
-                    try:
-                        self._te_forward_signature = inspect.signature(_fwd)
-                    except (TypeError, ValueError):
-                        self._te_forward_signature = None
-            params = (
-                self._te_forward_signature.parameters
-                if self._te_forward_signature
-                else {}
-            )
+            _fwd = getattr(self._te_mha, "forward", getattr(self._te_mha, "__call__", None))
+            try:
+                self._te_forward_signature = inspect.signature(_fwd) if _fwd else None
+            except:
+                self._te_forward_signature = None
+            params = self._te_forward_signature.parameters if self._te_forward_signature else {}
             if "attention_mask" in params:
                 self._te_mask_param = "attention_mask"
             elif "attn_mask" in params:
@@ -1255,24 +1148,14 @@ class _MultiHeadAttentionNvidia(nn.Module):
                 self._te_mask_type_param = "attention_mask_type"
             self._te_supports_is_causal = "is_causal" in params
             self._te_supports_training = "training" in params
-        if self._force_pt:
-            warnings.warn(
-                "Unable to use Transformer Engine multi-head attention; falling back to torch.nn.MultiheadAttention.",
-                RuntimeWarning,
-            )
 
     @staticmethod
-    def _nvidia_mha(
-        embed_dim: int, num_heads: int, dropout: float, kwargs: dict[str, Any]
-    ) -> Any | None:
-        if not _HAS_TE:
+    def _nvidia_mha(embed_dim, num_heads, dropout, kwargs):
+        if not (_HAS_TE and _is_nvidia_te_supported()):
             return None
-        if not _is_nvidia_te_supported():
-            return None
-        candidates = []
-        for name in ("MultiHeadAttention", "MultiheadAttention"):
-            if hasattr(te, name):
-                candidates.append(getattr(te, name))
+        candidates = [
+            getattr(te, n) for n in ("MultiHeadAttention", "MultiheadAttention") if hasattr(te, n)
+        ]
         for cls in candidates:
             ctor_variants = (
                 dict(
@@ -1288,12 +1171,8 @@ class _MultiHeadAttentionNvidia(nn.Module):
                 dict(embed_dim=embed_dim, num_heads=num_heads, dropout=dropout),
             )
             for ckw in ctor_variants:
-                try:
+                with contextlib.suppress(Exception):
                     return cls(**{**ckw, **kwargs})
-                except TypeError:
-                    continue
-                except Exception:
-                    continue
         return None
 
     def forward(
@@ -1307,8 +1186,7 @@ class _MultiHeadAttentionNvidia(nn.Module):
         is_causal: Optional[bool] = None,
         average_attn_weights: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        embed_dim = int(query.shape[-1])
-        if self._force_pt or (self._te_mha is None):
+        def _fallback_call():
             return _call_sdpa_fallback(
                 self._fallback,
                 query,
@@ -1320,84 +1198,32 @@ class _MultiHeadAttentionNvidia(nn.Module):
                 average_attn_weights=average_attn_weights,
                 is_causal=is_causal,
             )
-        if need_weights:
-            return _call_sdpa_fallback(
-                self._fallback,
-                query,
-                key,
-                value,
-                attn_mask=attn_mask,
-                key_padding_mask=key_padding_mask,
-                need_weights=need_weights,
-                average_attn_weights=average_attn_weights,
-                is_causal=is_causal,
-            )
-        if attn_mask is not None:
-            return _call_sdpa_fallback(
-                self._fallback,
-                query,
-                key,
-                value,
-                attn_mask=attn_mask,
-                key_padding_mask=key_padding_mask,
-                need_weights=need_weights,
-                average_attn_weights=average_attn_weights,
-                is_causal=is_causal,
-            )
-        if (not query.is_cuda) or (query.dtype not in (torch.float16, torch.bfloat16)):
-            return _call_sdpa_fallback(
-                self._fallback,
-                query,
-                key,
-                value,
-                attn_mask=attn_mask,
-                key_padding_mask=key_padding_mask,
-                need_weights=need_weights,
-                average_attn_weights=average_attn_weights,
-                is_causal=is_causal,
-            )
-        try:
+
+        if (
+            self._force_pt
+            or self._te_mha is None
+            or need_weights
+            or attn_mask is not None
+            or not query.is_cuda
+            or query.dtype not in (torch.float16, torch.bfloat16)
+        ):
+            return _fallback_call()
+
+        with contextlib.suppress(Exception):
             if torch._dynamo.is_compiling():
-                return _call_sdpa_fallback(
-                    self._fallback,
-                    query,
-                    key,
-                    value,
-                    attn_mask=attn_mask,
-                    key_padding_mask=key_padding_mask,
-                    need_weights=need_weights,
-                    average_attn_weights=average_attn_weights,
-                    is_causal=is_causal,
-                )
-        except Exception:
-            pass
+                return _fallback_call()
+
         bf = bool(self.batch_first)
         _q, _k, _v = query, key, value
         if not bf:
-            _q, _k, _v = (
-                query.transpose(0, 1),
-                key.transpose(0, 1),
-                value.transpose(0, 1),
-            )
-        te_kwargs: dict[str, Any] = {}
-        te_mask: Any = None
-        mask_type: str | None = None
+            _q, _k, _v = query.transpose(0, 1), key.transpose(0, 1), value.transpose(0, 1)
+
+        te_kwargs, te_mask, mask_type = {}, None, None
+
         if key_padding_mask is not None:
-            B0 = int(_q.shape[0])
-            Lq = int(_q.shape[1])
-            Lk = int(_k.shape[1])
+            B0, Lq, Lk = int(_q.shape[0]), int(_q.shape[1]), int(_k.shape[1])
             if key_padding_mask.shape != (B0, Lk):
-                return _call_sdpa_fallback(
-                    self._fallback,
-                    query,
-                    key,
-                    value,
-                    attn_mask=attn_mask,
-                    key_padding_mask=key_padding_mask,
-                    need_weights=need_weights,
-                    average_attn_weights=average_attn_weights,
-                    is_causal=is_causal,
-                )
+                return _fallback_call()
             kpm = key_padding_mask
             if kpm.dtype is not torch.bool:
                 kpm = kpm.to(torch.bool)
@@ -1407,104 +1233,41 @@ class _MultiHeadAttentionNvidia(nn.Module):
                 te_mask = kv_mask
             else:
                 if not self._te_supports_tuple_mask:
-                    return _call_sdpa_fallback(
-                        self._fallback,
-                        query,
-                        key,
-                        value,
-                        attn_mask=attn_mask,
-                        key_padding_mask=key_padding_mask,
-                        need_weights=need_weights,
-                        average_attn_weights=average_attn_weights,
-                        is_causal=is_causal,
-                    )
+                    return _fallback_call()
                 q_mask = torch.zeros((B0, 1, 1, Lq), device=_q.device, dtype=torch.bool)
                 te_mask = (q_mask, kv_mask)
             mask_type = "padding_causal" if bool(is_causal) else "padding"
         else:
             mask_type = "causal" if bool(is_causal) else "no_mask"
+
         if (
             te_mask is not None
-            and mask_type is not None
+            and mask_type
             and mask_type.startswith("padding")
+            and self._te_mask_type_param is None
         ):
-            if self._te_mask_type_param is None:
-                return _call_sdpa_fallback(
-                    self._fallback,
-                    query,
-                    key,
-                    value,
-                    attn_mask=attn_mask,
-                    key_padding_mask=key_padding_mask,
-                    need_weights=need_weights,
-                    average_attn_weights=average_attn_weights,
-                    is_causal=is_causal,
-                )
+            return _fallback_call()
         if te_mask is not None:
             if self._te_mask_param is None:
-                return _call_sdpa_fallback(
-                    self._fallback,
-                    query,
-                    key,
-                    value,
-                    attn_mask=attn_mask,
-                    key_padding_mask=key_padding_mask,
-                    need_weights=need_weights,
-                    average_attn_weights=average_attn_weights,
-                    is_causal=is_causal,
-                )
+                return _fallback_call()
             te_kwargs[self._te_mask_param] = te_mask
-        if (mask_type is not None) and (self._te_mask_type_param is not None):
+
+        if mask_type and self._te_mask_type_param:
             te_kwargs[self._te_mask_type_param] = mask_type
         elif self._te_supports_is_causal and (is_causal is not None):
             te_kwargs["is_causal"] = bool(is_causal)
         if self._te_supports_training:
             te_kwargs["training"] = bool(self.training)
+
         try:
             out = self._te_mha(_q, _k, _v, **te_kwargs)
-        except TypeError:
-            if isinstance(te_mask, tuple):
+        except Exception as e:
+            if isinstance(e, TypeError) and isinstance(te_mask, tuple):
                 self._te_supports_tuple_mask = False
-                return _call_sdpa_fallback(
-                    self._fallback,
-                    query,
-                    key,
-                    value,
-                    attn_mask=attn_mask,
-                    key_padding_mask=key_padding_mask,
-                    need_weights=need_weights,
-                    average_attn_weights=average_attn_weights,
-                    is_causal=is_causal,
-                )
             self._force_pt = True
-            return _call_sdpa_fallback(
-                self._fallback,
-                query,
-                key,
-                value,
-                attn_mask=attn_mask,
-                key_padding_mask=key_padding_mask,
-                need_weights=need_weights,
-                average_attn_weights=average_attn_weights,
-                is_causal=is_causal,
-            )
-        except Exception:
-            self._force_pt = True
-            return _call_sdpa_fallback(
-                self._fallback,
-                query,
-                key,
-                value,
-                attn_mask=attn_mask,
-                key_padding_mask=key_padding_mask,
-                need_weights=need_weights,
-                average_attn_weights=average_attn_weights,
-                is_causal=is_causal,
-            )
-        if isinstance(out, tuple) and len(out) >= 1:
-            y, w = out[0], None
-        else:
-            y, w = out, None
+            return _fallback_call()
+
+        y, w = (out[0] if isinstance(out, tuple) and len(out) >= 1 else out), None
         if not bf and isinstance(y, torch.Tensor) and y.dim() >= 2:
             y = y.transpose(0, 1)
         _compute_flops_mha(

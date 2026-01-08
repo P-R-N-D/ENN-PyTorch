@@ -13,10 +13,9 @@ import tempfile
 import threading
 import warnings
 import weakref
-from types import ModuleType
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from typing import Any, Iterator, Protocol, Sequence, TypeAlias
+from typing import Any, Iterator, Protocol, Sequence
 
 import torch
 from torch import nn
@@ -36,18 +35,8 @@ except ImportError:
     add_safe_globals = None
 
 
-PathLike: TypeAlias = str | os.PathLike[str] | Path
-TorchDeviceLike: TypeAlias = torch.device | str | int
-
-_IGNORED_WARNING_SENTENCES: tuple[str, ...] = (
-    "torch.distributed is disabled, unavailable or uninitialized, assuming the intent is to save in a single process.",
-    "TypedStorage is deprecated. It will be removed in the future",
-)
-_IGNORED_WARNING_MESSAGE_RE: str = (
-    r".*(?:"
-    + "|".join((re.escape(str(s)) for s in _IGNORED_WARNING_SENTENCES))
-    + r").*"
-)
+_IGNORED_WARNINGS = ("torch.distributed is disabled", "TypedStorage is deprecated")
+_IGNORED_RE = r".*(?:" + "|".join(re.escape(s) for s in _IGNORED_WARNINGS) + r").*"
 
 _FORWARD_PARAM_CACHE: dict[object, object] = {}
 _FORWARD_PARAM_CACHE_LOCK = threading.Lock()
@@ -58,43 +47,32 @@ _SAVE_LOCK_GUARD = threading.Lock()
 _SAVE_PATH_LOCKS = weakref.WeakValueDictionary()
 
 
-def _register_torchversion_safe_global() -> None:
-    if add_safe_globals is None:
-        return
+def _register_safe_globals():
     with contextlib.suppress(Exception):
-        from torch.torch_version import TorchVersion
+        if add_safe_globals:
+            from torch.torch_version import TorchVersion
 
-        add_safe_globals([TorchVersion])
+            add_safe_globals([TorchVersion])
 
 
 @contextlib.contextmanager
-def _filtered_warnings(
-    ignored_sentences: Sequence[str] | None = None,
-) -> Iterator[None]:
-    sentences = (
-        _IGNORED_WARNING_SENTENCES
-        if ignored_sentences is None
-        else tuple(ignored_sentences)
+def _filtered_warnings(sentences: Sequence[str] | None = None) -> Iterator[None]:
+    msg_re = (
+        _IGNORED_RE
+        if sentences is None
+        else (
+            r".*(?:" + "|".join(re.escape(str(s)) for s in sentences) + r").*" if sentences else ""
+        )
     )
-    if not sentences:
+    if not msg_re:
         yield
         return
-    msg_re = _IGNORED_WARNING_MESSAGE_RE
-    if ignored_sentences is not None:
-        parts = [re.escape(str(s)) for s in sentences if s]
-        msg_re = r".*(?:" + "|".join(parts) + r").*" if parts else ""
-    ctx_aware = False
-    with contextlib.suppress(Exception):
-        if sys.version_info >= (3, 14):
-            ctx_aware = bool(
-                getattr(getattr(sys, "flags", None), "context_aware_warnings", False)
-            )
-    guard = contextlib.nullcontext() if ctx_aware else _WARNINGS_FILTER_LOCK
+    guard = _WARNINGS_FILTER_LOCK
+    if getattr(sys.flags, "context_aware_warnings", False):
+        guard = contextlib.nullcontext()
     with guard:
         with warnings.catch_warnings():
-            with contextlib.suppress(Exception):
-                if msg_re:
-                    warnings.filterwarnings("ignore", message=str(msg_re))
+            warnings.filterwarnings("ignore", message=msg_re)
             yield
 
 
@@ -122,50 +100,31 @@ def _temp_environ(
 
 
 def _save_lock(path: PathLike | None = None) -> threading.RLock:
-    if path is None:
-        key = "__global__"
-    else:
-        try:
-            key = str(Path(path).expanduser().resolve())
-        except Exception:
-            key = str(path)
+    try:
+        key = str(Path(path).expanduser().resolve()) if path else "__global__"
+    except Exception:
+        key = str(path)
     with _SAVE_LOCK_GUARD:
-        lk = _SAVE_PATH_LOCKS.get(key)
-        if lk is None:
-            lk = threading.RLock()
-            _SAVE_PATH_LOCKS[key] = lk
-        return lk
+        return _SAVE_PATH_LOCKS.setdefault(key, threading.RLock())
 
 
-def _get_dist() -> ModuleType | None:
+def _dist_op(op_name: str) -> object:
     try:
         import torch.distributed as dist
+
+        if dist.is_available() and dist.is_initialized():
+            return getattr(dist, op_name)()
     except Exception:
-        return None
-    return dist
+        pass
+    return None
 
 
 def _is_rank0_global() -> bool:
-    dist = _get_dist()
-    if dist is None:
-        return True
-    try:
-        if dist.is_available() and dist.is_initialized():
-            return int(dist.get_rank()) == 0
-    except Exception:
-        pass
-    return True
+    return _dist_op("get_rank") in (0, None)
 
 
 def _dist_barrier() -> None:
-    dist = _get_dist()
-    if dist is None:
-        return
-    try:
-        if dist.is_available() and dist.is_initialized():
-            dist.barrier()
-    except Exception:
-        pass
+    _dist_op("barrier")
 
 
 @contextlib.contextmanager
@@ -196,84 +155,42 @@ def _to_tensor(
     make_contiguous: bool = True,
 ) -> object:
     if isinstance(value, torch.Tensor):
-        t = value
-        with contextlib.suppress(Exception):
-            from torch.distributed.tensor import DTensor
-
-            if isinstance(t, DTensor):
-                t = t.to_local()
+        t = value.to_local() if hasattr(value, "to_local") else value
         if materialize_meta and is_meta_or_fake_tensor(t):
-            t = torch.zeros(tuple(t.shape), dtype=t.dtype, device="cpu")
+            t = torch.zeros(t.shape, dtype=t.dtype, device="cpu")
+        t = t.detach()
         if t.device.type != "cpu":
-            t = t.detach().to(device="cpu")
-        else:
-            t = t.detach()
-        if make_contiguous:
-            with contextlib.suppress(Exception):
-                if hasattr(t, "is_contiguous") and (not bool(t.is_contiguous())):
-                    t = t.contiguous()
+            t = t.to(device="cpu")
+        if make_contiguous and not t.is_contiguous():
+            t = t.contiguous()
         return t
+    if isinstance(value, (list, tuple)):
+        out = [
+            _to_tensor(v, materialize_meta=materialize_meta, make_contiguous=make_contiguous)
+            for v in value
+        ]
+        return type(value)(*out) if hasattr(value, "_fields") else type(value)(out)
     if isinstance(value, dict):
         return type(value)(
             (
-                (
-                    k,
-                    _to_tensor(
-                        v,
-                        materialize_meta=materialize_meta,
-                        make_contiguous=make_contiguous,
-                    ),
-                )
-                for k, v in value.items()
+                k,
+                _to_tensor(v, materialize_meta=materialize_meta, make_contiguous=make_contiguous),
             )
+            for k, v in value.items()
         )
-    if isinstance(value, list):
-        return [
-            _to_tensor(
-                v, materialize_meta=materialize_meta, make_contiguous=make_contiguous
-            )
-            for v in value
-        ]
-    if isinstance(value, tuple):
-        seq = tuple(
-            (
-                _to_tensor(
-                    v,
-                    materialize_meta=materialize_meta,
-                    make_contiguous=make_contiguous,
-                )
-                for v in value
-            )
-        )
-        if type(value) is tuple:
-            return seq
-        if hasattr(value, "_fields"):
-            with contextlib.suppress(Exception):
-                return type(value)(*seq)
-        with contextlib.suppress(Exception):
-            return type(value)(seq)
-        return seq
     return value
 
 
 def _torch_load_checkpoint(
-    path: PathLike,
-    *args: Any,
-    map_location: TorchDeviceLike | None = None,
-    weights_only: bool = True,
+    path: PathLike, *args: Any, map_location: object = None, weights_only: bool = True
 ) -> object:
-    p = Path(path)
     try:
-        return torch.load(
-            str(p), map_location=map_location or "cpu", weights_only=bool(weights_only)
-        )
+        return torch.load(str(path), map_location=map_location or "cpu", weights_only=weights_only)
     except TypeError:
-        return torch.load(str(p), map_location=map_location or "cpu")
+        return torch.load(str(path), map_location=map_location or "cpu")
     except Exception as exc:
         if weights_only:
-            raise RuntimeError(
-                "Failed to load checkpoint with weights_only=True. If you trust the checkpoint source, retry with weights_only=False."
-            ) from exc
+            raise RuntimeError("weights_only=True failed") from exc
         raise
 
 
@@ -286,8 +203,10 @@ def _in_console(cmd: object, desc: object) -> None:
 
 @contextlib.contextmanager
 def _onnx_model(model: object) -> None:
-    was_training = bool(getattr(model, "training", False))
-    candidate_attrs = (
+    was_training = getattr(model, "training", False)
+    removed_top, removed_sub = {}, []
+    model.eval()
+    for name in (
         "optimizer",
         "optimizer_state",
         "optim",
@@ -296,38 +215,22 @@ def _onnx_model(model: object) -> None:
         "logger",
         "metrics",
         "_training_history",
-    )
-    removed_top = {}
-    removed_sub = []
-    model.eval()
-    for name in candidate_attrs:
+    ):
         if hasattr(model, name):
-            try:
+            with contextlib.suppress(Exception):
                 removed_top[name] = getattr(model, name)
                 delattr(model, name)
-            except Exception:
-                pass
     with contextlib.suppress(Exception):
         for module in model.modules():
             for attr in ("logger", "history"):
-                if hasattr(module, attr):
-                    try:
-                        v = getattr(module, attr)
-                    except Exception:
-                        continue
-                    if isinstance(v, Recorder):
-                        try:
-                            removed_sub.append((module, attr, v))
-                            delattr(module, attr)
-                        except Exception:
-                            pass
+                if hasattr(module, attr) and isinstance(v := getattr(module, attr), Recorder):
+                    with contextlib.suppress(Exception):
+                        removed_sub.append((module, attr, v))
+                        delattr(module, attr)
     try:
         with _temp_environ({"STNET_MSR_FORCE_TORCH": "1"}, only_if_unset=True):
             eager_ctx = getattr(model, "eager_for_export", None)
-            if callable(eager_ctx):
-                with eager_ctx():
-                    yield model
-            else:
+            with eager_ctx() if callable(eager_ctx) else contextlib.nullcontext():
                 yield model
     finally:
         for module, attr, v in removed_sub:
@@ -354,34 +257,29 @@ def _extract_tensor(out: object) -> torch.Tensor:
     if isinstance(out, (tuple, list)) and out:
         if isinstance(out[0], torch.Tensor):
             return out[0]
-        for v in out:
-            if isinstance(v, torch.Tensor):
-                return v
+        tensor = next((v for v in out if isinstance(v, torch.Tensor)), None)
+        if tensor is not None:
+            return tensor
     raise RuntimeError("Model forward did not return a tensor output.")
 
 
 def _get_forward_parameters(model_cls: object) -> object:
     with _FORWARD_PARAM_CACHE_LOCK:
         cached = _FORWARD_PARAM_CACHE.get(model_cls)
-    if cached is not None:
-        return cached
+        if cached is not None:
+            return cached
     try:
         sig = inspect.signature(model_cls.forward)
     except Exception:
-        with _FORWARD_PARAM_CACHE_LOCK:
-            _FORWARD_PARAM_CACHE[model_cls] = None
         return None
-    names = set(sig.parameters.keys())
-    accepts_kwargs = any(
-        getattr(p, "kind", None) == inspect.Parameter.VAR_KEYWORD
-        for p in sig.parameters.values()
+    info = (
+        set(sig.parameters.keys()),
+        any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()),
     )
-    info = (names, bool(accepts_kwargs))
     with _FORWARD_PARAM_CACHE_LOCK:
-        _FORWARD_PARAM_CACHE[model_cls] = info
         if len(_FORWARD_PARAM_CACHE) > 512:
             _FORWARD_PARAM_CACHE.clear()
-    return info
+        return _FORWARD_PARAM_CACHE.setdefault(model_cls, info)
 
 
 def _forward(model: object, x: object) -> object:
@@ -393,45 +291,29 @@ def _forward(model: object, x: object) -> object:
         return model(x)
     names, accepts_kwargs = info
     kwargs = {}
-    if accepts_kwargs or "labels_flat" in names:
-        kwargs["labels_flat"] = None
-    if accepts_kwargs or "net_loss" in names:
-        kwargs["net_loss"] = None
+    for key in ("labels_flat", "net_loss"):
+        if accepts_kwargs or key in names:
+            kwargs[key] = None
     return model(x, **kwargs) if kwargs else model(x)
 
 
 def _get_tensor_shape(model: object, sample_input: object) -> object:
-    in_dim = None
-    out_shape = None
-    if hasattr(model, "in_dim"):
-        try:
-            in_dim = int(getattr(model, "in_dim"))
-        except (TypeError, ValueError):
-            in_dim = None
-    if hasattr(model, "out_shape"):
-        try:
-            _shape = getattr(model, "out_shape")
-            out_shape = tuple((int(x) for x in _shape))
-        except (TypeError, ValueError):
-            out_shape = None
+    in_dim = int(getattr(model, "in_dim")) if hasattr(model, "in_dim") else None
+    out_shape = (
+        tuple(int(x) for x in getattr(model, "out_shape")) if hasattr(model, "out_shape") else None
+    )
     if (in_dim is None or out_shape is None) and sample_input is not None:
-        dev = next(
-            (p.device for p in model.parameters() if p is not None), torch.device("cpu")
-        )
+        dev = next((p.device for p in model.parameters() if p is not None), torch.device("cpu"))
         sample = sample_input.to(dev)
         model.eval()
         with torch.no_grad():
-            if sample.ndim == 1:
-                sample = sample.unsqueeze(0)
-            y_flat = _extract_tensor(_forward(model, sample))
-        if in_dim is None:
-            in_dim = int(sample.numel() // int(sample.shape[0]))
-        if out_shape is None:
-            out_shape = tuple((int(x) for x in y_flat.shape[1:]))
-            if len(out_shape) == 1:
-                out_shape = (out_shape[0],)
+            y_flat = _extract_tensor(
+                _forward(model, sample.unsqueeze(0) if sample.ndim == 1 else sample)
+            )
+        in_dim = in_dim or int(sample.numel() // sample.shape[0])
+        out_shape = out_shape or tuple(y_flat.shape[1:])
     if in_dim is None or out_shape is None:
-        raise RuntimeError("Failed to infer input and output shapes.")
+        raise RuntimeError("Failed to infer shapes.")
     return (int(in_dim), tuple(out_shape))
 
 
@@ -439,76 +321,48 @@ def _pad_sample(model: object, sample_input: object) -> object:
     if sample_input is not None:
         return sample_input
     in_dim, _ = _get_tensor_shape(model, sample_input)
-    try:
-        param = next(model.parameters())
-        dtype, device = (param.dtype, param.device)
-    except StopIteration:
-        dtype, device = (torch.float32, torch.device("cpu"))
+    param = next(model.parameters(), None)
+    dtype, device = (
+        (param.dtype, param.device) if param is not None else (torch.float32, torch.device("cpu"))
+    )
     return torch.zeros(1, in_dim, dtype=dtype, device=device)
 
 
 def _onnx_options(kwargs: object, *args: Any, target: str = "onnx") -> object:
     target_l = str(target or "onnx").strip().lower()
-    if target_l in {"tensorrt", "trt", "tensor-rt", "tensor_rt"}:
-        default_opset = 17
-        default_dynamic_batch = True
-        default_prefer_dynamo = False
-        default_simplify = True
-        default_fallback = [17, 16, 15, 14, 13]
-    elif target_l in {"tensorflow", "tf", "litert", "tflite"}:
-        default_opset = 15
-        default_dynamic_batch = False
-        default_prefer_dynamo = False
-        default_simplify = True
-        default_fallback = [15, 13]
-    elif target_l in {"nnef"}:
-        default_opset = 13
-        default_dynamic_batch = False
-        default_prefer_dynamo = False
-        default_simplify = True
-        default_fallback = [13]
-    else:
-        default_opset = 18
-        default_dynamic_batch = True
-        default_prefer_dynamo = True
-        default_simplify = False
-        default_fallback = [18, 17, 16, 15, 13]
-    opset_version = int(kwargs.get("opset_version", default_opset))
-    dynamic_batch = bool(kwargs.get("dynamic_batch", default_dynamic_batch))
-    prefer_dynamo = bool(
-        kwargs.get("prefer_dynamo", kwargs.get("dynamo", default_prefer_dynamo))
+    defaults = {
+        "tensorrt": (17, True, False, True, [17, 16, 15, 14, 13]),
+        "tensorflow": (15, False, False, True, [15, 13]),
+        "nnef": (13, False, False, True, [13]),
+        "default": (18, True, True, False, [18, 17, 16, 15, 13]),
+    }
+    key = target_l.replace("-", "").replace("_", "")
+    if key == "trt":
+        key = "tensorrt"
+    d_opset, d_dyn, d_pref, d_simp, d_fb = defaults.get(
+        target_l, defaults.get(key, defaults["default"])
     )
-    simplify = bool(
-        kwargs.get("simplify_onnx", kwargs.get("onnx_simplify", default_simplify))
+    opset = int(kwargs.get("opset_version", d_opset))
+    fb = kwargs.get("opset_fallback", d_fb)
+    fallback = (
+        [int(x) for x in re.split(r"[\s,]+", fb) if x]
+        if isinstance(fb, str)
+        else [int(x) for x in fb]
+        if isinstance(fb, (list, tuple))
+        else [int(fb)]
     )
-    fb = kwargs.get("opset_fallback", None)
-    opset_fallback: list[int]
-    if fb is None:
-        opset_fallback = list(default_fallback)
-    elif isinstance(fb, str):
-        opset_fallback = [int(x) for x in re.split(r"[\s,]+", fb) if x]
-    elif isinstance(fb, (list, tuple)):
-        opset_fallback = [int(x) for x in fb]
-    else:
-        opset_fallback = [int(fb)]
-    opset_try = [opset_version] + [
-        v for v in opset_fallback if int(v) != int(opset_version)
-    ]
     return {
         "sample_input": kwargs.get("sample_input"),
-        "opset_version": opset_version,
-        "opset_fallback": opset_try,
-        "dynamic_batch": dynamic_batch,
-        "prefer_dynamo": prefer_dynamo,
-        "simplify": simplify,
+        "opset_version": opset,
+        "opset_fallback": [opset] + [v for v in fallback if v != opset],
+        "dynamic_batch": kwargs.get("dynamic_batch", d_dyn),
+        "prefer_dynamo": kwargs.get("prefer_dynamo", kwargs.get("dynamo", d_pref)),
+        "simplify": kwargs.get("simplify_onnx", kwargs.get("onnx_simplify", d_simp)),
     }
 
 
 def _coerce_onnx_path(dst: PathLike, kwargs: object) -> object:
-    override = kwargs.get("onnx_path")
-    if override:
-        return Path(override)
-    return dst.with_suffix(".onnx")
+    return Path(kwargs.get("onnx_path") or dst.with_suffix(".onnx"))
 
 
 def is_required(module: str, pip_hint: str | None = None) -> None:
@@ -540,9 +394,7 @@ class _OnnxLayer:
         dynamic_batch: bool = True,
         prefer_dynamo: bool = True,
         simplify: bool = False,
-        **kwargs: Any,
     ) -> object:
-        del args, kwargs
         is_required("onnx", "pip install onnx")
         wrapper = _CompatLayer(model).eval()
         sample = _pad_sample(model, sample_input)
@@ -551,136 +403,79 @@ class _OnnxLayer:
         onnx_path = Path(onnx_path)
         onnx_path.parent.mkdir(parents=True, exist_ok=True)
         input_names = ["features"]
-        output_names = ["preds_flat"]
-        dynamic_axes = None
-        dynamic_shapes = None
-        if bool(dynamic_batch):
-            dynamic_axes = {"features": {0: "batch"}, "preds_flat": {0: "batch"}}
-            with contextlib.suppress(Exception):
-                if hasattr(torch, "export") and hasattr(torch.export, "Dim"):
-                    dynamic_shapes = {"features": {0: torch.export.Dim("batch")}}
-
-        training_mode = None
+        dyn_axes, dyn_shapes = (
+            (
+                {"features": {0: "batch"}, "preds_flat": {0: "batch"}},
+                {"features": {0: torch.export.Dim("batch")}},
+            )
+            if dynamic_batch
+            else (None, None)
+        )
+        if not (hasattr(torch, "export") and hasattr(torch.export, "Dim")):
+            dyn_shapes = None
+        training = None
         with contextlib.suppress(Exception):
-            training_mode = torch.onnx.TrainingMode.EVAL
-
-        def _base_kwargs(opset: int) -> dict[str, Any]:
-            common_kwargs: dict[str, Any] = {
+            training = torch.onnx.TrainingMode.EVAL
+        sig_keys = Exporter._export_sig_keys()
+        has_dynamo = "dynamo" in sig_keys
+        exporters = [True, False] if prefer_dynamo and has_dynamo else [False]
+        errors: list[str] = []
+        seen: set[int] = set()
+        for opset in (opset_version, *(opset_fallback or ())):
+            if opset in seen or opset < 1:
+                continue
+            seen.add(opset)
+            base_kw: dict[str, Any] = {
                 "export_params": True,
+                "f": str(onnx_path),
                 "opset_version": int(opset),
                 "do_constant_folding": True,
                 "keep_initializers_as_inputs": False,
                 "input_names": input_names,
-                "output_names": output_names,
+                "output_names": ["preds_flat"],
             }
-            if training_mode is not None:
-                common_kwargs["training"] = training_mode
-            if dynamic_axes is not None:
-                common_kwargs["dynamic_axes"] = dynamic_axes
-            base = inspect.signature(torch.onnx.export).parameters
-            return {k: v for k, v in common_kwargs.items() if k in base}
-
-        def _onnx_export(*args: Any, use_dynamo: bool, call_kwargs: dict[str, Any]) -> None:
-            with warnings.catch_warnings():
-                warnings.filterwarnings(
-                    "ignore",
-                    message=r"torchvision is not installed\. Skipping torchvision::nms",
-                )
-                warnings.filterwarnings(
-                    "ignore",
-                    message=r"Setting ONNX exporter to use operator set version .*",
-                )
-                if use_dynamo:
-                    torch.onnx.export(
-                        wrapper,
-                        sample,
-                        str(onnx_path),
-                        dynamo=True,
-                        **call_kwargs,
-                    )
-                else:
-                    if "dynamo" in inspect.signature(torch.onnx.export).parameters:
-                        torch.onnx.export(
-                            wrapper,
-                            sample,
-                            str(onnx_path),
-                            dynamo=False,
-                            **call_kwargs,
-                        )
-                    else:
-                        torch.onnx.export(
-                            wrapper,
-                            sample,
-                            str(onnx_path),
-                            **call_kwargs,
-                        )
-
-        supports_dynamo = bool(
-            "dynamo" in inspect.signature(torch.onnx.export).parameters
-        )
-        if opset_fallback is None:
-            opset_fallback = (opset_version,)
-        seen: set[int] = set()
-        opset_try: list[int] = []
-        for v in (int(opset_version), *[int(x) for x in opset_fallback]):
-            if v not in seen and v > 0:
-                seen.add(v)
-                opset_try.append(v)
-        if len(opset_try) == 0:
-            opset_try = [int(opset_version)]
-        exporter_order: list[bool]
-        if supports_dynamo:
-            exporter_order = [True, False] if bool(prefer_dynamo) else [False, True]
-        else:
-            exporter_order = [False]
-        errors: list[str] = []
-        for opset in opset_try:
-            base_kwargs = _base_kwargs(opset)
-            for use_dynamo in exporter_order:
+            if training is not None:
+                base_kw["training"] = training
+            if dyn_axes:
+                base_kw["dynamic_axes"] = dyn_axes
+            valid_kw = {k: v for k, v in base_kw.items() if k in sig_keys}
+            for use_dyn in exporters:
                 try:
-                    if supports_dynamo:
-                        if use_dynamo:
-                            dyn_kwargs = dict(base_kwargs)
-                            if dynamic_shapes is not None:
-                                dyn_kwargs["dynamic_shapes"] = dynamic_shapes
-                            _onnx_export(
-                                use_dynamo=True,
-                                call_kwargs=dyn_kwargs,
-                            )
-                        else:
-                            _onnx_export(
-                                use_dynamo=False,
-                                call_kwargs=base_kwargs,
-                            )
-                    else:
-                        _onnx_export(
-                            use_dynamo=False,
-                            call_kwargs=base_kwargs,
+                    with warnings.catch_warnings():
+                        warnings.filterwarnings(
+                            "ignore",
+                            message=r"torchvision|Setting ONNX exporter to use operator set version",
                         )
-                    if bool(simplify):
+                        call_kw = dict(valid_kw)
+                        if use_dyn and dyn_shapes:
+                            call_kw["dynamic_shapes"] = dyn_shapes
+                        if has_dynamo:
+                            call_kw["dynamo"] = use_dyn
+                        call_kw.pop("model", None)
+                        call_kw.pop("args", None)
+                        if isinstance(sample, tuple):
+                            args = sample
+                        elif isinstance(sample, list):
+                            args = tuple(sample)
+                        else:
+                            args = (sample,)
+                        torch.onnx.export(model=wrapper, args=args, **call_kw)
+                    if simplify:
                         with contextlib.suppress(Exception):
                             import onnx
+                            import onnxsim
 
                             model_onnx = onnx.load(str(onnx_path))
-                            with contextlib.suppress(Exception):
-                                import onnxsim
-
-                                model_simp, ok = onnxsim.simplify(model_onnx)
-                                if bool(ok):
-                                    onnx.save(model_simp, str(onnx_path))
+                            model_simp, ok = onnxsim.simplify(model_onnx)
+                            if ok:
+                                onnx.save(model_simp, str(onnx_path))
                     return onnx_path
                 except Exception as exc:
-                    errors.append(
-                        f"opset={opset} dynamo={use_dynamo} -> {type(exc).__name__}: {exc}"
-                    )
-                    continue
-
+                    errors.append(f"opset={opset} dynamo={use_dyn} -> {exc}")
         raise RuntimeError("ONNX export failed. " + "; ".join(errors[-6:]))
 
     @staticmethod
-    def coerce(
-        model: nn.Module, onnx_path: PathLike, *args: Any, **kwargs: Any
-    ) -> object:
+    def coerce(model: nn.Module, onnx_path: PathLike, *args: Any, **kwargs: Any) -> object:
         if not onnx_path.exists():
             return Exporter._OnnxLayer.export(model, onnx_path, **kwargs)
         return onnx_path
@@ -707,14 +502,11 @@ class _OrtLayer:
             "extended": ort.GraphOptimizationLevel.ORT_ENABLE_EXTENDED,
             "all": ort.GraphOptimizationLevel.ORT_ENABLE_ALL,
         }
-        level = opt_map.get(
-            optimization_level.lower(), ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-        )
+        level = opt_map.get(optimization_level.lower(), ort.GraphOptimizationLevel.ORT_ENABLE_ALL)
         platform = (target_platform or "").lower()
         disabled_optimizers = (
             ["NchwcTransformer"]
-            if level == ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-            and platform not in {"", "amd64"}
+            if level == ort.GraphOptimizationLevel.ORT_ENABLE_ALL and platform not in {"", "amd64"}
             else None
         )
         optimized_onnx_path = None
@@ -738,9 +530,7 @@ class _OrtLayer:
         so.graph_optimization_level = level
         so.add_session_config_entry("session.save_model_format", "ORT")
         if optimization_style.lower() == "runtime":
-            so.add_session_config_entry(
-                "optimization.minimal_build_optimizations", "save"
-            )
+            so.add_session_config_entry("optimization.minimal_build_optimizations", "save")
         ort.InferenceSession(
             str(onnx_path),
             sess_options=so,
@@ -753,9 +543,7 @@ class _OrtLayer:
 class Format(Protocol):
     name = None
 
-    def save(
-        self, model: nn.Module, dst: PathLike, *args: Any, **kwargs: Any
-    ) -> None: ...
+    def save(self, model: nn.Module, dst: PathLike, *args: Any, **kwargs: Any) -> None: ...
 
 
 class Builder:
@@ -763,8 +551,7 @@ class Builder:
 
     @staticmethod
     def is_target_native(path: PathLike) -> bool:
-        p = Path(path)
-        suffix = p.suffix.lower()
+        suffix = Path(path).suffix.lower()
         return not suffix or suffix in Builder.NATIVE_EXTS
 
     @staticmethod
@@ -776,45 +563,43 @@ class Builder:
         **opts: Any,
     ) -> object:
         p = Path(path)
-        suffix = p.suffix.lower()
-        if not suffix and p.exists() and p.is_dir():
+
+        def _make_meta() -> dict[str, Any]:
+            return {
+                "version": 1,
+                "in_dim": int(getattr(model, "in_dim", 0)),
+                "out_shape": tuple(int(x) for x in getattr(model, "out_shape", ())),
+                "config": _load_model_config(model),
+                "pytorch_version": torch.__version__,
+                "extra": coerce_json(extra or {}),
+            }
+
+        if not p.suffix and p.exists() and p.is_dir():
             from torch.distributed.checkpoint import FileSystemWriter
             from torch.distributed.checkpoint import save as dcp_save
 
             with _save_sync(p, barrier=True):
-                opts_sd = StateDictOptions(full_state_dict=True)
-                m_sd = get_model_state_dict(model, options=opts_sd)
                 dcp_save(
-                    state_dict={"model": m_sd}, storage_writer=FileSystemWriter(str(p))
+                    state_dict={
+                        "model": get_model_state_dict(
+                            model, options=StateDictOptions(full_state_dict=True)
+                        )
+                    },
+                    storage_writer=FileSystemWriter(str(p)),
                 )
-                meta = {
-                    "version": 1,
-                    "format": "dcp-dir-v1",
-                    "in_dim": int(getattr(model, "in_dim", 0)),
-                    "out_shape": tuple(
-                        (int(x) for x in getattr(model, "out_shape", ()))
-                    ),
-                    "config": _load_model_config(model),
-                    "pytorch_version": torch.__version__,
-                    "extra": coerce_json(extra or {}),
-                }
-                meta_path = p / "meta.json"
                 if _is_rank0_global():
-                    write_json(meta_path, coerce_json(meta), indent=2)
+                    write_json(p / "meta.json", {**_make_meta(), "format": "dcp-dir-v1"}, indent=2)
             return p
-        if not suffix:
+        if not p.suffix:
             p = p.with_suffix(".pt")
-            suffix = ".pt"
         p.parent.mkdir(parents=True, exist_ok=True)
         with _save_sync(p, barrier=False):
             if not _is_rank0_global():
                 return p
-            if suffix == ".safetensors":
+            if p.suffix == ".safetensors":
                 is_required("safetensors", "pip install safetensors")
                 from safetensors.torch import save_file as save_tensors
 
-                sd = model.state_dict()
-                cpu_sd = {k: _to_tensor(v) for k, v in sd.items()}
                 fd, tmp_name = tempfile.mkstemp(
                     prefix=p.name + ".", suffix=p.suffix + ".tmp", dir=str(p.parent)
                 )
@@ -822,39 +607,20 @@ class Builder:
                 tmp_path = Path(tmp_name)
                 try:
                     save_tensors(
-                        cpu_sd, str(tmp_path), metadata={"format": "safetensors-v1"}
+                        {k: _to_tensor(v) for k, v in model.state_dict().items()},
+                        str(tmp_path),
+                        metadata={"format": "safetensors-v1"},
                     )
                     tmp_path.replace(p)
                 finally:
                     with contextlib.suppress(Exception):
-                        if tmp_path.exists():
-                            tmp_path.unlink()
-                meta = {
-                    "version": 1,
-                    "in_dim": int(getattr(model, "in_dim", 0)),
-                    "out_shape": tuple(
-                        (int(x) for x in getattr(model, "out_shape", ()))
-                    ),
-                    "config": _load_model_config(model),
-                    "pytorch_version": torch.__version__,
-                    "extra": coerce_json(extra or {}),
-                }
-                meta_path = p.with_suffix(".json")
-                write_json(meta_path, coerce_json(meta), indent=2)
+                        tmp_path.unlink() if tmp_path.exists() else None
+                write_json(p.with_suffix(".json"), _make_meta(), indent=2)
                 return p
-            payload = {
-                "version": 1,
-                "in_dim": int(getattr(model, "in_dim", 0)),
-                "out_shape": tuple((int(x) for x in getattr(model, "out_shape", ()))),
-                "config": _load_model_config(model),
-                "state_dict": model.state_dict(),
-                "pytorch_version": torch.__version__,
-            }
-            if optimizer is not None and hasattr(optimizer, "state_dict"):
+            payload = {**_make_meta(), "state_dict": model.state_dict()}
+            if optimizer is not None:
                 with contextlib.suppress(Exception):
                     payload["optimizer_state_dict"] = optimizer.state_dict()
-            if extra is not None:
-                payload["extra"] = coerce_json(extra)
             save_temp(p, payload, **opts)
             return p
 
@@ -884,6 +650,22 @@ class Exporter:
                 sig = None
             cls._export_sig_cache = sig
             return sig
+
+    @classmethod
+    def _export_sig_keys(cls) -> set[str]:
+        sig = cls._export_sig()
+        if sig is None:
+            return set()
+        try:
+            params = getattr(sig, "parameters", None)
+            if isinstance(params, dict):
+                return set(params.keys())
+        except Exception:
+            pass
+        try:
+            return set(sig.parameters.keys())  # type: ignore[attr-defined]
+        except Exception:
+            return set()
 
     @classmethod
     def register(cls, name: str, exts: tuple[str, ...], impl: Format) -> None:
@@ -927,9 +709,7 @@ class Onnx(Format):
         **kwargs: Any,
     ) -> object:
         with _onnx_model(model) as serving:
-            out = Exporter._OnnxLayer.export(
-                serving, dst, **_onnx_options(kwargs, target="onnx")
-            )
+            out = Exporter._OnnxLayer.export(serving, dst, **_onnx_options(kwargs, target="onnx"))
         return (out,)
 
 
@@ -949,15 +729,13 @@ class Ort(Format):
                 _coerce_onnx_path(dst, kwargs),
                 **_onnx_options(kwargs, target="onnx"),
             )
-            ort_path, optimized = Exporter.OrtLayer.to_ort(
+            ort_path, optimized = Exporter._OrtLayer.to_ort(
                 onnx_path,
                 dst,
                 optimization_level=str(kwargs.get("optimization_level", "all")),
                 optimization_style=str(kwargs.get("optimization_style", "fixed")),
                 target_platform=kwargs.get("target_platform"),
-                save_optimized_onnx_model=bool(
-                    kwargs.get("save_optimized_onnx_model", False)
-                ),
+                save_optimized_onnx_model=bool(kwargs.get("save_optimized_onnx_model", False)),
             )
         return (ort_path, optimized) if optimized is not None else (ort_path,)
 
@@ -986,16 +764,12 @@ class TensorRT(Format):
             trt_logger = trt.Logger(trt.Logger.WARNING)
             explicit_batch_flag = 0
             with contextlib.suppress(Exception):
-                explicit_batch_flag = 1 << int(
-                    trt.NetworkDefinitionCreationFlag.EXPLICIT_BATCH
-                )
+                explicit_batch_flag = 1 << int(trt.NetworkDefinitionCreationFlag.EXPLICIT_BATCH)
             with contextlib.ExitStack() as stack:
                 builder = stack.enter_context(trt.Builder(trt_logger))
                 create_network = getattr(builder, "create_network", None)
                 if not callable(create_network):
-                    raise RuntimeError(
-                        "TensorRT builder.create_network is not available."
-                    )
+                    raise RuntimeError("TensorRT builder.create_network is not available.")
                 try:
                     network = stack.enter_context(create_network(explicit_batch_flag))
                 except TypeError:
@@ -1006,9 +780,7 @@ class TensorRT(Format):
 
                 workspace_size_bytes = int(kwargs.get("workspace_size_bytes", 1 << 30))
                 if hasattr(config, "set_memory_pool_limit"):
-                    config.set_memory_pool_limit(
-                        trt.MemoryPoolType.WORKSPACE, workspace_size_bytes
-                    )
+                    config.set_memory_pool_limit(trt.MemoryPoolType.WORKSPACE, workspace_size_bytes)
                 else:
                     config.max_workspace_size = workspace_size_bytes
                 with open(onnx_path, "rb") as handle:
@@ -1096,9 +868,7 @@ class Nnef(Format):
 
                 importlib.import_module("nnef_tools.convert")
             except ImportError as exc:
-                raise ImportError(
-                    "nnef-tools[onnx] is required for this export."
-                ) from exc
+                raise ImportError("nnef-tools[onnx] is required for this export.") from exc
             input_shapes = kwargs.get("input_shapes")
             if input_shapes is None:
                 sample = _pad_sample(serving_model, kwargs.get("sample_input"))
@@ -1259,9 +1029,7 @@ class LiteRT(Format):
             with TemporaryDirectory() as tmpd:
                 saved_model_dir = Path(tmpd) / "saved_model"
                 prepare(model_onnx).export_graph(str(saved_model_dir))
-                converter = tf.lite.TFLiteConverter.from_saved_model(
-                    str(saved_model_dir)
-                )
+                converter = tf.lite.TFLiteConverter.from_saved_model(str(saved_model_dir))
                 if bool(kwargs.get("allow_fp16", False)):
                     converter.target_spec.supported_types = [tf.float16]
                     converter.optimizations = [tf.lite.Optimize.DEFAULT]
@@ -1273,9 +1041,7 @@ class LiteRT(Format):
                         )
                     converter.optimizations = [tf.lite.Optimize.DEFAULT]
                     converter.representative_dataset = rep_ds
-                    converter.target_spec.supported_ops = [
-                        tf.lite.OpsSet.TFLITE_BUILTINS_INT8
-                    ]
+                    converter.target_spec.supported_ops = [tf.lite.OpsSet.TFLITE_BUILTINS_INT8]
                     converter.inference_input_type = tf.int8
                     converter.inference_output_type = tf.int8
                 tflite_model = converter.convert()
@@ -1437,4 +1203,4 @@ class TensorFlow(Format):
         return (saved_model_dir,)
 
 
-_register_torchversion_safe_global()
+_register_safe_globals()

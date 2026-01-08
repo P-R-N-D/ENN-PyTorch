@@ -105,6 +105,7 @@ def _import_torchao_quantization() -> None:
                     Int8WeightOnlyConfig as _Int8WeightOnlyConfig,
                     quantize_ as _quantize_,
                 )
+
                 try:
                     from torchao.quantization import quant_primitives as _quant_primitives
                 except Exception:
@@ -119,17 +120,14 @@ def _import_torchao_quantization() -> None:
 
 
 def _prod_int(shape: Sequence[int]) -> int:
-    out = 1
-    for v in shape:
-        out *= int(v)
-    return int(out)
+    return int(math.prod(int(v) for v in shape))
 
 
 def _normalize_tile_shape(
     tile_shape: Sequence[int] | int | None,
     event_shape: Sequence[int],
 ) -> Optional[Tuple[int, ...]]:
-    if tile_shape is None:
+    if tile_shape is None or not event_shape:
         return None
     if isinstance(tile_shape, int) and not isinstance(tile_shape, bool):
         ts = (int(tile_shape),)
@@ -137,15 +135,12 @@ def _normalize_tile_shape(
         ts = tuple(int(v) for v in tile_shape)
     if not ts:
         return None
-    ev = tuple(int(v) for v in event_shape)
-    if not ev:
-        return None
-    ndim = len(ev)
+    ndim = len(event_shape)
     if len(ts) == 1:
         ts = ts * ndim
     elif len(ts) < ndim:
         ts = (1,) * (ndim - len(ts)) + ts
-    elif len(ts) > ndim:
+    else:
         ts = ts[-ndim:]
     return tuple(max(1, int(v)) for v in ts)
 
@@ -164,15 +159,13 @@ def _tile_counts_grid(
     for d, t, g in zip(ev, ts, grid):
         if g <= 0:
             counts_1d.append(torch.zeros((0,), device=device, dtype=dtype))
-            continue
-        if g == 1:
+        elif g == 1:
             counts_1d.append(torch.tensor([float(d)], device=device, dtype=dtype))
-            continue
-        last = d - (g - 1) * t
-        last = max(1, int(last))
-        head = torch.full((g - 1,), float(t), device=device, dtype=dtype)
-        tail = torch.tensor([float(last)], device=device, dtype=dtype)
-        counts_1d.append(torch.cat((head, tail), dim=0))
+        else:
+            last = max(1, int(d - (g - 1) * t))
+            head = torch.full((g - 1,), float(t), device=device, dtype=dtype)
+            tail = torch.tensor([float(last)], device=device, dtype=dtype)
+            counts_1d.append(torch.cat((head, tail), dim=0))
     out = torch.ones(grid, device=device, dtype=dtype)
     for i, c in enumerate(counts_1d):
         shape = [1] * len(grid)
@@ -193,24 +186,24 @@ def _reduce_flat_to_grid(
     ev = tuple(int(v) for v in event_shape)
     ts = tuple(int(v) for v in tile_shape)
     grid = tuple((d + t - 1) // t for d, t in zip(ev, ts))
-    padded = tuple(int(g * t) for g, t in zip(grid, ts))
     B = x.size(0)
     x_ev = x.reshape(B, *ev)
-    pads: list[int] = []
-    for orig, pad in reversed(list(zip(ev, padded))):
-        pads.extend([0, int(pad - orig)])
-    if any(int(p) != 0 for p in pads):
+    pads = []
+    for orig, g, t in reversed(list(zip(ev, grid, ts))):
+        pads.extend([0, int(g * t - orig)])
+    if any(p != 0 for p in pads):
         x_ev = F.pad(x_ev, tuple(pads))
-    view_shape: list[int] = [B]
+
+    view_shape = [B]
     for g, t in zip(grid, ts):
         view_shape.extend([int(g), int(t)])
     blk = x_ev.reshape(*view_shape).to(dtype=work_dtype)
     tile_dims = tuple(range(2, 1 + 2 * len(grid), 2))
+    sum_v = blk.sum(dim=tile_dims)
     if reduce == "sum":
-        return blk.sum(dim=tile_dims)
+        return sum_v
     counts = _tile_counts_grid(ev, ts, device=blk.device, dtype=blk.dtype).unsqueeze(0)
-    denom = torch.clamp(counts, min=float(eps))
-    return blk.sum(dim=tile_dims) / denom
+    return sum_v / torch.clamp(counts, min=float(eps))
 
 
 def _tv_loss_grid(
@@ -236,9 +229,7 @@ def _dot_product_attention_cls() -> Any:
         return None
 
 
-def _is_ptq_unavailable(
-    model: nn.Module, *args: Any, **kwargs: Any
-) -> tuple[nn.Module, bool, str]:
+def _is_ptq_unavailable(model: nn.Module, *args: Any, **kwargs: Any) -> tuple[nn.Module, bool, str]:
     return (model, False, "PTQ backend unavailable")
 
 
@@ -269,9 +260,7 @@ class _CallableFuser:
 
 
 class _ProxyDecoder(nn.Module):
-    def __init__(
-        self, norm: nn.Module, head: nn.Module, out_shape: Sequence[int]
-    ) -> None:
+    def __init__(self, norm: nn.Module, head: nn.Module, out_shape: Sequence[int]) -> None:
         super().__init__()
         self._norm_ref = weakref.ref(norm)
         self._head_ref = weakref.ref(head)
@@ -346,11 +335,7 @@ class SpatialExtractor(nn.Module):
                     per_blk = _size_of_retnet(out, blk0, mode="spatial")
                     est = int(per_blk) * int(len(self.blocks))
                 else:
-                    est = (
-                        int(out.numel())
-                        * int(out.element_size())
-                        * int(len(self.blocks))
-                    )
+                    est = int(out.numel()) * int(out.element_size()) * int(len(self.blocks))
             do_ckpt = bool(est >= int(getattr(self, "_ckpt_min_bytes", 0) or 0))
         for blk in self.blocks:
             if do_ckpt:
@@ -410,7 +395,6 @@ class TemporalExtractor(nn.Module):
         self._ckpt_min_bytes = int(64 * 1024 * 1024)
 
     @staticmethod
-    @torch_compiler_disable(reason="TemporalExtractor state coercion", recursive=False)
     def _coerce_state_tensor(
         state: Any,
         *args: Any,
@@ -423,9 +407,7 @@ class TemporalExtractor(nn.Module):
     ) -> Optional[torch.Tensor]:
         if state is None:
             return None
-        strict = env_bool(
-            ("STNET_STRICT_TEMPORAL_STATE", "STNET_STRICT_STATE"), default=False
-        )
+        strict = env_bool(("STNET_STRICT_TEMPORAL_STATE", "STNET_STRICT_STATE"), default=False)
 
         def _bad(reason: str) -> Optional[torch.Tensor]:
             if not strict:
@@ -607,9 +589,7 @@ class TemporalExtractor(nn.Module):
             do_ckpt = bool(est >= int(getattr(self, "_ckpt_min_bytes", 0) or 0))
         next_state: Optional[torch.Tensor] = None
         if return_state:
-            next_state = x.new_empty(
-                (int(self.depth), B, int(self.nhead), int(self.head_dim))
-            )
+            next_state = x.new_empty((int(self.depth), B, int(self.nhead), int(self.head_dim)))
         for i, blk in enumerate(self.blocks):
             blk_state = None
             if st_tensor is not None and i < int(self.depth):
@@ -633,9 +613,7 @@ class TemporalExtractor(nn.Module):
                 )
                 if next_state is not None:
                     if blk_next_state is None:
-                        blk_next_state = x.new_zeros(
-                            (B, int(self.nhead), int(self.head_dim))
-                        )
+                        blk_next_state = x.new_zeros((B, int(self.nhead), int(self.head_dim)))
                     next_state[i] = blk_next_state
         x = self.norm(x)
         if next_state is not None:
@@ -753,9 +731,7 @@ class TokenCollector(nn.Module):
             mb_cur = int(self.microbatch) if self.microbatch else B
         mb = max(1, min(B, mb_cur))
         infer_mode = (not torch.is_grad_enabled()) and (not is_export_or_trace())
-        controller_ctx = (
-            inference_mode(self.backbone) if infer_mode else contextlib.nullcontext()
-        )
+        controller_ctx = inference_mode(self.backbone) if infer_mode else contextlib.nullcontext()
         runner = _CallableFuser(
             self.backbone,
             device=device,
@@ -771,9 +747,7 @@ class TokenCollector(nn.Module):
 
 
 class TokenizedView(nn.Module):
-    def __init__(
-        self, in_dim: int, tokens: int, d_model: int, extractor: nn.Module
-    ) -> None:
+    def __init__(self, in_dim: int, tokens: int, d_model: int, extractor: nn.Module) -> None:
         super().__init__()
         self.in_dim = int(in_dim)
         self.tokens = int(tokens)
@@ -806,9 +780,7 @@ class TokenFuser(nn.Module):
         out_shape: Sequence[int],
         config: ModelConfig,
         *args: Any,
-        views: Optional[
-            Mapping[str, nn.Module] | Sequence[Tuple[str, nn.Module]]
-        ] = None,
+        views: Optional[Mapping[str, nn.Module] | Sequence[Tuple[str, nn.Module]]] = None,
         fusions: Optional[
             Mapping[str | Tuple[str, str], nn.Module]
             | Sequence[Tuple[str | Tuple[str, str], nn.Module]]
@@ -829,9 +801,7 @@ class TokenFuser(nn.Module):
         self.drop_path = float(getattr(config, "drop_path", 0.0))
         self.norm_type = str(getattr(config, "normalization_method", "layernorm"))
         self.gate_blend_alpha = float(
-            getattr(
-                config, "fuser_blend_alpha", getattr(config, "fuser_gate_blend", 0.0)
-            )
+            getattr(config, "fuser_blend_alpha", getattr(config, "fuser_gate_blend", 0.0))
         )
         self.gate_blend_alpha = float(min(max(self.gate_blend_alpha, 0.0), 1.0))
         self.view_encoders = nn.ModuleDict()
@@ -913,9 +883,7 @@ class TokenFuser(nn.Module):
             nn.GELU(),
             nn.Linear(hid, 1),
         )
-        self._token_generator = nn.Linear(
-            self.d_model, self.fused_tokens * self.d_model
-        )
+        self._token_generator = nn.Linear(self.d_model, self.fused_tokens * self.d_model)
         self.norm = norm_layer(self.norm_type, self.d_model)
         self.head_hidden_dim = hid
         self.head = nn.Sequential(
@@ -944,9 +912,7 @@ class TokenFuser(nn.Module):
         x, y = (a, b) if a <= b else (b, a)
         return f"{x}|{y}", (x, y)
 
-    def _canon_pair_key(
-        self, raw: str | Tuple[str, str]
-    ) -> tuple[str, tuple[str, str]]:
+    def _canon_pair_key(self, raw: str | Tuple[str, str]) -> tuple[str, tuple[str, str]]:
         return self._canon_pair_key_static(raw)
 
     @staticmethod
@@ -954,17 +920,13 @@ class TokenFuser(nn.Module):
         if t.dim() == 2:
             return t.unsqueeze(1)
         if t.dim() != 3:
-            raise ValueError(
-                f"expected tokens shaped (B,N,D) or (B,D), got {tuple(t.shape)}"
-            )
+            raise ValueError(f"expected tokens shaped (B,N,D) or (B,D), got {tuple(t.shape)}")
         return t
 
     def _aggregate_tokens(self, token_sets: Sequence[torch.Tensor]) -> torch.Tensor:
         if len(token_sets) < 1:
             raise ValueError("no token sets to aggregate")
-        summaries = torch.stack(
-            [self._agg_norm(ts.mean(dim=1)) for ts in token_sets], dim=1
-        )
+        summaries = torch.stack([self._agg_norm(ts.mean(dim=1)) for ts in token_sets], dim=1)
         feats = self._agg_phi(summaries)
         logits = self._agg_gate(feats).squeeze(-1)
         w_soft = torch.softmax(logits, dim=1)
@@ -1095,9 +1057,7 @@ class TokenFuser(nn.Module):
         if tn is not None:
             depth = int(getattr(tn, "depth", 0))
             nhead = int(getattr(tn, "nhead", self.nhead))
-            head_dim = int(
-                getattr(tn, "head_dim", max(1, self.d_model // max(1, nhead)))
-            )
+            head_dim = int(getattr(tn, "head_dim", max(1, self.d_model // max(1, nhead))))
         else:
             depth = 0
             nhead = int(self.nhead)
@@ -1119,9 +1079,7 @@ class TokenFuser(nn.Module):
         )
         return tokens, context, next_state
 
-    def decode(
-        self, tokens: torch.Tensor, *args: Any, apply_norm: bool = False
-    ) -> torch.Tensor:
+    def decode(self, tokens: torch.Tensor, *args: Any, apply_norm: bool = False) -> torch.Tensor:
         if apply_norm:
             tokens = self.norm(tokens)
         pooled = tokens.mean(dim=1)
@@ -1131,9 +1089,7 @@ class TokenFuser(nn.Module):
     def forward_export(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         if not isinstance(x, torch.Tensor):
             raise TypeError("forward_export expects a Tensor")
-        views, _ = self._run_views(
-            x, temporal_state=None, want_state=False, causal_mask=None
-        )
+        views, _ = self._run_views(x, temporal_state=None, want_state=False, causal_mask=None)
         mode_l = _coerce_modeling_types(self.modeling_type)
         if mode_l == "ss":
             chosen = [self._pick_view(views, ("spatial", "s"))]
@@ -1149,9 +1105,11 @@ class TokenFuser(nn.Module):
 
 
 class Model(nn.Module):
-    def __init__(
-        self, in_dim: int, out_shape: Sequence[int], config: ModelConfig
-    ) -> None:
+    @staticmethod
+    def _get_cfg(cfg, name, default, type_=float):
+        return type_(getattr(cfg, name, default))
+
+    def __init__(self, in_dim: int, out_shape: Sequence[int], config: ModelConfig) -> None:
         super().__init__()
         self.in_dim = int(in_dim)
         self.out_shape = tuple((int(x) for x in out_shape))
@@ -1175,18 +1133,11 @@ class Model(nn.Module):
         self.logger = Recorder()
         self.is_norm_linear = bool(getattr(config, "use_linear_branch", False))
         self.linear_branch = (
-            nn.Linear(self.in_dim, self.out_dim).to(self._device)
-            if self.is_norm_linear
-            else None
+            nn.Linear(self.in_dim, self.out_dim).to(self._device) if self.is_norm_linear else None
         )
-        self.fuser = TokenFuser(self.in_dim, self.out_shape, config=config).to(
-            self._device
-        )
+        self.fuser = TokenFuser(self.in_dim, self.out_shape, config=config).to(self._device)
         self.processor = self.fuser
-        try:
-            bucket = int(getattr(config, "length_bucket_multiple", 64))
-        except Exception:
-            bucket = 64
+        bucket = self._get_cfg(config, "length_bucket_multiple", 64, int)
         self.temporal_token_collector = TokenCollector(
             int(config.d_model),
             int(config.heads),
@@ -1198,63 +1149,41 @@ class Model(nn.Module):
         ).to(self._device)
         self.controller = self.temporal_token_collector
         self.p_gate: Optional[SigmoidGate]
-        k_default = float(getattr(config, "p_gate_fallback_k", 6.0))
-        k_low_cfg = getattr(config, "p_gate_fallback_k_low", None)
-        k_high_cfg = getattr(config, "p_gate_fallback_k_high", None)
-        self.p_gate_fallback_k: float = float(k_default)
-        self.p_gate_fallback_k_low: float = float(
-            k_default if k_low_cfg is None else float(k_low_cfg)
-        )
-        self.p_gate_fallback_k_high: float = float(
-            k_default if k_high_cfg is None else float(k_high_cfg)
+        k_def = self._get_cfg(config, "p_gate_fallback_k", 6.0)
+        self.p_gate_fallback_k: float = float(k_def)
+        self.p_gate_fallback_k_low = float(getattr(config, "p_gate_fallback_k_low", k_def) or k_def)
+        self.p_gate_fallback_k_high = float(
+            getattr(config, "p_gate_fallback_k_high", k_def) or k_def
         )
         self.p_gate_auto_k_enabled: bool = True
-        self.p_gate_auto_k_interval: int = max(
-            1, int(getattr(config, "p_gate_auto_k_interval", 100) or 100)
+        self.p_gate_auto_k_interval = max(
+            1, self._get_cfg(config, "p_gate_auto_k_interval", 100, int)
         )
-        self.p_gate_auto_k_warmup: int = max(
-            0, int(getattr(config, "p_gate_auto_k_warmup", 0) or 0)
+        self.p_gate_auto_k_warmup = max(0, self._get_cfg(config, "p_gate_auto_k_warmup", 0, int))
+        self.p_gate_auto_k_ema_alpha = self._get_cfg(config, "p_gate_auto_k_ema_alpha", 0.1)
+        self.p_gate_auto_k_target_tight = self._get_cfg(config, "p_gate_auto_k_target_tight", 0.02)
+        self.p_gate_auto_k_tolerance = self._get_cfg(config, "p_gate_auto_k_tolerance", 0.5)
+        self.p_gate_auto_k_step_up = self._get_cfg(config, "p_gate_auto_k_step_up", 0.1)
+        self.p_gate_auto_k_step_down = self._get_cfg(config, "p_gate_auto_k_step_down", 0.02)
+        self.p_gate_auto_k_step_up_low = self._get_cfg(
+            config, "p_gate_auto_k_step_up_low", self.p_gate_auto_k_step_up
         )
-        self.p_gate_auto_k_ema_alpha: float = float(
-            getattr(config, "p_gate_auto_k_ema_alpha", 0.1)
+        self.p_gate_auto_k_step_down_low = self._get_cfg(
+            config, "p_gate_auto_k_step_down_low", self.p_gate_auto_k_step_down
         )
-        self.p_gate_auto_k_target_tight: float = float(
-            getattr(config, "p_gate_auto_k_target_tight", 0.02)
+        self.p_gate_auto_k_step_up_high = self._get_cfg(
+            config, "p_gate_auto_k_step_up_high", self.p_gate_auto_k_step_up
         )
-        self.p_gate_auto_k_tolerance: float = float(
-            getattr(config, "p_gate_auto_k_tolerance", 0.5)
-        )
-        self.p_gate_auto_k_step_up: float = float(
-            getattr(config, "p_gate_auto_k_step_up", 0.1)
-        )
-        self.p_gate_auto_k_step_down: float = float(
-            getattr(config, "p_gate_auto_k_step_down", 0.02)
-        )
-        self.p_gate_auto_k_step_up_low: float = float(
-            getattr(config, "p_gate_auto_k_step_up_low", self.p_gate_auto_k_step_up)
-        )
-        self.p_gate_auto_k_step_down_low: float = float(
-            getattr(config, "p_gate_auto_k_step_down_low", self.p_gate_auto_k_step_down)
-        )
-        self.p_gate_auto_k_step_up_high: float = float(
-            getattr(config, "p_gate_auto_k_step_up_high", self.p_gate_auto_k_step_up)
-        )
-        self.p_gate_auto_k_step_down_high: float = float(
-            getattr(
-                config, "p_gate_auto_k_step_down_high", self.p_gate_auto_k_step_down
-            )
+        self.p_gate_auto_k_step_down_high = self._get_cfg(
+            config, "p_gate_auto_k_step_down_high", self.p_gate_auto_k_step_down
         )
         self.p_gate_auto_k_edge_enabled: bool = True
-        self.p_gate_auto_k_target_edge: float = float(
-            getattr(config, "p_gate_auto_k_target_edge", 0.05)
-        )
-        self.p_gate_auto_k_edge_tolerance: float = float(
-            getattr(config, "p_gate_auto_k_edge_tolerance", 0.5)
+        self.p_gate_auto_k_target_edge = self._get_cfg(config, "p_gate_auto_k_target_edge", 0.05)
+        self.p_gate_auto_k_edge_tolerance = self._get_cfg(
+            config, "p_gate_auto_k_edge_tolerance", 0.5
         )
         self.p_gate_auto_k_edge_ema_alpha: float = float(
-            getattr(
-                config, "p_gate_auto_k_edge_ema_alpha", self.p_gate_auto_k_ema_alpha
-            )
+            getattr(config, "p_gate_auto_k_edge_ema_alpha", self.p_gate_auto_k_ema_alpha)
         )
         self.p_gate_auto_k_edge_step_down_low: float = float(
             getattr(config, "p_gate_auto_k_edge_step_down_low", 0.01)
@@ -1263,9 +1192,7 @@ class Model(nn.Module):
             getattr(config, "p_gate_auto_k_edge_step_down_high", 0.01)
         )
         self.p_gate_auto_k_min: float = float(getattr(config, "p_gate_auto_k_min", 1.0))
-        self.p_gate_auto_k_max: float = float(
-            getattr(config, "p_gate_auto_k_max", 16.0)
-        )
+        self.p_gate_auto_k_max: float = float(getattr(config, "p_gate_auto_k_max", 16.0))
         self.p_gate_auto_k_width_frac: float = float(
             getattr(config, "p_gate_auto_k_width_frac", 0.05)
         )
@@ -1275,11 +1202,12 @@ class Model(nn.Module):
         self.p_gate_auto_k_log_interval: int = int(
             getattr(config, "p_gate_auto_k_log_interval", 200) or 0
         )
-        if self.p_gate_auto_k_enabled:
-            if self.p_gate_fallback_k_low <= 0.0:
-                self.p_gate_fallback_k_low = max(float(self.p_gate_auto_k_min), 1e-6)
-            if self.p_gate_fallback_k_high <= 0.0:
-                self.p_gate_fallback_k_high = max(float(self.p_gate_auto_k_min), 1e-6)
+        if self.p_gate_auto_k_enabled and (
+            self.p_gate_fallback_k_low <= 0.0 or self.p_gate_fallback_k_high <= 0.0
+        ):
+            m = max(float(self.p_gate_auto_k_min), 1e-6)
+            self.p_gate_fallback_k_low = max(self.p_gate_fallback_k_low, m)
+            self.p_gate_fallback_k_high = max(self.p_gate_fallback_k_high, m)
         self.p_gate_fallback_enabled: bool = bool(
             self.p_gate_fallback_k_low > 0.0 and self.p_gate_fallback_k_high > 0.0
         )
@@ -1290,9 +1218,7 @@ class Model(nn.Module):
             if raw_tile_shape is None:
                 tile_shape = None
             else:
-                if isinstance(raw_tile_shape, int) and not isinstance(
-                    raw_tile_shape, bool
-                ):
+                if isinstance(raw_tile_shape, int) and not isinstance(raw_tile_shape, bool):
                     tile_shape = (int(raw_tile_shape),)
                 else:
                     tile_shape = tuple(int(v) for v in raw_tile_shape)
@@ -1312,12 +1238,8 @@ class Model(nn.Module):
         self.p_gate_bounds_use_quantile: bool = bool(
             getattr(config, "p_gate_bounds_use_quantile", False)
         )
-        self.p_gate_bounds_q_low: float = float(
-            getattr(config, "p_gate_bounds_q_low", 0.005)
-        )
-        self.p_gate_bounds_q_high: float = float(
-            getattr(config, "p_gate_bounds_q_high", 0.995)
-        )
+        self.p_gate_bounds_q_low: float = float(getattr(config, "p_gate_bounds_q_low", 0.005))
+        self.p_gate_bounds_q_high: float = float(getattr(config, "p_gate_bounds_q_high", 0.995))
         self.p_gate_bounds_q_max_samples: int = int(
             getattr(config, "p_gate_bounds_q_max_samples", 8192) or 0
         )
@@ -1338,9 +1260,7 @@ class Model(nn.Module):
             self.register_buffer(
                 "p_gate_fallback_k_buf",
                 torch.tensor(
-                    float(
-                        0.5 * (self.p_gate_fallback_k_low + self.p_gate_fallback_k_high)
-                    ),
+                    float(0.5 * (self.p_gate_fallback_k_low + self.p_gate_fallback_k_high)),
                     dtype=torch.float32,
                 ),
                 persistent=True,
@@ -1406,9 +1326,7 @@ class Model(nn.Module):
         self.p_prior_weight = float(getattr(config, "p_prior_weight", 0.0))
         self.p_prior_alpha = float(getattr(config, "p_prior_alpha", 2.0))
         self.p_prior_beta = float(getattr(config, "p_prior_beta", 2.0))
-        self.p_gate_edge_reg_weight = float(
-            getattr(config, "p_gate_edge_reg_weight", 0.0)
-        )
+        self.p_gate_edge_reg_weight = float(getattr(config, "p_gate_edge_reg_weight", 0.0))
         self.p_gate_edge_reg_frac = float(
             getattr(
                 config,
@@ -1423,16 +1341,12 @@ class Model(nn.Module):
                 getattr(config, "p_gate_auto_k_width_frac", 0.05),
             )
         )
-        self.p_gate_edge_reg_power = float(
-            getattr(config, "p_gate_edge_reg_power", 2.0)
-        )
+        self.p_gate_edge_reg_power = float(getattr(config, "p_gate_edge_reg_power", 2.0))
         self.p_gate_budget_weight = float(getattr(config, "p_gate_budget_weight", 0.0))
         self.p_gate_budget_target = float(getattr(config, "p_gate_budget_target", 0.5))
         self.p_gate_tv_weight = float(getattr(config, "p_gate_tv_weight", 0.0))
         self.p_gate_tv_power = float(getattr(config, "p_gate_tv_power", 1.0))
-        self.p_gate_teacher_weight = float(
-            getattr(config, "p_gate_teacher_weight", 0.0)
-        )
+        self.p_gate_teacher_weight = float(getattr(config, "p_gate_teacher_weight", 0.0))
         self.p_gate_teacher_temp = float(getattr(config, "p_gate_teacher_temp", 0.25))
         self.p_gate_teacher_tau = float(getattr(config, "p_gate_teacher_tau", 0.0))
         self.p_gate_teacher_relu = bool(getattr(config, "p_gate_teacher_relu", False))
@@ -1440,14 +1354,10 @@ class Model(nn.Module):
             w_low_cfg = getattr(config, "p_gate_edge_reg_weight_low", None)
             w_high_cfg = getattr(config, "p_gate_edge_reg_weight_high", None)
             self.p_gate_edge_reg_weight_low = (
-                float(self.p_gate_edge_reg_weight)
-                if w_low_cfg is None
-                else float(w_low_cfg)
+                float(self.p_gate_edge_reg_weight) if w_low_cfg is None else float(w_low_cfg)
             )
             self.p_gate_edge_reg_weight_high = (
-                float(self.p_gate_edge_reg_weight)
-                if w_high_cfg is None
-                else float(w_high_cfg)
+                float(self.p_gate_edge_reg_weight) if w_high_cfg is None else float(w_high_cfg)
             )
         except Exception:
             self.p_gate_edge_reg_weight_low = float(self.p_gate_edge_reg_weight)
@@ -1469,9 +1379,7 @@ class Model(nn.Module):
         self.microbatch: int = 0
         self._auto_microbatch_pending: bool = True
         self._runtime_lock = threading.Lock()
-        self._eager_processor_temporal_net = getattr(
-            self.processor, "temporal_net", None
-        )
+        self._eager_processor_temporal_net = getattr(self.processor, "temporal_net", None)
         self._eager_processor_perception = getattr(self.processor, "perception", None)
         self._decode_compiled: Optional[nn.Module] = None
         try:
@@ -1484,9 +1392,7 @@ class Model(nn.Module):
             pass
         raw_mode = getattr(config, "compile_mode", "disabled")
         compile_mode_canonical = canonicalize_compile_mode(raw_mode)
-        compile_mode_arg = (
-            None if compile_mode_canonical == "disabled" else compile_mode_canonical
-        )
+        compile_mode_arg = None if compile_mode_canonical == "disabled" else compile_mode_canonical
         compile_requested = compile_mode_arg is not None
         compile_available = bool(torch_compiler_supported())
         compile_enabled = bool(compile_requested and compile_available)
@@ -1504,23 +1410,15 @@ class Model(nn.Module):
                 raw_mode,
             )
         compile_dynamic = bool(
-            getattr(
-                config, "compile_dynamic", compile_mode_canonical == "reduce-overhead"
-            )
+            getattr(config, "compile_dynamic", compile_mode_canonical == "reduce-overhead")
         )
-        compile_cudagraphs_default = (
-            not bool(nogil_opt)
-        ) and compile_mode_canonical not in {
+        compile_cudagraphs_default = (not bool(nogil_opt)) and compile_mode_canonical not in {
             "reduce-overhead",
             "max-autotune-no-cudagraphs",
         }
-        compile_cudagraphs = bool(
-            getattr(config, "compile_cudagraphs", compile_cudagraphs_default)
-        )
+        compile_cudagraphs = bool(getattr(config, "compile_cudagraphs", compile_cudagraphs_default))
         self._compile_cudagraphs = bool(
-            compile_enabled
-            and compile_cudagraphs
-            and getattr(self._device, "type", None) == "cuda"
+            compile_enabled and compile_cudagraphs and getattr(self._device, "type", None) == "cuda"
         )
         compile_patch_ctx = contextlib.nullcontext()
         compile_options = (
@@ -1532,16 +1430,12 @@ class Model(nn.Module):
             )
             else None
         )
-        compile_heavy_submodules_default = (
-            not bool(nogil_opt)
-        ) and compile_mode_canonical not in {
+        compile_heavy_submodules_default = (not bool(nogil_opt)) and compile_mode_canonical not in {
             "max-autotune",
             "max-autotune-no-cudagraphs",
         }
         compile_heavy_submodules = bool(
-            getattr(
-                config, "compile_heavy_submodules", compile_heavy_submodules_default
-            )
+            getattr(config, "compile_heavy_submodules", compile_heavy_submodules_default)
         )
         if (
             compile_enabled
@@ -1559,9 +1453,9 @@ class Model(nn.Module):
             with compile_patch_ctx:
                 try:
                     _raw_head = self.processor.head
-                    _decode_mod = _ProxyDecoder(
-                        self.processor.norm, _raw_head, self.out_shape
-                    ).to(self._device)
+                    _decode_mod = _ProxyDecoder(self.processor.norm, _raw_head, self.out_shape).to(
+                        self._device
+                    )
                     _compiled = compile_module(
                         _decode_mod,
                         mode=compile_mode_arg,
@@ -1580,9 +1474,7 @@ class Model(nn.Module):
                         exc_info=True,
                     )
                 if getattr(self._device, "type", None) == "cuda":
-                    empty_device_cache(
-                        device=self._device, do_gc=True, min_interval_s=0.0
-                    )
+                    empty_device_cache(device=self._device, do_gc=True, min_interval_s=0.0)
                 if compile_heavy_submodules:
                     try:
                         _orig = self._eager_processor_temporal_net
@@ -1609,9 +1501,7 @@ class Model(nn.Module):
                             exc_info=True,
                         )
                 if getattr(self._device, "type", None) == "cuda":
-                    empty_device_cache(
-                        device=self._device, do_gc=True, min_interval_s=0.0
-                    )
+                    empty_device_cache(device=self._device, do_gc=True, min_interval_s=0.0)
                 if compile_heavy_submodules:
                     try:
                         _orig = self._eager_processor_perception
@@ -1629,13 +1519,9 @@ class Model(nn.Module):
                             with contextlib.suppress(Exception):
                                 if hasattr(self.processor, "pair_fusers"):
                                     if "spatial|temporal" in self.processor.pair_fusers:
-                                        self.processor.pair_fusers[
-                                            "spatial|temporal"
-                                        ] = _compiled
+                                        self.processor.pair_fusers["spatial|temporal"] = _compiled
                                     elif len(self.processor.pair_fusers) == 1:
-                                        _pair = next(
-                                            iter(self.processor.pair_fusers.keys())
-                                        )
+                                        _pair = next(iter(self.processor.pair_fusers.keys()))
                                         self.processor.pair_fusers[_pair] = _compiled
                             compiled_perception = _compiled is not _orig
                     except Exception:
@@ -1644,9 +1530,7 @@ class Model(nn.Module):
                             exc_info=True,
                         )
                 if getattr(self._device, "type", None) == "cuda":
-                    empty_device_cache(
-                        device=self._device, do_gc=True, min_interval_s=0.0
-                    )
+                    empty_device_cache(device=self._device, do_gc=True, min_interval_s=0.0)
         self._compiled_submodules = {
             "decode": bool(compiled_decode),
             "temporal_net": bool(compiled_temporal),
@@ -1720,9 +1604,7 @@ class Model(nn.Module):
         def _sync_after_swap(swapped: str) -> None:
             if swapped == "temporal_net":
                 with contextlib.suppress(Exception):
-                    if hasattr(proc, "view_encoders") and (
-                        "temporal" in proc.view_encoders
-                    ):
+                    if hasattr(proc, "view_encoders") and ("temporal" in proc.view_encoders):
                         proc.view_encoders["temporal"] = proc.temporal_net
             elif swapped == "perception":
                 with contextlib.suppress(Exception):
@@ -1758,51 +1640,101 @@ class Model(nn.Module):
                     setattr(proc, name, old)
                 _sync_after_swap(name)
 
-    def forward_export(self, features: torch.Tensor) -> torch.Tensor:
-        if not isinstance(features, torch.Tensor):
-            raise TypeError("forward_export expects a Tensor")
-        device = self._device
-        try:
-            base_dtype = next(self.parameters()).dtype
-        except Exception:
-            base_dtype = features.dtype
-        x = self._cast_graph_safe(features, device, base_dtype)
+    def _run_forward_core(
+        self,
+        features: torch.Tensor,
+        *,
+        export: bool = False,
+        temporal_state: Optional[torch.Tensor] = None,
+        causal_mask: Optional[torch.Tensor] = None,
+        sanitize_nan: bool = True,
+        calibrate_output: bool = True,
+        device: Optional[torch.device] = None,
+        base_dtype: Optional[torch.dtype] = None,
+    ):
+        x = self._cast_graph_safe(features, device or self._device, base_dtype or features.dtype)
         x = self.scaler.normalize_x(x)
         b = x.size(0)
-        tokens, context = self.fuser.forward_export(x)
+        if export:
+            tokens, context = self.fuser.forward_export(x)
+            next_state = None
+        else:
+            tokens, context, next_state = self.fuser(
+                x,
+                temporal_state=temporal_state,
+                return_temporal_state=True,
+                causal_mask=causal_mask,
+            )
+        if sanitize_nan:
+            tokens = _coerce_tensor(tokens, enabled=True, inplace=not export)
+            context = _coerce_tensor(context, enabled=True, inplace=not export)
         assembled = context.reshape(b, -1)
         if self.is_norm_linear and self.linear_branch is not None:
-            bl = self.linear_branch(self._cast_graph_safe(x, device, assembled.dtype))
-            assembled = assembled + bl
-        mean = tokens.mean(dim=1, keepdim=True, dtype=tokens.dtype)
-        tokens_centered = tokens - mean.to(dtype=tokens.dtype)
-        if not tokens_centered.is_contiguous():
-            tokens_centered = tokens_centered.contiguous()
-        refined_tokens = self.temporal_token_collector.forward_export(tokens_centered)
-        residual_context = self.fuser.decode(refined_tokens, apply_norm=True)
-        enhanced = residual_context.reshape(b, -1)
-        if enhanced.dtype != assembled.dtype:
-            enhanced = enhanced.to(dtype=assembled.dtype)
+            assembled = assembled + self.linear_branch(
+                self._cast_graph_safe(x, self._device, assembled.dtype)
+            )
+        tokens_centered = (
+            tokens - tokens.mean(dim=1, keepdim=True, dtype=tokens.dtype).to(tokens.dtype)
+        ).contiguous()
+        if export:
+            refined = self.temporal_token_collector.forward_export(tokens_centered)
+        else:
+            refined = self.temporal_token_collector.forward(tokens_centered)[0]
+        if sanitize_nan:
+            refined = _coerce_tensor(refined, enabled=True, inplace=not export)
+        residual = self.fuser.decode(refined, apply_norm=True)
+        if sanitize_nan:
+            residual = _coerce_tensor(residual, enabled=True, inplace=not export)
+        enhanced = residual.reshape(b, -1).to(dtype=assembled.dtype)
         delta = enhanced - assembled
-        y_hat = assembled + (assembled.new_tensor(0.5) * delta)
+        p = None
         if self.p_gate is not None:
             p = self.p_gate(
                 tokens=tokens,
-                refined_tokens=refined_tokens,
+                refined_tokens=refined,
                 base=assembled,
                 residue=delta,
                 fallback_bounds=False,
+            ).to(dtype=assembled.dtype)
+            clip = float(
+                min(
+                    max(
+                        max(
+                            float(getattr(self.p_gate, "clip_eps", 1e-6)),
+                            float(getattr(self.p_gate, "eps", 0.0)),
+                        ),
+                        0.0,
+                    ),
+                    0.49,
+                )
             )
-            p = p.to(dtype=assembled.dtype)
-            clip_eps = float(getattr(self.p_gate, "clip_eps", 1e-6))
-            eps = float(getattr(self.p_gate, "eps", 0.0))
-            clip = max(clip_eps, eps)
-            clip = float(min(max(clip, 0.0), 0.49))
             p = p.clamp(clip, 1.0 - clip)
             y_hat = assembled + p * delta
-        z_cal = self.scaler.calibrate(y_hat)
-        pred = self.scaler.denormalize_y(z_cal).reshape(b, *self.out_shape)
-        return pred
+        else:
+            y_hat = assembled + assembled.new_tensor(0.5) * delta
+        if sanitize_nan:
+            y_hat = _coerce_tensor(y_hat, enabled=True, inplace=not export)
+        if calibrate_output:
+            y_hat = self.scaler.calibrate(y_hat)
+        pred = self.scaler.denormalize_y(y_hat).reshape(b, *self.out_shape)
+        if sanitize_nan:
+            pred = _coerce_tensor(pred, enabled=True, inplace=not export)
+        return pred, next_state, p, assembled, enhanced, delta, tokens, refined
+
+    def forward_export(self, features: torch.Tensor) -> torch.Tensor:
+        if not isinstance(features, torch.Tensor):
+            raise TypeError("forward_export expects Tensor")
+        base_dtype = None
+        param = next(self.parameters(), None)
+        if param is not None:
+            base_dtype = param.dtype
+        return self._run_forward_core(
+            features,
+            export=True,
+            sanitize_nan=False,
+            calibrate_output=True,
+            base_dtype=base_dtype,
+        )[0]
 
     def forward_stream(
         self,
@@ -1815,73 +1747,191 @@ class Model(nn.Module):
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         if not isinstance(features, torch.Tensor):
             raise TypeError("forward_stream expects a Tensor input")
-        if not isinstance(calibrate_output, bool):
-            raise TypeError("calibrate_output must be a bool")
-        if not isinstance(sanitize_nan, bool):
-            raise TypeError("sanitize_nan must be a bool")
-        device = self._device
-        try:
-            try:
-                base_dtype = next(self.parameters()).dtype
-            except Exception:
-                base_dtype = features.dtype
-            x = self._cast_graph_safe(features, device, base_dtype)
-            x = self.scaler.normalize_x(x)
-            b = x.size(0)
-            tokens, context, next_state = cast(
-                Tuple[torch.Tensor, torch.Tensor, Any],
-                self.fuser(
-                    x,
-                    temporal_state=temporal_state,
-                    return_temporal_state=True,
-                    causal_mask=causal_mask,
-                ),
+        pred, next_state, _, _, _, _, _, _ = self._run_forward_core(
+            features,
+            export=False,
+            temporal_state=temporal_state,
+            causal_mask=causal_mask,
+            sanitize_nan=sanitize_nan,
+            calibrate_output=calibrate_output,
+        )
+        return pred, next_state
+
+    def _compute_aux_losses(
+        self,
+        loss_val,
+        y_hat,
+        assembled,
+        enhanced,
+        tokens,
+        p,
+        z_true,
+        features_t,
+        is_cls_loss,
+        edge_reg_low,
+        edge_reg_high,
+    ):
+        if not (self.training and torch.is_grad_enabled()):
+            return loss_val
+        aux_total = y_hat.new_tensor(0.0, dtype=y_hat.dtype)
+        aux_used = False
+        if self.unsup_xx_weight > 0.0 and self.x_recon_head is not None:
+            loss_xx = F.smooth_l1_loss(
+                self.x_recon_head(tokens.mean(dim=1)).float(),
+                features_t.float(),
+                reduction="mean",
             )
-            tokens = _coerce_tensor(tokens, enabled=sanitize_nan, inplace=False)
-            context = _coerce_tensor(context, enabled=sanitize_nan, inplace=False)
-            assembled = context.reshape(b, -1)
-            if self.is_norm_linear and self.linear_branch is not None:
-                bl = self.linear_branch(
-                    self._cast_graph_safe(x, device, assembled.dtype)
-                )
-                assembled = assembled + bl
-            mean = tokens.mean(dim=1, keepdim=True, dtype=tokens.dtype)
-            tokens_centered = tokens - mean.to(dtype=tokens.dtype)
-            if not tokens_centered.is_contiguous():
-                tokens_centered = tokens_centered.contiguous()
-            refined_tokens = self.temporal_token_collector.forward_export(
-                tokens_centered
+            aux_total += self.unsup_xx_weight * loss_xx.to(aux_total.dtype)
+            aux_used = True
+        if self.unsup_yy_weight > 0.0:
+            if p is not None:
+                if p.dim() != 2 or p.shape[1] == 1:
+                    w = p.detach().squeeze(-1).clamp(min=0.0)
+                else:
+                    w = p.detach().mean(dim=1).clamp(min=0.0)
+                loss_yy = (
+                    F.smooth_l1_loss(assembled, y_hat.detach(), reduction="none").mean(dim=1) * w
+                ).mean()
+            else:
+                loss_yy = F.smooth_l1_loss(assembled, y_hat.detach(), reduction="mean")
+            aux_total += self.unsup_yy_weight * loss_yy.to(aux_total.dtype)
+            aux_used = True
+        if self.p_prior_weight > 0.0 and p is not None:
+            clip_eps = max(
+                float(getattr(self.p_gate, "clip_eps", 1e-6)),
+                float(getattr(self.p_gate, "eps", 0.0)),
             )
-            refined_tokens = _coerce_tensor(
-                refined_tokens, enabled=sanitize_nan, inplace=False
-            )
-            residual_context = self.fuser.decode(refined_tokens, apply_norm=True)
-            enhanced = residual_context.reshape(b, -1)
-            if enhanced.dtype != assembled.dtype:
-                enhanced = enhanced.to(dtype=assembled.dtype)
-            delta = enhanced - assembled
-            y_hat = assembled + (assembled.new_tensor(0.5) * delta)
+            p01 = p.squeeze(-1).clamp(min=clip_eps, max=1.0 - clip_eps)
+            loss_p = -(
+                ((self.p_prior_alpha - 1.0) * torch.log(p01))
+                + ((self.p_prior_beta - 1.0) * torch.log1p(-p01))
+            ).mean()
+            aux_total += self.p_prior_weight * loss_p.to(aux_total.dtype)
+            aux_used = True
+        if p is not None and (
+            self.p_gate_budget_weight > 0.0
+            or self.p_gate_tv_weight > 0.0
+            or self.p_gate_teacher_weight > 0.0
+        ):
+            gate_eps = 1e-6
+            p_floor = 0.0
+            p_ceil = 1.0
             if self.p_gate is not None:
-                p = self.p_gate(
-                    tokens=tokens,
-                    refined_tokens=refined_tokens,
-                    base=assembled,
-                    residue=delta,
-                    fallback_bounds=False,
-                ).to(dtype=assembled.dtype)
-                clip_eps = float(getattr(self.p_gate, "clip_eps", 1e-6))
-                eps = float(getattr(self.p_gate, "eps", 0.0))
-                clip = max(clip_eps, eps)
-                clip = float(min(max(clip, 0.0), 0.49))
-                p = p.clamp(clip, 1.0 - clip)
-                y_hat = assembled + p * delta
-            if calibrate_output:
-                y_hat = self.scaler.calibrate(y_hat)
-            pred = self.scaler.denormalize_y(y_hat).reshape(b, *self.out_shape)
-            pred = _coerce_tensor(pred, enabled=sanitize_nan, inplace=False)
-            return pred, next_state
-        finally:
-            pass
+                with contextlib.suppress(Exception):
+                    gate_eps = float(getattr(self.p_gate, "clip_eps", gate_eps))
+                with contextlib.suppress(Exception):
+                    gate_eps = max(gate_eps, float(getattr(self.p_gate, "eps", 0.0)))
+                with contextlib.suppress(Exception):
+                    p_floor = float(getattr(self.p_gate, "p_floor", p_floor))
+                with contextlib.suppress(Exception):
+                    p_ceil = float(getattr(self.p_gate, "p_ceil", p_ceil))
+            gate_eps = max(0.0, float(gate_eps))
+            if self.p_gate_budget_weight > 0.0:
+                tgt = float(self.p_gate_budget_target)
+                if p_ceil >= p_floor:
+                    tgt = max(p_floor, min(p_ceil, tgt))
+                loss_budget = (p.to(dtype=torch.float32).mean() - p.new_tensor(tgt)).square()
+                aux_total += self.p_gate_budget_weight * loss_budget.to(aux_total.dtype)
+                aux_used = True
+            p_grid = None
+            w_grid = None
+            tile_shape = None
+            if (self.p_gate_tv_weight > 0.0 or self.p_gate_teacher_weight > 0.0) and self.out_shape:
+                tile_shape = _normalize_tile_shape(
+                    getattr(self, "p_gate_tile_shape", None), self.out_shape
+                )
+            if (self.p_gate_tv_weight > 0.0 or self.p_gate_teacher_weight > 0.0) and self.out_shape:
+                try:
+                    if tile_shape is not None:
+                        p_grid = _reduce_flat_to_grid(
+                            p.to(dtype=torch.float32),
+                            self.out_shape,
+                            tile_shape,
+                            reduce="mean",
+                            eps=gate_eps,
+                            work_dtype=torch.float32,
+                        )
+                        w_grid = _tile_counts_grid(
+                            self.out_shape,
+                            tile_shape,
+                            device=p_grid.device,
+                            dtype=torch.float32,
+                        ).unsqueeze(0)
+                    else:
+                        p_grid = p.to(dtype=torch.float32).mean(dim=1, keepdim=True)
+                except Exception:
+                    p_grid = None
+                    w_grid = None
+            if self.p_gate_tv_weight > 0.0 and p_grid is not None:
+                tv = _tv_loss_grid(p_grid, power=float(self.p_gate_tv_power), eps=gate_eps)
+                aux_total += self.p_gate_tv_weight * tv.to(dtype=aux_total.dtype)
+                aux_used = True
+            if (
+                self.p_gate_teacher_weight > 0.0
+                and p_grid is not None
+                and z_true is not None
+                and (not is_cls_loss)
+            ):
+                base_det = assembled.detach().to(dtype=torch.float32)
+                ref_det = enhanced.detach().to(dtype=torch.float32)
+                tgt_det = z_true.detach().to(device=base_det.device, dtype=torch.float32)
+                err_base = (base_det - tgt_det).square()
+                err_ref = (ref_det - tgt_det).square()
+                improve = err_base - err_ref
+                if bool(self.p_gate_teacher_relu):
+                    improve = F.relu(improve)
+                scale = 0.5 * (err_base + err_ref)
+                if tile_shape is not None:
+                    imp_grid = _reduce_flat_to_grid(
+                        improve,
+                        self.out_shape,
+                        tile_shape,
+                        reduce="mean",
+                        eps=gate_eps,
+                        work_dtype=torch.float32,
+                    )
+                    scale_grid = _reduce_flat_to_grid(
+                        scale,
+                        self.out_shape,
+                        tile_shape,
+                        reduce="mean",
+                        eps=gate_eps,
+                        work_dtype=torch.float32,
+                    )
+                else:
+                    imp_grid = improve.mean(dim=1, keepdim=True)
+                    scale_grid = scale.mean(dim=1, keepdim=True)
+                scale_grid = torch.clamp(scale_grid, min=float(gate_eps))
+                temp = max(float(self.p_gate_teacher_temp), float(gate_eps))
+                score = ((imp_grid / scale_grid - float(self.p_gate_teacher_tau)) / temp).clamp(
+                    min=-20.0, max=20.0
+                )
+                p01 = torch.sigmoid(score)
+                p_target = p01 * float(p_ceil - p_floor) + float(p_floor)
+                lo = float(p_floor) + float(gate_eps)
+                hi = float(p_ceil) - float(gate_eps)
+                if hi > lo:
+                    p_target = p_target.clamp(min=lo, max=hi)
+                if w_grid is not None:
+                    w = w_grid.to(device=p_grid.device, dtype=torch.float32)
+                    loss_teacher = (
+                        (p_grid.to(dtype=torch.float32) - p_target).square() * w
+                    ).sum() / w.sum().clamp_min(float(gate_eps))
+                else:
+                    loss_teacher = F.mse_loss(
+                        p_grid.to(dtype=torch.float32), p_target, reduction="mean"
+                    )
+                aux_total += self.p_gate_teacher_weight * loss_teacher.to(dtype=aux_total.dtype)
+                aux_used = True
+        if self.p_gate_edge_reg_weight_low > 0.0 and edge_reg_low is not None:
+            aux_total += self.p_gate_edge_reg_weight_low * edge_reg_low.to(dtype=aux_total.dtype)
+            aux_used = True
+        if self.p_gate_edge_reg_weight_high > 0.0 and edge_reg_high is not None:
+            aux_total += self.p_gate_edge_reg_weight_high * edge_reg_high.to(dtype=aux_total.dtype)
+            aux_used = True
+        if aux_used:
+            return (loss_val + aux_total) if (loss_val is not None) else aux_total
+        return loss_val
 
     def _auto_microbatch(
         self, features: torch.Tensor | TensorDictBase, device: torch.device
@@ -1913,9 +1963,7 @@ class Model(nn.Module):
             per_sample = int(bytes_per_sample * 8)
         stage_div = max(1, int(env_int("STNET_MICROBATCH_STAGE_DIV", 4)))
         per_sample = max(1, int(per_sample // stage_div))
-        mb_size = _autofit_microbatch(
-            device=device, hard_max=hard_max, per_sample_bytes=per_sample
-        )
+        mb_size = _autofit_microbatch(device=device, hard_max=hard_max, per_sample_bytes=per_sample)
         return int(mb_size)
 
     def forward(
@@ -2008,9 +2056,7 @@ class Model(nn.Module):
             meta = Autocast.coerce_metadata(device)
         except Exception:
             meta = None
-            _LOGGER.debug(
-                "Autocast.coerce_metadata failed; falling back to fp32", exc_info=True
-            )
+            _LOGGER.debug("Autocast.coerce_metadata failed; falling back to fp32", exc_info=True)
         amp_candidates: Tuple[torch.dtype, ...] = ()
         if meta is not None:
             try:
@@ -2025,9 +2071,7 @@ class Model(nn.Module):
         except Exception:
             safety_margin_pow2 = 3
         safety_margin_pow2 = max(0, min(30, safety_margin_pow2))
-        dev_index = (
-            int(device.index) if getattr(device, "index", None) is not None else -1
-        )
+        dev_index = int(device.index) if getattr(device, "index", None) is not None else -1
         if meta is None:
             cache_key = (
                 device.type,
@@ -2097,9 +2141,7 @@ class Model(nn.Module):
             else False
         )
         has_any_loss = (
-            (net_loss is not None)
-            or (global_loss is not None)
-            or (local_loss is not None)
+            (net_loss is not None) or (global_loss is not None) or (local_loss is not None)
         )
         has_supervision = labels_flat is not None and has_any_loss
         is_train_path = bool(self.training and grad_enabled and has_supervision)
@@ -2119,9 +2161,7 @@ class Model(nn.Module):
             except Exception:
                 _did_unshard_fuser = False
         try:
-            requested_base = getattr(self, "base_dtype", None) or getattr(
-                self, "_base_dtype", None
-            )
+            requested_base = getattr(self, "base_dtype", None) or getattr(self, "_base_dtype", None)
             if requested_base is not None:
                 base_dtype = requested_base
             else:
@@ -2131,11 +2171,7 @@ class Model(nn.Module):
                     base_dtype = torch.float32 if amp_enabled else amp_dtype
             if isinstance(x_scaled, torch.Tensor) and x_scaled.device != device:
                 x_scaled = x_scaled.to(device=device, non_blocking=True)
-            features_t = (
-                x_scaled.to(dtype=base_dtype)
-                if x_scaled.dtype != base_dtype
-                else x_scaled
-            )
+            features_t = x_scaled.to(dtype=base_dtype) if x_scaled.dtype != base_dtype else x_scaled
             if features_t.ndim != 2 or features_t.shape[1] != self.in_dim:
                 raise ValueError(
                     f"Expected features shaped (B, {self.in_dim}), got {tuple(features_t.shape)}"
@@ -2153,9 +2189,7 @@ class Model(nn.Module):
                         self.microbatch = max(1, int(mb_enc))
                 except Exception:
                     with self._runtime_lock:
-                        self.microbatch = max(
-                            1, int(getattr(self, "microbatch", 64) or 64)
-                        )
+                        self.microbatch = max(1, int(getattr(self, "microbatch", 64) or 64))
             with self._runtime_lock:
                 mb_cfg = int(self.microbatch) if self.microbatch else int(b)
             mb = max(1, min(int(b), mb_cfg))
@@ -2168,9 +2202,7 @@ class Model(nn.Module):
                 ):
                     return self.fuser(inp)
 
-            enc_ctx = (
-                inference_mode(self.fuser) if infer_mode else contextlib.nullcontext()
-            )
+            enc_ctx = inference_mode(self.fuser) if infer_mode else contextlib.nullcontext()
             with enc_ctx:
                 tokens, context = cast(
                     Tuple[torch.Tensor, torch.Tensor],
@@ -2180,18 +2212,12 @@ class Model(nn.Module):
                         _encode,
                         pad_to=int(mb) if self._pad_compiled_microbatch else None,
                         out_dtype=base_dtype,
-                        cast_slice=lambda t: self._cast_graph_safe(
-                            t, device, base_dtype
-                        ),
+                        cast_slice=lambda t: self._cast_graph_safe(t, device, base_dtype),
                         stage="encoder",
                     ),
                 )
-            tokens = _coerce_tensor(
-                tokens, enabled=sanitize_enabled, inplace=sanitize_inplace
-            )
-            context = _coerce_tensor(
-                context, enabled=sanitize_enabled, inplace=sanitize_inplace
-            )
+            tokens = _coerce_tensor(tokens, enabled=sanitize_enabled, inplace=sanitize_inplace)
+            context = _coerce_tensor(context, enabled=sanitize_enabled, inplace=sanitize_inplace)
             if int(tokens.shape[0]) != int(b):
                 raise RuntimeError(
                     "Internal error: token batch mismatch after microbatch concat. "
@@ -2199,9 +2225,7 @@ class Model(nn.Module):
                 )
             assembled = context.reshape(b, -1)
             if self.is_norm_linear and self.linear_branch is not None:
-                bl = self.linear_branch(
-                    self._cast_graph_safe(features_t, device, assembled.dtype)
-                )
+                bl = self.linear_branch(self._cast_graph_safe(features_t, device, assembled.dtype))
                 assembled = assembled + bl
             mean_dtype = torch.float32 if amp_enabled else tokens.dtype
             mean = tokens.mean(dim=1, keepdim=True, dtype=mean_dtype)
@@ -2223,13 +2247,9 @@ class Model(nn.Module):
                 enabled=sanitize_enabled,
                 inplace=sanitize_inplace,
             )
-            ctrl_mb = max(
-                1, min(int(b), int(self.temporal_token_collector.microbatch) or int(b))
-            )
+            ctrl_mb = max(1, min(int(b), int(self.temporal_token_collector.microbatch) or int(b)))
             graph_break()
-            processor_ctx = (
-                inference_mode(self.fuser) if infer_mode else contextlib.nullcontext()
-            )
+            processor_ctx = inference_mode(self.fuser) if infer_mode else contextlib.nullcontext()
             with processor_ctx:
                 dc = getattr(self, "_decode_compiled", None)
 
@@ -2286,19 +2306,12 @@ class Model(nn.Module):
                     y_max = getattr(self.scaler, "y_max", None)
                     y_q_low = getattr(self.scaler, "y_q_low", None)
                     y_q_high = getattr(self.scaler, "y_q_high", None)
-                    mean = self.scaler.y_mean.to(
-                        device=assembled.device, dtype=assembled.dtype
-                    )
-                    std = self.scaler.y_std.to(
-                        device=assembled.device, dtype=assembled.dtype
-                    )
+                    mean = self.scaler.y_mean.to(device=assembled.device, dtype=assembled.dtype)
+                    std = self.scaler.y_std.to(device=assembled.device, dtype=assembled.dtype)
                     denom = std + float(self.scaler.eps)
 
                     def _finite_pair(lo: object, hi: object) -> bool:
-                        if not (
-                            isinstance(lo, torch.Tensor)
-                            and isinstance(hi, torch.Tensor)
-                        ):
+                        if not (isinstance(lo, torch.Tensor) and isinstance(hi, torch.Tensor)):
                             return False
                         try:
                             return bool(torch.isfinite(lo).all().item()) and bool(
@@ -2310,9 +2323,7 @@ class Model(nn.Module):
                     have_minmax = _finite_pair(y_min, y_max)
                     have_quant = _finite_pair(y_q_low, y_q_high)
                     use_quant = bool(getattr(self, "p_gate_bounds_use_quantile", False))
-                    clip_quant = bool(
-                        getattr(self, "p_gate_bounds_clip_to_minmax", True)
-                    )
+                    clip_quant = bool(getattr(self, "p_gate_bounds_clip_to_minmax", True))
                     ylo_t: Optional[torch.Tensor] = None
                     yhi_t: Optional[torch.Tensor] = None
                     if use_quant and have_quant:
@@ -2344,13 +2355,9 @@ class Model(nn.Module):
                     else:
                         if bool(getattr(self, "p_gate_fallback_enabled", False)):
                             k_low_buf = getattr(self, "p_gate_fallback_k_low_buf", None)
-                            k_high_buf = getattr(
-                                self, "p_gate_fallback_k_high_buf", None
-                            )
+                            k_high_buf = getattr(self, "p_gate_fallback_k_high_buf", None)
                             if isinstance(k_low_buf, torch.Tensor):
-                                k_low = k_low_buf.to(
-                                    device=assembled.device, dtype=assembled.dtype
-                                )
+                                k_low = k_low_buf.to(device=assembled.device, dtype=assembled.dtype)
                             else:
                                 k_low = mean.new_tensor(
                                     float(
@@ -2391,10 +2398,7 @@ class Model(nn.Module):
                     )
                     and (z_min is not None)
                     and (z_max is not None)
-                    and (
-                        (not self.p_gate_edge_reg_fallback_only)
-                        or bool(fallback_bounds)
-                    )
+                    and ((not self.p_gate_edge_reg_fallback_only) or bool(fallback_bounds))
                 )
                 if do_edge_reg:
                     p, edge_reg_low, edge_reg_high = self.p_gate(
@@ -2407,9 +2411,7 @@ class Model(nn.Module):
                         fallback_bounds=bool(fallback_bounds),
                         return_edge_reg_lr=True,
                         edge_reg_frac=float(self.p_gate_edge_reg_frac),
-                        edge_reg_min_width_frac=float(
-                            self.p_gate_edge_reg_min_width_frac
-                        ),
+                        edge_reg_min_width_frac=float(self.p_gate_edge_reg_min_width_frac),
                         edge_reg_power=float(self.p_gate_edge_reg_power),
                     )
                 else:
@@ -2437,9 +2439,7 @@ class Model(nn.Module):
                 y_hat = assembled + assembled.new_tensor(0.5) * delta
             else:
                 y_hat = assembled + p * delta
-            y_hat = _coerce_tensor(
-                y_hat, enabled=sanitize_enabled, inplace=sanitize_inplace
-            )
+            y_hat = _coerce_tensor(y_hat, enabled=sanitize_enabled, inplace=sanitize_inplace)
             pred = y_hat.reshape(b, *self.out_shape)
             loss_val: Optional[torch.Tensor] = None
             top_component: Optional[torch.Tensor] = None
@@ -2447,11 +2447,7 @@ class Model(nn.Module):
             use_global_local = labels_flat is not None and (
                 global_loss is not None or local_loss is not None
             )
-            use_net = (
-                labels_flat is not None
-                and (net_loss is not None)
-                and (not use_global_local)
-            )
+            use_net = labels_flat is not None and (net_loss is not None) and (not use_global_local)
             if use_global_local:
                 if loss_weights is None:
                     weights = (1.0, 0.0)
@@ -2463,17 +2459,13 @@ class Model(nn.Module):
                 else:
                     weights = cast(LossWeightPolicy, loss_weights).weights()
                 if z_true is None:
-                    raise RuntimeError(
-                        "Internal error: z_true missing for regression loss path"
-                    )
+                    raise RuntimeError("Internal error: z_true missing for regression loss path")
                 tgt = z_true.to(device=y_hat.device, dtype=y_hat.dtype)
                 total = y_hat.new_tensor(0.0, dtype=y_hat.dtype)
                 y_bot = assembled.to(device=y_hat.device, dtype=y_hat.dtype)
                 if global_loss is not None:
                     use_base_detach = bool(
-                        is_train_path
-                        and (local_loss is not None)
-                        and (float(weights[1]) > 1e-12)
+                        is_train_path and (local_loss is not None) and (float(weights[1]) > 1e-12)
                     )
                     if use_base_detach:
                         base_det = assembled.detach()
@@ -2481,9 +2473,7 @@ class Model(nn.Module):
                         z_top = _coerce_tensor(
                             base_det
                             + (
-                                base_det.new_tensor(0.5) * delta_det
-                                if p is None
-                                else p * delta_det
+                                base_det.new_tensor(0.5) * delta_det if p is None else p * delta_det
                             ),
                             enabled=sanitize_enabled,
                             inplace=sanitize_inplace,
@@ -2512,224 +2502,20 @@ class Model(nn.Module):
                     tgt = z_true.to(device=y_hat.device, dtype=y_hat.dtype)
                     loss_val = cast(torch.Tensor, net_loss(y_hat, tgt))
             if loss_val is not None and not isinstance(loss_val, torch.Tensor):
-                loss_val = torch.as_tensor(
-                    loss_val, device=y_hat.device, dtype=y_hat.dtype
-                )
-            if self.training and grad_enabled:
-                aux_total = y_hat.new_tensor(0.0, dtype=y_hat.dtype)
-                aux_used = False
-                if self.unsup_xx_weight > 0.0 and self.x_recon_head is not None:
-                    x_recon = self.x_recon_head(tokens.mean(dim=1))
-                    loss_xx = F.smooth_l1_loss(
-                        x_recon.to(dtype=torch.float32),
-                        features_t.to(dtype=torch.float32),
-                        reduction="mean",
-                    )
-                    aux_total = aux_total + self.unsup_xx_weight * loss_xx.to(
-                        dtype=aux_total.dtype
-                    )
-                    aux_used = True
-                if self.unsup_yy_weight > 0.0:
-                    teacher = y_hat.detach()
-                    student = assembled
-                    if p is not None:
-                        w = p.detach()
-                        if w.dim() == 2 and int(w.shape[1]) != 1:
-                            w = w.mean(dim=1)
-                        else:
-                            w = w.squeeze(-1)
-                        w = w.clamp(min=0.0)
-                        per = F.smooth_l1_loss(student, teacher, reduction="none").mean(
-                            dim=1
-                        )
-                        loss_yy = (per * w).mean()
-                    else:
-                        loss_yy = F.smooth_l1_loss(student, teacher, reduction="mean")
-                    aux_total = aux_total + self.unsup_yy_weight * loss_yy.to(
-                        dtype=aux_total.dtype
-                    )
-                    aux_used = True
-                if self.p_prior_weight > 0.0 and p is not None:
-                    clip_eps = (
-                        float(getattr(self.p_gate, "clip_eps", 1e-6))
-                        if self.p_gate is not None
-                        else 1e-6
-                    )
-                    with contextlib.suppress(Exception):
-                        clip_eps = max(
-                            clip_eps, float(getattr(self.p_gate, "eps", 0.0))
-                        )
-                    p01 = p.squeeze(-1).clamp(min=clip_eps, max=1.0 - clip_eps)
-                    a = float(self.p_prior_alpha)
-                    b = float(self.p_prior_beta)
-                    loss_p = -(
-                        ((a - 1.0) * torch.log(p01)) + ((b - 1.0) * torch.log1p(-p01))
-                    ).mean()
-                    aux_total = aux_total + self.p_prior_weight * loss_p.to(
-                        dtype=aux_total.dtype
-                    )
-                    aux_used = True
-                if p is not None and (
-                    self.p_gate_budget_weight > 0.0
-                    or self.p_gate_tv_weight > 0.0
-                    or self.p_gate_teacher_weight > 0.0
-                ):
-                    gate_eps = 1e-6
-                    p_floor = 0.0
-                    p_ceil = 1.0
-                    if self.p_gate is not None:
-                        with contextlib.suppress(Exception):
-                            gate_eps = float(getattr(self.p_gate, "clip_eps", gate_eps))
-                        with contextlib.suppress(Exception):
-                            gate_eps = max(
-                                gate_eps, float(getattr(self.p_gate, "eps", 0.0))
-                            )
-                        with contextlib.suppress(Exception):
-                            p_floor = float(getattr(self.p_gate, "p_floor", p_floor))
-                        with contextlib.suppress(Exception):
-                            p_ceil = float(getattr(self.p_gate, "p_ceil", p_ceil))
-                    gate_eps = max(0.0, float(gate_eps))
-                    if self.p_gate_budget_weight > 0.0:
-                        tgt = float(self.p_gate_budget_target)
-                        if p_ceil >= p_floor:
-                            tgt = max(p_floor, min(p_ceil, tgt))
-                        mean_p = p.to(dtype=torch.float32).mean()
-                        loss_budget = (mean_p - mean_p.new_tensor(tgt)).square()
-                        aux_total = (
-                            aux_total
-                            + self.p_gate_budget_weight
-                            * loss_budget.to(dtype=aux_total.dtype)
-                        )
-                        aux_used = True
-                    p_grid: Optional[torch.Tensor] = None
-                    w_grid: Optional[torch.Tensor] = None
-                    tile_shape: Optional[Tuple[int, ...]] = None
-                    if (
-                        self.p_gate_tv_weight > 0.0 or self.p_gate_teacher_weight > 0.0
-                    ) and self.out_shape:
-                        tile_shape = _normalize_tile_shape(
-                            getattr(self, "p_gate_tile_shape", None),
-                            self.out_shape,
-                        )
-                    if (
-                        self.p_gate_tv_weight > 0.0 or self.p_gate_teacher_weight > 0.0
-                    ) and self.out_shape:
-                        try:
-                            if tile_shape is not None:
-                                p_grid = _reduce_flat_to_grid(
-                                    p.to(dtype=torch.float32),
-                                    self.out_shape,
-                                    tile_shape,
-                                    reduce="mean",
-                                    eps=gate_eps,
-                                    work_dtype=torch.float32,
-                                )
-                                w_grid = _tile_counts_grid(
-                                    self.out_shape,
-                                    tile_shape,
-                                    device=p_grid.device,
-                                    dtype=torch.float32,
-                                ).unsqueeze(0)
-                            else:
-                                p_grid = p.to(dtype=torch.float32).mean(
-                                    dim=1, keepdim=True
-                                )
-                        except Exception:
-                            p_grid = None
-                            w_grid = None
-                    if self.p_gate_tv_weight > 0.0 and p_grid is not None:
-                        tv = _tv_loss_grid(
-                            p_grid, power=float(self.p_gate_tv_power), eps=gate_eps
-                        )
-                        aux_total = aux_total + self.p_gate_tv_weight * tv.to(
-                            dtype=aux_total.dtype
-                        )
-                        aux_used = True
-                    if (
-                        self.p_gate_teacher_weight > 0.0
-                        and p_grid is not None
-                        and (z_true is not None)
-                        and (not is_cls_loss)
-                    ):
-                        base_det = assembled.detach().to(dtype=torch.float32)
-                        ref_det = enhanced.detach().to(dtype=torch.float32)
-                        tgt_det = z_true.detach().to(
-                            device=base_det.device, dtype=torch.float32
-                        )
-                        err_base = (base_det - tgt_det).square()
-                        err_ref = (ref_det - tgt_det).square()
-                        improve = err_base - err_ref
-                        if bool(self.p_gate_teacher_relu):
-                            improve = F.relu(improve)
-                        scale = 0.5 * (err_base + err_ref)
-                        imp_grid: torch.Tensor
-                        scale_grid: torch.Tensor
-                        if tile_shape is not None:
-                            imp_grid = _reduce_flat_to_grid(
-                                improve,
-                                self.out_shape,
-                                tile_shape,
-                                reduce="mean",
-                                eps=gate_eps,
-                                work_dtype=torch.float32,
-                            )
-                            scale_grid = _reduce_flat_to_grid(
-                                scale,
-                                self.out_shape,
-                                tile_shape,
-                                reduce="mean",
-                                eps=gate_eps,
-                                work_dtype=torch.float32,
-                            )
-                        else:
-                            imp_grid = improve.mean(dim=1, keepdim=True)
-                            scale_grid = scale.mean(dim=1, keepdim=True)
-                        scale_grid = torch.clamp(scale_grid, min=float(gate_eps))
-                        tau = float(self.p_gate_teacher_tau)
-                        temp = max(float(self.p_gate_teacher_temp), float(gate_eps))
-                        score = (imp_grid / scale_grid - tau) / temp
-                        score = score.clamp(min=-20.0, max=20.0)
-                        p01 = torch.sigmoid(score)
-                        p_target = p01 * float(p_ceil - p_floor) + float(p_floor)
-                        lo = float(p_floor) + float(gate_eps)
-                        hi = float(p_ceil) - float(gate_eps)
-                        if hi > lo:
-                            p_target = p_target.clamp(min=lo, max=hi)
-                        if w_grid is not None:
-                            w = w_grid.to(device=p_grid.device, dtype=torch.float32)
-                            num = (
-                                (p_grid.to(dtype=torch.float32) - p_target).square() * w
-                            ).sum()
-                            den = w.sum().clamp_min(float(gate_eps))
-                            loss_teacher = num / den
-                        else:
-                            loss_teacher = F.mse_loss(
-                                p_grid.to(dtype=torch.float32),
-                                p_target,
-                                reduction="mean",
-                            )
-                        aux_total = (
-                            aux_total
-                            + self.p_gate_teacher_weight
-                            * loss_teacher.to(dtype=aux_total.dtype)
-                        )
-                        aux_used = True
-                if edge_reg_low is not None and self.p_gate_edge_reg_weight_low > 0.0:
-                    aux_total = (
-                        aux_total
-                        + self.p_gate_edge_reg_weight_low
-                        * edge_reg_low.to(dtype=aux_total.dtype)
-                    )
-                    aux_used = True
-                if edge_reg_high is not None and self.p_gate_edge_reg_weight_high > 0.0:
-                    aux_total = (
-                        aux_total
-                        + self.p_gate_edge_reg_weight_high
-                        * edge_reg_high.to(dtype=aux_total.dtype)
-                    )
-                    aux_used = True
-                if aux_used:
-                    loss_val = aux_total if loss_val is None else (loss_val + aux_total)
+                loss_val = torch.as_tensor(loss_val, device=y_hat.device, dtype=y_hat.dtype)
+            loss_val = self._compute_aux_losses(
+                loss_val,
+                y_hat,
+                assembled,
+                enhanced,
+                tokens,
+                p,
+                z_true,
+                features_t,
+                is_cls_loss,
+                edge_reg_low,
+                edge_reg_high,
+            )
             if infer_mode and calibrate_output and (not is_cls_loss):
                 z_cal = self.scaler.calibrate(y_hat)
                 pred = self.scaler.denormalize_y(z_cal).reshape(b, *self.out_shape)
@@ -2861,9 +2647,7 @@ class ModelPolicy:
         for dtype in candidates:
             if is_scale_safe(dtype, metadata):
                 return dtype
-        return (
-            torch.float64 if is_scale_safe(torch.float64, metadata) else candidates[-1]
-        )
+        return torch.float64 if is_scale_safe(torch.float64, metadata) else candidates[-1]
 
     @staticmethod
     def _peek_layer(module: nn.Module) -> Optional[torch.Tensor]:
@@ -2874,9 +2658,7 @@ class ModelPolicy:
         return None
 
     @staticmethod
-    def _coerce_metadata(
-        model: nn.Module, metadata: Optional[Dataset[Any]] = None
-    ) -> Dataset[Any]:
+    def _coerce_metadata(model: nn.Module, metadata: Optional[Dataset[Any]] = None) -> Dataset[Any]:
         Autocast.configure(model, metadata=metadata)
         meta = Autocast.metadata()
         if meta is None:
@@ -2901,9 +2683,7 @@ class ModelPolicy:
                 dst.to(dtype=params_dtype)
 
     @staticmethod
-    def _clone_state(
-        src: nn.Module, dst: nn.Module, params_dtype: Optional[torch.dtype]
-    ) -> None:
+    def _clone_state(src: nn.Module, dst: nn.Module, params_dtype: Optional[torch.dtype]) -> None:
         try:
             state = src.state_dict()
         except (RuntimeError, AttributeError):
@@ -3034,23 +2814,13 @@ class ModelPolicy:
                 replacement: Optional[nn.Module] = None
                 if apply_te_linear and isinstance(child, nn.Linear):
                     if filter_linear is None or filter_linear(child, name):
-                        replacement = ModelPolicy._nvidia_linear(
-                            child, params_dtype, te
-                        )
+                        replacement = ModelPolicy._nvidia_linear(child, params_dtype, te)
                 elif apply_te_layer_norm and isinstance(child, nn.LayerNorm):
-                    replacement = ModelPolicy._nvidia_layer_norm(
-                        child, params_dtype, te
-                    )
+                    replacement = ModelPolicy._nvidia_layer_norm(child, params_dtype, te)
                 else:
                     rms_cls = getattr(torch.nn, "RMSNorm", None)
-                    if (
-                        apply_te_rms_norm
-                        and rms_cls is not None
-                        and isinstance(child, rms_cls)
-                    ):
-                        replacement = ModelPolicy._nvidia_rms_norm(
-                            child, params_dtype, te
-                        )
+                    if apply_te_rms_norm and rms_cls is not None and isinstance(child, rms_cls):
+                        replacement = ModelPolicy._nvidia_rms_norm(child, params_dtype, te)
                 if replacement is not None:
                     setattr(parent, name, replacement)
                     converted += 1
@@ -3116,9 +2886,7 @@ class ModelPolicy:
             params_dtype=params_dtype,
         )
         try:
-            model, attn_swapped = ModelPolicy._to_nvidia_attention(
-                model, params_dtype=params_dtype
-            )
+            model, attn_swapped = ModelPolicy._to_nvidia_attention(model, params_dtype=params_dtype)
         except Exception:
             attn_swapped = 0
         n_total = (n_layers or 0) + (attn_swapped or 0)
@@ -3206,9 +2974,7 @@ class ModelPolicy:
     ) -> Tuple[nn.Module, bool, str]:
         te_present = any(
             (
-                getattr(module.__class__, "__module__", "").startswith(
-                    "transformer_engine"
-                )
+                getattr(module.__class__, "__module__", "").startswith("transformer_engine")
                 for module in model.modules()
             )
         )
@@ -3259,20 +3025,14 @@ class ModelPolicy:
             return (model, False, reason)
         if getattr(meta, "has_scale", False):
             float8_dtypes = Autocast.float8_formats()
-            if not any(
-                is_scale_safe(dtype, meta, safety_margin=2.0) for dtype in float8_dtypes
-            ):
-                _log_info(
-                    logger, "[FP8] training disabled: data scale exceeds float8 range"
-                )
+            if not any(is_scale_safe(dtype, meta, safety_margin=2.0) for dtype in float8_dtypes):
+                _log_info(logger, "[FP8] training disabled: data scale exceeds float8 range")
                 Autocast.configure(model, metadata=meta)
                 return (model, False, "data scale")
         params_dtype = ModelPolicy.negotiate(device, metadata=meta)
         for backend in ("te", "torchao"):
             if backend == "te":
-                m2, ok2, why = ModelPolicy._enable_nvidia_training(
-                    model, params_dtype, logger
-                )
+                m2, ok2, why = ModelPolicy._enable_nvidia_training(model, params_dtype, logger)
             else:
                 m2, ok2, why = ModelPolicy._enable_torchao_training(model, logger)
             if ok2:
@@ -3298,25 +3058,18 @@ class ModelPolicy:
             return (model, False, reason)
         if getattr(meta, "has_scale", False):
             float8_dtypes = Autocast.float8_formats()
-            if not any(
-                is_scale_safe(dtype, meta, safety_margin=2.0) for dtype in float8_dtypes
-            ):
-                _log_info(
-                    logger, "[FP8] inference disabled: data scale exceeds float8 range"
-                )
+            if not any(is_scale_safe(dtype, meta, safety_margin=2.0) for dtype in float8_dtypes):
+                _log_info(logger, "[FP8] inference disabled: data scale exceeds float8 range")
                 Autocast.configure(model, metadata=meta)
                 return (model, False, "data scale")
         params_dtype = ModelPolicy.negotiate(device, metadata=meta)
         dynamic_activations = not (
-            getattr(meta, "has_scale", False)
-            and getattr(meta, "scale_is_integral", None) is True
+            getattr(meta, "has_scale", False) and getattr(meta, "scale_is_integral", None) is True
         )
         order = ("te_swap", "te_present", "ao")
         for step in order:
             if step == "te_swap":
-                m2, ok2, why = ModelPolicy._enable_nvidia_inference(
-                    model, params_dtype, logger
-                )
+                m2, ok2, why = ModelPolicy._enable_nvidia_inference(model, params_dtype, logger)
             elif step == "te_present":
                 m2, ok2, why = ModelPolicy._reuse_nvidia_layers(model, logger)
             else:
@@ -3343,8 +3096,7 @@ class ModelPolicy:
         with contextlib.suppress(Exception):
             model.to(device)
         dynamic_activations = not (
-            getattr(meta, "has_scale", False)
-            and getattr(meta, "scale_is_integral", None) is True
+            getattr(meta, "has_scale", False) and getattr(meta, "scale_is_integral", None) is True
         )
         group_size = 128
         m2, ok, why = Quantization.enable_qat(
@@ -3367,8 +3119,7 @@ class ModelPolicy:
         with contextlib.suppress(Exception):
             model.to(device)
         dynamic_activations = not (
-            getattr(meta, "has_scale", False)
-            and getattr(meta, "scale_is_integral", None) is True
+            getattr(meta, "has_scale", False) and getattr(meta, "scale_is_integral", None) is True
         )
         m2, ok, why = Quantization._enable_ptq(
             model, dynamic_activations=dynamic_activations, logger=logger
@@ -3397,9 +3148,7 @@ class Quantization:
     @staticmethod
     def is_ptq_available() -> bool:
         _import_torchao_quantization()
-        return bool(
-            _PTQ_IMPL is not None and _Int8DynamicActivationInt8WeightConfig is not None
-        )
+        return bool(_PTQ_IMPL is not None and _Int8DynamicActivationInt8WeightConfig is not None)
 
     @staticmethod
     def _prepare_qat(

@@ -124,7 +124,9 @@ def _env_cast(name: str, cast: Callable[[str], Any], default: Any) -> Any:
 def _env_clean(value: object | None) -> str | None:
     if value is None:
         return None
-    s = str(value).strip()
+    if isinstance(value, (bytes, bytearray)):
+        value = value.decode(errors="ignore")
+    s = str(value).replace("\\r\\n", "\n").replace("\\n", "\n").strip()
     return s or None
 
 
@@ -161,7 +163,9 @@ def _canonical_dtype(src: Any) -> str:
 def parse_bool(value: object) -> bool | None:
     if value is None:
         return None
-    s = str(value).strip().lower()
+    if isinstance(value, (bytes, bytearray)):
+        value = value.decode(errors="ignore")
+    s = str(value).replace("\\r\\n", "\n").replace("\\n", "\n").strip().lower()
     if not s:
         return None
     if s in _TRUE:

@@ -256,7 +256,31 @@ def is_tracing_or_exporting() -> bool:
 
 
 def is_export_or_trace() -> bool:
-    return bool(is_compiling() or is_tracing_or_exporting())
+    return bool(is_tracing_or_exporting())
+
+
+def is_symbolic() -> bool:
+    return bool(is_tracing_or_exporting() or is_compiling())
+
+
+def assert_trace(condition: object, message: str = "") -> None:
+    fn = getattr(torch, "_assert_scalar", None)
+    if callable(fn):
+        fn(condition, message)
+        return
+
+    try:
+        if isinstance(condition, torch.Tensor):
+            if condition.numel() == 1:
+                ok = bool(condition.item())
+            else:
+                ok = bool(condition.all().item())
+        else:
+            ok = bool(condition)
+    except Exception:
+        ok = False
+    if not ok:
+        raise RuntimeError(str(message))
 
 
 def canonicalize_compile_mode(mode: object | None) -> str:
@@ -319,7 +343,7 @@ def is_nvidia_te_available(model: torch.nn.Module) -> bool:
 
 def inference_mode(model: torch.nn.Module) -> AbstractContextManager[None]:
     if (
-        is_export_or_trace()
+        is_symbolic()
         or is_nvidia_te_available(model)
         or _is_compiled_for_inference(model)
         or _is_aot_autograd_enabled(model)
@@ -380,12 +404,8 @@ def compile(
                         )
                         if int(local_world) > 1:
                             cpu_count = int(process_cpu_count() or 1)
-                            per_rank = max(
-                                1, int(cpu_count) // max(1, int(local_world))
-                            )
-                            _inductor_config.compile_threads = max(
-                                1, min(4, int(per_rank) // 2)
-                            )
+                            per_rank = max(1, int(cpu_count) // max(1, int(local_world)))
+                            _inductor_config.compile_threads = max(1, min(4, int(per_rank) // 2))
             except Exception:
                 pass
             if canonical_mode in {"max-autotune", "max-autotune-no-cudagraphs"}:
@@ -397,17 +417,12 @@ def compile(
                     _inductor_config.autotune_remote_cache = None
                 with suppress(Exception):
                     if (
-                        getattr(
-                            _inductor_config, "max_autotune_gemm_search_space", None
-                        )
+                        getattr(_inductor_config, "max_autotune_gemm_search_space", None)
                         is not None
                     ):
                         _inductor_config.max_autotune_gemm_search_space = "DEFAULT"
                 with suppress(Exception):
-                    if (
-                        getattr(_inductor_config, "max_autotune_pointwise", None)
-                        is not None
-                    ):
+                    if getattr(_inductor_config, "max_autotune_pointwise", None) is not None:
                         _inductor_config.max_autotune_pointwise = False
                 with suppress(Exception):
                     if getattr(_inductor_config, "max_autotune_gemm", None) is not None:
@@ -453,9 +468,7 @@ def compile(
         compile_kwargs["options"] = options_merged
     if mode_value is not None and isinstance(compile_kwargs.get("options", None), dict):
         inductor_cfg = _get_inductor_config()
-        patch = (
-            getattr(inductor_cfg, "patch", None) if inductor_cfg is not None else None
-        )
+        patch = getattr(inductor_cfg, "patch", None) if inductor_cfg is not None else None
 
         def _has_cfg_key(cfg: Any, key: str) -> bool:
             obj = cfg
@@ -591,9 +604,7 @@ def torch_compiler_disable(
     return decorator
 
 
-def compile_distributed_safe(
-    *args: Any, collectives: tuple[str, ...] = _COLLECTIVE_NAMES
-) -> bool:
+def compile_distributed_safe(*args: Any, collectives: tuple[str, ...] = _COLLECTIVE_NAMES) -> bool:
     if _TORCH_DYNAMO is None or not hasattr(_TORCH_DYNAMO, "disallow_in_graph"):
         return False
     try:
@@ -630,9 +641,7 @@ def compile_safe(
             with suppress(Exception):
                 layers_module = importlib.import_module(mod_name)
                 break
-    scaler_cls = (
-        getattr(layers_module, "Scaler", None) if layers_module is not None else None
-    )
+    scaler_cls = getattr(layers_module, "Scaler", None) if layers_module is not None else None
     if scaler_cls is None:
         for mod_name in ("stnet.nn.layers", "stnet.nn.blocks"):
             with suppress(Exception):
@@ -655,9 +664,7 @@ def compile_safe(
                 reason="Scaler uses Python-side caches/loops; keep eager",
                 recursive=False,
             )
-    history_cls = (
-        getattr(layers_module, "Recorder", None) if layers_module is not None else None
-    )
+    history_cls = getattr(layers_module, "Recorder", None) if layers_module is not None else None
     if history_cls is None:
         for mod_name in ("stnet.nn.layers", "stnet.nn.blocks"):
             with suppress(Exception):
@@ -767,9 +774,7 @@ def to_checkpoint(
         if prev_mb <= 0:
             setattr(inst, "_stnet_ckpt_pressure_min_bytes", int(min_bytes))
         else:
-            setattr(
-                inst, "_stnet_ckpt_pressure_min_bytes", int(min(prev_mb, min_bytes))
-            )
+            setattr(inst, "_stnet_ckpt_pressure_min_bytes", int(min(prev_mb, min_bytes)))
     return bool(changed)
 
 
@@ -808,6 +813,13 @@ def from_checkpoint(model: nn.Module, *args: Any, step_total: int) -> None:
         setattr(inst, "_stnet_ckpt_pressure_min_bytes", 0)
 
 
+@torch_compiler_disable(reason="torch.utils.checkpoint", recursive=False)
+def _checkpoint_call(fn, *args, **kwargs):
+    if _torch_checkpoint is None:
+        return fn(*args, **kwargs)
+    return _torch_checkpoint(fn, *args, **kwargs)
+
+
 def coerce_checkpoint(
     fn: Callable[..., Any],
     *args: Any,
@@ -815,25 +827,41 @@ def coerce_checkpoint(
 ) -> Any:
     if _torch_checkpoint is None:
         return fn(*args)
-    for t in args:
-        if isinstance(t, torch.Tensor) and t.requires_grad:
-            return _torch_checkpoint(fn, *args, **ckpt_kwargs)
-    base = next(
-        (
-            t
-            for t in args
-            if isinstance(t, torch.Tensor) and (t.is_floating_point() or t.is_complex())
-        ),
-        None,
-    )
-    if base is None:
-        return fn(*args)
-    try:
-        dummy = base.new_zeros((), requires_grad=True)
-    except Exception:
+    if is_export_or_trace() or not any(
+        isinstance(a, torch.Tensor) and a.requires_grad for a in args
+    ):
         return fn(*args)
 
-    def _fn_with_dummy(*inps: Any) -> Any:
-        return fn(*inps[:-1])
+    use_reentrant = ckpt_kwargs.pop("use_reentrant", None)
+    preserve_rng_state = ckpt_kwargs.pop("preserve_rng_state", None)
+    determinism_check = ckpt_kwargs.pop("determinism_check", None)
 
-    return _torch_checkpoint(_fn_with_dummy, *args, dummy, **ckpt_kwargs)
+    if use_reentrant is None:
+        use_reentrant = True
+    if preserve_rng_state is None:
+        preserve_rng_state = True
+
+    ck_opts = {
+        k: v
+        for k, v in [
+            ("use_reentrant", use_reentrant),
+            ("preserve_rng_state", preserve_rng_state),
+            ("determinism_check", determinism_check),
+        ]
+        if v is not None
+    }
+    tried: set[tuple[tuple[str, object], ...]] = set()
+    for opts in [
+        ck_opts,
+        {k: v for k, v in ck_opts.items() if k != "determinism_check"},
+        {k: v for k, v in ck_opts.items() if k not in ("determinism_check", "use_reentrant")},
+        {k: v for k, v in ck_opts.items() if k != "use_reentrant"},
+        {},
+    ]:
+        key = tuple(sorted(opts.items()))
+        if key in tried:
+            continue
+        tried.add(key)
+        with suppress(TypeError):
+            return _checkpoint_call(fn, *args, **opts, **ckpt_kwargs)
+    return _checkpoint_call(fn, *args, **ckpt_kwargs)

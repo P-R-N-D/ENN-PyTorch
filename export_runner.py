@@ -74,13 +74,11 @@ def export_and_validate(
     onnx_path = targets["onnx"]
     if onnx_path.exists():
         try:
-            sess = ort.InferenceSession(
-                str(onnx_path), providers=["CPUExecutionProvider"]
-            )
+            sess = ort.InferenceSession(str(onnx_path), providers=["CPUExecutionProvider"])
             inp_name = sess.get_inputs()[0].name
-            onnx_out = sess.run(
-                None, {inp_name: sample.detach().cpu().numpy().astype(np.float32)}
-            )[0]
+            onnx_out = sess.run(None, {inp_name: sample.detach().cpu().numpy().astype(np.float32)})[
+                0
+            ]
             with torch.no_grad():
                 if hasattr(model, "forward_export"):
                     torch_out_t = model.forward_export(sample)
@@ -121,9 +119,7 @@ def main() -> None:
         modeling_type="spatiotemporal",
         compile_mode="disabled",
     )
-    model = new_model(in_dim=td_train["X"].shape[1], out_shape=(S, T), config=cfg).to(
-        device
-    )
+    model = new_model(in_dim=td_train["X"].shape[1], out_shape=(S, T), config=cfg).to(device)
     print("[export] training short run (epochs=2) for exportable weights")
     train(
         model,
