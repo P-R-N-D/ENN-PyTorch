@@ -34,9 +34,7 @@ def _torch_load(path: Path, map_location: str | torch.device):
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument(
-        "--out", type=str, default="pickle_smoke_out", help="Output directory"
-    )
+    ap.add_argument("--out", type=str, default="pickle_smoke_out", help="Output directory")
     ap.add_argument("--device", type=str, default="cpu", help="cpu|cuda")
     ap.add_argument("--dtype", type=str, default="fp32", help="fp32|fp16|bf16")
     ap.add_argument("--compile-mode", type=str, default="disabled")
@@ -60,9 +58,7 @@ def main() -> int:
 
     device = torch.device(args.device)
     dtype = _dtype_from_str(args.dtype)
-    out_shape = tuple(
-        int(p.strip()) for p in str(args.out_shape).split(",") if p.strip()
-    )
+    out_shape = tuple(int(p.strip()) for p in str(args.out_shape).split(",") if p.strip())
     if not out_shape:
         raise ValueError("out-shape must be like '8,8'")
 
@@ -87,9 +83,7 @@ def main() -> int:
     model = Model(int(args.in_dim), out_shape, cfg).to(device=device, dtype=dtype)
     model.eval()
 
-    x = torch.randn(
-        int(args.batch), int(args.seq), int(args.in_dim), device=device, dtype=dtype
-    )
+    x = torch.randn(int(args.batch), int(args.seq), int(args.in_dim), device=device, dtype=dtype)
 
     with torch.no_grad():
         y_ref = model.forward_export(x)

@@ -114,19 +114,13 @@ def _is_lazy_tensor(x: Any) -> bool:
     return isinstance(x, MemoryMappedTensor)
 
 
-def _to_safe_tensor(
-    obj: Any, dtype: Optional[torch.dtype] = None
-) -> Optional[torch.Tensor]:
+def _to_safe_tensor(obj: Any, dtype: Optional[torch.dtype] = None) -> Optional[torch.Tensor]:
     if obj is None:
         return None
     t = obj if isinstance(obj, torch.Tensor) else torch.as_tensor(obj)
     if dtype is None:
         return t
-    return (
-        t.to(dtype=dtype, copy=False)
-        if isinstance(t, torch.Tensor) and t.dtype != dtype
-        else t
-    )
+    return t.to(dtype=dtype, copy=False) if isinstance(t, torch.Tensor) and t.dtype != dtype else t
 
 
 def _feature_size_hint(obj: Any) -> Optional[int]:
@@ -159,9 +153,7 @@ def _stack_sequence(
         if reshape_1d:
             ti = ti.reshape(-1)
         if ti.shape != t0.shape:
-            raise ValueError(
-                f"Dataset.preprocess: shape mismatch {t0.shape} vs {ti.shape}"
-            )
+            raise ValueError(f"Dataset.preprocess: shape mismatch {t0.shape} vs {ti.shape}")
         out[i].copy_(ti)
     return out
 
@@ -176,9 +168,7 @@ def _get_sample_size(_x_cpu: torch.Tensor, _y_cpu: Optional[torch.Tensor]) -> in
     return int(bx + by)
 
 
-def _get_random_batch(
-    _sample_bytes: int, _device: torch.device, _N: int
-) -> Sequence[int]:
+def _get_random_batch(_sample_bytes: int, _device: torch.device, _N: int) -> Sequence[int]:
     if _sample_bytes <= 0 or _N <= 0:
         return [1]
     capB = 1024
@@ -192,14 +182,10 @@ def _get_random_batch(
     if effective_free is not None:
         capB = max(
             1,
-            int(
-                (max(0, int(effective_free)) * 0.80) // max(_sample_bytes * 4, 1)
-            ),
+            int((max(0, int(effective_free)) * 0.80) // max(_sample_bytes * 4, 1)),
         )
     capB = max(1, min(capB, int(_N)))
-    cands = sorted(
-        {max(1, int(capB * f)) for f in (0.125, 0.25, 0.375, 0.5, 0.75, 1.0)}
-    )
+    cands = sorted({max(1, int(capB * f)) for f in (0.125, 0.25, 0.375, 0.5, 0.75, 1.0)})
     return [c for c in cands if c <= _N]
 
 
@@ -226,18 +212,10 @@ def _h2d_counter(
         yb = _y_cpu[start : start + bs] if _y_cpu is not None else None
         if pin_ok:
             with contextlib.suppress(Exception):
-                xb = (
-                    xb
-                    if (hasattr(xb, "is_pinned") and xb.is_pinned())
-                    else xb.pin_memory()
-                )
+                xb = xb if (hasattr(xb, "is_pinned") and xb.is_pinned()) else xb.pin_memory()
             if yb is not None:
                 with contextlib.suppress(Exception):
-                    yb = (
-                        yb
-                        if (hasattr(yb, "is_pinned") and yb.is_pinned())
-                        else yb.pin_memory()
-                    )
+                    yb = yb if (hasattr(yb, "is_pinned") and yb.is_pinned()) else yb.pin_memory()
         _sync_device(_device)
         if ev0 is not None and ev1 is not None:
             with accelerator(_device):
@@ -320,6 +298,7 @@ def _set_batch_interval(
 
     def _get_opt_bytes(name):
         return val if (val := _get_bytes(name)) > 0 else None
+
     tpl = BatchPolicy(
         sample_bytes=per_sample,
         host_sample_bytes=sbytes,
@@ -338,9 +317,7 @@ def _set_batch_interval(
         ),
         device_budget_min_bytes=_get_bytes("STNET_DEVICE_BUDGET_MIN_BYTES"),
         device_budget_max_bytes=_get_opt_bytes("STNET_DEVICE_BUDGET_MAX_BYTES"),
-        host_budget_ratio=float(
-            env_first_float(("STNET_HOST_BUDGET_RATIO",), default=1.0) or 1.0
-        ),
+        host_budget_ratio=float(env_first_float(("STNET_HOST_BUDGET_RATIO",), default=1.0) or 1.0),
         host_budget_min_bytes=_get_bytes("STNET_HOST_BUDGET_MIN_BYTES"),
         host_budget_max_bytes=_get_opt_bytes("STNET_HOST_BUDGET_MAX_BYTES"),
     )
@@ -360,9 +337,9 @@ def _set_batch_interval(
     probe_bs_cache: Optional[int] = None
     med_probe_cache: Optional[float] = None
     b_init_hint: Optional[int] = None
-    if (
-        tpl.device_budget_max_bytes is None or tpl.host_budget_max_bytes is None
-    ) and int(tpl.sample_bytes or 0) > 0:
+    if (tpl.device_budget_max_bytes is None or tpl.host_budget_max_bytes is None) and int(
+        tpl.sample_bytes or 0
+    ) > 0:
         try:
             inflight = int(tpl.host_inflight_batches_per_proc())
             lw = max(1, int(getattr(tpl, "local_world_size", 1) or 1))
@@ -376,17 +353,13 @@ def _set_batch_interval(
             probe_bs = max(1, min(int(B_cap), 64))
             med_probe = 0.0
             with contextlib.suppress(Exception):
-                med_probe = float(
-                    _h2d_counter(x_cpu, y_cpu, _dev, probe_bs, _steps=4, _warmup=1)
-                )
+                med_probe = float(_h2d_counter(x_cpu, y_cpu, _dev, probe_bs, _steps=4, _warmup=1))
             if (
                 isinstance(med_probe, (float, int))
                 and math.isfinite(float(med_probe))
                 and float(med_probe) > 0.0
             ):
-                bs_est = int(
-                    math.ceil((target_ms * float(probe_bs)) / float(med_probe))
-                )
+                bs_est = int(math.ceil((target_ms * float(probe_bs)) / float(med_probe)))
                 target_batch_samples = max(1, min(int(B_cap), bs_est))
                 probe_bs_cache = int(probe_bs)
                 med_probe_cache = float(med_probe)
@@ -441,9 +414,7 @@ def _set_batch_interval(
         B_cap = min(B_cap, cap_from_mem)
     B_cap = max(1, min(int(B_cap), len(_ds)))
     if (
-        env_max := int(
-            env_first_int(("STNET_MAX_BATCH_SIZE", "STNET_MAX_BATCH"), default=0) or 0
-        )
+        env_max := int(env_first_int(("STNET_MAX_BATCH_SIZE", "STNET_MAX_BATCH"), default=0) or 0)
     ) > 0:
         B_cap = max(1, min(B_cap, int(env_max)))
     with contextlib.suppress(Exception):
@@ -474,11 +445,7 @@ def _set_batch_interval(
                 B = int(B_hint)
         except Exception:
             pass
-    if (
-        probe_bs_cache is not None
-        and med_probe_cache is not None
-        and int(B) == int(probe_bs_cache)
-    ):
+    if probe_bs_cache is not None and med_probe_cache is not None and int(B) == int(probe_bs_cache):
         med = float(med_probe_cache)
     else:
         med = _h2d_counter(x_cpu, y_cpu, _dev, B)
@@ -529,11 +496,7 @@ def _process(
     if features is None and isinstance(batch, Mapping):
         features = batch.get("X")
         labels = batch.get("Y", None)
-    if (
-        flatten_features
-        and isinstance(features, torch.Tensor)
-        and (features.dim() >= 2)
-    ):
+    if flatten_features and isinstance(features, torch.Tensor) and (features.dim() >= 2):
         features = features.reshape(features.shape[0], -1)
     if labels_dtype is not None and isinstance(labels, torch.Tensor):
         labels = labels.to(dtype=labels_dtype, non_blocking=True, copy=False)
@@ -559,8 +522,6 @@ def _merge_opt(v1, v2, op):
     if v2 is None:
         return v1
     return op(v1, v2)
-
-
 
 
 def _fetch_stream_batch(
@@ -630,9 +591,7 @@ def _fetch_cap_pf_depth(
         if host_avail <= 0:
             return int(pf)
         dev_free, _ = _device_mem_get_info(device)
-        effective_avail = (
-            min(host_avail, dev_free) if dev_free is not None else host_avail
-        )
+        effective_avail = min(host_avail, dev_free) if dev_free is not None else host_avail
         budget = int(effective_avail * float(memory_budget_fraction))
         if budget <= 0 or bs <= 0:
             return int(pf)
@@ -666,9 +625,7 @@ def _fetch_cap_pf_depth(
         pf_cap = max(1, int(budget // max(1, bytes_per_batch)))
         with contextlib.suppress(Exception):
             hard = int(loader_policy.hard_inflight_batches(device))
-            soft_cap = max(
-                1, int(hard * max(1, int(loader_policy.soft_cap_multiplier)))
-            )
+            soft_cap = max(1, int(hard * max(1, int(loader_policy.soft_cap_multiplier))))
             pb = max(1, int(prebatch))
             workers = max(1, int(io_workers) if int(io_workers) > 0 else 1)
             inflight_pf_cap = max(1, int((soft_cap - pb) // max(1, workers)))
@@ -716,9 +673,7 @@ def _fetch_iterate_sample(
 
 
 def _fetch_merge_batches(batches: Sequence[Any]) -> Any:
-    if TensorDictBase is not None and all(
-        isinstance(b, TensorDictBase) for b in batches
-    ):
+    if TensorDictBase is not None and all(isinstance(b, TensorDictBase) for b in batches):
         with contextlib.suppress(Exception):
             return torch.cat(list(batches), dim=0)
     if all(isinstance(b, Mapping) for b in batches):
@@ -736,35 +691,24 @@ def _fetch_merge_batches(batches: Sequence[Any]) -> Any:
                 for v in vals:
                     if v is None:
                         continue
-                    tensors.append(
-                        v if isinstance(v, torch.Tensor) else torch.as_tensor(v)
-                    )
+                    tensors.append(v if isinstance(v, torch.Tensor) else torch.as_tensor(v))
                 if tensors:
                     merged[key] = torch.cat(tensors, dim=0)
                 continue
             if all(isinstance(v, (list, tuple)) for v in vals):
                 merged[key] = list(
-                    chain.from_iterable(
-                        v if isinstance(v, list) else list(v) for v in vals
-                    )
+                    chain.from_iterable(v if isinstance(v, list) else list(v) for v in vals)
                 )
                 continue
             with contextlib.suppress(Exception):
-                tensors = [
-                    v if isinstance(v, torch.Tensor) else torch.as_tensor(v)
-                    for v in vals
-                ]
+                tensors = [v if isinstance(v, torch.Tensor) else torch.as_tensor(v) for v in vals]
                 merged[key] = torch.cat(tensors, dim=0)
                 continue
             merged[key] = list(
-                chain.from_iterable(
-                    v if isinstance(v, (list, tuple)) else [v] for v in vals
-                )
+                chain.from_iterable(v if isinstance(v, (list, tuple)) else [v] for v in vals)
             )
         return merged
-    return list(
-        chain.from_iterable(b if isinstance(b, (list, tuple)) else [b] for b in batches)
-    )
+    return list(chain.from_iterable(b if isinstance(b, (list, tuple)) else [b] for b in batches))
 
 
 def _fetch_normalize_sources(sources: Any) -> Dict[str, Source]:
@@ -811,9 +755,7 @@ def _fetch_build_sampler_nodes(
     nodes: Dict[str, BaseNode] = {}
     lengths: Dict[str, int] = {}
     for k, ds in datasets.items():
-        sn = ds.compose(
-            batch_size=int(bs), shuffle=bool(shuffle), seed=int(seed), key=str(k)
-        )
+        sn = ds.compose(batch_size=int(bs), shuffle=bool(shuffle), seed=int(seed), key=str(k))
         if len(ds) > 0:
             nodes[str(k)] = sn
             lengths[str(k)] = int(len(ds))
@@ -827,12 +769,7 @@ def iter_dataset(data: object) -> tuple[list[tuple[str, object]], object | None]
     if (
         isinstance(data, collections.abc.Mapping)
         and data
-        and all(
-            (
-                isinstance(v, (TensorDictBase, collections.abc.Mapping))
-                for v in data.values()
-            )
-        )
+        and all((isinstance(v, (TensorDictBase, collections.abc.Mapping)) for v in data.values()))
     ):
         manifest: dict[str, str] = {}
         items: list[tuple[str, object]] = []
@@ -844,9 +781,7 @@ def iter_dataset(data: object) -> tuple[list[tuple[str, object]], object | None]
     if (
         isinstance(data, Sequence)
         and data
-        and all(
-            (isinstance(d, (TensorDictBase, collections.abc.Mapping)) for d in data)
-        )
+        and all((isinstance(d, (TensorDictBase, collections.abc.Mapping)) for d in data))
     ):
         manifest_list: list[str] = []
         items2: list[tuple[str, object]] = []
@@ -906,14 +841,10 @@ def compose(
     **kwargs: Any,
 ) -> Tuple[BaseNode, BaseNode, BaseNode]:
     _require_nodes()
-    device_obj = (
-        torch.device(device) if not isinstance(device, torch.device) else device
-    )
+    device_obj = torch.device(device) if not isinstance(device, torch.device) else device
     with contextlib.suppress(Exception):
         get_affinity(io_workers=io_workers)
-    sampler = Multiplexer(
-        stop_criteria="ALL_DATASETS_EXHAUSTED", seed=int(seed), weights=weights
-    )
+    sampler = Multiplexer(stop_criteria="ALL_DATASETS_EXHAUSTED", seed=int(seed), weights=weights)
     source = sampler.compose(node_or_nodes)
     if epochables is not None and getattr(sampler, "_node", None) is not None:
         with contextlib.suppress(Exception):
@@ -949,15 +880,9 @@ def fetch(
     seed: int = 0,
 ) -> Dict[str, Any]:
     _require_nodes()
-    device_obj = (
-        torch.device(device) if not isinstance(device, torch.device) else device
-    )
+    device_obj = torch.device(device) if not isinstance(device, torch.device) else device
     lp = loader_policy if isinstance(loader_policy, LoaderPolicy) else LoaderPolicy()
-    wp = (
-        worker_policy
-        if isinstance(worker_policy, WorkerPolicy)
-        else WorkerPolicy.optimize()
-    )
+    wp = worker_policy if isinstance(worker_policy, WorkerPolicy) else WorkerPolicy.optimize()
     wp.set_thread_setting()
     io_workers = int(getattr(wp, "num_workers", 0) or 0)
     prebatch = int(getattr(wp, "prebatch", 1) or 1)
@@ -972,9 +897,8 @@ def fetch(
     train_epochables: List[Any] = []
     specs = _fetch_normalize_sources(sources)
     spec_keys = list(specs.keys())
-    def _create_loader_stage(
-        split, shuffle, weights, collect_epochables=False, epochables=None
-    ):
+
+    def _create_loader_stage(split, shuffle, weights, collect_epochables=False, epochables=None):
         datasets = _fetch_build_datasets(
             specs,
             split=split,
@@ -1018,9 +942,7 @@ def fetch(
                 fallback=bs,
             )
 
-        nodes, lengths = _fetch_build_sampler_nodes(
-            datasets, bs=bs, shuffle=shuffle, seed=seed
-        )
+        nodes, lengths = _fetch_build_sampler_nodes(datasets, bs=bs, shuffle=shuffle, seed=seed)
         if not nodes:
             raise RuntimeError(f"No non-empty sources for split={split}")
 
@@ -1064,9 +986,7 @@ def fetch(
         collect_epochables=True,
         epochables=train_epochables,
     )
-    val_loader = (
-        _create_loader_stage("val", False, val_weights) if float(val_frac) > 0.0 else None
-    )
+    val_loader = _create_loader_stage("val", False, val_weights) if float(val_frac) > 0.0 else None
     with contextlib.suppress(Exception):
         if train_loader is not None:
             setattr(train_loader, "_stnet_sampler_scale", scale_ctl)
@@ -1093,17 +1013,13 @@ class LoaderPolicy:
             return max(1, int(self.max_batches_accel))
         return max(1, int(self.max_batches_cpu))
 
-    def apply_soft_limits(
-        self, wp: WorkerPolicy, device: torch.device | str
-    ) -> WorkerPolicy:
+    def apply_soft_limits(self, wp: WorkerPolicy, device: torch.device | str) -> WorkerPolicy:
         hard = int(self.hard_inflight_batches(device))
         soft_cap = max(1, int(hard * max(1, int(self.soft_cap_multiplier))))
         prefetch_factor = max(1, int(getattr(wp, "prefetch_factor", 1) or 1))
         prebatch = max(1, int(getattr(wp, "prebatch", 1) or 1))
         num_workers_req = max(0, int(getattr(wp, "num_workers", 0) or 0))
-        max_workers_inflight = max(
-            0, int((soft_cap - prebatch) // max(1, prefetch_factor))
-        )
+        max_workers_inflight = max(0, int((soft_cap - prebatch) // max(1, prefetch_factor)))
         num_workers = min(num_workers_req, max_workers_inflight, soft_cap)
         num_workers = max(0, int(num_workers))
         inflight = int(num_workers) * int(prefetch_factor) + int(prebatch)
@@ -1112,12 +1028,8 @@ class LoaderPolicy:
                 1,
                 int((int(soft_cap) - int(prebatch)) // max(1, int(num_workers))),
             )
-            max_workers_inflight = max(
-                0, int((soft_cap - prebatch) // max(1, prefetch_factor))
-            )
-            num_workers = min(
-                int(num_workers), int(max_workers_inflight), int(soft_cap)
-            )
+            max_workers_inflight = max(0, int((soft_cap - prebatch) // max(1, prefetch_factor)))
+            num_workers = min(int(num_workers), int(max_workers_inflight), int(soft_cap))
             num_workers = max(0, int(num_workers))
         wp.num_workers = int(num_workers)
         wp.prebatch = int(prebatch)
@@ -1133,9 +1045,7 @@ class LoaderPolicy:
             )
         return wp
 
-    def wrap_input(
-        self, loader: Any, device: torch.device | str, *args: Any, name: str
-    ) -> Any:
+    def wrap_input(self, loader: Any, device: torch.device | str, *args: Any, name: str) -> Any:
         from ..data.nodes import BatchQueue
 
         max_batches = self.hard_inflight_batches(device)
@@ -1177,12 +1087,8 @@ class BatchPolicy:
             self.max_batch = max(int(self.max_batch), 1)
         self.device_margin = max(0.0, min(1.0, float(self.device_margin)))
         self.host_margin = max(0.0, min(1.0, float(self.host_margin)))
-        self.device_budget_ratio = max(
-            0.0, min(1.0, float(self.device_budget_ratio or 0.0))
-        )
-        self.host_budget_ratio = max(
-            0.0, min(1.0, float(self.host_budget_ratio or 0.0))
-        )
+        self.device_budget_ratio = max(0.0, min(1.0, float(self.device_budget_ratio or 0.0)))
+        self.host_budget_ratio = max(0.0, min(1.0, float(self.host_budget_ratio or 0.0)))
         self.device_budget_min_bytes = max(int(self.device_budget_min_bytes or 0), 0)
         self.host_budget_min_bytes = max(int(self.host_budget_min_bytes or 0), 0)
         if self.device_budget_max_bytes is not None:
@@ -1257,15 +1163,9 @@ class BatchPolicy:
                     usable = min(int(usable), int(budget))
             dev_cap = int(max(0, usable) // denom)
         host_cap: Optional[int] = None
-        if (
-            host_free is not None
-            and host_free >= 0
-            and (self.host_sample_bytes or 0) > 0
-        ):
+        if host_free is not None and host_free >= 0 and (self.host_sample_bytes or 0) > 0:
             inflight = self.host_inflight_batches_per_proc()
-            denom = (
-                max(1, int(self.host_sample_bytes or 0)) * max(1, inflight) * max(1, lw)
-            )
+            denom = max(1, int(self.host_sample_bytes or 0)) * max(1, inflight) * max(1, lw)
             usable = int(float(host_free) * float(self.host_margin))
             if use_host_budget:
                 budget = self._budget_bytes(
@@ -1308,19 +1208,12 @@ class Collator:
 
                 def _stack_key(key, default=None):
                     vals = [
-                        x.get(key, default) if isinstance(x, Mapping) else default
-                        for x in items
+                        x.get(key, default) if isinstance(x, Mapping) else default for x in items
                     ]
                     if all(v is None for v in vals):
                         return None
                     return _to_safe_tensor(
-                        torch.stack(
-                            [
-                                _to_safe_tensor(v)
-                                for v in vals
-                                if v is not None
-                            ]
-                        )
+                        torch.stack([_to_safe_tensor(v) for v in vals if v is not None])
                         if any(isinstance(v, torch.Tensor) for v in vals)
                         else vals
                     )
@@ -1334,11 +1227,7 @@ class Collator:
                     data["Y"] = Y
                 if rows is not None:
                     data["row_ids"] = rows
-                return (
-                    TensorDict(data, batch_size=_td_batch_size_from_X(X))
-                    if TensorDict
-                    else data
-                )
+                return TensorDict(data, batch_size=_td_batch_size_from_X(X)) if TensorDict else data
 
             stacked = _standardize_batch(batch)
             if isinstance(stacked, TensorDictBase):
@@ -1379,9 +1268,7 @@ class Collator:
                 X = batch.get("X")
             if Y is None:
                 Y = batch.get("Y")
-            row_ids = conv.get("row_ids") if isinstance(conv, Mapping) else batch.get(
-                "row_ids"
-            )
+            row_ids = conv.get("row_ids") if isinstance(conv, Mapping) else batch.get("row_ids")
             data: dict[str, Any] = {"X": X}
             if isinstance(Y, torch.Tensor):
                 data["Y"] = Y
@@ -1430,9 +1317,7 @@ class Session:
         if self.sampler_scale is None:
             self.sampler_scale = BatchScaler()
         dev = (
-            torch.device(self.device)
-            if not isinstance(self.device, torch.device)
-            else self.device
+            torch.device(self.device) if not isinstance(self.device, torch.device) else self.device
         )
         wp = self.worker_policy or WorkerPolicy.optimize()
         wp = self.loader_policy.apply_soft_limits(wp, dev)
@@ -1458,18 +1343,10 @@ class Session:
         self.disposable = dl.get("disposable")
         self.raw_training_loader = train_loader
         self.raw_validation_loader = val_loader
-        if (
-            train_state
-            and train_loader is not None
-            and hasattr(train_loader, "load_state_dict")
-        ):
+        if train_state and train_loader is not None and hasattr(train_loader, "load_state_dict"):
             with contextlib.suppress(Exception):
                 train_loader.load_state_dict(train_state)
-        if (
-            val_state
-            and val_loader is not None
-            and hasattr(val_loader, "load_state_dict")
-        ):
+        if val_state and val_loader is not None and hasattr(val_loader, "load_state_dict"):
             with contextlib.suppress(Exception):
                 val_loader.load_state_dict(val_state)
         self.training_loader = (
@@ -1484,21 +1361,12 @@ class Session:
         )
         with contextlib.suppress(Exception):
             if self.training_loader is not None:
-                setattr(
-                    self.training_loader, "_stnet_sampler_scale", self.sampler_scale
-                )
+                setattr(self.training_loader, "_stnet_sampler_scale", self.sampler_scale)
             if self.validation_loader is not None:
-                setattr(
-                    self.validation_loader, "_stnet_sampler_scale", self.sampler_scale
-                )
+                setattr(self.validation_loader, "_stnet_sampler_scale", self.sampler_scale)
         with contextlib.suppress(Exception):
-            if (
-                self.raw_training_loader is not None
-                and self.training_loader is not None
-            ):
-                epochables = getattr(
-                    self.raw_training_loader, "_stnet_epochables", None
-                )
+            if self.raw_training_loader is not None and self.training_loader is not None:
+                epochables = getattr(self.raw_training_loader, "_stnet_epochables", None)
                 if epochables is not None:
                     setattr(self.training_loader, "_stnet_epochables", epochables)
         self._opened = True
@@ -1583,9 +1451,7 @@ class Dataset(Generic[TExtra]):
                 self.int_dtypes = parsed
 
     def _refresh_quant_from_env(self) -> None:
-        bits = env_first_int(
-            ("STNET_DATA_INT_QUANT_BITS", "STNET_INT_QUANT_BITS"), default=0
-        )
+        bits = env_first_int(("STNET_DATA_INT_QUANT_BITS", "STNET_INT_QUANT_BITS"), default=0)
         if bits > 0:
             self.int_quant_bits = int(bits)
 
@@ -1669,17 +1535,11 @@ class Dataset(Generic[TExtra]):
                 else:
                     if isinstance(v0, (list, tuple)) and len(v0) >= 2:
                         n = len(data)
-                        keys_list: Optional[list[Any]] = (
-                            [k0] if bool(return_keys) else None
-                        )
+                        keys_list: Optional[list[Any]] = [k0] if bool(return_keys) else None
                         x0 = _to_safe_tensor(v0[0], feat_dtype)
                         if x0 is None:
-                            raise ValueError(
-                                "Dataset.preprocess: missing feature in tuple mapping"
-                            )
-                        feat = torch.empty(
-                            (n, *x0.shape), dtype=x0.dtype, device=x0.device
-                        )
+                            raise ValueError("Dataset.preprocess: missing feature in tuple mapping")
+                        feat = torch.empty((n, *x0.shape), dtype=x0.dtype, device=x0.device)
                         feat[0].copy_(x0)
                         labels_out: Optional[torch.Tensor] = None
                         y0: Optional[torch.Tensor] = None
@@ -1750,9 +1610,7 @@ class Dataset(Generic[TExtra]):
                                     labels = None
                                     parsed = features is not None
                                 else:
-                                    labels = _stack_sequence(
-                                        values_list, dtype=label_dtype
-                                    )
+                                    labels = _stack_sequence(values_list, dtype=label_dtype)
                                     parsed = features is not None and labels is not None
                             except Exception:
                                 parsed = False
@@ -1847,11 +1705,7 @@ class Dataset(Generic[TExtra]):
                             max_neg = float(x[neg].max().item())
                             cand = float(-max_neg)
                             if cand > 0.0:
-                                min_pos = (
-                                    cand
-                                    if (min_pos is None or cand < min_pos)
-                                    else min_pos
-                                )
+                                min_pos = cand if (min_pos is None or cand < min_pos) else min_pos
                 return {
                     "has_scale": True,
                     "has_nonfinite": bool(has_nonfinite),
@@ -1883,9 +1737,7 @@ class Dataset(Generic[TExtra]):
                         max_neg = float(xf[neg].max().item())
                         cand = float(-max_neg)
                         if cand > 0.0:
-                            min_pos = (
-                                cand if (min_pos is None or cand < min_pos) else min_pos
-                            )
+                            min_pos = cand if (min_pos is None or cand < min_pos) else min_pos
             else:
                 max_abs = float("nan")
                 min_val = None
@@ -1927,9 +1779,7 @@ class Dataset(Generic[TExtra]):
     def merge_scale_stats(a: Mapping[str, Any], b: Mapping[str, Any]) -> Dict[str, Any]:
         out: Dict[str, Any] = {}
         out["has_scale"] = bool(a.get("has_scale")) or bool(b.get("has_scale"))
-        out["has_nonfinite"] = bool(a.get("has_nonfinite")) or bool(
-            b.get("has_nonfinite")
-        )
+        out["has_nonfinite"] = bool(a.get("has_nonfinite")) or bool(b.get("has_nonfinite"))
         out["scale_max_abs"] = _merge_opt(
             a.get("scale_max_abs"),
             b.get("scale_max_abs"),
@@ -1984,9 +1834,7 @@ class Dataset(Generic[TExtra]):
         info = torch.finfo(torch.float32)
         if max_abs_f > float(info.max) / max(1.0, float(safety_margin)):
             return False
-        action = normalize_underflow_action(
-            underflow_action, default=default_underflow_action()
-        )
+        action = normalize_underflow_action(underflow_action, default=default_underflow_action())
         if action == "forbid":
             min_pos = stats.get("scale_min_positive")
             if min_pos is not None:
@@ -2003,9 +1851,7 @@ class Dataset(Generic[TExtra]):
         self.has_scale = bool(stats.get("has_scale") or False)
         self.has_nonfinite = bool(stats.get("has_nonfinite") or False)
         self.scale_max_abs = (
-            float(stats["scale_max_abs"])
-            if stats.get("scale_max_abs") is not None
-            else None
+            float(stats["scale_max_abs"]) if stats.get("scale_max_abs") is not None else None
         )
         self.scale_min_value = stats.get("scale_min_value")
         self.scale_max_value = stats.get("scale_max_value")
@@ -2015,9 +1861,7 @@ class Dataset(Generic[TExtra]):
             else None
         )
         self.scale_is_integral = (
-            bool(stats["scale_is_integral"])
-            if stats.get("scale_is_integral") is not None
-            else None
+            bool(stats["scale_is_integral"]) if stats.get("scale_is_integral") is not None else None
         )
         self.is_negotiable = bool(
             self.has_scale

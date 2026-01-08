@@ -23,9 +23,7 @@ class GLU(nn.Module):
         self.in_dim, self.hid = int(in_dim), int(hidden_dim)
         self.out_dim = int(out_dim if out_dim is not None else self.in_dim)
         if any(x <= 0 for x in (self.in_dim, self.hid, self.out_dim)):
-            raise ValueError(
-                f"Dims must be > 0: {self.in_dim}, {self.hid}, {self.out_dim}"
-            )
+            raise ValueError(f"Dims must be > 0: {self.in_dim}, {self.hid}, {self.out_dim}")
         if not 0.0 <= float(dropout) <= 1.0:
             raise ValueError(f"Dropout {dropout} invalid")
         if not isinstance(activation, nn.Module):
@@ -49,11 +47,7 @@ class GLU(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if (
-            self.check_input
-            and (not torch.jit.is_tracing())
-            and x.size(-1) != self.in_dim
-        ):
+        if self.check_input and (not torch.jit.is_tracing()) and x.size(-1) != self.in_dim:
             raise ValueError(f"Expected dim {self.in_dim}, got {x.size(-1)}")
         a, b = self.in_proj(x).chunk(2, dim=-1)
         return self.out_proj(self.dropout(self.activation(a) * b))
