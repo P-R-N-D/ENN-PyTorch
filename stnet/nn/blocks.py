@@ -11,7 +11,7 @@ import torch.nn as nn
 
 from ..core.distributed import _unshard_fsdp_module
 from ..core.compat import StochasticDepth, is_meta_or_fake_tensor
-from ..core.graph import coerce_checkpoint, is_export_or_trace
+from ..core.graph import coerce_checkpoint, is_export_or_trace, is_symbolic
 from .layers import CrossAttention, DilatedAttention, Retention, norm_layer
 
 _STNET_HAS_FLEX_ATTENTION = getattr(
@@ -217,7 +217,7 @@ class RetNet(nn.Module):
         state: Optional[dict] = None,
         mode: Optional[str] = None,
     ) -> Tuple[torch.Tensor, Optional[dict]]:
-        if is_meta_or_fake_tensor(x) and (not is_export_or_trace()):
+        if is_meta_or_fake_tensor(x) and (not is_symbolic()):
             raise RuntimeError("meta/fake tensor reached RetNet.forward")
         x = x.contiguous()
         if causal_mask is not None:

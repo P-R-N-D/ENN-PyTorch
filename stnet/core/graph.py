@@ -256,13 +256,11 @@ def is_tracing_or_exporting() -> bool:
 
 
 def is_export_or_trace() -> bool:
-    if torch.jit.is_tracing() or torch.jit.is_scripting():
-        return True
-    with suppress(Exception):
-        comp = getattr(torch, "compiler", None)
-        if comp is not None and bool(getattr(comp, "is_compiling", lambda: False)()):
-            return True
-    return False
+    return bool(is_tracing_or_exporting())
+
+
+def is_symbolic() -> bool:
+    return bool(is_tracing_or_exporting() or is_compiling())
 
 
 def canonicalize_compile_mode(mode: object | None) -> str:
@@ -325,7 +323,7 @@ def is_nvidia_te_available(model: torch.nn.Module) -> bool:
 
 def inference_mode(model: torch.nn.Module) -> AbstractContextManager[None]:
     if (
-        is_export_or_trace()
+        is_symbolic()
         or is_nvidia_te_available(model)
         or _is_compiled_for_inference(model)
         or _is_aot_autograd_enabled(model)
@@ -795,6 +793,13 @@ def from_checkpoint(model: nn.Module, *args: Any, step_total: int) -> None:
         setattr(inst, "_stnet_ckpt_pressure_min_bytes", 0)
 
 
+@torch_compiler_disable(reason="torch.utils.checkpoint", recursive=False)
+def _checkpoint_call(fn, *args, **kwargs):
+    if _torch_checkpoint is None:
+        return fn(*args, **kwargs)
+    return _torch_checkpoint(fn, *args, **kwargs)
+
+
 def coerce_checkpoint(
     fn: Callable[..., Any],
     *args: Any,
@@ -809,12 +814,34 @@ def coerce_checkpoint(
 
     use_reentrant = ckpt_kwargs.pop("use_reentrant", None)
     preserve_rng_state = ckpt_kwargs.pop("preserve_rng_state", None)
+    determinism_check = ckpt_kwargs.pop("determinism_check", None)
+
+    if use_reentrant is None:
+        use_reentrant = True
+    if preserve_rng_state is None:
+        preserve_rng_state = True
+
     ck_opts = {
         k: v
-        for k, v in [("use_reentrant", use_reentrant), ("preserve_rng_state", preserve_rng_state)]
+        for k, v in [
+            ("use_reentrant", use_reentrant),
+            ("preserve_rng_state", preserve_rng_state),
+            ("determinism_check", determinism_check),
+        ]
         if v is not None
     }
-    for opts in [ck_opts, {k: v for k, v in ck_opts.items() if k != "use_reentrant"}, {}]:
+    tried: set[tuple[tuple[str, object], ...]] = set()
+    for opts in [
+        ck_opts,
+        {k: v for k, v in ck_opts.items() if k != "determinism_check"},
+        {k: v for k, v in ck_opts.items() if k not in ("determinism_check", "use_reentrant")},
+        {k: v for k, v in ck_opts.items() if k != "use_reentrant"},
+        {},
+    ]:
+        key = tuple(sorted(opts.items()))
+        if key in tried:
+            continue
+        tried.add(key)
         with suppress(TypeError):
-            return _torch_checkpoint(fn, *args, **opts, **ckpt_kwargs)
-    return _torch_checkpoint(fn, *args, **ckpt_kwargs)
+            return _checkpoint_call(fn, *args, **opts, **ckpt_kwargs)
+    return _checkpoint_call(fn, *args, **ckpt_kwargs)

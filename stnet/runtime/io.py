@@ -68,7 +68,7 @@ def _filtered_warnings(sentences: Sequence[str] | None = None) -> Iterator[None]
         yield
         return
     guard = _WARNINGS_FILTER_LOCK
-    if sys.version_info >= (3, 14) and getattr(sys.flags, "context_aware_warnings", False):
+    if getattr(sys.flags, "context_aware_warnings", False):
         guard = contextlib.nullcontext()
     with guard:
         with warnings.catch_warnings():
@@ -264,8 +264,10 @@ def _extract_tensor(out: object) -> torch.Tensor:
 
 
 def _get_forward_parameters(model_cls: object) -> object:
-    if model_cls in _FORWARD_PARAM_CACHE:
-        return _FORWARD_PARAM_CACHE[model_cls]
+    with _FORWARD_PARAM_CACHE_LOCK:
+        cached = _FORWARD_PARAM_CACHE.get(model_cls)
+        if cached is not None:
+            return cached
     try:
         sig = inspect.signature(model_cls.forward)
     except Exception:
@@ -414,7 +416,8 @@ class _OnnxLayer:
         training = None
         with contextlib.suppress(Exception):
             training = torch.onnx.TrainingMode.EVAL
-        has_dynamo = "dynamo" in inspect.signature(torch.onnx.export).parameters
+        sig_keys = Exporter._export_sig_keys()
+        has_dynamo = "dynamo" in sig_keys
         exporters = [True, False] if prefer_dynamo and has_dynamo else [False]
         errors: list[str] = []
         seen: set[int] = set()
@@ -424,6 +427,7 @@ class _OnnxLayer:
             seen.add(opset)
             base_kw: dict[str, Any] = {
                 "export_params": True,
+                "f": str(onnx_path),
                 "opset_version": int(opset),
                 "do_constant_folding": True,
                 "keep_initializers_as_inputs": False,
@@ -434,7 +438,6 @@ class _OnnxLayer:
                 base_kw["training"] = training
             if dyn_axes:
                 base_kw["dynamic_axes"] = dyn_axes
-            sig_keys = inspect.signature(torch.onnx.export).parameters
             valid_kw = {k: v for k, v in base_kw.items() if k in sig_keys}
             for use_dyn in exporters:
                 try:
@@ -448,7 +451,9 @@ class _OnnxLayer:
                             call_kw["dynamic_shapes"] = dyn_shapes
                         if has_dynamo:
                             call_kw["dynamo"] = use_dyn
-                        torch.onnx.export(wrapper, sample, str(onnx_path), **call_kw)
+                        call_kw.pop("model", None)
+                        call_kw.pop("args", None)
+                        torch.onnx.export(model=wrapper, args=(sample,), **call_kw)
                     if simplify:
                         with contextlib.suppress(Exception):
                             import onnx
@@ -641,6 +646,22 @@ class Exporter:
             return sig
 
     @classmethod
+    def _export_sig_keys(cls) -> set[str]:
+        sig = cls._export_sig()
+        if sig is None:
+            return set()
+        try:
+            params = getattr(sig, "parameters", None)
+            if isinstance(params, dict):
+                return set(params.keys())
+        except Exception:
+            pass
+        try:
+            return set(sig.parameters.keys())  # type: ignore[attr-defined]
+        except Exception:
+            return set()
+
+    @classmethod
     def register(cls, name: str, exts: tuple[str, ...], impl: Format) -> None:
         cls._by_name[name] = impl
         for ext in exts:
@@ -702,7 +723,7 @@ class Ort(Format):
                 _coerce_onnx_path(dst, kwargs),
                 **_onnx_options(kwargs, target="onnx"),
             )
-            ort_path, optimized = Exporter.OrtLayer.to_ort(
+            ort_path, optimized = Exporter._OrtLayer.to_ort(
                 onnx_path,
                 dst,
                 optimization_level=str(kwargs.get("optimization_level", "all")),

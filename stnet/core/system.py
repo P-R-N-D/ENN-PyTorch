@@ -531,24 +531,68 @@ def empty_device_cache(
         if device is not None:
             target = device if isinstance(device, torch.device) else torch.device(str(device))
     dt = getattr(target, "type", None) if target is not None else None
-    match str(dt or "all"):
-        case "cuda" | "all":
+    dt_s = str(dt or "all")
+    if dt_s == "all":
+        if torch.cuda.is_available():
+            if target is not None and target.index is not None:
+                with torch.cuda.device(int(target.index)):
+                    _call(getattr(torch.cuda, "empty_cache", None))
+            else:
+                _call(getattr(torch.cuda, "empty_cache", None))
+        mps_mod = getattr(torch, "mps", None)
+        _call(getattr(mps_mod, "empty_cache", None))
+        xpu_mod = getattr(torch, "xpu", None)
+        if _call(getattr(xpu_mod, "empty_cache", None)) is None:
+            memory_mod = getattr(xpu_mod, "memory", None) if xpu_mod is not None else None
+            _call(getattr(memory_mod, "empty_cache", None))
+        return
+    match dt_s:
+        case "cuda":
             if torch.cuda.is_available():
                 if target is not None and target.index is not None:
                     with torch.cuda.device(int(target.index)):
                         _call(getattr(torch.cuda, "empty_cache", None))
                 else:
                     _call(getattr(torch.cuda, "empty_cache", None))
-        case "mps" | "all":
+        case "mps":
             mps_mod = getattr(torch, "mps", None)
             _call(getattr(mps_mod, "empty_cache", None))
-        case "xpu" | "all":
+        case "xpu":
             xpu_mod = getattr(torch, "xpu", None)
             if _call(getattr(xpu_mod, "empty_cache", None)) is None:
                 memory_mod = getattr(xpu_mod, "memory", None) if xpu_mod is not None else None
                 _call(getattr(memory_mod, "empty_cache", None))
         case _:
             pass
+
+
+def is_oom_error(exc: BaseException) -> bool:
+    with contextlib.suppress(Exception):
+        typ = getattr(torch, "OutOfMemoryError", None)
+        if isinstance(typ, type) and isinstance(exc, typ):
+            return True
+    for mod_name in ("cuda", "xpu", "mps"):
+        with contextlib.suppress(Exception):
+            mod = getattr(torch, mod_name, None)
+            typ = getattr(mod, "OutOfMemoryError", None) if mod is not None else None
+            if isinstance(typ, type) and isinstance(exc, typ):
+                return True
+    msg = str(exc).lower()
+    if not msg:
+        return False
+    patterns = (
+        "out of memory",
+        "cuda out of memory",
+        "cuda error: out of memory",
+        "hip out of memory",
+        "xpu out of memory",
+        "mps backend out of memory",
+        "not enough memory",
+        "failed to allocate memory",
+        "cublas_status_alloc_failed",
+        "cudnn_status_alloc_failed",
+    )
+    return any(p in msg for p in patterns)
 
 
 def _acc_mod(dt: str):

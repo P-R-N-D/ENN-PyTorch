@@ -13,8 +13,8 @@ import torch.nn.functional as F
 
 from ..core.casting import env_bool, env_int
 from ..core.compat import StochasticDepth
-from ..core.system import empty_device_cache
-from ..core.graph import coerce_checkpoint, torch_compiler_disable, is_export_or_trace
+from ..core.system import empty_device_cache, is_oom_error
+from ..core.graph import coerce_checkpoint, torch_compiler_disable, is_symbolic
 from .kernels import DotProductAttention, MultiHeadAttention, MultiScaleRetention
 
 _Norm = nn.LayerNorm
@@ -70,10 +70,16 @@ def _get_dilated_mask(
 ) -> torch.Tensor:
     if dilation < 1:
         raise ValueError(f"dilation must be >= 1, got {dilation}")
+    tracing = False
     try:
-        tracing = bool(torch.jit.is_tracing() or torch.jit.is_scripting())
+        tracing = bool(is_symbolic())
     except Exception:
         tracing = False
+    if not tracing:
+        try:
+            tracing = bool(torch.jit.is_tracing() or torch.jit.is_scripting())
+        except Exception:
+            tracing = False
     L = seq_len if tracing else int(seq_len)
     device = torch.device("cpu") if device is None else torch.device(device)
     i = torch.arange(L, device=device).unsqueeze(1).expand(L, L)
@@ -366,10 +372,7 @@ class Retention(nn.Module):
         if x_in.dim() != 3:
             raise ValueError(f"Retention(spatial) expects (B,L,D), got {tuple(x_in.shape)}")
         B, L, D = x_in.shape
-        try:
-            tracing = bool(torch.jit.is_tracing() or torch.jit.is_scripting())
-        except Exception:
-            tracing = False
+        tracing = bool(is_symbolic())
         if (not tracing) and L <= 0:
             out0 = x_in.new_zeros(x_in.shape)
             return out0.to(restore_dtype) if restore_dtype is not None else out0
@@ -520,22 +523,15 @@ class DilatedAttention(nn.Module):
         last = getattr(self, last_attr_name, None)
         if last is not None and last[0] == key:
             return last[1]
+        is_flex = str(last_attr_name).startswith("_flex")
+        cache_attr = "_flex_block_mask_cache" if is_flex else "_mask_cache"
+        lock_attr = "_flex_block_mask_cache_lock" if is_flex else "_mask_cache_lock"
         if cache is None:
             cache = OrderedDict()
-            setattr(
-                self,
-                "_mask_cache" if "mask_cache" in last_attr_name else "_flex_block_mask_cache",
-                cache,
-            )
+            setattr(self, cache_attr, cache)
         if lock is None:
             lock = threading.Lock()
-            setattr(
-                self,
-                "_mask_cache_lock"
-                if "mask_cache" in last_attr_name
-                else "_flex_block_mask_cache_lock",
-                lock,
-            )
+            setattr(self, lock_attr, lock)
 
         with lock:
             cached = cache.get(key)
@@ -584,10 +580,16 @@ class DilatedAttention(nn.Module):
         self._flex_block_mask_cache_last = None
 
     def _get_mask(self, L: int, device: torch.device) -> torch.Tensor:
+        tracing = False
         try:
-            tracing = bool(torch.jit.is_tracing() or torch.jit.is_scripting())
+            tracing = bool(is_symbolic())
         except Exception:
             tracing = False
+        if not tracing:
+            try:
+                tracing = bool(torch.jit.is_tracing() or torch.jit.is_scripting())
+            except Exception:
+                tracing = False
         if tracing:
             return _get_dilated_mask(
                 L,
@@ -730,19 +732,20 @@ class DilatedAttention(nn.Module):
         return attn(q, k, v, **kwargs)
 
     def _run_with_oom_retry(self, func, B, device):
-        group = B
-        last_oom = None
+        group = int(B)
+        last_oom: BaseException | None = None
         while group >= 1:
             try:
                 return func(group)
-            except RuntimeError as e:
-                if "out of memory" not in str(e):
+            except Exception as e:
+                if not is_oom_error(e):
                     raise
                 last_oom = e
-                if device.type == "cuda":
-                    with contextlib.suppress(Exception):
-                        empty_device_cache(device=device, do_gc=False, min_interval_s=0.0)
+                with contextlib.suppress(Exception):
+                    empty_device_cache(device=device, do_gc=False, min_interval_s=0.0)
                 group //= 2
+        if last_oom is None:
+            raise RuntimeError("OOM retry reached unreachable state (no exception captured)")
         raise last_oom
 
     def forward(
@@ -781,10 +784,16 @@ class DilatedAttention(nn.Module):
                 f"DilatedAttention expects a 3D tensor (B,L,D), got shape {tuple(x.shape)}"
             )
         B, L, D = x.shape
+        tracing = False
         try:
-            tracing = bool(torch.jit.is_tracing() or torch.jit.is_scripting())
+            tracing = bool(is_symbolic())
         except Exception:
             tracing = False
+        if not tracing:
+            try:
+                tracing = bool(torch.jit.is_tracing() or torch.jit.is_scripting())
+            except Exception:
+                tracing = False
         if (not tracing) and D != self.embed_dim:
             raise ValueError(f"x.shape[-1]={D} must match embed_dim={self.embed_dim}")
         want_weights = bool(need_weights)
@@ -808,7 +817,7 @@ class DilatedAttention(nn.Module):
             q_pad = kpm
             with contextlib.suppress(Exception):
                 q_pad = q_pad.contiguous()
-        use_flex = bool(_HAS_FLEX_ATTENTION and x.is_cuda and (not want_weights))
+        use_flex = bool(_HAS_FLEX_ATTENTION and x.is_cuda and (not want_weights) and (not tracing))
         if want_weights or tracing:
             L_k = L
             pad_len = 0
@@ -877,62 +886,87 @@ class DilatedAttention(nn.Module):
                     diagonal=1
                 )
                 causal_mask = causal_mask[None, None, :, :]
-            env_mb = int(env_int("STNET_ATTN_WEIGHTS_BATCH_MICROBATCH", 0))
-            est = int(B) * int(H) * int(L_q) * int(L_k)
-            if env_mb > 0:
-                group = max(1, min(int(B), int(env_mb)))
-            else:
-                if est >= 64 * 1024 * 1024:
-                    group = 1
-                elif est >= 32 * 1024 * 1024:
-                    group = 2
-                elif est >= 16 * 1024 * 1024:
-                    group = 4
-                elif est >= 8 * 1024 * 1024:
-                    group = 8
+            if tracing:
+                scores = torch.matmul(qh, kh.transpose(-2, -1)) * (1.0 / math.sqrt(float(Dh)))
+                scores = scores.to(torch.float32)
+                if causal_mask is not None:
+                    scores.masked_fill_(causal_mask, float("-inf"))
+                if base_mask_out is not None:
+                    scores.masked_fill_(base_mask_out, float("-inf"))
+                if key_mask is not None:
+                    scores.masked_fill_(key_mask, float("-inf"))
+                probs = _stable_softmax(scores)
+                if dropout_p > 0.0:
+                    probs = F.dropout(probs, p=dropout_p, training=True)
+                if avg_weights:
+                    attn_w = probs.mean(dim=1).to(dtype=qh.dtype)
                 else:
-                    group = int(B)
-                group = max(1, min(int(B), int(group)))
-            out_full = qh.new_empty((B, L_q, self.embed_dim))
-            if avg_weights:
-                attn_w_full = qh.new_empty((B, L_q, L_k))
+                    attn_w = probs.to(dtype=qh.dtype)
+                yg = torch.matmul(probs.to(dtype=vh.dtype), vh)
+                attn_out = self.out_proj(
+                    yg.transpose(1, 2).contiguous().view(B, L_q, self.embed_dim)
+                )
+                if q_pad is not None:
+                    attn_out = attn_out.masked_fill(q_pad.unsqueeze(-1), 0.0)
             else:
-                attn_w_full = qh.new_empty((B, H, L_q, L_k))
-
-            def _chunk_weights_fn(grp):
-                for b0 in range(0, B, grp):
-                    b1 = min(B, b0 + grp)
-                    scores = torch.matmul(qh[b0:b1], kh[b0:b1].transpose(-2, -1)) * (
-                        1.0 / math.sqrt(float(Dh))
-                    )
-                    scores = scores.to(torch.float32)
-                    if causal_mask is not None:
-                        scores.masked_fill_(causal_mask, float("-inf"))
-                    if base_mask_out is not None:
-                        scores.masked_fill_(base_mask_out, float("-inf"))
-                    if key_mask is not None:
-                        scores.masked_fill_(
-                            key_mask if key_mask.shape[0] == 1 else key_mask[b0:b1],
-                            float("-inf"),
-                        )
-                    probs = _stable_softmax(scores)
-                    if dropout_p > 0.0:
-                        probs = F.dropout(probs, p=dropout_p, training=True)
-                    if avg_weights:
-                        attn_w_full[b0:b1] = probs.mean(dim=1).to(dtype=qh.dtype)
+                env_mb = int(env_int("STNET_ATTN_WEIGHTS_BATCH_MICROBATCH", 0))
+                est = int(B) * int(H) * int(L_q) * int(L_k)
+                if env_mb > 0:
+                    group = max(1, min(int(B), int(env_mb)))
+                else:
+                    if est >= 64 * 1024 * 1024:
+                        group = 1
+                    elif est >= 32 * 1024 * 1024:
+                        group = 2
+                    elif est >= 16 * 1024 * 1024:
+                        group = 4
+                    elif est >= 8 * 1024 * 1024:
+                        group = 8
                     else:
-                        attn_w_full[b0:b1] = probs.to(dtype=qh.dtype)
-                    yg = torch.matmul(probs.to(dtype=vh.dtype), vh[b0:b1])
-                    attn_out_g = self.out_proj(
-                        yg.transpose(1, 2).contiguous().view((b1 - b0), L_q, self.embed_dim)
-                    )
-                    if q_pad is not None:
-                        attn_out_g = attn_out_g.masked_fill(q_pad[b0:b1].unsqueeze(-1), 0.0)
-                    out_full[b0:b1] = attn_out_g
-                return out_full
+                        group = int(B)
+                    group = max(1, min(int(B), int(group)))
+                out_full = qh.new_empty((B, L_q, self.embed_dim))
+                if avg_weights:
+                    attn_w_full = qh.new_empty((B, L_q, L_k))
+                else:
+                    attn_w_full = qh.new_empty((B, H, L_q, L_k))
 
-            attn_out = self._run_with_oom_retry(_chunk_weights_fn, group, x_k.device)
-            attn_w = attn_w_full
+                def _chunk_weights_fn(grp):
+                    for b0 in range(0, B, grp):
+                        b1 = min(B, b0 + grp)
+                        scores = torch.matmul(qh[b0:b1], kh[b0:b1].transpose(-2, -1)) * (
+                            1.0 / math.sqrt(float(Dh))
+                        )
+                        scores = scores.to(torch.float32)
+                        if causal_mask is not None:
+                            scores.masked_fill_(causal_mask, float("-inf"))
+                        if base_mask_out is not None:
+                            scores.masked_fill_(base_mask_out, float("-inf"))
+                        if key_mask is not None:
+                            scores.masked_fill_(
+                                key_mask if key_mask.shape[0] == 1 else key_mask[b0:b1],
+                                float("-inf"),
+                            )
+                        probs = _stable_softmax(scores)
+                        if dropout_p > 0.0:
+                            probs = F.dropout(probs, p=dropout_p, training=True)
+                        if avg_weights:
+                            attn_w_full[b0:b1] = probs.mean(dim=1).to(dtype=qh.dtype)
+                        else:
+                            attn_w_full[b0:b1] = probs.to(dtype=qh.dtype)
+                        yg = torch.matmul(probs.to(dtype=vh.dtype), vh[b0:b1])
+                        attn_out_g = self.out_proj(
+                            yg.transpose(1, 2).contiguous().view((b1 - b0), L_q, self.embed_dim)
+                        )
+                        if q_pad is not None:
+                            attn_out_g = attn_out_g.masked_fill(
+                                q_pad[b0:b1].unsqueeze(-1), 0.0
+                            )
+                        out_full[b0:b1] = attn_out_g
+                    return out_full
+
+                attn_out = self._run_with_oom_retry(_chunk_weights_fn, group, x_k.device)
+                attn_w = attn_w_full
         elif use_flex:
             win = int(self.window_size) if self.window_size is not None else None
             if L_k <= 2048:
@@ -963,15 +997,6 @@ class DilatedAttention(nn.Module):
 
             attn_out = self._run_with_oom_retry(_flex_fn, group, x_k.device)
         else:
-            qkv = self.qkv(x_k)
-            q, k, v = qkv.chunk(3, dim=-1)
-            H = self.num_heads
-            Dh = self.head_dim
-            qh = q[:, :L_q, :].reshape(B, L_q, H, Dh).transpose(1, 2)
-            kh = k.reshape(B, L_k, H, Dh).transpose(1, 2)
-            vh = v.reshape(B, L_k, H, Dh).transpose(1, 2)
-            training = bool(self.training)
-            dropout_p = float(self.dropout_p) if training else 0.0
             is_simple = (int(self.dilation) == 1) and (self.window_size is None)
             attn_out: Optional[torch.Tensor] = None
             if (
@@ -1057,36 +1082,55 @@ class DilatedAttention(nn.Module):
                             is_causal=False,
                         )
                     else:
-                        env_mb = int(env_int("STNET_SDPA_BATCH_MICROBATCH", 0))
-                        group = int(env_mb)
-                        if group <= 0:
-                            est = int(B) * int(L_q) * int(L_k)
-                            if est >= 64 * 1024 * 1024:
-                                group = 1
-                            elif est >= 16 * 1024 * 1024:
-                                group = 2
-                            elif est >= 4 * 1024 * 1024:
-                                group = 4
-                            else:
-                                group = int(B)
-                        group = max(1, min(int(B), int(group)))
-                        out_full = qh.new_empty((B, H, L_q, Dh))
+                        if tracing:
+                            y = self._call_dot_attn(
+                                qh,
+                                kh,
+                                vh,
+                                attn_mask=base4 | key_mask,
+                                dropout_p=dropout_p,
+                                is_causal=False,
+                            )
+                        else:
+                            env_mb = int(env_int("STNET_SDPA_BATCH_MICROBATCH", 0))
+                            group = int(env_mb)
+                            if group <= 0:
+                                est = int(B) * int(L_q) * int(L_k)
+                                if est >= 64 * 1024 * 1024:
+                                    group = 1
+                                elif est >= 16 * 1024 * 1024:
+                                    group = 2
+                                elif est >= 4 * 1024 * 1024:
+                                    group = 4
+                                else:
+                                    group = int(B)
+                            group = max(1, min(int(B), int(group)))
 
-                        def _sdpa_chunk_fn(grp):
-                            for b0 in range(0, B, grp):
-                                b1 = min(B, b0 + grp)
-                                y_g = self._call_dot_attn(
-                                    qh[b0:b1],
-                                    kh[b0:b1],
-                                    vh[b0:b1],
-                                    attn_mask=base4 | key_mask[b0:b1],
-                                    dropout_p=dropout_p,
-                                    is_causal=False,
-                                )
-                                out_full[b0:b1] = y_g
-                            return out_full
+                            def _sdpa_chunk_fn(grp):
+                                if grp >= B:
+                                    return self._call_dot_attn(
+                                        qh,
+                                        kh,
+                                        vh,
+                                        attn_mask=base4 | key_mask,
+                                        dropout_p=dropout_p,
+                                        is_causal=False,
+                                    )
+                                out_full = qh.new_empty((B, H, L_q, Dh))
+                                for b0 in range(0, B, grp):
+                                    b1 = min(B, b0 + grp)
+                                    y_g = self._call_dot_attn(
+                                        qh[b0:b1],
+                                        kh[b0:b1],
+                                        vh[b0:b1],
+                                        attn_mask=base4 | key_mask[b0:b1],
+                                        dropout_p=dropout_p,
+                                        is_causal=False,
+                                    )
+                                    out_full[b0:b1] = y_g
+                                return out_full
 
-                        y = self._run_with_oom_retry(_sdpa_chunk_fn, group, x_k.device)
+                            y = self._run_with_oom_retry(_sdpa_chunk_fn, group, x_k.device)
                 attn_out = self.out_proj(
                     y.transpose(1, 2).contiguous().view(B, L_q, self.embed_dim)
                 )
@@ -1119,21 +1163,13 @@ class DilatedAttention(nn.Module):
             and ffn_bytes >= int(64 * 1024 * 1024)
         )
         if do_ckpt_ffn:
-            try:
-                x_out = coerce_checkpoint(
-                    self.ffn,
-                    x_out,
-                    use_reentrant=True,
-                    preserve_rng_state=True,
-                    determinism_check="none",
-                )
-            except TypeError:
-                x_out = coerce_checkpoint(
-                    self.ffn,
-                    x_out,
-                    use_reentrant=True,
-                    preserve_rng_state=True,
-                )
+            x_out = coerce_checkpoint(
+                self.ffn,
+                x_out,
+                use_reentrant=True,
+                preserve_rng_state=True,
+                determinism_check="none",
+            )
         else:
             x_out = self.ffn(x_out)
         x_out = res2 + self.dropout(x_out)
@@ -1322,34 +1358,8 @@ class SigmoidGate(nn.Module):
         edge_low_sum: torch.Tensor,
         edge_high_sum: torch.Tensor,
     ) -> None:
-        try:
-            dyn = getattr(torch, "_dynamo", None)
-            if dyn is not None:
-                is_comp = getattr(dyn, "is_compiling", None)
-                if callable(is_comp) and bool(is_comp()):
-                    return
-        except Exception:
-            pass
-        try:
-            comp = getattr(torch, "compiler", None)
-            is_exp = getattr(comp, "is_exporting", None)
-            if callable(is_exp) and bool(is_exp()):
-                return
-        except Exception:
-            pass
-        try:
-            if getattr(torch, "jit", None) is not None:
-                if torch.jit.is_tracing() or torch.jit.is_scripting():
-                    return
-        except Exception:
-            pass
-        try:
-            onnx = getattr(torch, "onnx", None)
-            is_onnx = getattr(onnx, "is_in_onnx_export", None)
-            if callable(is_onnx) and bool(is_onnx()):
-                return
-        except Exception:
-            pass
+        if is_symbolic():
+            return
         with torch.no_grad():
             lock = getattr(self, "_fb_lock", None)
             if lock is None:
@@ -1469,7 +1479,8 @@ class SigmoidGate(nn.Module):
         b = base.detach() if self.detach_inputs else base
         r = residue.detach() if self.detach_inputs else residue
         b32, r32 = b.to(dtype=torch.float32), r.to(dtype=torch.float32)
-        B, D = int(b32.shape[0]), int(b32.shape[1])
+        B = b32.shape[0]
+        D = b32.shape[1]
         event_shape_t = tuple(int(v) for v in self.event_shape)
         tile_shape_t = tuple(int(v) for v in self._normalize_tile_shape(self.event_shape))
         grid_shape = tuple(
@@ -1666,20 +1677,32 @@ class SigmoidGate(nn.Module):
         x = feats[0] if len(feats) == 1 else torch.cat(feats, dim=1)
         global_logit = self.net(x).squeeze(-1)
         use_tile_nd = False
+        symbolic = False
+        try:
+            symbolic = bool(is_symbolic())
+        except Exception:
+            symbolic = False
         if (
             self.tile_net is not None
             and base is not None
             and residue is not None
             and base.dim() == 2
             and residue.dim() == 2
-            and int(base.shape[0]) == int(residue.shape[0])
             and len(getattr(self, "tile_shape", ()) or ()) > 0
             and len(getattr(self, "event_shape", ()) or ()) > 0
         ):
             try:
-                use_tile_nd = bool(self._normalize_tile_shape(self.event_shape)) and int(
+                tile_ok = bool(self._normalize_tile_shape(self.event_shape)) and int(
                     self._prod_int(self.event_shape)
-                ) == int(base.shape[1])
+                ) > 0
+                if not tile_ok:
+                    use_tile_nd = False
+                elif symbolic:
+                    use_tile_nd = True
+                else:
+                    use_tile_nd = int(base.shape[0]) == int(residue.shape[0]) and int(
+                        self._prod_int(self.event_shape)
+                    ) == int(base.shape[1])
             except Exception:
                 use_tile_nd = False
         if use_tile_nd:
@@ -1877,7 +1900,7 @@ class Scaler(nn.Module):
         self._update_stats_impl(y, self.y_mean, self.y_std)
 
     def _normalize_impl(self, t, mean_buf, std_buf, cache_key_prefix):
-        compiling = is_export_or_trace()
+        compiling = is_symbolic()
         if not compiling:
             if t.numel() == 0:
                 return t
@@ -1921,7 +1944,7 @@ class Scaler(nn.Module):
         return self._normalize_impl(x, self.x_mean, self.x_std, "x")
 
     def _denormalize_impl(self, t, mean_buf, std_buf, cache_key_prefix):
-        compiling = is_export_or_trace()
+        compiling = is_symbolic()
         if not compiling:
             if t.numel() == 0:
                 return t
@@ -2257,6 +2280,23 @@ class Recorder(nn.Module):
         self._global_step: int = 0
         self._records: List[Dict[str, Any]] = []
         self.max_history_steps: int = 0
+
+    def _apply(self, fn):
+        out = super()._apply(fn)
+        with torch.no_grad():
+            for name, buf in list(getattr(self, "_buffers", {}).items()):
+                if not isinstance(buf, torch.Tensor):
+                    continue
+                if buf.is_floating_point() and buf.dtype is not torch.float64:
+                    with contextlib.suppress(Exception):
+                        self._buffers[name] = buf.to(dtype=torch.float64)
+                elif (
+                    buf.dtype in (torch.int8, torch.int16, torch.int32, torch.int64, torch.uint8)
+                    and buf.dtype is not torch.int64
+                ):
+                    with contextlib.suppress(Exception):
+                        self._buffers[name] = buf.to(dtype=torch.int64)
+        return out
 
     @torch.no_grad()
     def start_session(self, start_posix: float, timezone: Optional[str] = None) -> None:
