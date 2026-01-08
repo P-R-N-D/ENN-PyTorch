@@ -6,6 +6,7 @@ import copy
 import inspect
 import json
 import logging
+import math
 import threading
 from collections import OrderedDict
 from functools import lru_cache
@@ -619,17 +620,53 @@ class AdamW:
                 and getattr(meta, "scale_is_integral", None) is not False
             )
             if use_int:
-                target_bits = (
-                    8
-                    if quant_bits == 8 or (not quant_bits and Dataset.is_int8_supported(dev)[0])
-                    else 4
-                )
-                cls_name = f"AdamW{target_bits}bit"
-                for pkg in ("torchao.optim", "torchao.prototype.low_bit_optim"):
-                    selected_opt = _attempt_load(pkg, cls_name, attempts)
-                    if selected_opt:
-                        selected_name = f"torchao.{cls_name}"
-                        break
+                def _scale_safe_int4(meta: Any) -> bool:
+                    if not getattr(meta, "has_scale", False):
+                        return True
+                    if getattr(meta, "has_nonfinite", False):
+                        return False
+                    if getattr(meta, "scale_is_integral", None) is False:
+                        return False
+                    if (mn := getattr(meta, "scale_min_value", None)) is not None and (
+                        mx := getattr(meta, "scale_max_value", None)
+                    ) is not None:
+                        try:
+                            mn_f, mx_f = float(mn), float(mx)
+                        except Exception:
+                            return False
+                        if not (math.isfinite(mn_f) and math.isfinite(mx_f)):
+                            return False
+                        return mn_f >= -8.0 and mx_f <= 7.0
+                    max_abs = getattr(meta, "scale_max_abs", None)
+                    if max_abs is None:
+                        return True
+                    try:
+                        max_abs_f = float(abs(max_abs))
+                    except Exception:
+                        return False
+                    return math.isfinite(max_abs_f) and max_abs_f <= 7.0
+
+                safe_int8 = not getattr(meta, "has_scale", False) or is_scale_safe(torch.int8, meta)
+                safe_int4 = _scale_safe_int4(meta)
+                target_bits: Optional[int] = None
+                if quant_bits == 8:
+                    if safe_int8:
+                        target_bits = 8
+                elif quant_bits == 4:
+                    if safe_int4:
+                        target_bits = 4
+                else:
+                    if Dataset.is_int8_supported(dev)[0] and safe_int8:
+                        target_bits = 8
+                    elif safe_int4:
+                        target_bits = 4
+                if target_bits is not None:
+                    cls_name = f"AdamW{target_bits}bit"
+                    for pkg in ("torchao.optim", "torchao.prototype.low_bit_optim"):
+                        selected_opt = _attempt_load(pkg, cls_name, attempts)
+                        if selected_opt:
+                            selected_name = f"torchao.{cls_name}"
+                            break
 
         if not selected_opt:
             flags = optimal_optimizer_params(dev, use_foreach=None, use_fused=False)
