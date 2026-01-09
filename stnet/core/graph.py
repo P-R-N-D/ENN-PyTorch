@@ -50,25 +50,6 @@ _GRAPH_BREAK_FN: Callable[[], None] | None = None
 _GRAPH_BREAK_LOCK = threading.Lock()
 
 
-@torch_compiler_disable(reason="torch.utils.checkpoint", recursive=False)
-def _checkpoint_call(
-    fn: Callable[..., Any], *args: Any, **kwargs: Any
-) -> Callable[..., Any]:
-    if _torch_checkpoint is None:
-        return fn(*args, **kwargs)
-    tl = _CKPT_TL
-
-    def _state(*a: Any, **k: Any) -> Callable[..., Any]:
-        depth = int(getattr(tl, "depth", 0) or 0)
-        setattr(tl, "depth", depth + 1)
-        try:
-            return fn(*a, **k)
-        finally:
-            setattr(tl, "depth", depth)
-
-    return _torch_checkpoint(_state, *args, **kwargs)
-
-
 def _is_compiled_for_inference(model: torch.nn.Module) -> bool:
     cached = getattr(model, "__stnet_cached_is_compiled_for_inference__", None)
     if isinstance(cached, bool):
@@ -878,5 +859,22 @@ def coerce_checkpoint(
             continue
         tried.add(key)
         with suppress(TypeError):
-            return _checkpoint_call(fn, *args, **opts, **ckpt_kwargs)
-    return _checkpoint_call(fn, *args, **ckpt_kwargs)
+            return checkpoint(fn, *args, **opts, **ckpt_kwargs)
+    return checkpoint(fn, *args, **ckpt_kwargs)
+
+
+@torch_compiler_disable(reason="torch.utils.checkpoint", recursive=False)
+def checkpoint(fn: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
+    if _torch_checkpoint is None:
+        return fn(*args, **kwargs)
+    tl = _CKPT_TL
+
+    def _state(*a: Any, **k: Any) -> Any:
+        depth = int(getattr(tl, "depth", 0) or 0)
+        setattr(tl, "depth", depth + 1)
+        try:
+            return fn(*a, **k)
+        finally:
+            setattr(tl, "depth", depth)
+
+    return _torch_checkpoint(_state, *args, **kwargs)
