@@ -111,7 +111,7 @@ from .losses import (
     StudentsTLoss,
     TiledLoss,
 )
-from .optimizers import SWALR, AdamW, stochastic_weight_average
+from .optimizers import AdamW, CPUShadowEMA, CPUShadowSWA
 from ..data.nodes import Storage
 from ..data.pipeline import Dataset, get_row
 from ..data.schemas import read_json
@@ -2182,6 +2182,7 @@ def epochs(
     scheduler_step_per_batch: bool = True,
     swa_helper: object | None = None,
     swa_start_epoch: int = 0,
+    ema_helper: object | None = None,
     buffers_dtype: torch.dtype | None = None,
     dataset: object | None = None,
     **kwargs: Any,
@@ -2494,7 +2495,6 @@ def epochs(
         else None
     )
     scheduler_step_per_batch = bool(scheduler_step_per_batch)
-    swa_enabled = swa_helper is not None
     swa_start_epoch = max(0, int(swa_start_epoch))
     prev_io_time = 0.0
     prev_comp_time = 0.0
@@ -2702,6 +2702,18 @@ def epochs(
                                         scaler.step(optimizer)
                                         scaler.update()
                                         optimizer.zero_grad(set_to_none=True)
+
+                                        if ema_helper is not None:
+                                            ema_target = (
+                                                model.module if hasattr(model, "module") else model
+                                            )
+                                            ema_helper.update(ema_target)
+
+                                        if swa_helper is not None and epoch_idx >= swa_start_epoch:
+                                            swa_target = (
+                                                model.module if hasattr(model, "module") else model
+                                            )
+                                            swa_helper.update(swa_target)
 
                                         target_for_step = (
                                             model.module if hasattr(model, "module") else model
@@ -3203,11 +3215,6 @@ def epochs(
                 io_bytes = float(stats_cpu[3].item())
                 train_samples_epoch = float(stats_cpu[4].item())
                 distributed_barrier(device)
-            if swa_enabled and epoch_idx >= swa_start_epoch:
-                try:
-                    swa_helper.update_weight()
-                except Exception:
-                    pass
             if not scheduler_step_per_batch:
                 try:
                     sched.step()
@@ -3689,6 +3696,7 @@ def infer(
                     td_cg_x_inner_shape = None
 
             row_ids_buf = None
+            pad_buf = None
             for batch in data_loader:
                 if batch is None:
                     if status_bar is not None:
@@ -3787,7 +3795,15 @@ def infer(
                                 Xi_pad[n_i:].copy_(Xi[-1:].expand(pad_n, *tuple(Xi.shape[1:])))
                                 Xi_run = Xi_pad
                             else:
-                                Xi_pad = Xi.new_empty((int(mb),) + tuple(Xi.shape[1:]))
+                                want_shape = (int(mb),) + tuple(Xi.shape[1:])
+                                if (
+                                    pad_buf is None
+                                    or pad_buf.shape != want_shape
+                                    or pad_buf.dtype != Xi.dtype
+                                    or pad_buf.device != Xi.device
+                                ):
+                                    pad_buf = Xi.new_empty(want_shape)
+                                Xi_pad = pad_buf
                                 Xi_pad[:n_i].copy_(Xi)
                                 Xi_pad[n_i:].copy_(Xi[-1:].expand(pad_n, *tuple(Xi.shape[1:])))
                                 Xi_run = Xi_pad
@@ -4292,43 +4308,33 @@ def process(*args: Any, **kwargs: Any) -> object:
             )
             sched = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
             scheduler_step_per_batch = True
+            tracked_module = model.module if hasattr(model, "module") else model
+            ema_helper = None
             swa_helper = None
             swa_start_epoch = total_epochs
-            enable_swa_cfg = bool(getattr(ops, "swa_enabled", False))
-            start_epoch_cfg = getattr(ops, "swa_start_epoch", None)
-            enable_swa = (enable_swa_cfg or start_epoch_cfg is not None) and SWALR is not None
-            if enable_swa:
-                tracked_module = model.module if hasattr(model, "module") else model
-                use_buffers = True
-                try:
-                    swa_helper = stochastic_weight_average(tracked_module, use_buffers=use_buffers)
-                except Exception:
-                    swa_helper = None
-                if swa_helper is not None:
-                    scheduler_step_per_batch = False
-                    if start_epoch_cfg is not None:
-                        try:
-                            swa_start_epoch = max(0, int(start_epoch_cfg))
-                        except (TypeError, ValueError):
-                            swa_start_epoch = max(1, total_epochs // 2)
-                    else:
-                        swa_start_epoch = max(1, total_epochs // 2)
-                    eta_min = float(getattr(ops, "eta_min", 0.0) or 0.0)
-                    base_lr = float(ops.base_lr)
-                    default_swa_lr = max(1e-08, eta_min if eta_min > 0.0 else 0.1 * base_lr)
-                    swa_lr = default_swa_lr
-                    anneal_epochs = max(1, max(1, total_epochs // 10))
-                    try:
-                        sched = SWALR(
-                            optimizer,
-                            swa_lr=swa_lr,
-                            anneal_epochs=anneal_epochs,
-                            anneal_strategy="cos",
-                        )
-                    except Exception:
-                        scheduler_step_per_batch = True
-                        swa_helper = None
-                        swa_start_epoch = total_epochs
+            use_swa = False
+            try:
+                import torch.nn as nn
+
+                has_bn = any(
+                    isinstance(m, nn.modules.batchnorm._BatchNorm)
+                    for m in tracked_module.modules()
+                )
+                fixed_accum = 2 if getattr(device, "type", None) == "cpu" else 4
+                approx_optim_steps = max(
+                    1,
+                    (int(total_epochs) * max(1, int(train_steps)))
+                    // max(1, int(fixed_accum)),
+                )
+                use_swa = (not has_bn) and (int(total_epochs) >= 4) and (approx_optim_steps >= 200)
+            except Exception:
+                use_swa = False
+
+            if use_swa:
+                swa_start_epoch = max(1, int(total_epochs) // 2)
+                swa_helper = CPUShadowSWA(tracked_module, metadata=metadata)
+            else:
+                ema_helper = CPUShadowEMA(tracked_module, decay=0.9999, metadata=metadata)
             amp_dtype = getattr(precision, "amp_float", None)
             compute_dtype = amp_dtype or param_dtype
             scaler = torch.amp.GradScaler(
@@ -4357,6 +4363,7 @@ def process(*args: Any, **kwargs: Any) -> object:
                 total_epochs=total_epochs,
                 scheduler_step_per_batch=scheduler_step_per_batch,
                 swa_helper=swa_helper,
+                ema_helper=ema_helper,
                 swa_start_epoch=swa_start_epoch,
                 buffers_dtype=amp_buffers_dtype,
                 dataset=metadata,
@@ -4388,6 +4395,30 @@ def process(*args: Any, **kwargs: Any) -> object:
                         "val": (raw_val_loader.state_dict() if raw_val_loader is not None else {}),
                     }
                     Storage.write_json(get_loader_state(ops.ckpt_dir or ""), _dl, indent=2)
+                avg_tag = None
+                avg_helper = None
+                if swa_helper is not None:
+                    avg_tag = "swa"
+                    avg_helper = swa_helper
+                elif ema_helper is not None:
+                    avg_tag = "ema"
+                    avg_helper = ema_helper
+                if avg_tag is not None and avg_helper is not None:
+                    shadow = getattr(avg_helper, "shadow", None)
+                    if isinstance(shadow, dict) and shadow:
+                        avg_fallback = dict(model_fallback)
+                        for k, v in shadow.items():
+                            if not torch.is_tensor(v):
+                                continue
+                            if k in avg_fallback:
+                                avg_fallback[k] = v
+                            else:
+                                mk = f"module.{k}"
+                                if mk in avg_fallback:
+                                    avg_fallback[mk] = v
+                        _coerce_dcp_keys(avg_fallback)
+                        torch.save(avg_fallback, os.path.join(ops.ckpt_dir, f"model_{avg_tag}.pt"))
+                        torch.save(avg_fallback, os.path.join(ops.ckpt_dir, "model_avg.pt"))
         torch.distributed.barrier(
             device_ids=[local_rank] if device.type in ("cuda", "xpu") else None
         )

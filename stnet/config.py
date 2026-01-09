@@ -739,9 +739,6 @@ class RuntimeConfig:
     loss_tile_size: Optional[int] = None
     loss_mask_mode: str = "none"
     loss_mask_value: Optional[float] = None
-    swa_enabled: bool = False
-    swa_start_epoch: Optional[int] = None
-    swa_update_batch_norm: bool = False
     model_ckpt_dir: Optional[str] = None
     keys: Optional[Sequence[Any]] = None
     loss_skew: bool = True
@@ -757,9 +754,6 @@ class RuntimeConfig:
         "loss_tile_size",
         "loss_mask_mode",
         "loss_mask_value",
-        "swa_enabled",
-        "swa_start_epoch",
-        "swa_update_batch_norm",
         "loss_skew",
     )
     PRED_POS_ORDER: ClassVar[Tuple[str, ...]] = ("seed",)
@@ -784,9 +778,6 @@ class RuntimeConfig:
             "loss_tile_size",
             "loss_mask_mode",
             "loss_mask_value",
-            "swa_enabled",
-            "swa_start_epoch",
-            "swa_update_batch_norm",
             "loss_skew",
         }
     )
@@ -903,14 +894,6 @@ class RuntimeConfig:
                 loss_mask_value=_get_val("loss_mask_value", float)
                 if data.get("loss_mask_value")
                 else None,
-                swa_enabled=_coerce_bool(data.get("swa_enabled", False), name="swa_enabled"),
-                swa_start_epoch=_get_val("swa_start_epoch", int, 0)
-                if data.get("swa_start_epoch")
-                else None,
-                swa_update_batch_norm=_coerce_bool(
-                    data.get("swa_update_batch_norm", False),
-                    name="swa_update_batch_norm",
-                ),
                 loss_skew=_coerce_bool(data.get("loss_skew", True), name="loss_skew"),
             )
         for k in ("sources", "ckpt_dir"):

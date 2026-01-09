@@ -711,7 +711,7 @@ class Exporter:
             cls.register("coreml", (".mlmodel",), CoreML())
             cls.register("litert", (".tflite",), LiteRT())
             cls.register("pt2", (".pt2", ".export"), TorchExport())
-            cls.register("aoti", (".aoti",), TorchAot())
+            cls.register("aoti", (".aoti",), TorchAOT())
             cls.register("executorch", (".pte",), ExecuTorch())
             cls.register("tensorflow", (".savedmodel", ".pb", ".tf"), TensorFlow())
             cls._defaults_registered = True
@@ -1162,7 +1162,7 @@ class TorchExport(Format):
             raise
 
 
-class TorchAot(Format):
+class TorchAOT(Format):
     name = "aoti"
 
     def save(
@@ -1178,12 +1178,12 @@ class TorchAot(Format):
 
             torch_export = torch.export.export
         except Exception as exc:
-            raise ImportError("torch.export is required for TorchAot export (PyTorch 2.0+).") from exc
+            raise ImportError("torch.export is required for TorchAOT export (PyTorch 2.0+).") from exc
         try:
             from torch._inductor import aoti_compile_and_package
         except Exception as exc:
             raise ImportError(
-                "torch._inductor (TorchAot) is required for AOT compilation. "
+                "torch._inductor (TorchAOT) is required for AOT compilation. "
                 "Install a PyTorch build with torch.compile/TorchInductor support."
             ) from exc
 
@@ -1229,7 +1229,7 @@ class TorchAot(Format):
                 strict_supported = "strict" in export_kw
                 if strict_supported and export_kw.get("strict", True):
                     warnings.warn(
-                        "torch.export strict=True failed; retrying strict=False for TorchAot export",
+                        "torch.export strict=True failed; retrying strict=False for TorchAOT export",
                         RuntimeWarning,
                     )
                     export_kw["strict"] = False
