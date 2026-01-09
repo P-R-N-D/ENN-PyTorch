@@ -20,7 +20,7 @@ def export_and_validate(
 ) -> Dict[str, Any]:
     out_dir.mkdir(exist_ok=True)
     targets = {
-        "torchscript": out_dir / "model.ts",
+        "pt2": out_dir / "model.pt2",
         "onnx": out_dir / "model.onnx",
         "executorch": out_dir / "model.pte",
         "nnef": out_dir / "model.nnef",
@@ -34,16 +34,13 @@ def export_and_validate(
             if fmt is None:
                 raise RuntimeError("no exporter registered")
             save_kwargs: Dict[str, Any] = {"sample_input": sample}
-            if name == "torchscript":
-                # TorchScript scripting dislikes **kwargs in Model.forward; trace is safer here.
-                save_kwargs["method"] = "trace"
             out = fmt.save(model, path, **save_kwargs)
             results[name] = {
                 "status": "ok",
                 "path": str(out if out is not None else path),
             }
         except ImportError as exc:
-            if name in ("torchscript", "onnx"):
+            if name in ("pt2", "onnx"):
                 results[name] = {"status": "error", "error": repr(exc)}
             else:
                 results[name] = {
@@ -54,22 +51,21 @@ def export_and_validate(
         except Exception as exc:  # pragma: no cover - diagnostic output
             results[name] = {"status": "error", "error": repr(exc)}
 
-    # TorchScript validation
     validations: Dict[str, Any] = {}
-    ts_path = targets["torchscript"]
-    if ts_path.exists():
+    pt2_path = targets["pt2"]
+    if pt2_path.exists():
         try:
-            ts_model = torch.jit.load(str(ts_path))
+            ep = torch.export.load(str(pt2_path))
             with torch.no_grad():
-                ts_out = ts_model(sample)
+                pt2_out = ep.module()(sample)
             if hasattr(model, "forward_export"):
                 torch_out = model.forward_export(sample)
             else:
                 torch_out = model(sample, return_loss=False)
-            ts_mae = float(torch.mean(torch.abs(ts_out - torch_out)).item())
-            validations["torchscript_mae"] = ts_mae
+            pt2_mae = float(torch.mean(torch.abs(pt2_out - torch_out)).item())
+            validations["pt2_mae"] = pt2_mae
         except Exception as exc:
-            validations["torchscript_error"] = repr(exc)
+            validations["pt2_error"] = repr(exc)
 
     onnx_path = targets["onnx"]
     if onnx_path.exists():

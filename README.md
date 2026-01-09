@@ -31,7 +31,7 @@ This repository also includes a worked example notebook (`notebook.ipynb`) and a
 - **Templated configurations** (`stnet.config`): dataclass configs with coercion/validation and string canonicalizers for modeling type, normalization, and compile options.
 - **Neural network stacks** (`stnet.nn`): spatio-temporal TokenFuser/TokenCollector blocks, attention variants, scaler + recorder modules, AMP negotiation guard band (`ModelConfig.safety_margin_pow2`).
 - **Data pipeline** (`stnet.data`): `torchdata.nodes`-driven memmap pipeline with TensorDict support, prefetch/pin/pool options, and scale-aware dataset metadata.
-- **Runnable tasks** (`stnet.runtime`): thread/NUMA tuning, free-threaded/no-GIL optimizations, mixed-precision helpers, history recorder, and OOM recovery hooks. ONNX/ORT/TorchScript out of the box; optional platform-dependent backends (TensorRT/CoreML/ExecuTorch/onnx-tf) via extras. elastic launch wiring and group setup for multi-process CPU/GPU runs.
+- **Runnable tasks** (`stnet.runtime`): thread/NUMA tuning, free-threaded/no-GIL optimizations, mixed-precision helpers, history recorder, and OOM recovery hooks. ONNX/ORT/torch.export (PT2) out of the box; optional platform-dependent backends (TensorRT/CoreML/ExecuTorch/onnx-tf) via extras. elastic launch wiring and group setup for multi-process CPU/GPU runs.
 - **Losses/optimizers/profiling** (`stnet.core`): Student’s t losses, SWA helpers, FLOP/IO timing.
 
 ## Installation
@@ -194,7 +194,7 @@ stnet/
     schemas.py            # key resolution, JSON helpers, underflow handling
   runtime/
     __init__.py
-    io.py                 # exporters (ONNX/ORT/TorchScript/etc.), checkpoint save/load
+    io.py                 # exporters (ONNX/ORT/torch.export (PT2)/etc.), checkpoint save/load
     main.py               # training loop, predict path, elastic worker entrypoint
     losses.py             # Student’s t, regression losses, mask utils
     optimizers.py         # SGD/AdamW wrappers, SWA helper

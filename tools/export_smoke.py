@@ -104,29 +104,20 @@ def _ort_run(path: Path, x: torch.Tensor, prefer_cuda: bool) -> bool:
         return False
 
 
-def _torchscript_run(path: Path, x: torch.Tensor, device: torch.device) -> bool:
+def _pt2_run(path: Path, x: torch.Tensor, device: torch.device) -> bool:
     try:
-        m = torch.jit.load(str(path), map_location="cpu")
+        ep = torch.export.load(str(path))
     except Exception as exc:
-        print(f"[fail] torchscript load: {type(exc).__name__}: {exc}")
+        print(f"[fail] pt2 load: {type(exc).__name__}: {exc}")
         return False
+    try:
+        m = ep.module()
+    except Exception:
+        m = ep
     m.eval()
     x_run = x.detach()
     try:
-        if device.type != "cpu":
-            m.to(device)
-    except Exception:
-        pass
-    try:
-        p0 = None
-        try:
-            p0 = next(m.parameters(), None)
-        except Exception:
-            p0 = None
-        if isinstance(p0, torch.Tensor):
-            x_run = x_run.to(device=p0.device, dtype=p0.dtype)
-        else:
-            x_run = x_run.to(device=device)
+        x_run = x_run.to(device=device)
     except Exception:
         x_run = x_run.to("cpu", dtype=torch.float32)
     try:
@@ -134,10 +125,39 @@ def _torchscript_run(path: Path, x: torch.Tensor, device: torch.device) -> bool:
             y = m(x_run)
         y0 = y[0] if isinstance(y, (tuple, list)) and y else y
         shape = tuple(y0.shape) if isinstance(y0, torch.Tensor) else type(y0)
-        print(f"[ok] torchscript run: output={shape}")
+        print(f"[ok] pt2 run: output={shape}")
         return True
     except Exception as exc:
-        print(f"[fail] torchscript run: {type(exc).__name__}: {exc}")
+        print(f"[fail] pt2 run: {type(exc).__name__}: {exc}")
+        return False
+
+
+def _aoti_run(path: Path, x: torch.Tensor, device: torch.device) -> bool:
+    try:
+        from torch._inductor import aoti_load_package
+    except Exception as exc:
+        print(f"[skip] aoti run: torch._inductor not available ({type(exc).__name__}: {exc})")
+        return True
+    try:
+        dev_index = int(device.index or 0) if device.type == "cuda" else -1
+        m = aoti_load_package(str(path), device_index=dev_index)
+    except Exception as exc:
+        print(f"[fail] aoti load: {type(exc).__name__}: {exc}")
+        return False
+    x_run = x.detach()
+    try:
+        x_run = x_run.to(device=device)
+    except Exception:
+        x_run = x_run.to("cpu", dtype=torch.float32)
+    try:
+        with torch.no_grad():
+            y = m(x_run)
+        y0 = y[0] if isinstance(y, (tuple, list)) and y else y
+        shape = tuple(y0.shape) if isinstance(y0, torch.Tensor) else type(y0)
+        print(f"[ok] aoti run: output={shape}")
+        return True
+    except Exception as exc:
+        print(f"[fail] aoti run: {type(exc).__name__}: {exc}")
         return False
 
 
@@ -153,8 +173,8 @@ def main() -> int:
     ap.add_argument(
         "--formats",
         type=str,
-        default="onnx,torchscript",
-        help="comma-separated: onnx,ort,torchscript,executorch,litert,coreml,tensorrt,nnef,tensorflow",
+        default="onnx,pt2",
+        help="comma-separated: onnx,ort,pt2,aoti,executorch,litert,coreml,tensorrt,nnef,tensorflow",
     )
     ap.add_argument(
         "--force-torch-msr",
@@ -237,7 +257,8 @@ def main() -> int:
         ext = {
             "onnx": ".onnx",
             "ort": ".ort",
-            "torchscript": ".ts",
+            "pt2": ".pt2",
+            "aoti": ".aoti",
             "executorch": ".pte",
             "litert": ".tflite",
             "tensorflow": ".savedmodel",
@@ -272,8 +293,10 @@ def main() -> int:
                 ok = bool(_ort_run(dst, x, prefer_cuda=prefer_cuda)) and ok
             elif fmt_name == "ort":
                 ok = bool(_ort_run(dst, x, prefer_cuda=prefer_cuda)) and ok
-            elif fmt_name == "torchscript":
-                ok = bool(_torchscript_run(dst, x, device=device)) and ok
+            elif fmt_name == "pt2":
+                ok = bool(_pt2_run(dst, x, device=device)) and ok
+            elif fmt_name == "aoti":
+                ok = bool(_aoti_run(dst, x, device=device)) and ok
     return 0 if ok else 2
 
 
