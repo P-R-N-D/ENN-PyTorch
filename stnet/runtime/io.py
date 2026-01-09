@@ -710,7 +710,8 @@ class Exporter:
             cls.register("nnef", (".nnef",), Nnef())
             cls.register("coreml", (".mlmodel",), CoreML())
             cls.register("litert", (".tflite",), LiteRT())
-            cls.register("torchscript", (".ts", ".torchscript"), TorchScript())
+            cls.register("pt2", (".pt2", ".export"), TorchExport())
+            cls.register("aoti", (".aoti",), TorchAot())
             cls.register("executorch", (".pte",), ExecuTorch())
             cls.register("tensorflow", (".savedmodel", ".pb", ".tf"), TensorFlow())
             cls._defaults_registered = True
@@ -1073,8 +1074,8 @@ class LiteRT(Format):
         return (dst,)
 
 
-class TorchScript(Format):
-    name = "torchscript"
+class TorchExport(Format):
+    name = "pt2"
 
     def save(
         self,
@@ -1083,55 +1084,190 @@ class TorchScript(Format):
         *args: Any,
         **kwargs: Any,
     ) -> object:
-        method = str(kwargs.get("method", "script")).lower()
+        del args
+        try:
+            import torch.export
+
+            torch_save = torch.export.save
+        except Exception as exc:
+            raise ImportError("torch.export is required for PT2 export (PyTorch 2.0+).") from exc
+
         with _onnx_model(model) as serving_model:
             sample = kwargs.get("sample_input")
+            sample = _pad_sample(serving_model, sample)
+            if isinstance(sample, torch.Tensor) and sample.ndim == 1:
+                sample = sample.unsqueeze(0)
             wrapper = _CompatLayer(serving_model).eval()
-            if "method" not in kwargs and hasattr(serving_model, "forward_export"):
-                method = "trace"
-            if method == "trace":
-                if sample is None:
-                    sample = _pad_sample(serving_model, None)
+
+            exported = self._export_program(wrapper, sample, **kwargs)
+
+            dst = Path(dst)
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            torch_save(exported, str(dst))
+
+            with contextlib.suppress(Exception):
+                write_json(dst.with_suffix(".json"), _load_model_config(model), indent=2)
+
+        return (dst,)
+
+    def _export_program(self, wrapper: nn.Module, sample: torch.Tensor, **kwargs: Any) -> object:
+        try:
+            import torch.export
+
+            torch_export = torch.export.export
+        except Exception as exc:
+            raise ImportError("torch.export is required for PT2 export (PyTorch 2.0+).") from exc
+
+        dynamic_batch = bool(kwargs.get("dynamic_batch", True))
+        dynamic_seq = bool(kwargs.get("dynamic_seq", False))
+        strict = bool(kwargs.get("strict", True))
+
+        dynamic_shapes = None
+        if (dynamic_batch or dynamic_seq) and hasattr(torch, "export") and hasattr(torch.export, "Dim"):
+            spec: dict[int, object] = {}
+            if dynamic_batch:
+                spec[0] = torch.export.Dim("batch")
+            if dynamic_seq and sample.ndim >= 2:
+                spec[1] = torch.export.Dim("seq")
+            if spec:
+                dynamic_shapes = {"x": spec}
+
+        call_kw: dict[str, Any] = {}
+        try:
+            sig = inspect.signature(torch_export)
+            params = getattr(sig, "parameters", None)
+            if isinstance(params, dict):
+                if "dynamic_shapes" in params and dynamic_shapes is not None:
+                    call_kw["dynamic_shapes"] = dynamic_shapes
+                if "strict" in params:
+                    call_kw["strict"] = strict
+        except Exception:
+            if dynamic_shapes is not None:
+                call_kw["dynamic_shapes"] = dynamic_shapes
+            call_kw["strict"] = strict
+
+        try:
+            with torch.no_grad():
+                return torch_export(wrapper, (sample,), **call_kw)
+        except Exception as exc:
+            strict_supported = "strict" in call_kw
+            if strict_supported and call_kw.get("strict", True):
+                warnings.warn(
+                    "torch.export strict=True failed; retrying strict=False for PT2 export",
+                    RuntimeWarning,
+                )
+                call_kw["strict"] = False
                 with torch.no_grad():
-                    scripted = torch.jit.trace(
-                        wrapper,
-                        sample,
-                        check_trace=False,
-                        strict=False,
-                    )
-            else:
-                try:
-                    with torch.no_grad():
-                        scripted = torch.jit.script(wrapper)
-                except Exception as exc:
-                    if sample is None:
-                        sample = _pad_sample(serving_model, None)
+                    return torch_export(wrapper, (sample,), **call_kw)
+            raise
+
+
+class TorchAot(Format):
+    name = "aoti"
+
+    def save(
+        self,
+        model: nn.Module,
+        dst: PathLike,
+        *args: Any,
+        **kwargs: Any,
+    ) -> object:
+        del args
+        try:
+            import torch.export
+
+            torch_export = torch.export.export
+        except Exception as exc:
+            raise ImportError("torch.export is required for TorchAot export (PyTorch 2.0+).") from exc
+        try:
+            from torch._inductor import aoti_compile_and_package
+        except Exception as exc:
+            raise ImportError(
+                "torch._inductor (TorchAot) is required for AOT compilation. "
+                "Install a PyTorch build with torch.compile/TorchInductor support."
+            ) from exc
+
+        with _onnx_model(model) as serving_model:
+            sample = kwargs.get("sample_input")
+            sample = _pad_sample(serving_model, sample)
+            if isinstance(sample, torch.Tensor) and sample.ndim == 1:
+                sample = sample.unsqueeze(0)
+            wrapper = _CompatLayer(serving_model).eval()
+
+            dynamic_batch = bool(kwargs.get("dynamic_batch", True))
+            dynamic_seq = bool(kwargs.get("dynamic_seq", False))
+            strict = bool(kwargs.get("strict", True))
+
+            dynamic_shapes = None
+            if (dynamic_batch or dynamic_seq) and hasattr(torch, "export") and hasattr(torch.export, "Dim"):
+                spec: dict[int, object] = {}
+                if dynamic_batch:
+                    spec[0] = torch.export.Dim("batch")
+                if dynamic_seq and sample.ndim >= 2:
+                    spec[1] = torch.export.Dim("seq")
+                if spec:
+                    dynamic_shapes = {"x": spec}
+
+            export_kw: dict[str, Any] = {}
+            try:
+                sig = inspect.signature(torch_export)
+                params = getattr(sig, "parameters", None)
+                if isinstance(params, dict):
+                    if "dynamic_shapes" in params and dynamic_shapes is not None:
+                        export_kw["dynamic_shapes"] = dynamic_shapes
+                    if "strict" in params:
+                        export_kw["strict"] = strict
+            except Exception:
+                if dynamic_shapes is not None:
+                    export_kw["dynamic_shapes"] = dynamic_shapes
+                export_kw["strict"] = strict
+
+            try:
+                with torch.no_grad():
+                    exported = torch_export(wrapper, (sample,), **export_kw)
+            except Exception as exc:
+                strict_supported = "strict" in export_kw
+                if strict_supported and export_kw.get("strict", True):
                     warnings.warn(
-                        f"TorchScript scripting failed ({type(exc).__name__}: {exc}); falling back to tracing.",
+                        "torch.export strict=True failed; retrying strict=False for TorchAot export",
                         RuntimeWarning,
                     )
+                    export_kw["strict"] = False
                     with torch.no_grad():
-                        scripted = torch.jit.trace(
-                            wrapper,
-                            sample,
-                            check_trace=False,
-                            strict=False,
-                        )
-            if bool(kwargs.get("optimize_for_mobile", False)):
-                try:
-                    from torch.utils.mobile_optimizer import optimize_for_mobile
-                except ImportError as exc:
-                    raise ImportError(
-                        "torch.utils.mobile_optimizer is required for optimize_for_mobile=True"
-                    ) from exc
-                backend = str(kwargs.get("mobile_backend", "cpu")).lower()
-                try:
-                    scripted = optimize_for_mobile(scripted, backend=backend)
-                except TypeError:
-                    scripted = optimize_for_mobile(scripted)
+                        exported = torch_export(wrapper, (sample,), **export_kw)
+                else:
+                    raise
+
+            dst = Path(dst)
             dst.parent.mkdir(parents=True, exist_ok=True)
-            scripted.save(str(dst))
-        return (dst,)
+
+            inductor_configs = kwargs.get("inductor_configs")
+            aoti_kw: dict[str, Any] = {}
+            try:
+                sig = inspect.signature(aoti_compile_and_package)
+                params = getattr(sig, "parameters", None)
+                if isinstance(params, dict):
+                    if "package_path" in params:
+                        aoti_kw["package_path"] = str(dst)
+                    if inductor_configs is not None and "inductor_configs" in params:
+                        aoti_kw["inductor_configs"] = inductor_configs
+            except Exception:
+                aoti_kw["package_path"] = str(dst)
+                if inductor_configs is not None:
+                    aoti_kw["inductor_configs"] = inductor_configs
+
+            out_path = aoti_compile_and_package(exported, **aoti_kw)
+
+            out = Path(str(out_path))
+            if out != dst:
+                with contextlib.suppress(Exception):
+                    shutil.copyfile(out, dst)
+                out = dst
+
+            with contextlib.suppress(Exception):
+                write_json(dst.with_suffix(".json"), _load_model_config(model), indent=2)
+
+        return (out,)
 
 
 class ExecuTorch(Format):
