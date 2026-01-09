@@ -365,6 +365,30 @@ def _coerce_onnx_path(dst: PathLike, kwargs: object) -> object:
     return Path(kwargs.get("onnx_path") or dst.with_suffix(".onnx"))
 
 
+def _coerce_nnef_args(input_shapes: object) -> str:
+    if input_shapes is None:
+        return "{}"
+    if isinstance(input_shapes, str):
+        return input_shapes.replace("\\r\\n", "\n").replace("\\n", "\n")
+    if not isinstance(input_shapes, dict):
+        raise TypeError(
+            f"input_shapes must be a dict[str, Sequence[int]] or a str, got {type(input_shapes)}"
+        )
+    coerced: dict[str, tuple[int, ...]] = {}
+    for name, shape in input_shapes.items():
+        if isinstance(shape, int):
+            tup = (int(shape),)
+        else:
+            try:
+                tup = tuple(int(x) for x in shape)
+            except TypeError as exc:
+                raise TypeError(
+                    f"input_shapes[{name!r}] must be an int or an iterable of ints, got {type(shape)}"
+                ) from exc
+        coerced[str(name)] = tup
+    return repr(coerced)
+
+
 def is_required(module: str, pip_hint: str | None = None) -> None:
     try:
         __import__(module)
@@ -873,8 +897,6 @@ class Nnef(Format):
             if input_shapes is None:
                 sample = _pad_sample(serving_model, kwargs.get("sample_input"))
                 input_shapes = {"features": tuple((int(x) for x in sample.shape))}
-            import json
-
             cmd = [
                 sys.executable,
                 "-m",
@@ -888,7 +910,7 @@ class Nnef(Format):
                 "--output-model",
                 str(dst),
                 "--input-shapes",
-                json.dumps(input_shapes),
+                _coerce_nnef_args(input_shapes),
             ]
             toggles = (
                 ("keep_io_names", "--keep-io-names", True),
