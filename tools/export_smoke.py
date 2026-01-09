@@ -117,6 +117,15 @@ def _pt2_run(path: Path, x: torch.Tensor, device: torch.device) -> bool:
     m.eval()
     x_run = x.detach()
     try:
+        if hasattr(m, "to"):
+            m = m.to(device=device)
+    except Exception:
+        try:
+            m = m.to("cpu")
+        except Exception:
+            pass
+        x_run = x_run.to("cpu", dtype=torch.float32)
+    try:
         x_run = x_run.to(device=device)
     except Exception:
         x_run = x_run.to("cpu", dtype=torch.float32)
