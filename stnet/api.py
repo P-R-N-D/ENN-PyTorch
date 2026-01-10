@@ -34,7 +34,7 @@ from tensordict import (
     TensorDict,
     TensorDictBase,
 )
-from torch.distributed.run import LaunchConfig, elastic_launch
+from torch.distributed.launcher.api import LaunchConfig, elastic_launch
 from torch.distributed.checkpoint import (
     FileSystemReader,
     FileSystemWriter,
