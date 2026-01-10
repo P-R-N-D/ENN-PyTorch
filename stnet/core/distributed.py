@@ -166,7 +166,6 @@ def _get_preferred_ip_cached(
         ["localhost"] if allow_loopback else []
     )
     found, seen = [], set()
-
     for name in names:
         for info in _safe_getaddrinfo(name):
             if not info[4] or not (
@@ -187,7 +186,6 @@ def _get_preferred_ip_cached(
             if (score == 1 and not allow_loopback) or (score == 2 and not allow_link_local):
                 continue
             found.append((score, ip.version == (6 if prefer_ipv6 else 4), canon))
-
     found.sort(key=lambda x: x[:2], reverse=True)
     if found:
         return found[0][2]
@@ -233,11 +231,9 @@ def resolve_ip_expr(
     )
     if lit := _canonize_ip(host_text, loopback=allow_loopback, link_local=link_local):
         return lit
-
     addrs = _safe_getaddrinfo(_clean_ip_str(host_text))
     if not addrs:
         return None
-
     res = {4: [], 6: []}
     for a in addrs:
         if a[4] and (
@@ -245,12 +241,10 @@ def resolve_ip_expr(
         ):
             with contextlib.suppress(Exception):
                 res[ipaddress.ip_address(_clean_ip_str(canon)).version].append(canon)
-
     vers = (6, 4) if (prefer_ipv6 is None or prefer_ipv6) else (4, 6)
     for v in vers:
         if res[v]:
             return res[v][0]
-
     if "%" in host_text and link_local:
         for v in vers:
             for ip in res[v]:
@@ -300,7 +294,6 @@ def is_port_available(
     )
     if not host_ip:
         return False
-
     try:
         ver = ipaddress.ip_address(_clean_ip_str(host_ip)).version
         family = socket.AF_INET6 if ver == 6 else socket.AF_INET
@@ -343,7 +336,6 @@ def get_available_host(
         or resolve_ip_expr(cand, allow_loopback=True, prefer_ipv6=True, allow_link_local=link_local)
         or "127.0.0.1"
     )
-
     try:
         ver = ipaddress.ip_address(_clean_ip_str(host)).version
         family, addr = (
@@ -537,10 +529,8 @@ def distributed_broadcast(
                 continue
             seen.add(id(t))
             tensors.append(t)
-
     if not tensors:
         return
-
     with torch.no_grad():
         if (c := getattr(dist, "_broadcast_coalesced", None)) and (
             pg := _get_default_process_group()
@@ -583,7 +573,6 @@ def to_hsdp_module(
 ) -> torch.nn.Module:
     if fully_shard is None:
         raise RuntimeError("Missing fully_shard")
-
     params = _hsdp_supported_params()
     fsdp_kwargs: dict[str, Any] = dict(user_kwargs)
     pg_obj: Any | None = None
@@ -598,7 +587,6 @@ def to_hsdp_module(
                 mesh_obj = mesh
         if pg_obj is None and mesh_obj is None:
             mesh_obj = mesh
-
     defaults: dict[str, Any] = {
         "forward_prefetch": env_bool("STNET_FSDP_FWD_PREFETCH", True),
         "limit_all_gathers": env_bool("STNET_FSDP_LIMIT_AG", True),
@@ -622,42 +610,33 @@ def to_hsdp_module(
             if k in params and k not in fsdp_kwargs and v is not None
         }
     )
-
     sharded = fully_shard(module, *args, **fsdp_kwargs)
     with contextlib.suppress(AttributeError):
         sharded.set_requires_gradient_sync(True)
-
     with contextlib.suppress(ImportError):
         from torch.distributed.fsdp import register_fsdp_forward_method
-
         for _name in ("forward", "decode", "predict", "forward_export", "forward_state", "forward_stream"):
             if hasattr(sharded, _name):
                 register_fsdp_forward_method(sharded, _name)
-
     return sharded
 
 
 def get_distributed_mesh(device: torch.device | None = None) -> tuple[Any | None, str]:
     if not is_distributed():
         return (None, "none")
-
     dev = device
     if dev is None:
         with contextlib.suppress(Exception):
             dev = get_device()
-
     dev_type = str(getattr(dev, "type", "cpu"))
     if dev_type not in {"cuda", "xpu"}:
         return (None, "none")
-
     try:
         world = int(dist.get_world_size())
     except Exception:
         return (None, "none")
-
     if world <= 1:
         return (None, "none")
-
     local_world_size = None
     for k in (
         "LOCAL_WORLD_SIZE",
@@ -669,7 +648,6 @@ def get_distributed_mesh(device: torch.device | None = None) -> tuple[Any | None
             with contextlib.suppress(ValueError):
                 local_world_size = int(v)
                 break
-
     if local_world_size is None:
         if dev_type == "cuda":
             with contextlib.suppress(Exception):
@@ -677,9 +655,7 @@ def get_distributed_mesh(device: torch.device | None = None) -> tuple[Any | None
         elif dev_type == "xpu":
             with contextlib.suppress(Exception):
                 local_world_size = int(get_num_accelerators("xpu"))
-
     local_world_size = int(local_world_size or 1)
-
     is_consistent = True
     if dist.is_initialized():
         try:
@@ -690,15 +666,12 @@ def get_distributed_mesh(device: torch.device | None = None) -> tuple[Any | None
             is_consistent = all(s == local_world_size for s in all_sizes)
         except Exception:
             is_consistent = False
-
     if importlib.util.find_spec("torch.distributed.device_mesh") is None:
         return (None, "none")
-
     device_mesh = importlib.import_module("torch.distributed.device_mesh")
     init_device_mesh = getattr(device_mesh, "init_device_mesh", None)
     if init_device_mesh is None:
         return (None, "none")
-
     if is_consistent and world > local_world_size and world % local_world_size == 0:
         dp_replicate = world // local_world_size
         dp_shard = local_world_size
@@ -711,7 +684,6 @@ def get_distributed_mesh(device: torch.device | None = None) -> tuple[Any | None
             return (mesh, "hsdp2")
         except Exception:
             pass
-
     try:
         mesh = init_device_mesh(
             dev_type,
