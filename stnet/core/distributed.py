@@ -11,7 +11,6 @@ import os
 import socket
 import warnings
 from contextlib import AbstractContextManager
-from functools import lru_cache
 from typing import TYPE_CHECKING, Any, Iterable
 
 import torch
@@ -638,7 +637,6 @@ def to_hsdp_module(
     return sharded
 
 
-@lru_cache(maxsize=4)
 def get_distributed_mesh(device: torch.device | None = None) -> tuple[Any | None, str]:
     if not is_distributed():
         return (None, "none")
