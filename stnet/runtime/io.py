@@ -317,7 +317,7 @@ def _get_tensor_shape(model: object, sample_input: object) -> object:
     return (int(in_dim), tuple(out_shape))
 
 
-def _pad_sample(model: object, sample_input: object) -> object:
+def _pad_sample(model: object, sample_input: object, *, batch: int = 1) -> object:
     if sample_input is not None:
         return sample_input
     in_dim, _ = _get_tensor_shape(model, sample_input)
@@ -325,16 +325,16 @@ def _pad_sample(model: object, sample_input: object) -> object:
     dtype, device = (
         (param.dtype, param.device) if param is not None else (torch.float32, torch.device("cpu"))
     )
-    return torch.zeros(1, in_dim, dtype=dtype, device=device)
+    b = max(1, int(batch))
+    return torch.zeros(b, in_dim, dtype=dtype, device=device)
 
 
 def _onnx_options(kwargs: object, *args: Any, target: str = "onnx") -> object:
     target_l = str(target or "onnx").strip().lower()
     defaults = {
-        "tensorrt": (17, True, False, True, [17, 16, 15, 14, 13]),
-        "tensorflow": (15, False, False, True, [15, 13]),
-        "nnef": (13, False, False, True, [13]),
-        "default": (18, True, True, False, [18, 17, 16, 15, 13]),
+        "tensorrt": (18, True, True, True, [18, 17, 16, 15, 13]),
+        "tensorflow": (18, False, True, True, [18, 17, 16, 15, 13]),
+        "default": (18, False, True, False, [18, 17, 16, 15, 13]),
     }
     key = target_l.replace("-", "").replace("_", "")
     if key == "trt":
@@ -365,30 +365,6 @@ def _coerce_onnx_path(dst: PathLike, kwargs: object) -> object:
     return Path(kwargs.get("onnx_path") or dst.with_suffix(".onnx"))
 
 
-def _coerce_nnef_args(input_shapes: object) -> str:
-    if input_shapes is None:
-        return "{}"
-    if isinstance(input_shapes, str):
-        return input_shapes.replace("\\r\\n", "\n").replace("\\n", "\n")
-    if not isinstance(input_shapes, dict):
-        raise TypeError(
-            f"input_shapes must be a dict[str, Sequence[int]] or a str, got {type(input_shapes)}"
-        )
-    coerced: dict[str, tuple[int, ...]] = {}
-    for name, shape in input_shapes.items():
-        if isinstance(shape, int):
-            tup = (int(shape),)
-        else:
-            try:
-                tup = tuple(int(x) for x in shape)
-            except TypeError as exc:
-                raise TypeError(
-                    f"input_shapes[{name!r}] must be an int or an iterable of ints, got {type(shape)}"
-                ) from exc
-        coerced[str(name)] = tup
-    return repr(coerced)
-
-
 def is_required(module: str, pip_hint: str | None = None) -> None:
     try:
         __import__(module)
@@ -415,28 +391,42 @@ class _OnnxLayer:
         sample_input: object | None = None,
         opset_version: int = 18,
         opset_fallback: Sequence[int] | None = None,
-        dynamic_batch: bool = True,
+        dynamic_batch: bool = False,
         prefer_dynamo: bool = True,
         simplify: bool = False,
     ) -> object:
         is_required("onnx", "pip install onnx")
         wrapper = _CompatLayer(model).eval()
-        sample = _pad_sample(model, sample_input)
-        if isinstance(sample, torch.Tensor) and sample.ndim == 1:
-            sample = sample.unsqueeze(0)
         onnx_path = Path(onnx_path)
         onnx_path.parent.mkdir(parents=True, exist_ok=True)
         input_names = ["features"]
-        dyn_axes, dyn_shapes = (
-            (
-                {"features": {0: "batch"}, "preds_flat": {0: "batch"}},
-                {"features": {0: torch.export.Dim("batch")}},
+        dyn_axes = None
+        dyn_shapes = None
+        if dynamic_batch and hasattr(torch, "export") and hasattr(torch.export, "Dim"):
+            try:
+                batch_dim = torch.export.Dim("batch", min=2)
+            except TypeError:
+                dynamic_batch = False
+            else:
+                dyn_axes = {"features": {0: "batch"}, "preds_flat": {0: "batch"}}
+                dyn_shapes = ({0: batch_dim},)
+
+        min_export_batch = 2 if dynamic_batch else 1
+        sample = _pad_sample(model, sample_input, batch=min_export_batch)
+        if isinstance(sample, torch.Tensor) and sample.ndim == 1:
+            sample = sample.unsqueeze(0)
+        if (
+            dynamic_batch
+            and isinstance(sample, torch.Tensor)
+            and sample.ndim >= 2
+            and int(sample.shape[0]) < min_export_batch
+        ):
+            pad = torch.zeros(
+                (min_export_batch - int(sample.shape[0]),) + tuple(sample.shape[1:]),
+                device=sample.device,
+                dtype=sample.dtype,
             )
-            if dynamic_batch
-            else (None, None)
-        )
-        if not (hasattr(torch, "export") and hasattr(torch.export, "Dim")):
-            dyn_shapes = None
+            sample = torch.cat([sample, pad], dim=0)
         training = None
         with contextlib.suppress(Exception):
             training = torch.onnx.TrainingMode.EVAL
@@ -707,7 +697,6 @@ class Exporter:
             cls.register("onnx", (".onnx",), Onnx())
             cls.register("ort", (".ort",), Ort())
             cls.register("tensorrt", (".engine",), TensorRT())
-            cls.register("nnef", (".nnef",), Nnef())
             cls.register("coreml", (".mlmodel",), CoreML())
             cls.register("litert", (".tflite",), LiteRT())
             cls.register("pt2", (".pt2", ".export"), TorchExport())
@@ -833,9 +822,12 @@ class TensorRT(Format):
                 input_tensor = network.get_input(0)
                 sample = _pad_sample(serving_model, kwargs.get("sample_input"))
                 shape = tuple((int(x) for x in sample.shape))
-                min_shape = (1, *shape[1:])
-                opt_shape = (int(kwargs.get("opt_batch", shape[0])), *shape[1:])
-                max_shape = (int(kwargs.get("max_batch", 8)), *shape[1:])
+                min_batch = max(1, int(kwargs.get("min_batch", 1)))
+                opt_batch = max(min_batch, int(kwargs.get("opt_batch", shape[0])))
+                max_batch = max(opt_batch, int(kwargs.get("max_batch", 8)))
+                min_shape = (min_batch, *shape[1:])
+                opt_shape = (opt_batch, *shape[1:])
+                max_shape = (max_batch, *shape[1:])
                 profile = builder.create_optimization_profile()
                 profile.set_shape(input_tensor.name, min_shape, opt_shape, max_shape)
                 config.add_optimization_profile(profile)
@@ -869,61 +861,6 @@ class TensorRT(Format):
                 dst.parent.mkdir(parents=True, exist_ok=True)
                 with open(dst, "wb") as handle:
                     handle.write(engine_bytes)
-        return (dst,)
-
-
-class Nnef(Format):
-    name = "nnef"
-
-    def save(
-        self,
-        model: nn.Module,
-        dst: PathLike,
-        *args: Any,
-        **kwargs: Any,
-    ) -> object:
-        with _onnx_model(model) as serving_model:
-            onnx_path = Exporter._OnnxLayer.coerce(
-                serving_model,
-                _coerce_onnx_path(dst, kwargs),
-                **_onnx_options(kwargs, target="nnef"),
-            )
-            try:
-                import importlib
-
-                importlib.import_module("nnef_tools.convert")
-            except ImportError as exc:
-                raise ImportError("nnef-tools[onnx] is required for this export.") from exc
-            input_shapes = kwargs.get("input_shapes")
-            if input_shapes is None:
-                sample = _pad_sample(serving_model, kwargs.get("sample_input"))
-                input_shapes = {"features": tuple((int(x) for x in sample.shape))}
-            cmd = [
-                sys.executable,
-                "-m",
-                "nnef_tools.convert",
-                "--input-format",
-                "onnx",
-                "--output-format",
-                "nnef",
-                "--input-model",
-                str(onnx_path),
-                "--output-model",
-                str(dst),
-                "--input-shapes",
-                _coerce_nnef_args(input_shapes),
-            ]
-            toggles = (
-                ("keep_io_names", "--keep-io-names", True),
-                ("io_transpose", "--io-transpose", False),
-                ("fold_constants", "--fold-constants", True),
-                ("optimize", "--optimize", True),
-                ("compress", "--compress", True),
-            )
-            for key, flag, default in toggles:
-                if bool(kwargs.get(key, default)):
-                    cmd.append(flag)
-            _in_console(cmd, "nnef convert")
         return (dst,)
 
 

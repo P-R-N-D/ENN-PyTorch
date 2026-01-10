@@ -7,7 +7,7 @@ This repository also includes a worked example notebook (`notebook.ipynb`) and a
 ## Requirements
 
 ### Mandatory
-- **Python**: >= 3.10 (uses `match` / `case`)
+- **Python**: >= 3.11
 - **PyTorch**: >= 2.8.0
 - **Triton**: >= 3.4.0 (core JIT backend; typically installed alongside PyTorch)
 - **torchao**: >= 0.14.0
@@ -76,6 +76,32 @@ pip install -e .[dev]
 > **Note**: Triton >= 3.4.0 is required, but a matching build is normally installed alongside PyTorch—avoid overriding it with a mismatched wheel.
 
 > **Platform note**: many `deployment_full` backends are OS/driver/python dependent (e.g., CoreML on macOS, TensorRT on Linux/CUDA, ExecuTorch often lacks wheels for Python ≥3.12). If you only need ONNX export, installing `onnx` (and optionally `onnxruntime`) is usually sufficient.
+
+## Distributed training & inference (HSDP2)
+
+STNet uses **FSDP2 (composable `fully_shard`)** for both training and inference on GPU/XPU.
+When running multi-node, STNet will prefer an **HSDP2-style 2D DeviceMesh**:
+
+- **Shard** within a node (across local GPUs)
+- **Replicate** across nodes (no cross-node parameter sharding)
+
+### Heterogeneous nodes (different GPU counts)
+
+HSDP2 requires a rectangular 2D mesh (i.e., the same number of local ranks/GPUs per node). When nodes have different GPU counts, STNet will **automatically fall back to a 1D FSDP2 mesh** across all ranks. This keeps the run working (no hang/crash), but it does mean **parameters can be sharded across nodes** in the fallback mode.
+
+### Mesh selection
+
+- Default: **implicit mesh** via `torch.distributed.device_mesh.init_device_mesh`.
+- If your rank ordering is not node-contiguous, you can force explicit mesh construction:
+  - `STNET_HSDP_EXPLICIT_MESH=1`
+- If your launcher does not set `LOCAL_WORLD_SIZE`, you can override the assumed per-node size:
+  - `STNET_HSDP_SHARD_SIZE=<int>`
+
+## Export / serving notes
+
+- NNEF export has been removed.
+- ONNX export defaults to **opset 18**.
+- Some graphs contain batch-dependent control flow; the export utilities avoid common `batch==1` specialization pitfalls by using safe defaults (and disabling dynamic batching when the current `torch.export.Dim` implementation cannot express constraints).
 
 ## Quickstart
 
