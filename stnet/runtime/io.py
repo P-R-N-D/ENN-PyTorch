@@ -202,7 +202,7 @@ def _in_console(cmd: object, desc: object) -> None:
 
 
 @contextlib.contextmanager
-def _onnx_model(model: object) -> None:
+def _onnx_model(model: object) -> Iterator[object]:
     was_training = getattr(model, "training", False)
     removed_top, removed_sub = {}, []
     model.eval()

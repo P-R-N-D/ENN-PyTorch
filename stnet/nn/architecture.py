@@ -30,7 +30,7 @@ from tensordict import TensorDictBase
 from ..config import ModelConfig
 from ..core.casting import env_bool, env_first_int, env_int
 from ..core.compat import is_meta_or_fake_tensor
-from ..core.distributed import _unshard_fsdp_module
+from ..core.distributed import _from_hsdp_module
 from ..core.graph import (
     graph_break,
     inference_mode,
@@ -342,8 +342,8 @@ class SpatialExtractor(nn.Module):
 
                 def _f(t: torch.Tensor, _blk: RetNet = blk) -> torch.Tensor:
                     if torch.is_grad_enabled():
-                        _unshard_fsdp_module(self)
-                        _unshard_fsdp_module(_blk)
+                        _from_hsdp_module(self)
+                        _from_hsdp_module(_blk)
                     y, _ = _blk(t, causal_mask=attn_mask, state=None, mode="spatial")
                     return y
 
@@ -598,8 +598,8 @@ class TemporalExtractor(nn.Module):
 
                 def _f(t: torch.Tensor, _blk: RetNet = blk) -> torch.Tensor:
                     if torch.is_grad_enabled():
-                        _unshard_fsdp_module(self)
-                        _unshard_fsdp_module(_blk)
+                        _from_hsdp_module(self)
+                        _from_hsdp_module(_blk)
                     y, _ = _blk(t, causal_mask=causal_mask, state=None, mode="temporal")
                     return y
 
@@ -1615,13 +1615,13 @@ class Model(nn.Module):
                             k = next(iter(proc.pair_fusers.keys()))
                             proc.pair_fusers[k] = proc.perception
 
-        swaps: list[tuple[str, Any]] = []
+        swaps: list[tuple[object, str, Any]] = []
         with contextlib.suppress(Exception):
             eager_temporal = getattr(self, "_eager_processor_temporal_net", None)
             if isinstance(eager_temporal, nn.Module):
                 cur = getattr(proc, "temporal_net", None)
                 if cur is not eager_temporal and cur is not None:
-                    swaps.append(("temporal_net", cur))
+                    swaps.append((proc, "temporal_net", cur))
                     proc.temporal_net = eager_temporal
                     _sync_after_swap("temporal_net")
         with contextlib.suppress(Exception):
@@ -1629,16 +1629,22 @@ class Model(nn.Module):
             if isinstance(eager_perception, nn.Module):
                 cur = getattr(proc, "perception", None)
                 if cur is not eager_perception and cur is not None:
-                    swaps.append(("perception", cur))
+                    swaps.append((proc, "perception", cur))
                     proc.perception = eager_perception
                     _sync_after_swap("perception")
+        with contextlib.suppress(Exception):
+            dc = getattr(self, "_decode_compiled", None)
+            if isinstance(dc, nn.Module):
+                swaps.append((self, "_decode_compiled", dc))
+                self._decode_compiled = None
         try:
             yield self
         finally:
-            for name, old in swaps:
+            for target, name, old in swaps:
                 with contextlib.suppress(Exception):
-                    setattr(proc, name, old)
-                _sync_after_swap(name)
+                    setattr(target, name, old)
+                if target is proc:
+                    _sync_after_swap(name)
 
     def _run_forward_core(
         self,
