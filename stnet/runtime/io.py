@@ -822,7 +822,7 @@ class TensorRT(Format):
                 input_tensor = network.get_input(0)
                 sample = _pad_sample(serving_model, kwargs.get("sample_input"))
                 shape = tuple((int(x) for x in sample.shape))
-                min_batch = max(2, int(kwargs.get("min_batch", 2)))
+                min_batch = max(1, int(kwargs.get("min_batch", 1)))
                 opt_batch = max(min_batch, int(kwargs.get("opt_batch", shape[0])))
                 max_batch = max(opt_batch, int(kwargs.get("max_batch", 8)))
                 min_shape = (min_batch, *shape[1:])
