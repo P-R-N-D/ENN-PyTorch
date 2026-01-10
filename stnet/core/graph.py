@@ -5,6 +5,7 @@ import contextlib
 import importlib
 import sys
 import threading
+import traceback
 from contextlib import AbstractContextManager, suppress, nullcontext
 from typing import Any, Callable, Dict, List, Optional, Iterator
 
@@ -821,6 +822,19 @@ def is_checkpoint() -> bool:
     return bool(getattr(_CKPT_TL, "depth", 0) or 0)
 
 
+def _raised_from_checkpointed_fn(err: BaseException) -> bool:
+    tb = err.__traceback__
+    if tb is None:
+        return False
+    for frame, _ in traceback.walk_tb(tb):
+        if (
+            frame.f_code.co_name == "_state"
+            and frame.f_globals.get("__name__") == __name__
+        ):
+            return True
+    return False
+
+
 def coerce_checkpoint(
     fn: Callable[..., Any],
     *args: Any,
@@ -890,6 +904,8 @@ def coerce_checkpoint(
         try:
             return checkpoint(fn, *args, **opts, **ckpt_kwargs)
         except TypeError as e:
+            if require_reentrant and _raised_from_checkpointed_fn(e):
+                raise
             last_type_error = e
             continue
 
