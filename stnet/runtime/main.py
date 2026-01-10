@@ -34,6 +34,7 @@ from torch.distributed.checkpoint.state_dict import (
     set_model_state_dict,
     set_optimizer_state_dict,
 )
+from torch.distributed.elastic.control_plane import worker_main
 
 from ..config import RuntimeConfig, coerce_model_config
 from ..core.system import (
@@ -3911,7 +3912,7 @@ def process(ops: RuntimeConfig, ret_sink: ReturnSink | None = None) -> object: .
 @overload
 def process(local_rank: int, ops: RuntimeConfig, ret_sink: ReturnSink | None = None) -> object: ...
 
-
+@worker_main()
 def process(*args: Any, **kwargs: Any) -> object:
     from ..data.pipeline import Session
 
