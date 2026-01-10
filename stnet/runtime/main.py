@@ -4314,8 +4314,6 @@ def process(*args: Any, **kwargs: Any) -> object:
             swa_start_epoch = total_epochs
             use_swa = False
             try:
-                import torch.nn as nn
-
                 has_bn = any(
                     isinstance(m, nn.modules.batchnorm._BatchNorm)
                     for m in tracked_module.modules()

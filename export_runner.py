@@ -20,8 +20,8 @@ def export_and_validate(
 ) -> Dict[str, Any]:
     out_dir.mkdir(exist_ok=True)
     targets = {
-        "pt2": out_dir / "model.pt2",
         "onnx": out_dir / "model.onnx",
+        "pt2": out_dir / "model.pt2",
         "executorch": out_dir / "model.pte",
         "nnef": out_dir / "model.nnef",
         "tensorflow": out_dir / "model.savedmodel",

@@ -427,16 +427,7 @@ class _OnnxLayer:
         onnx_path = Path(onnx_path)
         onnx_path.parent.mkdir(parents=True, exist_ok=True)
         input_names = ["features"]
-        dyn_axes, dyn_shapes = (
-            (
-                {"features": {0: "batch"}, "preds_flat": {0: "batch"}},
-                {"features": {0: torch.export.Dim("batch")}},
-            )
-            if dynamic_batch
-            else (None, None)
-        )
-        if not (hasattr(torch, "export") and hasattr(torch.export, "Dim")):
-            dyn_shapes = None
+        dyn_axes = {"features": {0: "batch"}, "preds_flat": {0: "batch"}} if dynamic_batch else None
         training = None
         with contextlib.suppress(Exception):
             training = torch.onnx.TrainingMode.EVAL
@@ -470,9 +461,15 @@ class _OnnxLayer:
                             "ignore",
                             message=r"torchvision|Setting ONNX exporter to use operator set version",
                         )
+                        warnings.filterwarnings(
+                            "ignore",
+                            message=r"# 'dynamic_axes' is not recommended when dynamo=True.*",
+                        )
+                        warnings.filterwarnings(
+                            "ignore",
+                            message=r"Weight '.*' not found in the model\\. Skipped applying\\.",
+                        )
                         call_kw = dict(valid_kw)
-                        if use_dyn and dyn_shapes:
-                            call_kw["dynamic_shapes"] = dyn_shapes
                         if has_dynamo:
                             call_kw["dynamo"] = use_dyn
                         call_kw.pop("model", None)
@@ -483,7 +480,27 @@ class _OnnxLayer:
                             args = tuple(sample)
                         else:
                             args = (sample,)
-                        torch.onnx.export(model=wrapper, args=args, **call_kw)
+                        try:
+                            if use_dyn:
+                                export_kw = dict(call_kw)
+                                export_kw["f"] = None
+                                prog = torch.onnx.export(model=wrapper, args=args, **export_kw)
+                                if prog is None:
+                                    raise RuntimeError("torch.onnx.export returned None")
+                                with contextlib.suppress(Exception):
+                                    prog.apply_weights(wrapper.state_dict())
+                                prog.save(
+                                    str(onnx_path),
+                                    include_initializers=True,
+                                    keep_initializers_as_inputs=bool(
+                                        call_kw.get("keep_initializers_as_inputs", False)
+                                    ),
+                                    external_data=True,
+                                )
+                            else:
+                                torch.onnx.export(model=wrapper, args=args, **call_kw)
+                        except Exception:
+                            raise
                     if simplify:
                         with contextlib.suppress(Exception):
                             import onnx

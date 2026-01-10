@@ -1674,7 +1674,7 @@ class Model(nn.Module):
                 self._cast_graph_safe(x, self._device, assembled.dtype)
             )
         tokens_centered = (
-            tokens - tokens.mean(dim=1, keepdim=True, dtype=tokens.dtype).to(tokens.dtype)
+            tokens - tokens.mean(dim=1, keepdim=True)
         ).contiguous()
         if export:
             refined = self.temporal_token_collector.forward_export(tokens_centered)
