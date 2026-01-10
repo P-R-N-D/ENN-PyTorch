@@ -2225,7 +2225,6 @@ class Sampler(torch.utils.data.Sampler):
                 if created >= max_pairs:
                     if not self._mmap_thread_local_overflow_warned:
                         self._mmap_thread_local_overflow_warned = True
-                        _LOGGER.warning(f"[memmap] limit reached ({max_pairs}). Falling back.")
                     return self._features, self._labels
                 self._mmap_thread_local_created += 1
 
