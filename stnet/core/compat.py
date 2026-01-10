@@ -84,7 +84,7 @@ def is_fake_tensor(value: Any) -> bool:
         return False
     if _tdx_is_fake and (res := _tdx_is_fake(value)):
         return bool(res)
-    return isinstance(value, FakeTensor) or getattr(value, "fake_mode", None) is not None
+    return isinstance(value, FakeTensor)
 
 
 def is_meta_tensor(value: Any) -> bool:

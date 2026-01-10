@@ -83,8 +83,8 @@ from ..core.distributed import (
     no_sync,
     get_world_size,
     is_distributed,
-    to_ddp,
-    to_fsdp,
+    get_distributed_mesh,
+    to_hsdp_module,
 )
 from ..core.graph import (
     inference_mode,
@@ -1245,40 +1245,6 @@ def _get_sample_size(
             os.environ["STNET_PER_SAMPLE_MEM_BYTES"] = str(int(per_sample))
     except Exception:
         return
-
-
-def _get_fsdp_module(
-    target: PathLike,
-    mesh: object,
-    mp_policy: object,
-    reshard_after_forward: object,
-    wrapped: object,
-) -> object:
-    if target is None or id(target) in wrapped:
-        return target
-    wrapped.add(id(target))
-    return to_fsdp(
-        target,
-        mesh=mesh,
-        mp_policy=mp_policy,
-        reshard_after_forward=bool(reshard_after_forward),
-        sync_module_states=True,
-    )
-
-
-def _get_layers(root: object) -> object:
-    if root is None:
-        return []
-    blocks = []
-    seen = set()
-    for module in root.modules():
-        block_list = getattr(module, "blocks", None)
-        if isinstance(block_list, torch.nn.ModuleList):
-            for block in block_list:
-                if isinstance(block, torch.nn.Module) and id(block) not in seen:
-                    seen.add(id(block))
-                    blocks.append(block)
-    return blocks
 
 
 def _init_tensor(
@@ -3537,10 +3503,28 @@ def infer(
         est_row_bytes = max(1, out_numel * 4)
         target_bytes = int(_env_int("STNET_PRED_CHUNK_BYTES", 64 * 1024 * 1024))
         target_rows = max(256, min(65536, target_bytes // est_row_bytes))
-    run_model = to_ddp(model, device=device)
+    dev_obj = device if isinstance(device, torch.device) else torch.device(device)
+    run_model: torch.nn.Module = model
+    if (
+        is_distributed()
+        and get_world_size(dev_obj) > 1
+        and str(getattr(dev_obj, "type", "cpu")) in ("cuda", "xpu")
+    ):
+        mesh, mesh_kind = get_distributed_mesh(dev_obj)
+        if mesh_kind != "hsdp2":
+            _LOGGER.warning(
+                f"HSDP2 mesh not available (e.g. heterogeneous nodes). Using fallback: {mesh_kind}"
+            )
+        run_model = to_hsdp_module(
+            model,
+            mesh=mesh,
+            mp_policy=None,
+            reshard_after_forward=True,
+            sync_module_states=True,
+        )
     run_model.eval()
     module_eval = run_model.module if hasattr(run_model, "module") else run_model
-    distributed_sync(module_eval, device=device)
+    distributed_sync(module_eval, device=dev_obj)
     cg_enabled = bool(dev_type == "cuda" and getattr(module_eval, "_compile_cudagraphs", False))
     td_cg_candidate = bool(
         (not cg_enabled)
@@ -4097,7 +4081,6 @@ def process(*args: Any, **kwargs: Any) -> object:
             _float8_log(f"[FP8] disabled: {disable_note}")
         _cast_float_dtype(model, param_dtype)
         model.train()
-        mesh = None
         fsdp_mp_dtype = precision.fsdp_reduce_dtype
         if device.type == "cpu" and fsdp_mp_dtype is not torch.float64:
             fsdp_mp_dtype = torch.float32
@@ -4120,38 +4103,53 @@ def process(*args: Any, **kwargs: Any) -> object:
         _validate_model_dtype_unity(_m_pre, device)
         _validate_no_meta_tensors(_m_pre)
         _validate_no_fake_dtensor(_m_pre)
-        wrapped = set()
-        try:
-            for submodule in _get_layers(getattr(model, "processor", None)):
-                _get_fsdp_module(
-                    submodule,
-                    mesh,
-                    mp_policy,
-                    reshard_after_forward=True,
-                    wrapped=wrapped,
+        if is_distributed() and get_world_size(device) > 1 and device.type in ("cuda", "xpu"):
+            mesh, mesh_kind = get_distributed_mesh(device)
+            if mesh_kind != "hsdp2":
+                _LOGGER.warning(
+                    f"HSDP2 mesh not available (e.g. heterogeneous nodes). Using fallback: {mesh_kind}"
                 )
-            for submodule in _get_layers(getattr(model, "controller", None)):
-                _get_fsdp_module(
-                    submodule,
-                    mesh,
-                    mp_policy,
-                    reshard_after_forward=True,
-                    wrapped=wrapped,
+            try:
+                wrapped_ids: set[int] = set()
+
+                def _wrap_once(mod: torch.nn.Module | None, *, is_root: bool) -> None:
+                    if mod is None or id(mod) in wrapped_ids:
+                        return
+                    wrapped_ids.add(id(mod))
+                    to_hsdp_module(
+                        mod,
+                        mesh=mesh,
+                        mp_policy=mp_policy,
+                        reshard_after_forward=(not is_root),
+                        sync_module_states=bool(is_root),
+                    )
+
+                for root_mod in (getattr(model, "processor", None), getattr(model, "controller", None)):
+                    if isinstance(root_mod, torch.nn.Module):
+                        blocks = getattr(root_mod, "blocks", None)
+                        if isinstance(blocks, torch.nn.ModuleList):
+                            for blk in blocks:
+                                if isinstance(blk, torch.nn.Module):
+                                    _wrap_once(blk, is_root=False)
+                        _wrap_once(root_mod, is_root=False)
+
+                model = to_hsdp_module(
+                    model,
+                    mesh=mesh,
+                    mp_policy=mp_policy,
+                    reshard_after_forward=False,
+                    sync_module_states=True,
                 )
-            model = (
-                _get_fsdp_module(
-                    model, mesh, mp_policy, reshard_after_forward=True, wrapped=wrapped
+            except Exception as e:
+                _LOGGER.warning(f"HSDP2 wrapping fallback to root-only FSDP: {e}")
+                model = to_hsdp_module(
+                    model,
+                    mesh=mesh,
+                    mp_policy=mp_policy,
+                    reshard_after_forward=False,
+                    sync_module_states=True,
                 )
-                or model
-            )
-        except (RuntimeError, ValueError, TypeError):
-            model = to_fsdp(
-                model,
-                mesh=mesh,
-                mp_policy=mp_policy,
-                reshard_after_forward=False,
-                sync_module_states=True,
-            )
+
         _m_post = model.module if hasattr(model, "module") else model
         _validate_model_dtype_unity(_m_post, device)
         _validate_no_meta_tensors(_m_post)

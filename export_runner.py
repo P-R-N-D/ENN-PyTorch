@@ -23,7 +23,6 @@ def export_and_validate(
         "pt2": out_dir / "model.pt2",
         "onnx": out_dir / "model.onnx",
         "executorch": out_dir / "model.pte",
-        "nnef": out_dir / "model.nnef",
         "tensorflow": out_dir / "model.savedmodel",
         "litert": out_dir / "model.tflite",
     }

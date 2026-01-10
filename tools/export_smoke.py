@@ -183,7 +183,7 @@ def main() -> int:
         "--formats",
         type=str,
         default="onnx,pt2",
-        help="comma-separated: onnx,ort,pt2,aoti,executorch,litert,coreml,tensorrt,nnef,tensorflow",
+        help="comma-separated: onnx,ort,pt2,aoti,executorch,litert,coreml,tensorrt,tensorflow",
     )
     ap.add_argument(
         "--force-torch-msr",
@@ -273,7 +273,6 @@ def main() -> int:
             "tensorflow": ".savedmodel",
             "coreml": ".mlmodel",
             "tensorrt": ".engine",
-            "nnef": ".nnef",
         }.get(fmt_name)
         if ext is None:
             print(f"[skip] unknown format: {fmt_name}")

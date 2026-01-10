@@ -14,7 +14,6 @@ from typing import TYPE_CHECKING, Any, Iterable
 
 import torch
 import torch.distributed as dist
-from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.optim import Optimizer
 
 from .casting import env_bool, env_int
@@ -205,14 +204,7 @@ def _get_default_process_group() -> Any:
         return None
 
 
-def _ddp_supported_params() -> set[str]:
-    try:
-        return set(inspect.signature(DDP.__init__).parameters.keys())
-    except:
-        return set()
-
-
-def _fully_shard_supported_params() -> set[str]:
+def _hsdp_supported_params() -> set[str]:
     if fully_shard is None:
         return set()
     try:
@@ -575,36 +567,11 @@ def distributed_sync(
 ) -> None:
     if not is_distributed():
         return
-    _m = module.module if hasattr(module, "module") else module
-    distributed_broadcast(_m, src=src)
+    distributed_broadcast(module, src=src)
     distributed_barrier(device)
 
 
-def to_ddp(
-    module: torch.nn.Module,
-    *args: Any,
-    device: torch.device,
-    **kwargs: Any,
-) -> torch.nn.Module:
-    module = module.to(device)
-    if isinstance(module, DDP):
-        return module
-
-    ddp_kwargs = {"broadcast_buffers": True, "find_unused_parameters": False}
-    if ids := _get_device_id(device):
-        ddp_kwargs["device_ids"] = list(ids)
-
-    defaults = {
-        "bucket_cap_mb": env_int("STNET_DDP_BUCKET_MB", 25),
-        "gradient_as_bucket_view": True,
-        "static_graph": False,
-    }
-    ddp_kwargs.update({k: v for k, v in defaults.items() if k in _ddp_supported_params()})
-    ddp_kwargs.update(kwargs)
-    return DDP(module, **ddp_kwargs)
-
-
-def to_fsdp(
+def to_hsdp_module(
     module: torch.nn.Module,
     *args: Any,
     mesh: Any | None,
@@ -616,17 +583,37 @@ def to_fsdp(
     if fully_shard is None:
         raise RuntimeError("Missing fully_shard")
 
-    params = _fully_shard_supported_params()
+    params = _hsdp_supported_params()
     fsdp_kwargs: dict[str, Any] = dict(user_kwargs)
-    defaults = {
+    pg_obj: Any | None = None
+    mesh_obj: Any | None = None
+    if mesh is not None:
+        with contextlib.suppress(Exception):
+            from torch.distributed.distributed_c10d import ProcessGroup  # type: ignore
+
+            if isinstance(mesh, ProcessGroup):
+                pg_obj = mesh
+            else:
+                mesh_obj = mesh
+        if pg_obj is None and mesh_obj is None:
+            mesh_obj = mesh
+
+    defaults: dict[str, Any] = {
         "forward_prefetch": env_bool("STNET_FSDP_FWD_PREFETCH", True),
         "limit_all_gathers": env_bool("STNET_FSDP_LIMIT_AG", True),
         "use_orig_params": env_bool("STNET_FSDP_USE_ORIG_PARAMS", True),
-        "mesh" if "mesh" in params else "process_group": mesh,
         "mp_policy": mp_policy,
         "reshard_after_forward": reshard_after_forward,
         "sync_module_states": sync_module_states,
     }
+    if mesh_obj is not None:
+        if "mesh" in params:
+            defaults["mesh"] = mesh_obj
+        elif "device_mesh" in params:
+            defaults["device_mesh"] = mesh_obj
+
+    if pg_obj is not None and "process_group" in params:
+        defaults["process_group"] = pg_obj
     fsdp_kwargs.update(
         {
             k: v
@@ -642,8 +629,311 @@ def to_fsdp(
     with contextlib.suppress(ImportError):
         from torch.distributed.fsdp import register_fsdp_forward_method
 
-        for _name in ("forward", "decode", "predict"):
+        for _name in ("forward", "decode", "predict", "forward_export", "forward_state", "forward_stream"):
             if hasattr(sharded, _name):
                 register_fsdp_forward_method(sharded, _name)
 
     return sharded
+
+
+@lru_cache(maxsize=16)
+def _get_mesh(
+    device_type: str,
+    mesh: tuple[tuple[int, ...], ...],
+) -> Any | None:
+    if not mesh:
+        return None
+    try:
+        from torch.distributed.device_mesh import DeviceMesh
+    except Exception:
+        return None
+    try:
+        mesh_tensor = torch.tensor(mesh, device="cpu", dtype=torch.int)
+        return DeviceMesh(
+            device_type,
+            mesh_tensor,
+            mesh_dim_names=("dp_replicate", "dp_shard"),
+        )
+    except Exception:
+        return None
+
+
+@lru_cache(maxsize=8)
+def _get_mesh_2d(
+    device_type: str,
+    world_size: int,
+    local_world_size: int,
+) -> Any | None:
+    if world_size <= 1:
+        return None
+    if world_size % local_world_size != 0:
+        return None
+    try:
+        from torch.distributed.device_mesh import init_device_mesh
+    except Exception:
+        return None
+    dp_replicate = world_size // local_world_size
+    dp_shard = local_world_size
+    return init_device_mesh(
+        device_type,
+        (int(dp_replicate), int(dp_shard)),
+        mesh_dim_names=("dp_replicate", "dp_shard"),
+    )
+
+
+def _get_local_rank() -> int | None:
+    for k in (
+        "LOCAL_RANK",
+        "SLURM_LOCALID",
+        "OMPI_COMM_WORLD_LOCAL_RANK",
+        "MV2_COMM_WORLD_LOCAL_RANK",
+        "MPI_LOCALRANKID",
+        "PMI_LOCAL_RANK",
+    ):
+        v = os.environ.get(k)
+        if v is None:
+            continue
+        with contextlib.suppress(Exception):
+            return int(str(v).strip())
+    return None
+
+
+def _env_local_world_size() -> int | None:
+    for k in (
+        "LOCAL_WORLD_SIZE",
+        "OMPI_COMM_WORLD_LOCAL_SIZE",
+        "MV2_COMM_WORLD_LOCAL_SIZE",
+        "MPI_LOCALNRANKS",
+        "PMI_LOCAL_SIZE",
+        "SLURM_NTASKS_PER_NODE",
+    ):
+        v = os.environ.get(k)
+        if not v:
+            continue
+        s = str(v).strip()
+        prefix = "".join(itertools.takewhile(lambda ch: ch.isdigit(), s))
+        with contextlib.suppress(Exception):
+            if prefix:
+                return int(prefix)
+            return int(s)
+    return None
+
+
+def _get_host_id() -> str:
+    for k in ("SLURMD_NODENAME", "HOSTNAME"):
+        v = os.environ.get(k)
+        if v:
+            return str(v)
+    with contextlib.suppress(Exception):
+        return socket.gethostname()
+    return ""
+
+
+def _coerce_host_id(host: str) -> str:
+    host = str(host or "").strip()
+    if not host:
+        return ""
+    if host.startswith("[") and host.endswith("]"):
+        host = host[1:-1].strip()
+    host = host.split(".")[0].strip()
+    return host
+
+
+def _gather_process_group(host_id: str, local_rank: int | None) -> list[dict[str, Any]] | None:
+    if not is_distributed():
+        return None
+    try:
+        world = int(dist.get_world_size())
+        rank = int(dist.get_rank())
+    except Exception:
+        return None
+
+    info: dict[str, Any] = {"rank": rank, "host": host_id, "local_rank": local_rank}
+    gathered: list[Any] = [None for _ in range(world)]
+    try:
+        dist.all_gather_object(gathered, info)
+    except Exception:
+        return None
+
+    out: list[dict[str, Any]] = []
+    for x in gathered:
+        if isinstance(x, dict):
+            out.append(x)
+    return out if len(out) == world else None
+
+
+def _from_process_group(
+    topo: list[dict[str, Any]],
+    world_size: int,
+) -> tuple[tuple[int, ...], ...] | None:
+    if not topo or len(topo) != int(world_size):
+        return None
+
+    groups: dict[str, list[tuple[int, int | None]]] = {}
+    seen_ranks: set[int] = set()
+
+    for item in topo:
+        try:
+            r = int(item.get("rank"))
+        except Exception:
+            return None
+        if r < 0 or r >= int(world_size) or r in seen_ranks:
+            return None
+        seen_ranks.add(r)
+
+        host = _coerce_host_id(item.get("host", ""))
+        if not host:
+            return None
+
+        lr = item.get("local_rank", None)
+        lr_i: int | None = None
+        if lr is not None:
+            with contextlib.suppress(Exception):
+                lr_i = int(lr)
+
+        groups.setdefault(host, []).append((r, lr_i))
+
+    if len(seen_ranks) != int(world_size):
+        return None
+
+    hosts = sorted(groups.keys(), key=lambda h: min(rr for rr, _ in groups[h]))
+    sizes = [len(groups[h]) for h in hosts]
+    if not sizes or len(set(sizes)) != 1:
+        return None
+
+    local_world_size = int(sizes[0])
+    if local_world_size <= 0:
+        return None
+
+    mesh_rows: list[tuple[int, ...]] = []
+    for h in hosts:
+        members = groups[h]
+        lrs = [lr for _, lr in members if lr is not None]
+        if len(lrs) == len(members) and len(set(lrs)) == len(members):
+            members_sorted = sorted(members, key=lambda t: int(t[1]))  # type: ignore[arg-type]
+        else:
+            members_sorted = sorted(members, key=lambda t: int(t[0]))
+        row = tuple(int(rr) for rr, _ in members_sorted)
+        if len(row) != local_world_size:
+            return None
+        mesh_rows.append(row)
+
+    return tuple(mesh_rows)
+
+
+def _gather_local_world_sizes(local_world_size: int) -> list[int] | None:
+    if not is_distributed():
+        return None
+    try:
+        world = int(dist.get_world_size())
+    except Exception:
+        return None
+    gathered: list[Any] = [None] * int(world)
+    try:
+        dist.all_gather_object(gathered, int(local_world_size))
+    except Exception:
+        return None
+    out: list[int] = []
+    for v in gathered:
+        if not isinstance(v, int):
+            return None
+        out.append(int(v))
+    return out
+
+
+def get_hsdp_mesh(device: torch.device | None = None) -> Any | None:
+    if not is_distributed():
+        return None
+
+    dev = device
+    if dev is None:
+        with contextlib.suppress(Exception):
+            dev = get_device()
+    if dev is None:
+        return None
+
+    dev_type = str(getattr(dev, "type", ""))
+    if dev_type not in {"cuda", "xpu"}:
+        return None
+
+    if dev_type == "cuda":
+        with contextlib.suppress(Exception):
+            if getattr(dev, "index", None) is not None:
+                torch.cuda.set_device(int(dev.index))
+
+    try:
+        world = int(dist.get_world_size())
+    except Exception:
+        return None
+    if world <= 1:
+        return None
+
+    forced = env_int("STNET_HSDP_SHARD_SIZE", 0)
+    local_guess = int(forced) if forced > 0 else int(_env_local_world_size() or 0)
+    if local_guess <= 0:
+        with contextlib.suppress(Exception):
+            if dev_type == "cuda":
+                local_guess = int(torch.cuda.device_count())
+            elif dev_type == "xpu":
+                local_guess = int(get_num_accelerators("xpu") or 0)
+    local_guess = max(1, min(int(local_guess or 1), int(world)))
+
+    sizes = _gather_local_world_sizes(int(local_guess))
+    if not sizes:
+        return None
+    uniq = sorted(set(int(x) for x in sizes if int(x) > 0))
+    if len(uniq) != 1:
+        return None
+    local = int(uniq[0])
+    if local <= 0 or int(world) % int(local) != 0:
+        return None
+
+    if env_bool("STNET_HSDP_EXPLICIT_MESH", False):
+        host_id = _coerce_host_id(_get_host_id())
+        local_rank = _get_local_rank()
+        topo = _gather_process_group(host_id, local_rank)
+        if topo is not None:
+            mesh = _from_process_group(topo, int(world))
+            if mesh is not None:
+                return _get_mesh(dev_type, mesh)
+
+    return _get_mesh_2d(dev_type, int(world), int(local))
+
+
+@lru_cache(maxsize=8)
+def _get_mesh_1d(device_type: str, world_size: int) -> Any | None:
+    if world_size <= 1:
+        return None
+    try:
+        from torch.distributed.device_mesh import init_device_mesh
+    except Exception:
+        return None
+    return init_device_mesh(device_type, (int(world_size),), mesh_dim_names=("dp",))
+
+
+def get_distributed_mesh(device: torch.device | None = None) -> tuple[Any | None, str]:
+    if not is_distributed():
+        return (None, "none")
+
+    dev = device
+    if dev is None:
+        with contextlib.suppress(Exception):
+            dev = get_device()
+    if dev is None:
+        return (None, "none")
+
+    dev_type = str(getattr(dev, "type", ""))
+    if dev_type not in {"cuda", "xpu"}:
+        return (None, "none")
+
+    try:
+        world = int(dist.get_world_size())
+    except Exception:
+        return (None, "none")
+    if world <= 1:
+        return (None, "none")
+
+    hsdp = get_hsdp_mesh(dev)
+    if hsdp is not None:
+        return (hsdp, "hsdp2")
+    return (_get_mesh_1d(dev_type, int(world)), "fsdp2")
