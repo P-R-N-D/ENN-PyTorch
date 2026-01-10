@@ -47,8 +47,19 @@ except ImportError:
 
 Join = _TorchJoin
 
+_DTENSOR_ACTIVE: bool = False
 
-def _unshard_fsdp_module(module: torch.nn.Module) -> None:
+
+def is_dtensor_active() -> bool:
+    return bool(_DTENSOR_ACTIVE)
+
+
+def _set_dtensor_active() -> None:
+    global _DTENSOR_ACTIVE
+    _DTENSOR_ACTIVE = True
+
+
+def _from_hsdp_module(module: torch.nn.Module) -> None:
     if not (is_distributed() and callable(unshard := getattr(module, "unshard", None))):
         return
     try:
@@ -61,6 +72,8 @@ def _unshard_fsdp_module(module: torch.nn.Module) -> None:
                     or type(getattr(p0, "data", None)).__name__ == "DTensor"
                 )
             )
+            if is_dt:
+                _set_dtensor_active()
             if not is_dt:
                 return
         if (handle := unshard(async_op=True)) and callable(wait := getattr(handle, "wait", None)):
@@ -69,7 +82,7 @@ def _unshard_fsdp_module(module: torch.nn.Module) -> None:
         pass
 
 
-def _clean_ip_str(v: Any, strip_zone: bool = True) -> str:
+def _coerce_ip_addr(v: Any, strip_zone: bool = True) -> str:
     s = str(v).strip() if v is not None else ""
     if s.startswith("[") and s.endswith("]"):
         s = s[1:-1].strip()
@@ -78,16 +91,16 @@ def _clean_ip_str(v: Any, strip_zone: bool = True) -> str:
     return s
 
 
-def _looks_like_ip(value: str) -> bool:
+def _is_ip_addr(value: str) -> bool:
     try:
-        ipaddress.ip_address(_clean_ip_str(value))
+        ipaddress.ip_address(_coerce_ip_addr(value))
         return True
     except:
         return False
 
 
 def _canonize_ip(value: Any, loopback: bool = False, link_local: bool = False) -> str | None:
-    s = _clean_ip_str(value)
+    s = _coerce_ip_addr(value)
     if not s:
         return None
     try:
@@ -107,7 +120,7 @@ def _format_endpoint(host: str, port: int) -> str:
         host_text = host_text[1:-1].strip()
     h, p = host_text or "127.0.0.1", int(port)
     try:
-        h = f"[{h}]" if ipaddress.ip_address(_clean_ip_str(h)).version == 6 and ":" in h else h
+        h = f"[{h}]" if ipaddress.ip_address(_coerce_ip_addr(h)).version == 6 and ":" in h else h
     except:
         pass
     return f"{h}:{p}"
@@ -120,7 +133,7 @@ def _parse_endpoint(text: str) -> tuple[str, int]:
     if text.startswith("["):
         host, _, rest = text[1:].partition("]")
         return host.strip(), int(rest[1:]) if rest.startswith(":") and rest[1:].isdigit() else 0
-    if _looks_like_ip(text):
+    if _is_ip_addr(text):
         return text, 0
     host, sep, port = text.rpartition(":")
     if sep and port.isdigit():
@@ -133,7 +146,7 @@ def _canonize_host(ep: str, default: str, link_local: bool) -> tuple[str, int]:
         return default, 0
     host, port = _parse_endpoint(ep)
     host = _canonize_ip(host or default, loopback=True, link_local=link_local) or (
-        default if _looks_like_ip(host) else host
+        default if _is_ip_addr(host) else host
     )
     return host, port if 0 < port <= 65535 else 0
 
@@ -173,7 +186,7 @@ def _get_preferred_ip_cached(
             ):
                 continue
             try:
-                ip = ipaddress.ip_address(_clean_ip_str(canon))
+                ip = ipaddress.ip_address(_coerce_ip_addr(canon))
             except:
                 continue
             if ip.is_unspecified:
@@ -231,7 +244,7 @@ def resolve_ip_expr(
     )
     if lit := _canonize_ip(host_text, loopback=allow_loopback, link_local=link_local):
         return lit
-    addrs = _safe_getaddrinfo(_clean_ip_str(host_text))
+    addrs = _safe_getaddrinfo(_coerce_ip_addr(host_text))
     if not addrs:
         return None
     res = {4: [], 6: []}
@@ -240,7 +253,7 @@ def resolve_ip_expr(
             canon := _canonize_ip(a[4][0], loopback=allow_loopback, link_local=link_local)
         ):
             with contextlib.suppress(Exception):
-                res[ipaddress.ip_address(_clean_ip_str(canon)).version].append(canon)
+                res[ipaddress.ip_address(_coerce_ip_addr(canon)).version].append(canon)
     vers = (6, 4) if (prefer_ipv6 is None or prefer_ipv6) else (4, 6)
     for v in vers:
         if res[v]:
@@ -248,7 +261,7 @@ def resolve_ip_expr(
     if "%" in host_text and link_local:
         for v in vers:
             for ip in res[v]:
-                if v == 6 and ipaddress.ip_address(_clean_ip_str(ip)).is_link_local:
+                if v == 6 and ipaddress.ip_address(_coerce_ip_addr(ip)).is_link_local:
                     return f"{ip}%{host_text.partition('%')[2]}"
     return None
 
@@ -271,7 +284,7 @@ def validate_ip_expr(
     for h in [host, fallback]:
         txt = str(h).strip() if h else ""
         if txt:
-            if _looks_like_ip(txt):
+            if _is_ip_addr(txt):
                 if lit := _canonize_ip(txt, loopback=allow_loopback, link_local=link_local):
                     return lit
             elif allow_hostname:
@@ -295,7 +308,7 @@ def is_port_available(
     if not host_ip:
         return False
     try:
-        ver = ipaddress.ip_address(_clean_ip_str(host_ip)).version
+        ver = ipaddress.ip_address(_coerce_ip_addr(host_ip)).version
         family = socket.AF_INET6 if ver == 6 else socket.AF_INET
         addr = (host_ip, port, 0, 0) if ver == 6 else (host_ip, port)
         with contextlib.closing(socket.socket(family, socket.SOCK_STREAM)) as sock:
@@ -337,7 +350,7 @@ def get_available_host(
         or "127.0.0.1"
     )
     try:
-        ver = ipaddress.ip_address(_clean_ip_str(host)).version
+        ver = ipaddress.ip_address(_coerce_ip_addr(host)).version
         family, addr = (
             (socket.AF_INET6, (host, 0, 0, 0)) if ver == 6 else (socket.AF_INET, (host, 0))
         )
@@ -394,7 +407,7 @@ def get_preferred_ip(
     )
 
 
-def initialize_master_addr(
+def init_master_addr(
     endpoint: Optional[str],
     *args: Any,
     prefer_ipv6: bool = True,
@@ -578,6 +591,7 @@ def to_hsdp_module(
     pg_obj: Any | None = None
     mesh_obj: Any | None = None
     if mesh is not None:
+        _set_dtensor_active()
         with contextlib.suppress(Exception):
             from torch.distributed.distributed_c10d import ProcessGroup  # type: ignore
 

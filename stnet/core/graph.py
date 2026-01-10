@@ -5,14 +5,15 @@ import contextlib
 import importlib
 import sys
 import threading
+import traceback
 from contextlib import AbstractContextManager, suppress, nullcontext
 from typing import Any, Callable, Dict, List, Optional, Iterator
 
 import torch
 from torch import nn
 
-from .casting import env_first, env_first_int
-from .distributed import broadcast_scalar, is_distributed
+from .casting import env_bool, env_first, env_first_int
+from .distributed import broadcast_scalar, is_distributed, is_dtensor_active
 from .system import is_accelerator_available, process_cpu_count
 
 try:
@@ -468,7 +469,7 @@ def compile(
         if isinstance(existing, dict):
             options_merged = {**options_merged, **existing}
         compile_kwargs["options"] = options_merged
-    if mode_value is not None and isinstance(compile_kwargs.get("options", None), dict):
+    if isinstance(compile_kwargs.get("options", None), dict):
         inductor_cfg = _get_inductor_config()
         patch = getattr(inductor_cfg, "patch", None) if inductor_cfg is not None else None
 
@@ -487,12 +488,14 @@ def compile(
                 for k, v in options_dict.items()
                 if isinstance(k, str) and _has_cfg_key(inductor_cfg, k)
             }
+            strip_options = mode_value is not None
             with _INDUCTOR_CONFIG_LOCK:
                 with patch(patchable) if patchable else nullcontext():
-                    compile_kwargs.pop("options", None)
+                    if strip_options or patchable:
+                        compile_kwargs.pop("options", None)
                     return compile_fn(module, **compile_kwargs)
-        compile_kwargs.pop("options", None)
-        return compile_fn(module, **compile_kwargs)
+        if mode_value is not None:
+            compile_kwargs.pop("options", None)
     return compile_fn(module, **compile_kwargs)
 
 
@@ -819,6 +822,19 @@ def is_checkpoint() -> bool:
     return bool(getattr(_CKPT_TL, "depth", 0) or 0)
 
 
+def _raised_from_checkpointed_fn(err: BaseException) -> bool:
+    tb = err.__traceback__
+    if tb is None:
+        return False
+    for frame, _ in traceback.walk_tb(tb):
+        if (
+            frame.f_code.co_name == "_state"
+            and frame.f_globals.get("__name__") == __name__
+        ):
+            return True
+    return False
+
+
 def coerce_checkpoint(
     fn: Callable[..., Any],
     *args: Any,
@@ -830,13 +846,24 @@ def coerce_checkpoint(
         isinstance(a, torch.Tensor) and a.requires_grad for a in args
     ):
         return fn(*args)
+    force_reentrant = env_first(("STNET_CKPT_REQUIRE_REENTRANT",), default=None)
+    require_reentrant = (
+        env_bool("STNET_CKPT_REQUIRE_REENTRANT", default=False)
+        if force_reentrant is not None
+        else bool(is_dtensor_active())
+    )
+
     use_reentrant = ckpt_kwargs.pop("use_reentrant", None)
     preserve_rng_state = ckpt_kwargs.pop("preserve_rng_state", None)
     determinism_check = ckpt_kwargs.pop("determinism_check", None)
+
     if use_reentrant is None:
+        use_reentrant = True
+    if require_reentrant:
         use_reentrant = True
     if preserve_rng_state is None:
         preserve_rng_state = True
+
     ck_opts = {
         k: v
         for k, v in [
@@ -846,20 +873,46 @@ def coerce_checkpoint(
         ]
         if v is not None
     }
+
     tried: set[tuple[tuple[str, object], ...]] = set()
-    for opts in [
+    last_type_error: TypeError | None = None
+
+    opts_list: list[dict[str, object]] = [
         ck_opts,
         {k: v for k, v in ck_opts.items() if k != "determinism_check"},
-        {k: v for k, v in ck_opts.items() if k not in ("determinism_check", "use_reentrant")},
-        {k: v for k, v in ck_opts.items() if k != "use_reentrant"},
-        {},
-    ]:
+    ]
+    if require_reentrant:
+        opts_list.extend([{k: v for k, v in ck_opts.items() if k == "use_reentrant"}])
+    else:
+        opts_list.extend(
+            [
+                {
+                    k: v
+                    for k, v in ck_opts.items()
+                    if k not in ("determinism_check", "use_reentrant")
+                },
+                {k: v for k, v in ck_opts.items() if k != "use_reentrant"},
+                {},
+            ]
+        )
+
+    for opts in opts_list:
         key = tuple(sorted(opts.items()))
         if key in tried:
             continue
         tried.add(key)
-        with suppress(TypeError):
+        try:
             return checkpoint(fn, *args, **opts, **ckpt_kwargs)
+        except TypeError as e:
+            if require_reentrant and _raised_from_checkpointed_fn(e):
+                raise
+            last_type_error = e
+            continue
+
+    if require_reentrant:
+        raise TypeError(
+            "DTensor/FSDP2 checkpointing requires `use_reentrant=True`, but torch.utils.checkpoint.checkpoint did not accept a compatible signature in this runtime. Upgrade PyTorch or set STNET_CKPT_REQUIRE_REENTRANT=0 to override."
+        ) from last_type_error
     return checkpoint(fn, *args, **ckpt_kwargs)
 
 

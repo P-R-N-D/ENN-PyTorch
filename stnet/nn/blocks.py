@@ -9,7 +9,7 @@ from typing import Any, Callable, List, Optional, Sequence, Tuple, Union, cast
 import torch
 import torch.nn as nn
 
-from ..core.distributed import _unshard_fsdp_module
+from ..core.distributed import _from_hsdp_module
 from ..core.compat import StochasticDepth, is_meta_or_fake_tensor
 from ..core.graph import coerce_checkpoint, is_export_or_trace, is_symbolic
 from .layers import CrossAttention, DilatedAttention, Retention, norm_layer
@@ -306,7 +306,7 @@ class CrossTransformer(nn.Module):
 
         def _ckpt_impl(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
             if torch.is_grad_enabled():
-                _unshard_fsdp_module(self)
+                _from_hsdp_module(self)
             return _impl(a, b)
 
         if self.training and torch.is_grad_enabled() and not is_export_or_trace():
@@ -430,8 +430,8 @@ class LongNet(nn.Module):
 
     def _ckpt_fn(self, t, layer, key_padding_mask):
         if torch.is_grad_enabled():
-            _unshard_fsdp_module(self)
-            _unshard_fsdp_module(layer)
+            _from_hsdp_module(self)
+            _from_hsdp_module(layer)
         return layer(
             t,
             key_padding_mask=key_padding_mask,

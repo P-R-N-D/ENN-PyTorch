@@ -58,7 +58,7 @@ from .core.casting import env_bool, parse_torch_dtype
 from .core.distributed import (
     get_available_host,
     get_preferred_ip,
-    initialize_master_addr,
+    init_master_addr,
 )
 from .core.graph import inference_mode
 from .core.system import (
@@ -978,7 +978,7 @@ def train(
         rdzv = get_available_host(
             rdzv_endpoint or get_preferred_ip(allow_loopback=True) or "127.0.0.1"
         )
-        master_addr, _master_port = initialize_master_addr(rdzv)
+        master_addr, _master_port = init_master_addr(rdzv)
         _wp = WorkerPolicy.optimize()
         _wp.set_thread_setting()
         cfg_raw = _extract_model_config_dict(model)
@@ -1216,7 +1216,7 @@ def predict(
             _wp = WorkerPolicy.optimize()
             _wp.set_thread_setting()
             rdzv = get_available_host(rdzv_endpoint or get_preferred_ip())
-            master_addr, _ = initialize_master_addr(rdzv)
+            master_addr, _ = init_master_addr(rdzv)
             lc = LaunchConfig(
                 min_nodes=1,
                 max_nodes=int(max_nodes) if max_nodes is not None else int(_wp.nproc_per_node),
