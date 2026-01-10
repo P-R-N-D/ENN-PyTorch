@@ -686,7 +686,13 @@ class StochasticWeightAverage:
         **kwargs: Any,
     ) -> None:
         self._source = model
-        self._averaged = AveragedModel(model, device=device, use_buffers=use_buffers, avg_fn=avg_fn)
+        averaged_device = device or torch.device("cpu")
+        self._averaged = AveragedModel(
+            model,
+            device=averaged_device,
+            use_buffers=use_buffers,
+            avg_fn=avg_fn,
+        )
         self.n_averaged: int = 0
         dev = torch.device(Autocast.coerce_metadata(get_device(), metadata=metadata).device)
         self.master_float, _ = _master_cpu_dtypes(dev, meta=metadata)
