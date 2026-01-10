@@ -111,7 +111,7 @@ from .losses import (
     StudentsTLoss,
     TiledLoss,
 )
-from .optimizers import AdamW, CPUShadowEMA, CPUShadowSWA
+from .optimizers import AdamW, ExponentialMovingAverage, StochasticWeightAverage
 from ..data.nodes import Storage
 from ..data.pipeline import Dataset, get_row
 from ..data.schemas import read_json
@@ -4332,9 +4332,11 @@ def process(*args: Any, **kwargs: Any) -> object:
 
             if use_swa:
                 swa_start_epoch = max(1, int(total_epochs) // 2)
-                swa_helper = CPUShadowSWA(tracked_module, metadata=metadata)
+                swa_helper = StochasticWeightAverage(tracked_module, metadata=metadata)
             else:
-                ema_helper = CPUShadowEMA(tracked_module, decay=0.9999, metadata=metadata)
+                ema_helper = ExponentialMovingAverage(
+                    tracked_module, decay=0.9999, metadata=metadata
+                )
             amp_dtype = getattr(precision, "amp_float", None)
             compute_dtype = amp_dtype or param_dtype
             scaler = torch.amp.GradScaler(

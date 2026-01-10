@@ -288,8 +288,8 @@ def exponential_weight_average(
     pin_memory: bool = False,
     update_every: int = 1,
     non_blocking: Optional[bool] = None,
-) -> "CPUShadowEMA":
-    return CPUShadowEMA(
+) -> "ExponentialMovingAverage":
+    return ExponentialMovingAverage(
         model,
         decay=decay,
         *args,
@@ -311,214 +311,6 @@ def stochastic_weight_average(
     return StochasticWeightAverage(
         model, *args, device=device, use_buffers=use_buffers, avg_fn=avg_fn, **kwargs
     )
-
-
-class CPUShadowEMA(nn.Module):
-    def __init__(
-        self,
-        model: nn.Module,
-        *args: Any,
-        decay: float = 0.9999,
-        metadata: Optional["Dataset[Any]"] = None,
-        pin_memory: bool | None = None,
-        update_every: int = 1,
-        non_blocking: bool | None = None,
-        **kwargs: Any,
-    ) -> None:
-        super().__init__()
-        self.decay = float(decay)
-        self.pin_memory = bool(pin_memory) if pin_memory is not None else False
-        self.update_every = max(1, int(update_every))
-        self.non_blocking = bool(non_blocking) if non_blocking is not None else False
-        meta = metadata if isinstance(metadata, Dataset) else None
-        dev = torch.device(Autocast.coerce_metadata(get_device(), metadata=meta).device)
-        self.master_float, self.master_int = _master_cpu_dtypes(dev, meta)
-        self.shadow: Dict[str, torch.Tensor] = {}
-        self.collected: Dict[str, torch.Tensor] = {}
-        self._scratch: Dict[torch.dtype, torch.Tensor] = {}
-        self._step: int = 0
-        with torch.no_grad():
-            self._init_shadow(model)
-
-    def _iter_named_params(self, model: nn.Module) -> Iterator[tuple[str, torch.Tensor]]:
-        for name, p in model.named_parameters(recurse=True):
-            if not isinstance(p, torch.Tensor):
-                continue
-            if getattr(p, "is_meta", False):
-                continue
-            if p.numel() <= 0:
-                continue
-            if (not p.is_floating_point()) and (not p.is_complex()):
-                continue
-            yield name, p
-
-    def _target_dtype(self, t: torch.Tensor) -> torch.dtype:
-        if t.is_floating_point():
-            return self.master_float
-        if t.is_complex():
-            return torch.complex128 if t.dtype == torch.complex128 else torch.complex64
-        return self.master_int
-
-    def _scratch_view(self, numel: int, shape: torch.Size, dtype: torch.dtype) -> torch.Tensor:
-        buf = self._scratch.get(dtype, None)
-        if buf is None or buf.numel() < numel:
-            self._scratch[dtype] = torch.empty(
-                (int(numel),),
-                device="cpu",
-                dtype=dtype,
-                pin_memory=bool(self.pin_memory),
-            )
-            buf = self._scratch[dtype]
-        return buf[: int(numel)].view(shape)
-
-    def _init_shadow(self, model: nn.Module) -> None:
-        shadow: Dict[str, torch.Tensor] = {}
-        for name, p in self._iter_named_params(model):
-            dt = self._target_dtype(p)
-            shadow[name] = _cpu_offload(
-                p.detach(),
-                dtype=dt,
-                pin_memory=bool(self.pin_memory),
-                non_blocking=bool(self.non_blocking),
-            )
-        self.shadow = shadow
-
-    @torch.no_grad()
-    def update(self, model: nn.Module, optimizer: object | None = None) -> None:
-        _ = optimizer
-        self._step += 1
-        if self.update_every > 1 and (self._step % self.update_every) != 0:
-            return
-
-        decay = float(self.decay)
-        if not (0.0 <= decay < 1.0):
-            raise ValueError(f"EMA decay must be in [0, 1). got decay={decay}")
-        weight = 1.0 - decay
-
-        shadow = self.shadow
-        pin_memory = bool(self.pin_memory)
-
-        for name, p in self._iter_named_params(model):
-            dt = self._target_dtype(p)
-            cur = shadow.get(name, None)
-            if cur is None or (not isinstance(cur, torch.Tensor)) or cur.shape != p.shape or cur.dtype != dt:
-                shadow[name] = _cpu_offload(
-                    p.detach(),
-                    dtype=dt,
-                    pin_memory=pin_memory,
-                    non_blocking=False,
-                )
-                continue
-
-            try:
-                tmp = self._scratch_view(p.numel(), p.shape, dt)
-                tmp.copy_(p.detach(), non_blocking=False)
-            except Exception:
-                tmp = _cpu_offload(p.detach(), dtype=dt, pin_memory=pin_memory, non_blocking=False)
-
-            if cur.is_floating_point() or cur.is_complex():
-                cur.lerp_(tmp, weight)
-            else:
-                cur.copy_(tmp)
-
-    @torch.no_grad()
-    def store(self, model: nn.Module, optimizer: object | None = None) -> None:
-        _ = optimizer
-        self.collected = {}
-        collected = self.collected
-        for name, p in self._iter_named_params(model):
-            collected[name] = _cpu_offload(
-                p.detach(),
-                dtype=p.dtype,
-                pin_memory=bool(self.pin_memory),
-                non_blocking=False,
-            )
-
-    @torch.no_grad()
-    def restore(self, model: nn.Module, optimizer: object | None = None) -> None:
-        _ = optimizer
-        if not self.collected:
-            return
-        for name, p in self._iter_named_params(model):
-            prev = self.collected.get(name, None)
-            if not isinstance(prev, torch.Tensor):
-                continue
-            try:
-                p.copy_(prev.to(device=p.device, dtype=p.dtype), non_blocking=False)
-            except Exception:
-                with contextlib.suppress(Exception):
-                    p.data = prev.to(device=p.device, dtype=p.dtype)
-
-    @torch.no_grad()
-    def apply(self, model: nn.Module, optimizer: object | None = None) -> None:
-        _ = optimizer
-        shadow = self.shadow
-        if not shadow:
-            return
-        for name, p in self._iter_named_params(model):
-            ema_v = shadow.get(name, None)
-            if not isinstance(ema_v, torch.Tensor):
-                continue
-            try:
-                p.copy_(ema_v.to(device=p.device, dtype=p.dtype), non_blocking=False)
-            except Exception:
-                with contextlib.suppress(Exception):
-                    p.data = ema_v.to(device=p.device, dtype=p.dtype)
-
-
-class CPUShadowSWA:
-    def __init__(
-        self,
-        model: nn.Module,
-        *,
-        metadata: Optional["Dataset[Any]"] = None,
-    ) -> None:
-        self.n_averaged: int = 0
-        dev = torch.device(Autocast.coerce_metadata(get_device(), metadata=metadata).device)
-        self.master_float, _ = _master_cpu_dtypes(dev, meta=metadata)
-        self.shadow: Dict[str, torch.Tensor] = {}
-
-    @torch.no_grad()
-    def update(self, model: nn.Module) -> None:
-        self.n_averaged += 1
-        n = int(self.n_averaged)
-        inv_n = 1.0 / float(max(1, n))
-        one_m = 1.0 - inv_n
-
-        for name, p in model.named_parameters(recurse=True):
-            if p is None or (not isinstance(p, torch.Tensor)):
-                continue
-            if not bool(getattr(p, "requires_grad", False)):
-                continue
-            if not bool(p.is_floating_point() or p.is_complex()):
-                continue
-
-            key = str(name)
-            cur = self.shadow.get(key)
-            if cur is None or (not torch.is_tensor(cur)) or cur.shape != p.shape:
-                self.shadow[key] = _cpu_offload(p, self.master_float, pin_memory=False)
-                continue
-
-            src_cpu = _cpu_offload(p, dtype=cur.dtype, pin_memory=False)
-            if bool(p.is_complex()):
-                cur.copy_(src_cpu)
-            else:
-                cur.mul_(one_m).add_(src_cpu, alpha=inv_n)
-
-    @torch.no_grad()
-    def apply(self, model: nn.Module) -> None:
-        if not self.shadow:
-            return
-        for name, p in model.named_parameters(recurse=True):
-            if p is None or (not isinstance(p, torch.Tensor)):
-                continue
-            buf = self.shadow.get(str(name))
-            if buf is None:
-                continue
-            _safe_copy(p, buf)
-
-
-ExponentialMovingAverage = CPUShadowEMA
 
 
 class _TensorDictCompat(nn.Module):
@@ -719,6 +511,169 @@ class AdamW:
         return selected_opt
 
 
+class ExponentialMovingAverage(nn.Module):
+    def __init__(
+        self,
+        model: nn.Module,
+        *args: Any,
+        decay: float = 0.9999,
+        metadata: Optional["Dataset[Any]"] = None,
+        pin_memory: bool | None = None,
+        update_every: int = 1,
+        non_blocking: bool | None = None,
+        **kwargs: Any,
+    ) -> None:
+        super().__init__()
+        self.decay = float(decay)
+        self.pin_memory = bool(pin_memory) if pin_memory is not None else False
+        self.update_every = max(1, int(update_every))
+        self.non_blocking = bool(non_blocking) if non_blocking is not None else False
+        meta = metadata if isinstance(metadata, Dataset) else None
+        dev = torch.device(Autocast.coerce_metadata(get_device(), metadata=meta).device)
+        self.master_float, self.master_int = _master_cpu_dtypes(dev, meta)
+        self.shadow: Dict[str, torch.Tensor] = {}
+        self.collected: Dict[str, torch.Tensor] = {}
+        self._scratch: Dict[torch.dtype, torch.Tensor] = {}
+        self._step: int = 0
+        with torch.no_grad():
+            self._init_shadow(model)
+
+    def _iter_named_params(self, model: nn.Module) -> Iterator[tuple[str, torch.Tensor]]:
+        for name, p in model.named_parameters(recurse=True):
+            if not isinstance(p, torch.Tensor):
+                continue
+            if getattr(p, "is_meta", False):
+                continue
+            if p.numel() <= 0:
+                continue
+            if (not p.is_floating_point()) and (not p.is_complex()):
+                continue
+            yield name, p
+
+    def _target_dtype(self, t: torch.Tensor) -> torch.dtype:
+        if t.is_floating_point():
+            return self.master_float
+        if t.is_complex():
+            return torch.complex128 if t.dtype == torch.complex128 else torch.complex64
+        return self.master_int
+
+    def _scratch_view(self, numel: int, shape: torch.Size, dtype: torch.dtype) -> torch.Tensor:
+        buf = self._scratch.get(dtype, None)
+        if buf is None or buf.numel() < numel:
+            self._scratch[dtype] = torch.empty(
+                (int(numel),),
+                device="cpu",
+                dtype=dtype,
+                pin_memory=bool(self.pin_memory),
+            )
+            buf = self._scratch[dtype]
+        return buf[: int(numel)].view(shape)
+
+    def _init_shadow(self, model: nn.Module) -> None:
+        shadow: Dict[str, torch.Tensor] = {}
+        for name, p in self._iter_named_params(model):
+            dt = self._target_dtype(p)
+            shadow[name] = _cpu_offload(
+                p.detach(),
+                dtype=dt,
+                pin_memory=bool(self.pin_memory),
+                non_blocking=bool(self.non_blocking),
+            )
+        self.shadow = shadow
+
+    @torch.no_grad()
+    def update(self, model: nn.Module, optimizer: object | None = None) -> None:
+        _ = optimizer
+        self._step += 1
+        if self.update_every > 1 and (self._step % self.update_every) != 0:
+            return
+
+        decay = float(self.decay)
+        if not (0.0 <= decay < 1.0):
+            raise ValueError(f"EMA decay must be in [0, 1). got decay={decay}")
+        weight = 1.0 - decay
+
+        shadow = self.shadow
+        pin_memory = bool(self.pin_memory)
+
+        for name, p in self._iter_named_params(model):
+            dt = self._target_dtype(p)
+            cur = shadow.get(name, None)
+            if (
+                cur is None
+                or (not isinstance(cur, torch.Tensor))
+                or cur.shape != p.shape
+                or cur.dtype != dt
+            ):
+                shadow[name] = _cpu_offload(
+                    p.detach(),
+                    dtype=dt,
+                    pin_memory=pin_memory,
+                    non_blocking=False,
+                )
+                continue
+
+            try:
+                tmp = self._scratch_view(p.numel(), p.shape, dt)
+                tmp.copy_(p.detach(), non_blocking=False)
+            except Exception:
+                tmp = _cpu_offload(
+                    p.detach(),
+                    dtype=dt,
+                    pin_memory=pin_memory,
+                    non_blocking=False,
+                )
+
+            if cur.is_floating_point() or cur.is_complex():
+                cur.lerp_(tmp, weight)
+            else:
+                cur.copy_(tmp)
+
+    @torch.no_grad()
+    def store(self, model: nn.Module, optimizer: object | None = None) -> None:
+        _ = optimizer
+        self.collected = {}
+        collected = self.collected
+        for name, p in self._iter_named_params(model):
+            collected[name] = _cpu_offload(
+                p.detach(),
+                dtype=p.dtype,
+                pin_memory=bool(self.pin_memory),
+                non_blocking=False,
+            )
+
+    @torch.no_grad()
+    def restore(self, model: nn.Module, optimizer: object | None = None) -> None:
+        _ = optimizer
+        if not self.collected:
+            return
+        for name, p in self._iter_named_params(model):
+            prev = self.collected.get(name, None)
+            if not isinstance(prev, torch.Tensor):
+                continue
+            try:
+                p.copy_(prev.to(device=p.device, dtype=p.dtype), non_blocking=False)
+            except Exception:
+                with contextlib.suppress(Exception):
+                    p.data = prev.to(device=p.device, dtype=p.dtype)
+
+    @torch.no_grad()
+    def apply(self, model: nn.Module, optimizer: object | None = None) -> None:
+        _ = optimizer
+        shadow = self.shadow
+        if not shadow:
+            return
+        for name, p in self._iter_named_params(model):
+            ema_v = shadow.get(name, None)
+            if not isinstance(ema_v, torch.Tensor):
+                continue
+            try:
+                p.copy_(ema_v.to(device=p.device, dtype=p.dtype), non_blocking=False)
+            except Exception:
+                with contextlib.suppress(Exception):
+                    p.data = ema_v.to(device=p.device, dtype=p.dtype)
+
+
 class StochasticWeightAverage:
     def __init__(
         self,
@@ -727,10 +682,15 @@ class StochasticWeightAverage:
         device: Optional[torch.device] = None,
         use_buffers: bool = True,
         avg_fn: Optional[Any] = None,
+        metadata: Optional["Dataset[Any]"] = None,
         **kwargs: Any,
     ) -> None:
         self._source = model
         self._averaged = AveragedModel(model, device=device, use_buffers=use_buffers, avg_fn=avg_fn)
+        self.n_averaged: int = 0
+        dev = torch.device(Autocast.coerce_metadata(get_device(), metadata=metadata).device)
+        self.master_float, _ = _master_cpu_dtypes(dev, meta=metadata)
+        self.shadow: Dict[str, torch.Tensor] = {}
 
     @property
     def module(self) -> nn.Module:
@@ -739,6 +699,14 @@ class StochasticWeightAverage:
     @property
     def source(self) -> nn.Module:
         return self._source
+
+    @torch.no_grad()
+    def update(self, model: Optional[nn.Module] = None) -> None:
+        target = model if model is not None else self._source
+        if target is None:
+            raise RuntimeError("StochasticWeightAverage was initialised without a source model")
+        self.update_weight(target)
+        self._update_shadow(target)
 
     def update_weight(self, model: Optional[nn.Module] = None) -> None:
         target = model if model is not None else self._source
@@ -749,6 +717,45 @@ class StochasticWeightAverage:
                 self._averaged.update_parameters(target)
             except Exception as e:
                 raise RuntimeError(f"SWA update failed: {e}") from e
+
+    @torch.no_grad()
+    def _update_shadow(self, model: nn.Module) -> None:
+        self.n_averaged += 1
+        n = int(self.n_averaged)
+        inv_n = 1.0 / float(max(1, n))
+        one_m = 1.0 - inv_n
+
+        for name, p in model.named_parameters(recurse=True):
+            if p is None or (not isinstance(p, torch.Tensor)):
+                continue
+            if not bool(getattr(p, "requires_grad", False)):
+                continue
+            if not bool(p.is_floating_point() or p.is_complex()):
+                continue
+
+            key = str(name)
+            cur = self.shadow.get(key)
+            if cur is None or (not torch.is_tensor(cur)) or cur.shape != p.shape:
+                self.shadow[key] = _cpu_offload(p, self.master_float, pin_memory=False)
+                continue
+
+            src_cpu = _cpu_offload(p, dtype=cur.dtype, pin_memory=False)
+            if bool(p.is_complex()):
+                cur.copy_(src_cpu)
+            else:
+                cur.mul_(one_m).add_(src_cpu, alpha=inv_n)
+
+    @torch.no_grad()
+    def apply(self, model: nn.Module) -> None:
+        if not self.shadow:
+            return
+        for name, p in model.named_parameters(recurse=True):
+            if p is None or (not isinstance(p, torch.Tensor)):
+                continue
+            buf = self.shadow.get(str(name))
+            if buf is None:
+                continue
+            _safe_copy(p, buf)
 
     @contextlib.contextmanager
     def reduction(self, model: nn.Module) -> Iterator[None]:
