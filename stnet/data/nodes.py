@@ -2227,7 +2227,6 @@ class Sampler(torch.utils.data.Sampler):
                         self._mmap_thread_local_overflow_warned = True
                     return self._features, self._labels
                 self._mmap_thread_local_created += 1
-
         try:
             f_new = MemoryMappedTensor.from_filename(
                 filename=str(self._feat_path),
