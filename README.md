@@ -77,17 +77,17 @@ pip install -e .[dev]
 
 > **Platform note**: many `deployment_full` backends are OS/driver/python dependent (e.g., CoreML on macOS, TensorRT on Linux/CUDA, ExecuTorch often lacks wheels for Python ≥3.12). If you only need ONNX export, installing `onnx` (and optionally `onnxruntime`) is usually sufficient.
 
-## Distributed training & inference (HSDP2)
+## Distributed training & inference (HSDP)
 
 STNet uses **FSDP2 (composable `fully_shard`)** for both training and inference on GPU/XPU.
-When running multi-node, STNet will prefer an **HSDP2-style 2D DeviceMesh**:
+When running multi-node, STNet will prefer an **HSDP-style 2D DeviceMesh**:
 
 - **Shard** within a node (across local GPUs)
 - **Replicate** across nodes (no cross-node parameter sharding)
 
 ### Heterogeneous nodes (different GPU counts)
 
-HSDP2 requires a rectangular 2D mesh (i.e., the same number of local ranks/GPUs per node). When nodes have different GPU counts, STNet will **automatically fall back to a 1D FSDP2 mesh** across all ranks. This keeps the run working (no hang/crash), but it does mean **parameters can be sharded across nodes** in the fallback mode.
+HSDP requires a rectangular 2D mesh (i.e., the same number of local ranks/GPUs per node). When nodes have different GPU counts, STNet will **automatically fall back to a 1D FSDP2 mesh** across all ranks. This keeps the run working (no hang/crash), but it does mean **parameters can be sharded across nodes** in the fallback mode.
 
 ### Mesh selection
 
