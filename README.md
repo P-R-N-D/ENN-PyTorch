@@ -85,7 +85,7 @@ When running multi-node, STNet will prefer an **HSDP-style 2D DeviceMesh**:
 - **Shard** within a node (across local GPUs)
 - **Replicate** across nodes (no cross-node parameter sharding)
 
-### Heterogeneous nodes (different GPU counts)
+### Asymmetric nodes (different GPU counts)
 
 HSDP requires a rectangular 2D mesh (i.e., the same number of local ranks/GPUs per node). When nodes have different GPU counts, STNet will **automatically fall back to a 1D FSDP2 mesh** across all ranks. This keeps the run working (no hang/crash), but it does mean **parameters can be sharded across nodes** in the fallback mode.
 
