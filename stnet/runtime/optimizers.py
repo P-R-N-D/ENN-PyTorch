@@ -28,10 +28,12 @@ from tensordict import TensorDict, TensorDictBase
 from torch import nn, optim
 from torch.optim.swa_utils import AveragedModel, SWALR, update_bn
 
-from ..core.precision import Autocast, PrecisionPolicy, is_scale_safe
+from .wrappers import _TensorDictCompat
+
+from ..core.precision import Autocast, is_scale_safe
+from ..core.policies import ModelPolicy, PrecisionPolicy
 from ..core.system import get_device, optimal_optimizer_params
 from ..data.pipeline import Dataset
-from ..nn.architecture import ModelPolicy
 
 
 _LOGGER = logging.getLogger(__name__)
@@ -311,18 +313,6 @@ def stochastic_weight_average(
     return StochasticWeightAverage(
         model, *args, device=device, use_buffers=use_buffers, avg_fn=avg_fn, **kwargs
     )
-
-
-class _TensorDictCompat(nn.Module):
-    def __init__(self, averaged_module: nn.Module, key: str) -> None:
-        super().__init__()
-        self._averaged_module = averaged_module
-        self._key = str(key)
-
-    def forward(self, x: torch.Tensor) -> Any:
-        bs = int(x.shape[0]) if (hasattr(x, "ndim") and x.ndim >= 1) else 1
-        td = TensorDict({self._key: x}, batch_size=[bs], device=x.device)
-        return self._averaged_module(td)
 
 
 class AdamW:

@@ -61,8 +61,8 @@ from .core.distributed import (
     init_master_addr,
 )
 from .core.graph import inference_mode
+from .core.policies import WorkerPolicy
 from .core.system import (
-    WorkerPolicy,
     init_python_path,
     init_start_method,
     new_dir,

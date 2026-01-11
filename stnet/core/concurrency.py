@@ -24,13 +24,13 @@ from typing import Any, Callable, Optional, Protocol, Tuple, runtime_checkable
 import torch
 
 from .datatypes import env_first, env_first_float, env_first_int, env_flag
+from .policies import WorkerPolicy, optimize_threads
+
 from .system import (
     CPU,
-    WorkerPolicy,
     _default_thread_limit,
     _optimal_local_worlds,
     _optimal_threads,
-    optimize_threads,
 )
 
 
