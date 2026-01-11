@@ -30,7 +30,7 @@ from torch.optim.swa_utils import AveragedModel, SWALR, update_bn
 
 from .wrappers import _TensorDictCompat
 
-from ..core.precision import Autocast, is_scale_safe
+from ..core.amp import Autocast, is_scale_safe
 from ..core.policies import ModelPolicy, PrecisionPolicy
 from ..core.system import get_device, optimal_optimizer_params
 from ..data.pipeline import Dataset

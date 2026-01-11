@@ -208,7 +208,7 @@ stnet/
     compat.py             # accelerator/memory helpers, meta/fake tensor guards
     distributed.py        # elastic launch + process group utilities
     graph.py              # torch.compile helpers, graph break utilities
-    precision.py          # AMP negotiation/autocast policies, dtype guards
+    amp.py                # AMP negotiation/autocast policies, dtype guards
     profiler.py           # lightweight FLOP/IO timers
     staging.py            # pinned-memory staging pool
     system.py             # thread/NUMA tuning, device detection, temp dirs

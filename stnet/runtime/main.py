@@ -92,7 +92,7 @@ from ..core.graph import (
     to_checkpoint,
 )
 from ..core.profiler import FlopCounter
-from ..core.precision import Autocast
+from ..core.amp import Autocast
 from ..core.policies import ModelPolicy, PrecisionPolicy
 from ..nn.architecture import Model
 from ..nn.layers import Recorder, resize_scaler_buffer
@@ -1132,7 +1132,7 @@ def _get_sample_size(
         meta = dataset if isinstance(dataset, Dataset) else Dataset.for_device(device)
         try:
             from ..core.graph import inference_mode
-            from ..core.precision import Autocast
+            from ..core.amp import Autocast
 
             feats, labels, *_rest = meta.preprocess(batch, return_keys=False)
             X = to_torch_tensor(feats)
