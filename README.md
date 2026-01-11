@@ -114,7 +114,7 @@ import stnet
 
 from stnet.config import ModelConfig
 from stnet.runtime.losses import StudentsTLoss
-from stnet.core.system import optimize_threads
+from stnet.core.policies import optimize_threads
 
 # 1) Build a config and model
 cfg = ModelConfig(

@@ -50,10 +50,10 @@ from ..core.datatypes import (
 )
 from ..core.graph import inference_mode
 from ..core.concurrency import Buffer, Pool, ProducerError, close, get_affinity, new_thread
+from ..core.policies import WorkerPolicy
 from ..core.system import (
     CPU,
     Memory,
-    WorkerPolicy,
     accelerator_stream,
     accelerator_type,
     current_accelerator_stream,

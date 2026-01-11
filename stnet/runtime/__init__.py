@@ -10,6 +10,7 @@ __all__ = [
     "main",
     "losses",
     "optimizers",
+    "wrappers",
 ]
 
 

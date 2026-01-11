@@ -92,8 +92,9 @@ from ..core.graph import (
     to_checkpoint,
 )
 from ..core.profiler import FlopCounter
-from ..core.precision import Autocast, PrecisionPolicy
-from ..nn.architecture import Model, ModelPolicy
+from ..core.precision import Autocast
+from ..core.policies import ModelPolicy, PrecisionPolicy
+from ..nn.architecture import Model
 from ..nn.layers import Recorder, resize_scaler_buffer
 from .losses import (
     CRPSLoss,
@@ -2199,7 +2200,7 @@ def epochs(
                 per_batch = 1
     if per_batch is None or per_batch <= 0:
         per_batch = 1
-    from ..data.pipeline import BatchPolicy
+    from ..core.policies import BatchPolicy
 
     fixed_accum = 2 if getattr(device, "type", "cpu") == "cpu" else 4
     min_grad_accum = fixed_accum
