@@ -28,95 +28,11 @@ from ..data.schemas import default_underflow_action, normalize_underflow_action
 if TYPE_CHECKING:
     from ..data.pipeline import Dataset
 
+
 _TORCH_THREAD_CFG_LOCK = threading.Lock()
 _TORCH_NUM_THREADS_SET: Optional[int] = None
 _TORCH_INTEROP_THREADS_SET: Optional[int] = None
 _TORCH_INTEROP_LOCKED: bool = False
-
-@dataclass(slots=True)
-class PrecisionPolicy:
-    master_float: torch.dtype = torch.float32
-    amp_dtype: Optional[torch.dtype] = None
-    fsdp_param_dtype: torch.dtype = torch.float32
-    fsdp_reduce_dtype: torch.dtype = torch.float32
-    fsdp_output_dtype: torch.dtype = torch.float32
-    bn_buffers_dtype: torch.dtype = torch.float32
-    underflow_action: str = "warn"
-
-    @property
-    def amp_float(self) -> Optional[torch.dtype]:
-        return self.amp_dtype
-
-    @classmethod
-    def from_metadata(
-        cls,
-        device: Union[torch.device, str],
-        metadata: Any | None,
-        *args: Any,
-        logger: Optional[logging.Logger] = None,
-        safety_margin: float = 8.0,
-    ) -> "PrecisionPolicy":
-        dev = torch.device(device)
-        meta = metadata
-        if meta is None:
-            meta = DeviceMeta.for_device(dev)
-        else:
-            with contextlib.suppress(Exception):
-                setattr(meta, "device", dev)
-                if callable(f := getattr(meta, "refresh", None)):
-                    f()
-        action = normalize_underflow_action(
-            getattr(meta, "underflow_action", None), default=default_underflow_action()
-        )
-        with contextlib.suppress(Exception):
-            setattr(meta, "underflow_action", action)
-        is_negotiable = bool(getattr(meta, "is_negotiable", False))
-        safety = float(safety_margin)
-        amp_dtype: Optional[torch.dtype] = None
-        master_float = (
-            torch.float32
-            if is_negotiable
-            or (
-                dev.type not in ("cpu", "xpu", "mps")
-                and is_scale_safe(torch.float32, meta, safety_margin=safety)
-            )
-            else torch.float64
-        )
-
-        if dev.type == "cuda":
-            if is_negotiable and is_scale_safe(torch.float32, meta, safety_margin=safety):
-                master_float = torch.float32
-            if is_cuda_bf16_supported(dev) and is_scale_safe(
-                torch.bfloat16, meta, safety_margin=safety
-            ):
-                amp_dtype = torch.bfloat16
-            elif is_scale_safe(torch.float16, meta, safety_margin=safety):
-                amp_dtype = torch.float16
-        elif dev.type == "xpu":
-            amp_dtype = torch.bfloat16
-        elif dev.type == "mps":
-            amp_dtype = torch.float16
-
-        fsdp_dt = amp_dtype if master_float == torch.float32 and amp_dtype else master_float
-        return cls(
-            master_float=master_float,
-            amp_dtype=amp_dtype,
-            fsdp_param_dtype=fsdp_dt,
-            fsdp_reduce_dtype=fsdp_dt,
-            fsdp_output_dtype=fsdp_dt,
-            bn_buffers_dtype=master_float,
-            underflow_action=str(action),
-        )
-
-    def to_fsdp_policy(self):
-        from torch.distributed.fsdp import MixedPrecisionPolicy
-
-        return MixedPrecisionPolicy(
-            param_dtype=self.fsdp_param_dtype,
-            reduce_dtype=self.fsdp_reduce_dtype,
-            output_dtype=self.fsdp_output_dtype,
-            cast_forward_inputs=True,
-        )
 
 
 def optimal_procs() -> dict[str, Union[int, str]]:
@@ -139,6 +55,16 @@ def optimize_threads(
     wp.set_thread_setting()
     return wp.get_thread_setting()
 
+
+class LossWeightPolicy(Protocol):
+    def weights(self) -> Tuple[float, float]: ...
+
+    def update(
+        self,
+        top_loss: Optional[torch.Tensor],
+        bottom_loss: Optional[torch.Tensor],
+    ) -> None:
+        raise NotImplementedError
 
 
 @dataclass(slots=True)
@@ -558,7 +484,6 @@ class BatchPolicy:
 
 
 @dataclass(slots=True)
-
 class ModelPolicy:
     @staticmethod
     def negotiate(
@@ -1089,12 +1014,87 @@ class ModelPolicy:
         return (m2, ok, why)
 
 
-class LossWeightPolicy(Protocol):
-    def weights(self) -> Tuple[float, float]: ...
+@dataclass(slots=True)
+class PrecisionPolicy:
+    master_float: torch.dtype = torch.float32
+    amp_dtype: Optional[torch.dtype] = None
+    fsdp_param_dtype: torch.dtype = torch.float32
+    fsdp_reduce_dtype: torch.dtype = torch.float32
+    fsdp_output_dtype: torch.dtype = torch.float32
+    bn_buffers_dtype: torch.dtype = torch.float32
+    underflow_action: str = "warn"
 
-    def update(
-        self,
-        top_loss: Optional[torch.Tensor],
-        bottom_loss: Optional[torch.Tensor],
-    ) -> None:
-        raise NotImplementedError
+    @property
+    def amp_float(self) -> Optional[torch.dtype]:
+        return self.amp_dtype
+
+    @classmethod
+    def from_metadata(
+        cls,
+        device: Union[torch.device, str],
+        metadata: Any | None,
+        *args: Any,
+        logger: Optional[logging.Logger] = None,
+        safety_margin: float = 8.0,
+    ) -> "PrecisionPolicy":
+        dev = torch.device(device)
+        meta = metadata
+        if meta is None:
+            meta = DeviceMeta.for_device(dev)
+        else:
+            with contextlib.suppress(Exception):
+                setattr(meta, "device", dev)
+                if callable(f := getattr(meta, "refresh", None)):
+                    f()
+        action = normalize_underflow_action(
+            getattr(meta, "underflow_action", None), default=default_underflow_action()
+        )
+        with contextlib.suppress(Exception):
+            setattr(meta, "underflow_action", action)
+        is_negotiable = bool(getattr(meta, "is_negotiable", False))
+        safety = float(safety_margin)
+        amp_dtype: Optional[torch.dtype] = None
+        master_float = (
+            torch.float32
+            if is_negotiable
+            or (
+                dev.type not in ("cpu", "xpu", "mps")
+                and is_scale_safe(torch.float32, meta, safety_margin=safety)
+            )
+            else torch.float64
+        )
+
+        if dev.type == "cuda":
+            if is_negotiable and is_scale_safe(torch.float32, meta, safety_margin=safety):
+                master_float = torch.float32
+            if is_cuda_bf16_supported(dev) and is_scale_safe(
+                torch.bfloat16, meta, safety_margin=safety
+            ):
+                amp_dtype = torch.bfloat16
+            elif is_scale_safe(torch.float16, meta, safety_margin=safety):
+                amp_dtype = torch.float16
+        elif dev.type == "xpu":
+            amp_dtype = torch.bfloat16
+        elif dev.type == "mps":
+            amp_dtype = torch.float16
+
+        fsdp_dt = amp_dtype if master_float == torch.float32 and amp_dtype else master_float
+        return cls(
+            master_float=master_float,
+            amp_dtype=amp_dtype,
+            fsdp_param_dtype=fsdp_dt,
+            fsdp_reduce_dtype=fsdp_dt,
+            fsdp_output_dtype=fsdp_dt,
+            bn_buffers_dtype=master_float,
+            underflow_action=str(action),
+        )
+
+    def to_fsdp_policy(self):
+        from torch.distributed.fsdp import MixedPrecisionPolicy
+
+        return MixedPrecisionPolicy(
+            param_dtype=self.fsdp_param_dtype,
+            reduce_dtype=self.fsdp_reduce_dtype,
+            output_dtype=self.fsdp_output_dtype,
+            cast_forward_inputs=True,
+        )
