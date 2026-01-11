@@ -12,7 +12,6 @@ __all__ = [
     "distributed",
     "graph",
     "amp",
-    "precision",
     "profiler",
     "concurrency",
     "system",
