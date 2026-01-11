@@ -9,6 +9,7 @@ import numpy as np
 import torch
 import onnxruntime as ort
 
+from stnet.core.graph import from_buffer
 from wsl_nogil_train import build_dataset
 from stnet.api import new_model, train
 from stnet.config import ModelConfig, PatchConfig
@@ -54,7 +55,8 @@ def export_and_validate(
     pt2_path = targets["pt2"]
     if pt2_path.exists():
         try:
-            ep = torch.export.load(str(pt2_path))
+            with from_buffer():
+                ep = torch.export.load(str(pt2_path))
             with torch.no_grad():
                 pt2_out = ep.module()(sample)
             if hasattr(model, "forward_export"):
