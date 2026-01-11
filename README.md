@@ -7,7 +7,7 @@ This repository also includes a worked example notebook (`notebook.ipynb`) and a
 ## Requirements
 
 ### Mandatory
-- **Python**: >= 3.11
+- **Python**: >= 3.12
 - **PyTorch**: >= 2.8.0
 - **Triton**: >= 3.4.0 (core JIT backend; typically installed alongside PyTorch)
 - **torchao**: >= 0.14.0
@@ -99,7 +99,6 @@ HSDP requires a rectangular 2D mesh (i.e., the same number of local ranks/GPUs p
 
 ## Export / serving notes
 
-- NNEF export has been removed.
 - ONNX export defaults to **opset 18**.
 - Some graphs contain batch-dependent control flow; the export utilities avoid common `batch==1` specialization pitfalls by using safe defaults (and disabling dynamic batching when the current `torch.export.Dim` implementation cannot express constraints).
 
