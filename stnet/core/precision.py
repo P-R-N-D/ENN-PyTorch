@@ -822,4 +822,11 @@ class Autocast:
             yield
 
 
+def __getattr__(name: str) -> Any:
+    if name == "PrecisionPolicy":
+        raise AttributeError(
+            "PrecisionPolicy has moved to stnet.core.policies; "
+            "import it from that module instead."
+        )
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
