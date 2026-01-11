@@ -801,7 +801,10 @@ class Thread:
     @staticmethod
     def _pin_thread_linux(core: int) -> bool:
         try:
-            os.sched_setaffinity(0, {int(core)})
+            tid = threading.get_native_id()
+            if tid <= 0:
+                return False
+            os.sched_setaffinity(int(tid), {int(core)})
             return True
         except Exception:
             return False
