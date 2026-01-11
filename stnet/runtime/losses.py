@@ -12,6 +12,7 @@ from torch.distributions import Normal, StudentT
 from torch.nn import functional as F
 
 from ..core.graph import is_compiling
+from ..core.tensor import to_tensor_like
 
 
 Number = Union[float, int]
@@ -532,16 +533,8 @@ class DistributionLoss(nn.Module):
         )
 
     @staticmethod
-    def _to_tensor_like(x: TensorLike, ref: torch.Tensor) -> torch.Tensor:
-        return (
-            x.to(device=ref.device, dtype=ref.dtype)
-            if torch.is_tensor(x)
-            else torch.tensor(x, device=ref.device, dtype=ref.dtype)
-        )
-
-    @staticmethod
     def _expand_params(x: TensorLike, ref: torch.Tensor) -> torch.Tensor:
-        t = DistributionLoss._to_tensor_like(x, ref)
+        t = to_tensor_like(x, ref)
         return t.view(*[1] * (ref.ndim - t.ndim), *t.shape) if t.ndim < ref.ndim else t
 
     @staticmethod
@@ -843,7 +836,7 @@ class StudentsTLoss(DistributionLoss):
             and self._cached_t_q == float(q)
         ):
             return torch.tensor(self._cached_t_threshold_f64, device=device, dtype=dtype)
-        df = self._to_tensor_like(self.df, torch.empty((), device=device, dtype=dtype))
+        df = to_tensor_like(self.df, torch.empty((), device=device, dtype=dtype))
         try:
             dist = StudentT(df=df)
             thr = dist.icdf(torch.tensor(q, device=device, dtype=dtype))

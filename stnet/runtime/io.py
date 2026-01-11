@@ -23,9 +23,7 @@ from torch.distributed.checkpoint.state_dict import (
     StateDictOptions,
     get_model_state_dict,
 )
-from tensordict import TensorDictBase
-
-from ..core.compat import is_meta_or_fake_tensor
+from ..core.tensor import coerce_tensor, extract_tensor, from_buffer, is_meta_or_fake_tensor
 from ..data.schemas import save_temp, write_json, coerce_json
 from ..nn.layers import Recorder
 
@@ -148,39 +146,6 @@ def _load_model_config(model: object) -> object:
         return {}
 
 
-def _to_tensor(
-    value: object,
-    *args: Any,
-    materialize_meta: bool = True,
-    make_contiguous: bool = True,
-) -> object:
-    if isinstance(value, torch.Tensor):
-        t = value.to_local() if hasattr(value, "to_local") else value
-        if materialize_meta and is_meta_or_fake_tensor(t):
-            t = torch.zeros(t.shape, dtype=t.dtype, device="cpu")
-        t = t.detach()
-        if t.device.type != "cpu":
-            t = t.to(device="cpu")
-        if make_contiguous and not t.is_contiguous():
-            t = t.contiguous()
-        return t
-    if isinstance(value, (list, tuple)):
-        out = [
-            _to_tensor(v, materialize_meta=materialize_meta, make_contiguous=make_contiguous)
-            for v in value
-        ]
-        return type(value)(*out) if hasattr(value, "_fields") else type(value)(out)
-    if isinstance(value, dict):
-        return type(value)(
-            (
-                k,
-                _to_tensor(v, materialize_meta=materialize_meta, make_contiguous=make_contiguous),
-            )
-            for k, v in value.items()
-        )
-    return value
-
-
 def _torch_load_checkpoint(
     path: PathLike, *args: Any, map_location: object = None, weights_only: bool = True
 ) -> object:
@@ -244,25 +209,6 @@ def _onnx_model(model: object) -> Iterator[object]:
                 model.train(True)
 
 
-def _extract_tensor(out: object) -> torch.Tensor:
-    if isinstance(out, TensorDictBase):
-        y = out.get("pred", None)
-        if not isinstance(y, torch.Tensor):
-            y = next((v for v in out.values() if isinstance(v, torch.Tensor)), None)
-        if isinstance(y, torch.Tensor):
-            return y
-        raise RuntimeError("Failed to extract tensor from TensorDict output.")
-    if isinstance(out, torch.Tensor):
-        return out
-    if isinstance(out, (tuple, list)) and out:
-        if isinstance(out[0], torch.Tensor):
-            return out[0]
-        tensor = next((v for v in out if isinstance(v, torch.Tensor)), None)
-        if tensor is not None:
-            return tensor
-    raise RuntimeError("Model forward did not return a tensor output.")
-
-
 def _get_forward_parameters(model_cls: object) -> object:
     with _FORWARD_PARAM_CACHE_LOCK:
         cached = _FORWARD_PARAM_CACHE.get(model_cls)
@@ -307,7 +253,7 @@ def _get_tensor_shape(model: object, sample_input: object) -> object:
         sample = sample_input.to(dev)
         model.eval()
         with torch.no_grad():
-            y_flat = _extract_tensor(
+            y_flat = extract_tensor(
                 _forward(model, sample.unsqueeze(0) if sample.ndim == 1 else sample)
             )
         in_dim = in_dim or int(sample.numel() // sample.shape[0])
@@ -373,16 +319,16 @@ def is_required(module: str, pip_hint: str | None = None) -> None:
         raise ImportError(f"{module} is required for this operation{hint}") from err
 
 
-class _CompatLayer(nn.Module):
+class _CompatModule(nn.Module):
     def __init__(self, net: object) -> None:
         super().__init__()
         self.net = net
 
     def forward(self, x: object) -> object:
-        return _extract_tensor(_forward(self.net, x))
+        return extract_tensor(_forward(self.net, x))
 
 
-class _OnnxLayer:
+class _ONNXModule:
     @staticmethod
     def export(
         model: nn.Module,
@@ -396,7 +342,7 @@ class _OnnxLayer:
         simplify: bool = False,
     ) -> object:
         is_required("onnx", "pip install onnx")
-        wrapper = _CompatLayer(model).eval()
+        wrapper = _CompatModule(model).eval()
         onnx_path = Path(onnx_path)
         onnx_path.parent.mkdir(parents=True, exist_ok=True)
         input_names = ["features"]
@@ -491,11 +437,11 @@ class _OnnxLayer:
     @staticmethod
     def coerce(model: nn.Module, onnx_path: PathLike, *args: Any, **kwargs: Any) -> object:
         if not onnx_path.exists():
-            return Exporter._OnnxLayer.export(model, onnx_path, **kwargs)
+            return Exporter._ONNXModule.export(model, onnx_path, **kwargs)
         return onnx_path
 
 
-class _OrtLayer:
+class _ORTModule:
     @staticmethod
     def to_ort(
         onnx_path: PathLike,
@@ -621,7 +567,7 @@ class Builder:
                 tmp_path = Path(tmp_name)
                 try:
                     save_tensors(
-                        {k: _to_tensor(v) for k, v in model.state_dict().items()},
+                        {k: coerce_tensor(v) for k, v in model.state_dict().items()},
                         str(tmp_path),
                         metadata={"format": "safetensors-v1"},
                     )
@@ -644,8 +590,8 @@ class Exporter:
     _ext_map: dict[str, str] = {}
     _defaults_registered: bool = False
     _defaults_lock = threading.Lock()
-    _OnnxLayer = _OnnxLayer
-    _OrtLayer = _OrtLayer
+    _ONNXModule = _ONNXModule
+    _ORTModule = _ORTModule
     _export_sig_cache: object | None = None
     _export_sig_lock = threading.Lock()
 
@@ -694,8 +640,8 @@ class Exporter:
         with cls._defaults_lock:
             if cls._defaults_registered:
                 return
-            cls.register("onnx", (".onnx",), Onnx())
-            cls.register("ort", (".ort",), Ort())
+            cls.register("onnx", (".onnx",), ONNX())
+            cls.register("ort", (".ort",), ORT())
             cls.register("tensorrt", (".engine",), TensorRT())
             cls.register("coreml", (".mlmodel",), CoreML())
             cls.register("litert", (".tflite",), LiteRT())
@@ -712,7 +658,7 @@ class Exporter:
         return cls._by_name.get(name) if name else None
 
 
-class Onnx(Format):
+class ONNX(Format):
     name = "onnx"
 
     def save(
@@ -723,11 +669,11 @@ class Onnx(Format):
         **kwargs: Any,
     ) -> object:
         with _onnx_model(model) as serving:
-            out = Exporter._OnnxLayer.export(serving, dst, **_onnx_options(kwargs, target="onnx"))
+            out = Exporter._ONNXModule.export(serving, dst, **_onnx_options(kwargs, target="onnx"))
         return (out,)
 
 
-class Ort(Format):
+class ORT(Format):
     name = "ort"
 
     def save(
@@ -738,12 +684,12 @@ class Ort(Format):
         **kwargs: Any,
     ) -> object:
         with _onnx_model(model) as serving:
-            onnx_path = Exporter._OnnxLayer.coerce(
+            onnx_path = Exporter._ONNXModule.coerce(
                 serving,
                 _coerce_onnx_path(dst, kwargs),
                 **_onnx_options(kwargs, target="onnx"),
             )
-            ort_path, optimized = Exporter._OrtLayer.to_ort(
+            ort_path, optimized = Exporter._ORTModule.to_ort(
                 onnx_path,
                 dst,
                 optimization_level=str(kwargs.get("optimization_level", "all")),
@@ -766,7 +712,7 @@ class TensorRT(Format):
     ) -> object:
         del args
         with _onnx_model(model) as serving_model:
-            onnx_path = Exporter._OnnxLayer.coerce(
+            onnx_path = Exporter._ONNXModule.coerce(
                 serving_model,
                 _coerce_onnx_path(dst, kwargs),
                 **_onnx_options(kwargs, target="tensorrt"),
@@ -879,7 +825,7 @@ class CoreML(Format):
 
         with _onnx_model(model) as serving_model:
             sample = _pad_sample(serving_model, kwargs.get("sample_input"))
-            wrapper = _CompatLayer(serving_model).eval()
+            wrapper = _CompatModule(serving_model).eval()
             with torch.no_grad():
                 scripted = torch.jit.trace(
                     wrapper,
@@ -948,7 +894,7 @@ class LiteRT(Format):
         **kwargs: Any,
     ) -> object:
         with _onnx_model(model) as serving_model:
-            onnx_path = Exporter._OnnxLayer.coerce(
+            onnx_path = Exporter._ONNXModule.coerce(
                 serving_model,
                 _coerce_onnx_path(dst, kwargs),
                 **_onnx_options(kwargs, target="litert"),
@@ -1034,13 +980,14 @@ class TorchExport(Format):
             sample = _pad_sample(serving_model, sample)
             if isinstance(sample, torch.Tensor) and sample.ndim == 1:
                 sample = sample.unsqueeze(0)
-            wrapper = _CompatLayer(serving_model).eval()
+            wrapper = _CompatModule(serving_model).eval()
 
             exported = self._export_program(wrapper, sample, **kwargs)
 
             dst = Path(dst)
             dst.parent.mkdir(parents=True, exist_ok=True)
-            torch_save(exported, str(dst))
+            with from_buffer():
+                torch_save(exported, str(dst))
 
             with contextlib.suppress(Exception):
                 write_json(dst.with_suffix(".json"), _load_model_config(model), indent=2)
@@ -1129,7 +1076,7 @@ class TorchAOT(Format):
             sample = _pad_sample(serving_model, sample)
             if isinstance(sample, torch.Tensor) and sample.ndim == 1:
                 sample = sample.unsqueeze(0)
-            wrapper = _CompatLayer(serving_model).eval()
+            wrapper = _CompatModule(serving_model).eval()
 
             dynamic_batch = bool(kwargs.get("dynamic_batch", True))
             dynamic_seq = bool(kwargs.get("dynamic_seq", False))
@@ -1229,7 +1176,7 @@ class ExecuTorch(Format):
         with _onnx_model(model) as serving_model:
             sample = kwargs.get("sample_input")
             sample = _pad_sample(serving_model, sample)
-            wrapper = _CompatLayer(serving_model).eval()
+            wrapper = _CompatModule(serving_model).eval()
             with torch.no_grad():
                 try:
                     exported = torch_export(wrapper, (sample,))
@@ -1264,7 +1211,7 @@ class TensorFlow(Format):
         **kwargs: Any,
     ) -> object:
         with _onnx_model(model) as serving_model:
-            onnx_path = Exporter._OnnxLayer.coerce(
+            onnx_path = Exporter._ONNXModule.coerce(
                 serving_model,
                 dst,
                 **_onnx_options(kwargs, target="tensorflow"),

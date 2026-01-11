@@ -80,12 +80,8 @@ from .data.pipeline import (
 from .data.schemas import read_json
 from .nn.architecture import Model
 from .nn.layers import Recorder, resize_scaler_buffer
-from .runtime.io import (
-    _filtered_warnings,
-    _to_tensor,
-    _torch_load_checkpoint,
-    is_required,
-)
+from .core.tensor import coerce_tensor
+from .runtime.io import _filtered_warnings, _torch_load_checkpoint, is_required
 from .runtime.main import _coerce_dcp_keys, process
 
 
@@ -1031,7 +1027,7 @@ def train(
         elastic_launch(lc, process)(ops)
         fallback = os.path.join(ckpt_dir, "model.pt")
         if os.path.isfile(fallback):
-            cpu_state = _to_tensor(
+            cpu_state = coerce_tensor(
                 _torch_load_checkpoint(fallback, map_location="cpu", weights_only=True)
             )
             resize_scaler_buffer(model, cpu_state)

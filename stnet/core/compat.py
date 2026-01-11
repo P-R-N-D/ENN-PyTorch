@@ -11,18 +11,6 @@ from torch import nn
 
 from .graph import compile_distributed_safe
 
-try:
-    import torchdistx.fake
-
-    _tdx_is_fake = getattr(torchdistx.fake, "is_fake", None)
-except:
-    _tdx_is_fake = None
-
-try:
-    from torch._subclasses.fake_tensor import FakeTensor
-except:
-    FakeTensor = tuple()
-
 _PATCH_LOCK = threading.RLock()
 _TORCH_COMPAT: TorchCompat | None = None
 RMSNorm = getattr(nn, "RMSNorm", None)
@@ -77,22 +65,6 @@ def _nansum_impl(tm, x, dim=None, keepdim=False, *args, dtype=None, **kwargs):
         keepdim=keepdim,
         **kwargs,
     )
-
-
-def is_fake_tensor(value: Any) -> bool:
-    if not isinstance(value, torch.Tensor):
-        return False
-    if _tdx_is_fake and (res := _tdx_is_fake(value)):
-        return bool(res)
-    return isinstance(value, FakeTensor)
-
-
-def is_meta_tensor(value: Any) -> bool:
-    return isinstance(value, torch.Tensor) and getattr(value, "is_meta", False)
-
-
-def is_meta_or_fake_tensor(value: Any) -> bool:
-    return is_meta_tensor(value) or is_fake_tensor(value)
 
 
 def torch_compat(module: Any | None = None, nn_module: Any | None = None) -> TorchCompat:

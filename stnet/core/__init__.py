@@ -7,6 +7,7 @@ from types import ModuleType
 
 __all__ = [
     "casting",
+    "tensor",
     "compat",
     "distributed",
     "graph",

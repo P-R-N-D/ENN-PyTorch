@@ -18,7 +18,7 @@ import torch.distributed as dist
 from torch.optim import Optimizer
 
 from .casting import env_bool, env_int
-from .system import get_device, get_num_accelerators, process_cpu_count
+from .system import CPU, get_device, get_num_accelerators
 
 fully_shard = None
 
@@ -458,7 +458,7 @@ def get_world_size(device: Optional[torch.device] = None) -> int:
                     return count
             return 1
         case _:
-            ncpu = process_cpu_count()
+            ncpu = CPU.count()
             return max(1, min(int(ncpu), 4))
 
 

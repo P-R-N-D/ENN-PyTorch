@@ -33,12 +33,12 @@ from tensordict import MemoryMappedTensor, TensorDict, TensorDictBase
 from torchdata.nodes import BaseNode
 
 from ..core.casting import env_first, env_first_float, env_first_int
+from ..core.concurrency import get_affinity
 from ..core.system import (
     Memory,
     WorkerPolicy,
     accelerator,
     cuda_compute_capability,
-    get_affinity,
     get_device,
     get_device_stats,
     is_accelerator_available,

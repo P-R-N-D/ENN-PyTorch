@@ -2,6 +2,11 @@
 from __future__ import annotations
 
 import contextlib
+import ctypes
+import importlib
+import itertools
+import platform
+import sys
 import math
 import os
 import collections
@@ -13,11 +18,20 @@ import time
 from collections.abc import Sequence
 from dataclasses import dataclass
 from functools import lru_cache
+from types import ModuleType
 from typing import Any, Callable, Optional, Protocol, Tuple, runtime_checkable
 
 import torch
 
-from .casting import env_first, env_first_float, env_flag
+from .casting import env_first, env_first_float, env_first_int, env_flag
+from .system import (
+    CPU,
+    WorkerPolicy,
+    _default_thread_limit,
+    _optimal_local_worlds,
+    _optimal_threads,
+    optimize_threads,
+)
 
 
 def _get_throttle_state() -> str:
@@ -650,3 +664,355 @@ class Buffer:
 
     def is_stopped(self) -> bool:
         return bool(self._stop.is_set())
+
+
+_TLB_SINGLETON: Optional["Thread"] = None
+_TLB_SINGLETON_LOCK = threading.Lock()
+
+
+def get_affinity(io_workers: Optional[int] = None) -> "Thread":
+    global _TLB_SINGLETON
+    if _TLB_SINGLETON is None:
+        with _TLB_SINGLETON_LOCK:
+            if _TLB_SINGLETON is None:
+                default_workers = (
+                    int(io_workers)
+                    if io_workers is not None
+                    else max(1, int(CPU.count()) // 2)
+                )
+                _TLB_SINGLETON = Thread(io_workers=int(default_workers))
+    elif io_workers is not None:
+        _TLB_SINGLETON.tune(io_workers=int(io_workers))
+    return _TLB_SINGLETON
+
+
+class _AffinityCallable:
+    __slots__ = (
+        "_parent",
+        "_fn",
+        "_pin_thread",
+        "_tls",
+        "_lock",
+        "_tune",
+        "_sample_every",
+        "_flush_every",
+        "_perf_counter_ns",
+        "_thread_time_ns",
+    )
+
+    def __init__(
+        self,
+        parent: "Thread",
+        fn: Callable[[Any], Any],
+        pin_thread: Callable[[], None],
+        tls: Any,
+        lock: Any,
+        tune: Callable[..., None],
+        sample_every: int,
+        flush_every: int,
+        perf_counter_ns: Callable[[], int],
+        thread_time_ns: Optional[Callable[[], int]],
+    ) -> None:
+        self._parent = parent
+        self._fn = fn
+        self._pin_thread = pin_thread
+        self._tls = tls
+        self._lock = lock
+        self._tune = tune
+        self._sample_every = sample_every
+        self._flush_every = flush_every
+        self._perf_counter_ns = perf_counter_ns
+        self._thread_time_ns = thread_time_ns
+
+    def __call__(self, *args: Any, **kwargs: Any) -> Any:
+        if not getattr(self._tls, "pinned", False):
+            self._pin_thread()
+        count = getattr(self._tls, "count", 0) + 1
+        self._tls.count = count
+        do_sample = count % self._sample_every == 0
+        t0 = self._perf_counter_ns() if do_sample else 0
+        c0 = self._thread_time_ns() if do_sample and callable(self._thread_time_ns) else 0
+        out = self._fn(*args, **kwargs)
+        if do_sample:
+            t1 = self._perf_counter_ns()
+            c1 = self._thread_time_ns() if callable(self._thread_time_ns) else None
+            try:
+                with self._lock:
+                    self._parent._total_time += max(0, int(t1) - int(t0))
+                    if c1 is not None:
+                        self._parent._total_cpu += max(0, int(c1) - int(c0))
+            except Exception:
+                pass
+        if count % self._flush_every == 0:
+            try:
+                self._tune(initial=False)
+            except Exception:
+                pass
+        return out
+
+
+class Thread:
+    def __init__(
+        self,
+        io_workers: int,
+        enabled: bool = True,
+        allow_omp_bind: bool = True,
+    ) -> None:
+        self._allowed_cpus = sorted({int(x) for x in CPU.allowed()})
+        self._proc_cycle = itertools.cycle(list(self._allowed_cpus))
+        self._enabled = bool(enabled) and bool(self._allowed_cpus)
+        self._nogil = bool(CPU.is_optimized_for_no_gil())
+        self._io_workers = max(1, min(int(io_workers), max(1, len(self._allowed_cpus))))
+        self._pin_attempts = 0
+        self._pin_success = 0
+        self._tls = threading.local()
+        self._lock = Lock()
+        self._total_time = 0
+        self._total_cpu = 0
+        self._omp_ok = bool(allow_omp_bind) and bool(self.spread_threads())
+
+        self._flush_every = max(1, int(env_first_int(("STNET_TLB_FLUSH_EVERY",), 256)))
+        self._sample_every = max(1, int(env_first_int(("STNET_TLB_SAMPLE_EVERY",), 8)))
+
+    @staticmethod
+    def _import_psutil() -> Optional[ModuleType]:
+        spec = importlib.util.find_spec("psutil")
+        if spec is None:
+            return None
+        return importlib.import_module("psutil")
+
+    def _next_core(self) -> int:
+        return int(next(self._proc_cycle))
+
+    @staticmethod
+    def _pin_thread_windows(core: int) -> bool:
+        try:
+            k32 = ctypes.WinDLL("kernel32")
+            k32.GetCurrentThread.restype = ctypes.c_void_p
+            handle = k32.GetCurrentThread()
+            mask = ctypes.c_size_t(1 << int(core))
+            k32.SetThreadAffinityMask.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
+            k32.SetThreadAffinityMask.restype = ctypes.c_size_t
+            prev = k32.SetThreadAffinityMask(handle, mask)
+            return bool(prev)
+        except Exception:
+            return False
+
+    @staticmethod
+    def _pin_thread_linux(core: int) -> bool:
+        try:
+            os.sched_setaffinity(0, {int(core)})
+            return True
+        except Exception:
+            return False
+
+    def tune(self, io_workers: Optional[int] = None) -> None:
+        if io_workers is not None:
+            self._io_workers = max(1, min(int(io_workers), max(1, len(self._allowed_cpus))))
+        self.tune_threads(io_workers=self._io_workers, initial=True)
+
+    def _retune_threads(self) -> None:
+        if not self._enabled:
+            return
+        if getattr(self._tls, "in_retune", False):
+            return
+        self._tls.in_retune = True
+        try:
+            dev_type, nacc = WorkerPolicy._available_accelerator()
+            is_accel = bool(nacc and int(nacc) > 0)
+            cpus = max(1, len(self._allowed_cpus))
+            cap_mult = _default_thread_limit(cpus, is_accel=is_accel, nogil=bool(self._nogil))
+            local_world = _optimal_local_worlds(1)
+            distribute_default = local_world > 1
+            distribute = bool(
+                env_first_int(("STNET_DISTRIBUTE_THREAD_CAP",), int(distribute_default))
+            )
+            thread_cap = _optimal_threads(
+                ncpu=cpus,
+                cap_mult=cap_mult,
+                local_world=local_world,
+                distribute=bool(distribute),
+            )
+            try:
+                intra = int(torch.get_num_threads())
+            except Exception:
+                intra = int(cpus)
+            try:
+                inter = int(torch.get_num_interop_threads())
+            except Exception:
+                inter = 1
+            workers = int(self._io_workers)
+            total = int(intra) + int(inter) + int(workers)
+            if total > int(thread_cap):
+                new_intra = max(1, int(thread_cap) - int(inter) - int(workers))
+                if int(new_intra) < int(intra):
+                    optimize_threads(intra=int(new_intra))
+                    intra = int(new_intra)
+            total = int(intra) + int(inter) + int(workers)
+            if total > int(thread_cap):
+                new_inter = max(1, int(thread_cap) - int(workers) - int(intra))
+                if int(new_inter) < int(inter):
+                    optimize_threads(inter=int(new_inter))
+        finally:
+            self._tls.in_retune = False
+
+    def total_procs(self) -> list[int]:
+        return list(self._allowed_cpus)
+
+    @staticmethod
+    def spread_threads() -> bool:
+        plat = sys.platform
+        if plat.startswith("linux"):
+            candidates = ["libgomp.so.1", "libgomp.so", "libiomp5.so", "libomp.so"]
+        elif plat == "darwin":
+            candidates = ["libomp.dylib", "libiomp5.dylib"]
+        elif os.name == "nt":
+            candidates = ["libiomp5md.dll", "vcomp140.dll"]
+        else:
+            candidates = []
+        for name in candidates:
+            try:
+                lib = ctypes.CDLL(name)
+            except OSError:
+                continue
+            try:
+                fn = getattr(lib, "omp_set_proc_bind")
+                fn.argtypes = [ctypes.c_int]
+                fn.restype = None
+                fn(4)
+                return True
+            except Exception:
+                pass
+            try:
+                kmp = getattr(lib, "kmp_set_defaults")
+                kmp.restype = None
+                kmp(b"KMP_AFFINITY=granularity=fine,scatter")
+                return True
+            except Exception:
+                pass
+        return False
+
+    def pin_thread(self) -> None:
+        if not self._enabled:
+            return
+        attempts = getattr(self._tls, "attempts", 0)
+        if getattr(self._tls, "pinned", False) or attempts >= 4:
+            return
+        self._tls.attempts = attempts + 1
+        core = self._next_core()
+        ok = False
+        if os.name == "nt":
+            ok = self._pin_thread_windows(core)
+        else:
+            plat = sys.platform
+            if plat.startswith("linux"):
+                ok = self._pin_thread_linux(core)
+            elif plat == "darwin":
+                with contextlib.suppress(Exception):
+                    lib = ctypes.CDLL("/usr/lib/libSystem.B.dylib")
+                    THREAD_AFFINITY_POLICY = 4
+
+                    class thread_affinity_policy_data_t(ctypes.Structure):
+                        _fields_ = [("affinity_tag", ctypes.c_int)]
+
+                    policy = thread_affinity_policy_data_t(int(core) + 1)
+                    lib.mach_thread_self.restype = ctypes.c_uint
+                    lib.thread_policy_set.argtypes = [
+                        ctypes.c_uint,
+                        ctypes.c_int,
+                        ctypes.c_void_p,
+                        ctypes.c_uint,
+                    ]
+                    port = lib.mach_thread_self()
+                    ok = (
+                        lib.thread_policy_set(
+                            port,
+                            THREAD_AFFINITY_POLICY,
+                            ctypes.byref(policy),
+                            1,
+                        )
+                        == 0
+                    )
+        self._tls.pinned = bool(ok)
+        self._pin_attempts += 1
+        if ok:
+            self._pin_success += 1
+        if self._pin_attempts >= 16 and self._pin_success == 0 and not self._omp_ok:
+            self._enabled = False
+
+    def tune_threads(
+        self,
+        io_workers: Optional[int] = None,
+        *_unused_args: Any,
+        initial: bool = False,
+        **_unused_kwargs: Any,
+    ) -> None:
+        if not self._enabled:
+            return
+        if initial:
+            cpus = max(1, len(self._allowed_cpus))
+            tuned_workers = max(
+                1,
+                min(
+                    int(io_workers if io_workers is not None else self._io_workers),
+                    cpus,
+                ),
+            )
+            self._io_workers = tuned_workers
+            dev_type, nacc = WorkerPolicy._available_accelerator()
+            is_accel = bool(nacc and int(nacc) > 0)
+            cap_mult = _default_thread_limit(cpus, is_accel=is_accel, nogil=bool(self._nogil))
+            local_world = _optimal_local_worlds(1)
+            distribute_default = local_world > 1
+            distribute = bool(
+                env_first_int(("STNET_DISTRIBUTE_THREAD_CAP",), int(distribute_default))
+            )
+            thread_cap = _optimal_threads(
+                ncpu=cpus,
+                cap_mult=cap_mult,
+                local_world=local_world,
+                distribute=bool(distribute),
+            )
+            try:
+                intra_now = int(torch.get_num_threads())
+            except Exception:
+                intra_now = int(cpus)
+            want_inter = max(1, min(tuned_workers // 2, 4))
+            total = int(intra_now) + int(want_inter) + int(tuned_workers)
+            if total > int(thread_cap):
+                new_intra = max(1, int(thread_cap) - int(want_inter) - int(tuned_workers))
+                if int(new_intra) != int(intra_now):
+                    optimize_threads(intra=int(new_intra))
+                    intra_now = int(new_intra)
+                total = int(intra_now) + int(want_inter) + int(tuned_workers)
+                if total > int(thread_cap):
+                    want_inter = max(1, int(thread_cap) - int(tuned_workers) - int(intra_now))
+            optimize_threads(inter=int(want_inter))
+            return
+        self._retune_threads()
+
+    def new_thread(self, fn: Callable[[Any], Any]) -> Callable[[Any], Any]:
+        if not self._enabled:
+            return fn
+        sample_every = int(self._sample_every) if int(self._sample_every) > 0 else 1
+        flush_every = int(self._flush_every) if int(self._flush_every) > 0 else 1
+        return _AffinityCallable(
+            parent=self,
+            fn=fn,
+            pin_thread=self.pin_thread,
+            tls=self._tls,
+            lock=self._lock,
+            tune=self.tune_threads,
+            sample_every=sample_every,
+            flush_every=flush_every,
+            perf_counter_ns=time.perf_counter_ns,
+            thread_time_ns=getattr(time, "thread_time_ns", None),
+        )
+
+    def optimize_procs(self, io_workers: int) -> int:
+        if not self._enabled:
+            return int(io_workers)
+        cpus = max(1, len(self._allowed_cpus))
+        tuned = max(1, min(int(io_workers), cpus))
+        self._io_workers = tuned
+        return tuned
