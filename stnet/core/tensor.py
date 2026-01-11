@@ -37,9 +37,18 @@ def to_torch_tensor(obj: Any) -> torch.Tensor:
         except Exception:
             fn = None
         if callable(fn):
-            t = fn()
+            try:
+                t = fn()
+            except TypeError:
+                continue
+            except Exception:
+                continue
             if isinstance(t, torch.Tensor):
                 return t
+            try:
+                return torch.as_tensor(t)
+            except Exception:
+                continue
     return torch.as_tensor(obj)
 
 
