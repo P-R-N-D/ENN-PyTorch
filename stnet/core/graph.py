@@ -7,6 +7,7 @@ import inspect
 import sys
 import threading
 import traceback
+from collections.abc import Mapping
 from contextlib import AbstractContextManager, suppress, nullcontext
 from typing import Any, Callable, Dict, List, Optional, Iterator
 
@@ -213,7 +214,7 @@ def _call_from_buffer(
     try:
         sig = inspect.signature(fn)
         params = getattr(sig, "parameters", None)
-        if isinstance(params, dict) and "requires_grad" not in params:
+        if isinstance(params, Mapping) and "requires_grad" not in params:
             return fn(buffer, dtype=dtype, count=count, offset=offset)
     except Exception:
         pass
