@@ -205,7 +205,6 @@ class Builder:
         if not p.suffix and p.exists() and p.is_dir():
             from torch.distributed.checkpoint import FileSystemWriter
             from torch.distributed.checkpoint import save as dcp_save
-
             with _save_sync(p, barrier=True):
                 dcp_save(
                     state_dict={
