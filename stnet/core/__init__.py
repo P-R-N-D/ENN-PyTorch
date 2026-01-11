@@ -11,7 +11,7 @@ __all__ = [
     "compat",
     "distributed",
     "graph",
-    "precision",
+    "amp",
     "profiler",
     "concurrency",
     "system",

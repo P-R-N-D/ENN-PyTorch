@@ -12,7 +12,7 @@ import torch.nn as nn
 
 from .datatypes import env_first_int, env_float, env_str
 from .graph import clear_model_cache
-from .precision import Autocast, DeviceMeta, is_scale_safe
+from .amp import Autocast, DeviceMeta, is_scale_safe
 from .system import (
     CPU,
     _call,

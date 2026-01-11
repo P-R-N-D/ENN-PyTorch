@@ -42,7 +42,7 @@ from ..core.graph import (
     is_export_or_trace,
     coerce_checkpoint,
 )
-from ..core.precision import Autocast, is_scale_safe
+from ..core.amp import Autocast, is_scale_safe
 from ..core.policies import LossWeightPolicy
 from ..core.profiler import FLOP_PROFILER
 from ..core.system import _log_debug, _log_info, CPU, empty_device_cache, get_device
