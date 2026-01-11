@@ -291,27 +291,3 @@ def parse_torch_dtype(src: Any) -> torch.dtype | None:
 def dtype_from_name(name: Any, default: torch.dtype) -> torch.dtype:
     dt = parse_torch_dtype(name)
     return dt if isinstance(dt, torch.dtype) else default
-
-
-def to_torch_tensor(obj: Any) -> torch.Tensor:
-    if isinstance(obj, torch.Tensor):
-        return obj
-    for attr in ("to_torch_tensor", "to_torch", "to_tensor", "as_tensor"):
-        method = getattr(obj, attr, None)
-        if callable(method):
-            try:
-                out = method()
-            except TypeError:
-                continue
-            except Exception:
-                continue
-            if isinstance(out, torch.Tensor):
-                return out
-            try:
-                return torch.as_tensor(out)
-            except Exception:
-                continue
-    try:
-        return torch.as_tensor(obj)
-    except Exception as e:
-        raise TypeError(f"cannot convert to torch.Tensor: {type(obj)}") from e

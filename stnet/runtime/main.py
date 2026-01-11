@@ -37,10 +37,11 @@ from torch.distributed.checkpoint.state_dict import (
 from torch.distributed.elastic.control_plane import worker_main
 
 from ..config import RuntimeConfig, coerce_model_config
+from ..core.concurrency import Cache, Pool, get_affinity
 from ..core.system import (
+    CPU,
     Memory,
     empty_device_cache,
-    get_affinity,
     get_device,
     init_python_path,
     is_oom_error,
@@ -65,17 +66,8 @@ from ..core.system import (
     sync_accelerator,
     posix_time,
 )
-from ..core.casting import (
-    env_bool,
-    env_first,
-    env_first_int,
-    env_float,
-    env_int,
-    env_str,
-    to_torch_tensor,
-)
-from ..core.compat import is_meta_or_fake_tensor
-from ..core.concurrency import Cache, Pool
+from ..core.datatypes import env_bool, env_first, env_first_int, env_float, env_int, env_str
+from ..core.tensor import is_meta_or_fake_tensor, to_torch_tensor
 from ..core.distributed import (
     broadcast_scalar,
     distributed_barrier,
@@ -1344,14 +1336,11 @@ def _gpu_nvml_utils(device: TorchDeviceLike) -> object:
     if _is_nvml_available() and _nvml is not None:
         if _is_nvml_blocked(now := time.perf_counter()):
             return (None, None)
-        try:
-            from ..core.system import Thread
-        except Exception:
-            Thread = None
+        nogil = bool(CPU.is_optimized_for_no_gil())
         min_interval = float(
             _nvml_cfg(
                 "MIN_INTERVAL",
-                0.0 if not Thread or Thread.is_optimized_for_no_gil() else 0.0,
+                0.0,
                 float,
             )
         )
@@ -1390,7 +1379,7 @@ def _gpu_nvml_utils(device: TorchDeviceLike) -> object:
                 backoff_s = float(
                     _nvml_cfg(
                         "BACKOFF",
-                        30.0 if not Thread or Thread.is_optimized_for_no_gil() else 10.0,
+                        30.0 if nogil else 10.0,
                         float,
                     )
                 )
@@ -3470,11 +3459,7 @@ def infer(
     if rank == 0:
         os.makedirs(chunk_dir, exist_ok=True)
     distributed_barrier(device)
-    _nogil_opt = False
-    with contextlib.suppress(Exception):
-        from ..core.system import Thread
-
-        _nogil_opt = bool(Thread.is_optimized_for_no_gil())
+    _nogil_opt = bool(CPU.is_optimized_for_no_gil())
     _cache_default = 16 if _nogil_opt else 4
     cache_q = max(
         1,
@@ -3548,11 +3533,7 @@ def infer(
         with contextlib.suppress(Exception):
             Memory.prefer_local_numa()
         with contextlib.suppress(Exception):
-            _nogil = False
-            with contextlib.suppress(Exception):
-                from ..core.system import Thread
-
-                _nogil = bool(Thread.is_optimized_for_no_gil())
+            _nogil = bool(CPU.is_optimized_for_no_gil())
             _cpu_default = 8
             if _nogil:
                 try:
@@ -3564,11 +3545,7 @@ def infer(
     pred_pool = None
     if non_blocking_ok and Pool is not None and _env_flag("STNET_PRED_PINNED", True):
         with contextlib.suppress(Exception):
-            _nogil = False
-            with contextlib.suppress(Exception):
-                from ..core.system import Thread
-
-                _nogil = bool(Thread.is_optimized_for_no_gil())
+            _nogil = bool(CPU.is_optimized_for_no_gil())
             _pred_default = 2 if not _nogil else 4
             pred_pool_cap = max(2, int(_env_int("STNET_PRED_PIN_POOL_CAPACITY", _pred_default)))
             pred_pool = Pool(capacity=pred_pool_cap, pin_memory=True)

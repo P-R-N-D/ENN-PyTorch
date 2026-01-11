@@ -41,7 +41,7 @@ from torchdata.nodes import (
     SamplerWrapper,
 )
 
-from ..core.casting import (
+from ..core.datatypes import (
     dtype_from_name,
     env_bool,
     env_first_int,
@@ -49,23 +49,20 @@ from ..core.casting import (
     parse_torch_dtype,
 )
 from ..core.graph import inference_mode
-from ..core.concurrency import Buffer, Pool, ProducerError, close
+from ..core.concurrency import Buffer, Pool, ProducerError, close, get_affinity, new_thread
 from ..core.system import (
+    CPU,
     Memory,
-    Thread,
     WorkerPolicy,
     accelerator_stream,
     accelerator_type,
     current_accelerator_stream,
     get_accelerator_index,
-    get_affinity,
+    get_num_accelerators,
     is_accelerator_available,
     is_stream_supported,
     new_accelerator_event,
     new_accelerator_stream,
-    new_thread,
-    num_accelerators,
-    process_cpu_count,
 )
 from . import schemas
 from .pipeline import Dataset
@@ -2071,7 +2068,7 @@ class Sampler(torch.utils.data.Sampler):
         self._mmap_thread_local_overflow_warned = False
         default_tl = False
         with suppress(Exception):
-            default_tl = bool(Thread.is_optimized_for_no_gil())
+            default_tl = bool(CPU.is_optimized_for_no_gil())
         self._mmap_thread_local = env_bool(
             (
                 "STNET_MEMMAP_THREAD_LOCAL_HANDLES",
@@ -2081,7 +2078,7 @@ class Sampler(torch.utils.data.Sampler):
             default=default_tl,
         )
         if self._mmap_thread_local:
-            cpu = int(process_cpu_count() or 8)
+            cpu = int(CPU.count() or 8)
             default_max = max(8, min(64, cpu))
             self._mmap_thread_local_max = env_first_int(
                 ("STNET_MEMMAP_THREAD_LOCAL_MAX", "STNET_MEMMAP_TL_MAX"),
@@ -2777,7 +2774,9 @@ class Loader:
         self._num_shards = 1
         self._shard_id = 0
         try:
-            acc = max(1, int(num_accelerators()))
+            acc = max(1, int(get_num_accelerators("cuda") or 0))
+            if acc <= 0:
+                acc = max(1, int(get_num_accelerators("xpu") or 0))
             thr = max(1, int(self._threads_hint))
             self._num_shards = acc * thr
             dev_idx = self._local_device_index()

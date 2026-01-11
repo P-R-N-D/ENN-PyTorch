@@ -11,7 +11,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from ..core.casting import env_bool, env_int
+from ..core.datatypes import env_bool, env_int
 from ..core.compat import StochasticDepth
 from ..core.system import empty_device_cache, is_oom_error
 from ..core.graph import coerce_checkpoint, torch_compiler_disable, is_symbolic, is_checkpoint
@@ -2374,12 +2374,12 @@ class Recorder(nn.Module):
         cpu_models: List[str] = []
         arch_norm: List[str] = []
         try:
-            from ..core.system import cpu_info, process_cpu_count
+            from ..core.system import CPU
 
-            n_cores = max(1, int(process_cpu_count() or 1))
+            n_cores = max(1, int(CPU.count() or 1))
             model_name: Optional[str] = None
             with contextlib.suppress(Exception):
-                info = cpu_info()
+                info = CPU.info()
                 first = info.split(";", 1)[0]
                 cand = first.split(":", 1)[1] if ":" in first else first
                 cand = str(cand).strip()

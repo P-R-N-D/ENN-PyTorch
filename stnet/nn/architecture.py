@@ -28,8 +28,8 @@ import torch.nn.functional as F
 from tensordict import TensorDictBase
 
 from ..config import ModelConfig
-from ..core.casting import env_bool, env_first_int, env_int
-from ..core.compat import is_meta_or_fake_tensor
+from ..core.datatypes import env_bool, env_first_int, env_int
+from ..core.tensor import is_meta_or_fake_tensor
 from ..core.distributed import _from_hsdp_module
 from ..core.graph import (
     graph_break,
@@ -44,13 +44,7 @@ from ..core.graph import (
 )
 from ..core.precision import Autocast, is_scale_safe
 from ..core.profiler import FLOP_PROFILER
-from ..core.system import (
-    _log_debug,
-    _log_info,
-    empty_device_cache,
-    get_device,
-    Thread,
-)
+from ..core.system import _log_debug, _log_info, CPU, empty_device_cache, get_device
 from ..data.pipeline import Dataset, get_feature_key, get_label_key
 from .blocks import (
     CrossTransformer,
@@ -1398,7 +1392,7 @@ class Model(nn.Module):
         compile_enabled = bool(compile_requested and compile_available)
         nogil_opt = False
         with contextlib.suppress(Exception):
-            nogil_opt = bool(Thread.is_optimized_for_no_gil())
+            nogil_opt = bool(CPU.is_optimized_for_no_gil())
         if nogil_opt and compile_enabled:
             _LOGGER.info(
                 "No-GIL optimized mode detected; using conservative torch.compile defaults "

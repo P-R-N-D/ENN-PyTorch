@@ -3,20 +3,18 @@ from __future__ import annotations
 
 import contextlib
 import importlib
-import inspect
 import sys
 import threading
 import traceback
-from collections.abc import Mapping
 from contextlib import AbstractContextManager, suppress, nullcontext
 from typing import Any, Callable, Dict, List, Optional, Iterator
 
 import torch
 from torch import nn
 
-from .casting import env_bool, env_first, env_first_int
+from .datatypes import env_bool, env_first, env_first_int
 from .distributed import broadcast_scalar, is_distributed, is_dtensor_active
-from .system import is_accelerator_available, process_cpu_count
+from .system import CPU, is_accelerator_available
 
 try:
     from torch.utils.checkpoint import checkpoint as _torch_checkpoint
@@ -200,69 +198,6 @@ def _get_inductor_config() -> Any | None:
 
 def _identity(fn: Callable[..., Any]) -> Callable[..., Any]:
     return fn
-
-
-def _call_from_buffer(
-    fn: Any,
-    buffer: Any,
-    *,
-    dtype: torch.dtype,
-    count: int = -1,
-    offset: int = 0,
-    requires_grad: bool = False,
-) -> torch.Tensor:
-    try:
-        sig = inspect.signature(fn)
-        params = getattr(sig, "parameters", None)
-        if isinstance(params, Mapping) and "requires_grad" not in params:
-            return fn(buffer, dtype=dtype, count=count, offset=offset)
-    except Exception:
-        pass
-    return fn(buffer, dtype=dtype, count=count, offset=offset, requires_grad=requires_grad)
-
-
-@contextlib.contextmanager
-def from_buffer() -> Iterator[None]:
-    orig = getattr(torch, "frombuffer", None)
-    if not callable(orig):
-        yield
-        return
-
-    def _patched(
-        buffer: Any,
-        *,
-        dtype: torch.dtype,
-        count: int = -1,
-        offset: int = 0,
-        requires_grad: bool = False,
-    ) -> torch.Tensor:
-        try:
-            mv = memoryview(buffer)
-        except Exception:
-            return _call_from_buffer(
-                orig, buffer, dtype=dtype, count=count, offset=offset, requires_grad=requires_grad
-            )
-
-        nbytes = mv.nbytes
-        if offset < 0:
-            offset = 0
-        if nbytes <= offset:
-            n = 0 if count < 0 else max(0, int(count))
-            return torch.empty((n,), dtype=dtype)
-
-        if getattr(mv, "readonly", False):
-            buffer = bytearray(mv.tobytes())
-            mv = memoryview(buffer)
-
-        return _call_from_buffer(
-            orig, mv, dtype=dtype, count=count, offset=offset, requires_grad=requires_grad
-        )
-
-    torch.frombuffer = _patched
-    try:
-        yield
-    finally:
-        torch.frombuffer = orig
 
 
 def _decorate_compiler_disable(
@@ -471,7 +406,7 @@ def compile(
                             1,
                         )
                         if int(local_world) > 1:
-                            cpu_count = int(process_cpu_count() or 1)
+                            cpu_count = int(CPU.count() or 1)
                             per_rank = max(1, int(cpu_count) // max(1, int(local_world)))
                             _inductor_config.compile_threads = max(1, min(4, int(per_rank) // 2))
             except Exception:
