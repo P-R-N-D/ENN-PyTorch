@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import contextlib
 import importlib
+import inspect
 import sys
 import threading
 import traceback
@@ -198,6 +199,69 @@ def _get_inductor_config() -> Any | None:
 
 def _identity(fn: Callable[..., Any]) -> Callable[..., Any]:
     return fn
+
+
+def _call_from_buffer(
+    fn: Any,
+    buffer: Any,
+    *,
+    dtype: torch.dtype,
+    count: int = -1,
+    offset: int = 0,
+    requires_grad: bool = False,
+) -> torch.Tensor:
+    try:
+        sig = inspect.signature(fn)
+        params = getattr(sig, "parameters", None)
+        if isinstance(params, dict) and "requires_grad" not in params:
+            return fn(buffer, dtype=dtype, count=count, offset=offset)
+    except Exception:
+        pass
+    return fn(buffer, dtype=dtype, count=count, offset=offset, requires_grad=requires_grad)
+
+
+@contextlib.contextmanager
+def from_buffer() -> Iterator[None]:
+    orig = getattr(torch, "frombuffer", None)
+    if not callable(orig):
+        yield
+        return
+
+    def _patched(
+        buffer: Any,
+        *,
+        dtype: torch.dtype,
+        count: int = -1,
+        offset: int = 0,
+        requires_grad: bool = False,
+    ) -> torch.Tensor:
+        try:
+            mv = memoryview(buffer)
+        except Exception:
+            return _call_from_buffer(
+                orig, buffer, dtype=dtype, count=count, offset=offset, requires_grad=requires_grad
+            )
+
+        nbytes = mv.nbytes
+        if offset < 0:
+            offset = 0
+        if nbytes <= offset:
+            n = 0 if count < 0 else max(0, int(count))
+            return torch.empty((n,), dtype=dtype)
+
+        if getattr(mv, "readonly", False):
+            buffer = bytearray(mv.tobytes())
+            mv = memoryview(buffer)
+
+        return _call_from_buffer(
+            orig, mv, dtype=dtype, count=count, offset=offset, requires_grad=requires_grad
+        )
+
+    torch.frombuffer = _patched
+    try:
+        yield
+    finally:
+        torch.frombuffer = orig
 
 
 def _decorate_compiler_disable(

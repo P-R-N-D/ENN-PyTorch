@@ -75,7 +75,7 @@ from ..core.casting import (
     to_torch_tensor,
 )
 from ..core.compat import is_meta_or_fake_tensor
-from ..core.staging import Cache, Pool
+from ..core.concurrency import Cache, Pool
 from ..core.distributed import (
     broadcast_scalar,
     distributed_barrier,

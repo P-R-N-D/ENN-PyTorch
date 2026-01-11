@@ -49,7 +49,7 @@ from ..core.casting import (
     parse_torch_dtype,
 )
 from ..core.graph import inference_mode
-from ..core.staging import Buffer, Pool, ProducerError, close
+from ..core.concurrency import Buffer, Pool, ProducerError, close
 from ..core.system import (
     Memory,
     Thread,

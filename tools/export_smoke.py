@@ -5,11 +5,17 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import importlib
 import os
 from pathlib import Path
 
 import torch
+
+try:
+    from stnet.core.graph import from_buffer
+except Exception:
+    from_buffer = contextlib.nullcontext
 
 
 def _parse_out_shape(s: str) -> tuple[int, ...]:
@@ -106,7 +112,8 @@ def _ort_run(path: Path, x: torch.Tensor, prefer_cuda: bool) -> bool:
 
 def _pt2_run(path: Path, x: torch.Tensor, device: torch.device) -> bool:
     try:
-        ep = torch.export.load(str(path))
+        with from_buffer():
+            ep = torch.export.load(str(path))
     except Exception as exc:
         print(f"[fail] pt2 load: {type(exc).__name__}: {exc}")
         return False
