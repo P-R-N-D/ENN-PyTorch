@@ -10,7 +10,7 @@ import torch
 import torch._dynamo
 from torch import nn
 
-from ..core.casting import env_str, env_bool
+from ..core.datatypes import env_str, env_bool
 from ..core.graph import (
     torch_compiler_disable,
     is_compiling,

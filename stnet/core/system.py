@@ -26,7 +26,7 @@ from typing import Any, Callable, Optional, Sequence, Tuple, Union
 import torch
 import torch.multiprocessing
 
-from .casting import (
+from .datatypes import (
     env_bool,
     env_first,
     env_first_float,

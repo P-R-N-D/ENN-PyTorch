@@ -54,7 +54,7 @@ from .config import (
     coerce_model_config,
     runtime_config,
 )
-from .core.casting import env_bool, parse_torch_dtype
+from .core.datatypes import env_bool, parse_torch_dtype
 from .core.distributed import (
     get_available_host,
     get_preferred_ip,

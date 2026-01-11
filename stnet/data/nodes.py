@@ -41,7 +41,7 @@ from torchdata.nodes import (
     SamplerWrapper,
 )
 
-from ..core.casting import (
+from ..core.datatypes import (
     dtype_from_name,
     env_bool,
     env_first_int,

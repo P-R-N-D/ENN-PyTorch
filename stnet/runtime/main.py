@@ -66,7 +66,7 @@ from ..core.system import (
     sync_accelerator,
     posix_time,
 )
-from ..core.casting import env_bool, env_first, env_first_int, env_float, env_int, env_str
+from ..core.datatypes import env_bool, env_first, env_first_int, env_float, env_int, env_str
 from ..core.tensor import is_meta_or_fake_tensor, to_torch_tensor
 from ..core.distributed import (
     broadcast_scalar,

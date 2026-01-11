@@ -11,7 +11,7 @@ from typing import Any, Mapping, Optional, Tuple, TypeAlias
 import torch
 from tensordict import TensorDictBase
 
-from ..core.casting import env_first
+from ..core.datatypes import env_first
 
 
 PathLike: TypeAlias = str | os.PathLike[str] | Path

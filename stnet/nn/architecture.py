@@ -28,7 +28,7 @@ import torch.nn.functional as F
 from tensordict import TensorDictBase
 
 from ..config import ModelConfig
-from ..core.casting import env_bool, env_first_int, env_int
+from ..core.datatypes import env_bool, env_first_int, env_int
 from ..core.tensor import is_meta_or_fake_tensor
 from ..core.distributed import _from_hsdp_module
 from ..core.graph import (

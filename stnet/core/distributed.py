@@ -17,7 +17,7 @@ import torch
 import torch.distributed as dist
 from torch.optim import Optimizer
 
-from .casting import env_bool, env_int
+from .datatypes import env_bool, env_int
 from .system import CPU, get_device, get_num_accelerators
 
 fully_shard = None
