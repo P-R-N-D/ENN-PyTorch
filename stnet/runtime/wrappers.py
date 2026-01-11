@@ -845,7 +845,7 @@ class TorchExport(Format):
             raise
 
 
-class TorchAOT(Format):
+class TorchInductor(Format):
     name = "aoti"
 
     def save(
@@ -861,12 +861,14 @@ class TorchAOT(Format):
 
             torch_export = torch.export.export
         except Exception as exc:
-            raise ImportError("torch.export is required for TorchAOT export (PyTorch 2.0+).") from exc
+            raise ImportError(
+                "torch.export is required for TorchInductor export (PyTorch 2.0+)."
+            ) from exc
         try:
             from torch._inductor import aoti_compile_and_package
         except Exception as exc:
             raise ImportError(
-                "torch._inductor (TorchAOT) is required for AOT compilation. "
+                "torch._inductor (TorchInductor) is required for AOT compilation. "
                 "Install a PyTorch build with torch.compile/TorchInductor support."
             ) from exc
 
@@ -912,7 +914,7 @@ class TorchAOT(Format):
                 strict_supported = "strict" in export_kw
                 if strict_supported and export_kw.get("strict", True):
                     warnings.warn(
-                        "torch.export strict=True failed; retrying strict=False for TorchAOT export",
+                        "torch.export strict=True failed; retrying strict=False for TorchInductor export",
                         RuntimeWarning,
                     )
                     export_kw["strict"] = False

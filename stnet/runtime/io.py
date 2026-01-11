@@ -31,8 +31,8 @@ from .wrappers import (
     PathLike,
     TensorFlow,
     TensorRT,
-    TorchAOT,
     TorchExport,
+    TorchInductor,
     _ONNXModule,
     _ORTModule,
 )
@@ -314,7 +314,7 @@ class Exporter:
             cls.register("coreml", (".mlmodel",), CoreML())
             cls.register("litert", (".tflite",), LiteRT())
             cls.register("pt2", (".pt2", ".export"), TorchExport())
-            cls.register("aoti", (".aoti",), TorchAOT())
+            cls.register("aoti", (".aoti",), TorchInductor())
             cls.register("executorch", (".pte",), ExecuTorch())
             cls.register("tensorflow", (".savedmodel", ".pb", ".tf"), TensorFlow())
             cls._defaults_registered = True
