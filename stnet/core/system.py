@@ -17,13 +17,14 @@ import threading
 import time
 from dataclasses import dataclass, replace
 from datetime import timezone, tzinfo
-from functools import lru_cache
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
-from typing import Any, Callable, Optional, Sequence, Tuple, Union
+from typing import Any, Optional, Sequence, Tuple, Union, TYPE_CHECKING
 
 import torch
 import torch.multiprocessing
+
+try:
     from zoneinfo import ZoneInfo
 except Exception:
     ZoneInfo = None
@@ -39,103 +40,7 @@ _LAZY_LOCK_NAMES = {
     "_RUNTIME_CFG_LOCK",
 }
 
-
-def __getattr__(name: str) -> Any:
-    if name in _LAZY_LOCK_NAMES:
-        lock = globals().get(name)
-        if lock is None:
-            from .concurrency import Mutex
-
-            lock = Mutex()
-            globals()[name] = lock
-        return lock
-    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
-
-
-def _mutex_lock(name: str):
-    return getattr(sys.modules[__name__], name)
-
 _FP32_PRECISION_CACHE: dict[str, str] = {}
-
-    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
-
-
-class _LazyMutex:
-    def __init__(self, *, reentrant: bool = False) -> None:
-        self._reentrant = bool(reentrant)
-        self._lock = None
-
-    def _get_lock(self):
-        if self._lock is None:
-            mutex_cls = getattr(sys.modules[__name__], "Mutex")
-            self._lock = mutex_cls(reentrant=self._reentrant)
-        return self._lock
-
-    @property
-    def raw(self):
-        return self._get_lock().raw
-
-    def acquire(self, blocking: bool = True, timeout: float | None = None) -> bool:
-        return self._get_lock().acquire(blocking, timeout)
-
-    def release(self) -> None:
-        self._get_lock().release()
-
-    def locked(self) -> bool:
-        return self._get_lock().locked()
-
-    def __enter__(self) -> "_LazyMutex":
-        self._get_lock().__enter__()
-        return self
-
-    def __exit__(self, exc_type, exc, tb) -> None:
-        self._get_lock().__exit__(exc_type, exc, tb)
-
-
-_FP32_PRECISION_LOCK = _LazyMutex()
-_EMPTY_CACHE_LOCK = _LazyMutex()
-_DEVICE_STATS_LOCK = _LazyMutex()
-_CPU_PROC_LOCK = _LazyMutex()
-        self._lock = None
-
-    def _get_lock(self):
-        if self._lock is None:
-            from .concurrency import Mutex
-
-            self._lock = Mutex(reentrant=self._reentrant)
-        return self._lock
-
-    @property
-    def raw(self):
-        return self._get_lock().raw
-
-    def acquire(self, blocking: bool = True, timeout: float | None = None) -> bool:
-
-    def release(self) -> None:
-        self._get_lock().release()
-
-    def locked(self) -> bool:
-        return self._get_lock().locked()
-
-    def __enter__(self) -> "_LazyMutex":
-        self._get_lock().__enter__()
-        return self
-
-    def __exit__(self, exc_type, exc, tb) -> None:
-        self._get_lock().__exit__(exc_type, exc, tb)
-
-
-_FP32_PRECISION_CACHE: dict[str, str] = {}
-_FP32_PRECISION_LOCK = _LazyMutex()
-
-_EMPTY_CACHE_LOCK = _LazyMutex()
-_EMPTY_CACHE_LAST_CALL_S_BY_DEVICE: dict[Tuple[str, int], float] = {}
-
-_DEVICE_STATS_CACHE: dict[Tuple[str, int], Device] = {}
-_DEVICE_STATS_LOCK = _LazyMutex()
-
-_CPU_PROC_CACHE: Optional[int] = None
-_CPU_PROC_LOCK = _LazyMutex()
 
 _TZ_ALIASES = {
     k: v
@@ -148,7 +53,6 @@ _TZ_ALIASES = {
         ("HKT", "Asia/Hong_Kong"),
         ("SGT", "Asia/Singapore"),
         ("ICT", "Asia/Bangkok"),
-_RUNTIME_CFG_LOCK = _LazyMutex()
         ("WITA", "Asia/Makassar"),
         ("WIT", "Asia/Jayapura"),
         ("PHT", "Asia/Manila"),
@@ -206,7 +110,29 @@ _RUNTIME_CFG = SimpleNamespace(
     sdpa_backends=None,
     te_first=True,
 )
-_RUNTIME_CFG_LOCK = _LazyMutex()
+
+
+if TYPE_CHECKING:
+    from .concurrency import Mutex as _Mutex
+    _FP32_PRECISION_LOCK: _Mutex
+    _EMPTY_CACHE_LOCK: _Mutex
+    _DEVICE_STATS_LOCK: _Mutex
+    _CPU_PROC_LOCK: _Mutex
+    _RUNTIME_CFG_LOCK: _Mutex
+
+
+def __getattr__(name: str) -> Any:
+    if name in _LAZY_LOCK_NAMES:
+        g = globals()
+        if name not in g:
+            from .concurrency import Mutex
+            g[name] = Mutex()
+        return g[name]
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+def _mutex_lock(name: str):
+    return getattr(sys.modules[__name__], name)
 
 
 def _device_from(device: Optional[Union[torch.device, str]]) -> torch.device:
