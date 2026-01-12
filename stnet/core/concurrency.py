@@ -46,6 +46,52 @@ from .system import (
 )
 
 
+def _get_throttle_state() -> str:
+    s = (
+        str(
+            env_first(
+                ("STNET_CACHE_BACKPRESSURE_MODE", "STNET_CACHE_BACKPRESSURE", "STNET_CACHE_MODE"),
+                default="block",
+            )
+            or "block"
+        )
+        .strip()
+        .lower()
+    )
+    return (
+        "sync"
+        if s in {"sync", "synchronous"}
+        else ("raise" if s in {"raise", "error"} else "block")
+    )
+
+
+@lru_cache(maxsize=1)
+def _get_throttle_timeout() -> float:
+    return max(
+        0.0,
+        float(
+            env_first_float(
+                ("STNET_CACHE_BACKPRESSURE_TIMEOUT_S", "STNET_CACHE_SUBMIT_TIMEOUT_S"), default=0.05
+            )
+            or 0.05
+        ),
+    )
+
+
+@lru_cache(maxsize=1)
+def _is_early_release_enabled() -> bool:
+    return bool(env_flag("STNET_CACHE_EARLY_RELEASE", "STNET_CACHE_RELEASE_EARLY", default=True))
+
+
+@lru_cache(maxsize=1)
+def _is_force_unpin_enabled() -> bool:
+    return bool(env_flag("STNET_CACHE_FORCE_UNPIN", "STNET_CACHE_UNPIN", default=False))
+
+
+def _prod_int(shape: Sequence[int]) -> int:
+    return int(max(1, math.prod(int(s) for s in shape)))
+
+    
 def is_free_threading_build() -> bool:
     tag = getattr(getattr(sys, "implementation", None), "cache_tag", "") or ""
     if tag.endswith("t"):
@@ -107,52 +153,6 @@ def new_executor(
         except Exception:
             pass
     return futures.ProcessPoolExecutor(max_workers=mw)
-
-
-def _get_throttle_state() -> str:
-    s = (
-        str(
-            env_first(
-                ("STNET_CACHE_BACKPRESSURE_MODE", "STNET_CACHE_BACKPRESSURE", "STNET_CACHE_MODE"),
-                default="block",
-            )
-            or "block"
-        )
-        .strip()
-        .lower()
-    )
-    return (
-        "sync"
-        if s in {"sync", "synchronous"}
-        else ("raise" if s in {"raise", "error"} else "block")
-    )
-
-
-@lru_cache(maxsize=1)
-def _get_throttle_timeout() -> float:
-    return max(
-        0.0,
-        float(
-            env_first_float(
-                ("STNET_CACHE_BACKPRESSURE_TIMEOUT_S", "STNET_CACHE_SUBMIT_TIMEOUT_S"), default=0.05
-            )
-            or 0.05
-        ),
-    )
-
-
-@lru_cache(maxsize=1)
-def _is_early_release_enabled() -> bool:
-    return bool(env_flag("STNET_CACHE_EARLY_RELEASE", "STNET_CACHE_RELEASE_EARLY", default=True))
-
-
-@lru_cache(maxsize=1)
-def _is_force_unpin_enabled() -> bool:
-    return bool(env_flag("STNET_CACHE_FORCE_UNPIN", "STNET_CACHE_UNPIN", default=False))
-
-
-def _prod_int(shape: Sequence[int]) -> int:
-    return int(max(1, math.prod(int(s) for s in shape)))
 
 
 def close(obj: Any, *args: Any, join_timeout: float | None = 1.0) -> None:
