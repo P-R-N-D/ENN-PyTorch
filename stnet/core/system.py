@@ -39,7 +39,26 @@ except Exception:
     ZoneInfo = None
 
 
+if TYPE_CHECKING:
+    from .concurrency import Mutex as _Mutex
+    _FP32_PRECISION_LOCK: _Mutex
+    _EMPTY_CACHE_LOCK: _Mutex
+    _DEVICE_STATS_LOCK: _Mutex
+    _CPU_PROC_LOCK: _Mutex
+    _RUNTIME_CFG_LOCK: _Mutex
+    
 _LOGGER = logging.getLogger(__name__)
+
+_FP32_PRECISION_CACHE: dict[str, str] = {}
+
+_RUNTIME_CFG = SimpleNamespace(
+    deterministic=False,
+    allow_tf32=None,
+    cudnn_benchmark=None,
+    matmul_precision=None,
+    sdpa_backends=None,
+    te_first=True,
+)
 
 _LAZY_LOCK_NAMES = {
     "_FP32_PRECISION_LOCK",
@@ -48,8 +67,6 @@ _LAZY_LOCK_NAMES = {
     "_CPU_PROC_LOCK",
     "_RUNTIME_CFG_LOCK",
 }
-
-_FP32_PRECISION_CACHE: dict[str, str] = {}
 
 _TZ_ALIASES = {
     k: v
@@ -110,24 +127,6 @@ _TZ_ALIASES = {
         ("WAT", "Africa/Lagos"),
     ]
 }
-
-_RUNTIME_CFG = SimpleNamespace(
-    deterministic=False,
-    allow_tf32=None,
-    cudnn_benchmark=None,
-    matmul_precision=None,
-    sdpa_backends=None,
-    te_first=True,
-)
-
-
-if TYPE_CHECKING:
-    from .concurrency import Mutex as _Mutex
-    _FP32_PRECISION_LOCK: _Mutex
-    _EMPTY_CACHE_LOCK: _Mutex
-    _DEVICE_STATS_LOCK: _Mutex
-    _CPU_PROC_LOCK: _Mutex
-    _RUNTIME_CFG_LOCK: _Mutex
 
 
 def __getattr__(name: str) -> Any:
