@@ -25,16 +25,8 @@ from typing import Any, Callable, Optional, Sequence, Tuple, Union
 import torch
 import torch.multiprocessing
 
-from .datatypes import (
-    Mutex,
-    env_bool,
-    env_first,
-    env_first_float,
-    env_first_int,
-    env_float,
-    env_str,
-    parse_bool,
-)
+from .concurrency import Mutex
+from .datatypes import env_bool, env_first, env_first_float, env_first_int, env_float, env_str, parse_bool
 
 try:
     from zoneinfo import ZoneInfo

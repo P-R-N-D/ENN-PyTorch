@@ -5,7 +5,6 @@ import contextlib
 import json
 import os
 import tempfile
-import threading
 from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from typing import Any, Optional, TypeAlias
@@ -375,32 +374,3 @@ def normalize_underflow_action(value: object, *args: Any, default: str = "warn")
     d = str(default).strip().lower()
     return d if d in _DEF_UNDERFLOW_ACTIONS else "warn"
 
-
-class Mutex:
-    def __init__(self, *, reentrant: bool = False) -> None:
-        self._lock = threading.RLock() if bool(reentrant) else threading.Lock()
-
-    @property
-    def raw(self) -> threading.Lock | threading.RLock:
-        return self._lock
-
-    def acquire(self, blocking: bool = True, timeout: float | None = None) -> bool:
-        if timeout is None:
-            return bool(self._lock.acquire(blocking))
-        return bool(self._lock.acquire(blocking, float(timeout)))
-
-    def release(self) -> None:
-        self._lock.release()
-
-    def locked(self) -> bool:
-        fn = getattr(self._lock, "locked", None)
-        if callable(fn):
-            return bool(fn())
-        return False
-
-    def __enter__(self) -> "Mutex":
-        self.acquire(True, None)
-        return self
-
-    def __exit__(self, exc_type, exc, tb) -> None:
-        self.release()

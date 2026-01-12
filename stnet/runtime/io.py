@@ -19,8 +19,9 @@ from torch.distributed.checkpoint.state_dict import (
     StateDictOptions,
     get_model_state_dict,
 )
+from ..core.concurrency import Mutex
 from ..core.tensor import coerce_tensor, is_meta_or_fake_tensor
-from ..core.datatypes import Mutex, PathLike, coerce_json, save_temp, write_json
+from ..core.datatypes import PathLike, coerce_json, save_temp, write_json
 from .wrappers import (
     CoreML,
     ExecuTorch,

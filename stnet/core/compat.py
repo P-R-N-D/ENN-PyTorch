@@ -9,8 +9,8 @@ from typing import Any, Iterator
 import torch
 from torch import nn
 
+from .concurrency import Mutex
 from .graph import compile_distributed_safe
-from .datatypes import Mutex
 
 
 _PATCH_LOCK = Mutex(reentrant=True)

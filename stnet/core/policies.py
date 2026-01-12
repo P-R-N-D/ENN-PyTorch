@@ -10,7 +10,8 @@ from typing import Any, Callable, Dict, List, Optional, Protocol, Sequence, Tupl
 import torch
 import torch.nn as nn
 
-from .datatypes import Mutex, env_first_int, env_float, env_str
+from .concurrency import Mutex
+from .datatypes import env_first_int, env_float, env_str
 from .graph import clear_model_cache
 from .precision import Autocast, DeviceMeta, Quantization, is_scale_safe
 from .system import (

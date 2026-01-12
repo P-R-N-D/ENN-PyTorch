@@ -12,7 +12,8 @@ from typing import Any, Callable, Dict, List, Optional, Iterator
 import torch
 from torch import nn
 
-from .datatypes import Mutex, env_bool, env_first, env_first_int
+from .concurrency import Mutex
+from .datatypes import env_bool, env_first, env_first_int
 from .distributed import broadcast_scalar, is_distributed, is_dtensor_active
 from .system import CPU, is_accelerator_available
 

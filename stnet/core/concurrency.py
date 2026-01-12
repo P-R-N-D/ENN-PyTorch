@@ -26,24 +26,40 @@ from typing import Any, Callable, Optional, Protocol, Tuple, runtime_checkable
 
 import torch
 
-from .datatypes import (
-    Mutex,
-    env_first,
-    env_first_float,
-    env_first_int,
-    env_flag,
-    get_meta_path,
-    save_temp,
-    write_json,
-)
+from .datatypes import env_first, env_first_float, env_first_int, env_flag, get_meta_path, save_temp, write_json
 from .policies import WorkerPolicy, optimize_threads
 
-from .system import (
-    CPU,
-    _default_thread_limit,
-    _optimal_local_worlds,
-    _optimal_threads,
-)
+from .system import CPU, _default_thread_limit, _optimal_local_worlds, _optimal_threads
+
+
+class Mutex:
+    def __init__(self, *, reentrant: bool = False) -> None:
+        self._lock = threading.RLock() if bool(reentrant) else threading.Lock()
+
+    @property
+    def raw(self) -> threading.Lock | threading.RLock:
+        return self._lock
+
+    def acquire(self, blocking: bool = True, timeout: float | None = None) -> bool:
+        if timeout is None:
+            return bool(self._lock.acquire(blocking))
+        return bool(self._lock.acquire(blocking, float(timeout)))
+
+    def release(self) -> None:
+        self._lock.release()
+
+    def locked(self) -> bool:
+        fn = getattr(self._lock, "locked", None)
+        if callable(fn):
+            return bool(fn())
+        return False
+
+    def __enter__(self) -> "Mutex":
+        self.acquire(True, None)
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self.release()
 
 
 _TLB_SINGLETON: Optional["Thread"] = None
@@ -141,8 +157,8 @@ def buffered(
     max_batches: int = 4,
     name: str = "buffer",
     daemon: bool = True,
-) -> Buffered:
-    return Buffered(iterable, max_batches=max_batches, name=name, daemon=daemon)
+) -> Prefetcher:
+    return Prefetcher(iterable, max_batches=max_batches, name=name, daemon=daemon)
 
 
 def new_executor(
@@ -179,7 +195,7 @@ def new_executor(
     return futures.ProcessPoolExecutor(max_workers=mw)
 
 
-def get_affinity(io_workers: Optional[int] = None) -> "Thread":
+def new_affinity(io_workers: Optional[int] = None) -> "Thread":
     global _TLB_SINGLETON
     if _TLB_SINGLETON is None:
         with _TLB_SINGLETON_LOCK:
@@ -216,7 +232,42 @@ def close(obj: Any, *args: Any, join_timeout: float | None = 1.0) -> None:
         obj() if callable(obj) else None
 
 
-class _AffinityCallable:
+class _QueryEvent(Protocol):
+    def query(self) -> bool: ...
+
+
+@runtime_checkable
+class _SyncEvent(Protocol):
+    def synchronize(self) -> Any: ...
+
+
+@runtime_checkable
+class _WaitEvent(Protocol):
+    def wait(self, timeout: float | None = None) -> Any: ...
+
+
+@dataclass(slots=True)
+class _PoolToken:
+    i: int
+    g: int
+
+
+@dataclass(slots=True)
+class _PoolEntry:
+    page: TensorPage
+    busy: bool = False
+    fence: object | None = None
+    fence_evt: object | None = None
+    gen: int = 0
+
+
+@dataclass(slots=True)
+class ProducerError:
+    exc: BaseException
+    tb: str
+
+
+class Affinity:
     __slots__ = (
         "_parent",
         "_fn",
@@ -281,41 +332,6 @@ class _AffinityCallable:
         return out
 
 
-class _QueryEvent(Protocol):
-    def query(self) -> bool: ...
-
-
-@runtime_checkable
-class _SyncEvent(Protocol):
-    def synchronize(self) -> Any: ...
-
-
-@runtime_checkable
-class _WaitEvent(Protocol):
-    def wait(self, timeout: float | None = None) -> Any: ...
-
-
-@dataclass(slots=True)
-class _PoolToken:
-    i: int
-    g: int
-
-
-@dataclass(slots=True)
-class _PoolEntry:
-    page: Page
-    busy: bool = False
-    fence: object | None = None
-    fence_evt: object | None = None
-    gen: int = 0
-
-
-@dataclass(slots=True)
-class ProducerError:
-    exc: BaseException
-    tb: str
-
-
 class Disposable:
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         self._keep: list[Any] = list(_flatten_args(list(args)))
@@ -338,7 +354,7 @@ class Disposable:
         return iter(self._keep)
 
 
-class Buffered:
+class Prefetcher:
     __slots__ = ("_src", "_max_batches", "_name", "_daemon", "_session", "_join_timeout_s")
 
     def __init__(
@@ -373,7 +389,7 @@ class Buffered:
     def __iter__(self) -> Iterator[Any]:
         if not bool(self._session):
             return iter(
-                Buffered(
+                Prefetcher(
                     self._src,
                     max_batches=int(self._max_batches),
                     name=self._name,
@@ -383,7 +399,7 @@ class Buffered:
             )
         return self._iter_session()
 
-    def _producer_loop(self, it: Iterator[Any], buf: "Buffer", sentinel: object) -> None:
+    def _producer_loop(self, it: Iterator[Any], buf: "SizedQueue", sentinel: object) -> None:
         try:
             while not buf.is_stopped():
                 if not buf.block(timeout=None):
@@ -405,7 +421,7 @@ class Buffered:
 
     def _iter_session(self) -> Iterator[Any]:
         src_iter = iter(self._src)
-        buf = Buffer(max_batches=int(self._max_batches))
+        buf = SizedQueue(max_batches=int(self._max_batches))
         sentinel = object()
         ex = new_executor(1, workload="io", name=f"{self._name}-producer")
         fut = ex.submit(self._producer_loop, src_iter, buf, sentinel)
@@ -441,7 +457,7 @@ class Buffered:
                     ex.shutdown(wait=False)
 
 
-class Page:
+class TensorPage:
     __slots__ = ("_buf", "_numel", "_dtype", "_pinned")
 
     def __init__(self, numel: int, dtype: torch.dtype, *args: Any, pin_memory: bool = True) -> None:
@@ -485,14 +501,14 @@ class Page:
         return self._buf[:need].view(*shape)
 
 
-class Pool:
+class TensorPagePool:
     Token = _PoolToken
     _Entry = _PoolEntry
 
     def __init__(self, capacity: int = 4, *args: Any, pin_memory: bool = True) -> None:
         self._cap = max(1, int(capacity))
         self._pin = bool(pin_memory)
-        self._pages: list[Pool._Entry] = []
+        self._pages: list[TensorPagePool._Entry] = []
         self._rr = 0
         self._cv = threading.Condition()
 
@@ -527,7 +543,7 @@ class Pool:
         return_handle: bool = False,
         block: bool = False,
         timeout: float | None = None,
-    ) -> torch.Tensor | tuple[torch.Tensor, Pool.Token | None]:
+    ) -> torch.Tensor | tuple[torch.Tensor, TensorPagePool.Token | None]:
         shape_t = tuple(int(s) for s in shape)
         need = _prod_int(shape_t)
         deadline = (time.monotonic() + float(timeout)) if timeout is not None else None
@@ -564,17 +580,17 @@ class Pool:
                         break
 
             if idx is not None:
-                new_page = Page(numel=need, dtype=dtype, pin_memory=self._pin) if need_new else None
+                new_page = TensorPage(numel=need, dtype=dtype, pin_memory=self._pin) if need_new else None
                 with self._cv:
                     e = self._pages[idx]
                     if new_page:
                         e.page, e.gen = new_page, e.gen + 1
-                    view, token = e.page.view(*shape_t), Pool.Token(int(idx), int(e.gen))
+                    view, token = e.page.view(*shape_t), TensorPagePool.Token(int(idx), int(e.gen))
                 return (view, token) if return_handle else view
 
             if grow:
-                entry = Pool._Entry(
-                    page=Page(numel=need, dtype=dtype, pin_memory=self._pin),
+                entry = TensorPagePool._Entry(
+                    page=TensorPage(numel=need, dtype=dtype, pin_memory=self._pin),
                     busy=True,
                     fence=None,
                     gen=0,
@@ -583,7 +599,7 @@ class Pool:
                     if len(self._pages) < self._cap:
                         self._pages.append(entry)
                         self._rr = len(self._pages) % self._cap
-                        view, token = entry.page.view(*shape_t), Pool.Token(len(self._pages) - 1, 0)
+                        view, token = entry.page.view(*shape_t), TensorPagePool.Token(len(self._pages) - 1, 0)
                         return (view, token) if return_handle else view
                 continue
             break
@@ -598,7 +614,7 @@ class Pool:
         return_handle: bool = False,
         block: bool = False,
         timeout: float | None = None,
-    ) -> torch.Tensor | tuple[torch.Tensor, Pool.Token | None]:
+    ) -> torch.Tensor | tuple[torch.Tensor, TensorPagePool.Token | None]:
         return self.get(
             tuple(int(s) for s in t.shape),
             t.dtype,
@@ -609,7 +625,7 @@ class Pool:
 
     def fence_event(
         self,
-        token: Pool.Token | None,
+        token: TensorPagePool.Token | None,
         factory: Callable[[], object] | None,
     ) -> object | None:
         if token is None or factory is None:
@@ -636,7 +652,7 @@ class Pool:
                 return self._pages[i].fence_evt
         return ev_new
 
-    def release_after(self, token: Pool.Token | None, wait_event: object | None) -> None:
+    def release_after(self, token: TensorPagePool.Token | None, wait_event: object | None) -> None:
         if token is None:
             return
         with self._cv:
@@ -646,7 +662,7 @@ class Pool:
                 self._pages[i].busy, self._pages[i].fence = True, wait_event
                 self._cv.notify()
 
-    def release(self, token: Pool.Token | None) -> None:
+    def release(self, token: TensorPagePool.Token | None) -> None:
         if token is None:
             return
         with self._cv:
@@ -662,7 +678,7 @@ class Pool:
                 self._cv.notify_all()
 
 
-class Cache:
+class TensorSpooler:
     def __init__(self, root: str, max_queue: int = 8) -> None:
         self._root = os.fspath(root)
         os.makedirs(self._root, exist_ok=True)
@@ -721,7 +737,7 @@ class Cache:
         unpin = force_unpin if force_unpin is not None else self._force_unpin
         released = False
 
-        if Cache._is_cpu_pinned(buf) and (unpin or (early and callable(release_cb))):
+        if TensorSpooler._is_cpu_pinned(buf) and (unpin or (early and callable(release_cb))):
             try:
                 tmp = torch.empty_like(buf, device="cpu", pin_memory=False)
                 tmp.copy_(buf, non_blocking=False)
@@ -815,7 +831,7 @@ class Cache:
         if self._err_event.is_set():
             raise RuntimeError(f"Async writer error: {self._err!r}")
         if self._closed.is_set():
-            raise RuntimeError("Cache is closed")
+            raise RuntimeError("TensorSpooler is closed")
 
         path = (
             os.path.join(self._root, f"chunk_{int(idx):06d}.pt")
@@ -829,7 +845,7 @@ class Cache:
                 acquired = self._sem.acquire(timeout=timeout)
                 if not acquired:
                     if mode == "raise":
-                        raise RuntimeError("Cache queue is full")
+                        raise RuntimeError("TensorSpooler queue is full")
                     self._wait(wait_event)
                     buf, released = self._init_tensor(
                         tensor, release_cb=release_cb, early_release=False
@@ -843,7 +859,7 @@ class Cache:
                 acquired = self._sem.acquire(timeout=timeout) if timeout > 0 else False
                 while not acquired:
                     if self._err_event.is_set() or self._closed.is_set():
-                        raise RuntimeError("Cache unavailable")
+                        raise RuntimeError("TensorSpooler unavailable")
                     acquired = self._sem.acquire(timeout=0.1)
         try:
             self._q.put((tensor, path, wait_event, release_cb))
@@ -867,7 +883,7 @@ class Cache:
         return bool(self._err_event.is_set())
 
 
-class Buffer:
+class SizedQueue:
     def __init__(self, max_batches: int) -> None:
         self.max_batches = max(1, int(max_batches))
         self._buf: "collections.deque[Any]" = collections.deque()
@@ -898,7 +914,7 @@ class Buffer:
         elapsed = time.monotonic() - t0
         if self._warn_blocking and elapsed > 0.1:
             logging.warning(
-                "Buffer.put blocked for %.3f s (max_batches=%d)",
+                "SizedQueue.put blocked for %.3f s (max_batches=%d)",
                 float(elapsed),
                 int(self.max_batches),
             )
@@ -1218,7 +1234,7 @@ class Thread:
             return fn
         sample_every = int(self._sample_every) if int(self._sample_every) > 0 else 1
         flush_every = int(self._flush_every) if int(self._flush_every) > 0 else 1
-        return _AffinityCallable(
+        return Affinity(
             parent=self,
             fn=fn,
             pin_thread=self.pin_thread,

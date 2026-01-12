@@ -41,8 +41,18 @@ from torchdata.nodes import (
     SamplerWrapper,
 )
 
-from ..core.datatypes import (
+from ..core.concurrency import (
+    SizedQueue,
+    Disposable,
     Mutex,
+    TensorPagePool,
+    ProducerError,
+    close,
+    new_affinity,
+    new_executor,
+    new_thread,
+)
+from ..core.datatypes import (
     dtype_from_name,
     env_bool,
     env_first_int,
@@ -56,7 +66,6 @@ from ..core.datatypes import (
     normalize_underflow_action,
 )
 from ..core.graph import inference_mode
-from ..core.concurrency import Buffer, Disposable, Pool, ProducerError, close, get_affinity, new_executor, new_thread
 from ..core.policies import WorkerPolicy
 from ..core.system import (
     CPU,
@@ -255,7 +264,7 @@ def _primary_device(device_spec: torch.device | list[torch.device]) -> torch.dev
     return device_spec[0] if isinstance(device_spec, list) and device_spec else device_spec
 
 
-class _RowSlicer:
+class _BatchSliceGetter:
     def __init__(self, raw_X: Any, raw_Y: Any, *args: Any, features_only: bool) -> None:
         self.raw_X, self.raw_Y, self.features_only = raw_X, raw_Y, bool(features_only)
 
@@ -266,7 +275,7 @@ class _RowSlicer:
         return out
 
 
-class _RowIndexer:
+class _BatchIndexGetter:
     def __init__(self, raw_X: Any, raw_Y: Any, *args: Any, features_only: bool) -> None:
         self.raw_X, self.raw_Y, self.features_only = raw_X, raw_Y, bool(features_only)
 
@@ -286,7 +295,7 @@ class _RowIndexer:
         return out
 
 
-class _ColumnView(collections.abc.Mapping):
+class _KeyView(collections.abc.Mapping):
     __slots__ = ("_data", "_keys")
 
     def __init__(self, data: Mapping[Any, Any], keys: Sequence[Any]) -> None:
@@ -303,7 +312,7 @@ class _ColumnView(collections.abc.Mapping):
         return self._data[k]
 
 
-class _ColumnCursor:
+class _KeyCursor:
     __slots__ = ("_data", "_keys_source", "_it", "_pos")
 
     def __init__(self, data: Mapping[Any, Any], keys: Optional[Sequence[Any]] = None) -> None:
@@ -316,7 +325,7 @@ class _ColumnCursor:
         self._it = iter(self._keys_source)
         self._pos = 0
 
-    def __call__(self, s: int, e: int) -> _ColumnView:
+    def __call__(self, s: int, e: int) -> _KeyView:
         s_i = int(s)
         e_i = int(e)
         if s_i < 0 or e_i < s_i:
@@ -331,7 +340,7 @@ class _ColumnCursor:
             )
         need = e_i - s_i
         if need <= 0:
-            return _ColumnView(self._data, ())
+            return _KeyView(self._data, ())
         batch_keys: list[Any] = []
         for _ in range(int(need)):
             try:
@@ -340,7 +349,7 @@ class _ColumnCursor:
                 break
             batch_keys.append(k)
         self._pos += int(len(batch_keys))
-        return _ColumnView(self._data, batch_keys)
+        return _KeyView(self._data, batch_keys)
 
 
 class Storage:
@@ -518,11 +527,11 @@ class Storage:
         data: Mapping[Any, Any],
         *args: Any,
         keys: Optional[Sequence[Any]] = None,
-    ) -> Tuple[int, Callable[[int, int], _ColumnView]]:
+    ) -> Tuple[int, Callable[[int, int], _KeyView]]:
         count = int(len(data) if keys is None else len(keys))
         if count <= 0:
             raise ValueError("Empty mapping: no keys")
-        return count, _ColumnCursor(data, keys)
+        return count, _KeyCursor(data, keys)
 
     @staticmethod
     def is_feature_label_batch_mapping(obj: Any) -> bool:
@@ -1042,9 +1051,9 @@ class Storage:
         ua = normalize_underflow_action(underflow_action, default=default_underflow_action())
         ds = Dataset.for_device("cpu", feature_dtype=torch.float64, label_float_dtype=torch.float64)
         ds.underflow_action = ua
-        get_batch = _RowSlicer(raw_X, raw_Y, features_only=bool(features_only))
+        get_batch = _BatchSliceGetter(raw_X, raw_Y, features_only=bool(features_only))
         get_by_indices = (
-            _RowIndexer(raw_X, raw_Y, features_only=bool(features_only)) if bool(shuffle) else None
+            _BatchIndexGetter(raw_X, raw_Y, features_only=bool(features_only)) if bool(shuffle) else None
         )
         Storage.stream_memmap(
             ds=ds,
@@ -1760,7 +1769,7 @@ class Storage:
 # Disposable is defined in stnet.core.concurrency (re-exported here for convenience)
 
 
-class BatchScaler:
+class Governor:
     __slots__ = ("_v", "_min_scale", "_max_scale")
 
     def __init__(
@@ -1878,13 +1887,13 @@ class Sampler(torch.utils.data.Sampler):
         *args: Any,
         split: str = "train",
         val_frac: float = 0.0,
-        sampler_scale: Optional["BatchScaler"] = None,
+        sampler_scale: Optional["Governor"] = None,
         **kwargs: Any,
     ) -> None:
         self.dir = os.fspath(memmap_dir)
         self.split = str(split)
         self._meta: Mapping[str, Any] = self._load_meta(self.dir)
-        self._sampler_scale = sampler_scale if sampler_scale is not None else BatchScaler()
+        self._sampler_scale = sampler_scale if sampler_scale is not None else Governor()
         self._S_B_cap = 0
         self._N = int(self._meta.get("N", 0))
         if self._N <= 0:
@@ -2280,7 +2289,7 @@ class Sampler(torch.utils.data.Sampler):
         return max(0, (int(total) - si + ns - 1) // ns)
 
     @property
-    def sampler_scale(self) -> "BatchScaler":
+    def sampler_scale(self) -> "Governor":
         return self._sampler_scale
 
     @property
@@ -2567,7 +2576,7 @@ class Mapper:
         self.pin_memory = self._pin_memory
         self.max_concurrency = max(1, int(self.io_workers))
         try:
-            get_affinity(io_workers=self.io_workers)
+            new_affinity(io_workers=self.io_workers)
         except Exception:
             pass
 
@@ -2667,7 +2676,7 @@ class Loader:
         use_prefetch = bool(use_accel and self._non_blocking)
         iterable: Any = self._base_iterable
         if use_prefetch:
-            iterable = Prefetcher(
+            iterable = Stream(
                 iterable,
                 device=dev,
                 depth=int(self._prefetch_depth),
@@ -2745,7 +2754,7 @@ class Loader:
         )
 
 
-class Prefetcher(Buffer):
+class Stream(SizedQueue):
     def __init__(
         self,
         iterable: Any,
@@ -2777,13 +2786,13 @@ class Prefetcher(Buffer):
         )
         self._pin = bool(kwargs.get("pin_host", use_accel))
         self._pin_pool = False
-        self._host_pool: Optional[Pool] = None
+        self._host_pool: Optional[TensorPagePool] = None
         if self._pin and self._non_blocking and is_stream_supported(self._device.type):
             use_pool = env_bool("STNET_PREFETCH_PIN_POOL", default=True)
             cap_default = max(8, max(2, int(self._depth) * 2))
             cap = env_first_int(("STNET_PREFETCH_PIN_POOL_CAPACITY",), default=cap_default)
             if use_pool and int(cap) > 0:
-                self._host_pool = Pool(capacity=int(cap), pin_memory=True)
+                self._host_pool = TensorPagePool(capacity=int(cap), pin_memory=True)
                 self._pin_pool = True
         self._accel_stream: Optional[object] = None
         self._accel_event_pool: Optional[queue.SimpleQueue] = None
@@ -2795,8 +2804,8 @@ class Prefetcher(Buffer):
             jt_ms = int(env_first_int(("STNET_THREAD_JOIN_TIMEOUT_MS",), default=500) or 500)
             self._join_timeout_s = max(0.0, float(jt_ms) / 1000.0)
 
-    def _spawn_session(self) -> "Prefetcher":
-        return Prefetcher(
+    def _spawn_session(self) -> "Stream":
+        return Stream(
             self._src,
             device=self._device,
             depth=int(self._depth),
@@ -2846,7 +2855,7 @@ class Prefetcher(Buffer):
 
         return self._apply_structure(x, _f)
 
-    def _stage_with_pool(self, obj: Any, pool: Pool, tokens: list[Optional[Pool.Token]]) -> Any:
+    def _stage_with_pool(self, obj: Any, pool: TensorPagePool, tokens: list[Optional[TensorPagePool.Token]]) -> Any:
         def _f(t):
             if not (torch.is_tensor(t) and t.device.type == "cpu") or (
                 hasattr(t, "is_pinned") and t.is_pinned()
@@ -2859,13 +2868,13 @@ class Prefetcher(Buffer):
 
         return self._apply_structure(obj, _f)
 
-    def _pin_batch(self, x: Any) -> tuple[Any, list[Optional[Pool.Token]]]:
+    def _pin_batch(self, x: Any) -> tuple[Any, list[Optional[TensorPagePool.Token]]]:
         if not self._pin:
             return x, []
         pool = self._host_pool
         if pool is None:
             return self._pin_memory(x), []
-        tokens: list[Optional[Pool.Token]] = []
+        tokens: list[Optional[TensorPagePool.Token]] = []
         return self._stage_with_pool(x, pool, tokens), tokens
 
     def _producer_loop(
@@ -3007,7 +3016,7 @@ class Prefetcher(Buffer):
             self._accel_event_pool = None
         sentinel = object()
         it = iter(iterable)
-        ex = new_executor(1, workload="io", name="PrefetcherProducer")
+        ex = new_executor(1, workload="io", name="StreamProducer")
         fut = ex.submit(
             self._producer_loop,
             it,
@@ -3034,9 +3043,7 @@ class Prefetcher(Buffer):
                 if isinstance(item, ProducerError):
                     if isinstance(item.exc, (KeyboardInterrupt, SystemExit)):
                         raise item.exc
-                    raise RuntimeError(
-                        f"Prefetcher producer crashed: {item.exc}\n{item.tb}"
-                    ) from item.exc
+                    raise RuntimeError(f"Stream producer crashed: {item.exc}\n{item.tb}") from item.exc
                 batch, ev = item
                 if use_accel_stream and ev is not None:
                     cs = current_accelerator_stream(device)
