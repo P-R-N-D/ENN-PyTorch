@@ -46,6 +46,10 @@ from .system import (
 )
 
 
+_TLB_SINGLETON: Optional["Thread"] = None
+_TLB_SINGLETON_LOCK = Mutex()
+
+
 def _flatten_args(items: Sequence[Any]) -> Iterator[Any]:
     for item in items:
         if isinstance(item, dict):
@@ -175,6 +179,22 @@ def new_executor(
     return futures.ProcessPoolExecutor(max_workers=mw)
 
 
+def get_affinity(io_workers: Optional[int] = None) -> "Thread":
+    global _TLB_SINGLETON
+    if _TLB_SINGLETON is None:
+        with _TLB_SINGLETON_LOCK:
+            if _TLB_SINGLETON is None:
+                default_workers = (
+                    int(io_workers)
+                    if io_workers is not None
+                    else max(1, int(CPU.count()) // 2)
+                )
+                _TLB_SINGLETON = Thread(io_workers=int(default_workers))
+    elif io_workers is not None:
+        _TLB_SINGLETON.tune(io_workers=int(io_workers))
+    return _TLB_SINGLETON
+
+
 def close(obj: Any, *args: Any, join_timeout: float | None = 1.0) -> None:
     for name in (
         "cleanup",
@@ -194,6 +214,71 @@ def close(obj: Any, *args: Any, join_timeout: float | None = 1.0) -> None:
             return
     with contextlib.suppress(Exception):
         obj() if callable(obj) else None
+
+
+class _AffinityCallable:
+    __slots__ = (
+        "_parent",
+        "_fn",
+        "_pin_thread",
+        "_tls",
+        "_lock",
+        "_tune",
+        "_sample_every",
+        "_flush_every",
+        "_perf_counter_ns",
+        "_thread_time_ns",
+    )
+
+    def __init__(
+        self,
+        parent: "Thread",
+        fn: Callable[[Any], Any],
+        pin_thread: Callable[[], None],
+        tls: Any,
+        lock: Any,
+        tune: Callable[..., None],
+        sample_every: int,
+        flush_every: int,
+        perf_counter_ns: Callable[[], int],
+        thread_time_ns: Optional[Callable[[], int]],
+    ) -> None:
+        self._parent = parent
+        self._fn = fn
+        self._pin_thread = pin_thread
+        self._tls = tls
+        self._lock = lock
+        self._tune = tune
+        self._sample_every = sample_every
+        self._flush_every = flush_every
+        self._perf_counter_ns = perf_counter_ns
+        self._thread_time_ns = thread_time_ns
+
+    def __call__(self, *args: Any, **kwargs: Any) -> Any:
+        if not getattr(self._tls, "pinned", False):
+            self._pin_thread()
+        count = getattr(self._tls, "count", 0) + 1
+        self._tls.count = count
+        do_sample = count % self._sample_every == 0
+        t0 = self._perf_counter_ns() if do_sample else 0
+        c0 = self._thread_time_ns() if do_sample and callable(self._thread_time_ns) else 0
+        out = self._fn(*args, **kwargs)
+        if do_sample:
+            t1 = self._perf_counter_ns()
+            c1 = self._thread_time_ns() if callable(self._thread_time_ns) else None
+            try:
+                with self._lock:
+                    self._parent._total_time += max(0, int(t1) - int(t0))
+                    if c1 is not None:
+                        self._parent._total_cpu += max(0, int(c1) - int(c0))
+            except Exception:
+                pass
+        if count % self._flush_every == 0:
+            try:
+                self._tune(initial=False)
+            except Exception:
+                pass
+        return out
 
 
 class _QueryEvent(Protocol):
@@ -883,91 +968,6 @@ class Buffer:
 
     def is_stopped(self) -> bool:
         return bool(self._stop.is_set())
-
-
-_TLB_SINGLETON: Optional["Thread"] = None
-_TLB_SINGLETON_LOCK = Mutex()
-
-
-def get_affinity(io_workers: Optional[int] = None) -> "Thread":
-    global _TLB_SINGLETON
-    if _TLB_SINGLETON is None:
-        with _TLB_SINGLETON_LOCK:
-            if _TLB_SINGLETON is None:
-                default_workers = (
-                    int(io_workers)
-                    if io_workers is not None
-                    else max(1, int(CPU.count()) // 2)
-                )
-                _TLB_SINGLETON = Thread(io_workers=int(default_workers))
-    elif io_workers is not None:
-        _TLB_SINGLETON.tune(io_workers=int(io_workers))
-    return _TLB_SINGLETON
-
-
-class _AffinityCallable:
-    __slots__ = (
-        "_parent",
-        "_fn",
-        "_pin_thread",
-        "_tls",
-        "_lock",
-        "_tune",
-        "_sample_every",
-        "_flush_every",
-        "_perf_counter_ns",
-        "_thread_time_ns",
-    )
-
-    def __init__(
-        self,
-        parent: "Thread",
-        fn: Callable[[Any], Any],
-        pin_thread: Callable[[], None],
-        tls: Any,
-        lock: Any,
-        tune: Callable[..., None],
-        sample_every: int,
-        flush_every: int,
-        perf_counter_ns: Callable[[], int],
-        thread_time_ns: Optional[Callable[[], int]],
-    ) -> None:
-        self._parent = parent
-        self._fn = fn
-        self._pin_thread = pin_thread
-        self._tls = tls
-        self._lock = lock
-        self._tune = tune
-        self._sample_every = sample_every
-        self._flush_every = flush_every
-        self._perf_counter_ns = perf_counter_ns
-        self._thread_time_ns = thread_time_ns
-
-    def __call__(self, *args: Any, **kwargs: Any) -> Any:
-        if not getattr(self._tls, "pinned", False):
-            self._pin_thread()
-        count = getattr(self._tls, "count", 0) + 1
-        self._tls.count = count
-        do_sample = count % self._sample_every == 0
-        t0 = self._perf_counter_ns() if do_sample else 0
-        c0 = self._thread_time_ns() if do_sample and callable(self._thread_time_ns) else 0
-        out = self._fn(*args, **kwargs)
-        if do_sample:
-            t1 = self._perf_counter_ns()
-            c1 = self._thread_time_ns() if callable(self._thread_time_ns) else None
-            try:
-                with self._lock:
-                    self._parent._total_time += max(0, int(t1) - int(t0))
-                    if c1 is not None:
-                        self._parent._total_cpu += max(0, int(c1) - int(c0))
-            except Exception:
-                pass
-        if count % self._flush_every == 0:
-            try:
-                self._tune(initial=False)
-            except Exception:
-                pass
-        return out
 
 
 class Thread:
