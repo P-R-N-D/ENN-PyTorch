@@ -380,7 +380,6 @@ def _get_allowed_cpu_windows() -> Optional[list[int]]:
                     return [i for i in range(m.bit_length()) if (m >> i) & 1]
     except Exception:
         pass
-    # Windows processor groups (best-effort)
     try:
         get_group_cnt = getattr(k32, "GetActiveProcessorGroupCount", None)
         get_group_procs = getattr(k32, "GetActiveProcessorCount", None)
@@ -1335,7 +1334,6 @@ if is_accelerator_available("cuda"):
     idx = 0
     with contextlib.suppress(Exception):
         idx = int(idx_env) % int(ndev)
-    # serialize device selection in multi-thread contexts
     with _mutex_lock("_CPU_PROC_LOCK"):
         set_accelerator_index("cuda", int(idx))
     device = torch.device(f"cuda:{idx}")
