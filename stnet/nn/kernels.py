@@ -359,6 +359,242 @@ def reshape_for_mha(
     return x.reshape(int(batch), -1, int(heads), int(head_dim)).transpose(1, 2).contiguous()
 
 
+class _MultiHeadAttentionNvidia(nn.Module):
+    def __init__(
+        self,
+        embed_dim: int,
+        num_heads: int,
+        *args: Any,
+        bias: bool = True,
+        dropout: float = 0.0,
+        batch_first: bool = True,
+        **kwargs: Any,
+    ) -> None:
+        super().__init__()
+        self.batch_first = batch_first
+        self.num_heads = int(num_heads)
+        self._fallback = _MultiHeadAttentionCompat(
+            embed_dim,
+            num_heads,
+            bias=bias,
+            dropout=dropout,
+            batch_first=batch_first,
+            **kwargs,
+        )
+        self._te_mha = self._nvidia_mha(embed_dim, num_heads, dropout, kwargs)
+        self._force_pt: bool = self._te_mha is None
+        self._te_forward_signature: inspect.Signature | None = None
+        self._te_mask_param: str | None = None
+        self._te_mask_type_param: str | None = None
+        self._te_supports_is_causal: bool = False
+        self._te_supports_training: bool = False
+        self._te_supports_tuple_mask: bool = True
+
+        if self._te_mha is not None:
+            _fwd = getattr(self._te_mha, "forward", getattr(self._te_mha, "__call__", None))
+            try:
+                self._te_forward_signature = inspect.signature(_fwd) if _fwd else None
+            except:
+                self._te_forward_signature = None
+            params = self._te_forward_signature.parameters if self._te_forward_signature else {}
+            if "attention_mask" in params:
+                self._te_mask_param = "attention_mask"
+            elif "attn_mask" in params:
+                self._te_mask_param = "attn_mask"
+            if "attn_mask_type" in params:
+                self._te_mask_type_param = "attn_mask_type"
+            elif "attention_mask_type" in params:
+                self._te_mask_type_param = "attention_mask_type"
+            self._te_supports_is_causal = "is_causal" in params
+            self._te_supports_training = "training" in params
+
+    @staticmethod
+    def _nvidia_mha(embed_dim, num_heads, dropout, kwargs):
+        if not (_HAS_TE and _is_nvidia_te_supported()):
+            return None
+        candidates = [
+            getattr(te, n) for n in ("MultiHeadAttention", "MultiheadAttention") if hasattr(te, n)
+        ]
+        for cls in candidates:
+            ctor_variants = (
+                dict(
+                    hidden_size=embed_dim,
+                    num_attention_heads=num_heads,
+                    attention_dropout=dropout,
+                ),
+                dict(
+                    hidden_size=embed_dim,
+                    num_heads=num_heads,
+                    attention_dropout=dropout,
+                ),
+                dict(embed_dim=embed_dim, num_heads=num_heads, dropout=dropout),
+            )
+            for ckw in ctor_variants:
+                with contextlib.suppress(Exception):
+                    return cls(**{**ckw, **kwargs})
+        return None
+
+    def forward(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        attn_mask: Optional[torch.Tensor] = None,
+        key_padding_mask: Optional[torch.Tensor] = None,
+        need_weights: bool = False,
+        is_causal: Optional[bool] = None,
+        average_attn_weights: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        def _fallback_call():
+            return _call_sdpa_fallback(
+                self._fallback,
+                query,
+                key,
+                value,
+                attn_mask=attn_mask,
+                key_padding_mask=key_padding_mask,
+                need_weights=need_weights,
+                average_attn_weights=average_attn_weights,
+                is_causal=is_causal,
+            )
+
+        if (
+            self._force_pt
+            or self._te_mha is None
+            or need_weights
+            or attn_mask is not None
+            or not query.is_cuda
+            or query.dtype not in (torch.float16, torch.bfloat16)
+        ):
+            return _fallback_call()
+
+        with contextlib.suppress(Exception):
+            if torch._dynamo.is_compiling():
+                return _fallback_call()
+
+        bf = bool(self.batch_first)
+        _q, _k, _v = query, key, value
+        if not bf:
+            _q, _k, _v = query.transpose(0, 1), key.transpose(0, 1), value.transpose(0, 1)
+
+        te_kwargs, te_mask, mask_type = {}, None, None
+
+        if key_padding_mask is not None:
+            B0, Lq, Lk = int(_q.shape[0]), int(_q.shape[1]), int(_k.shape[1])
+            if key_padding_mask.shape != (B0, Lk):
+                return _fallback_call()
+            kpm = key_padding_mask
+            if kpm.dtype is not torch.bool:
+                kpm = kpm.to(torch.bool)
+            kpm = kpm.to(device=_q.device, non_blocking=True).contiguous()
+            kv_mask = kpm.view(B0, 1, 1, Lk)
+            if Lq == Lk:
+                te_mask = kv_mask
+            else:
+                if not self._te_supports_tuple_mask:
+                    return _fallback_call()
+                q_mask = torch.zeros((B0, 1, 1, Lq), device=_q.device, dtype=torch.bool)
+                te_mask = (q_mask, kv_mask)
+            mask_type = "padding_causal" if bool(is_causal) else "padding"
+        else:
+            mask_type = "causal" if bool(is_causal) else "no_mask"
+
+        if (
+            te_mask is not None
+            and mask_type
+            and mask_type.startswith("padding")
+            and self._te_mask_type_param is None
+        ):
+            return _fallback_call()
+        if te_mask is not None:
+            if self._te_mask_param is None:
+                return _fallback_call()
+            te_kwargs[self._te_mask_param] = te_mask
+
+        if mask_type and self._te_mask_type_param:
+            te_kwargs[self._te_mask_type_param] = mask_type
+        elif self._te_supports_is_causal and (is_causal is not None):
+            te_kwargs["is_causal"] = bool(is_causal)
+        if self._te_supports_training:
+            te_kwargs["training"] = bool(self.training)
+
+        try:
+            out = self._te_mha(_q, _k, _v, **te_kwargs)
+        except Exception as e:
+            if isinstance(e, TypeError) and isinstance(te_mask, tuple):
+                self._te_supports_tuple_mask = False
+            self._force_pt = True
+            return _fallback_call()
+
+        y, w = (out[0] if isinstance(out, tuple) and len(out) >= 1 else out), None
+        if not bf and isinstance(y, torch.Tensor) and y.dim() >= 2:
+            y = y.transpose(0, 1)
+        _compute_flops_mha(
+            query,
+            key,
+            num_heads=self.num_heads,
+            embed_dim=embed_dim,
+            batch_first=self.batch_first,
+            include_projections=True,
+        )
+        return y, w
+
+
+class _MultiHeadAttentionCompat(nn.Module):
+    def __init__(
+        self,
+        embed_dim: int,
+        num_heads: int,
+        *args: Any,
+        bias: bool = True,
+        dropout: float = 0.0,
+        batch_first: bool = True,
+        **kwargs: Any,
+    ) -> None:
+        super().__init__()
+        self.batch_first = batch_first
+        self.mha = nn.MultiheadAttention(
+            embed_dim,
+            num_heads,
+            dropout=dropout,
+            bias=bias,
+            batch_first=batch_first,
+        )
+
+    def forward(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        attn_mask: Optional[torch.Tensor] = None,
+        key_padding_mask: Optional[torch.Tensor] = None,
+        need_weights: bool = False,
+        is_causal: Optional[bool] = None,
+        average_attn_weights: bool = False,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        kwargs = dict(key_padding_mask=key_padding_mask, need_weights=need_weights)
+        if need_weights:
+            kwargs["average_attn_weights"] = bool(average_attn_weights)
+        out, w = _call_mha_compat(
+            self.mha,
+            query,
+            key,
+            value,
+            attn_mask=attn_mask,
+            is_causal=is_causal,
+            kwargs=kwargs,
+        )
+        _compute_flops_mha(
+            query,
+            key,
+            num_heads=self.mha.num_heads,
+            embed_dim=self.mha.embed_dim,
+            batch_first=self.batch_first,
+            include_projections=True,
+        )
+        return out, w
+
+
 class DotProductAttention(nn.Module):
     def __init__(
         self,
@@ -1098,239 +1334,3 @@ class MultiHeadAttention(nn.Module):
             average_attn_weights=average_attn_weights,
             is_causal=is_causal,
         )
-
-
-class _MultiHeadAttentionNvidia(nn.Module):
-    def __init__(
-        self,
-        embed_dim: int,
-        num_heads: int,
-        *args: Any,
-        bias: bool = True,
-        dropout: float = 0.0,
-        batch_first: bool = True,
-        **kwargs: Any,
-    ) -> None:
-        super().__init__()
-        self.batch_first = batch_first
-        self.num_heads = int(num_heads)
-        self._fallback = _MultiHeadAttentionCompat(
-            embed_dim,
-            num_heads,
-            bias=bias,
-            dropout=dropout,
-            batch_first=batch_first,
-            **kwargs,
-        )
-        self._te_mha = self._nvidia_mha(embed_dim, num_heads, dropout, kwargs)
-        self._force_pt: bool = self._te_mha is None
-        self._te_forward_signature: inspect.Signature | None = None
-        self._te_mask_param: str | None = None
-        self._te_mask_type_param: str | None = None
-        self._te_supports_is_causal: bool = False
-        self._te_supports_training: bool = False
-        self._te_supports_tuple_mask: bool = True
-
-        if self._te_mha is not None:
-            _fwd = getattr(self._te_mha, "forward", getattr(self._te_mha, "__call__", None))
-            try:
-                self._te_forward_signature = inspect.signature(_fwd) if _fwd else None
-            except:
-                self._te_forward_signature = None
-            params = self._te_forward_signature.parameters if self._te_forward_signature else {}
-            if "attention_mask" in params:
-                self._te_mask_param = "attention_mask"
-            elif "attn_mask" in params:
-                self._te_mask_param = "attn_mask"
-            if "attn_mask_type" in params:
-                self._te_mask_type_param = "attn_mask_type"
-            elif "attention_mask_type" in params:
-                self._te_mask_type_param = "attention_mask_type"
-            self._te_supports_is_causal = "is_causal" in params
-            self._te_supports_training = "training" in params
-
-    @staticmethod
-    def _nvidia_mha(embed_dim, num_heads, dropout, kwargs):
-        if not (_HAS_TE and _is_nvidia_te_supported()):
-            return None
-        candidates = [
-            getattr(te, n) for n in ("MultiHeadAttention", "MultiheadAttention") if hasattr(te, n)
-        ]
-        for cls in candidates:
-            ctor_variants = (
-                dict(
-                    hidden_size=embed_dim,
-                    num_attention_heads=num_heads,
-                    attention_dropout=dropout,
-                ),
-                dict(
-                    hidden_size=embed_dim,
-                    num_heads=num_heads,
-                    attention_dropout=dropout,
-                ),
-                dict(embed_dim=embed_dim, num_heads=num_heads, dropout=dropout),
-            )
-            for ckw in ctor_variants:
-                with contextlib.suppress(Exception):
-                    return cls(**{**ckw, **kwargs})
-        return None
-
-    def forward(
-        self,
-        query: torch.Tensor,
-        key: torch.Tensor,
-        value: torch.Tensor,
-        attn_mask: Optional[torch.Tensor] = None,
-        key_padding_mask: Optional[torch.Tensor] = None,
-        need_weights: bool = False,
-        is_causal: Optional[bool] = None,
-        average_attn_weights: bool = False,
-    ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        def _fallback_call():
-            return _call_sdpa_fallback(
-                self._fallback,
-                query,
-                key,
-                value,
-                attn_mask=attn_mask,
-                key_padding_mask=key_padding_mask,
-                need_weights=need_weights,
-                average_attn_weights=average_attn_weights,
-                is_causal=is_causal,
-            )
-
-        if (
-            self._force_pt
-            or self._te_mha is None
-            or need_weights
-            or attn_mask is not None
-            or not query.is_cuda
-            or query.dtype not in (torch.float16, torch.bfloat16)
-        ):
-            return _fallback_call()
-
-        with contextlib.suppress(Exception):
-            if torch._dynamo.is_compiling():
-                return _fallback_call()
-
-        bf = bool(self.batch_first)
-        _q, _k, _v = query, key, value
-        if not bf:
-            _q, _k, _v = query.transpose(0, 1), key.transpose(0, 1), value.transpose(0, 1)
-
-        te_kwargs, te_mask, mask_type = {}, None, None
-
-        if key_padding_mask is not None:
-            B0, Lq, Lk = int(_q.shape[0]), int(_q.shape[1]), int(_k.shape[1])
-            if key_padding_mask.shape != (B0, Lk):
-                return _fallback_call()
-            kpm = key_padding_mask
-            if kpm.dtype is not torch.bool:
-                kpm = kpm.to(torch.bool)
-            kpm = kpm.to(device=_q.device, non_blocking=True).contiguous()
-            kv_mask = kpm.view(B0, 1, 1, Lk)
-            if Lq == Lk:
-                te_mask = kv_mask
-            else:
-                if not self._te_supports_tuple_mask:
-                    return _fallback_call()
-                q_mask = torch.zeros((B0, 1, 1, Lq), device=_q.device, dtype=torch.bool)
-                te_mask = (q_mask, kv_mask)
-            mask_type = "padding_causal" if bool(is_causal) else "padding"
-        else:
-            mask_type = "causal" if bool(is_causal) else "no_mask"
-
-        if (
-            te_mask is not None
-            and mask_type
-            and mask_type.startswith("padding")
-            and self._te_mask_type_param is None
-        ):
-            return _fallback_call()
-        if te_mask is not None:
-            if self._te_mask_param is None:
-                return _fallback_call()
-            te_kwargs[self._te_mask_param] = te_mask
-
-        if mask_type and self._te_mask_type_param:
-            te_kwargs[self._te_mask_type_param] = mask_type
-        elif self._te_supports_is_causal and (is_causal is not None):
-            te_kwargs["is_causal"] = bool(is_causal)
-        if self._te_supports_training:
-            te_kwargs["training"] = bool(self.training)
-
-        try:
-            out = self._te_mha(_q, _k, _v, **te_kwargs)
-        except Exception as e:
-            if isinstance(e, TypeError) and isinstance(te_mask, tuple):
-                self._te_supports_tuple_mask = False
-            self._force_pt = True
-            return _fallback_call()
-
-        y, w = (out[0] if isinstance(out, tuple) and len(out) >= 1 else out), None
-        if not bf and isinstance(y, torch.Tensor) and y.dim() >= 2:
-            y = y.transpose(0, 1)
-        _compute_flops_mha(
-            query,
-            key,
-            num_heads=self.num_heads,
-            embed_dim=embed_dim,
-            batch_first=self.batch_first,
-            include_projections=True,
-        )
-        return y, w
-
-
-class _MultiHeadAttentionCompat(nn.Module):
-    def __init__(
-        self,
-        embed_dim: int,
-        num_heads: int,
-        *args: Any,
-        bias: bool = True,
-        dropout: float = 0.0,
-        batch_first: bool = True,
-        **kwargs: Any,
-    ) -> None:
-        super().__init__()
-        self.batch_first = batch_first
-        self.mha = nn.MultiheadAttention(
-            embed_dim,
-            num_heads,
-            dropout=dropout,
-            bias=bias,
-            batch_first=batch_first,
-        )
-
-    def forward(
-        self,
-        query: torch.Tensor,
-        key: torch.Tensor,
-        value: torch.Tensor,
-        attn_mask: Optional[torch.Tensor] = None,
-        key_padding_mask: Optional[torch.Tensor] = None,
-        need_weights: bool = False,
-        is_causal: Optional[bool] = None,
-        average_attn_weights: bool = False,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        kwargs = dict(key_padding_mask=key_padding_mask, need_weights=need_weights)
-        if need_weights:
-            kwargs["average_attn_weights"] = bool(average_attn_weights)
-        out, w = _call_mha_compat(
-            self.mha,
-            query,
-            key,
-            value,
-            attn_mask=attn_mask,
-            is_causal=is_causal,
-            kwargs=kwargs,
-        )
-        _compute_flops_mha(
-            query,
-            key,
-            num_heads=self.mha.num_heads,
-            embed_dim=self.mha.embed_dim,
-            batch_first=self.batch_first,
-            include_projections=True,
-        )
-        return out, w
