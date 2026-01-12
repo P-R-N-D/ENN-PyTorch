@@ -12,8 +12,10 @@ from torch import nn
 from .graph import compile_distributed_safe
 from .datatypes import Mutex
 
+
 _PATCH_LOCK = Mutex(reentrant=True)
 _TORCH_COMPAT: TorchCompat | None = None
+
 RMSNorm = getattr(nn, "RMSNorm", None)
 
 
@@ -144,6 +146,5 @@ except Exception:
     def sdpa_kernel(*backends: Any) -> Iterator[None]:
         _ = backends
         yield
-
 
 StochasticDepth = getattr(nn, "StochasticDepth", None) or _StochasticDepthFallback
