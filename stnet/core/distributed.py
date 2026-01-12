@@ -34,7 +34,7 @@ except ImportError:
     _TorchJoin = None
 
 if TYPE_CHECKING:
-    from torch.distributed.fsdp import FullyShardedDataParallel as FSDP  # type: ignore
+    from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 
 try:
     from torch.distributed.tensor import DTensor as _DTensor
@@ -45,13 +45,9 @@ except ImportError:
         _DTensor = None
 
 
-Join = _TorchJoin
-
 _DTENSOR_ACTIVE: bool = False
 
-
-def is_dtensor_active() -> bool:
-    return bool(_DTENSOR_ACTIVE)
+Join = _TorchJoin
 
 
 def _set_dtensor_active() -> None:
@@ -600,6 +596,10 @@ def distributed_sync(
         return
     distributed_broadcast(module, src=src)
     distributed_barrier(device)
+
+
+def is_dtensor_active() -> bool:
+    return bool(_DTENSOR_ACTIVE)
 
 
 def to_hsdp_module(
