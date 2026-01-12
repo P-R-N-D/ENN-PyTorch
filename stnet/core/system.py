@@ -35,16 +35,16 @@ except Exception:
 _LOGGER = logging.getLogger(__name__)
 
 _FP32_PRECISION_CACHE: dict[str, str] = {}
-_FP32_PRECISION_LOCK = threading.Lock()
+_FP32_PRECISION_LOCK = None
 
-_EMPTY_CACHE_LOCK = threading.Lock()
+_EMPTY_CACHE_LOCK = None
 _EMPTY_CACHE_LAST_CALL_S_BY_DEVICE: dict[Tuple[str, int], float] = {}
 
 _DEVICE_STATS_CACHE: dict[Tuple[str, int], Device] = {}
-_DEVICE_STATS_LOCK = threading.Lock()
+_DEVICE_STATS_LOCK = None
 
 _CPU_PROC_CACHE: Optional[int] = None
-_CPU_PROC_LOCK = threading.Lock()
+_CPU_PROC_LOCK = None
 
 _TZ_ALIASES = {
     k: v
@@ -115,7 +115,37 @@ _RUNTIME_CFG = SimpleNamespace(
     sdpa_backends=None,
     te_first=True,
 )
-_RUNTIME_CFG_LOCK = threading.Lock()
+_RUNTIME_CFG_LOCK = None
+
+
+def _get_mutex_lock(name: str):
+    from .concurrency import Mutex
+
+    lock = globals().get(name)
+    if lock is None:
+        lock = Mutex()
+        globals()[name] = lock
+    return lock
+
+
+def _fp32_precision_lock():
+    return _get_mutex_lock("_FP32_PRECISION_LOCK")
+
+
+def _empty_cache_lock():
+    return _get_mutex_lock("_EMPTY_CACHE_LOCK")
+
+
+def _device_stats_lock():
+    return _get_mutex_lock("_DEVICE_STATS_LOCK")
+
+
+def _cpu_proc_lock():
+    return _get_mutex_lock("_CPU_PROC_LOCK")
+
+
+def _runtime_cfg_lock():
+    return _get_mutex_lock("_RUNTIME_CFG_LOCK")
 
 
 def _device_from(device: Optional[Union[torch.device, str]]) -> torch.device:
@@ -452,7 +482,7 @@ def empty_device_cache(
         min_interval_s = 0.0
     now = time.monotonic()
     key = _clear_device_index(device)
-    with _EMPTY_CACHE_LOCK:
+    with _empty_cache_lock():
         last = float(_EMPTY_CACHE_LAST_CALL_S_BY_DEVICE.get(key, 0.0))
         if min_interval_s and (now - last) < float(min_interval_s):
             return
@@ -848,7 +878,7 @@ def set_float32_precision(
                 break
     precision = "tf32" if use_tf32 else "ieee"
     key = "cuda"
-    with _FP32_PRECISION_LOCK:
+    with _fp32_precision_lock():
         if _FP32_PRECISION_CACHE.get(key) == precision:
             return
         _FP32_PRECISION_CACHE[key] = precision
@@ -1196,7 +1226,7 @@ def is_int4_supported(
 def get_device_stats(device: Optional[Union[torch.device, str]] = None) -> Device:
     dev = _device_from(device)
     key = (str(dev.type), int(dev.index) if dev.index is not None else -1)
-    with _DEVICE_STATS_LOCK:
+    with _device_stats_lock():
         cached = _DEVICE_STATS_CACHE.get(key)
         if cached is not None:
             return cached
@@ -1231,7 +1261,7 @@ def get_device_stats(device: Optional[Union[torch.device, str]] = None) -> Devic
         float8_dtypes=tuple(),
         int_quant_bits=quant_bits,
     )
-    with _DEVICE_STATS_LOCK:
+    with _device_stats_lock():
         _DEVICE_STATS_CACHE[key] = stats
     return stats
 
@@ -1247,7 +1277,7 @@ def get_device(
     **kwargs: Any,
 ) -> torch.device:
     del args, kwargs
-    with _RUNTIME_CFG_LOCK:
+    with _runtime_cfg_lock():
         cfg = _RUNTIME_CFG
         if deterministic is not None:
             cfg.deterministic = bool(deterministic)
@@ -1390,7 +1420,7 @@ class CPU:
         if _CPU_PROC_CACHE is not None:
             return _CPU_PROC_CACHE
 
-        with _CPU_PROC_LOCK:
+        with _cpu_proc_lock():
             if _CPU_PROC_CACHE is not None:
                 return _CPU_PROC_CACHE
 
