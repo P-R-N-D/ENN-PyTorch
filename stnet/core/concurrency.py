@@ -32,40 +32,6 @@ from .policies import WorkerPolicy, optimize_threads
 from .system import CPU, _default_thread_limit, _optimal_local_worlds, _optimal_threads
 
 
-class Mutex:
-    def __init__(self, *, reentrant: bool = False) -> None:
-        self._lock = threading.RLock() if bool(reentrant) else threading.Lock()
-
-    @property
-    def raw(self) -> threading.Lock | threading.RLock:
-        return self._lock
-
-    def acquire(self, blocking: bool = True, timeout: float | None = None) -> bool:
-        if timeout is None:
-            return bool(self._lock.acquire(blocking))
-        return bool(self._lock.acquire(blocking, float(timeout)))
-
-    def release(self) -> None:
-        self._lock.release()
-
-    def locked(self) -> bool:
-        fn = getattr(self._lock, "locked", None)
-        if callable(fn):
-            return bool(fn())
-        return False
-
-    def __enter__(self) -> "Mutex":
-        self.acquire(True, None)
-        return self
-
-    def __exit__(self, exc_type, exc, tb) -> None:
-        self.release()
-
-
-_TLB_SINGLETON: Optional["Thread"] = None
-_TLB_SINGLETON_LOCK = Mutex()
-
-
 def _flatten_args(items: Sequence[Any]) -> Iterator[Any]:
     for item in items:
         if isinstance(item, dict):
@@ -1254,3 +1220,37 @@ class Thread:
         tuned = max(1, min(int(io_workers), cpus))
         self._io_workers = tuned
         return tuned
+
+
+class Mutex:
+    def __init__(self, *, reentrant: bool = False) -> None:
+        self._lock = threading.RLock() if bool(reentrant) else threading.Lock()
+
+    @property
+    def raw(self) -> threading.Lock | threading.RLock:
+        return self._lock
+
+    def acquire(self, blocking: bool = True, timeout: float | None = None) -> bool:
+        if timeout is None:
+            return bool(self._lock.acquire(blocking))
+        return bool(self._lock.acquire(blocking, float(timeout)))
+
+    def release(self) -> None:
+        self._lock.release()
+
+    def locked(self) -> bool:
+        fn = getattr(self._lock, "locked", None)
+        if callable(fn):
+            return bool(fn())
+        return False
+
+    def __enter__(self) -> "Mutex":
+        self.acquire(True, None)
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self.release()
+
+
+_TLB_SINGLETON: Optional["Thread"] = None
+_TLB_SINGLETON_LOCK = Mutex()
