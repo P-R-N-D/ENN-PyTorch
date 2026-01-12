@@ -36,6 +36,66 @@ _NEGO_LOGGED_KEYS: "OrderedDict[object, None]" = OrderedDict()
 _NEGO_LOGGED_MAX: int = 256
 _NEGO_LOGGED_LOCK = Mutex()
 
+_Int8DynamicActivationInt8WeightConfig = None
+_Int8WeightOnlyConfig = None
+
+_PTQ_IMPL = None
+
+_qp = None
+
+_TORCHAO_IMPORT_TRIED = False
+_TORCHAO_IMPORT_LOCK = Mutex()
+
+
+def __getattr__(name: str) -> Any:
+    if name == "PrecisionPolicy":
+        raise AttributeError(
+            "PrecisionPolicy has moved to stnet.core.policies; "
+            "import it from that module instead."
+        )
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+def _import_torchao_quantization() -> None:
+    global _Int8DynamicActivationInt8WeightConfig
+    global _Int8WeightOnlyConfig
+    global _PTQ_IMPL
+    global _qp
+    global _TORCHAO_IMPORT_TRIED
+    if _TORCHAO_IMPORT_TRIED:
+        return
+    with _TORCHAO_IMPORT_LOCK:
+        if _TORCHAO_IMPORT_TRIED:
+            return
+        _TORCHAO_IMPORT_TRIED = True
+        buf = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
+                from torchao.quantization.quant_api import (
+                    Int8DynamicActivationInt8WeightConfig as _Int8DynamicActivationInt8WeightConfig,
+                    Int8WeightOnlyConfig as _Int8WeightOnlyConfig,
+                    quantize_ as _quantize_,
+                )
+
+                try:
+                    from torchao.quantization import quant_primitives as _quant_primitives
+                except Exception:
+                    _quant_primitives = None
+            _PTQ_IMPL = _quantize_
+            _qp = _quant_primitives
+        except Exception:
+            _Int8DynamicActivationInt8WeightConfig = None
+            _Int8WeightOnlyConfig = None
+            _PTQ_IMPL = None
+            _qp = None
+
+
+def _is_ptq_unavailable(
+    model: nn.Module, *args: Any, **kwargs: Any
+) -> tuple[nn.Module, bool, str]:
+    _ = args, kwargs
+    return (model, False, "PTQ backend unavailable")
+
 
 def _log_negotiation(
     logger: Optional[logging.Logger],
@@ -827,61 +887,6 @@ class Autocast:
             yield
 
 
-
-# --- Quantization (moved from stnet.nn.architecture) ---
-
-_Int8DynamicActivationInt8WeightConfig = None
-_Int8WeightOnlyConfig = None
-
-_PTQ_IMPL = None
-
-_qp = None
-
-_TORCHAO_IMPORT_TRIED = False
-_TORCHAO_IMPORT_LOCK = Mutex()
-
-
-def _import_torchao_quantization() -> None:
-    global _Int8DynamicActivationInt8WeightConfig
-    global _Int8WeightOnlyConfig
-    global _PTQ_IMPL
-    global _qp
-    global _TORCHAO_IMPORT_TRIED
-    if _TORCHAO_IMPORT_TRIED:
-        return
-    with _TORCHAO_IMPORT_LOCK:
-        if _TORCHAO_IMPORT_TRIED:
-            return
-        _TORCHAO_IMPORT_TRIED = True
-        buf = io.StringIO()
-        try:
-            with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
-                from torchao.quantization.quant_api import (
-                    Int8DynamicActivationInt8WeightConfig as _Int8DynamicActivationInt8WeightConfig,
-                    Int8WeightOnlyConfig as _Int8WeightOnlyConfig,
-                    quantize_ as _quantize_,
-                )
-
-                try:
-                    from torchao.quantization import quant_primitives as _quant_primitives
-                except Exception:
-                    _quant_primitives = None
-            _PTQ_IMPL = _quantize_
-            _qp = _quant_primitives
-        except Exception:
-            _Int8DynamicActivationInt8WeightConfig = None
-            _Int8WeightOnlyConfig = None
-            _PTQ_IMPL = None
-            _qp = None
-
-
-def _is_ptq_unavailable(
-    model: nn.Module, *args: Any, **kwargs: Any
-) -> tuple[nn.Module, bool, str]:
-    _ = args, kwargs
-    return (model, False, "PTQ backend unavailable")
-
-
 class Quantization:
     @staticmethod
     def is_qat_available() -> bool:
@@ -1047,14 +1052,3 @@ class Quantization:
             setattr(m2, "__int8_training_ptq__", True)
             return (m2, True, f"PTQ({why})")
         return (model, False, f"PTQ failed: {why}")
-
-
-
-def __getattr__(name: str) -> Any:
-    if name == "PrecisionPolicy":
-        raise AttributeError(
-            "PrecisionPolicy has moved to stnet.core.policies; "
-            "import it from that module instead."
-        )
-    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
-
