@@ -51,6 +51,19 @@ _GRAPH_BREAK_FN: Callable[[], None] | None = None
 _GRAPH_BREAK_LOCK = Mutex()
 
 
+def _raised_from_checkpointed_fn(err: BaseException) -> bool:
+    tb = err.__traceback__
+    if tb is None:
+        return False
+    for frame, _ in traceback.walk_tb(tb):
+        if (
+            frame.f_code.co_name == "_state"
+            and frame.f_globals.get("__name__") == __name__
+        ):
+            return True
+    return False
+
+
 def _is_compiled_for_inference(model: torch.nn.Module) -> bool:
     cached = getattr(model, "__stnet_cached_is_compiled_for_inference__", None)
     if isinstance(cached, bool):
@@ -820,19 +833,6 @@ def from_checkpoint(model: nn.Module, *args: Any, step_total: int) -> None:
 
 def is_checkpoint() -> bool:
     return bool(getattr(_CKPT_TL, "depth", 0) or 0)
-
-
-def _raised_from_checkpointed_fn(err: BaseException) -> bool:
-    tb = err.__traceback__
-    if tb is None:
-        return False
-    for frame, _ in traceback.walk_tb(tb):
-        if (
-            frame.f_code.co_name == "_state"
-            and frame.f_globals.get("__name__") == __name__
-        ):
-            return True
-    return False
 
 
 def coerce_checkpoint(
