@@ -24,6 +24,15 @@ from typing import Any, Optional, Sequence, Tuple, Union, TYPE_CHECKING
 import torch
 import torch.multiprocessing
 
+from .datatypes import (
+    env_bool,
+    env_first,
+    env_first_float,
+    env_first_int,
+    env_int,
+    parse_bool,
+)
+
 try:
     from zoneinfo import ZoneInfo
 except Exception:
@@ -371,8 +380,9 @@ def _get_allowed_cpu_windows() -> Optional[list[int]]:
                     return [i for i in range(m.bit_length()) if (m >> i) & 1]
     except Exception:
         pass
+    # Windows processor groups (best-effort)
     try:
-    with _mutex_lock("_EMPTY_CACHE_LOCK"):
+        get_group_cnt = getattr(k32, "GetActiveProcessorGroupCount", None)
         get_group_procs = getattr(k32, "GetActiveProcessorCount", None)
         if not (callable(get_group_cnt) and callable(get_group_procs)):
             return None
@@ -380,22 +390,27 @@ def _get_allowed_cpu_windows() -> Optional[list[int]]:
         if group_count <= 0:
             return None
 
-        counts = []
+        counts: list[int] = []
         for i in range(group_count):
-            c = _call(get_group_procs, ctypes.c_ushort(i)) or _call(get_group_procs, i) or 0
+            c = (
+                _call(get_group_procs, ctypes.c_ushort(i))
+                or _call(get_group_procs, i)
+                or 0
+            )
             counts.append(max(0, int(c)))
 
-        groups = None
-        if callable(get_pg_aff := getattr(k32, "GetProcessGroupAffinity", None)):
-            h, cnt, arr = (
-                k32.GetCurrentProcess(),
-                ctypes.c_ushort(0),
-                (ctypes.c_ushort * group_count)(),
-            )
+        groups: list[int] | None = None
+        get_pg_aff = getattr(k32, "GetProcessGroupAffinity", None)
+        if callable(get_pg_aff):
+            h = k32.GetCurrentProcess()
+            cnt = ctypes.c_ushort(0)
+            arr = (ctypes.c_ushort * group_count)()
             if get_pg_aff(h, ctypes.byref(cnt), arr) and cnt.value > 0:
-                groups = [int(arr[i]) for i in range(cnt.value)]
+                groups = [int(arr[i]) for i in range(int(cnt.value))]
+
         if not groups:
             groups = list(range(group_count))
+
         total = 0
         for g in groups:
             if 0 <= int(g) < group_count:
@@ -769,9 +784,14 @@ def is_accelerator_timer_supported(dev_type: str) -> bool:
     return True
 
 
-    with _mutex_lock("_FP32_PRECISION_LOCK"):
-    device: torch.device, *args: Any, enable_timing: bool = False
+
+
+def new_accelerator_event(
+    device: Union[torch.device, str],
+    *args: Any,
+    enable_timing: bool = False,
 ) -> object | None:
+    del args
     try:
         dev = device if isinstance(device, torch.device) else torch.device(str(device))
     except Exception:
@@ -1116,10 +1136,10 @@ def cuda_compute_capability(device: Union[torch.device, str]) -> Tuple[int, int]
     if dev.type != "cuda" or not torch.cuda.is_available():
         return (0, 0)
     try:
-    with _mutex_lock("_DEVICE_STATS_LOCK"):
-    with _mutex_lock("_DEVICE_STATS_LOCK"):
-    with _mutex_lock("_RUNTIME_CFG_LOCK"):
-    return (int(major), int(minor))
+        major, minor = torch.cuda.get_device_capability(dev)
+        return (int(major), int(minor))
+    except Exception:
+        return (0, 0)
 
 
 def is_cpu_bf16_supported() -> bool:
@@ -1308,25 +1328,28 @@ def get_device(
         cudnn_bench_val = bool(cfg.cudnn_benchmark)
         matmul_prec = str(cfg.matmul_precision)
     _call(getattr(torch, "set_float32_matmul_precision", None), matmul_prec)
-    if is_accelerator_available("cuda"):
-        idx = 0
-        with _mutex_lock("_CPU_PROC_LOCK"):
-        ndev = max(1, int(get_num_accelerators("cuda") or 1))
-        with contextlib.suppress(Exception):
-            idx = int(idx_env) % int(ndev)
+
+if is_accelerator_available("cuda"):
+    idx_env = env_first_int(("LOCAL_RANK", "STNET_ACCELERATOR_INDEX", "STNET_DEVICE_INDEX"), default=0)
+    ndev = max(1, int(get_num_accelerators("cuda") or 1))
+    idx = 0
+    with contextlib.suppress(Exception):
+        idx = int(idx_env) % int(ndev)
+    # serialize device selection in multi-thread contexts
+    with _mutex_lock("_CPU_PROC_LOCK"):
         set_accelerator_index("cuda", int(idx))
-        device = torch.device(f"cuda:{idx}")
-        cudnn = getattr(torch.backends, "cudnn", None)
-        if cudnn is not None:
-            _call(setattr, cudnn, "deterministic", bool(det))
-            _call(setattr, cudnn, "benchmark", bool(cudnn_bench_val))
-        cuda_b = getattr(torch.backends, "cuda", None)
-        matmul = getattr(cuda_b, "matmul", None) if cuda_b is not None else None
-        if matmul is not None and hasattr(matmul, "allow_tf32"):
-            _call(setattr, matmul, "allow_tf32", bool(allow_tf32_val))
-        cudnn_b = getattr(torch.backends, "cudnn", None)
-        if cudnn_b is not None and hasattr(cudnn_b, "allow_tf32"):
-            _call(setattr, cudnn_b, "allow_tf32", bool(allow_tf32_val))
+    device = torch.device(f"cuda:{idx}")
+    cudnn = getattr(torch.backends, "cudnn", None)
+    if cudnn is not None:
+        _call(setattr, cudnn, "deterministic", bool(det))
+        _call(setattr, cudnn, "benchmark", bool(cudnn_bench_val))
+    cuda_b = getattr(torch.backends, "cuda", None)
+    matmul = getattr(cuda_b, "matmul", None) if cuda_b is not None else None
+    if matmul is not None and hasattr(matmul, "allow_tf32"):
+        _call(setattr, matmul, "allow_tf32", bool(allow_tf32_val))
+    cudnn_b = getattr(torch.backends, "cudnn", None)
+    if cudnn_b is not None and hasattr(cudnn_b, "allow_tf32"):
+        _call(setattr, cudnn_b, "allow_tf32", bool(allow_tf32_val))
     elif is_accelerator_available("xpu"):
         idx = 0
         idx_env = env_first_int(("LOCAL_RANK",), default=0)
