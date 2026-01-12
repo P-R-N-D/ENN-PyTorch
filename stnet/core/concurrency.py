@@ -131,9 +131,19 @@ def supports_interpreter_pool_executor() -> bool:
     return getattr(futures, "InterpreterPoolExecutor", None) is not None
 
 
+def buffered(
+    iterable: Any,
+    *args: Any,
+    max_batches: int = 4,
+    name: str = "buffer",
+    daemon: bool = True,
+) -> Buffered:
+    return Buffered(iterable, max_batches=max_batches, name=name, daemon=daemon)
+
+
 def new_executor(
     max_workers: int,
-    *,
+    *args: Any,
     workload: str = "io",
     name: str = "stnet",
     prefer_interpreters: bool | None = None,
@@ -345,15 +355,6 @@ class Buffered:
                 except TypeError:
                     ex.shutdown(wait=False)
 
-
-def buffered(
-    iterable: Any,
-    *args: Any,
-    max_batches: int = 4,
-    name: str = "buffer",
-    daemon: bool = True,
-) -> Buffered:
-    return Buffered(iterable, max_batches=max_batches, name=name, daemon=daemon)
 
 class Page:
     __slots__ = ("_buf", "_numel", "_dtype", "_pinned")
