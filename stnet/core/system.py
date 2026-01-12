@@ -436,6 +436,14 @@ def _get_cgroup_quota() -> int:
     return 0
 
 
+def _acc_mod(dt: str):
+    return getattr(torch, dt, None) if dt in ("cuda", "xpu", "mps") else accelerator_type(dt)
+
+
+def _acc_op(dt, op, default=None):
+    return _call(getattr(_acc_mod(dt), op, None)) or default
+
+
 def empty_device_cache(
     *args: Any,
     device: Optional[Union[torch.device, str]] = None,
@@ -537,20 +545,12 @@ def is_oom_error(exc: BaseException) -> bool:
     return any(p in msg for p in patterns)
 
 
-def _acc_mod(dt: str):
-    return getattr(torch, dt, None) if dt in ("cuda", "xpu", "mps") else accelerator_type(dt)
-
-
 def accelerator_type(dev_type: str) -> Optional[ModuleType]:
     dt = str(dev_type or "cpu").strip().lower()
     if dt in ("cuda", "xpu", "mps"):
         return getattr(torch, dt, None)
     acc = getattr(torch, "accelerator", None)
     return acc if acc and getattr(acc, "device_type", None) == dt else None
-
-
-def _acc_op(dt, op, default=None):
-    return _call(getattr(_acc_mod(dt), op, None)) or default
 
 
 @lru_cache(maxsize=8)
