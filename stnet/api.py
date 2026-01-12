@@ -520,6 +520,67 @@ def _update_batch_stats(prev: object, n_prev: object, inc: object, n_inc: object
     return out
 
 
+def _update_history(
+    model: object,
+    ckpt_dir: str | None,
+    epochs: int,
+    val_frac: float,
+    num_samples_dataset: int,
+) -> None:
+    if not ckpt_dir:
+        return
+    history_path = os.path.join(ckpt_dir, "history.json")
+    if not os.path.isfile(history_path):
+        return
+    try:
+        raw = read_json(history_path)
+        if isinstance(raw, dict):
+            records = raw.get("records", []) or []
+            meta = raw.get("meta", {}) or {}
+        else:
+            records = raw if isinstance(raw, list) else []
+            meta = {}
+        run_stats = _reduce_batch_stats(records)
+        sampled_n = int(meta.get("sampled_n", 0)) if isinstance(meta, dict) else 0
+        if sampled_n <= 0:
+            epochs_val = int(meta.get("epochs", epochs)) if isinstance(meta, dict) else int(epochs)
+            frac_val = (
+                float(meta.get("val_frac", val_frac)) if isinstance(meta, dict) else float(val_frac)
+            )
+            frac_val = max(0.0, min(1.0, frac_val))
+            sampled_n = (
+                int(round(num_samples_dataset * max(0.0, 1.0 - frac_val) * max(1, epochs_val)))
+                or num_samples_dataset
+            )
+        prev_n = int(getattr(model, "_history_total_samples", 0))
+        cum_stats = _update_batch_stats(
+            getattr(model, "_history_cum_stats", None),
+            prev_n,
+            run_stats,
+            sampled_n,
+        )
+        setattr(model, "_history_total_samples", prev_n + sampled_n)
+        setattr(model, "_history_dataset_n", int(num_samples_dataset))
+        if cum_stats:
+            setattr(model, "_history_cum_stats", cum_stats)
+        history = getattr(model, "_train_history", []) or []
+        record = {
+            "run_index": len(history),
+            "sampled_n": sampled_n,
+            "reduced_n": prev_n + sampled_n,
+            **(run_stats or {}),
+            **(cum_stats or {}),
+        }
+        if meta:
+            record["env"] = dict(meta)
+        setattr(model, "_train_history", history + [record])
+        logger_obj = getattr(model, "logger", None)
+        if isinstance(logger_obj, Recorder):
+            logger_obj._records = getattr(model, "_train_history")
+    except Exception:
+        pass
+
+
 def _coerce_path(path: PathLike) -> Optional[PathLike]:
     if path is None:
         return None
@@ -836,67 +897,6 @@ def save_model(
         raise ValueError(f"Unknown export format for path '{path}'.")
     conv.save(model, p, *args, **kwargs)
     return str(p)
-
-
-def _update_history(
-    model: object,
-    ckpt_dir: str | None,
-    epochs: int,
-    val_frac: float,
-    num_samples_dataset: int,
-) -> None:
-    if not ckpt_dir:
-        return
-    history_path = os.path.join(ckpt_dir, "history.json")
-    if not os.path.isfile(history_path):
-        return
-    try:
-        raw = read_json(history_path)
-        if isinstance(raw, dict):
-            records = raw.get("records", []) or []
-            meta = raw.get("meta", {}) or {}
-        else:
-            records = raw if isinstance(raw, list) else []
-            meta = {}
-        run_stats = _reduce_batch_stats(records)
-        sampled_n = int(meta.get("sampled_n", 0)) if isinstance(meta, dict) else 0
-        if sampled_n <= 0:
-            epochs_val = int(meta.get("epochs", epochs)) if isinstance(meta, dict) else int(epochs)
-            frac_val = (
-                float(meta.get("val_frac", val_frac)) if isinstance(meta, dict) else float(val_frac)
-            )
-            frac_val = max(0.0, min(1.0, frac_val))
-            sampled_n = (
-                int(round(num_samples_dataset * max(0.0, 1.0 - frac_val) * max(1, epochs_val)))
-                or num_samples_dataset
-            )
-        prev_n = int(getattr(model, "_history_total_samples", 0))
-        cum_stats = _update_batch_stats(
-            getattr(model, "_history_cum_stats", None),
-            prev_n,
-            run_stats,
-            sampled_n,
-        )
-        setattr(model, "_history_total_samples", prev_n + sampled_n)
-        setattr(model, "_history_dataset_n", int(num_samples_dataset))
-        if cum_stats:
-            setattr(model, "_history_cum_stats", cum_stats)
-        history = getattr(model, "_train_history", []) or []
-        record = {
-            "run_index": len(history),
-            "sampled_n": sampled_n,
-            "reduced_n": prev_n + sampled_n,
-            **(run_stats or {}),
-            **(cum_stats or {}),
-        }
-        if meta:
-            record["env"] = dict(meta)
-        setattr(model, "_train_history", history + [record])
-        logger_obj = getattr(model, "logger", None)
-        if isinstance(logger_obj, Recorder):
-            logger_obj._records = getattr(model, "_train_history")
-    except Exception:
-        pass
 
 
 @get_execution_time(logger, fn_name="train")
