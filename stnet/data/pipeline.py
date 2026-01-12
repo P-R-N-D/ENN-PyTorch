@@ -58,10 +58,19 @@ from ..core.system import (
 )
 from ..core.datatypes import default_underflow_action, normalize_underflow_action
 
-# --- dataset row/key conventions (moved from data.schemas) ---
+
+SourceType = Literal["memmap"]
 
 _FEATURE_KEY_ALIASES = frozenset({"x", "feature", "features", "input", "inputs", "in"})
+
 _LABEL_KEY_ALIASES = frozenset({"y", "label", "labels", "output", "outputs", "out"})
+
+_NODES_LOCK = Mutex()
+_NODES_IMPORTED = False
+
+_device_mem_get_info = Memory.mem_get_info
+
+TExtra = TypeVar("TExtra")
 
 
 def _td_set(td: TensorDictBase, key: str, value: Any) -> None:
@@ -89,58 +98,6 @@ def _resolve_key(data: Any, aliases: frozenset, name: str, required: bool) -> Op
             f"Expected exactly one {name} key among {sorted(aliases)}; found {matches or 'none'}"
         )
     return None
-
-
-def get_feature_key(data: Any) -> str:
-    return _resolve_key(data, _FEATURE_KEY_ALIASES, "feature", True)
-
-
-def get_label_key(data: Any, *args: Any, required: bool = True) -> Optional[str]:
-    return _resolve_key(data, _LABEL_KEY_ALIASES, "label", required)
-
-
-def canonicalize_keys_(
-    td: TensorDictBase,
-    *args: Any,
-    x_key: str = "X",
-    y_key: str = "Y",
-    allow_missing_labels: bool = False,
-) -> TensorDictBase:
-    if not isinstance(td, TensorDictBase):
-        raise TypeError("canonicalize_xy_keys_ expects a TensorDict")
-    fkey = get_feature_key(td)
-    if fkey != x_key:
-        _td_set(td, x_key, td[fkey])
-        _td_del(td, fkey)
-    lkey = get_label_key(td, required=not bool(allow_missing_labels))
-    if lkey is not None and lkey != y_key:
-        _td_set(td, y_key, td[lkey])
-        _td_del(td, lkey)
-    return td
-
-
-def get_row(data: Any, *args: Any, labels_required: bool = False) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
-    return data[get_feature_key(data)], (
-        data[l] if (l := get_label_key(data, required=labels_required)) else None
-    )
-
-# --- data source types ---
-
-SourceType = Literal["memmap"]
-
-
-class Source(TypedDict):
-    path: Required[str]
-    format: NotRequired[SourceType]
-    kind: NotRequired[SourceType]
-
-
-_NODES_LOCK = Mutex()
-_NODES_IMPORTED = False
-
-_device_mem_get_info = Memory.mem_get_info
-
-TExtra = TypeVar("TExtra")
 
 
 def _require_nodes() -> None:
@@ -825,6 +782,40 @@ def _fetch_build_sampler_nodes(
     return nodes, lengths
 
 
+def get_feature_key(data: Any) -> str:
+    return _resolve_key(data, _FEATURE_KEY_ALIASES, "feature", True)
+
+
+def get_label_key(data: Any, *args: Any, required: bool = True) -> Optional[str]:
+    return _resolve_key(data, _LABEL_KEY_ALIASES, "label", required)
+
+
+def canonicalize_keys_(
+    td: TensorDictBase,
+    *args: Any,
+    x_key: str = "X",
+    y_key: str = "Y",
+    allow_missing_labels: bool = False,
+) -> TensorDictBase:
+    if not isinstance(td, TensorDictBase):
+        raise TypeError("canonicalize_xy_keys_ expects a TensorDict")
+    fkey = get_feature_key(td)
+    if fkey != x_key:
+        _td_set(td, x_key, td[fkey])
+        _td_del(td, fkey)
+    lkey = get_label_key(td, required=not bool(allow_missing_labels))
+    if lkey is not None and lkey != y_key:
+        _td_set(td, y_key, td[lkey])
+        _td_del(td, lkey)
+    return td
+
+
+def get_row(data: Any, *args: Any, labels_required: bool = False) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+    return data[get_feature_key(data)], (
+        data[l] if (l := get_label_key(data, required=labels_required)) else None
+    )
+
+
 def iter_dataset(data: object) -> tuple[list[tuple[str, object]], object | None]:
     if isinstance(data, TensorDictBase):
         return ([("0", data)], None)
@@ -1062,6 +1053,12 @@ def fetch(
         "disposable": allocated,
         "sampler_scale": scale_ctl,
     }
+
+
+class Source(TypedDict):
+    path: Required[str]
+    format: NotRequired[SourceType]
+    kind: NotRequired[SourceType]
 
 
 class Collator:
