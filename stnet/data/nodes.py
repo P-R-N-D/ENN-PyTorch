@@ -77,7 +77,6 @@ from .pipeline import Dataset, Source, SourceType, _FEATURE_KEY_ALIASES, _LABEL_
 _LOGGER = logging.getLogger(__name__)
 
 
-
 def _strictest_underflow_action(v1: Optional[str], v2: Optional[str]) -> Optional[str]:
     if v1 is None or v2 is None:
         return v1 or v2
