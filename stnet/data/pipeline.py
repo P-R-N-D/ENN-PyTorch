@@ -59,8 +59,6 @@ from ..core.system import (
 from ..core.datatypes import default_underflow_action, normalize_underflow_action
 
 
-SourceType = Literal["memmap"]
-
 _FEATURE_KEY_ALIASES = frozenset({"x", "feature", "features", "input", "inputs", "in"})
 
 _LABEL_KEY_ALIASES = frozenset({"y", "label", "labels", "output", "outputs", "out"})
@@ -71,6 +69,7 @@ _NODES_IMPORTED = False
 _device_mem_get_info = Memory.mem_get_info
 
 TExtra = TypeVar("TExtra")
+SourceType = Literal["memmap"]
 
 
 def _td_set(td: TensorDictBase, key: str, value: Any) -> None:
