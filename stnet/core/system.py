@@ -429,141 +429,6 @@ def _get_cgroup_quota() -> int:
     return 0
 
 
-class CPU:
-    @staticmethod
-    def allowed() -> list[int]:
-        try:
-            if os.name == "nt":
-                cpus = _get_allowed_cpu_windows()
-            elif sys.platform.startswith("linux"):
-                cpus = os.sched_getaffinity(0)
-            elif sys.platform == "darwin":
-                cpus = _get_allowed_cpu_darwin()
-            else:
-                cpus = _get_allowed_cpu_fallback()
-        except Exception:
-            cpus = _get_allowed_cpu_fallback()
-
-        if isinstance(cpus, set):
-            cpus = list(cpus)
-        if isinstance(cpus, (list, tuple)):
-            cpus = [int(v) for v in cpus]
-            return cpus or _get_allowed_cpu_fallback()
-        if isinstance(cpus, int) and cpus > 0:
-            return list(range(int(cpus)))
-
-        spec = importlib.util.find_spec("psutil")
-        if spec is not None:
-            psutil = importlib.import_module("psutil")
-            proc = psutil.Process()
-            fn = getattr(proc, "cpu_affinity", None)
-            if callable(fn):
-                cpus = fn()
-                if cpus:
-                    return sorted({int(c) for c in cpus})
-        return _get_allowed_cpu_fallback()
-
-    @staticmethod
-    def count() -> int:
-        global _CPU_PROC_CACHE
-        if _CPU_PROC_CACHE is not None:
-            return _CPU_PROC_CACHE
-
-        with _CPU_PROC_LOCK:
-            if _CPU_PROC_CACHE is not None:
-                return _CPU_PROC_CACHE
-
-            env_int = env_first_int(
-                ("STNET_CPU_LIMIT", "STNET_CPU_COUNT", "OMP_NUM_THREADS"), default=0
-            )
-            xopt_int = 0
-            with contextlib.suppress(Exception):
-                xopt = getattr(sys, "_xoptions", {})
-                if isinstance(xopt, dict):
-                    xopt_int = int(xopt.get("stnet.cpu_limit", 0))
-
-            base = max(env_int, xopt_int)
-            if base <= 0:
-                with contextlib.suppress(Exception):
-                    fn = getattr(os, "process_cpu_count", None)
-                    if callable(fn):
-                        base = int(fn() or 0)
-                if base <= 0:
-                    base = int(os.cpu_count() or 1)
-
-            base = max(1, int(base))
-
-            allowed = CPU.allowed()
-            if allowed:
-                base = min(base, len(allowed))
-
-            quota = _get_cgroup_quota()
-            if quota > 0:
-                base = min(base, quota)
-
-            _CPU_PROC_CACHE = int(base)
-            return _CPU_PROC_CACHE
-
-    @staticmethod
-    def info(max_bytes: Optional[int] = None) -> str:
-        cpuinfo = None
-        spec = importlib.util.find_spec("cpuinfo")
-        if spec is not None:
-            cpuinfo = importlib.import_module("cpuinfo")
-
-        info: dict[str, Any] = {
-            "cpu_count": int(CPU.count()),
-            "os": sys.platform,
-            "machine": platform.machine(),
-            "processor": platform.processor(),
-            "python": sys.version,
-        }
-
-        if cpuinfo is not None:
-            with contextlib.suppress(Exception):
-                raw = cpuinfo.get_CPU.info()
-                if isinstance(raw, dict):
-                    raw = {k: v for k, v in raw.items() if not k.startswith("_")}
-                    info["cpuinfo"] = raw
-
-        out = json.dumps(info, sort_keys=True, ensure_ascii=True, default=str)
-        if max_bytes is not None and max_bytes > 0:
-            b = out.encode("utf-8")
-            if len(b) > max_bytes:
-                out = b[: max_bytes - 3].decode("utf-8", errors="ignore") + "..."
-        return out
-
-    @staticmethod
-    def is_free_threaded_build() -> bool:
-        val = sysconfig.get_config_var("Py_GIL_DISABLED")
-        with contextlib.suppress(Exception):
-            return bool(int(val or 0))
-        return False
-
-    @staticmethod
-    def is_gil_enabled() -> bool:
-        if hasattr(sys, "_is_gil_enabled"):
-            with contextlib.suppress(Exception):
-                return bool(sys._is_gil_enabled())
-        return not CPU.is_free_threaded_build()
-
-    @staticmethod
-    def is_no_gil_enforced() -> bool:
-        return CPU.is_free_threaded_build() and (not CPU.is_gil_enabled())
-
-    @staticmethod
-    def is_optimized_for_no_gil() -> bool:
-        for key in (
-            "STNET_NOGIL_OPTIMIZED",
-            "STNET_NO_GIL_OPTIMIZED",
-            "STNET_FREE_THREADED_OPTIMIZED",
-        ):
-            override = parse_bool(os.environ.get(key))
-            if override is not None:
-                return bool(override)
-        return CPU.is_no_gil_enforced()
-
-
 def empty_device_cache(
     *args: Any,
     device: Optional[Union[torch.device, str]] = None,
@@ -1485,7 +1350,6 @@ def optimal_optimizer_params(
     return flags
 
 
-
 @dataclass(slots=True)
 class Device:
     device: torch.device
@@ -1496,6 +1360,140 @@ class Device:
     float8_dtypes: Tuple[torch.dtype, ...]
     int_quant_bits: int
 
+
+class CPU:
+    @staticmethod
+    def allowed() -> list[int]:
+        try:
+            if os.name == "nt":
+                cpus = _get_allowed_cpu_windows()
+            elif sys.platform.startswith("linux"):
+                cpus = os.sched_getaffinity(0)
+            elif sys.platform == "darwin":
+                cpus = _get_allowed_cpu_darwin()
+            else:
+                cpus = _get_allowed_cpu_fallback()
+        except Exception:
+            cpus = _get_allowed_cpu_fallback()
+
+        if isinstance(cpus, set):
+            cpus = list(cpus)
+        if isinstance(cpus, (list, tuple)):
+            cpus = [int(v) for v in cpus]
+            return cpus or _get_allowed_cpu_fallback()
+        if isinstance(cpus, int) and cpus > 0:
+            return list(range(int(cpus)))
+
+        spec = importlib.util.find_spec("psutil")
+        if spec is not None:
+            psutil = importlib.import_module("psutil")
+            proc = psutil.Process()
+            fn = getattr(proc, "cpu_affinity", None)
+            if callable(fn):
+                cpus = fn()
+                if cpus:
+                    return sorted({int(c) for c in cpus})
+        return _get_allowed_cpu_fallback()
+
+    @staticmethod
+    def count() -> int:
+        global _CPU_PROC_CACHE
+        if _CPU_PROC_CACHE is not None:
+            return _CPU_PROC_CACHE
+
+        with _CPU_PROC_LOCK:
+            if _CPU_PROC_CACHE is not None:
+                return _CPU_PROC_CACHE
+
+            env_int = env_first_int(
+                ("STNET_CPU_LIMIT", "STNET_CPU_COUNT", "OMP_NUM_THREADS"), default=0
+            )
+            xopt_int = 0
+            with contextlib.suppress(Exception):
+                xopt = getattr(sys, "_xoptions", {})
+                if isinstance(xopt, dict):
+                    xopt_int = int(xopt.get("stnet.cpu_limit", 0))
+
+            base = max(env_int, xopt_int)
+            if base <= 0:
+                with contextlib.suppress(Exception):
+                    fn = getattr(os, "process_cpu_count", None)
+                    if callable(fn):
+                        base = int(fn() or 0)
+                if base <= 0:
+                    base = int(os.cpu_count() or 1)
+
+            base = max(1, int(base))
+
+            allowed = CPU.allowed()
+            if allowed:
+                base = min(base, len(allowed))
+
+            quota = _get_cgroup_quota()
+            if quota > 0:
+                base = min(base, quota)
+
+            _CPU_PROC_CACHE = int(base)
+            return _CPU_PROC_CACHE
+
+    @staticmethod
+    def info(max_bytes: Optional[int] = None) -> str:
+        cpuinfo = None
+        spec = importlib.util.find_spec("cpuinfo")
+        if spec is not None:
+            cpuinfo = importlib.import_module("cpuinfo")
+
+        info: dict[str, Any] = {
+            "cpu_count": int(CPU.count()),
+            "os": sys.platform,
+            "machine": platform.machine(),
+            "processor": platform.processor(),
+            "python": sys.version,
+        }
+
+        if cpuinfo is not None:
+            with contextlib.suppress(Exception):
+                raw = cpuinfo.get_CPU.info()
+                if isinstance(raw, dict):
+                    raw = {k: v for k, v in raw.items() if not k.startswith("_")}
+                    info["cpuinfo"] = raw
+
+        out = json.dumps(info, sort_keys=True, ensure_ascii=True, default=str)
+        if max_bytes is not None and max_bytes > 0:
+            b = out.encode("utf-8")
+            if len(b) > max_bytes:
+                out = b[: max_bytes - 3].decode("utf-8", errors="ignore") + "..."
+        return out
+
+    @staticmethod
+    def is_free_threaded_build() -> bool:
+        val = sysconfig.get_config_var("Py_GIL_DISABLED")
+        with contextlib.suppress(Exception):
+            return bool(int(val or 0))
+        return False
+
+    @staticmethod
+    def is_gil_enabled() -> bool:
+        if hasattr(sys, "_is_gil_enabled"):
+            with contextlib.suppress(Exception):
+                return bool(sys._is_gil_enabled())
+        return not CPU.is_free_threaded_build()
+
+    @staticmethod
+    def is_no_gil_enforced() -> bool:
+        return CPU.is_free_threaded_build() and (not CPU.is_gil_enabled())
+
+    @staticmethod
+    def is_optimized_for_no_gil() -> bool:
+        for key in (
+            "STNET_NOGIL_OPTIMIZED",
+            "STNET_NO_GIL_OPTIMIZED",
+            "STNET_FREE_THREADED_OPTIMIZED",
+        ):
+            override = parse_bool(os.environ.get(key))
+            if override is not None:
+                return bool(override)
+        return CPU.is_no_gil_enforced()
 
 
 class Memory:
