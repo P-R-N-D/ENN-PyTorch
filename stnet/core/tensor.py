@@ -8,24 +8,45 @@ from typing import Any, Iterator
 
 import torch
 
+
 spec = importlib.util.find_spec("torchdistx.fake")
 if spec is not None:
     torchdistx_fake = importlib.import_module("torchdistx.fake")
     _tdx_is_fake = getattr(torchdistx_fake, "is_fake", None)
 else:
     _tdx_is_fake = None
-
 spec = importlib.util.find_spec("torch._subclasses.fake_tensor")
 if spec is not None:
     from torch._subclasses.fake_tensor import FakeTensor
 else:
     FakeTensor = tuple()
-
 spec = importlib.util.find_spec("tensordict")
 if spec is not None:
     from tensordict import TensorDictBase
 else:
     TensorDictBase = ()
+
+
+def _call_from_buffer(
+    fn: Any,
+    buffer: Any,
+    *args: Any,
+    dtype: torch.dtype,
+    count: int = -1,
+    offset: int = 0,
+    requires_grad: bool = False,
+) -> torch.Tensor:
+    s = inspect.signature(fn)
+    args = {"buffer": buffer, "dtype": dtype, "count": count, "offset": offset}
+    if "requires_grad" in s.parameters:
+        args["requires_grad"] = requires_grad
+    else:
+        try:
+            if requires_grad:
+                args["requires_grad"] = requires_grad
+        except Exception:
+            pass
+    return fn(**args)
 
 
 def to_torch_tensor(obj: Any) -> torch.Tensor:
@@ -124,28 +145,6 @@ def to_tensor_like(x: Any, ref: torch.Tensor) -> torch.Tensor:
         if torch.is_tensor(x)
         else torch.tensor(x, device=ref.device, dtype=ref.dtype)
     )
-
-
-def _call_from_buffer(
-    fn: Any,
-    buffer: Any,
-    *,
-    dtype: torch.dtype,
-    count: int = -1,
-    offset: int = 0,
-    requires_grad: bool = False,
-) -> torch.Tensor:
-    s = inspect.signature(fn)
-    args = {"buffer": buffer, "dtype": dtype, "count": count, "offset": offset}
-    if "requires_grad" in s.parameters:
-        args["requires_grad"] = requires_grad
-    else:
-        try:
-            if requires_grad:
-                args["requires_grad"] = requires_grad
-        except Exception:
-            pass
-    return fn(**args)
 
 
 @contextlib.contextmanager
