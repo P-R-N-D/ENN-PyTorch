@@ -46,110 +46,8 @@ from .system import (
 )
 
 
-
-# ---------------------------------------------------------------------------
-# Executors / (No-)GIL helpers
-# ---------------------------------------------------------------------------
-
-def is_free_threading_build() -> bool:
-    """True if this CPython build is the free-threading ('t') build."""
-    tag = getattr(getattr(sys, "implementation", None), "cache_tag", "") or ""
-    if tag.endswith("t"):
-        return True
-    # CPython may expose this via sysconfig in free-threading builds.
-    try:
-        return bool(int(sysconfig.get_config_var("Py_GIL_DISABLED") or 0))
-    except Exception:
-        return False
-
-
-def is_gil_enabled() -> bool:
-    """True if the GIL is enabled at runtime.
-
-    Free-threading builds expose a runtime toggle; regular builds always return True.
-    """
-    fn = getattr(sys, "_is_gil_enabled", None)
-    if callable(fn):
-        try:
-            return bool(fn())
-        except Exception:
-            return True
-    return True
-
-
-def python_build_tag() -> str:
-    """Return a short tag like '3.14' or '3.14t' for free-threading builds."""
-    major, minor = sys.version_info[:2]
-    return f"{major}.{minor}{'t' if is_free_threading_build() else ''}"
-
-
-def supports_interpreter_pool_executor() -> bool:
-    """Whether concurrent.futures.InterpreterPoolExecutor exists on this Python."""
-    return getattr(futures, "InterpreterPoolExecutor", None) is not None
-
-
-def new_executor(
-    max_workers: int,
-    *,
-    workload: str = "io",
-    name: str = "stnet",
-    prefer_interpreters: bool | None = None,
-) -> futures.Executor:
-    """Create an executor appropriate for the current Python runtime.
-
-    This centralizes the policy for choosing between:
-    - ThreadPoolExecutor
-    - InterpreterPoolExecutor (Python 3.14+)
-    - ProcessPoolExecutor
-
-    Parameters
-    ----------
-    workload:
-        - "io" (default): background I/O-ish work (prefetch, async write, etc).
-          Uses ThreadPoolExecutor.
-        - "cpu": CPU-bound python work.
-          * No-GIL runtime: ThreadPoolExecutor
-          * GIL runtime: InterpreterPoolExecutor (if available) else ProcessPoolExecutor
-
-    prefer_interpreters:
-        When workload="cpu" and the GIL is enabled, prefer InterpreterPoolExecutor
-        when available. Defaults to True unless disabled via env:
-        STNET_PREFER_INTERPRETER_POOL=0.
-    """
-    mw = max(1, int(max_workers))
-    wl = str(workload or "io").strip().lower()
-
-    if wl in {"io", "i/o", "thread", "threads"}:
-        return futures.ThreadPoolExecutor(
-            max_workers=mw,
-            thread_name_prefix=str(name or "stnet-io"),
-        )
-
-    if wl not in {"cpu", "compute"}:
-        # Safe default.
-        return futures.ThreadPoolExecutor(
-            max_workers=mw,
-            thread_name_prefix=str(name or "stnet"),
-        )
-
-    if not is_gil_enabled():
-        # Free-threading runtime: threads can run CPU python in parallel.
-        return futures.ThreadPoolExecutor(
-            max_workers=mw,
-            thread_name_prefix=str(name or "stnet-cpu"),
-        )
-
-    if prefer_interpreters is None:
-        prefer_interpreters = bool(env_flag("STNET_PREFER_INTERPRETER_POOL", default=True))
-
-    if bool(prefer_interpreters) and supports_interpreter_pool_executor():
-        try:
-            return futures.InterpreterPoolExecutor(max_workers=mw)  # type: ignore[attr-defined]
-        except Exception:
-            pass
-
-    # Fallback: processes (stable, but higher overhead).
-    return futures.ProcessPoolExecutor(max_workers=mw)
+_TLB_SINGLETON: Optional["Thread"] = None
+_TLB_SINGLETON_LOCK = Mutex()
 
 
 def _get_throttle_state() -> str:
@@ -198,6 +96,89 @@ def _prod_int(shape: Sequence[int]) -> int:
     return int(max(1, math.prod(int(s) for s in shape)))
 
 
+def _flatten_args(items: Sequence[Any]) -> Iterator[Any]:
+    for item in items:
+        if isinstance(item, dict):
+            yield from _flatten_args(list(item.values()))
+        elif isinstance(item, (list, tuple, set)):
+            yield from _flatten_args(list(item))
+        else:
+            yield item
+
+
+def is_free_threading_build() -> bool:
+    tag = getattr(getattr(sys, "implementation", None), "cache_tag", "") or ""
+    if tag.endswith("t"):
+        return True
+    try:
+        return bool(int(sysconfig.get_config_var("Py_GIL_DISABLED") or 0))
+    except Exception:
+        return False
+
+
+def is_gil_enabled() -> bool:
+    fn = getattr(sys, "_is_gil_enabled", None)
+    if callable(fn):
+        try:
+            return bool(fn())
+        except Exception:
+            return True
+    return True
+
+
+def python_build_tag() -> str:
+    major, minor = sys.version_info[:2]
+    return f"{major}.{minor}{'t' if is_free_threading_build() else ''}"
+
+
+def supports_interpreter_pool_executor() -> bool:
+    return getattr(futures, "InterpreterPoolExecutor", None) is not None
+
+
+def new_executor(
+    max_workers: int,
+    *arg: Any,
+    workload: str = "io",
+    name: str = "stnet",
+    prefer_interpreters: bool | None = None,
+) -> futures.Executor:
+    mw = max(1, int(max_workers))
+    wl = str(workload or "io").strip().lower()
+    if wl in {"io", "i/o", "thread", "threads"}:
+        return futures.ThreadPoolExecutor(
+            max_workers=mw,
+            thread_name_prefix=str(name or "stnet-io"),
+        )
+    if wl not in {"cpu", "compute"}:
+        return futures.ThreadPoolExecutor(
+            max_workers=mw,
+            thread_name_prefix=str(name or "stnet"),
+        )
+    if not is_gil_enabled():
+        return futures.ThreadPoolExecutor(
+            max_workers=mw,
+            thread_name_prefix=str(name or "stnet-cpu"),
+        )
+    if prefer_interpreters is None:
+        prefer_interpreters = bool(env_flag("STNET_PREFER_INTERPRETER_POOL", default=True))
+    if bool(prefer_interpreters) and supports_interpreter_pool_executor():
+        try:
+            return futures.InterpreterPoolExecutor(max_workers=mw)
+        except Exception:
+            pass
+    return futures.ProcessPoolExecutor(max_workers=mw)
+
+
+def buffered(
+    iterable: Any,
+    *args: Any,
+    max_batches: int = 4,
+    name: str = "buffer",
+    daemon: bool = True,
+) -> Buffered:
+    return Buffered(iterable, max_batches=max_batches, name=name, daemon=daemon)
+
+
 def close(obj: Any, *args: Any, join_timeout: float | None = 1.0) -> None:
     for name in (
         "cleanup",
@@ -217,6 +198,22 @@ def close(obj: Any, *args: Any, join_timeout: float | None = 1.0) -> None:
             return
     with contextlib.suppress(Exception):
         obj() if callable(obj) else None
+
+
+def get_affinity(io_workers: Optional[int] = None) -> "Thread":
+    global _TLB_SINGLETON
+    if _TLB_SINGLETON is None:
+        with _TLB_SINGLETON_LOCK:
+            if _TLB_SINGLETON is None:
+                default_workers = (
+                    int(io_workers)
+                    if io_workers is not None
+                    else max(1, int(CPU.count()) // 2)
+                )
+                _TLB_SINGLETON = Thread(io_workers=int(default_workers))
+    elif io_workers is not None:
+        _TLB_SINGLETON.tune(io_workers=int(io_workers))
+    return _TLB_SINGLETON
 
 
 class _QueryEvent(Protocol):
@@ -247,6 +244,71 @@ class _PoolEntry:
     fence_evt: object | None = None
     gen: int = 0
 
+    
+class _AffinityCallable:
+    __slots__ = (
+        "_parent",
+        "_fn",
+        "_pin_thread",
+        "_tls",
+        "_lock",
+        "_tune",
+        "_sample_every",
+        "_flush_every",
+        "_perf_counter_ns",
+        "_thread_time_ns",
+    )
+
+    def __init__(
+        self,
+        parent: "Thread",
+        fn: Callable[[Any], Any],
+        pin_thread: Callable[[], None],
+        tls: Any,
+        lock: Any,
+        tune: Callable[..., None],
+        sample_every: int,
+        flush_every: int,
+        perf_counter_ns: Callable[[], int],
+        thread_time_ns: Optional[Callable[[], int]],
+    ) -> None:
+        self._parent = parent
+        self._fn = fn
+        self._pin_thread = pin_thread
+        self._tls = tls
+        self._lock = lock
+        self._tune = tune
+        self._sample_every = sample_every
+        self._flush_every = flush_every
+        self._perf_counter_ns = perf_counter_ns
+        self._thread_time_ns = thread_time_ns
+
+    def __call__(self, *args: Any, **kwargs: Any) -> Any:
+        if not getattr(self._tls, "pinned", False):
+            self._pin_thread()
+        count = getattr(self._tls, "count", 0) + 1
+        self._tls.count = count
+        do_sample = count % self._sample_every == 0
+        t0 = self._perf_counter_ns() if do_sample else 0
+        c0 = self._thread_time_ns() if do_sample and callable(self._thread_time_ns) else 0
+        out = self._fn(*args, **kwargs)
+        if do_sample:
+            t1 = self._perf_counter_ns()
+            c1 = self._thread_time_ns() if callable(self._thread_time_ns) else None
+            try:
+                with self._lock:
+                    self._parent._total_time += max(0, int(t1) - int(t0))
+                    if c1 is not None:
+                        self._parent._total_cpu += max(0, int(c1) - int(c0))
+            except Exception:
+                pass
+        if count % self._flush_every == 0:
+            try:
+                self._tune(initial=False)
+            except Exception:
+                pass
+        return out
+
 
 @dataclass(slots=True)
 class ProducerError:
@@ -254,19 +316,7 @@ class ProducerError:
     tb: str
 
 
-def _flatten_args(items: Sequence[Any]) -> Iterator[Any]:
-    for item in items:
-        if isinstance(item, dict):
-            yield from _flatten_args(list(item.values()))
-        elif isinstance(item, (list, tuple, set)):
-            yield from _flatten_args(list(item))
-        else:
-            yield item
-
-
 class Disposable:
-    """Keep references to closeables and release them together."""
-
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         self._keep: list[Any] = list(_flatten_args(list(args)))
         if kwargs:
@@ -289,12 +339,6 @@ class Disposable:
 
 
 class Buffered:
-    """Threaded buffering for an iterable (thin wrapper around Buffer).
-
-    This replaces the old data.nodes.BatchQueue. Each iteration creates a new session
-    (fresh buffer + producer thread), so the wrapper itself is reusable.
-    """
-
     __slots__ = ("_src", "_max_batches", "_name", "_daemon", "_session", "_join_timeout_s")
 
     def __init__(
@@ -396,16 +440,6 @@ class Buffered:
                 except TypeError:
                     ex.shutdown(wait=False)
 
-
-def buffered(
-    iterable: Any,
-    *args: Any,
-    max_batches: int = 4,
-    name: str = "buffer",
-    daemon: bool = True,
-) -> Buffered:
-    """Return an iterable that prefetches items into an in-memory Buffer."""
-    return Buffered(iterable, max_batches=max_batches, name=name, daemon=daemon)
 
 class Page:
     __slots__ = ("_buf", "_numel", "_dtype", "_pinned")
@@ -936,91 +970,6 @@ class Buffer:
         return bool(self._stop.is_set())
 
 
-_TLB_SINGLETON: Optional["Thread"] = None
-_TLB_SINGLETON_LOCK = Mutex()
-
-
-def get_affinity(io_workers: Optional[int] = None) -> "Thread":
-    global _TLB_SINGLETON
-    if _TLB_SINGLETON is None:
-        with _TLB_SINGLETON_LOCK:
-            if _TLB_SINGLETON is None:
-                default_workers = (
-                    int(io_workers)
-                    if io_workers is not None
-                    else max(1, int(CPU.count()) // 2)
-                )
-                _TLB_SINGLETON = Thread(io_workers=int(default_workers))
-    elif io_workers is not None:
-        _TLB_SINGLETON.tune(io_workers=int(io_workers))
-    return _TLB_SINGLETON
-
-
-class _AffinityCallable:
-    __slots__ = (
-        "_parent",
-        "_fn",
-        "_pin_thread",
-        "_tls",
-        "_lock",
-        "_tune",
-        "_sample_every",
-        "_flush_every",
-        "_perf_counter_ns",
-        "_thread_time_ns",
-    )
-
-    def __init__(
-        self,
-        parent: "Thread",
-        fn: Callable[[Any], Any],
-        pin_thread: Callable[[], None],
-        tls: Any,
-        lock: Any,
-        tune: Callable[..., None],
-        sample_every: int,
-        flush_every: int,
-        perf_counter_ns: Callable[[], int],
-        thread_time_ns: Optional[Callable[[], int]],
-    ) -> None:
-        self._parent = parent
-        self._fn = fn
-        self._pin_thread = pin_thread
-        self._tls = tls
-        self._lock = lock
-        self._tune = tune
-        self._sample_every = sample_every
-        self._flush_every = flush_every
-        self._perf_counter_ns = perf_counter_ns
-        self._thread_time_ns = thread_time_ns
-
-    def __call__(self, *args: Any, **kwargs: Any) -> Any:
-        if not getattr(self._tls, "pinned", False):
-            self._pin_thread()
-        count = getattr(self._tls, "count", 0) + 1
-        self._tls.count = count
-        do_sample = count % self._sample_every == 0
-        t0 = self._perf_counter_ns() if do_sample else 0
-        c0 = self._thread_time_ns() if do_sample and callable(self._thread_time_ns) else 0
-        out = self._fn(*args, **kwargs)
-        if do_sample:
-            t1 = self._perf_counter_ns()
-            c1 = self._thread_time_ns() if callable(self._thread_time_ns) else None
-            try:
-                with self._lock:
-                    self._parent._total_time += max(0, int(t1) - int(t0))
-                    if c1 is not None:
-                        self._parent._total_cpu += max(0, int(c1) - int(c0))
-            except Exception:
-                pass
-        if count % self._flush_every == 0:
-            try:
-                self._tune(initial=False)
-            except Exception:
-                pass
-        return out
-
-
 class Thread:
     def __init__(
         self,
@@ -1040,7 +989,6 @@ class Thread:
         self._total_time = 0
         self._total_cpu = 0
         self._omp_ok = bool(allow_omp_bind) and bool(self.spread_threads())
-
         self._flush_every = max(1, int(env_first_int(("STNET_TLB_FLUSH_EVERY",), 256)))
         self._sample_every = max(1, int(env_first_int(("STNET_TLB_SAMPLE_EVERY",), 8)))
 
