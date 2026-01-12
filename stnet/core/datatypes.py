@@ -14,49 +14,6 @@ import numpy
 import torch
 
 
-class Mutex:
-    """A small lock wrapper.
-
-    Why a wrapper instead of using ``threading.Lock`` / ``threading.RLock`` directly?
-    - It lets the project centralize lock behavior (timeouts, debug hooks, swapping).
-    - It keeps call sites consistent while staying compatible with both GIL and
-      free-threading ("no-GIL") builds.
-
-    The default is a non-reentrant mutex. Use ``reentrant=True`` for an RLock.
-    """
-
-    def __init__(self, *, reentrant: bool = False) -> None:
-        self._lock = threading.RLock() if bool(reentrant) else threading.Lock()
-
-    @property
-    def raw(self) -> threading.Lock | threading.RLock:
-        """Underlying threading lock."""
-
-        return self._lock
-
-    def acquire(self, blocking: bool = True, timeout: float | None = None) -> bool:
-        # threading.Lock/RLock use timeout=-1 to mean "wait forever".
-        if timeout is None:
-            return bool(self._lock.acquire(blocking))
-        return bool(self._lock.acquire(blocking, float(timeout)))
-
-    def release(self) -> None:
-        self._lock.release()
-
-    def locked(self) -> bool:
-        fn = getattr(self._lock, "locked", None)
-        if callable(fn):
-            return bool(fn())
-        return False
-
-    def __enter__(self) -> "Mutex":
-        self.acquire(True, None)
-        return self
-
-    def __exit__(self, exc_type, exc, tb) -> None:
-        self.release()
-
-
 _TRUE = frozenset({"1", "true", "yes", "y", "on", "enable", "enabled"})
 
 _FALSE = frozenset({"0", "false", "no", "n", "off", "disable", "disabled"})
@@ -207,6 +164,21 @@ def _canonical_dtype(src: Any) -> str:
     return canonical
 
 
+@contextlib.contextmanager
+def _atomic_swap(path: PathLike):
+    p = os.fspath(path)
+    parent = os.path.dirname(p) or "."
+    os.makedirs(parent, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(prefix=os.path.basename(p) + ".", suffix=".tmp", dir=parent)
+    os.close(fd)
+    try:
+        yield tmp_name
+        os.replace(tmp_name, p)
+    finally:
+        with contextlib.suppress(Exception):
+            os.remove(tmp_name)
+
+
 def parse_bool(value: object) -> bool | None:
     if value is None:
         return None
@@ -338,7 +310,6 @@ def parse_torch_dtype(src: Any) -> torch.dtype | None:
 def dtype_from_name(name: Any, default: torch.dtype) -> torch.dtype:
     dt = parse_torch_dtype(name)
     return dt if isinstance(dt, torch.dtype) else default
-# --- JSON / IO utilities ---
 
 PathLike: TypeAlias = str | os.PathLike[str] | Path
 JsonPrimitive: TypeAlias = str | int | float | bool | None
@@ -348,18 +319,15 @@ _DEF_UNDERFLOW_ACTIONS = {"allow", "warn", "forbid"}
 
 
 def get_meta_path(mmt_path: str) -> str:
-    """Return sidecar metadata path for a memory-mapped tensor file."""
     return str(mmt_path) + ".meta.json"
 
 
 def read_json(path: PathLike) -> JsonValue:
-    """Read a JSON file (UTF-8 with optional BOM)."""
     with open(os.fspath(path), "r", encoding="utf-8-sig") as f:
         return json.load(f)
 
 
 def coerce_json(obj: object) -> JsonValue:
-    """Best-effort conversion to JSON-serializable structures."""
     if obj is None or isinstance(obj, (str, int, float, bool)):
         return obj
     if isinstance(obj, (torch.device, Path, torch.dtype)):
@@ -378,28 +346,12 @@ def coerce_json(obj: object) -> JsonValue:
     return str(obj)
 
 
-@contextlib.contextmanager
-def _atomic_swap(path: PathLike):
-    p = os.fspath(path)
-    parent = os.path.dirname(p) or "."
-    os.makedirs(parent, exist_ok=True)
-    fd, tmp_name = tempfile.mkstemp(prefix=os.path.basename(p) + ".", suffix=".tmp", dir=parent)
-    os.close(fd)
-    try:
-        yield tmp_name
-        os.replace(tmp_name, p)
-    finally:
-        with contextlib.suppress(Exception):
-            os.remove(tmp_name)
-
-
 def write_json(path: PathLike, payload: Any, *args: Any, indent: int | None = 2) -> None:
     with _atomic_swap(path) as tmp, open(tmp, "w", encoding="utf-8") as f:
         json.dump(payload, f, indent=indent)
 
 
 def save_temp(path: PathLike, payload: Any, **opts: Any) -> None:
-    """Atomically torch.save() to a target path."""
     with _atomic_swap(path) as tmp:
         torch.save(payload, tmp, **opts)
 
@@ -422,3 +374,33 @@ def normalize_underflow_action(value: object, *args: Any, default: str = "warn")
         return r
     d = str(default).strip().lower()
     return d if d in _DEF_UNDERFLOW_ACTIONS else "warn"
+
+
+class Mutex:
+    def __init__(self, *, reentrant: bool = False) -> None:
+        self._lock = threading.RLock() if bool(reentrant) else threading.Lock()
+
+    @property
+    def raw(self) -> threading.Lock | threading.RLock:
+        return self._lock
+
+    def acquire(self, blocking: bool = True, timeout: float | None = None) -> bool:
+        if timeout is None:
+            return bool(self._lock.acquire(blocking))
+        return bool(self._lock.acquire(blocking, float(timeout)))
+
+    def release(self) -> None:
+        self._lock.release()
+
+    def locked(self) -> bool:
+        fn = getattr(self._lock, "locked", None)
+        if callable(fn):
+            return bool(fn())
+        return False
+
+    def __enter__(self) -> "Mutex":
+        self.acquire(True, None)
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self.release()
