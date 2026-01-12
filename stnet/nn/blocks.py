@@ -235,92 +235,6 @@ class RetNet(nn.Module):
         return x, new_state
 
 
-class CrossTransformer(nn.Module):
-    def __init__(
-        self,
-        d_model: int,
-        nhead: int,
-        *args: Any,
-        dropout: float = 0.0,
-        norm_type: str = "layernorm",
-        mlp_ratio: float = 4.0,
-        drop_path: float = 0.0,
-        cross: Optional[Sequence[nn.Module]] = None,
-        **kwargs: Any,
-    ) -> None:
-        super().__init__()
-        if cross is None:
-            cross_mods: List[nn.Module] = [
-                CrossAttention(d_model, nhead, dropout=dropout, norm_type=norm_type),
-                CrossAttention(d_model, nhead, dropout=dropout, norm_type=norm_type),
-            ]
-        else:
-            cross_mods = list(cross)
-            if len(cross_mods) != 2:
-                raise ValueError(f"CrossTransformer expects 2 modules, got {len(cross_mods)}")
-        self.cross = nn.ModuleList(cross_mods)
-        self.cross_s = self.cross[0]
-        self.cross_t = self.cross[1]
-        self.mix_norm = norm_layer(norm_type, 2 * d_model)
-        hid = int(2 * d_model * mlp_ratio * (2.0 / 3.0))
-        from .activations import SwiGLU
-
-        self.mix = SwiGLU(2 * d_model, hid, out_dim=d_model, dropout=dropout)
-        self.dropout = nn.Dropout(dropout)
-        self.drop_path = StochasticDepth(p=drop_path, mode="row")
-        self._fixed_mode: Optional[str] = getattr(self, "modeling_type", None)
-
-    def forward(
-        self,
-        tokens_a: torch.Tensor,
-        tokens_b: torch.Tensor,
-        mode: Optional[str] = None,
-    ) -> torch.Tensor:
-        spatial_tokens, temporal_tokens = tokens_a, tokens_b
-        if spatial_tokens.dim() != 3 or temporal_tokens.dim() != 3:
-            raise ValueError("Expects 3D tensors")
-        if not torch.jit.is_tracing():
-            if spatial_tokens.size(0) != temporal_tokens.size(0):
-                raise ValueError("Batch mismatch")
-            if spatial_tokens.size(2) != temporal_tokens.size(2):
-                raise ValueError("Hidden dim mismatch")
-        mode_l = _coerce_modeling_types(self._fixed_mode or mode or "st")
-
-        def _impl(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
-            if mode_l == "ss":
-                return self.cross[0](a, b)
-            if mode_l == "tt":
-                return self.cross[1](b, a)
-            s_context = self.cross[0](a, b)
-            t_context = self.cross[1](b, a)
-            base_s = torch.cat(
-                [s_context, t_context.mean(dim=1, keepdim=True).expand_as(s_context)], dim=-1
-            )
-            fused_s = self.mix(self.mix_norm(base_s))
-            out_s = s_context + self.drop_path(self.dropout(fused_s))
-            base_t = torch.cat(
-                [t_context, s_context.mean(dim=1, keepdim=True).expand_as(t_context)], dim=-1
-            )
-            fused_t = self.mix(self.mix_norm(base_t))
-            out_t = t_context + self.drop_path(self.dropout(fused_t))
-            return torch.cat([out_s, out_t], dim=1)
-
-        def _ckpt_impl(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
-            if torch.is_grad_enabled():
-                _from_hsdp_module(self)
-            return _impl(a, b)
-
-        if self.training and torch.is_grad_enabled() and not is_export_or_trace():
-            return coerce_checkpoint(
-                _ckpt_impl,
-                spatial_tokens,
-                temporal_tokens,
-                use_reentrant=True,
-                preserve_rng_state=True,
-            )
-        return _impl(spatial_tokens, temporal_tokens)
-
-
 class LongNet(nn.Module):
     def __init__(
         self,
@@ -479,3 +393,89 @@ class LongNet(nn.Module):
         if need_transpose_fallback and out.dim() == 3 and out.shape[0] != out.shape[1]:
             out = out.transpose(0, 1)
         return out, attn_w
+
+
+class CrossTransformer(nn.Module):
+    def __init__(
+        self,
+        d_model: int,
+        nhead: int,
+        *args: Any,
+        dropout: float = 0.0,
+        norm_type: str = "layernorm",
+        mlp_ratio: float = 4.0,
+        drop_path: float = 0.0,
+        cross: Optional[Sequence[nn.Module]] = None,
+        **kwargs: Any,
+    ) -> None:
+        super().__init__()
+        if cross is None:
+            cross_mods: List[nn.Module] = [
+                CrossAttention(d_model, nhead, dropout=dropout, norm_type=norm_type),
+                CrossAttention(d_model, nhead, dropout=dropout, norm_type=norm_type),
+            ]
+        else:
+            cross_mods = list(cross)
+            if len(cross_mods) != 2:
+                raise ValueError(f"CrossTransformer expects 2 modules, got {len(cross_mods)}")
+        self.cross = nn.ModuleList(cross_mods)
+        self.cross_s = self.cross[0]
+        self.cross_t = self.cross[1]
+        self.mix_norm = norm_layer(norm_type, 2 * d_model)
+        hid = int(2 * d_model * mlp_ratio * (2.0 / 3.0))
+        from .activations import SwiGLU
+
+        self.mix = SwiGLU(2 * d_model, hid, out_dim=d_model, dropout=dropout)
+        self.dropout = nn.Dropout(dropout)
+        self.drop_path = StochasticDepth(p=drop_path, mode="row")
+        self._fixed_mode: Optional[str] = getattr(self, "modeling_type", None)
+
+    def forward(
+        self,
+        tokens_a: torch.Tensor,
+        tokens_b: torch.Tensor,
+        mode: Optional[str] = None,
+    ) -> torch.Tensor:
+        spatial_tokens, temporal_tokens = tokens_a, tokens_b
+        if spatial_tokens.dim() != 3 or temporal_tokens.dim() != 3:
+            raise ValueError("Expects 3D tensors")
+        if not torch.jit.is_tracing():
+            if spatial_tokens.size(0) != temporal_tokens.size(0):
+                raise ValueError("Batch mismatch")
+            if spatial_tokens.size(2) != temporal_tokens.size(2):
+                raise ValueError("Hidden dim mismatch")
+        mode_l = _coerce_modeling_types(self._fixed_mode or mode or "st")
+
+        def _impl(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+            if mode_l == "ss":
+                return self.cross[0](a, b)
+            if mode_l == "tt":
+                return self.cross[1](b, a)
+            s_context = self.cross[0](a, b)
+            t_context = self.cross[1](b, a)
+            base_s = torch.cat(
+                [s_context, t_context.mean(dim=1, keepdim=True).expand_as(s_context)], dim=-1
+            )
+            fused_s = self.mix(self.mix_norm(base_s))
+            out_s = s_context + self.drop_path(self.dropout(fused_s))
+            base_t = torch.cat(
+                [t_context, s_context.mean(dim=1, keepdim=True).expand_as(t_context)], dim=-1
+            )
+            fused_t = self.mix(self.mix_norm(base_t))
+            out_t = t_context + self.drop_path(self.dropout(fused_t))
+            return torch.cat([out_s, out_t], dim=1)
+
+        def _ckpt_impl(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+            if torch.is_grad_enabled():
+                _from_hsdp_module(self)
+            return _impl(a, b)
+
+        if self.training and torch.is_grad_enabled() and not is_export_or_trace():
+            return coerce_checkpoint(
+                _ckpt_impl,
+                spatial_tokens,
+                temporal_tokens,
+                use_reentrant=True,
+                preserve_rng_state=True,
+            )
+        return _impl(spatial_tokens, temporal_tokens)
