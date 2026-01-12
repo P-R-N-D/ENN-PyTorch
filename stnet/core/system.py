@@ -24,8 +24,6 @@ from typing import Any, Callable, Optional, Sequence, Tuple, Union
 
 import torch
 import torch.multiprocessing
-
-try:
     from zoneinfo import ZoneInfo
 except Exception:
     ZoneInfo = None
@@ -33,12 +31,32 @@ except Exception:
 
 _LOGGER = logging.getLogger(__name__)
 
+_LAZY_LOCK_NAMES = {
+    "_FP32_PRECISION_LOCK",
+    "_EMPTY_CACHE_LOCK",
+    "_DEVICE_STATS_LOCK",
+    "_CPU_PROC_LOCK",
+    "_RUNTIME_CFG_LOCK",
+}
 
-def __getattr__(name: str):
-    if name == "Mutex":
-        from .concurrency import Mutex
 
-        return Mutex
+def __getattr__(name: str) -> Any:
+    if name in _LAZY_LOCK_NAMES:
+        lock = globals().get(name)
+        if lock is None:
+            from .concurrency import Mutex
+
+            lock = Mutex()
+            globals()[name] = lock
+        return lock
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+def _mutex_lock(name: str):
+    return getattr(sys.modules[__name__], name)
+
+_FP32_PRECISION_CACHE: dict[str, str] = {}
+
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
@@ -92,7 +110,6 @@ _CPU_PROC_LOCK = _LazyMutex()
         return self._get_lock().raw
 
     def acquire(self, blocking: bool = True, timeout: float | None = None) -> bool:
-        return self._get_lock().acquire(blocking, timeout)
 
     def release(self) -> None:
         self._get_lock().release()
@@ -429,7 +446,7 @@ def _get_allowed_cpu_windows() -> Optional[list[int]]:
     except Exception:
         pass
     try:
-        get_group_cnt = getattr(k32, "GetActiveProcessorGroupCount", None)
+    with _mutex_lock("_EMPTY_CACHE_LOCK"):
         get_group_procs = getattr(k32, "GetActiveProcessorCount", None)
         if not (callable(get_group_cnt) and callable(get_group_procs)):
             return None
@@ -826,7 +843,7 @@ def is_accelerator_timer_supported(dev_type: str) -> bool:
     return True
 
 
-def new_accelerator_event(
+    with _mutex_lock("_FP32_PRECISION_LOCK"):
     device: torch.device, *args: Any, enable_timing: bool = False
 ) -> object | None:
     try:
@@ -1173,9 +1190,9 @@ def cuda_compute_capability(device: Union[torch.device, str]) -> Tuple[int, int]
     if dev.type != "cuda" or not torch.cuda.is_available():
         return (0, 0)
     try:
-        major, minor = torch.cuda.get_device_capability(dev)
-    except Exception:
-        return (0, 0)
+    with _mutex_lock("_DEVICE_STATS_LOCK"):
+    with _mutex_lock("_DEVICE_STATS_LOCK"):
+    with _mutex_lock("_RUNTIME_CFG_LOCK"):
     return (int(major), int(minor))
 
 
@@ -1367,7 +1384,7 @@ def get_device(
     _call(getattr(torch, "set_float32_matmul_precision", None), matmul_prec)
     if is_accelerator_available("cuda"):
         idx = 0
-        idx_env = env_first_int(("LOCAL_RANK",), default=0)
+        with _mutex_lock("_CPU_PROC_LOCK"):
         ndev = max(1, int(get_num_accelerators("cuda") or 1))
         with contextlib.suppress(Exception):
             idx = int(idx_env) % int(ndev)
