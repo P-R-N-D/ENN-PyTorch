@@ -24,6 +24,7 @@ from typing import Any, Callable, Optional, Sequence, Tuple, Union
 
 import torch
 import torch.multiprocessing
+
 from .datatypes import env_bool, env_first, env_first_float, env_first_int, env_float, env_str, parse_bool
 
 try:
@@ -34,17 +35,51 @@ except Exception:
 
 _LOGGER = logging.getLogger(__name__)
 
-_FP32_PRECISION_CACHE: dict[str, str] = {}
-_FP32_PRECISION_LOCK = None
 
-_EMPTY_CACHE_LOCK = None
+class _LazyMutex:
+    def __init__(self, *, reentrant: bool = False) -> None:
+        self._reentrant = bool(reentrant)
+        self._lock = None
+
+    def _get_lock(self):
+        if self._lock is None:
+            from .concurrency import Mutex
+
+            self._lock = Mutex(reentrant=self._reentrant)
+        return self._lock
+
+    @property
+    def raw(self):
+        return self._get_lock().raw
+
+    def acquire(self, blocking: bool = True, timeout: float | None = None) -> bool:
+        return self._get_lock().acquire(blocking, timeout)
+
+    def release(self) -> None:
+        self._get_lock().release()
+
+    def locked(self) -> bool:
+        return self._get_lock().locked()
+
+    def __enter__(self) -> "_LazyMutex":
+        self._get_lock().__enter__()
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self._get_lock().__exit__(exc_type, exc, tb)
+
+
+_FP32_PRECISION_CACHE: dict[str, str] = {}
+_FP32_PRECISION_LOCK = _LazyMutex()
+
+_EMPTY_CACHE_LOCK = _LazyMutex()
 _EMPTY_CACHE_LAST_CALL_S_BY_DEVICE: dict[Tuple[str, int], float] = {}
 
 _DEVICE_STATS_CACHE: dict[Tuple[str, int], Device] = {}
-_DEVICE_STATS_LOCK = None
+_DEVICE_STATS_LOCK = _LazyMutex()
 
 _CPU_PROC_CACHE: Optional[int] = None
-_CPU_PROC_LOCK = None
+_CPU_PROC_LOCK = _LazyMutex()
 
 _TZ_ALIASES = {
     k: v
@@ -115,37 +150,7 @@ _RUNTIME_CFG = SimpleNamespace(
     sdpa_backends=None,
     te_first=True,
 )
-_RUNTIME_CFG_LOCK = None
-
-
-def _get_mutex_lock(name: str):
-    from .concurrency import Mutex
-
-    lock = globals().get(name)
-    if lock is None:
-        lock = Mutex()
-        globals()[name] = lock
-    return lock
-
-
-def _fp32_precision_lock():
-    return _get_mutex_lock("_FP32_PRECISION_LOCK")
-
-
-def _empty_cache_lock():
-    return _get_mutex_lock("_EMPTY_CACHE_LOCK")
-
-
-def _device_stats_lock():
-    return _get_mutex_lock("_DEVICE_STATS_LOCK")
-
-
-def _cpu_proc_lock():
-    return _get_mutex_lock("_CPU_PROC_LOCK")
-
-
-def _runtime_cfg_lock():
-    return _get_mutex_lock("_RUNTIME_CFG_LOCK")
+_RUNTIME_CFG_LOCK = _LazyMutex()
 
 
 def _device_from(device: Optional[Union[torch.device, str]]) -> torch.device:
@@ -482,7 +487,7 @@ def empty_device_cache(
         min_interval_s = 0.0
     now = time.monotonic()
     key = _clear_device_index(device)
-    with _empty_cache_lock():
+    with _EMPTY_CACHE_LOCK:
         last = float(_EMPTY_CACHE_LAST_CALL_S_BY_DEVICE.get(key, 0.0))
         if min_interval_s and (now - last) < float(min_interval_s):
             return
@@ -878,7 +883,7 @@ def set_float32_precision(
                 break
     precision = "tf32" if use_tf32 else "ieee"
     key = "cuda"
-    with _fp32_precision_lock():
+    with _FP32_PRECISION_LOCK:
         if _FP32_PRECISION_CACHE.get(key) == precision:
             return
         _FP32_PRECISION_CACHE[key] = precision
@@ -1226,7 +1231,7 @@ def is_int4_supported(
 def get_device_stats(device: Optional[Union[torch.device, str]] = None) -> Device:
     dev = _device_from(device)
     key = (str(dev.type), int(dev.index) if dev.index is not None else -1)
-    with _device_stats_lock():
+    with _DEVICE_STATS_LOCK:
         cached = _DEVICE_STATS_CACHE.get(key)
         if cached is not None:
             return cached
@@ -1261,7 +1266,7 @@ def get_device_stats(device: Optional[Union[torch.device, str]] = None) -> Devic
         float8_dtypes=tuple(),
         int_quant_bits=quant_bits,
     )
-    with _device_stats_lock():
+    with _DEVICE_STATS_LOCK:
         _DEVICE_STATS_CACHE[key] = stats
     return stats
 
@@ -1277,7 +1282,7 @@ def get_device(
     **kwargs: Any,
 ) -> torch.device:
     del args, kwargs
-    with _runtime_cfg_lock():
+    with _RUNTIME_CFG_LOCK:
         cfg = _RUNTIME_CFG
         if deterministic is not None:
             cfg.deterministic = bool(deterministic)
@@ -1420,7 +1425,7 @@ class CPU:
         if _CPU_PROC_CACHE is not None:
             return _CPU_PROC_CACHE
 
-        with _cpu_proc_lock():
+        with _CPU_PROC_LOCK:
             if _CPU_PROC_CACHE is not None:
                 return _CPU_PROC_CACHE
 
