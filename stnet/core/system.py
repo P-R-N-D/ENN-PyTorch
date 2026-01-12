@@ -25,8 +25,6 @@ from typing import Any, Callable, Optional, Sequence, Tuple, Union
 import torch
 import torch.multiprocessing
 
-from .datatypes import env_bool, env_first, env_first_float, env_first_int, env_float, env_str, parse_bool
-
 try:
     from zoneinfo import ZoneInfo
 except Exception:
@@ -36,9 +34,50 @@ except Exception:
 _LOGGER = logging.getLogger(__name__)
 
 
+def __getattr__(name: str):
+    if name == "Mutex":
+        from .concurrency import Mutex
+
+        return Mutex
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
 class _LazyMutex:
     def __init__(self, *, reentrant: bool = False) -> None:
         self._reentrant = bool(reentrant)
+        self._lock = None
+
+    def _get_lock(self):
+        if self._lock is None:
+            mutex_cls = getattr(sys.modules[__name__], "Mutex")
+            self._lock = mutex_cls(reentrant=self._reentrant)
+        return self._lock
+
+    @property
+    def raw(self):
+        return self._get_lock().raw
+
+    def acquire(self, blocking: bool = True, timeout: float | None = None) -> bool:
+        return self._get_lock().acquire(blocking, timeout)
+
+    def release(self) -> None:
+        self._get_lock().release()
+
+    def locked(self) -> bool:
+        return self._get_lock().locked()
+
+    def __enter__(self) -> "_LazyMutex":
+        self._get_lock().__enter__()
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self._get_lock().__exit__(exc_type, exc, tb)
+
+
+_FP32_PRECISION_LOCK = _LazyMutex()
+_EMPTY_CACHE_LOCK = _LazyMutex()
+_DEVICE_STATS_LOCK = _LazyMutex()
+_CPU_PROC_LOCK = _LazyMutex()
         self._lock = None
 
     def _get_lock(self):
@@ -92,7 +131,7 @@ _TZ_ALIASES = {
         ("HKT", "Asia/Hong_Kong"),
         ("SGT", "Asia/Singapore"),
         ("ICT", "Asia/Bangkok"),
-        ("WIB", "Asia/Jakarta"),
+_RUNTIME_CFG_LOCK = _LazyMutex()
         ("WITA", "Asia/Makassar"),
         ("WIT", "Asia/Jayapura"),
         ("PHT", "Asia/Manila"),
