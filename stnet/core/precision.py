@@ -17,7 +17,8 @@ from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 import torch
 from torch import nn
 
-from .datatypes import Mutex, default_underflow_action, normalize_underflow_action
+from .concurrency import Mutex
+from .datatypes import default_underflow_action, normalize_underflow_action
 from .graph import clear_model_cache
 from .system import (
     _log_debug,

@@ -36,8 +36,8 @@ import torch
 from tensordict import MemoryMappedTensor, TensorDict, TensorDictBase
 from torchdata.nodes import BaseNode
 
-from ..core.datatypes import Mutex, env_first, env_first_float, env_first_int
-from ..core.concurrency import Disposable, get_affinity
+from ..core.concurrency import Disposable, Mutex, new_affinity
+from ..core.datatypes import env_first, env_first_float, env_first_int
 from ..core.policies import BatchPolicy, LoaderPolicy, WorkerPolicy
 from ..core.system import (
     Memory,
@@ -114,7 +114,7 @@ def _require_nodes() -> None:
             {
                 k: getattr(mod, k)
                 for k in [
-                    "BatchScaler",
+                    "Governor",
                     "Loader",
                     "Mapper",
                     "Multiplexer",
@@ -749,7 +749,7 @@ def _fetch_build_datasets(
     *args: Any,
     split: str,
     val_frac: float,
-    sampler_scale: "BatchScaler",
+    sampler_scale: "Governor",
     allocated: "Disposable",
     collect_epochables: bool = False,
     epochables: Optional[list[Any]] = None,
@@ -851,7 +851,7 @@ def dataset(
     *args: Any,
     split: str = "train",
     val_frac: float = 0.0,
-    sampler_scale: Optional["BatchScaler"] = None,
+    sampler_scale: Optional["Governor"] = None,
     **kwargs: Any,
 ) -> "Sampler":
     _require_nodes()
@@ -896,7 +896,7 @@ def compose(
     _require_nodes()
     device_obj = torch.device(device) if not isinstance(device, torch.device) else device
     with contextlib.suppress(Exception):
-        get_affinity(io_workers=io_workers)
+        new_affinity(io_workers=io_workers)
     sampler = Multiplexer(stop_criteria="ALL_DATASETS_EXHAUSTED", seed=int(seed), weights=weights)
     source = sampler.compose(node_or_nodes)
     if epochables is not None and getattr(sampler, "_node", None) is not None:
@@ -929,7 +929,7 @@ def fetch(
     val_frac: float = 0.0,
     loader_policy: Optional["LoaderPolicy"] = None,
     worker_policy: Optional[WorkerPolicy] = None,
-    sampler_scale: Optional["BatchScaler"] = None,
+    sampler_scale: Optional["Governor"] = None,
     seed: int = 0,
 ) -> Dict[str, Any]:
     _require_nodes()
@@ -946,7 +946,7 @@ def fetch(
         sanitize=bool(sanitize),
     )
     allocated = Disposable()
-    scale_ctl = sampler_scale if sampler_scale is not None else BatchScaler()
+    scale_ctl = sampler_scale if sampler_scale is not None else Governor()
     train_epochables: List[Any] = []
     specs = _fetch_normalize_sources(sources)
     spec_keys = list(specs.keys())
@@ -1169,7 +1169,7 @@ class Session:
     training_loader: Any = None
     validation_loader: Any = None
     disposable: Any = None
-    sampler_scale: Optional["BatchScaler"] = None
+    sampler_scale: Optional["Governor"] = None
     _opened: bool = False
 
     def __enter__(self) -> "Session":
@@ -1186,7 +1186,7 @@ class Session:
     ) -> "Session":
         _require_nodes()
         if self.sampler_scale is None:
-            self.sampler_scale = BatchScaler()
+            self.sampler_scale = Governor()
         dev = (
             torch.device(self.device) if not isinstance(self.device, torch.device) else self.device
         )

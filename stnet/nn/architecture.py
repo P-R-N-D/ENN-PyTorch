@@ -28,7 +28,8 @@ import torch.nn.functional as F
 from tensordict import TensorDictBase
 
 from ..config import ModelConfig
-from ..core.datatypes import Mutex, env_bool, env_first_int, env_int
+from ..core.concurrency import Mutex
+from ..core.datatypes import env_bool, env_first_int, env_int
 from ..core.tensor import is_meta_or_fake_tensor
 from ..core.distributed import _from_hsdp_module
 from ..core.graph import (
@@ -2546,4 +2547,3 @@ class Model(nn.Module):
     @staticmethod
     def unflatten_y(flat: torch.Tensor, shape: Sequence[int]) -> torch.Tensor:
         return flat.reshape(flat.shape[0], *shape).contiguous()
-

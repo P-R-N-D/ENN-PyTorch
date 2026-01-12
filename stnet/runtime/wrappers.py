@@ -19,8 +19,9 @@ import torch
 from tensordict import TensorDict
 from torch import nn
 
+from ..core.concurrency import Mutex
 from ..core.tensor import extract_tensor, from_buffer
-from ..core.datatypes import Mutex, PathLike, write_json
+from ..core.datatypes import PathLike, write_json
 from ..nn.layers import Recorder
 
 

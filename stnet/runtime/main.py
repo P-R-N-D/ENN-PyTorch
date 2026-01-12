@@ -37,7 +37,7 @@ from torch.distributed.checkpoint.state_dict import (
 from torch.distributed.elastic.control_plane import worker_main
 
 from ..config import RuntimeConfig, coerce_model_config
-from ..core.concurrency import Cache, Pool, get_affinity
+from ..core.concurrency import TensorSpooler, Mutex, TensorPagePool, new_affinity
 from ..core.system import (
     CPU,
     Memory,
@@ -66,7 +66,7 @@ from ..core.system import (
     sync_accelerator,
     posix_time,
 )
-from ..core.datatypes import Mutex, env_bool, env_first, env_first_int, env_float, env_int, env_str
+from ..core.datatypes import env_bool, env_first, env_first_int, env_float, env_int, env_str
 from ..core.tensor import is_meta_or_fake_tensor, to_torch_tensor
 from ..core.distributed import (
     broadcast_scalar,
@@ -1438,10 +1438,10 @@ def _pool_tensor(
     *args: Any,
     dtype: torch.dtype,
     device: torch.device,
-    cpu_pool: Pool | None,
+    cpu_pool: TensorPagePool | None,
     dev_type: str | None = None,
     pinned_ok: bool | None = None,
-) -> tuple[torch.Tensor, Pool.Token | None, bool]:
+) -> tuple[torch.Tensor, TensorPagePool.Token | None, bool]:
     if not torch.is_tensor(tensor):
         raise TypeError(f"stage_tensor expects a torch.Tensor, got {type(tensor)}")
     if dev_type is None:
@@ -1482,7 +1482,7 @@ def _stream_tensor(
     *args: Any,
     device: TorchDeviceLike,
     cpu_pool: object,
-    handle: Pool.Token | None = None,
+    handle: TensorPagePool.Token | None = None,
     pinned: bool | None = None,
     dev_type: object | None = None,
     non_blocking_ok: object | None = None,
@@ -1594,13 +1594,13 @@ def _stream_tensor(
 
 def _move_staged_pair_to_device(
     X_st: object,
-    x_tok: Pool.Token | None,
+    x_tok: TensorPagePool.Token | None,
     x_pinned: bool,
     Y_st: object | None,
-    y_tok: Pool.Token | None,
+    y_tok: TensorPagePool.Token | None,
     y_pinned: bool,
     to_device: object,
-) -> tuple[object, object | None, Pool.Token | None, Pool.Token | None]:
+) -> tuple[object, object | None, TensorPagePool.Token | None, TensorPagePool.Token | None]:
     X_dev = to_device(X_st, handle=x_tok, pinned=x_pinned)
     x_tok = None
     Y_dev = None
@@ -1630,8 +1630,8 @@ def _pin(
         Y_src = None
     else:
         Y_src = label if torch.is_tensor(label) else to_torch_tensor(label)
-    x_tok: Pool.Token | None = None
-    y_tok: Pool.Token | None = None
+    x_tok: TensorPagePool.Token | None = None
+    y_tok: TensorPagePool.Token | None = None
     try:
         x_dtype = getattr(meta, "feature_dtype", X_src.dtype)
         X_st, x_tok, x_pinned = stage_tensor(X_src, dtype=x_dtype)
@@ -2172,7 +2172,7 @@ def epochs(
             Memory.prefer_local_numa()
         try:
             cpu_pool_cap = max(2, int(_env_int("STNET_RUNTIME_PIN_POOL_CAPACITY", 8)))
-            cpu_pool = Pool(capacity=cpu_pool_cap)
+            cpu_pool = TensorPagePool(capacity=cpu_pool_cap)
             pool_capacity = int(getattr(cpu_pool, "capacity", 8))
         except Exception:
             cpu_pool = None
@@ -2461,7 +2461,7 @@ def epochs(
     join_context = joining(model=model, optimizer=optimizer)
     with join_context:
         with contextlib.suppress(Exception):
-            get_affinity().pin_thread()
+            new_affinity().pin_thread()
         stage_tensor = partial(
             _pool_tensor,
             device=device,
@@ -3480,7 +3480,7 @@ def infer(
     use_mmt_pred_parts = bool(_env_flag("STNET_PRED_MMT_PARTS", dev_type != "cpu"))
     if not use_async_write:
         use_mmt_pred_parts = False
-    cache = Cache(chunk_dir, max_queue=cache_q) if use_async_write else None
+    cache = TensorSpooler(chunk_dir, max_queue=cache_q) if use_async_write else None
     target_rows = int(_env_int("STNET_PRED_CHUNK_ROWS", 0))
     if target_rows <= 0:
         out_shape = tuple((int(x) for x in ops.out_shape or ()))
@@ -3530,7 +3530,7 @@ def infer(
     )
     make_fence_event = partial(new_accelerator_event, device, enable_timing=False)
     cpu_pool = None
-    if pinned_ok and Pool is not None:
+    if pinned_ok and TensorPagePool is not None:
         with contextlib.suppress(Exception):
             Memory.prefer_local_numa()
         with contextlib.suppress(Exception):
@@ -3542,14 +3542,14 @@ def infer(
                 except Exception:
                     _cpu_default = 16
             cpu_pool_cap = max(2, int(_env_int("STNET_RUNTIME_PIN_POOL_CAPACITY", _cpu_default)))
-            cpu_pool = Pool(capacity=cpu_pool_cap)
+            cpu_pool = TensorPagePool(capacity=cpu_pool_cap)
     pred_pool = None
-    if non_blocking_ok and Pool is not None and _env_flag("STNET_PRED_PINNED", True):
+    if non_blocking_ok and TensorPagePool is not None and _env_flag("STNET_PRED_PINNED", True):
         with contextlib.suppress(Exception):
             _nogil = bool(CPU.is_optimized_for_no_gil())
             _pred_default = 2 if not _nogil else 4
             pred_pool_cap = max(2, int(_env_int("STNET_PRED_PIN_POOL_CAPACITY", _pred_default)))
-            pred_pool = Pool(capacity=pred_pool_cap, pin_memory=True)
+            pred_pool = TensorPagePool(capacity=pred_pool_cap, pin_memory=True)
     stage_tensor = partial(
         _pool_tensor,
         device=device,
@@ -4318,7 +4318,7 @@ def process(*args: Any, **kwargs: Any) -> object:
                 enabled=bool(device.type == "cuda" and compute_dtype == torch.float16)
             )
             try:
-                get_affinity().pin_thread()
+                new_affinity().pin_thread()
                 with contextlib.suppress(Exception):
                     Memory.prefer_local_numa()
             except Exception:
@@ -4604,8 +4604,8 @@ class _PredictionWriter:
         chunk_dir: str,
         rank: int,
         use_mmt_pred_parts: bool,
-        cache: Cache | None,
-        pred_pool: Pool | None,
+        cache: TensorSpooler | None,
+        pred_pool: TensorPagePool | None,
         target_rows: int,
         make_fence_event: callable,
     ) -> None:
@@ -4619,7 +4619,7 @@ class _PredictionWriter:
         self.use_buffer = True
         self.rows_buf: torch.Tensor | None = None
         self.pred_buf: torch.Tensor | None = None
-        self.pred_handle: Pool.Token | None = None
+        self.pred_handle: TensorPagePool.Token | None = None
         self.pred_buf_is_pinned = False
         self.buf_needs_wait_evt = False
         self.buf_fill = 0

@@ -11,7 +11,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from ..core.datatypes import Mutex, env_bool, env_int
+from ..core.concurrency import Mutex
+from ..core.datatypes import env_bool, env_int
 from ..core.compat import StochasticDepth
 from ..core.system import empty_device_cache, is_oom_error
 from ..core.graph import coerce_checkpoint, torch_compiler_disable, is_symbolic, is_checkpoint
