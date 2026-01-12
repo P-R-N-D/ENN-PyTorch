@@ -50,7 +50,6 @@ _FP32_PRECISION_LOCK = Mutex()
 _EMPTY_CACHE_LOCK = Mutex()
 _EMPTY_CACHE_LAST_CALL_S_BY_DEVICE: dict[Tuple[str, int], float] = {}
 
-
 _DEVICE_STATS_CACHE: dict[Tuple[str, int], Device] = {}
 _DEVICE_STATS_LOCK = Mutex()
 
@@ -127,6 +126,14 @@ _RUNTIME_CFG = SimpleNamespace(
     te_first=True,
 )
 _RUNTIME_CFG_LOCK = Mutex()
+
+
+def _device_from(device: Optional[Union[torch.device, str]]) -> torch.device:
+    if device is not None:
+        return device if isinstance(device, torch.device) else torch.device(str(device))
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    return torch.device("cpu")
 
 
 def _log_msg(logger, msg, level):
@@ -1095,14 +1102,6 @@ def get_sdpa_backends() -> list[object]:
 
 def get_dpa_backends() -> list[object]:
     return get_sdpa_backends()
-
-
-def _device_from(device: Optional[Union[torch.device, str]]) -> torch.device:
-    if device is not None:
-        return device if isinstance(device, torch.device) else torch.device(str(device))
-    if torch.cuda.is_available():
-        return torch.device("cuda")
-    return torch.device("cpu")
 
 
 def cuda_compute_capability(device: Union[torch.device, str]) -> Tuple[int, int]:
