@@ -24,8 +24,6 @@ from typing import Any, Callable, Optional, Sequence, Tuple, Union
 
 import torch
 import torch.multiprocessing
-
-from .concurrency import Mutex
 from .datatypes import env_bool, env_first, env_first_float, env_first_int, env_float, env_str, parse_bool
 
 try:
@@ -37,16 +35,16 @@ except Exception:
 _LOGGER = logging.getLogger(__name__)
 
 _FP32_PRECISION_CACHE: dict[str, str] = {}
-_FP32_PRECISION_LOCK = Mutex()
+_FP32_PRECISION_LOCK = threading.Lock()
 
-_EMPTY_CACHE_LOCK = Mutex()
+_EMPTY_CACHE_LOCK = threading.Lock()
 _EMPTY_CACHE_LAST_CALL_S_BY_DEVICE: dict[Tuple[str, int], float] = {}
 
 _DEVICE_STATS_CACHE: dict[Tuple[str, int], Device] = {}
-_DEVICE_STATS_LOCK = Mutex()
+_DEVICE_STATS_LOCK = threading.Lock()
 
 _CPU_PROC_CACHE: Optional[int] = None
-_CPU_PROC_LOCK = Mutex()
+_CPU_PROC_LOCK = threading.Lock()
 
 _TZ_ALIASES = {
     k: v
@@ -117,7 +115,7 @@ _RUNTIME_CFG = SimpleNamespace(
     sdpa_backends=None,
     te_first=True,
 )
-_RUNTIME_CFG_LOCK = Mutex()
+_RUNTIME_CFG_LOCK = threading.Lock()
 
 
 def _device_from(device: Optional[Union[torch.device, str]]) -> torch.device:
