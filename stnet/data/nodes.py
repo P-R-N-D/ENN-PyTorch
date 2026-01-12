@@ -1763,12 +1763,6 @@ class Storage:
             os.rmdir(os.fspath(memmap_dir))
 
 
-# Source is defined in stnet.data.pipeline (re-exported here for convenience)
-
-
-# Disposable is defined in stnet.core.concurrency (re-exported here for convenience)
-
-
 class Governor:
     __slots__ = ("_v", "_min_scale", "_max_scale")
 
@@ -1873,9 +1867,6 @@ class Governor:
                 self._v.value = float(max(float(self._min_scale), cur * float(f)))
         except Exception:
             pass
-
-
-# NOTE: BatchQueue has moved to stnet.core.concurrency.buffered (thin wrapper).
 
 
 class Sampler(torch.utils.data.Sampler):
