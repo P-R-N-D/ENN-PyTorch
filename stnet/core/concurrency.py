@@ -46,6 +46,16 @@ from .system import (
 )
 
 
+def _flatten_args(items: Sequence[Any]) -> Iterator[Any]:
+    for item in items:
+        if isinstance(item, dict):
+            yield from _flatten_args(list(item.values()))
+        elif isinstance(item, (list, tuple, set)):
+            yield from _flatten_args(list(item))
+        else:
+            yield item
+
+
 def _get_throttle_state() -> str:
     s = (
         str(
@@ -209,16 +219,6 @@ class _PoolEntry:
 class ProducerError:
     exc: BaseException
     tb: str
-
-
-def _flatten_args(items: Sequence[Any]) -> Iterator[Any]:
-    for item in items:
-        if isinstance(item, dict):
-            yield from _flatten_args(list(item.values()))
-        elif isinstance(item, (list, tuple, set)):
-            yield from _flatten_args(list(item))
-        else:
-            yield item
 
 
 class Disposable:
