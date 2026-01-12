@@ -114,6 +114,12 @@ _PLATFORM_ALIASES: dict[str, str] = {
     "canonical": "name",
 }
 
+_DEF_UNDERFLOW_ACTIONS = {"allow", "warn", "forbid"}
+
+PathLike: TypeAlias = str | os.PathLike[str] | Path
+JsonPrimitive: TypeAlias = str | int | float | bool | None
+JsonValue: TypeAlias = JsonPrimitive | list["JsonValue"] | dict[str, "JsonValue"]
+
 
 def _env_cast(name: str, cast: Callable[[str], Any], default: Any) -> Any:
     s = env_str(name)
@@ -310,12 +316,6 @@ def parse_torch_dtype(src: Any) -> torch.dtype | None:
 def dtype_from_name(name: Any, default: torch.dtype) -> torch.dtype:
     dt = parse_torch_dtype(name)
     return dt if isinstance(dt, torch.dtype) else default
-
-PathLike: TypeAlias = str | os.PathLike[str] | Path
-JsonPrimitive: TypeAlias = str | int | float | bool | None
-JsonValue: TypeAlias = JsonPrimitive | list["JsonValue"] | dict[str, "JsonValue"]
-
-_DEF_UNDERFLOW_ACTIONS = {"allow", "warn", "forbid"}
 
 
 def get_meta_path(mmt_path: str) -> str:
