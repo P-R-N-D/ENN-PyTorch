@@ -1626,9 +1626,9 @@ class Storage:
                 rows_t = Storage._load_row(rows_file)
                 preds_t = Storage._load_prediction(pred_file, dtype=cast_dtype)
                 preds_np = preds_t.detach().to(device="cpu", dtype=cast_dtype).numpy()
-                if predsnp.shape[0] != int(rows_t.numel()):
+                if preds_np.shape[0] != int(rows_t.numel()):
                     raise ValueError(
-                        f"Pred/rows mismatch in {pred_file}: preds[0]={predsnp.shape[0]} vs rows={int(rows_t.numel())}"
+                        f"Pred/rows mismatch in {pred_file}: preds[0]={preds_np.shape[0]} vs rows={int(rows_t.numel())}"
                     )
                 Storage._h5_write_rows(dset_Y, rows_t, preds_np, count=int(count))
         return PersistentTensorDict(filename=out_path, batch_size=[int(count)], mode="r")
@@ -2024,4 +2024,3 @@ class _PredictionWriter:
             start += n
             if self.buf_fill >= int(self.target_rows):
                 self.flush()
-
