@@ -367,7 +367,7 @@ class Prefetcher:
             )
         return self._iter_session()
 
-    def _producer_loop(self, it: Iterator[Any], buf: "SizedQueue", sentinel: object) -> None:
+    def _producer_loop(self, it: Iterator[Any], buf: "BufferQueue", sentinel: object) -> None:
         try:
             while not buf.is_stopped():
                 if not buf.block(timeout=None):
@@ -389,7 +389,7 @@ class Prefetcher:
 
     def _iter_session(self) -> Iterator[Any]:
         src_iter = iter(self._src)
-        buf = SizedQueue(max_batches=int(self._max_batches))
+        buf = BufferQueue(max_batches=int(self._max_batches))
         sentinel = object()
         ex = new_executor(1, workload="io", name=f"{self._name}-producer")
         fut = ex.submit(self._producer_loop, src_iter, buf, sentinel)
@@ -851,7 +851,7 @@ class TensorSpooler:
         return bool(self._err_event.is_set())
 
 
-class SizedQueue:
+class BufferQueue:
     def __init__(self, max_batches: int) -> None:
         self.max_batches = max(1, int(max_batches))
         self._buf: "collections.deque[Any]" = collections.deque()
@@ -882,7 +882,7 @@ class SizedQueue:
         elapsed = time.monotonic() - t0
         if self._warn_blocking and elapsed > 0.1:
             logging.warning(
-                "SizedQueue.put blocked for %.3f s (max_batches=%d)",
+                "BufferQueue.put blocked for %.3f s (max_batches=%d)",
                 float(elapsed),
                 int(self.max_batches),
             )

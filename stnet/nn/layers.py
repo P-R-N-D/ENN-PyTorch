@@ -1824,8 +1824,8 @@ class Scaler(nn.Module):
         self.register_buffer("y_q_high", torch.full((1,), float("inf"), dtype=torch.float64))
         self.register_buffer("affine_a", torch.ones(1, dtype=torch.float64))
         self.register_buffer("affine_b", torch.zeros(1, dtype=torch.float64))
-        self.register_buffer("pw_x", torch.empty(0, dtype=torch.float64))
-        self.register_buffer("pw_y", torch.empty(0, dtype=torch.float64))
+        self.register_buffer("pw_x", torch.zeros((1, 1), dtype=torch.float64))
+        self.register_buffer("pw_y", torch.zeros((1, 1), dtype=torch.float64))
         self._stats_cache_lock = Mutex()
         self._stats_cache_max = 8
         self._x_stats_cache: Dict[
@@ -2055,7 +2055,7 @@ class Scaler(nn.Module):
     def calibrate(self, z_raw: torch.Tensor) -> torch.Tensor:
         match self.calib_mode:
             case "piecewise":
-                if self.pw_x.numel() > 0 and self.pw_y.numel() > 0:
+                if self.pw_x.numel() >= 2 and self.pw_y.numel() >= 2:
                     return self._piecewise(z_raw)
                 return z_raw
             case "affine":
@@ -2078,8 +2078,10 @@ class Scaler(nn.Module):
             self.affine_b.resize_(b.shape)
         self.affine_a.copy_(a.to(self.affine_a.device, dtype=self.affine_a.dtype))
         self.affine_b.copy_(b.to(self.affine_b.device, dtype=self.affine_b.dtype))
-        self.pw_x.resize_(0)
-        self.pw_y.resize_(0)
+        self.pw_x.resize_((1, 1))
+        self.pw_x.zero_()
+        self.pw_y.resize_((1, 1))
+        self.pw_y.zero_()
         self.calib_mode = "affine"
 
     @torch.no_grad()
@@ -2135,8 +2137,10 @@ class Scaler(nn.Module):
             self.affine_b.resize_(b.shape)
         self.affine_a.copy_(a)
         self.affine_b.copy_(b)
-        self.pw_x.resize_(0)
-        self.pw_y.resize_(0)
+        self.pw_x.resize_((1, 1))
+        self.pw_x.zero_()
+        self.pw_y.resize_((1, 1))
+        self.pw_y.zero_()
 
     @torch.no_grad()
     def _fit_piecewise(
@@ -2196,7 +2200,7 @@ class Scaler(nn.Module):
         self.affine_b.zero_()
 
     def _piecewise(self, z_raw: torch.Tensor) -> torch.Tensor:
-        if self.pw_x.numel() == 0 or self.pw_y.numel() == 0:
+        if self.pw_x.numel() < 2 or self.pw_y.numel() < 2:
             return z_raw
         if self.pw_x.dim() != 2 or self.pw_y.dim() != 2:
             return z_raw

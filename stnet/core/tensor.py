@@ -3,6 +3,7 @@ from __future__ import annotations
 import contextlib
 import importlib
 import inspect
+import warnings
 from collections.abc import Mapping
 from typing import Any, Iterator
 
@@ -56,17 +57,12 @@ def _call_from_buffer(
     offset: int = 0,
     requires_grad: bool = False,
 ) -> torch.Tensor:
-    s = inspect.signature(fn)
-    args = {"buffer": buffer, "dtype": dtype, "count": count, "offset": offset}
-    if "requires_grad" in s.parameters:
-        args["requires_grad"] = requires_grad
-    else:
-        try:
-            if requires_grad:
-                args["requires_grad"] = requires_grad
-        except Exception:
-            pass
-    return fn(**args)
+    del args
+    kw = {"buffer": buffer, "dtype": dtype, "count": count, "offset": offset}
+    try:
+        return fn(**kw, requires_grad=requires_grad)
+    except TypeError:
+        return fn(**kw)
 
 
 def to_torch_tensor(obj: Any) -> torch.Tensor:
@@ -184,6 +180,30 @@ def from_buffer(*, coerce_requires_grad: bool = True) -> Iterator[None]:
     ):
         if coerce_requires_grad:
             requires_grad = False
+        try:
+            mv = memoryview(buffer)
+            nbytes = int(getattr(mv, "nbytes", len(mv)))
+            off = max(0, int(offset))
+            if int(count) == 0:
+                return torch.zeros((0,), dtype=dtype)
+            if nbytes <= off:
+                n = int(count) if isinstance(count, int) and int(count) > 0 else 0
+                return torch.zeros((n,), dtype=dtype)
+            readonly = bool(getattr(mv, "readonly", False))
+        except Exception:
+            readonly = False
+
+        if readonly:
+            with warnings.catch_warnings():
+                warnings.filterwarnings("ignore", message=r".*buffer is not writable.*")
+                return _call_from_buffer(
+                    _original,
+                    buffer,
+                    dtype=dtype,
+                    count=count,
+                    offset=offset,
+                    requires_grad=requires_grad,
+                )
         return _call_from_buffer(
             _original,
             buffer,

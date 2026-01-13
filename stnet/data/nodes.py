@@ -38,7 +38,7 @@ from torchdata.nodes import (
 )
 
 from ..core.concurrency import (
-    SizedQueue,
+    BufferQueue,
     Disposable,
     Mutex,
     TensorPagePool,
@@ -1158,7 +1158,7 @@ class Loader:
         )
 
 
-class Stream(SizedQueue):
+class Stream(BufferQueue):
     def __init__(
         self,
         iterable: Any,
