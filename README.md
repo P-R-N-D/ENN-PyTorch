@@ -239,7 +239,7 @@ stnet/
     __init__.py
     nodes.py              # torchdata nodes, Sampler/Loader, memmap writer/reader
     pipeline.py           # dataset fetch, collate, session orchestration
-    storage.py            # dataset storage helpers
+    collate.py            # dataset storage helpers
   runtime/
     __init__.py
     io.py                 # exporters (ONNX/ORT/torch.export (PT2)/etc.), checkpoint save/load

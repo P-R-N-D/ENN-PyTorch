@@ -13,7 +13,6 @@ import time
 from itertools import chain
 from dataclasses import dataclass, field, replace
 from functools import partial
-from pathlib import Path
 from typing import (
     Any,
     Callable,
@@ -44,7 +43,6 @@ from ..core.datatypes import (
     env_first,
     env_first_float,
     env_first_int,
-    parse_torch_dtype,
     read_json,
 )
 from ..core.policies import BatchPolicy, LoaderPolicy, WorkerPolicy
@@ -66,14 +64,11 @@ from ..core.system import (
     sync_accelerator,
 )
 from ..core.datatypes import default_underflow_action, normalize_underflow_action
+from . import collate
 
 
 logger = logging.getLogger(__name__)
 
-
-_FEATURE_KEY_ALIASES = frozenset({"x", "feature", "features", "input", "inputs", "in"})
-
-_LABEL_KEY_ALIASES = frozenset({"y", "label", "labels", "output", "outputs", "out"})
 
 _NODES_LOCK = Mutex()
 _NODES_IMPORTED = False
@@ -82,33 +77,6 @@ _device_mem_get_info = Memory.mem_get_info
 
 TExtra = TypeVar("TExtra")
 SourceType = Literal["memmap"]
-
-
-def _td_set(td: TensorDictBase, key: str, value: Any) -> None:
-    try:
-        td.set(key, value)
-    except Exception:
-        td[key] = value
-
-
-def _td_del(td: TensorDictBase, key: str) -> None:
-    with contextlib.suppress(Exception):
-        td.del_(key) if hasattr(td, "del_") else td.__delitem__(key)
-
-
-def _resolve_key(data: Any, aliases: frozenset, name: str, required: bool) -> Optional[str]:
-    if not isinstance(data, (Mapping, TensorDictBase)):
-        raise TypeError(f"get_{name}_key expects Mapping/TensorDict")
-    matches = [str(k) for k in data.keys() if isinstance(k, str) and k.casefold() in aliases]
-    if len(matches) == 1:
-        return matches[0]
-    if len(matches) > 1:
-        raise KeyError(f"Expected exactly one {name} key among {sorted(aliases)}; found {matches}")
-    if required:
-        raise KeyError(
-            f"Expected exactly one {name} key among {sorted(aliases)}; found {matches or 'none'}"
-        )
-    return None
 
 
 def _require_nodes() -> None:
@@ -145,15 +113,6 @@ def _is_lazy_tensor(x: Any) -> bool:
     return isinstance(x, MemoryMappedTensor)
 
 
-def _to_safe_tensor(obj: Any, dtype: Optional[torch.dtype] = None) -> Optional[torch.Tensor]:
-    if obj is None:
-        return None
-    t = obj if isinstance(obj, torch.Tensor) else torch.as_tensor(obj)
-    if dtype is None:
-        return t
-    return t.to(dtype=dtype, copy=False) if isinstance(t, torch.Tensor) and t.dtype != dtype else t
-
-
 def _feature_size_hint(obj: Any) -> Optional[int]:
     if isinstance(obj, torch.Tensor):
         return int(obj.numel()) if obj.ndim > 0 else 1
@@ -170,7 +129,7 @@ def _stack_sequence(
 ) -> Optional[torch.Tensor]:
     if not seq:
         return None
-    t0 = _to_safe_tensor(seq[0], dtype)
+    t0 = collate._to_safe_tensor(seq[0], dtype)
     if t0 is None:
         return None
     if reshape_1d:
@@ -178,7 +137,7 @@ def _stack_sequence(
     out = torch.empty((len(seq), *t0.shape), dtype=t0.dtype, device=t0.device)
     out[0].copy_(t0)
     for i, item in enumerate(seq[1:], 1):
-        ti = _to_safe_tensor(item, dtype)
+        ti = collate._to_safe_tensor(item, dtype)
         if ti is None:
             raise ValueError("Dataset.preprocess: missing element")
         if reshape_1d:
@@ -282,7 +241,7 @@ def _set_batch_interval(
         return (1, 0.0)
     sbytes_cached = int(getattr(_ds, "_S_sample_bytes", 0) or 0)
     probe = _ds.get(0, min(8, len(_ds)))
-    x_cpu, y_cpu = get_row(probe, labels_required=False)
+    x_cpu, y_cpu = collate.get_row(probe, labels_required=False)
     if not isinstance(x_cpu, torch.Tensor):
         x_cpu = torch.as_tensor(x_cpu)
     if y_cpu is not None and not isinstance(y_cpu, torch.Tensor):
@@ -509,10 +468,6 @@ def _is_source(obj: Any) -> bool:
         return bool(os.fspath(p))
     except Exception:
         return False
-
-
-def _td_batch_size_from_X(x: Any) -> list[int]:
-    return [int(x.shape[0])] if isinstance(x, torch.Tensor) and x.ndim >= 1 else []
 
 
 def _merge_opt(v1, v2, op):
@@ -761,40 +716,6 @@ def _fetch_build_sampler_nodes(
     return nodes, lengths
 
 
-def get_feature_key(data: Any) -> str:
-    return _resolve_key(data, _FEATURE_KEY_ALIASES, "feature", True)
-
-
-def get_label_key(data: Any, *args: Any, required: bool = True) -> Optional[str]:
-    return _resolve_key(data, _LABEL_KEY_ALIASES, "label", required)
-
-
-def canonicalize_keys_(
-    td: TensorDictBase,
-    *args: Any,
-    x_key: str = "X",
-    y_key: str = "Y",
-    allow_missing_labels: bool = False,
-) -> TensorDictBase:
-    if not isinstance(td, TensorDictBase):
-        raise TypeError("canonicalize_xy_keys_ expects a TensorDict")
-    fkey = get_feature_key(td)
-    if fkey != x_key:
-        _td_set(td, x_key, td[fkey])
-        _td_del(td, fkey)
-    lkey = get_label_key(td, required=not bool(allow_missing_labels))
-    if lkey is not None and lkey != y_key:
-        _td_set(td, y_key, td[lkey])
-        _td_del(td, lkey)
-    return td
-
-
-def get_row(data: Any, *args: Any, labels_required: bool = False) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
-    return data[get_feature_key(data)], (
-        data[l] if (l := get_label_key(data, required=labels_required)) else None
-    )
-
-
 def iter_dataset(data: object) -> tuple[list[tuple[str, object]], object | None]:
     if isinstance(data, TensorDictBase):
         return ([("0", data)], None)
@@ -824,38 +745,6 @@ def iter_dataset(data: object) -> tuple[list[tuple[str, object]], object | None]
             manifest_list.append(key)
         return (items2, manifest_list)
     return ([("0", data)], None)
-
-
-def preprocess(
-    batch: Any,
-    *args: Any,
-    flatten_features: bool,
-    labels_dtype: Optional[torch.dtype],
-    sanitize: bool,
-    **kwargs: Any,
-) -> Dict[str, Any]:
-    features: Any = None
-    labels: Any = None
-    if isinstance(batch, (Mapping, TensorDictBase)):
-        with contextlib.suppress(Exception):
-            features, labels = get_row(batch, labels_required=False)
-    if features is None and isinstance(batch, Mapping):
-        features = batch.get("X")
-        labels = batch.get("Y", None)
-    if flatten_features and isinstance(features, torch.Tensor) and (features.dim() >= 2):
-        features = features.reshape(features.shape[0], -1)
-    if labels_dtype is not None and isinstance(labels, torch.Tensor):
-        labels = labels.to(dtype=labels_dtype, non_blocking=True, copy=False)
-    if sanitize and isinstance(labels, torch.Tensor) and labels.is_floating_point():
-        torch.nan_to_num(labels, nan=0.0, posinf=0.0, neginf=0.0, out=labels)
-    out: Dict[str, Any] = {"X": features}
-    if labels is not None:
-        out["Y"] = labels
-    if isinstance(batch, (Mapping, TensorDictBase)):
-        with contextlib.suppress(Exception):
-            if "row_ids" in batch:
-                out["row_ids"] = batch.get("row_ids")
-    return out
 
 
 def dataset(
@@ -952,7 +841,7 @@ def fetch(
     io_workers = int(getattr(wp, "num_workers", 0) or 0)
     prebatch = int(getattr(wp, "prebatch", 1) or 1)
     pf_depth_fixed = max(1, min(8, int(getattr(wp, "prefetch_factor", 1) or 1)))
-    collate_fn = Collator(
+    collate_fn = collate.Collator(
         flatten_features=bool(flatten_features),
         labels_dtype=labels_dtype,
         sanitize=bool(sanitize),
@@ -1070,106 +959,6 @@ class Source(TypedDict):
     path: Required[str]
     format: NotRequired[SourceType]
     kind: NotRequired[SourceType]
-
-
-class Collator:
-    labels_dtype: Optional[torch.dtype] = None
-    sanitize: bool = False
-    flatten_features: bool = False
-
-    def __init__(
-        self,
-        *,
-        labels_dtype: Optional[torch.dtype] = None,
-        sanitize: bool = False,
-        flatten_features: bool = False,
-    ) -> None:
-        self.labels_dtype = labels_dtype
-        self.sanitize = bool(sanitize)
-        self.flatten_features = bool(flatten_features)
-
-    def __call__(self, batch: Any) -> Any:
-        labels_dtype = self.labels_dtype
-        sanitize = bool(self.sanitize)
-        flatten = bool(self.flatten_features)
-        if isinstance(batch, (list, tuple)):
-            if not batch:
-                return batch
-
-            def _standardize_batch(items):
-                if all(isinstance(elem, TensorDictBase) for elem in items):
-                    return torch.stack(items, dim=0)
-
-                def _stack_key(key, default=None):
-                    vals = [
-                        x.get(key, default) if isinstance(x, Mapping) else default for x in items
-                    ]
-                    if all(v is None for v in vals):
-                        return None
-                    return _to_safe_tensor(
-                        torch.stack([_to_safe_tensor(v) for v in vals if v is not None])
-                        if any(isinstance(v, torch.Tensor) for v in vals)
-                        else vals
-                    )
-
-                X = _stack_key("X") or _stack_key("x")
-                Y = _stack_key("Y") or _stack_key("y")
-                rows = _stack_key("row_ids")
-
-                data = {"X": X}
-                if Y is not None:
-                    data["Y"] = Y
-                if rows is not None:
-                    data["row_ids"] = rows
-                return TensorDict(data, batch_size=_td_batch_size_from_X(X)) if TensorDict else data
-
-            stacked = _standardize_batch(batch)
-            if isinstance(stacked, TensorDictBase):
-                with contextlib.suppress(Exception):
-                    canonicalize_keys_(stacked, allow_missing_labels=True)
-
-            try:
-                conv = preprocess(
-                    stacked,
-                    flatten_features=flatten,
-                    labels_dtype=labels_dtype,
-                    sanitize=sanitize,
-                )
-            except Exception:
-                return stacked
-
-            if isinstance(conv, Mapping) and isinstance(stacked, TensorDictBase):
-                for k in ["X", "Y", "row_ids"]:
-                    if k in conv and conv[k] is not None:
-                        stacked.set(k, conv[k])
-            return stacked
-        if isinstance(batch, Mapping):
-            try:
-                conv = preprocess(
-                    batch,
-                    flatten_features=flatten,
-                    labels_dtype=labels_dtype,
-                    sanitize=sanitize,
-                )
-            except Exception:
-                conv = batch
-            X = conv.get("X", None) if isinstance(conv, Mapping) else None
-            Y = conv.get("Y", None) if isinstance(conv, Mapping) else None
-            if X is None:
-                with contextlib.suppress(Exception):
-                    X, Y = get_row(batch, labels_required=False)
-            if X is None:
-                X = batch.get("X")
-            if Y is None:
-                Y = batch.get("Y")
-            row_ids = conv.get("row_ids") if isinstance(conv, Mapping) else batch.get("row_ids")
-            data: dict[str, Any] = {"X": X}
-            if isinstance(Y, torch.Tensor):
-                data["Y"] = Y
-            if row_ids is not None:
-                data["row_ids"] = row_ids
-            return TensorDict(data, batch_size=_td_batch_size_from_X(X)) if TensorDict else data
-        return batch
 
 
 @dataclass
@@ -1398,20 +1187,20 @@ class Dataset(Generic[TExtra]):
         feat_dtype = self.feature_dtype if bool(cast) else None
         label_dtype = self.label_float_dtype if bool(cast) else None
         if isinstance(data, TensorDictBase):
-            fkey = get_feature_key(data)
+            fkey = collate.get_feature_key(data)
             features = data.get(fkey, None)
-            lkey = get_label_key(data, required=False)
+            lkey = collate.get_label_key(data, required=False)
             labels = data.get(lkey, None) if lkey is not None else None
             if bool(return_keys):
                 keys = data.get("row_ids", None) or data.get("keys", None) or ()
         elif isinstance(data, Mapping):
             if (
-                _resolve_key(data, _FEATURE_KEY_ALIASES, "feature", False) is not None
-                or _resolve_key(data, _LABEL_KEY_ALIASES, "label", False) is not None
+                collate._resolve_key(data, collate._FEATURE_KEY_ALIASES, "feature", False) is not None
+                or collate._resolve_key(data, collate._LABEL_KEY_ALIASES, "label", False) is not None
             ):
-                fkey = get_feature_key(data)
+                fkey = collate.get_feature_key(data)
                 features = data.get(fkey, None)
-                lkey = get_label_key(data, required=False)
+                lkey = collate.get_label_key(data, required=False)
                 labels = data.get(lkey, None) if lkey is not None else None
                 if bool(return_keys):
                     keys = data.get("row_ids", None) or data.get("keys", None) or ()
@@ -1425,7 +1214,7 @@ class Dataset(Generic[TExtra]):
                     if isinstance(v0, (list, tuple)) and len(v0) >= 2:
                         n = len(data)
                         keys_list: Optional[list[Any]] = [k0] if bool(return_keys) else None
-                        x0 = _to_safe_tensor(v0[0], feat_dtype)
+                        x0 = collate._to_safe_tensor(v0[0], feat_dtype)
                         if x0 is None:
                             raise ValueError("Dataset.preprocess: missing feature in tuple mapping")
                         feat = torch.empty((n, *x0.shape), dtype=x0.dtype, device=x0.device)
@@ -1433,7 +1222,7 @@ class Dataset(Generic[TExtra]):
                         labels_out: Optional[torch.Tensor] = None
                         y0: Optional[torch.Tensor] = None
                         if v0[1] is not None:
-                            y0 = _to_safe_tensor(v0[1], label_dtype)
+                            y0 = collate._to_safe_tensor(v0[1], label_dtype)
                             if y0 is not None:
                                 labels_out = torch.empty(
                                     (n, *y0.shape), dtype=y0.dtype, device=y0.device
@@ -1446,7 +1235,7 @@ class Dataset(Generic[TExtra]):
                                 raise ValueError(
                                     "Dataset.preprocess: invalid tuple mapping element"
                                 )
-                            x_i = _to_safe_tensor(v[0], feat_dtype)
+                            x_i = collate._to_safe_tensor(v[0], feat_dtype)
                             if x_i is None:
                                 raise ValueError(
                                     "Dataset.preprocess: missing feature in tuple mapping"
@@ -1461,7 +1250,7 @@ class Dataset(Generic[TExtra]):
                                 if len(v) < 2 or v[1] is None:
                                     labels_out = None
                                 else:
-                                    y_i = _to_safe_tensor(v[1], label_dtype)
+                                    y_i = collate._to_safe_tensor(v[1], label_dtype)
                                     if (
                                         y_i is None
                                         or y0 is None
@@ -1508,7 +1297,7 @@ class Dataset(Generic[TExtra]):
                             labels = None
         if features is None:
             raise ValueError("Dataset.preprocess: unable to locate feature tensor(s)")
-        features = _to_safe_tensor(features, feat_dtype)
+        features = collate._to_safe_tensor(features, feat_dtype)
         if features.ndim == 0:
             features = features.reshape(1, 1)
         elif features.ndim == 1:
@@ -1516,7 +1305,7 @@ class Dataset(Generic[TExtra]):
         if not bool(features.is_contiguous()) and not _is_lazy_tensor(features):
             features = features.contiguous()
         if labels is not None:
-            labels = _to_safe_tensor(labels, label_dtype)
+            labels = collate._to_safe_tensor(labels, label_dtype)
             if labels.ndim == 0:
                 labels = labels.reshape(1, 1)
             if labels.shape[0] != features.shape[0]:
@@ -1827,118 +1616,6 @@ class Dataset(Generic[TExtra]):
         )
 
 
-def _coerce_path(path: PathLike) -> Optional[str]:
-    if path is None:
-        return None
-    p = str(path).replace("\\n", "").replace("\r", "").replace("\n", "").strip()
-    if not p or p.lower() in ("none", "null", "nil"):
-        return None
-    return os.path.abspath(os.path.expanduser(p))
-
-
-def _coerce_prediction_output(output: object) -> str:
-    if isinstance(output, str) and output.strip().lower() in {
-        "file",
-        "disk",
-        "lazy",
-        "h5",
-        "hdf5",
-    }:
-        return "file"
-    return "memory"
-
-
-def _coerce_prediction_overwrite(overwrite: object) -> str:
-    if isinstance(overwrite, str):
-        ow = overwrite.strip().lower()
-        if ow == "resume":
-            return "resume"
-        if ow in {"replace", "overwrite", "force"}:
-            return "replace"
-        if ow in {"ignore", "skip"}:
-            return "ignore"
-    return "error"
-
-
-def _coerce_prediction_path(path: PathLike, *args: Any, run_id: str) -> Optional[str]:
-    del args
-    p = Path(str(path))
-    if p.suffix.lower() in {".h5", ".hdf5"}:
-        return os.fspath(p)
-    if p.is_dir():
-        return os.fspath(p / f"{run_id}.h5")
-    return None
-
-
-def _is_path_writable(path: PathLike) -> bool:
-    try:
-        p = Path(path)
-        if p.is_dir():
-            p.mkdir(parents=True, exist_ok=True)
-            probe = p / ".probe"
-            probe.write_text("", encoding="utf-8")
-            probe.unlink(missing_ok=True)
-            return True
-        p.parent.mkdir(parents=True, exist_ok=True)
-        with open(p, "a", encoding="utf-8"):
-            pass
-        return True
-    except Exception:
-        return False
-
-
-def _get_prediction_dtype(
-    chunks_dir: PathLike,
-    *args: Any,
-    default: torch.dtype = torch.float32,
-) -> torch.dtype:
-    del args
-    manifest_path = os.path.join(os.fspath(chunks_dir), "manifest.json")
-    if not os.path.isfile(manifest_path):
-        return default
-    try:
-        manifest = read_json(manifest_path)
-    except Exception:
-        return default
-    parts = manifest.get("parts") if isinstance(manifest, dict) else None
-    if not isinstance(parts, list) or not parts:
-        return default
-    for part in parts:
-        if not isinstance(part, dict):
-            continue
-        pred_rel = part.get("pred")
-        if not pred_rel:
-            continue
-        pred_path = os.path.join(os.fspath(chunks_dir), str(pred_rel))
-        if pred_path.endswith(".mmt"):
-            from .storage import Storage
-
-            meta_path = Storage.mmt_meta_path(pred_path)
-            if os.path.isfile(meta_path):
-                try:
-                    meta = read_json(meta_path)
-                except Exception:
-                    meta = None
-                if isinstance(meta, dict):
-                    dt = parse_torch_dtype(meta.get("dtype"))
-                    if isinstance(dt, torch.dtype):
-                        return dt
-        if os.path.isfile(pred_path):
-            try:
-                from ..runtime.io import _torch_load_checkpoint
-
-                preds_t = _torch_load_checkpoint(pred_path, map_location="cpu", weights_only=True)
-            except Exception:
-                preds_t = None
-            if isinstance(preds_t, torch.Tensor):
-                return preds_t.dtype
-            try:
-                return torch.as_tensor(preds_t).dtype
-            except Exception:
-                continue
-    return default
-
-
 def preload_memmap(
     data: Mapping[str, Any],
     *args: Any,
@@ -1987,7 +1664,8 @@ def preload_memmap(
     ds = Dataset.for_device("cpu", feature_dtype=torch.float64, label_float_dtype=torch.float64)
     ds.underflow_action = ua
 
-    from .storage import Storage, _BatchIndexGetter, _BatchSliceGetter
+    from . import collate
+    from .collate import _BatchIndexGetter, _BatchSliceGetter
 
     get_batch = _BatchSliceGetter(raw_X, raw_Y, features_only=bool(features_only))
     get_by_indices = (
@@ -1995,7 +1673,7 @@ def preload_memmap(
         if bool(shuffle)
         else None
     )
-    Storage.stream_memmap(
+    collate.stream_memmap(
         ds=ds,
         out_dir=os.fspath(memmap_dir),
         count=int(count),
@@ -2015,169 +1693,3 @@ def preload_memmap(
         chunk_size=int(chunk_size),
     )
     return None
-
-
-def postprocess(
-    source: PathLike,
-    *args: Any,
-    output: str | None = "memory",
-    path: PathLike | None = None,
-    overwrite: str = "error",
-) -> Any:
-    del args
-    with torch.inference_mode():
-        if not bool(source):
-            raise ValueError("postprocess: 'source' must be a non-empty path")
-        src = _coerce_path(source)
-        if src is None:
-            raise ValueError("postprocess: 'source' is empty/None after normalization")
-        output_mode = _coerce_prediction_output(output)
-        overwrite_mode = _coerce_prediction_overwrite(overwrite)
-        out_path = None
-        path_n = _coerce_path(path) if path is not None else None
-        if output_mode == "file":
-            if path_n is not None:
-                run_id = os.path.basename(src.rstrip(os.sep)) or f"prediction-{os.getpid()}"
-                out_path = _coerce_prediction_path(path_n, run_id=run_id)
-                if out_path is None:
-                    logger.warning(
-                        "postprocess: output=%r requires path to be a .h5/.hdf5 file. Got path=%r; falling back to output='memory'.",
-                        output,
-                        path,
-                    )
-                    output_mode = "memory"
-                elif not _is_path_writable(out_path):
-                    logger.warning(
-                        "postprocess: output=%r path is not writable: %r; falling back to output='memory'.",
-                        output,
-                        out_path,
-                    )
-                    out_path = None
-                    output_mode = "memory"
-            else:
-                output_mode = "memory"
-
-        from .storage import Storage
-        from tensordict import PersistentTensorDict
-
-        if output_mode == "file" and out_path is not None and os.path.exists(out_path):
-            if overwrite_mode == "resume" and os.path.isfile(out_path):
-                Storage.validate_predictions_h5(os.fspath(out_path))
-                return PersistentTensorDict(filename=out_path, mode="r")
-            if overwrite_mode == "error":
-                raise FileExistsError(f"postprocess: destination already exists: {out_path!r}")
-
-        if (src.endswith(".h5") or src.endswith(".hdf5")) and os.path.isfile(src):
-            if output_mode == "file":
-                if out_path is None:
-                    return PersistentTensorDict(filename=src, mode="r")
-                return Storage.copy_predictions_h5_atomic(
-                    os.fspath(src),
-                    os.fspath(out_path),
-                    overwrite=str(overwrite_mode or "replace"),
-                )
-            return Storage.load_predictions_h5(os.fspath(src))
-
-        if not os.path.isdir(src):
-            raise FileNotFoundError(f"source must be a directory or .h5 file: {src!r}")
-        memmap_dir = os.path.join(src, "memmap")
-        chunks_dir = os.path.join(src, "pred_chunks")
-        pred_path = os.path.join(src, "pred.mmt")
-        if not os.path.isdir(memmap_dir):
-            raise FileNotFoundError(f"missing memmap dir: {memmap_dir!r}")
-        count = None
-        out_shape = None
-        if os.path.isdir(chunks_dir):
-            man_path = os.path.join(chunks_dir, "manifest.json")
-            if os.path.isfile(man_path):
-                try:
-                    man = read_json(man_path)
-                    if isinstance(man, dict):
-                        count = man.get("count", None)
-                        out_shape = man.get("out_shape", None)
-                except Exception:
-                    pass
-        if not os.path.isfile(pred_path):
-            if not os.path.isdir(chunks_dir):
-                raise FileNotFoundError(f"missing pred_chunks dir: {chunks_dir!r}")
-            if count is None or out_shape is None:
-                raise FileNotFoundError(
-                    f"missing/invalid manifest.json in pred_chunks: {chunks_dir!r}"
-                )
-            count = int(count)
-            out_shape_t = tuple(int(x) for x in (out_shape or ()))
-            if count <= 0 or (not out_shape_t) or any(int(d) <= 0 for d in out_shape_t):
-                raise ValueError(
-                    f"postprocess: invalid manifest metadata: count={count!r}, out_shape={out_shape!r}"
-                )
-            store_float = _get_prediction_dtype(chunks_dir)
-            Storage.concat_memory_mapped_tensor(
-                os.fspath(chunks_dir),
-                os.fspath(pred_path),
-                count=count,
-                out_shape=out_shape_t,
-                store_float=store_float,
-            )
-        X_mmt = Storage.load_memmap_features(os.fspath(memmap_dir))
-        Y_mmt = Storage.open_memory_mapped_tensor(os.fspath(pred_path))
-        if Y_mmt is None:
-            raise RuntimeError("postprocess: failed to open pred.mmt")
-        if count is None:
-            try:
-                count = int(X_mmt.shape[0])
-            except Exception:
-                count = None
-        if count is None:
-            raise RuntimeError("postprocess: failed to infer count")
-
-        if out_path is not None:
-            if os.path.exists(out_path):
-                if overwrite_mode == "resume" and os.path.isfile(out_path):
-                    Storage.validate_predictions_h5(
-                        os.fspath(out_path),
-                        out_shape=tuple(int(d) for d in Y_mmt.shape[1:]),
-                        in_dim=(
-                            int(X_mmt.shape[1])
-                            if hasattr(X_mmt, "shape") and len(X_mmt.shape) > 1
-                            else None
-                        ),
-                    )
-                    return PersistentTensorDict(filename=out_path, mode="r")
-                if overwrite_mode == "error":
-                    raise FileExistsError(
-                        f"postprocess: destination already exists: {out_path!r}"
-                    )
-            out_td = Storage.write_predictions_h5_atomic(
-                os.fspath(out_path),
-                memmap_dir=os.fspath(memmap_dir),
-                pred_path=os.fspath(pred_path),
-                chunk_size=8192,
-                overwrite=str(overwrite_mode or "replace"),
-            )
-            if not os.path.isfile(out_path):
-                raise RuntimeError(
-                    f"postprocess: persistent output missing after write: {out_path!r}"
-                )
-            Storage.validate_predictions_h5(
-                os.fspath(out_path),
-                out_shape=tuple(int(d) for d in Y_mmt.shape[1:]),
-                in_dim=(
-                    int(X_mmt.shape[1])
-                    if hasattr(X_mmt, "shape") and len(X_mmt.shape) > 1
-                    else None
-                ),
-            )
-            Storage.remove_prediction_artifacts(
-                memmap_dir=os.fspath(memmap_dir),
-                pred_path=os.fspath(pred_path),
-            )
-            return out_td
-
-        X_t = Storage.copy_mmt_to_cpu_tensor(X_mmt, count=int(count), chunk_size=8192)
-        Y_t = Storage.copy_mmt_to_cpu_tensor(Y_mmt, count=int(count), chunk_size=8192)
-        td_out = TensorDict({"X": X_t, "Y": Y_t}, batch_size=[int(count)])
-        Storage.remove_prediction_artifacts(
-            memmap_dir=os.fspath(memmap_dir),
-            pred_path=os.fspath(pred_path),
-        )
-        return td_out

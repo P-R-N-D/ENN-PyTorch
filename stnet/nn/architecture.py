@@ -48,7 +48,8 @@ from ..core.precision import Autocast, is_scale_safe
 from ..core.policies import LossWeightPolicy
 from ..core.profiler import FLOP_PROFILER
 from ..core.system import _log_debug, _log_info, CPU, empty_device_cache, get_device
-from ..data.pipeline import Dataset, get_feature_key, get_label_key
+from ..data.pipeline import Dataset
+from ..data.collate import get_feature_key, get_label_key
 from .blocks import (
     CrossTransformer,
     LongNet,

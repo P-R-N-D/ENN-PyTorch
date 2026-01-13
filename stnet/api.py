@@ -68,22 +68,14 @@ from .core.system import (
     new_dir,
     optimal_start_method,
 )
-from .data.storage import Storage, __MappingSlicer, __TensorDictSlicer
+from .data import collate
+from .data.collate import MappingSlicer, TensorDictSlicer, postprocess as _postprocess_pipeline
 from .data.pipeline import (
     Dataset,
-    _coerce_path,
-    _coerce_prediction_output,
-    _coerce_prediction_overwrite,
-    _coerce_prediction_path,
-    _get_prediction_dtype,
-    _is_path_writable,
-    postprocess as _postprocess_pipeline,
     preload_memmap,
     default_underflow_action,
-    get_row,
     iter_dataset,
     normalize_underflow_action,
-    get_feature_key,
 )
 from .core.datatypes import read_json
 from .nn.architecture import Model
@@ -302,17 +294,17 @@ def _adapt_source(d: Any, allow_columns: bool = True) -> Tuple[int, Optional[Cal
     if isinstance(d, TensorDictBase):
         if not d.batch_size:
             raise ValueError("TensorDict must have batch dimension")
-        return int(d.batch_size[0]), __TensorDictSlicer(d), False
+        return int(d.batch_size[0]), TensorDictSlicer(d), False
     if (
         allow_columns
         and isinstance(d, Mapping)
         and all(not isinstance(v, Mapping) for v in d.values())
-        and not Storage.is_feature_label_batch_mapping(d)
+        and not collate.is_feature_label_batch_mapping(d)
     ):
-        count, getter = Storage.column_cursor(d)
+        count, getter = collate.column_cursor(d)
         return count, getter, False
-    if isinstance(d, Mapping) and Storage.is_feature_label_batch_mapping(d):
-        f_key = get_feature_key(d)
+    if isinstance(d, Mapping) and collate.is_feature_label_batch_mapping(d):
+        f_key = collate.get_feature_key(d)
         if f_key is None:
             return 0, None, True
         count = _value_len(d.get(f_key))
@@ -328,7 +320,7 @@ def _adapt_source(d: Any, allow_columns: bool = True) -> Tuple[int, Optional[Cal
                 slices.append((key, value))
         slices_t = tuple(slices)
         constants = {key: value for key, value in constants.items() if key not in dict(slices_t)}
-        return count, __MappingSlicer(constants, slices_t), False
+        return count, MappingSlicer(constants, slices_t), False
     if isinstance(d, (list, tuple)):
         return len(d), (lambda s, e: {"features": d[int(s) : int(e)]}), False
     return 0, None, True
@@ -351,14 +343,14 @@ def _save_dataset(
         shuffle_enabled = bool(shuffle)
         get_by_indices = None
         if shuffle_enabled:
-            if isinstance(getter, __TensorDictSlicer):
+            if isinstance(getter, TensorDictSlicer):
                 td = getter.td
 
                 def _td_indexer(indices: object) -> TensorDictBase:
                     return td[indices]
 
                 get_by_indices = _td_indexer
-            elif isinstance(getter, __MappingSlicer):
+            elif isinstance(getter, MappingSlicer):
 
                 def _can_index(value: object) -> bool:
                     if isinstance(value, (list, tuple)):
@@ -392,7 +384,7 @@ def _save_dataset(
                     get_by_indices = _map_indexer
         if shuffle_enabled and get_by_indices is None:
             shuffle_enabled = False
-        in_dim, label_shape = Storage.stream_memmap(
+        in_dim, label_shape = collate.stream_memmap(
             ds=ds,
             out_dir=out_dir,
             count=count,
@@ -610,15 +602,15 @@ def _to_torch_dtype(dt: object) -> Optional[torch.dtype]:
 def _get_float_precision(obj: object) -> torch.dtype:
     try:
         if TensorDictBase is not None and isinstance(obj, TensorDictBase):
-            X_td, _ = get_row(obj, labels_required=False)
+            X_td, _ = collate.get_row(obj, labels_required=False)
             if X_td is None:
                 return torch.float32
             if not bool(torch.is_tensor(X_td)):
                 X_td = torch.as_tensor(X_td)
             dt = _to_torch_dtype(getattr(X_td, "dtype", None))
             return torch.float64 if dt == torch.float64 else torch.float32
-        if isinstance(obj, Mapping) and Storage.is_feature_label_batch_mapping(obj):
-            f_key = get_feature_key(obj)
+        if isinstance(obj, Mapping) and collate.is_feature_label_batch_mapping(obj):
+            f_key = collate.get_feature_key(obj)
             if f_key is not None and f_key in obj:
                 X_all = obj.get(f_key)
                 dt = _to_torch_dtype(getattr(X_all, "dtype", None))
@@ -863,7 +855,7 @@ def train(
             raise RuntimeError("No training data")
         if manifest is not None:
             payload = manifest if isinstance(manifest, dict) else list(manifest)
-            Storage.write_json(os.path.join(memmap_dir, "multinode.json"), payload, indent=None)
+            collate.write_json(os.path.join(memmap_dir, "multinode.json"), payload, indent=None)
         if env_bool("STNET_SAVE_DCP", True) or env_bool("STNET_SAVE_MODEL_PT", True):
             init_dir = new_dir("init_dcp")
             _save_model_checkpoint(
@@ -988,8 +980,8 @@ def predict(
     if multi_sources is not None:
         base_kwargs = dict(kwargs)
         base_run_id = str(base_kwargs.get("run_id", f"predict-{os.getpid()}-{int(seed)}"))
-        output_mode0 = _coerce_prediction_output(output)
-        path_n0 = _coerce_path(path) if path is not None else None
+        output_mode0 = collate._coerce_prediction_output(output)
+        path_n0 = collate._coerce_path(path) if path is not None else None
         out_multi: dict[str, TensorDictBase] = {}
         for k, td in multi_sources.items():
             key = str(k)
@@ -1027,14 +1019,14 @@ def predict(
         return out_multi
     underflow_action = kwargs.pop("underflow_action", default_underflow_action())
     chunk_size = kwargs.pop("chunk_size", None)
-    output_mode = _coerce_prediction_output(output)
-    overwrite_mode = _coerce_prediction_overwrite(overwrite)
+    output_mode = collate._coerce_prediction_output(output)
+    overwrite_mode = collate._coerce_prediction_overwrite(overwrite)
     run_id = str(kwargs.pop("run_id", f"predict-{os.getpid()}-{int(seed)}"))
     out_path = None
-    path_n = _coerce_path(path) if path is not None else None
+    path_n = collate._coerce_path(path) if path is not None else None
     if output_mode == "file":
         if path_n is not None:
-            out_path = _coerce_prediction_path(path_n, run_id=run_id)
+            out_path = collate._coerce_prediction_path(path_n, run_id=run_id)
             if out_path is None:
                 logger.warning(
                     "predict: output=%r requires path to be a .h5/.hdf5 file. Got path=%r; falling back to output='memory'.",
@@ -1042,7 +1034,7 @@ def predict(
                     path,
                 )
                 output_mode = "memory"
-            elif not _is_path_writable(out_path):
+            elif not collate._is_path_writable(out_path):
                 logger.warning(
                     "predict: output=%r path is not writable: %r; falling back to output='memory'.",
                     output,
@@ -1054,7 +1046,7 @@ def predict(
             output_mode = "memory"
     if output_mode == "file" and out_path and os.path.exists(out_path):
         if overwrite_mode == "resume" and os.path.isfile(out_path):
-            Storage.validate_predictions_h5(os.fspath(out_path), out_shape=out_shape)
+            collate.validate_predictions_h5(os.fspath(out_path), out_shape=out_shape)
             return PersistentTensorDict(filename=out_path, mode="r")
         if overwrite_mode == "error":
             raise FileExistsError(f"predict: destination already exists: {out_path!r}")
@@ -1082,7 +1074,7 @@ def predict(
             count, getter, _needs_preprocess = _adapt_source(data)
             if count <= 0:
                 raise ValueError("Empty input")
-            in_dim, _ = Storage.stream_memmap(
+            in_dim, _ = collate.stream_memmap(
                 ds=ds,
                 out_dir=memmap_dir,
                 count=count,
@@ -1134,36 +1126,36 @@ def predict(
             chunks_dir = os.path.join(ckpt_dir, "pred_chunks")
             if not os.path.isdir(chunks_dir):
                 raise RuntimeError(f"predict: missing pred_chunks at {chunks_dir!r}")
-            store_float = _get_prediction_dtype(chunks_dir)
+            store_float = collate._get_prediction_dtype(chunks_dir)
             pred_mmt_path = os.path.join(tmp_dir, "pred.mmt")
-            Storage.concat_memory_mapped_tensor(
+            collate.concat_memory_mapped_tensor(
                 os.fspath(chunks_dir),
                 os.fspath(pred_mmt_path),
                 count=count,
                 out_shape=out_shape,
                 store_float=store_float,
             )
-            X_mmt = Storage.load_memmap_features(os.fspath(memmap_dir))
-            Y_mmt = Storage.open_memory_mapped_tensor(os.fspath(pred_mmt_path))
+            X_mmt = collate.load_memmap_features(os.fspath(memmap_dir))
+            Y_mmt = collate.open_memory_mapped_tensor(os.fspath(pred_mmt_path))
             if Y_mmt is None:
                 raise RuntimeError("predict: failed to open assembled pred.mmt")
             if out_path is not None:
-                out_td = Storage.write_predictions_h5_atomic(
+                out_td = collate.write_predictions_h5_atomic(
                     os.fspath(out_path),
                     memmap_dir=os.fspath(memmap_dir),
                     pred_path=os.fspath(pred_mmt_path),
                     chunk_size=int(chunk_size or 8192),
                     overwrite=str(overwrite_mode or "replace"),
                 )
-                Storage.validate_predictions_h5(
+                collate.validate_predictions_h5(
                     os.fspath(out_path),
                     out_shape=out_shape,
                     in_dim=(int(in_dim) if in_dim else None),
                 )
                 cleanup_ok = True
                 return out_td
-            X_t = Storage.copy_mmt_to_cpu_tensor(X_mmt, count=count, chunk_size=writer_chunk_size)
-            Y_t = Storage.copy_mmt_to_cpu_tensor(Y_mmt, count=count, chunk_size=writer_chunk_size)
+            X_t = collate.copy_mmt_to_cpu_tensor(X_mmt, count=count, chunk_size=writer_chunk_size)
+            Y_t = collate.copy_mmt_to_cpu_tensor(Y_mmt, count=count, chunk_size=writer_chunk_size)
             td_out = TensorDict({"X": X_t, "Y": Y_t}, batch_size=[int(count)])
             cleanup_ok = True
             return td_out
@@ -1190,4 +1182,3 @@ def postprocess(
             path=path,
             overwrite=overwrite,
         )
-
