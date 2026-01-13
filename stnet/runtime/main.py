@@ -106,8 +106,9 @@ from .losses import (
     TiledLoss,
 )
 from .optimizers import AdamW, ExponentialMovingAverage, StochasticWeightAverage
-from ..data.storage import Storage, _PredictionWriter
-from ..data.pipeline import Dataset, get_row
+from ..data import collate
+from ..data.collate import ShardCollector
+from ..data.pipeline import Dataset
 from ..core.datatypes import read_json
 from .io import _filtered_warnings, _torch_load_checkpoint
 
@@ -2041,7 +2042,7 @@ def _warmup_scaler_stats(model: object, train_loader: object, ops: object) -> No
     dt_y = model_for_scaler.scaler.y_mean.dtype
 
     try:
-        stats = Storage.load_scaler_stats(ops.sources)
+        stats = collate.load_scaler_stats(ops.sources)
     except Exception:
         stats = None
 
@@ -2068,7 +2069,7 @@ def _warmup_scaler_stats(model: object, train_loader: object, ops: object) -> No
         y_min = None
         y_max = None
         for batch in train_loader:
-            fx, ly = get_row(batch, labels_required=True)
+            fx, ly = collate.get_row(batch, labels_required=True)
             with inference_mode(torch.nn.Identity()):
                 xf = fx.reshape(-1, fx.shape[-1]).to(dev_x, dt_x)
                 yf = ly.reshape(-1, ly.shape[-1]).to(dev_y, dt_y)
@@ -3192,7 +3193,7 @@ def epochs(
         sum_xy = None
         total_n = 0
         for batch in train_loader:
-            x_b, y_b = get_row(batch, labels_required=True)
+            x_b, y_b = collate.get_row(batch, labels_required=True)
             x_raw = x_b.to(device)
             y_raw = y_b.to(scaler_y_device)
             if y_raw.ndim >= 2:
@@ -3412,7 +3413,7 @@ def epochs(
                         "backends": list(hist.backends),
                     }
                     payload = {"meta": meta, "records": records}
-                    Storage.write_json(history_path, payload, indent=2)
+                    collate.write_json(history_path, payload, indent=2)
             except Exception:
                 pass
     except Exception:
@@ -3580,7 +3581,7 @@ def infer(
         else None
     )
     row_cursor = 0
-    writer = _PredictionWriter(
+    writer = ShardCollector(
         chunk_dir=str(chunk_dir),
         rank=int(rank),
         use_mmt_pred_parts=bool(use_mmt_pred_parts),
@@ -3849,7 +3850,7 @@ def infer(
                 pred_pt = base + "-pred.pt"
                 if os.path.exists(pred_mmt):
                     pred_path = pred_mmt
-                    meta_path = Storage.mmt_meta_path(pred_mmt)
+                    meta_path = collate.get_meta_path(pred_mmt)
                     if not os.path.exists(meta_path):
                         raise RuntimeError(
                             f"infer: missing pred meta for memmap part: {pred_mmt} -> {meta_path}"
@@ -3876,7 +3877,7 @@ def infer(
                 "parts": parts,
             }
             man_path = os.path.join(chunk_dir, "manifest.json")
-            Storage.write_json(man_path, manifest, indent=2)
+            collate.write_json(man_path, manifest, indent=2)
         if exc_type is None:
             with contextlib.suppress(Exception):
                 distributed_barrier(device)
@@ -3976,10 +3977,10 @@ def process(*args: Any, **kwargs: Any) -> object:
         if ops.sources is None:
             raise RuntimeError("RuntimeConfig.sources is required but None")
         metadata = Dataset.for_device(device)
-        expanded_sources = Storage.expand_source(ops.sources)
+        expanded_sources = collate.expand_source(ops.sources)
         if expanded_sources is not ops.sources:
             ops = replace(ops, sources=expanded_sources)
-        meta_info = Storage.merge_meta_info(ops.sources)
+        meta_info = collate.merge_meta_info(ops.sources)
         meta_feature_dim = int(meta_info.get("feature_dim", ops.in_dim))
         if meta_feature_dim != int(ops.in_dim):
             raise RuntimeError(
@@ -4219,7 +4220,7 @@ def process(*args: Any, **kwargs: Any) -> object:
         raw_val_loader = None
         session = None
         try:
-            expanded_sources = Storage.expand_source(ops.sources)
+            expanded_sources = collate.expand_source(ops.sources)
             if expanded_sources is not ops.sources:
                 ops = replace(ops, sources=expanded_sources)
             accelerator_types = {"cuda", "xpu", "mps"}
@@ -4371,7 +4372,7 @@ def process(*args: Any, **kwargs: Any) -> object:
                         ),
                         "val": (raw_val_loader.state_dict() if raw_val_loader is not None else {}),
                     }
-                    Storage.write_json(get_loader_state(ops.ckpt_dir or ""), _dl, indent=2)
+                    collate.write_json(get_loader_state(ops.ckpt_dir or ""), _dl, indent=2)
                 avg_tag = None
                 avg_helper = None
                 if swa_helper is not None:
@@ -4526,7 +4527,7 @@ def process(*args: Any, **kwargs: Any) -> object:
                 dataset=metadata,
                 with_backward=False,
             )
-        expanded_sources = Storage.expand_source(ops.sources)
+        expanded_sources = collate.expand_source(ops.sources)
         if expanded_sources is not ops.sources:
             ops = replace(ops, sources=expanded_sources)
         session = None
