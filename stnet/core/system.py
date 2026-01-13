@@ -144,9 +144,7 @@ def __getattr__(name: str) -> Any:
         with _LAZY_LOCK_INIT_LOCK:
             lock = g.get(name, None)
             if lock is None:
-                from .concurrency import Mutex
-
-                lock = Mutex()
+                lock = threading.Lock()
                 g[name] = lock
         return lock
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

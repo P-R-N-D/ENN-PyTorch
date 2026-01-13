@@ -15,7 +15,7 @@ import warnings
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from dataclasses import dataclass
-from typing import Any, Callable, Iterator, Protocol, Sequence, TypeAlias
+from typing import Any, Callable, Iterator, Sequence, TypeAlias
 
 import torch
 from tensordict import TensorDict
@@ -25,6 +25,7 @@ from ..core.concurrency import Mutex
 from ..core.tensor import extract_tensor, from_buffer
 from ..core.datatypes import PathLike, write_json
 from ..nn.layers import Recorder
+from .io import Format, _load_model_config, _temp_environ, is_required
 
 
 _FORWARD_PARAM_CACHE: dict[object, object] = {}
@@ -32,38 +33,6 @@ _FORWARD_PARAM_CACHE_LOCK = Mutex()
 
 _EXPORT_SIG_CACHE: object | None = None
 _EXPORT_SIG_LOCK = Mutex()
-
-
-def _load_model_config(model: object) -> object:
-    try:
-        from ..config import _extract_model_config_dict
-
-        return _extract_model_config_dict(model)
-    except Exception:
-        return {}
-
-
-@contextlib.contextmanager
-def _temp_environ(
-    updates: dict[str, str | None], *args: Any, only_if_unset: bool = True
-) -> Iterator[None]:
-    prev: dict[str, str | None] = {}
-    for key, val in updates.items():
-        if only_if_unset and key in os.environ:
-            continue
-        prev[key] = os.environ.get(key)
-        if val is None:
-            os.environ.pop(key, None)
-        else:
-            os.environ[key] = str(val)
-    try:
-        yield
-    finally:
-        for key, val in prev.items():
-            if val is None:
-                os.environ.pop(key, None)
-            else:
-                os.environ[key] = val
 
 
 @contextlib.contextmanager
@@ -247,14 +216,6 @@ def _export_sig_keys() -> set[str]:
         return set(sig.parameters.keys())  # type: ignore[attr-defined]
     except Exception:
         return set()
-
-
-def is_required(module: str, pip_hint: str | None = None) -> None:
-    try:
-        __import__(module)
-    except ImportError as err:
-        hint = f" (try: {pip_hint})" if pip_hint else ""
-        raise ImportError(f"{module} is required for this operation{hint}") from err
 
 
 class _TensorDictPack(nn.Module):
@@ -447,13 +408,6 @@ class _ORTBuilder:
             disabled_optimizers=disabled_optimizers,
         )
         return (ort_path, optimized_onnx_path)
-
-
-class Format(Protocol):
-    name = None
-
-    def save(self, model: nn.Module, dst: PathLike, *args: Any, **kwargs: Any) -> None: ...
-
 
 @dataclass(frozen=True, slots=True)
 class BorrowedModule:

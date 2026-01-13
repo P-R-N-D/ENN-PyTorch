@@ -1223,8 +1223,14 @@ class Thread:
 
 
 class Mutex:
+    __slots__ = ("_lock", "_acquire", "_release", "_locked_fn")
+
     def __init__(self, *, reentrant: bool = False) -> None:
-        self._lock = threading.RLock() if bool(reentrant) else threading.Lock()
+        lock = threading.RLock() if bool(reentrant) else threading.Lock()
+        self._lock = lock
+        self._acquire = lock.acquire
+        self._release = lock.release
+        self._locked_fn = getattr(lock, "locked", None)
 
     @property
     def raw(self) -> threading.Lock | threading.RLock:
@@ -1232,14 +1238,14 @@ class Mutex:
 
     def acquire(self, blocking: bool = True, timeout: float | None = None) -> bool:
         if timeout is None:
-            return bool(self._lock.acquire(blocking))
-        return bool(self._lock.acquire(blocking, float(timeout)))
+            return bool(self._acquire(blocking))
+        return bool(self._acquire(blocking, float(timeout)))
 
     def release(self) -> None:
-        self._lock.release()
+        self._release()
 
     def locked(self) -> bool:
-        fn = getattr(self._lock, "locked", None)
+        fn = self._locked_fn
         if callable(fn):
             return bool(fn())
         return False

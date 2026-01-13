@@ -31,6 +31,7 @@ except Exception:
 _TORCH_COMPILER = getattr(torch, "compiler", None)
 
 _INDUCTOR_CONFIG_LOCK = Mutex(reentrant=True)
+_TORCH_COMPILE_LOCK = Mutex(reentrant=True)
 
 _CKPT_TL = threading.local()
 
@@ -305,6 +306,7 @@ def canonicalize_compile_mode(mode: object | None) -> str:
         return "disabled"
     compact_mode = mode.lower().replace("_", "").replace("-", "").replace(" ", "")
     mode_map = {
+        "default": "default",
         "aoteager": "aot-eager",
         "reduceoverhead": "reduce-overhead",
         "maxautotune": "max-autotune",
@@ -386,14 +388,17 @@ def compile(
     canonical_mode = canonicalize_compile_mode(mode)
     if canonical_mode == "disabled":
         return module
-    compile_fn = getattr(torch, "compile", None)
-    if compile_fn is None:
+    if not torch_compiler_supported():
         return module
-    if sys.version_info >= (3, 14):
+    compile_fn = getattr(torch, "compile", None)
+    if not callable(compile_fn):
         return module
     if canonical_mode == "max-autotune" and not _is_for_cuda(module):
         canonical_mode = "max-autotune-no-cudagraphs"
     opt: Dict[str, Any] = dict(options or {})
+    if CPU.is_free_threaded_build():
+        opt.setdefault("compile_threads", 1)
+        opt.setdefault("triton.cudagraphs", False)
     if canonical_mode == "max-autotune-no-cudagraphs":
         opt.setdefault("triton.cudagraphs", False)
     options_merged: Dict[str, Any] | None = opt or None
@@ -503,18 +508,19 @@ def compile(
                 if isinstance(k, str) and _has_cfg_key(inductor_cfg, k)
             }
             strip_options = mode_value is not None
-            with _INDUCTOR_CONFIG_LOCK:
+            with _TORCH_COMPILE_LOCK, _INDUCTOR_CONFIG_LOCK:
                 with patch(patchable) if patchable else nullcontext():
                     if strip_options or patchable:
                         compile_kwargs.pop("options", None)
                     return compile_fn(module, **compile_kwargs)
         if mode_value is not None:
             compile_kwargs.pop("options", None)
-    return compile_fn(module, **compile_kwargs)
+    with _TORCH_COMPILE_LOCK:
+        return compile_fn(module, **compile_kwargs)
 
 
 def torch_compiler_supported() -> bool:
-    if sys.version_info >= (3, 14):
+    if env_bool("STNET_TORCH_COMPILE", default=True) is False:
         return False
     compile_fn = getattr(torch, "compile", None)
     if not callable(compile_fn):

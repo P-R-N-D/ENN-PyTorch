@@ -9,20 +9,40 @@ from typing import Any, Iterator
 import torch
 
 
-spec = importlib.util.find_spec("torchdistx.fake")
+def _safe_find_spec(name: str) -> object | None:
+    try:
+        return importlib.util.find_spec(name)
+    except (ModuleNotFoundError, ImportError):
+        return None
+    except Exception:
+        return None
+
+
+spec = _safe_find_spec("torchdistx.fake")
 if spec is not None:
-    torchdistx_fake = importlib.import_module("torchdistx.fake")
-    _tdx_is_fake = getattr(torchdistx_fake, "is_fake", None)
+    try:
+        torchdistx_fake = importlib.import_module("torchdistx.fake")
+        _tdx_is_fake = getattr(torchdistx_fake, "is_fake", None)
+    except Exception:
+        _tdx_is_fake = None
 else:
     _tdx_is_fake = None
-spec = importlib.util.find_spec("torch._subclasses.fake_tensor")
+
+spec = _safe_find_spec("torch._subclasses.fake_tensor")
 if spec is not None:
-    from torch._subclasses.fake_tensor import FakeTensor
+    try:
+        from torch._subclasses.fake_tensor import FakeTensor
+    except Exception:
+        FakeTensor = tuple()
 else:
     FakeTensor = tuple()
-spec = importlib.util.find_spec("tensordict")
+
+spec = _safe_find_spec("tensordict")
 if spec is not None:
-    from tensordict import TensorDictBase
+    try:
+        from tensordict import TensorDictBase
+    except Exception:
+        TensorDictBase = ()
 else:
     TensorDictBase = ()
 
