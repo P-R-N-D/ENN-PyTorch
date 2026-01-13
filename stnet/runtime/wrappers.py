@@ -28,6 +28,24 @@ from ..nn.layers import Recorder
 from .io import Format, _load_model_config, _temp_environ, is_required
 
 
+@contextlib.contextmanager
+def _no_empty_tensor(root: nn.Module) -> Iterator[None]:
+    patched: list[tuple[nn.Module, str, torch.Tensor]] = []
+    try:
+        for module in root.modules():
+            for name in ("pw_x", "pw_y"):
+                tensor = getattr(module, name, None)
+                if isinstance(tensor, torch.Tensor) and tensor.numel() == 0:
+                    patched.append((module, name, tensor))
+                    placeholder = tensor.detach().new_zeros((1, 1))
+                    setattr(module, name, placeholder)
+        yield
+    finally:
+        for module, name, old in patched:
+            with contextlib.suppress(Exception):
+                setattr(module, name, old)
+
+
 _FORWARD_PARAM_CACHE: dict[object, object] = {}
 _FORWARD_PARAM_CACHE_LOCK = Mutex()
 
@@ -568,7 +586,8 @@ class TorchExport(Format):
                 sample = sample.unsqueeze(0)
             wrapper = _TensorOutputModule(serving_model).eval()
 
-            exported = self._export_program(wrapper, sample, **kwargs)
+            with _no_empty_tensor(serving_model):
+                exported = self._export_program(wrapper, sample, **kwargs)
 
             dst = Path(dst)
             dst.parent.mkdir(parents=True, exist_ok=True)
