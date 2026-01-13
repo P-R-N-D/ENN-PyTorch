@@ -67,15 +67,15 @@ from ..core.datatypes import default_underflow_action, normalize_underflow_actio
 from . import collate
 
 
-logger = logging.getLogger(__name__)
-
-
 _NODES_LOCK = Mutex()
 _NODES_IMPORTED = False
 
 _device_mem_get_info = Memory.mem_get_info
 
+logger = logging.getLogger(__name__)
+
 TExtra = TypeVar("TExtra")
+
 SourceType = Literal["memmap"]
 
 
