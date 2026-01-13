@@ -257,7 +257,7 @@ def is_required(module: str, pip_hint: str | None = None) -> None:
         raise ImportError(f"{module} is required for this operation{hint}") from err
 
 
-class _TensorDictCompat(nn.Module):
+class _TensorDictPack(nn.Module):
     def __init__(self, averaged_module: nn.Module, key: str) -> None:
         super().__init__()
         self._averaged_module = averaged_module
@@ -269,7 +269,7 @@ class _TensorDictCompat(nn.Module):
         return self._averaged_module(td)
 
 
-class _CompatModule(nn.Module):
+class _TensorOutputModule(nn.Module):
     def __init__(self, net: object) -> None:
         super().__init__()
         self.net = net
@@ -278,7 +278,7 @@ class _CompatModule(nn.Module):
         return extract_tensor(_forward(self.net, x))
 
 
-class _ONNXModule:
+class _ONNXExporter:
     @staticmethod
     def export(
         model: nn.Module,
@@ -292,7 +292,7 @@ class _ONNXModule:
         simplify: bool = False,
     ) -> object:
         is_required("onnx", "pip install onnx")
-        wrapper = _CompatModule(model).eval()
+        wrapper = _TensorOutputModule(model).eval()
         onnx_path = Path(onnx_path)
         onnx_path.parent.mkdir(parents=True, exist_ok=True)
         input_names = ["features"]
@@ -386,11 +386,11 @@ class _ONNXModule:
     @staticmethod
     def coerce(model: nn.Module, onnx_path: PathLike, *args: Any, **kwargs: Any) -> object:
         if not onnx_path.exists():
-            return _ONNXModule.export(model, onnx_path, **kwargs)
+            return _ONNXExporter.export(model, onnx_path, **kwargs)
         return onnx_path
 
 
-class _ORTModule:
+class _ORTBuilder:
     @staticmethod
     def to_ort(
         onnx_path: PathLike,
@@ -511,7 +511,7 @@ class TorchInductor(Format):
             sample = _pad_sample(serving_model, sample)
             if isinstance(sample, torch.Tensor) and sample.ndim == 1:
                 sample = sample.unsqueeze(0)
-            wrapper = _CompatModule(serving_model).eval()
+            wrapper = _TensorOutputModule(serving_model).eval()
 
             dynamic_batch = bool(kwargs.get("dynamic_batch", True))
             dynamic_seq = bool(kwargs.get("dynamic_seq", False))
@@ -612,7 +612,7 @@ class TorchExport(Format):
             sample = _pad_sample(serving_model, sample)
             if isinstance(sample, torch.Tensor) and sample.ndim == 1:
                 sample = sample.unsqueeze(0)
-            wrapper = _CompatModule(serving_model).eval()
+            wrapper = _TensorOutputModule(serving_model).eval()
 
             exported = self._export_program(wrapper, sample, **kwargs)
 
@@ -700,7 +700,7 @@ class ExecuTorch(Format):
         with _onnx_model(model) as serving_model:
             sample = kwargs.get("sample_input")
             sample = _pad_sample(serving_model, sample)
-            wrapper = _CompatModule(serving_model).eval()
+            wrapper = _TensorOutputModule(serving_model).eval()
             with torch.no_grad():
                 try:
                     exported = torch_export(wrapper, (sample,))
@@ -735,7 +735,7 @@ class ONNX(Format):
         **kwargs: Any,
     ) -> object:
         with _onnx_model(model) as serving:
-            out = _ONNXModule.export(serving, dst, **_onnx_options(kwargs, target="onnx"))
+            out = _ONNXExporter.export(serving, dst, **_onnx_options(kwargs, target="onnx"))
         return (out,)
 
 
@@ -750,12 +750,12 @@ class ORT(Format):
         **kwargs: Any,
     ) -> object:
         with _onnx_model(model) as serving:
-            onnx_path = _ONNXModule.coerce(
+            onnx_path = _ONNXExporter.coerce(
                 serving,
                 _coerce_onnx_path(dst, kwargs),
                 **_onnx_options(kwargs, target="onnx"),
             )
-            ort_path, optimized = _ORTModule.to_ort(
+            ort_path, optimized = _ORTBuilder.to_ort(
                 onnx_path,
                 dst,
                 optimization_level=str(kwargs.get("optimization_level", "all")),
@@ -778,7 +778,7 @@ class TensorRT(Format):
     ) -> object:
         del args
         with _onnx_model(model) as serving_model:
-            onnx_path = _ONNXModule.coerce(
+            onnx_path = _ONNXExporter.coerce(
                 serving_model,
                 _coerce_onnx_path(dst, kwargs),
                 **_onnx_options(kwargs, target="tensorrt"),
@@ -891,7 +891,7 @@ class CoreML(Format):
 
         with _onnx_model(model) as serving_model:
             sample = _pad_sample(serving_model, kwargs.get("sample_input"))
-            wrapper = _CompatModule(serving_model).eval()
+            wrapper = _TensorOutputModule(serving_model).eval()
             with torch.no_grad():
                 scripted = torch.jit.trace(
                     wrapper,
@@ -960,7 +960,7 @@ class LiteRT(Format):
         **kwargs: Any,
     ) -> object:
         with _onnx_model(model) as serving_model:
-            onnx_path = _ONNXModule.coerce(
+            onnx_path = _ONNXExporter.coerce(
                 serving_model,
                 _coerce_onnx_path(dst, kwargs),
                 **_onnx_options(kwargs, target="litert"),
@@ -1034,7 +1034,7 @@ class TensorFlow(Format):
         **kwargs: Any,
     ) -> object:
         with _onnx_model(model) as serving_model:
-            onnx_path = _ONNXModule.coerce(
+            onnx_path = _ONNXExporter.coerce(
                 serving_model,
                 dst,
                 **_onnx_options(kwargs, target="tensorflow"),

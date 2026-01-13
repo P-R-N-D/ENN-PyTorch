@@ -28,7 +28,7 @@ from tensordict import TensorDict, TensorDictBase
 from torch import nn, optim
 from torch.optim.swa_utils import AveragedModel, SWALR, update_bn
 
-from .wrappers import _TensorDictCompat
+from .wrappers import _TensorDictPack
 
 from ..core.precision import Autocast, is_scale_safe
 from ..core.concurrency import Mutex
@@ -783,7 +783,7 @@ class StochasticWeightAverage:
     ) -> None:
         key = str(in_key)
 
-        adapter = _TensorDictCompat(self._averaged, key)
+        adapter = _TensorDictPack(self._averaged, key)
         update_bn(_iter_batch(feature_iter, key), adapter, device=device)
 
     def save_state_dict(self) -> Dict[str, Any]:
