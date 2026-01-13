@@ -54,7 +54,7 @@ from .config import (
     coerce_model_config,
     runtime_config,
 )
-from .core.datatypes import env_bool, parse_torch_dtype
+from .core.datatypes import env_bool
 from .core.distributed import (
     get_available_host,
     get_preferred_ip,
@@ -68,9 +68,17 @@ from .core.system import (
     new_dir,
     optimal_start_method,
 )
-from .data.nodes import Storage
+from .data.storage import Storage, __MappingSlicer, __TensorDictSlicer
 from .data.pipeline import (
     Dataset,
+    _coerce_path,
+    _coerce_prediction_output,
+    _coerce_prediction_overwrite,
+    _coerce_prediction_path,
+    _get_prediction_dtype,
+    _is_path_writable,
+    postprocess as _postprocess_pipeline,
+    preload_memmap,
     default_underflow_action,
     get_row,
     iter_dataset,
@@ -294,7 +302,7 @@ def _adapt_source(d: Any, allow_columns: bool = True) -> Tuple[int, Optional[Cal
     if isinstance(d, TensorDictBase):
         if not d.batch_size:
             raise ValueError("TensorDict must have batch dimension")
-        return int(d.batch_size[0]), _TensorDictSlicer(d), False
+        return int(d.batch_size[0]), __TensorDictSlicer(d), False
     if (
         allow_columns
         and isinstance(d, Mapping)
@@ -320,7 +328,7 @@ def _adapt_source(d: Any, allow_columns: bool = True) -> Tuple[int, Optional[Cal
                 slices.append((key, value))
         slices_t = tuple(slices)
         constants = {key: value for key, value in constants.items() if key not in dict(slices_t)}
-        return count, _MappingSlicer(constants, slices_t), False
+        return count, __MappingSlicer(constants, slices_t), False
     if isinstance(d, (list, tuple)):
         return len(d), (lambda s, e: {"features": d[int(s) : int(e)]}), False
     return 0, None, True
@@ -343,14 +351,14 @@ def _save_dataset(
         shuffle_enabled = bool(shuffle)
         get_by_indices = None
         if shuffle_enabled:
-            if isinstance(getter, _TensorDictSlicer):
+            if isinstance(getter, __TensorDictSlicer):
                 td = getter.td
 
                 def _td_indexer(indices: object) -> TensorDictBase:
                     return td[indices]
 
                 get_by_indices = _td_indexer
-            elif isinstance(getter, _MappingSlicer):
+            elif isinstance(getter, __MappingSlicer):
 
                 def _can_index(value: object) -> bool:
                     if isinstance(value, (list, tuple)):
@@ -403,7 +411,7 @@ def _save_dataset(
         fx = fx.contiguous()
     if lb is None:
         raise ValueError("Labels required")
-    Storage.preload_memmap(
+    preload_memmap(
         {"features": fx, "labels": lb},
         memmap_dir=out_dir,
         val_frac=float(val_frac),
@@ -579,112 +587,6 @@ def _update_history(
             logger_obj._records = getattr(model, "_train_history")
     except Exception:
         pass
-
-
-def _coerce_path(path: PathLike) -> Optional[PathLike]:
-    if path is None:
-        return None
-    p = str(path).replace("\\n", "").replace("\r", "").replace("\n", "").strip()
-    if not p or p.lower() in ("none", "null", "nil"):
-        return None
-    return os.path.abspath(os.path.expanduser(p))
-
-
-def _coerce_prediction_output(output: object) -> str:
-    if isinstance(output, str) and output.strip().lower() in {
-        "file",
-        "disk",
-        "lazy",
-        "h5",
-        "hdf5",
-    }:
-        return "file"
-    return "memory"
-
-
-def _coerce_prediction_overwrite(overwrite: object) -> str:
-    if isinstance(overwrite, str):
-        ow = overwrite.strip().lower()
-        if ow == "resume":
-            return "resume"
-        if ow in {"replace", "overwrite", "force"}:
-            return "replace"
-        if ow in {"ignore", "skip"}:
-            return "ignore"
-    return "error"
-
-
-def _coerce_prediction_path(path: PathLike, *args: Any, run_id: str) -> Optional[str]:
-    p = Path(str(path))
-    if p.suffix.lower() in {".h5", ".hdf5"}:
-        return os.fspath(p)
-    if p.is_dir():
-        return os.fspath(p / f"{run_id}.h5")
-    return None
-
-
-def _is_path_writable(path: PathLike) -> bool:
-    try:
-        p = Path(path)
-        if p.is_dir():
-            p.mkdir(parents=True, exist_ok=True)
-            probe = p / ".probe"
-            probe.write_text("", encoding="utf-8")
-            probe.unlink(missing_ok=True)
-            return True
-        p.parent.mkdir(parents=True, exist_ok=True)
-        with open(p, "a", encoding="utf-8"):
-            pass
-        return True
-    except Exception:
-        return False
-
-
-def _get_prediction_dtype(
-    chunks_dir: PathLike,
-    *args: Any,
-    default: torch.dtype = torch.float32,
-) -> torch.dtype:
-    manifest_path = os.path.join(chunks_dir, "manifest.json")
-    if not os.path.isfile(manifest_path):
-        return default
-    try:
-        manifest = read_json(manifest_path)
-    except Exception:
-        return default
-    parts = manifest.get("parts") if isinstance(manifest, dict) else None
-    if not isinstance(parts, list) or not parts:
-        return default
-    for part in parts:
-        if not isinstance(part, dict):
-            continue
-        pred_rel = part.get("pred")
-        if not pred_rel:
-            continue
-        pred_path = os.path.join(chunks_dir, str(pred_rel))
-        if pred_path.endswith(".mmt"):
-            meta_path = Storage.mmt_meta_path(pred_path)
-            if os.path.isfile(meta_path):
-                try:
-                    meta = read_json(meta_path)
-                except Exception:
-                    meta = None
-                if isinstance(meta, dict):
-                    dt = parse_torch_dtype(meta.get("dtype"))
-                    if isinstance(dt, torch.dtype):
-                        return dt
-        if os.path.isfile(pred_path):
-            try:
-                preds_t = _torch_load_checkpoint(pred_path, map_location="cpu", weights_only=True)
-            except Exception:
-                preds_t = None
-            if isinstance(preds_t, torch.Tensor):
-                return preds_t.dtype
-            try:
-                return torch.as_tensor(preds_t).dtype
-            except Exception:
-                continue
-    return default
 
 
 def _to_torch_dtype(dt: object) -> Optional[torch.dtype]:
@@ -1280,180 +1182,12 @@ def postprocess(
     path: PathLike | None = None,
     overwrite: str = "error",
 ) -> PredictionOutput:
+    del args
     with inference_mode(torch.nn.Identity()):
-        if not bool(source):
-            raise ValueError("postprocess: 'source' must be a non-empty path")
-        src = _coerce_path(source)
-        if src is None:
-            raise ValueError("postprocess: 'source' is empty/None after normalization")
-        output_mode = _coerce_prediction_output(output)
-        overwrite_mode = _coerce_prediction_overwrite(overwrite)
-        out_path = None
-        path_n = _coerce_path(path) if path is not None else None
-        if output_mode == "file":
-            if path_n is not None:
-                run_id = os.path.basename(src.rstrip(os.sep)) or f"prediction-{os.getpid()}"
-                out_path = _coerce_prediction_path(path_n, run_id=run_id)
-                if out_path is None:
-                    logger.warning(
-                        "postprocess: output=%r requires path to be a .h5/.hdf5 file. Got path=%r; falling back to output='memory'.",
-                        output,
-                        path,
-                    )
-                    output_mode = "memory"
-                elif not _is_path_writable(out_path):
-                    logger.warning(
-                        "postprocess: output=%r path is not writable: %r; falling back to output='memory'.",
-                        output,
-                        out_path,
-                    )
-                    out_path = None
-                    output_mode = "memory"
-            else:
-                output_mode = "memory"
-        if output_mode == "file" and out_path is not None and os.path.exists(out_path):
-            if overwrite_mode == "resume" and os.path.isfile(out_path):
-                Storage.validate_predictions_h5(os.fspath(out_path))
-                return PersistentTensorDict(filename=out_path, mode="r")
-            if overwrite_mode == "error":
-                raise FileExistsError(f"postprocess: destination already exists: {out_path!r}")
-        if (src.endswith(".h5") or src.endswith(".hdf5")) and os.path.isfile(src):
-            if output_mode == "file":
-                if out_path is None:
-                    return PersistentTensorDict(filename=src, mode="r")
-                return Storage.copy_predictions_h5_atomic(
-                    os.fspath(src),
-                    os.fspath(out_path),
-                    overwrite=str(overwrite_mode or "replace"),
-                )
-            return Storage.load_predictions_h5(os.fspath(src))
-        if not os.path.isdir(src):
-            raise FileNotFoundError(f"source must be a directory or .h5 file: {src!r}")
-        memmap_dir = os.path.join(src, "memmap")
-        chunks_dir = os.path.join(src, "pred_chunks")
-        pred_path = os.path.join(src, "pred.mmt")
-        if not os.path.isdir(memmap_dir):
-            raise FileNotFoundError(f"missing memmap dir: {memmap_dir!r}")
-        count = None
-        out_shape = None
-        if os.path.isdir(chunks_dir):
-            man_path = os.path.join(chunks_dir, "manifest.json")
-            if os.path.isfile(man_path):
-                try:
-                    man = read_json(man_path)
-                    if isinstance(man, dict):
-                        count = man.get("count", None)
-                        out_shape = man.get("out_shape", None)
-                except Exception:
-                    pass
-        if os.path.isfile(pred_path):
-            pass
-        else:
-            if not os.path.isdir(chunks_dir):
-                raise FileNotFoundError(f"missing pred_chunks dir: {chunks_dir!r}")
-            if count is None or out_shape is None:
-                raise FileNotFoundError(
-                    f"missing/invalid manifest.json in pred_chunks: {chunks_dir!r}"
-                )
-            count = int(count)
-            out_shape_t = tuple(int(x) for x in (out_shape or ()))
-            if count <= 0 or (not out_shape_t) or any(int(d) <= 0 for d in out_shape_t):
-                raise ValueError(
-                    f"postprocess: invalid manifest metadata: count={count!r}, out_shape={out_shape!r}"
-                )
-            store_float = _get_prediction_dtype(chunks_dir)
-            Storage.concat_memory_mapped_tensor(
-                os.fspath(chunks_dir),
-                os.fspath(pred_path),
-                count=count,
-                out_shape=out_shape_t,
-                store_float=store_float,
-            )
-        X_mmt = Storage.load_memmap_features(os.fspath(memmap_dir))
-        Y_mmt = Storage.open_memory_mapped_tensor(os.fspath(pred_path))
-        if Y_mmt is None:
-            raise RuntimeError("postprocess: failed to open pred.mmt")
-        if count is None:
-            try:
-                count = int(X_mmt.shape[0])
-            except Exception:
-                count = None
-        if count is None:
-            raise RuntimeError("postprocess: failed to infer count")
-        if out_path is not None:
-            if os.path.exists(out_path):
-                if overwrite_mode == "resume" and os.path.isfile(out_path):
-                    Storage.validate_predictions_h5(
-                        os.fspath(out_path),
-                        out_shape=tuple(int(d) for d in Y_mmt.shape[1:]),
-                        in_dim=(
-                            int(X_mmt.shape[1])
-                            if hasattr(X_mmt, "shape") and len(X_mmt.shape) > 1
-                            else None
-                        ),
-                    )
-                    return PersistentTensorDict(filename=out_path, mode="r")
-                if overwrite_mode == "error":
-                    raise FileExistsError(
-                        f"postprocess: destination already exists: {out_path!r}"
-                    )
-            out_td = Storage.write_predictions_h5_atomic(
-                os.fspath(out_path),
-                memmap_dir=os.fspath(memmap_dir),
-                pred_path=os.fspath(pred_path),
-                chunk_size=8192,
-                overwrite=str(overwrite_mode or "replace"),
-            )
-            if not os.path.isfile(out_path):
-                raise RuntimeError(
-                    f"postprocess: persistent output missing after write: {out_path!r}"
-                )
-            Storage.validate_predictions_h5(
-                os.fspath(out_path),
-                out_shape=tuple(int(d) for d in Y_mmt.shape[1:]),
-                in_dim=(
-                    int(X_mmt.shape[1])
-                    if hasattr(X_mmt, "shape") and len(X_mmt.shape) > 1
-                    else None
-                ),
-            )
-            Storage.remove_prediction_artifacts(
-                memmap_dir=os.fspath(memmap_dir),
-                pred_path=os.fspath(pred_path),
-            )
-            return out_td
-        X_t = Storage.copy_mmt_to_cpu_tensor(X_mmt, count=int(count), chunk_size=8192)
-        Y_t = Storage.copy_mmt_to_cpu_tensor(Y_mmt, count=int(count), chunk_size=8192)
-        td_out = TensorDict({"X": X_t, "Y": Y_t}, batch_size=[int(count)])
-        Storage.remove_prediction_artifacts(
-            memmap_dir=os.fspath(memmap_dir),
-            pred_path=os.fspath(pred_path),
+        return _postprocess_pipeline(
+            source,
+            output=output,
+            path=path,
+            overwrite=overwrite,
         )
-        return td_out
 
-
-class _MappingSlicer:
-    __slots__ = ("const_items", "slice_items")
-
-    def __init__(self, const_items: Mapping[Any, Any], slice_items: Tuple[Any, ...]) -> None:
-        self.const_items = dict(const_items)
-        self.slice_items = tuple(slice_items)
-
-    def __call__(self, s: object, e: object) -> Mapping[Any, Any]:
-        batch = dict(self.const_items)
-        for k, v in self.slice_items:
-            try:
-                batch[k] = v[s:e]
-            except Exception:
-                batch[k] = v
-        return batch
-
-
-class _TensorDictSlicer:
-    __slots__ = ("td",)
-
-    def __init__(self, td: TensorDictBase) -> None:
-        self.td = td
-
-    def __call__(self, s: object, e: object) -> TensorDictBase:
-        return self.td[s:e]
