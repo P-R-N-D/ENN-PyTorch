@@ -955,6 +955,85 @@ def fetch(
     }
 
 
+def preload_memmap(
+    data: Mapping[str, Any],
+    *args: Any,
+    memmap_dir: PathLike,
+    val_frac: float = 0.0,
+    shuffle: bool = False,
+    seed: int | None = None,
+    underflow_action: str | None = None,
+    chunk_size: int = 4096,
+    allow_missing_labels: bool = False,
+    features_only: bool = False,
+    default_label_shape: Tuple[int, ...] | None = None,
+) -> None:
+    del args
+    if not isinstance(data, Mapping):
+        raise TypeError("preload_memmap expects a Mapping with at least 'features'")
+    if "features" not in data:
+        raise ValueError("preload_memmap expects 'features'")
+
+    raw_X = data["features"]
+    raw_Y = data.get("labels")
+
+    def _len0(obj: Any) -> int:
+        if isinstance(obj, torch.Tensor):
+            return int(obj.shape[0]) if int(getattr(obj, "ndim", 0) or 0) > 0 else 1
+        try:
+            return int(len(obj))
+        except Exception:
+            return 0
+
+    count = _len0(raw_X)
+    if count <= 0:
+        raise ValueError("cannot create memmap with zero samples")
+
+    if not bool(features_only):
+        if raw_Y is None:
+            if not bool(allow_missing_labels):
+                raise ValueError(
+                    "preload_memmap expects 'labels' unless allow_missing_labels=True"
+                )
+        else:
+            if _len0(raw_Y) != int(count):
+                raise ValueError("features and labels must have the same length")
+
+    ua = normalize_underflow_action(underflow_action, default=default_underflow_action())
+    ds = Dataset.for_device("cpu", feature_dtype=torch.float64, label_float_dtype=torch.float64)
+    ds.underflow_action = ua
+
+    from . import collate
+    from .collate import _BatchIndexGetter, _BatchSliceGetter
+
+    get_batch = _BatchSliceGetter(raw_X, raw_Y, features_only=bool(features_only))
+    get_by_indices = (
+        _BatchIndexGetter(raw_X, raw_Y, features_only=bool(features_only))
+        if bool(shuffle)
+        else None
+    )
+    collate.stream_memmap(
+        ds=ds,
+        out_dir=os.fspath(memmap_dir),
+        count=int(count),
+        get_batch=get_batch,
+        get_by_indices=get_by_indices,
+        val_frac=float(val_frac),
+        seed_value=int(seed) if seed is not None else None,
+        underflow_action=str(ua),
+        shuffle=bool(shuffle),
+        allow_missing_labels=bool(allow_missing_labels),
+        features_only=bool(features_only),
+        default_label_shape=(
+            tuple(int(x) for x in default_label_shape)
+            if default_label_shape is not None
+            else None
+        ),
+        chunk_size=int(chunk_size),
+    )
+    return None
+
+
 class Source(TypedDict):
     path: Required[str]
     format: NotRequired[SourceType]
@@ -1614,82 +1693,3 @@ class Dataset(Generic[TExtra]):
             label_float_dtype=label_float_dtype,
             extra=extra_map,
         )
-
-
-def preload_memmap(
-    data: Mapping[str, Any],
-    *args: Any,
-    memmap_dir: PathLike,
-    val_frac: float = 0.0,
-    shuffle: bool = False,
-    seed: int | None = None,
-    underflow_action: str | None = None,
-    chunk_size: int = 4096,
-    allow_missing_labels: bool = False,
-    features_only: bool = False,
-    default_label_shape: Tuple[int, ...] | None = None,
-) -> None:
-    del args
-    if not isinstance(data, Mapping):
-        raise TypeError("preload_memmap expects a Mapping with at least 'features'")
-    if "features" not in data:
-        raise ValueError("preload_memmap expects 'features'")
-
-    raw_X = data["features"]
-    raw_Y = data.get("labels")
-
-    def _len0(obj: Any) -> int:
-        if isinstance(obj, torch.Tensor):
-            return int(obj.shape[0]) if int(getattr(obj, "ndim", 0) or 0) > 0 else 1
-        try:
-            return int(len(obj))
-        except Exception:
-            return 0
-
-    count = _len0(raw_X)
-    if count <= 0:
-        raise ValueError("cannot create memmap with zero samples")
-
-    if not bool(features_only):
-        if raw_Y is None:
-            if not bool(allow_missing_labels):
-                raise ValueError(
-                    "preload_memmap expects 'labels' unless allow_missing_labels=True"
-                )
-        else:
-            if _len0(raw_Y) != int(count):
-                raise ValueError("features and labels must have the same length")
-
-    ua = normalize_underflow_action(underflow_action, default=default_underflow_action())
-    ds = Dataset.for_device("cpu", feature_dtype=torch.float64, label_float_dtype=torch.float64)
-    ds.underflow_action = ua
-
-    from . import collate
-    from .collate import _BatchIndexGetter, _BatchSliceGetter
-
-    get_batch = _BatchSliceGetter(raw_X, raw_Y, features_only=bool(features_only))
-    get_by_indices = (
-        _BatchIndexGetter(raw_X, raw_Y, features_only=bool(features_only))
-        if bool(shuffle)
-        else None
-    )
-    collate.stream_memmap(
-        ds=ds,
-        out_dir=os.fspath(memmap_dir),
-        count=int(count),
-        get_batch=get_batch,
-        get_by_indices=get_by_indices,
-        val_frac=float(val_frac),
-        seed_value=int(seed) if seed is not None else None,
-        underflow_action=str(ua),
-        shuffle=bool(shuffle),
-        allow_missing_labels=bool(allow_missing_labels),
-        features_only=bool(features_only),
-        default_label_shape=(
-            tuple(int(x) for x in default_label_shape)
-            if default_label_shape is not None
-            else None
-        ),
-        chunk_size=int(chunk_size),
-    )
-    return None
