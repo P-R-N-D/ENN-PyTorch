@@ -34,8 +34,8 @@ from .wrappers import (
     TensorRT,
     TorchExport,
     TorchInductor,
-    _ONNXModule,
-    _ORTModule,
+    _ONNXExporter,
+    _ORTBuilder,
 )
 
 try:
@@ -239,8 +239,8 @@ class Exporter:
     _ext_map: dict[str, str] = {}
     _defaults_registered: bool = False
     _defaults_lock = Mutex()
-    _ONNXModule = _ONNXModule
-    _ORTModule = _ORTModule
+    _ONNXExporter = _ONNXExporter
+    _ORTBuilder = _ORTBuilder
     _export_sig_cache: object | None = None
     _export_sig_lock = Mutex()
 
