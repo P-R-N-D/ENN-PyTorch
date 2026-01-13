@@ -10,10 +10,12 @@ import shutil
 import subprocess
 import sys
 import threading
+import weakref
 import warnings
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from typing import Any, Iterator, Protocol, Sequence, TypeAlias
+from dataclasses import dataclass
+from typing import Any, Callable, Iterator, Protocol, Sequence, TypeAlias
 
 import torch
 from tensordict import TensorDict
@@ -451,6 +453,30 @@ class Format(Protocol):
     name = None
 
     def save(self, model: nn.Module, dst: PathLike, *args: Any, **kwargs: Any) -> None: ...
+
+
+@dataclass(frozen=True, slots=True)
+class BorrowedModule:
+    module: nn.Module
+    name: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class OwnedModule:
+    module: nn.Module
+    name: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class ModulePath:
+    path: str
+    name: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class CallArguments:
+    args: tuple[Any, ...]
+    kwargs: dict[str, Any]
 
 
 class TorchInductor(Format):
@@ -1040,3 +1066,587 @@ class TensorFlow(Format):
             model_onnx = onnx.load(str(onnx_path))
             prepare(model_onnx).export_graph(str(saved_model_dir))
         return (saved_model_dir,)
+
+
+class ReduceMean(nn.Module):
+    def __init__(self, dim: int = 1, keepdim: bool = False) -> None:
+        super().__init__()
+        self.dim = int(dim)
+        self.keepdim = bool(keepdim)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x.mean(dim=self.dim, keepdim=self.keepdim)
+
+
+class GraphSequential(nn.Module):
+    _CONTROL_ATTR = "__stnet_subgraph_control_op__"
+    def __init__(
+        self,
+        steps: Sequence[object],
+        *args: Any,
+        out_shape: object | None = None,
+        name: str | None = None,
+        root: nn.Module | None = None,
+    ) -> None:
+        super().__init__()
+        del args
+        self._name = str(name or "subgraph")
+        self._owned = nn.ModuleList()
+
+        self._root_ref: weakref.ReferenceType[nn.Module] | None = (
+            weakref.ref(root) if root is not None else None
+        )
+        self._path_cache: dict[str, weakref.ReferenceType[nn.Module]] = {}
+        self._path_cache_lock = threading.Lock()
+
+        self._out_shape_kind, self._out_shape_spec = self._normalize_out_shape(out_shape)
+
+        compiled_steps: list[tuple[object, ...]] = []
+        for raw in steps:
+            step, extra_args, extra_kwargs = self._parse_step(raw)
+            meta: dict[str, Any] | None = None
+
+            if isinstance(step, BorrowedModule):
+                if step.name:
+                    meta = {"name": str(step.name)}
+                compiled_steps.append(("ref", weakref.ref(step.module), extra_args, extra_kwargs, meta))
+                continue
+            if isinstance(step, ModulePath):
+                meta = {"path": str(step.path), "name": (str(step.name) if step.name else None)}
+                compiled_steps.append(("path", str(step.path), extra_args, extra_kwargs, meta))
+                continue
+            if isinstance(step, OwnedModule):
+                if step.name:
+                    meta = {"name": str(step.name)}
+                self._owned.append(step.module)
+                compiled_steps.append(("owned", len(self._owned) - 1, extra_args, extra_kwargs, meta))
+                continue
+            if isinstance(step, nn.Module):
+                compiled_steps.append(("ref", weakref.ref(step), extra_args, extra_kwargs, meta))
+                continue
+            if callable(step):
+                tag = getattr(step, self._CONTROL_ATTR, None)
+                if tag is not None:
+                    meta = {"control": str(tag)}
+                compiled_steps.append(("fn", step, extra_args, extra_kwargs, meta))
+                continue
+
+            raise TypeError(f"Unsupported GraphSequential step: {type(step)!r}")
+
+        if not compiled_steps:
+            raise ValueError("GraphSequential requires at least one step.")
+        self._steps: list[tuple[object, ...]] = compiled_steps
+
+    @staticmethod
+    def ref(module: nn.Module, *args: Any, name: str | None = None) -> BorrowedModule:
+        del args
+        return BorrowedModule(module=module, name=name)
+
+    @staticmethod
+    def own(module: nn.Module, *args: Any, name: str | None = None) -> OwnedModule:
+        del args
+        return OwnedModule(module=module, name=name)
+
+    @staticmethod
+    def path(path: str, *, name: str | None = None) -> ModulePath:
+        return ModulePath(path=str(path), name=name)
+
+    @staticmethod
+    def mean(dim: int = 1, *args: Any, keepdim: bool = False) -> OwnedModule:
+        del args
+        return OwnedModule(module=ReduceMean(dim=int(dim), keepdim=bool(keepdim)), name="mean")
+
+    @staticmethod
+    def io(*args: Any, **kwargs: Any) -> CallArguments:
+        return CallArguments(args=tuple(args), kwargs=dict(kwargs))
+
+    @staticmethod
+    def _tag_control(fn: Callable[..., Any], tag: str) -> Callable[..., Any]:
+        try:
+            setattr(fn, GraphSequential._CONTROL_ATTR, str(tag))
+        except Exception:
+            pass
+        return fn
+
+    @staticmethod
+    def break_graph() -> Callable[..., Any]:
+        from ..core.graph import graph_break
+
+        def _op(*a: Any, **kw: Any) -> Any:
+            graph_break()
+            if kw:
+                return CallArguments(args=tuple(a), kwargs=dict(kw))
+            if len(a) == 1:
+                return a[0]
+            return tuple(a)
+
+        return GraphSequential._tag_control(_op, "graph_break")
+
+    @staticmethod
+    def cudagraph_begin(*args: Any, disable_compile: bool = True) -> Callable[..., Any]:
+        from ..core.graph import cudagraph_mark_step_begin, torch_compiler_disable
+
+        def _op(*a: Any, **kw: Any) -> Any:
+            cudagraph_mark_step_begin()
+            if kw:
+                return CallArguments(args=tuple(a), kwargs=dict(kw))
+            if len(a) == 1:
+                return a[0]
+            return tuple(a)
+
+        _op = GraphSequential._tag_control(_op, "cudagraph_begin")
+        return (
+            torch_compiler_disable(_op, reason="subgraph:cudagraph_begin", recursive=False)
+            if disable_compile
+            else _op
+        )
+
+    @staticmethod
+    def cudagraph_end(*args: Any, disable_compile: bool = True) -> Callable[..., Any]:
+        from ..core.graph import cudagraph_mark_step_end, torch_compiler_disable
+
+        def _op(*a: Any, **kw: Any) -> Any:
+            cudagraph_mark_step_end()
+            if kw:
+                return CallArguments(args=tuple(a), kwargs=dict(kw))
+            if len(a) == 1:
+                return a[0]
+            return tuple(a)
+
+        _op = GraphSequential._tag_control(_op, "cudagraph_end")
+        return (
+            torch_compiler_disable(_op, reason="subgraph:cudagraph_end", recursive=False)
+            if disable_compile
+            else _op
+        )
+
+    @staticmethod
+    def no_compile(
+        step: nn.Module | Callable[..., Any],
+        *args: Any,
+        reason: str | None = None,
+        recursive: bool = False,
+    ) -> Callable[..., Any]:
+        from ..core.graph import torch_compiler_disable
+
+        if isinstance(step, nn.Module):
+            ref = weakref.ref(step)
+
+            def _call(*a: Any, **kw: Any) -> Any:
+                mod = ref()
+                if mod is None:
+                    raise RuntimeError(
+                        "A shared submodule reference was cleared before GraphSequential.forward()."
+                    )
+                return mod(*a, **kw)
+
+        else:
+
+            def _call(*a: Any, **kw: Any) -> Any:
+                return step(*a, **kw)
+
+        wrapped = torch_compiler_disable(
+            _call,
+            reason=str(reason or "subgraph:no_compile"),
+            recursive=bool(recursive),
+        )
+        return GraphSequential._tag_control(wrapped, "no_compile")
+
+    @staticmethod
+    def checkpoint(
+        step: nn.Module | Callable[..., Any],
+        *args: Any,
+        use_reentrant: bool | None = None,
+        preserve_rng_state: bool | None = None,
+        determinism_check: str | None = None,
+    ) -> Callable[..., Any]:
+        from ..core.graph import coerce_checkpoint
+
+        if isinstance(step, nn.Module):
+            ref = weakref.ref(step)
+
+            def _call(*a: Any, **kw: Any) -> Any:
+                mod = ref()
+                if mod is None:
+                    raise RuntimeError(
+                        "A shared submodule reference was cleared before GraphSequential.forward()."
+                    )
+
+                def _inner(*aa: Any) -> Any:
+                    return mod(*aa, **kw)
+
+                return coerce_checkpoint(
+                    _inner,
+                    *a,
+                    use_reentrant=use_reentrant,
+                    preserve_rng_state=preserve_rng_state,
+                    determinism_check=determinism_check,
+                )
+
+        else:
+
+            def _call(*a: Any, **kw: Any) -> Any:
+                def _inner(*aa: Any) -> Any:
+                    return step(*aa, **kw)
+
+                return coerce_checkpoint(
+                    _inner,
+                    *a,
+                    use_reentrant=use_reentrant,
+                    preserve_rng_state=preserve_rng_state,
+                    determinism_check=determinism_check,
+                )
+
+        return GraphSequential._tag_control(_call, "checkpoint")
+
+    def set_root(self, root: nn.Module | None) -> "GraphSequential":
+        self._root_ref = weakref.ref(root) if root is not None else None
+        with self._path_cache_lock:
+            self._path_cache.clear()
+        return self
+
+    def bind(self, root: nn.Module | None = None, *args: Any, strict: bool = True) -> "GraphSequential":
+        if root is not None:
+            self.set_root(root)
+
+        rebound: list[tuple[object, ...]] = []
+        for item in list(self._steps):
+            kind, payload, extra_args, extra_kwargs, meta = self._split_step(item)
+
+            if kind == "path":
+                path = str(payload)
+                mod = self._resolve_path(path)
+                m = dict(meta) if isinstance(meta, dict) else {}
+                m["path"] = path
+                rebound.append(("ref", weakref.ref(mod), extra_args, extra_kwargs, m))
+                continue
+
+            if kind == "ref" and payload is None:
+                path = meta.get("path") if isinstance(meta, dict) else None
+                if isinstance(path, str):
+                    mod = self._resolve_path(path)
+                    rebound.append(("ref", weakref.ref(mod), extra_args, extra_kwargs, meta))
+                    continue
+                if strict:
+                    raise RuntimeError(
+                        "GraphSequential.bind() encountered an unresolved ref without a path hint."
+                    )
+
+            rebound.append((kind, payload, extra_args, extra_kwargs, meta))
+
+        self._steps = rebound
+        return self
+
+    def forward(self, *args: Any, **kwargs: Any) -> Any:
+        if kwargs:
+            cur: Any = CallArguments(args=tuple(args), kwargs=dict(kwargs))
+        else:
+            cur = args[0] if len(args) == 1 else tuple(args)
+
+        for item in self._steps:
+            kind, payload, extra_args, extra_kwargs, meta = self._split_step(item)
+            cur = self._apply_step(kind, payload, cur, extra_args, extra_kwargs, meta=meta)
+
+        return self._apply_out_shape(cur)
+
+    def extra_repr(self) -> str:
+        return f"name={self._name!r}, out_shape={self._out_shape_spec!r}, steps={len(self._steps)}"
+
+    def __getstate__(self) -> dict[str, object]:
+        state = super().__getstate__()
+
+        steps = state.get("_steps", [])
+        sanitized: list[tuple[object, ...]] = []
+        if isinstance(steps, list):
+            for item in steps:
+                kind, payload, extra_args, extra_kwargs, meta = self._split_step(item)
+                if kind == "ref":
+                    sanitized.append((kind, None, extra_args, extra_kwargs, meta))
+                else:
+                    sanitized.append((kind, payload, extra_args, extra_kwargs, meta))
+            state["_steps"] = sanitized
+
+        state["_root_ref"] = None
+        state["_path_cache"] = {}
+        state["_path_cache_lock"] = None
+        return state
+
+    def __setstate__(self, state: dict[str, object]) -> None:
+        super().__setstate__(state)
+        if getattr(self, "_path_cache", None) is None:
+            self._path_cache = {}
+        if getattr(self, "_path_cache_lock", None) is None:
+            self._path_cache_lock = threading.Lock()
+        if getattr(self, "_root_ref", None) is None:
+            self._root_ref = None
+
+    @staticmethod
+    def _parse_step(raw: object) -> tuple[object, tuple[Any, ...], dict[str, Any]]:
+        if isinstance(raw, (tuple, list)):
+            if len(raw) == 2 and isinstance(raw[1], dict):
+                return raw[0], (), dict(raw[1])
+            if len(raw) == 3 and isinstance(raw[1], (tuple, list)) and isinstance(raw[2], dict):
+                return raw[0], tuple(raw[1]), dict(raw[2])
+        return raw, (), {}
+
+    @staticmethod
+    def _split_step(
+        item: object,
+    ) -> tuple[str, object, tuple[Any, ...], dict[str, Any], object | None]:
+        if not isinstance(item, tuple) or len(item) < 4:
+            raise TypeError("Invalid GraphSequential internal step format.")
+        kind = str(item[0])
+        payload = item[1]
+
+        raw_args = item[2]
+        if raw_args is None:
+            extra_args: tuple[Any, ...] = ()
+        elif isinstance(raw_args, tuple):
+            extra_args = raw_args
+        else:
+            try:
+                extra_args = tuple(raw_args)
+            except TypeError:
+                extra_args = (raw_args,)
+
+        raw_kwargs = item[3]
+        if raw_kwargs is None:
+            extra_kwargs: dict[str, Any] = {}
+        elif isinstance(raw_kwargs, dict):
+            extra_kwargs = dict(raw_kwargs)
+        else:
+            extra_kwargs = dict(raw_kwargs) if hasattr(raw_kwargs, "items") else {}
+
+        meta = item[4] if len(item) >= 5 else None
+        return kind, payload, extra_args, extra_kwargs, meta
+
+    @staticmethod
+    def _normalize_out_shape(out_shape: object | None) -> tuple[str | None, object | None]:
+        if out_shape is None:
+            return None, None
+        if isinstance(out_shape, dict):
+            spec: dict[str, object] = {}
+            for k, v in out_shape.items():
+                if v is None:
+                    spec[str(k)] = None
+                else:
+                    spec[str(k)] = tuple(int(x) for x in v)
+            return "dict", spec
+        if (
+            isinstance(out_shape, (list, tuple))
+            and out_shape
+            and isinstance(out_shape[0], (list, tuple, type(None)))
+        ):
+            shapes: list[object] = []
+            for s in out_shape:
+                if s is None:
+                    shapes.append(None)
+                else:
+                    shapes.append(tuple(int(x) for x in s))
+            return "seq", tuple(shapes)
+        return "single", tuple(int(x) for x in out_shape)
+
+    @staticmethod
+    def _unpack(value: Any) -> tuple[tuple[Any, ...], dict[str, Any]]:
+        if isinstance(value, CallArguments):
+            return tuple(value.args), dict(value.kwargs)
+        if isinstance(value, tuple):
+            return value, {}
+        if isinstance(value, list):
+            return tuple(value), {}
+        if isinstance(value, dict):
+            return (), value
+        return (value,), {}
+
+    def _resolve_path(self, path: str) -> nn.Module:
+        with self._path_cache_lock:
+            ref = self._path_cache.get(path)
+        if ref is not None:
+            mod = ref()
+            if mod is not None:
+                return mod
+
+        root = self._root_ref() if self._root_ref is not None else None
+        if root is None:
+            raise RuntimeError(
+                "GraphSequential requires `root=` (or set_root()) when using ModulePath steps."
+            )
+
+        mod: nn.Module | None = None
+        if hasattr(root, "get_submodule"):
+            try:
+                mod = root.get_submodule(path)
+            except Exception:
+                mod = None
+        if mod is None:
+            cur: nn.Module = root
+            for part in str(path).split("."):
+                child = getattr(cur, "_modules", None)
+                if isinstance(child, dict) and part in child:
+                    nxt = child.get(part)
+                else:
+                    nxt = getattr(cur, part, None)
+                if not isinstance(nxt, nn.Module):
+                    raise AttributeError(f"Failed to resolve submodule path {path!r} at {part!r}.")
+                cur = nxt
+            mod = cur
+
+        if not isinstance(mod, nn.Module):
+            raise TypeError(f"get_submodule({path!r}) did not return an nn.Module")
+
+        with self._path_cache_lock:
+            self._path_cache[path] = weakref.ref(mod)
+        return mod
+
+    def _apply_step(
+        self,
+        kind: str,
+        payload: object,
+        cur: Any,
+        extra_args: tuple[Any, ...],
+        extra_kwargs: dict[str, Any],
+        *args: Any,
+        meta: object | None = None,
+    ) -> Any:
+        args, kwargs = self._unpack(cur)
+        if extra_args:
+            args = tuple(args) + tuple(extra_args)
+        if extra_kwargs:
+            merged = dict(kwargs)
+            merged.update(extra_kwargs)
+            kwargs = merged
+
+        if kind == "ref":
+            mod = payload() if callable(payload) else None
+            if mod is None:
+                path = meta.get("path") if isinstance(meta, dict) else None
+                if isinstance(path, str):
+                    mod = self._resolve_path(path)
+                else:
+                    raise RuntimeError(
+                        "A shared submodule reference was cleared (or not bound) before GraphSequential.forward()."
+                    )
+            if not isinstance(mod, nn.Module):
+                raise TypeError(f"GraphSequential ref step did not resolve to nn.Module: {type(mod)!r}")
+            return mod(*args, **kwargs)
+        if kind == "owned":
+            return self._owned[int(payload)](*args, **kwargs)
+        if kind == "path":
+            return self._resolve_path(str(payload))(*args, **kwargs)
+        return payload(*args, **kwargs)
+
+    def _apply_out_shape(self, out: Any) -> Any:
+        kind = self._out_shape_kind
+        spec = self._out_shape_spec
+        if kind is None or spec is None:
+            return out
+
+        def _reshape_one(t: torch.Tensor, shape: tuple[int, ...]) -> torch.Tensor:
+            if t.ndim == 0:
+                raise RuntimeError("Cannot reshape a scalar output in GraphSequential.")
+            return t.reshape(t.shape[0], *shape)
+
+        if kind == "single":
+            if not isinstance(out, torch.Tensor):
+                raise RuntimeError("out_shape is set but the pipeline output is not a Tensor.")
+            return _reshape_one(out, spec)
+
+        if kind == "seq":
+            if not isinstance(out, (tuple, list)):
+                raise RuntimeError("out_shape expects tuple/list output but got a different type.")
+            shapes = list(spec)
+            if len(out) != len(shapes):
+                raise RuntimeError("out_shape length does not match tuple/list output length.")
+            out_list = list(out)
+            for i, sh in enumerate(shapes):
+                if sh is None:
+                    continue
+                if not isinstance(out_list[i], torch.Tensor):
+                    raise RuntimeError("out_shape expects Tensor outputs in tuple/list.")
+                out_list[i] = _reshape_one(out_list[i], sh)
+            return tuple(out_list) if isinstance(out, tuple) else out_list
+        if not isinstance(out, dict):
+            raise RuntimeError("out_shape expects dict output but got a different type.")
+        out_dict = dict(out)
+        for k, sh in spec.items():
+            if sh is None:
+                continue
+            if k not in out_dict:
+                raise RuntimeError(f"out_shape missing key in output dict: {k!r}")
+            if not isinstance(out_dict[k], torch.Tensor):
+                raise RuntimeError("out_shape expects Tensor values in dict output.")
+            out_dict[k] = _reshape_one(out_dict[k], sh)
+        return out_dict
+
+    def extract_for_serving(
+        self,
+        *args: Any,
+        root: nn.Module | None = None,
+        clone_modules: bool = True,
+        strip_control_ops: bool = True,
+        name: str | None = None,
+    ) -> "GraphSequential":
+        import copy
+
+        if root is not None:
+            self.set_root(root)
+
+        steps_out: list[object] = []
+        for item in list(self._steps):
+            kind, payload, extra_args, extra_kwargs, meta = self._split_step(item)
+
+            if kind == "fn":
+                fn = payload
+                if strip_control_ops and bool(getattr(fn, self._CONTROL_ATTR, "")):
+                    continue
+                step_obj: object = fn
+            else:
+                mod: nn.Module | None = None
+                if kind == "owned":
+                    mod = self._owned[int(payload)]
+                elif kind == "path":
+                    mod = self._resolve_path(str(payload))
+                elif kind == "ref":
+                    mod = payload() if callable(payload) else None
+                    if mod is None and isinstance(meta, dict) and isinstance(meta.get("path"), str):
+                        mod = self._resolve_path(str(meta.get("path")))
+                else:
+                    raise TypeError(f"Unknown GraphSequential step kind: {kind!r}")
+
+                if not isinstance(mod, nn.Module):
+                    raise RuntimeError(
+                        f"extract_for_serving could not resolve module for step kind={kind!r}"
+                    )
+
+                if clone_modules:
+                    try:
+                        mod = copy.deepcopy(mod)
+                    except Exception as e:
+                        warnings.warn(
+                            f"GraphSequential.extract_for_serving: deepcopy failed for {mod.__class__.__name__}: {e}. "
+                            "Falling back to sharing the original module object.",
+                            RuntimeWarning,
+                        )
+                step_obj = OwnedModule(module=mod)
+
+            if extra_args and extra_kwargs:
+                steps_out.append((step_obj, extra_args, extra_kwargs))
+            elif extra_args:
+                steps_out.append((step_obj, extra_args, {}))
+            elif extra_kwargs:
+                steps_out.append((step_obj, extra_kwargs))
+            else:
+                steps_out.append(step_obj)
+
+        out = GraphSequential(
+            steps=steps_out,
+            out_shape=(self._out_shape_spec if self._out_shape_kind is not None else None),
+            name=str(name or f"{self._name}_serving"),
+            root=None,
+        )
+        out.eval()
+        with contextlib.suppress(Exception):
+            out.requires_grad_(False)
+        with contextlib.suppress(Exception):
+            setattr(out, "__compiled_for_serving__", True)
+        return out

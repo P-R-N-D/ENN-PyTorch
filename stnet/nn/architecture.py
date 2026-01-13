@@ -6,7 +6,6 @@ import io
 import logging
 import math
 import threading
-import weakref
 from functools import lru_cache
 from typing import (
     Any,
@@ -28,7 +27,7 @@ import torch.nn.functional as F
 from tensordict import TensorDictBase
 
 from ..config import ModelConfig
-from ..core.concurrency import Mutex
+from ..core.concurrency import Mutex, is_gil_enabled
 from ..core.datatypes import env_bool, env_first_int, env_int
 from ..core.tensor import is_meta_or_fake_tensor
 from ..core.distributed import _from_hsdp_module
@@ -42,6 +41,8 @@ from ..core.graph import (
     canonicalize_compile_mode,
     is_export_or_trace,
     coerce_checkpoint,
+    cudagraph_mark_step_begin,
+    cudagraph_mark_step_end,
 )
 from ..core.precision import Autocast, is_scale_safe
 from ..core.policies import LossWeightPolicy
@@ -180,24 +181,6 @@ def _dot_product_attention_cls() -> Any:
     except Exception:
         return None
 
-
-
-class _ProxyDecoder(nn.Module):
-    def __init__(self, norm: nn.Module, head: nn.Module, out_shape: Sequence[int]) -> None:
-        super().__init__()
-        self._norm_ref = weakref.ref(norm)
-        self._head_ref = weakref.ref(head)
-        self._out_shape = tuple(int(x) for x in out_shape)
-
-    def forward(self, tokens: torch.Tensor) -> torch.Tensor:
-        norm = self._norm_ref()
-        head = self._head_ref()
-        if norm is None or head is None:
-            raise RuntimeError("Decoder references were cleared before use.")
-        tokens = norm(tokens)
-        pooled = tokens.mean(dim=1)
-        flat = head(pooled)
-        return flat.reshape(tokens.shape[0], *self._out_shape)
 
 
 class SpatialExtractor(nn.Module):
@@ -1379,9 +1362,21 @@ class Model(nn.Module):
         if compile_enabled:
             with compile_patch_ctx:
                 try:
-                    _raw_head = self.processor.head
-                    _decode_mod = _ProxyDecoder(self.processor.norm, _raw_head, self.out_shape).to(
-                        self._device
+                    from ..runtime.wrappers import GraphSequential
+
+                    _decode_mod = (
+                        GraphSequential(
+                            steps=[
+                                GraphSequential.path("norm"),
+                                GraphSequential.mean(dim=1),
+                                GraphSequential.path("head"),
+                            ],
+                            out_shape=self.out_shape,
+                            name="decode",
+                            root=self.processor,
+                        )
+                        .to(self._device)
+                        .bind()
                     )
                     _compiled = compile_module(
                         _decode_mod,
@@ -1471,6 +1466,7 @@ class Model(nn.Module):
         self._amp_dtype_cache_last_dtype: torch.dtype | None = None
         self._amp_dtype_cache_max = 64
         self._amp_dtype_cache_lock = Mutex()
+        self._amp_dtype_cache_use_lock = not bool(is_gil_enabled())
         self.__config = config
         self.__stnet_instance_config__ = config
 
@@ -1502,6 +1498,7 @@ class Model(nn.Module):
         super().__setstate__(state)
         self._runtime_lock = Mutex()
         self._amp_dtype_cache_lock = Mutex()
+        self._amp_dtype_cache_use_lock = not bool(is_gil_enabled())
         self._amp_dtype_cache = {}
         self._amp_dtype_cache_last_key = None
         self._amp_dtype_cache_last_dtype = None
@@ -2038,8 +2035,15 @@ class Model(nn.Module):
                 str(underflow_action),
                 int(safety_margin_pow2),
             )
-        with self._amp_dtype_cache_lock:
-            if self._amp_dtype_cache_last_key == cache_key:
+        if self._amp_dtype_cache_use_lock:
+            with self._amp_dtype_cache_lock:
+                if self._amp_dtype_cache_last_key == cache_key:
+                    amp_dtype = self._amp_dtype_cache_last_dtype
+                else:
+                    amp_dtype = self._amp_dtype_cache.get(cache_key)
+        else:
+            last_key = self._amp_dtype_cache_last_key
+            if last_key == cache_key:
                 amp_dtype = self._amp_dtype_cache_last_dtype
             else:
                 amp_dtype = self._amp_dtype_cache.get(cache_key)
@@ -2054,19 +2058,33 @@ class Model(nn.Module):
                 decision_key=cache_key,
                 safety_margin_pow2=int(safety_margin_pow2),
             )
-            with self._amp_dtype_cache_lock:
+            if self._amp_dtype_cache_use_lock:
+                with self._amp_dtype_cache_lock:
+                    amp_dtype = self._amp_dtype_cache.get(cache_key)
+                    if amp_dtype is None:
+                        amp_dtype = negotiated
+                        if len(self._amp_dtype_cache) >= int(self._amp_dtype_cache_max):
+                            self._amp_dtype_cache.clear()
+                        self._amp_dtype_cache[cache_key] = amp_dtype
+                    self._amp_dtype_cache_last_dtype = amp_dtype
+                    self._amp_dtype_cache_last_key = cache_key
+            else:
                 amp_dtype = self._amp_dtype_cache.get(cache_key)
                 if amp_dtype is None:
                     amp_dtype = negotiated
                     if len(self._amp_dtype_cache) >= int(self._amp_dtype_cache_max):
                         self._amp_dtype_cache.clear()
                     self._amp_dtype_cache[cache_key] = amp_dtype
-                self._amp_dtype_cache_last_key = cache_key
                 self._amp_dtype_cache_last_dtype = amp_dtype
+                self._amp_dtype_cache_last_key = cache_key
         else:
-            with self._amp_dtype_cache_lock:
-                self._amp_dtype_cache_last_key = cache_key
+            if self._amp_dtype_cache_use_lock:
+                with self._amp_dtype_cache_lock:
+                    self._amp_dtype_cache_last_dtype = amp_dtype
+                    self._amp_dtype_cache_last_key = cache_key
+            else:
                 self._amp_dtype_cache_last_dtype = amp_dtype
+                self._amp_dtype_cache_last_key = cache_key
         amp_enabled = amp_dtype is not torch.float64
         is_cls_loss = (
             isinstance(net_loss, (nn.CrossEntropyLoss, nn.NLLLoss))
@@ -2193,6 +2211,11 @@ class Model(nn.Module):
                         else Autocast.suspend(device)
                     ):
                         if dc is not None:
+                            if self._compile_cudagraphs and getattr(device, "type", None) == "cuda":
+                                cudagraph_mark_step_begin()
+                                out = cast(torch.Tensor, dc(chunk))
+                                cudagraph_mark_step_end()
+                                return out
                             return cast(torch.Tensor, dc(chunk))
                         return self.fuser.decode(chunk, apply_norm=True)
 

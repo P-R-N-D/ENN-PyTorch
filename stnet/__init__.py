@@ -17,7 +17,6 @@ __all__ = [
     "data",
     "nn",
     "runtime",
-    "get_prediction",
     "load_model",
     "new_model",
     "predict",
@@ -61,8 +60,3 @@ def predict(*args: Any, **kwargs: Any) -> TensorDictBase | dict[str, TensorDictB
 
     return api.predict(*args, **kwargs)
 
-
-def get_prediction(*args: Any, **kwargs: Any) -> TensorDictBase:
-    from . import api
-
-    return api.get_prediction(*args, **kwargs)

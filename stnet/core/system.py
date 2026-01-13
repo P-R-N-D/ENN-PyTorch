@@ -15,6 +15,7 @@ import sys
 import sysconfig
 import threading
 import time
+from functools import lru_cache
 from dataclasses import dataclass, replace
 from datetime import timezone, tzinfo
 from pathlib import Path
@@ -50,6 +51,9 @@ if TYPE_CHECKING:
 _LOGGER = logging.getLogger(__name__)
 
 _FP32_PRECISION_CACHE: dict[str, str] = {}
+_EMPTY_CACHE_LAST_CALL_S_BY_DEVICE: dict[Tuple[str, int], float] = {}
+_DEVICE_STATS_CACHE: dict[Tuple[str, int], "Device"] = {}
+_CPU_PROC_CACHE: Optional[int] = None
 
 _RUNTIME_CFG = SimpleNamespace(
     deterministic=False,
@@ -67,6 +71,8 @@ _LAZY_LOCK_NAMES = {
     "_CPU_PROC_LOCK",
     "_RUNTIME_CFG_LOCK",
 }
+
+_LAZY_LOCK_INIT_LOCK = threading.Lock()
 
 _TZ_ALIASES = {
     k: v
@@ -132,10 +138,17 @@ _TZ_ALIASES = {
 def __getattr__(name: str) -> Any:
     if name in _LAZY_LOCK_NAMES:
         g = globals()
-        if name not in g:
-            from .concurrency import Mutex
-            g[name] = Mutex()
-        return g[name]
+        lock = g.get(name, None)
+        if lock is not None:
+            return lock
+        with _LAZY_LOCK_INIT_LOCK:
+            lock = g.get(name, None)
+            if lock is None:
+                from .concurrency import Mutex
+
+                lock = Mutex()
+                g[name] = lock
+        return lock
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
@@ -482,7 +495,7 @@ def empty_device_cache(
         min_interval_s = 0.0
     now = time.monotonic()
     key = _clear_device_index(device)
-    with _EMPTY_CACHE_LOCK:
+    with _mutex_lock("_EMPTY_CACHE_LOCK"):
         last = float(_EMPTY_CACHE_LAST_CALL_S_BY_DEVICE.get(key, 0.0))
         if min_interval_s and (now - last) < float(min_interval_s):
             return
@@ -883,7 +896,7 @@ def set_float32_precision(
                 break
     precision = "tf32" if use_tf32 else "ieee"
     key = "cuda"
-    with _FP32_PRECISION_LOCK:
+    with _mutex_lock("_FP32_PRECISION_LOCK"):
         if _FP32_PRECISION_CACHE.get(key) == precision:
             return
         _FP32_PRECISION_CACHE[key] = precision
@@ -1231,7 +1244,7 @@ def is_int4_supported(
 def get_device_stats(device: Optional[Union[torch.device, str]] = None) -> Device:
     dev = _device_from(device)
     key = (str(dev.type), int(dev.index) if dev.index is not None else -1)
-    with _DEVICE_STATS_LOCK:
+    with _mutex_lock("_DEVICE_STATS_LOCK"):
         cached = _DEVICE_STATS_CACHE.get(key)
         if cached is not None:
             return cached
@@ -1266,7 +1279,7 @@ def get_device_stats(device: Optional[Union[torch.device, str]] = None) -> Devic
         float8_dtypes=tuple(),
         int_quant_bits=quant_bits,
     )
-    with _DEVICE_STATS_LOCK:
+    with _mutex_lock("_DEVICE_STATS_LOCK"):
         _DEVICE_STATS_CACHE[key] = stats
     return stats
 
@@ -1282,7 +1295,7 @@ def get_device(
     **kwargs: Any,
 ) -> torch.device:
     del args, kwargs
-    with _RUNTIME_CFG_LOCK:
+    with _mutex_lock("_RUNTIME_CFG_LOCK"):
         cfg = _RUNTIME_CFG
         if deterministic is not None:
             cfg.deterministic = bool(deterministic)
@@ -1327,26 +1340,28 @@ def get_device(
         matmul_prec = str(cfg.matmul_precision)
     _call(getattr(torch, "set_float32_matmul_precision", None), matmul_prec)
 
-if is_accelerator_available("cuda"):
-    idx_env = env_first_int(("LOCAL_RANK", "STNET_ACCELERATOR_INDEX", "STNET_DEVICE_INDEX"), default=0)
-    ndev = max(1, int(get_num_accelerators("cuda") or 1))
-    idx = 0
-    with contextlib.suppress(Exception):
-        idx = int(idx_env) % int(ndev)
-    with _mutex_lock("_CPU_PROC_LOCK"):
-        set_accelerator_index("cuda", int(idx))
-    device = torch.device(f"cuda:{idx}")
-    cudnn = getattr(torch.backends, "cudnn", None)
-    if cudnn is not None:
-        _call(setattr, cudnn, "deterministic", bool(det))
-        _call(setattr, cudnn, "benchmark", bool(cudnn_bench_val))
-    cuda_b = getattr(torch.backends, "cuda", None)
-    matmul = getattr(cuda_b, "matmul", None) if cuda_b is not None else None
-    if matmul is not None and hasattr(matmul, "allow_tf32"):
-        _call(setattr, matmul, "allow_tf32", bool(allow_tf32_val))
-    cudnn_b = getattr(torch.backends, "cudnn", None)
-    if cudnn_b is not None and hasattr(cudnn_b, "allow_tf32"):
-        _call(setattr, cudnn_b, "allow_tf32", bool(allow_tf32_val))
+    if is_accelerator_available("cuda"):
+        idx_env = env_first_int(
+            ("LOCAL_RANK", "STNET_ACCELERATOR_INDEX", "STNET_DEVICE_INDEX"), default=0
+        )
+        ndev = max(1, int(get_num_accelerators("cuda") or 1))
+        idx = 0
+        with contextlib.suppress(Exception):
+            idx = int(idx_env) % int(ndev)
+        with _mutex_lock("_CPU_PROC_LOCK"):
+            set_accelerator_index("cuda", int(idx))
+        device = torch.device(f"cuda:{idx}")
+        cudnn = getattr(torch.backends, "cudnn", None)
+        if cudnn is not None:
+            _call(setattr, cudnn, "deterministic", bool(det))
+            _call(setattr, cudnn, "benchmark", bool(cudnn_bench_val))
+        cuda_b = getattr(torch.backends, "cuda", None)
+        matmul = getattr(cuda_b, "matmul", None) if cuda_b is not None else None
+        if matmul is not None and hasattr(matmul, "allow_tf32"):
+            _call(setattr, matmul, "allow_tf32", bool(allow_tf32_val))
+        cudnn_b = getattr(torch.backends, "cudnn", None)
+        if cudnn_b is not None and hasattr(cudnn_b, "allow_tf32"):
+            _call(setattr, cudnn_b, "allow_tf32", bool(allow_tf32_val))
     elif is_accelerator_available("xpu"):
         idx = 0
         idx_env = env_first_int(("LOCAL_RANK",), default=0)
@@ -1427,7 +1442,7 @@ class CPU:
         if _CPU_PROC_CACHE is not None:
             return _CPU_PROC_CACHE
 
-        with _CPU_PROC_LOCK:
+        with _mutex_lock("_CPU_PROC_LOCK"):
             if _CPU_PROC_CACHE is not None:
                 return _CPU_PROC_CACHE
 

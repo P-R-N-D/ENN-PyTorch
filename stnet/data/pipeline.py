@@ -499,38 +499,6 @@ def _is_source(obj: Any) -> bool:
         return False
 
 
-def _process(
-    batch: Any,
-    *args: Any,
-    flatten_features: bool,
-    labels_dtype: Optional[torch.dtype],
-    sanitize: bool,
-    **kwargs: Any,
-) -> Dict[str, Any]:
-    features: Any = None
-    labels: Any = None
-    if isinstance(batch, (Mapping, TensorDictBase)):
-        with contextlib.suppress(Exception):
-            features, labels = get_row(batch, labels_required=False)
-    if features is None and isinstance(batch, Mapping):
-        features = batch.get("X")
-        labels = batch.get("Y", None)
-    if flatten_features and isinstance(features, torch.Tensor) and (features.dim() >= 2):
-        features = features.reshape(features.shape[0], -1)
-    if labels_dtype is not None and isinstance(labels, torch.Tensor):
-        labels = labels.to(dtype=labels_dtype, non_blocking=True, copy=False)
-    if sanitize and isinstance(labels, torch.Tensor) and labels.is_floating_point():
-        torch.nan_to_num(labels, nan=0.0, posinf=0.0, neginf=0.0, out=labels)
-    out: Dict[str, Any] = {"X": features}
-    if labels is not None:
-        out["Y"] = labels
-    if isinstance(batch, (Mapping, TensorDictBase)):
-        with contextlib.suppress(Exception):
-            if "row_ids" in batch:
-                out["row_ids"] = batch.get("row_ids")
-    return out
-
-
 def _td_batch_size_from_X(x: Any) -> list[int]:
     return [int(x.shape[0])] if isinstance(x, torch.Tensor) and x.ndim >= 1 else []
 
@@ -846,6 +814,38 @@ def iter_dataset(data: object) -> tuple[list[tuple[str, object]], object | None]
     return ([("0", data)], None)
 
 
+def preprocess(
+    batch: Any,
+    *args: Any,
+    flatten_features: bool,
+    labels_dtype: Optional[torch.dtype],
+    sanitize: bool,
+    **kwargs: Any,
+) -> Dict[str, Any]:
+    features: Any = None
+    labels: Any = None
+    if isinstance(batch, (Mapping, TensorDictBase)):
+        with contextlib.suppress(Exception):
+            features, labels = get_row(batch, labels_required=False)
+    if features is None and isinstance(batch, Mapping):
+        features = batch.get("X")
+        labels = batch.get("Y", None)
+    if flatten_features and isinstance(features, torch.Tensor) and (features.dim() >= 2):
+        features = features.reshape(features.shape[0], -1)
+    if labels_dtype is not None and isinstance(labels, torch.Tensor):
+        labels = labels.to(dtype=labels_dtype, non_blocking=True, copy=False)
+    if sanitize and isinstance(labels, torch.Tensor) and labels.is_floating_point():
+        torch.nan_to_num(labels, nan=0.0, posinf=0.0, neginf=0.0, out=labels)
+    out: Dict[str, Any] = {"X": features}
+    if labels is not None:
+        out["Y"] = labels
+    if isinstance(batch, (Mapping, TensorDictBase)):
+        with contextlib.suppress(Exception):
+            if "row_ids" in batch:
+                out["row_ids"] = batch.get("row_ids")
+    return out
+
+
 def dataset(
     source: Source,
     *args: Any,
@@ -1106,7 +1106,7 @@ class Collator:
                     canonicalize_keys_(stacked, allow_missing_labels=True)
 
             try:
-                conv = _process(
+                conv = preprocess(
                     stacked,
                     flatten_features=flatten,
                     labels_dtype=labels_dtype,
@@ -1122,7 +1122,7 @@ class Collator:
             return stacked
         if isinstance(batch, Mapping):
             try:
-                conv = _process(
+                conv = preprocess(
                     batch,
                     flatten_features=flatten,
                     labels_dtype=labels_dtype,

@@ -27,8 +27,6 @@ from typing import Any, Callable, Optional, Protocol, Tuple, runtime_checkable
 import torch
 
 from .datatypes import env_first, env_first_float, env_first_int, env_flag, get_meta_path, save_temp, write_json
-from .policies import WorkerPolicy, optimize_threads
-
 from .system import CPU, _default_thread_limit, _optimal_local_worlds, _optimal_threads
 
 
@@ -1022,6 +1020,7 @@ class Thread:
             return
         self._tls.in_retune = True
         try:
+            from .policies import WorkerPolicy, optimize_threads
             dev_type, nacc = WorkerPolicy._available_accelerator()
             is_accel = bool(nacc and int(nacc) > 0)
             cpus = max(1, len(self._allowed_cpus))
@@ -1163,6 +1162,7 @@ class Thread:
                 ),
             )
             self._io_workers = tuned_workers
+            from .policies import WorkerPolicy, optimize_threads
             dev_type, nacc = WorkerPolicy._available_accelerator()
             is_accel = bool(nacc and int(nacc) > 0)
             cap_mult = _default_thread_limit(cpus, is_accel=is_accel, nogil=bool(self._nogil))
