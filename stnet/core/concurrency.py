@@ -175,6 +175,10 @@ def new_affinity(io_workers: Optional[int] = None) -> "Thread":
     return _TLB_SINGLETON
 
 
+def new_thread(fn: Callable[[Any], Any], *, io_workers: Optional[int] = None) -> Callable[[Any], Any]:
+    return new_affinity(io_workers=io_workers).new_thread(fn)
+
+
 def close(obj: Any, *args: Any, join_timeout: float | None = 1.0) -> None:
     for name in (
         "cleanup",
