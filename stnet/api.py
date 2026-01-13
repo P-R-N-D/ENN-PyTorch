@@ -1272,8 +1272,8 @@ def predict(
                 logger.info("predict debug: preserving tmp_dir=%s", tmp_dir)
 
 
-@get_execution_time(logger, fn_name="get_prediction")
-def get_prediction(
+@get_execution_time(logger, fn_name="postprocess")
+def postprocess(
     source: PathLike,
     *args: Any,
     output: str | None = "memory",
@@ -1282,10 +1282,10 @@ def get_prediction(
 ) -> PredictionOutput:
     with inference_mode(torch.nn.Identity()):
         if not bool(source):
-            raise ValueError("get_prediction: 'source' must be a non-empty path")
+            raise ValueError("postprocess: 'source' must be a non-empty path")
         src = _coerce_path(source)
         if src is None:
-            raise ValueError("get_prediction: 'source' is empty/None after normalization")
+            raise ValueError("postprocess: 'source' is empty/None after normalization")
         output_mode = _coerce_prediction_output(output)
         overwrite_mode = _coerce_prediction_overwrite(overwrite)
         out_path = None
@@ -1296,14 +1296,14 @@ def get_prediction(
                 out_path = _coerce_prediction_path(path_n, run_id=run_id)
                 if out_path is None:
                     logger.warning(
-                        "get_prediction: output=%r requires path to be a .h5/.hdf5 file. Got path=%r; falling back to output='memory'.",
+                        "postprocess: output=%r requires path to be a .h5/.hdf5 file. Got path=%r; falling back to output='memory'.",
                         output,
                         path,
                     )
                     output_mode = "memory"
                 elif not _is_path_writable(out_path):
                     logger.warning(
-                        "get_prediction: output=%r path is not writable: %r; falling back to output='memory'.",
+                        "postprocess: output=%r path is not writable: %r; falling back to output='memory'.",
                         output,
                         out_path,
                     )
@@ -1316,7 +1316,7 @@ def get_prediction(
                 Storage.validate_predictions_h5(os.fspath(out_path))
                 return PersistentTensorDict(filename=out_path, mode="r")
             if overwrite_mode == "error":
-                raise FileExistsError(f"get_prediction: destination already exists: {out_path!r}")
+                raise FileExistsError(f"postprocess: destination already exists: {out_path!r}")
         if (src.endswith(".h5") or src.endswith(".hdf5")) and os.path.isfile(src):
             if output_mode == "file":
                 if out_path is None:
@@ -1359,7 +1359,7 @@ def get_prediction(
             out_shape_t = tuple(int(x) for x in (out_shape or ()))
             if count <= 0 or (not out_shape_t) or any(int(d) <= 0 for d in out_shape_t):
                 raise ValueError(
-                    f"get_prediction: invalid manifest metadata: count={count!r}, out_shape={out_shape!r}"
+                    f"postprocess: invalid manifest metadata: count={count!r}, out_shape={out_shape!r}"
                 )
             store_float = _get_prediction_dtype(chunks_dir)
             Storage.concat_memory_mapped_tensor(
@@ -1372,14 +1372,14 @@ def get_prediction(
         X_mmt = Storage.load_memmap_features(os.fspath(memmap_dir))
         Y_mmt = Storage.open_memory_mapped_tensor(os.fspath(pred_path))
         if Y_mmt is None:
-            raise RuntimeError("get_prediction: failed to open pred.mmt")
+            raise RuntimeError("postprocess: failed to open pred.mmt")
         if count is None:
             try:
                 count = int(X_mmt.shape[0])
             except Exception:
                 count = None
         if count is None:
-            raise RuntimeError("get_prediction: failed to infer count")
+            raise RuntimeError("postprocess: failed to infer count")
         if out_path is not None:
             if os.path.exists(out_path):
                 if overwrite_mode == "resume" and os.path.isfile(out_path):
@@ -1395,7 +1395,7 @@ def get_prediction(
                     return PersistentTensorDict(filename=out_path, mode="r")
                 if overwrite_mode == "error":
                     raise FileExistsError(
-                        f"get_prediction: destination already exists: {out_path!r}"
+                        f"postprocess: destination already exists: {out_path!r}"
                     )
             out_td = Storage.write_predictions_h5_atomic(
                 os.fspath(out_path),
@@ -1406,7 +1406,7 @@ def get_prediction(
             )
             if not os.path.isfile(out_path):
                 raise RuntimeError(
-                    f"get_prediction: persistent output missing after write: {out_path!r}"
+                    f"postprocess: persistent output missing after write: {out_path!r}"
                 )
             Storage.validate_predictions_h5(
                 os.fspath(out_path),
