@@ -1077,6 +1077,17 @@ class Collator:
     sanitize: bool = False
     flatten_features: bool = False
 
+    def __init__(
+        self,
+        *,
+        labels_dtype: Optional[torch.dtype] = None,
+        sanitize: bool = False,
+        flatten_features: bool = False,
+    ) -> None:
+        self.labels_dtype = labels_dtype
+        self.sanitize = bool(sanitize)
+        self.flatten_features = bool(flatten_features)
+
     def __call__(self, batch: Any) -> Any:
         labels_dtype = self.labels_dtype
         sanitize = bool(self.sanitize)
