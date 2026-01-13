@@ -34,6 +34,27 @@ This repository also includes a worked example notebook (`notebook.ipynb`) and a
 - **Runnable tasks** (`stnet.runtime`): thread/NUMA tuning, free-threaded/no-GIL optimizations, mixed-precision helpers, history recorder, and OOM recovery hooks. ONNX/ORT/torch.export (PT2) out of the box; optional platform-dependent backends (TensorRT/CoreML/ExecuTorch/onnx-tf) via extras. elastic launch wiring and group setup for multi-process CPU/GPU runs.
 - **Losses/optimizers/profiling** (`stnet.core`): Student’s t losses, SWA helpers, FLOP/IO timing.
 
+## Model layout (current)
+
+High-level flow used by `stnet.nn.architecture.Model`:
+
+```
+Input features (B x C_in)
+  → Scaler (feature normalization)
+  → TokenFuser
+      → TokenizedView (spatial extractor)
+      → TokenizedView (temporal extractor)
+      → CrossTransformer fusion (spatial|temporal)
+      → Aggregation + MLP head → output vector
+  → TokenCollector (temporal controller head)
+  → Optional linear branch (configurable)
+```
+
+Key building blocks:
+- **Scaler** for input feature normalization, with an optional linear branch when `use_linear_branch` is enabled in the config.【F:stnet/nn/architecture.py†L1032-L1049】
+- **TokenFuser** builds spatial/temporal TokenizedViews and fuses them via a CrossTransformer before projecting through the head MLP to the output dimension.【F:stnet/nn/architecture.py†L659-L836】
+- **TokenCollector** acts as the temporal controller head for the model instance.【F:stnet/nn/architecture.py†L1051-L1061】
+
 ## Installation
 1. Install the appropriate **PyTorch** build for your accelerator first (CUDA/ROCm/XPU/CPU).
 2. Install STNet-PyTorch (editable for development is recommended):
@@ -204,25 +225,28 @@ stnet/
   config.py
   core/
     __init__.py
-    casting.py            # dtype helpers, env parsing, safe tensor coercions
     compat.py             # accelerator/memory helpers, meta/fake tensor guards
+    concurrency.py        # threading/affinity helpers
+    datatypes.py          # env parsing + small type utilities
     distributed.py        # elastic launch + process group utilities
     graph.py              # torch.compile helpers, graph break utilities
-    amp.py                # AMP negotiation/autocast policies, dtype guards
+    policies.py           # thread/data policy heuristics
+    precision.py          # dtype/precision helpers
     profiler.py           # lightweight FLOP/IO timers
-    staging.py            # pinned-memory staging pool
     system.py             # thread/NUMA tuning, device detection, temp dirs
+    tensor.py             # tensor helpers + from_buffer context manager
   data/
     __init__.py
     nodes.py              # torchdata nodes, Sampler/Loader, memmap writer/reader
     pipeline.py           # dataset fetch, collate, session orchestration
-    schemas.py            # key resolution, JSON helpers, underflow handling
+    storage.py            # dataset storage helpers
   runtime/
     __init__.py
     io.py                 # exporters (ONNX/ORT/torch.export (PT2)/etc.), checkpoint save/load
     main.py               # training loop, predict path, elastic worker entrypoint
     losses.py             # Student’s t, regression losses, mask utils
     optimizers.py         # SGD/AdamW wrappers, SWA helper
+    wrappers.py           # export/runtime wrappers
   nn/
     __init__.py
     activations.py
