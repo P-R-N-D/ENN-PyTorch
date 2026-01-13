@@ -9,7 +9,7 @@ import numpy as np
 import torch
 import onnxruntime as ort
 
-from stnet.core.graph import from_buffer
+from stnet.core.tensor import from_buffer
 from wsl_nogil_train import build_dataset
 from stnet.api import new_model, train
 from stnet.config import ModelConfig, PatchConfig
