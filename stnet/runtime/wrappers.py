@@ -170,9 +170,9 @@ def _pad_sample(model: object, sample_input: object, *, batch: int = 1) -> objec
 def _onnx_options(kwargs: object, *args: Any, target: str = "onnx") -> object:
     target_l = str(target or "onnx").strip().lower()
     defaults = {
-        "tensorrt": (18, True, True, True, [18, 17, 16, 15, 13]),
-        "tensorflow": (18, False, True, True, [18, 17, 16, 15, 13]),
-        "default": (18, False, True, False, [18, 17, 16, 15, 13]),
+        "tensorrt": (18, True, True, True, []),
+        "tensorflow": (18, False, True, True, []),
+        "default": (18, False, True, False, []),
     }
     key = target_l.replace("-", "").replace("_", "")
     if key == "trt":
@@ -182,17 +182,25 @@ def _onnx_options(kwargs: object, *args: Any, target: str = "onnx") -> object:
     )
     opset = int(kwargs.get("opset_version", d_opset))
     fb = kwargs.get("opset_fallback", d_fb)
-    fallback = (
-        [int(x) for x in re.split(r"[\s,]+", fb) if x]
-        if isinstance(fb, str)
-        else [int(x) for x in fb]
-        if isinstance(fb, (list, tuple))
-        else [int(fb)]
-    )
+    if not fb:
+        fallback: list[int] = []
+    elif isinstance(fb, str):
+        fallback = [int(x) for x in re.split(r"[\s,]+", fb) if x]
+    elif isinstance(fb, (list, tuple)):
+        fallback = [int(x) for x in fb]
+    else:
+        fallback = [int(fb)]
+    clean_fb: list[int] = []
+    for v in fallback:
+        iv = int(v)
+        if iv == int(opset):
+            continue
+        if iv not in clean_fb:
+            clean_fb.append(iv)
     return {
         "sample_input": kwargs.get("sample_input"),
         "opset_version": opset,
-        "opset_fallback": [opset] + [v for v in fallback if v != opset],
+        "opset_fallback": clean_fb,
         "dynamic_batch": kwargs.get("dynamic_batch", d_dyn),
         "prefer_dynamo": kwargs.get("prefer_dynamo", kwargs.get("dynamo", d_pref)),
         "simplify": kwargs.get("simplify_onnx", kwargs.get("onnx_simplify", d_simp)),
