@@ -7,28 +7,27 @@ This repository also includes a worked example notebook (`notebook.ipynb`) and a
 ## Requirements
 
 ### Mandatory
-- **Python**: >= 3.12
-- **PyTorch**: >= 2.9.1
-- **Triton**: >= 3.5.1 (core JIT backend; typically installed alongside PyTorch)
+- **python**: >= 3.12
+- **torch**: >= 2.9.1
 - **torchao**: >= 0.15.0
 - **torchdata**: >= 0.11.0 (`torchdata.nodes`-based pipeline)
 - **tensordict**: >= 0.10.0
+- **triton**: >= 3.5.1 (core JIT backend; typically installed alongside PyTorch)
 - **numpy**: >= 2.4.1
-- **psutil**: >= 7.2.1
-- **py-cpuinfo**: >= 9.0.0
-- **tqdm**: >= 4.67.1
-- **h5py**: >= 3.15.1 (required for persisted prediction outputs)
 - **onnx**: >= 1.20.1
 - **onnxruntime**: >= 1.23.2
 - **onnxscript**: >= 0.5.7
 - **onnx_ir**: >= 0.1.14
 - **ml_dtypes**: >= 0.5.4
+- **psutil**: >= 7.2.1
+- **py-cpuinfo**: >= 9.0.0
+- **tqdm**: >= 4.67.1
+- **h5py**: >= 3.15.1 (required for persisted prediction outputs)
 
 ### Recommended
-- **Python**: >= 3.13t (free-threading / no-GIL build)
+- **python**: >= 3.13t (free-threading / no-GIL build)
   - The data pipeline uses thread-parallel execution via `torchdata.nodes` and is designed to reduce GIL contention on standard CPython.
   - Free-threaded Python can further improve throughput by removing the GIL, but it is not necessary.
-- **PyTorch**: >= 2.9.1
 - DataFrame integrations (pandas, pandas-on-Spark, polars) are optional. install the corresponding extra (e.g., `pip install -e .[pandas]`) when needed.
 
 ## Features
@@ -320,11 +319,11 @@ to reduce "almost-right" config bugs:
 
 ## Version & compatibility notes
 
-- Python ≥ 3.10 is required.
-- PyTorch is expected to be **≥ 2.8.0**. If you rely on features that landed later (e.g., newer Inductor options), bump the constraint accordingly.
-- `torchdata` (`torchdata.nodes`) powers the data pipeline.
+- `python` ≥ 3.12 is mandatory among GIL-enabled builds (or abi3-complicants), while `python` ≥ 3.13t is reqiured among free-threading builds (or abi3t-complicants).
+- `torch` ≥ 2.9.1 is mandatory.
+- `torchdata` ≥ 0.11.0 is mandatory bacause `torchdata.nodes` is required.
 - `tensordict` provides TensorDict integration and memory-mapped tensor utilities.
-- `triton` is intentionally **not** pinned here; the correct binary is installed as a transitive dependency of PyTorch.
+- `triton` ≥ 3.5.1 is necessary.
 - Export backends (TensorRT/CoreML/ExecuTorch/ORT) have additional system requirements; install only what you need.
 
 ## License
