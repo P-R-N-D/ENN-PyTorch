@@ -1796,15 +1796,18 @@ class BoundedExecutor(futures.Executor):
 
     def submit(self, fn: Callable[..., Any], /, *args: Any, **kwargs: Any) -> futures.Future:
         sem = self._sem
+        sem.acquire()
+        try:
+            fut = self._inner.submit(fn, *args, **kwargs)
+        except Exception:
+            sem.release()
+            raise
 
-        def _wrapped(*a: Any, **k: Any) -> Any:
-            sem.acquire()
-            try:
-                return fn(*a, **k)
-            finally:
-                sem.release()
+        def _release(_fut: futures.Future) -> None:
+            sem.release()
 
-        return self._inner.submit(_wrapped, *args, **kwargs)
+        fut.add_done_callback(_release)
+        return fut
 
     def map(
         self,
@@ -1813,16 +1816,38 @@ class BoundedExecutor(futures.Executor):
         timeout: float | None = None,
         chunksize: int = 1,
     ) -> Any:
+        del chunksize
         sem = self._sem
+        end_time = None
+        if timeout is not None:
+            end_time = time.monotonic() + float(timeout)
 
-        def _wrapped(*a: Any) -> Any:
+        futures_list: list[futures.Future] = []
+        for args in zip(*iterables):
             sem.acquire()
             try:
-                return fn(*a)
-            finally:
+                fut = self._inner.submit(fn, *args)
+            except Exception:
+                sem.release()
+                raise
+
+            def _release(_fut: futures.Future) -> None:
                 sem.release()
 
-        return self._inner.map(_wrapped, *iterables, timeout=timeout, chunksize=chunksize)
+            fut.add_done_callback(_release)
+            futures_list.append(fut)
+
+        def _result_iter() -> Iterator[Any]:
+            for fut in futures_list:
+                if end_time is None:
+                    yield fut.result()
+                    continue
+                remaining = end_time - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError()
+                yield fut.result(remaining)
+
+        return _result_iter()
 
     def shutdown(self, wait: bool = True, *, cancel_futures: bool = False) -> None:
         try:
