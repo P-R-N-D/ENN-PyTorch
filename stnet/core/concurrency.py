@@ -32,6 +32,23 @@ from .datatypes import env_first, env_first_float, env_first_int, env_flag, get_
 from .system import CPU, _default_thread_limit, _optimal_local_worlds, _optimal_threads
 
 
+_EXECUTOR_ORDINAL = itertools.count(0)
+_ENV_INNER_THREAD_VARS: tuple[str, ...] = (
+    "OMP_NUM_THREADS",
+    "MKL_NUM_THREADS",
+    "OPENBLAS_NUM_THREADS",
+    "BLIS_NUM_THREADS",
+    "VECLIB_MAXIMUM_THREADS",
+    "NUMEXPR_NUM_THREADS",
+)
+_ENV_INNER_BOOL_VARS: dict[str, str] = {
+    "OMP_DYNAMIC": "FALSE",
+    "MKL_DYNAMIC": "FALSE",
+    "KMP_BLOCKTIME": "0",
+    "OMP_PROC_BIND": "TRUE",
+}
+
+
 def _flatten_args(items: Sequence[Any]) -> Iterator[Any]:
     for item in items:
         if isinstance(item, dict):
@@ -126,31 +143,10 @@ def _is_affinity_enabled() -> bool:
 def _is_affinity_strict() -> bool:
     return bool(env_flag("STNET_EXECUTOR_AFFINITY_STRICT", "STNET_AFFINITY_STRICT", default=False))
 
-
-_EXECUTOR_ORDINAL = itertools.count(0)
-
-
 def _next_ordinal() -> int:
     with contextlib.suppress(Exception):
         return int(next(_EXECUTOR_ORDINAL))
     return 0
-
-
-_ENV_INNER_THREAD_VARS: tuple[str, ...] = (
-    "OMP_NUM_THREADS",
-    "MKL_NUM_THREADS",
-    "OPENBLAS_NUM_THREADS",
-    "BLIS_NUM_THREADS",
-    "VECLIB_MAXIMUM_THREADS",
-    "NUMEXPR_NUM_THREADS",
-)
-_ENV_INNER_BOOL_VARS: dict[str, str] = {
-    "OMP_DYNAMIC": "FALSE",
-    "MKL_DYNAMIC": "FALSE",
-    "KMP_BLOCKTIME": "0",
-    "OMP_PROC_BIND": "TRUE",
-}
-
 
 def _is_inner_thread_limited(wl: str) -> bool:
     wl = str(wl or "").strip().lower()
