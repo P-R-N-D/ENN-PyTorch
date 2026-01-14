@@ -197,8 +197,21 @@ def _is_nvml_blocked(now: object | None = None) -> object:
 
 def _is_nvml_available() -> object:
     global _nvml, _NVML_READY, _NVML_TRIED
-    if _is_nvml_blocked() or _NVML_TRIED:
+    nogil = bool(CPU.is_optimized_for_no_gil())
+
+    if _is_nvml_blocked():
+        if nogil:
+            with _NVML_LOCK:
+                return bool(_NVML_READY)
         return bool(_NVML_READY)
+
+    if nogil:
+        with _NVML_LOCK:
+            if _NVML_TRIED:
+                return bool(_NVML_READY)
+    else:
+        if _NVML_TRIED:
+            return bool(_NVML_READY)
     if _is_nvml_disabled():
         with _NVML_LOCK:
             _NVML_TRIED = True
@@ -1346,7 +1359,7 @@ def _gpu_nvml_utils(device: TorchDeviceLike) -> object:
                 float,
             )
         )
-        if min_interval > 0.0:
+        if min_interval > 0.0 and not nogil:
             cached = _NVML_UTIL_CACHE.get(idx_i)
             if cached is not None:
                 ts, cg, cm = cached

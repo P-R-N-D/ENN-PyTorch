@@ -1023,6 +1023,7 @@ class Loader:
         if not isinstance(node_obj, BaseNode):
             raise TypeError("Loader supports only torchdata.nodes.BaseNode instances.")
         self._device = _normalize_device_spec(device)
+        self._nogil = bool(CPU.is_optimized_for_no_gil())
         self._non_blocking = bool(non_blocking)
         self._length = int(length) if length is not None else None
         depth = max(1, int(prefetch_factor))
@@ -1059,6 +1060,7 @@ class Loader:
             else torchdata.nodes.Loader(node_obj)
         )
         self._thread2dev: Dict[int, torch.device] = {}
+        self._thread2dev_lock = Mutex()
         self._threads_hint = self._infer_mapper_threads(node_obj) if node_obj is not None else 1
         self._num_shards = 1
         self._shard_id = 0
@@ -1103,12 +1105,14 @@ class Loader:
     def _device_for_current_thread(self) -> torch.device:
         if isinstance(self._device, list):
             tid = threading.get_ident()
-            dev = self._thread2dev.get(tid)
-            if dev is None:
-                idx = len(self._thread2dev) % max(1, len(self._device))
-                dev = self._device[idx]
-                self._thread2dev[tid] = dev
-            return dev
+            guard = self._thread2dev_lock if self._nogil else contextlib.nullcontext()
+            with guard:
+                dev = self._thread2dev.get(tid)
+                if dev is None:
+                    idx = len(self._thread2dev) % max(1, len(self._device))
+                    dev = self._device[idx]
+                    self._thread2dev[tid] = dev
+                return dev
         return self._device
 
     def _infer_mapper_threads(self, node: Any) -> int:

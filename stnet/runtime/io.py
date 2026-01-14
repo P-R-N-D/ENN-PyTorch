@@ -270,6 +270,11 @@ class Exporter:
 
     @classmethod
     def register(cls, name: str, exts: tuple[str, ...], impl: Format) -> None:
+        with cls._defaults_lock:
+            cls._register_unlocked(name, exts, impl)
+
+    @classmethod
+    def _register_unlocked(cls, name: str, exts: tuple[str, ...], impl: Format) -> None:
         cls._by_name[name] = impl
         for ext in exts:
             cls._ext_map[ext.lower()] = name
@@ -292,22 +297,23 @@ class Exporter:
             cls._ONNXExporter = getattr(_w, "_ONNXExporter", None)
             cls._ORTBuilder = getattr(_w, "_ORTBuilder", None)
 
-            cls.register("onnx", (".onnx",), _w.ONNX())
-            cls.register("ort", (".ort",), _w.ORT())
-            cls.register("tensorrt", (".engine",), _w.TensorRT())
-            cls.register("coreml", (".mlmodel",), _w.CoreML())
-            cls.register("litert", (".tflite",), _w.LiteRT())
-            cls.register("pt2", (".pt2", ".export"), _w.TorchExport())
-            cls.register("aoti", (".aoti",), _w.TorchInductor())
-            cls.register("executorch", (".pte",), _w.ExecuTorch())
-            cls.register("tensorflow", (".savedmodel", ".pb", ".tf"), _w.TensorFlow())
+            cls._register_unlocked("onnx", (".onnx",), _w.ONNX())
+            cls._register_unlocked("ort", (".ort",), _w.ORT())
+            cls._register_unlocked("tensorrt", (".engine",), _w.TensorRT())
+            cls._register_unlocked("coreml", (".mlmodel",), _w.CoreML())
+            cls._register_unlocked("litert", (".tflite",), _w.LiteRT())
+            cls._register_unlocked("pt2", (".pt2", ".export"), _w.TorchExport())
+            cls._register_unlocked("aoti", (".aoti",), _w.TorchInductor())
+            cls._register_unlocked("executorch", (".pte",), _w.ExecuTorch())
+            cls._register_unlocked("tensorflow", (".savedmodel", ".pb", ".tf"), _w.TensorFlow())
             cls._defaults_registered = True
 
     @classmethod
     def for_export(cls, ext: str) -> Format | None:
         cls._ensure_defaults_registered()
-        name = cls._ext_map.get(ext.lower())
-        return cls._by_name.get(name) if name else None
+        with cls._defaults_lock:
+            name = cls._ext_map.get(ext.lower())
+            return cls._by_name.get(name) if name else None
 
 
 _register_safe_globals()

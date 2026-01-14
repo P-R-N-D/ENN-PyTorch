@@ -1506,6 +1506,9 @@ class CPU:
 
     @staticmethod
     def is_free_threaded_build() -> bool:
+        tag = getattr(getattr(sys, "implementation", None), "cache_tag", "") or ""
+        if isinstance(tag, str) and tag.endswith("t"):
+            return True
         val = sysconfig.get_config_var("Py_GIL_DISABLED")
         with contextlib.suppress(Exception):
             return bool(int(val or 0))
