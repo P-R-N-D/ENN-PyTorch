@@ -15,7 +15,7 @@ from ..core.concurrency import Mutex
 from ..core.datatypes import env_bool, env_int
 from ..core.compat import StochasticDepth
 from ..core.system import empty_device_cache, is_oom_error
-from ..core.graph import coerce_checkpoint, torch_compiler_disable, is_symbolic, is_checkpoint
+from ..core.graph import coerce_checkpoint, torch_compiler_disable, is_symbolic, is_checkpoint, is_meta_or_fake_tensor
 from .kernels import DotProductAttention, MultiHeadAttention, MultiScaleRetention
 
 _Norm = nn.LayerNorm
@@ -797,6 +797,12 @@ class DilatedAttention(nn.Module):
                 tracing = bool(torch.jit.is_tracing() or torch.jit.is_scripting())
             except Exception:
                 tracing = False
+        if not tracing:
+            try:
+                if is_meta_or_fake_tensor(x) or is_meta_or_fake_tensor(key_padding_mask):
+                    tracing = True
+            except Exception:
+                pass
         if (not tracing) and D != self.embed_dim:
             raise ValueError(f"x.shape[-1]={D} must match embed_dim={self.embed_dim}")
         want_weights = bool(need_weights)
@@ -1003,7 +1009,8 @@ class DilatedAttention(nn.Module):
             is_simple = (int(self.dilation) == 1) and (self.window_size is None)
             attn_out: Optional[torch.Tensor] = None
             if (
-                is_simple
+                (not tracing)
+                and is_simple
                 and bool(self.causal)
                 and (kpm_k is not None)
                 and isinstance(kpm_k, torch.Tensor)

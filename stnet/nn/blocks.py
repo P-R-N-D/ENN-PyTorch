@@ -4,7 +4,6 @@ from __future__ import annotations
 import logging
 import contextlib
 import os
-import warnings
 from importlib import import_module
 from typing import Any, Callable, List, Optional, Sequence, Tuple, Union, cast
 
@@ -220,21 +219,15 @@ class RetNet(nn.Module):
         state: Optional[dict] = None,
         mode: Optional[str] = None,
     ) -> Tuple[torch.Tensor, Optional[dict]]:
-        if is_meta_or_fake_tensor(x) and (not is_symbolic()):
+        if getattr(x, "is_meta", False) and (not is_symbolic()):
             strict = str(os.environ.get("STNET_STRICT_META_FAKE", "0")).strip().lower() in {"1", "true", "yes", "y"}
             if strict:
-                raise RuntimeError("meta/fake tensor reached RetNet.forward")
-            warnings.warn(
-                "RetNet.forward received a meta/fake tensor; materializing to zeros. "
-                "Set STNET_STRICT_META_FAKE=1 to raise instead.",
-                RuntimeWarning,
-            )
+                raise RuntimeError("meta tensor reached RetNet.forward")
             try:
                 shape = tuple(int(s) for s in x.shape)
             except Exception:
                 shape = tuple(getattr(x, "shape", ()))
-            dev = torch.device("cpu") if getattr(x, "is_meta", False) else x.device
-            x = torch.zeros(shape, dtype=x.dtype, device=dev)
+            x = torch.zeros(shape, dtype=x.dtype, device=torch.device("cpu"))
         x = x.contiguous()
         if causal_mask is not None:
             causal_mask = causal_mask.contiguous()

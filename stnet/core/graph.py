@@ -16,6 +16,7 @@ from .concurrency import Mutex
 from .datatypes import env_bool, env_first, env_first_int
 from .distributed import broadcast_scalar, is_distributed, is_dtensor_active
 from .system import CPU, is_accelerator_available
+from .tensor import is_meta_or_fake_tensor
 
 try:
     from torch.utils.checkpoint import checkpoint as _torch_checkpoint
