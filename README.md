@@ -319,7 +319,7 @@ to reduce "almost-right" config bugs:
 
 ## Version & compatibility notes
 
-- `python` ≥ 3.12 is mandatory among GIL-enabled builds (or abi3-complicants), while `python` ≥ 3.13t is reqiured among free-threading builds (or abi3t-complicants).
+- `python` ≥ 3.12 is mandatory among GIL-enabled builds (or `abi3`-complicants), while `python` ≥ 3.13t is reqiured among free-threading builds (or `abi3t`-complicants).
 - `torch` ≥ 2.9.1 is mandatory.
 - `torchdata` ≥ 0.11.0 is mandatory bacause `torchdata.nodes` is required.
 - `tensordict` provides TensorDict integration and memory-mapped tensor utilities.
