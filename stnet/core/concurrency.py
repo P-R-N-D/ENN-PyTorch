@@ -4,6 +4,7 @@ from __future__ import annotations
 import contextlib
 import ctypes
 import importlib
+import hashlib
 import itertools
 import platform
 import sys
@@ -12,6 +13,7 @@ import concurrent.futures as futures
 import traceback
 import math
 import os
+import re
 import collections
 import logging
 import queue
@@ -28,6 +30,23 @@ import torch
 
 from .datatypes import env_first, env_first_float, env_first_int, env_flag, get_meta_path, save_temp, write_json
 from .system import CPU, _default_thread_limit, _optimal_local_worlds, _optimal_threads
+
+
+_EXECUTOR_ORDINAL = itertools.count(0)
+_ENV_INNER_THREAD_VARS: tuple[str, ...] = (
+    "OMP_NUM_THREADS",
+    "MKL_NUM_THREADS",
+    "OPENBLAS_NUM_THREADS",
+    "BLIS_NUM_THREADS",
+    "VECLIB_MAXIMUM_THREADS",
+    "NUMEXPR_NUM_THREADS",
+)
+_ENV_INNER_BOOL_VARS: dict[str, str] = {
+    "OMP_DYNAMIC": "FALSE",
+    "MKL_DYNAMIC": "FALSE",
+    "KMP_BLOCKTIME": "0",
+    "OMP_PROC_BIND": "TRUE",
+}
 
 
 def _flatten_args(items: Sequence[Any]) -> Iterator[Any]:
@@ -85,7 +104,7 @@ def _is_force_unpin_enabled() -> bool:
 def _prod_int(shape: Sequence[int]) -> int:
     return int(max(1, math.prod(int(s) for s in shape)))
 
-    
+
 def is_free_threading_build() -> bool:
     tag = getattr(getattr(sys, "implementation", None), "cache_tag", "") or ""
     if tag.endswith("t"):
@@ -111,11 +130,376 @@ def python_build_tag() -> str:
     return f"{major}.{minor}{'t' if is_free_threading_build() else ''}"
 
 
-def supports_interpreter_pool_executor() -> bool:
+def is_interpreter_pool_supported() -> bool:
     return getattr(futures, "InterpreterPoolExecutor", None) is not None
 
+    
+@lru_cache(maxsize=1)
+def _is_affinity_enabled() -> bool:
+    return bool(env_flag("STNET_EXECUTOR_AFFINITY", "STNET_AFFINITY", default=True))
 
-def buffered(
+
+@lru_cache(maxsize=1)
+def _is_affinity_strict() -> bool:
+    return bool(env_flag("STNET_EXECUTOR_AFFINITY_STRICT", "STNET_AFFINITY_STRICT", default=False))
+
+def _next_ordinal() -> int:
+    with contextlib.suppress(Exception):
+        return int(next(_EXECUTOR_ORDINAL))
+    return 0
+
+def _is_inner_thread_limited(wl: str) -> bool:
+    wl = str(wl or "").strip().lower()
+    if wl not in {"cpu", "compute"}:
+        return False
+    if not bool(env_flag("STNET_EXECUTOR_LIMIT_INNER_THREADS", default=True)):
+        return False
+    if not bool(env_flag("STNET_EXECUTOR_TORCH_OUTER_PARALLELISM", default=True)):
+        return False
+    return True
+
+
+def _set_concurrency_env(key: str, value: str, *, force: bool, cap_down: bool = True) -> None:
+    try:
+        k = str(key)
+        v = str(value)
+        if force:
+            os.environ[k] = v
+            return
+        cur = os.environ.get(k, None)
+        if cur is None or str(cur).strip() == "":
+            os.environ[k] = v
+            return
+        if not cap_down:
+            return
+        try:
+            cur_i = int(str(cur).strip())
+            tgt_i = int(str(v).strip())
+        except Exception:
+            return
+        if cur_i > tgt_i:
+            os.environ[k] = str(max(1, tgt_i))
+    except Exception:
+        return
+
+
+def _init_env(key: str, value: str, *, force: bool) -> None:
+    try:
+        if force or (key not in os.environ) or (str(os.environ.get(key, "")).strip() == ""):
+            os.environ[str(key)] = str(value)
+    except Exception:
+        return
+
+
+def _limit_inner_threads(threads: int, *, force: bool = False) -> int:
+    t = max(1, int(threads))
+    ov = env_first_int(("STNET_EXECUTOR_INNER_THREADS",), default=0) or 0
+    if int(ov) > 0:
+        t = max(1, int(ov))
+    force = bool(force) or bool(env_flag("STNET_EXECUTOR_FORCE_INNER_THREADS", default=False))
+    cap_down = bool(env_flag("STNET_EXECUTOR_CAP_DOWN_INNER_THREADS", default=True))
+
+    for k in _ENV_INNER_THREAD_VARS:
+        _set_concurrency_env(k, str(t), force=force, cap_down=cap_down)
+    for k, v in _ENV_INNER_BOOL_VARS.items():
+        _init_env(k, v, force=force)
+
+    with contextlib.suppress(Exception):
+        torch.set_num_threads(int(t))
+    with contextlib.suppress(Exception):
+        torch.set_num_interop_threads(1)
+
+    return int(t)
+
+
+@lru_cache(maxsize=1)
+def _is_outer_concurrency_limited() -> bool:
+    return bool(env_flag("STNET_EXECUTOR_LIMIT_OUTER_CONCURRENCY", default=True))
+
+
+@lru_cache(maxsize=1)
+def _max_outer_concurrency() -> int:
+    return int(
+        env_first_int(
+            ("STNET_EXECUTOR_OUTER_CONCURRENCY", "STNET_EXECUTOR_OUTER_LIMIT"),
+            default=0,
+        )
+        or 0
+    )
+
+
+@lru_cache(maxsize=1)
+def _outer_concurrency_mode() -> str:
+    s = str(env_first(("STNET_EXECUTOR_OUTER_CONCURRENCY_MODE",), default="auto") or "auto").strip().lower()
+    return s if s in {"auto", "logical", "physical"} else "auto"
+
+
+@lru_cache(maxsize=1)
+def _are_processes_limited() -> bool:
+    return bool(env_flag("STNET_EXECUTOR_CAP_PROCESS_WORKERS", default=True))
+
+
+@lru_cache(maxsize=1)
+def _target_process_workers() -> int:
+    return int(env_first_int(("STNET_EXECUTOR_PROCESS_TARGET_WORKERS",), default=0) or 0)
+
+
+def _outer_concurrency_limit(wl: str, executor_kind: str, nlogical: int, nphysical: int, mw: int) -> int:
+    wl = str(wl or "").strip().lower()
+    if wl not in {"cpu", "compute"}:
+        return 0
+    if str(executor_kind) not in {"thread", "interpreter"}:
+        return 0
+    if not _is_outer_concurrency_limited():
+        return 0
+    ov = int(_max_outer_concurrency())
+    if ov < 0:
+        return 0
+    if ov > 0:
+        return max(1, min(int(ov), int(mw)))
+    mode = _outer_concurrency_mode()
+    nlog = max(1, int(nlogical))
+    nphy = max(1, int(nphysical))
+    if mode == "logical":
+        base = nlog
+    elif mode == "physical":
+        base = nphy
+    else:
+        base = nphy if wl == "compute" else nlog
+    return max(1, min(int(mw), int(base)))
+
+
+def _parse_cpu_list(spec: str) -> list[int]:
+    out: list[int] = []
+    s = str(spec or "").strip()
+    for part in s.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "-" in part:
+            a, b = part.split("-", 1)
+            with contextlib.suppress(Exception):
+                lo = int(a.strip())
+                hi = int(b.strip())
+                if hi < lo:
+                    lo, hi = hi, lo
+                out.extend(range(lo, hi + 1))
+        else:
+            with contextlib.suppress(Exception):
+                out.append(int(part))
+    return out
+
+
+@lru_cache(maxsize=8)
+def _linux_thread_sibling_groups(cpus_key: tuple[int, ...]) -> list[tuple[int, ...]]:
+    if not sys.platform.startswith("linux"):
+        return []
+    groups: dict[tuple[int, ...], None] = {}
+    for c in cpus_key:
+        p = f"/sys/devices/system/cpu/cpu{int(c)}/topology/thread_siblings_list"
+        try:
+            with open(p, "r", encoding="utf-8") as f:
+                raw = f.read().strip()
+        except Exception:
+            continue
+        sibs = sorted({int(x) for x in _parse_cpu_list(raw)})
+        if not sibs:
+            continue
+        groups[tuple(sibs)] = None
+    return sorted(groups.keys(), key=lambda g: (g[0], len(g), g))
+
+
+def _executor_scatter_cpus(cpus: Sequence[int]) -> list[int]:
+    base = sorted({int(x) for x in (cpus or [])})
+    if not base:
+        return []
+    groups = _linux_thread_sibling_groups(tuple(base))
+    if not groups:
+        return base
+    primary = [int(min(g)) for g in groups]
+    secondary: list[int] = []
+    for g in groups:
+        for x in g:
+            if int(x) not in primary:
+                secondary.append(int(x))
+    allowed = set(base)
+    out = [c for c in primary if c in allowed] + [c for c in secondary if c in allowed]
+    return out if out else base
+
+
+def _executor_prefer_smt_lane(cpus: Sequence[int], *, prefer_primary: bool) -> list[int]:
+    base = sorted({int(x) for x in (cpus or [])})
+    if not base:
+        return []
+    groups = _linux_thread_sibling_groups(tuple(base))
+    if not groups:
+        return base
+    primary = [int(min(g)) for g in groups]
+    secondary: list[int] = []
+    for g in groups:
+        for x in g:
+            if int(x) not in primary:
+                secondary.append(int(x))
+    allowed = set(base)
+    prim = [c for c in primary if c in allowed]
+    sec = [c for c in secondary if c in allowed]
+    out = (prim + sec) if prefer_primary else (sec + prim)
+    return out if out else base
+
+
+def _executor_allowed_cpus() -> list[int]:
+    with contextlib.suppress(Exception):
+        return sorted({int(x) for x in CPU.allowed()})
+    with contextlib.suppress(Exception):
+        return sorted({int(x) for x in os.sched_getaffinity(0)})
+    return []
+
+
+def _hash32(s: str) -> int:
+    with contextlib.suppress(Exception):
+        b = hashlib.md5(s.encode("utf-8", errors="ignore")).digest()
+        return int.from_bytes(b[:4], byteorder="little", signed=False)
+    return 0
+
+
+def _pick_coprime_stride(n: int, hint: int, salt: int) -> int:
+    n = max(1, int(n))
+    if n == 1:
+        return 1
+    cand = max(1, int(hint)) + max(0, int(salt))
+    if n % 2 == 0 and cand % 2 == 0:
+        cand += 1
+    for k in range(cand, cand + n + 2):
+        if math.gcd(int(k), int(n)) == 1:
+            return int(k)
+    return 1
+
+
+def _executor_scope_start(role: str, wl: str, prefix: str, mw: int, cpw: int, ordinal: int, ncpu: int) -> int:
+    seed = env_first(("STNET_EXECUTOR_AFFINITY_SEED", "STNET_AFFINITY_SEED"), default="0")
+    key = f"{seed}|pid={os.getpid()}|role={role}|wl={wl}|pfx={prefix}|mw={mw}|cpw={cpw}|ord={ordinal}"
+    h = _hash32(key)
+    return int(h % max(1, int(ncpu)))
+
+
+def _pick_cores_balanced(
+    cpus: Sequence[int],
+    start: int,
+    idx: int,
+    mw: int,
+    cpw: int,
+    salt: int,
+) -> list[int]:
+    base = list(cpus or [])
+    n = len(base)
+    if n <= 0:
+        return []
+    i = int(idx) % max(1, int(mw))
+    cpw_i = max(1, min(int(cpw), n))
+
+    if cpw_i == 1:
+        return [int(base[(int(start) + i) % n])]
+
+    stride1 = _pick_coprime_stride(n, hint=max(1, n // max(1, int(mw))), salt=salt)
+    base_pos = (int(start) + i * stride1) % n
+    stride2 = _pick_coprime_stride(n, hint=max(1, n // cpw_i), salt=salt + 7)
+    out: list[int] = []
+    seen: set[int] = set()
+    for j in range(cpw_i):
+        c = int(base[(base_pos + j * stride2) % n])
+        if c not in seen:
+            out.append(c)
+            seen.add(c)
+    return out or [int(base[base_pos])]
+
+
+def _thread_worker_index(max_workers: int) -> int:
+    try:
+        nm = str(threading.current_thread().name or "")
+    except Exception:
+        nm = ""
+    m = re.search(r"(?:_|-)(\d+)$", nm)
+    if m:
+        with contextlib.suppress(Exception):
+            return int(m.group(1)) % max(1, int(max_workers))
+    with contextlib.suppress(Exception):
+        nid = int(threading.get_native_id())
+        return int(nid) % max(1, int(max_workers))
+    return 0
+
+
+def _process_worker_index(max_workers: int) -> int:
+    with contextlib.suppress(Exception):
+        import multiprocessing as _mp
+        ident = getattr(_mp.current_process(), "_identity", None)
+        if ident and len(ident) >= 1:
+            return max(0, int(ident[0]) - 1) % max(1, int(max_workers))
+    with contextlib.suppress(Exception):
+        return int(os.getpid()) % max(1, int(max_workers))
+    return 0
+
+
+def _set_current_thread_affinity(cores: Sequence[int]) -> None:
+    if not cores:
+        return
+    if sys.platform.startswith("linux"):
+        with contextlib.suppress(Exception):
+            tid = int(threading.get_native_id())
+            if tid > 0:
+                os.sched_setaffinity(tid, {int(c) for c in cores})
+    return
+
+
+def _set_current_process_affinity(cores: Sequence[int]) -> None:
+    if not cores:
+        return
+    if sys.platform.startswith("linux"):
+        with contextlib.suppress(Exception):
+            os.sched_setaffinity(0, {int(c) for c in cores})
+    return
+
+
+def _executor_thread_initializer(
+    role: str,
+    wl: str,
+    cpus: Sequence[int],
+    start: int,
+    mw: int,
+    cpw: int,
+    salt: int,
+) -> None:
+    idx = _thread_worker_index(max_workers=int(mw))
+    cores = _pick_cores_balanced(cpus, start=int(start), idx=int(idx), mw=int(mw), cpw=int(cpw), salt=int(salt))
+    if cores:
+        _set_current_thread_affinity(cores)
+
+    with contextlib.suppress(Exception):
+        tlb = new_affinity()
+        tlb._tls.pinned = True
+
+
+def _executor_process_initializer(
+    wl: str,
+    cpus: Sequence[int],
+    start: int,
+    mw: int,
+    cpw: int,
+    salt: int,
+) -> None:
+    idx = _process_worker_index(max_workers=int(mw))
+    cores = _pick_cores_balanced(cpus, start=int(start), idx=int(idx), mw=int(mw), cpw=int(cpw), salt=int(salt))
+    if cores:
+        _set_current_process_affinity(cores)
+
+    if cores and _is_inner_thread_limited(wl):
+        _limit_inner_threads(max(1, int(len(cores))))
+
+    with contextlib.suppress(Exception):
+        tlb = new_affinity()
+        tlb._tls.pinned = True
+
+
+def new_prefetcher(
     iterable: Any,
     *args: Any,
     max_batches: int = 4,
@@ -134,29 +518,167 @@ def new_executor(
 ) -> futures.Executor:
     mw = max(1, int(max_workers))
     wl = str(workload or "io").strip().lower()
-    if wl in {"io", "i/o", "thread", "threads"}:
-        return futures.ThreadPoolExecutor(
-            max_workers=mw,
-            thread_name_prefix=str(name or "stnet-io"),
-        )
-    if wl not in {"cpu", "compute"}:
-        return futures.ThreadPoolExecutor(
-            max_workers=mw,
-            thread_name_prefix=str(name or "stnet"),
-        )
-    if not is_gil_enabled():
-        return futures.ThreadPoolExecutor(
-            max_workers=mw,
-            thread_name_prefix=str(name or "stnet-cpu"),
-        )
-    if prefer_interpreters is None:
-        prefer_interpreters = bool(env_flag("STNET_PREFER_INTERPRETER_POOL", default=True))
-    if bool(prefer_interpreters) and supports_interpreter_pool_executor():
+    prefix = str(name or "stnet").strip() or "stnet"
+
+    executor_kind = "thread"
+    if wl in {"cpu", "compute"}:
+        if not is_gil_enabled():
+            executor_kind = "thread"
+        else:
+            if prefer_interpreters is None:
+                prefer_interpreters = bool(env_flag("STNET_PREFER_INTERPRETER_POOL", default=True))
+            if bool(prefer_interpreters) and is_interpreter_pool_supported():
+                executor_kind = "interpreter"
+            else:
+                executor_kind = "process"
+
+    if executor_kind == "process":
+        thread_prefix = f"{prefix}-proc"
+    elif executor_kind == "interpreter":
+        thread_prefix = f"{prefix}-interp"
+    else:
+        thread_prefix = f"{prefix}-thr" if wl in {"cpu", "compute"} else f"{prefix}-io"
+
+    init_fn: Callable[..., Any] | None = None
+    init_args: tuple[Any, ...] = ()
+    nlogical_for_limit = 0
+    nphysical_for_limit = 0
+    mw_eff = int(mw)
+
+    if _is_affinity_enabled():
         try:
-            return futures.InterpreterPoolExecutor(max_workers=mw)
+            allowed = _executor_allowed_cpus()
+            cpus_scatter = _executor_scatter_cpus(allowed)
+            if cpus_scatter:
+                groups = _linux_thread_sibling_groups(tuple(cpus_scatter))
+                nphysical_for_limit = int(len(groups) if groups else len(cpus_scatter))
+                ordinal = _next_ordinal()
+                if executor_kind == "process" and wl in {"cpu", "compute"}:
+                    mw_eff = int(mw)
+                    if _are_processes_limited():
+                        tgt = int(_target_process_workers())
+                        if tgt > 0:
+                            mw_eff = min(int(mw_eff), max(1, int(tgt)))
+                        else:
+                            mw_eff = min(int(mw_eff), max(1, int(nphysical_for_limit or len(cpus_scatter))))
+                    mw_eff = max(1, int(mw_eff))
+                if executor_kind == "process":
+                    default_cpw = max(1, int(len(cpus_scatter) // max(1, mw_eff)))
+                    cpw = int(
+                        env_first_int(
+                            ("STNET_EXECUTOR_CORES_PER_WORKER_CPU", "STNET_AFFINITY_CORES_PER_WORKER_CPU"),
+                            default=default_cpw,
+                        )
+                        or default_cpw
+                    )
+                    cpw = max(1, min(int(cpw), max(1, len(cpus_scatter))))
+                    start = _executor_scope_start(
+                        role="process",
+                        wl=wl,
+                        prefix=thread_prefix,
+                        mw=int(mw_eff),
+                        cpw=cpw,
+                        ordinal=ordinal,
+                        ncpu=len(cpus_scatter),
+                    )
+                    init_fn = _executor_process_initializer
+                    init_args = (wl, cpus_scatter, int(start), int(mw_eff), int(cpw), 11)
+
+                elif executor_kind == "interpreter":
+                    cpus_pref = _executor_prefer_smt_lane(cpus_scatter, prefer_primary=True)
+                    nlogical_for_limit = int(len(cpus_pref))
+                    start = _executor_scope_start(
+                        role="interpreter",
+                        wl=wl,
+                        prefix=thread_prefix,
+                        mw=int(mw_eff),
+                        cpw=1,
+                        ordinal=ordinal,
+                        ncpu=max(1, len(cpus_pref)),
+                    )
+                    init_fn = _executor_thread_initializer
+                    init_args = ("interpreter", wl, cpus_pref, int(start), int(mw), 1, 23)
+
+                else:
+                    cpus_pref = _executor_prefer_smt_lane(cpus_scatter, prefer_primary=False)
+                    nlogical_for_limit = int(len(cpus_pref))
+                    start = _executor_scope_start(
+                        role="thread",
+                        wl=wl,
+                        prefix=thread_prefix,
+                        mw=int(mw_eff),
+                        cpw=1,
+                        ordinal=ordinal,
+                        ncpu=max(1, len(cpus_pref)),
+                    )
+                    init_fn = _executor_thread_initializer
+                    init_args = ("thread", wl, cpus_pref, int(start), int(mw), 1, 37)
+
         except Exception:
-            pass
-    return futures.ProcessPoolExecutor(max_workers=mw)
+            if _is_affinity_strict():
+                raise
+            init_fn = None
+            init_args = ()
+            nlogical_for_limit = 0
+            nphysical_for_limit = 0
+            mw_eff = int(mw)
+
+    if executor_kind in {"thread", "interpreter"} and _is_inner_thread_limited(wl):
+        _limit_inner_threads(1)
+
+    if nlogical_for_limit <= 0:
+        with contextlib.suppress(Exception):
+            nlogical_for_limit = int(len(_executor_allowed_cpus()))
+    if nphysical_for_limit <= 0:
+        nphysical_for_limit = int(nlogical_for_limit or mw)
+
+    outer_limit = _outer_concurrency_limit(
+        wl,
+        executor_kind,
+        int(nlogical_for_limit or mw),
+        int(nphysical_for_limit or (nlogical_for_limit or mw)),
+        int(mw),
+    )
+
+    if executor_kind == "thread":
+        ex = futures.ThreadPoolExecutor(
+            max_workers=mw,
+            thread_name_prefix=thread_prefix,
+            initializer=init_fn,
+            initargs=init_args,
+        )
+        return BoundedExecutor(ex, outer_limit) if (outer_limit and outer_limit < mw) else ex
+
+    if executor_kind == "interpreter":
+        cls = getattr(futures, "InterpreterPoolExecutor", None)
+        if cls is None:
+            ex = futures.ThreadPoolExecutor(
+                max_workers=mw,
+                thread_name_prefix=thread_prefix,
+                initializer=init_fn,
+                initargs=init_args,
+            )
+            return BoundedExecutor(ex, outer_limit) if (outer_limit and outer_limit < mw) else ex
+
+        try:
+            ex = cls(
+                max_workers=mw,
+                thread_name_prefix=thread_prefix,
+                initializer=init_fn,
+                initargs=init_args,
+            )
+        except TypeError:
+            ex = cls(max_workers=mw, thread_name_prefix=thread_prefix)
+        return BoundedExecutor(ex, outer_limit) if (outer_limit and outer_limit < mw) else ex
+
+    try:
+        return futures.ProcessPoolExecutor(
+            max_workers=int(mw_eff),
+            initializer=init_fn,
+            initargs=init_args,
+        )
+    except TypeError:
+        return futures.ProcessPoolExecutor(max_workers=int(mw_eff))
 
 
 def new_affinity(io_workers: Optional[int] = None) -> "Thread":
@@ -1260,6 +1782,84 @@ class Mutex:
 
     def __exit__(self, exc_type, exc, tb) -> None:
         self.release()
+
+
+class BoundedExecutor(futures.Executor):
+    def __init__(self, inner: futures.Executor, limit: int) -> None:
+        self._inner = inner
+        self._limit = max(1, int(limit))
+        self._sem = threading.BoundedSemaphore(value=self._limit)
+
+    def submit(self, fn: Callable[..., Any], /, *args: Any, **kwargs: Any) -> futures.Future:
+        sem = self._sem
+        sem.acquire()
+        try:
+            fut = self._inner.submit(fn, *args, **kwargs)
+        except Exception:
+            sem.release()
+            raise
+
+        def _release(_fut: futures.Future) -> None:
+            sem.release()
+
+        fut.add_done_callback(_release)
+        return fut
+
+    def map(
+        self,
+        fn: Callable[..., Any],
+        *iterables: Any,
+        timeout: float | None = None,
+        chunksize: int = 1,
+    ) -> Any:
+        del chunksize
+        sem = self._sem
+        end_time = None
+        if timeout is not None:
+            end_time = time.monotonic() + float(timeout)
+
+        futures_list: list[futures.Future] = []
+        for args in zip(*iterables):
+            sem.acquire()
+            try:
+                fut = self._inner.submit(fn, *args)
+            except Exception:
+                sem.release()
+                raise
+
+            def _release(_fut: futures.Future) -> None:
+                sem.release()
+
+            fut.add_done_callback(_release)
+            futures_list.append(fut)
+
+        def _result_iter() -> Iterator[Any]:
+            for fut in futures_list:
+                if end_time is None:
+                    yield fut.result()
+                    continue
+                remaining = end_time - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError()
+                yield fut.result(remaining)
+
+        return _result_iter()
+
+    def shutdown(self, wait: bool = True, *, cancel_futures: bool = False) -> None:
+        try:
+            self._inner.shutdown(wait=wait, cancel_futures=cancel_futures)
+        except TypeError:
+            self._inner.shutdown(wait=wait)
+
+    def __enter__(self) -> "BoundedExecutor":
+        self._inner.__enter__()
+        return self
+
+    def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> Any:
+        return self._inner.__exit__(exc_type, exc, tb)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._inner, name)
 
 
 _TLB_SINGLETON: Optional["Thread"] = None

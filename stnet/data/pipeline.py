@@ -691,7 +691,7 @@ def _fetch_build_datasets(
 ) -> Dict[str, "Sampler"]:
     out: Dict[str, "Sampler"] = {}
     for k, spec in specs.items():
-        ds = dataset(spec, split=split, val_frac=val_frac, sampler_scale=sampler_scale)
+        ds = new_dataset(spec, split=split, val_frac=val_frac, sampler_scale=sampler_scale)
         allocated.add(ds)
         out[str(k)] = ds
         if collect_epochables and epochables is not None:
@@ -747,7 +747,7 @@ def iter_dataset(data: object) -> tuple[list[tuple[str, object]], object | None]
     return ([("0", data)], None)
 
 
-def dataset(
+def new_dataset(
     source: Source,
     *args: Any,
     split: str = "train",
@@ -766,7 +766,7 @@ def dataset(
     fmt = str(fmt)
     if fmt != "memmap":
         raise ValueError(f"Unsupported source format: {fmt!r}")
-    path = os.fspath(source.get("path", ""))
+    path = os.fspath(source.get("path", "")).strip()
     if not path:
         raise ValueError("Source['path'] must be provided")
     if not os.path.isdir(path):

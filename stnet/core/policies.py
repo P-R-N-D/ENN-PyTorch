@@ -342,10 +342,10 @@ class LoaderPolicy:
         return wp
 
     def wrap_input(self, loader: Any, device: torch.device | str, *args: Any, name: str) -> Any:
-        from .concurrency import buffered
+        from .concurrency import new_prefetcher
 
         max_batches = self.hard_inflight_batches(device)
-        return buffered(loader, max_batches=max_batches, name=name)
+        return new_prefetcher(loader, max_batches=max_batches, name=name)
 
 
 @dataclass
