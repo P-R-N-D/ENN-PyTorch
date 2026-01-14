@@ -8,7 +8,6 @@ import hashlib
 import itertools
 import platform
 import sys
-import sysconfig
 import concurrent.futures as futures
 import traceback
 import math
@@ -33,6 +32,7 @@ from .system import CPU, _default_thread_limit, _optimal_local_worlds, _optimal_
 
 
 _EXECUTOR_ORDINAL = itertools.count(0)
+_EXECUTOR_ORDINAL_LOCK = threading.Lock()
 _ENV_INNER_THREAD_VARS: tuple[str, ...] = (
     "OMP_NUM_THREADS",
     "MKL_NUM_THREADS",
@@ -106,22 +106,19 @@ def _prod_int(shape: Sequence[int]) -> int:
 
 
 def is_free_threading_build() -> bool:
+    with contextlib.suppress(Exception):
+        return bool(CPU.is_free_threaded_build())
     tag = getattr(getattr(sys, "implementation", None), "cache_tag", "") or ""
-    if tag.endswith("t"):
-        return True
-    try:
-        return bool(int(sysconfig.get_config_var("Py_GIL_DISABLED") or 0))
-    except Exception:
-        return False
+    return bool(isinstance(tag, str) and tag.endswith("t"))
 
 
 def is_gil_enabled() -> bool:
+    with contextlib.suppress(Exception):
+        return bool(CPU.is_gil_enabled())
     fn = getattr(sys, "_is_gil_enabled", None)
     if callable(fn):
-        try:
+        with contextlib.suppress(Exception):
             return bool(fn())
-        except Exception:
-            return True
     return True
 
 
@@ -133,7 +130,6 @@ def python_build_tag() -> str:
 def is_interpreter_pool_supported() -> bool:
     return getattr(futures, "InterpreterPoolExecutor", None) is not None
 
-    
 @lru_cache(maxsize=1)
 def _is_affinity_enabled() -> bool:
     return bool(env_flag("STNET_EXECUTOR_AFFINITY", "STNET_AFFINITY", default=True))
@@ -143,9 +139,11 @@ def _is_affinity_enabled() -> bool:
 def _is_affinity_strict() -> bool:
     return bool(env_flag("STNET_EXECUTOR_AFFINITY_STRICT", "STNET_AFFINITY_STRICT", default=False))
 
+
 def _next_ordinal() -> int:
-    with contextlib.suppress(Exception):
-        return int(next(_EXECUTOR_ORDINAL))
+    with _EXECUTOR_ORDINAL_LOCK:
+        with contextlib.suppress(Exception):
+            return int(next(_EXECUTOR_ORDINAL))
     return 0
 
 def _is_inner_thread_limited(wl: str) -> bool:
@@ -640,9 +638,15 @@ def new_executor(
         int(mw),
     )
 
+    mw_outer = int(mw)
+    if executor_kind in {"thread", "interpreter"} and outer_limit and int(outer_limit) < int(mw_outer):
+        mw_outer = int(outer_limit)
+        if init_fn is _executor_thread_initializer and init_args and len(init_args) >= 5:
+            init_args = (*init_args[:4], int(mw_outer), *init_args[5:])
+
     if executor_kind == "thread":
         ex = futures.ThreadPoolExecutor(
-            max_workers=mw,
+            max_workers=mw_outer,
             thread_name_prefix=thread_prefix,
             initializer=init_fn,
             initargs=init_args,
@@ -653,7 +657,7 @@ def new_executor(
         cls = getattr(futures, "InterpreterPoolExecutor", None)
         if cls is None:
             ex = futures.ThreadPoolExecutor(
-                max_workers=mw,
+                max_workers=mw_outer,
                 thread_name_prefix=thread_prefix,
                 initializer=init_fn,
                 initargs=init_args,
@@ -662,13 +666,13 @@ def new_executor(
 
         try:
             ex = cls(
-                max_workers=mw,
+                max_workers=mw_outer,
                 thread_name_prefix=thread_prefix,
                 initializer=init_fn,
                 initargs=init_args,
             )
         except TypeError:
-            ex = cls(max_workers=mw, thread_name_prefix=thread_prefix)
+            ex = cls(max_workers=mw_outer, thread_name_prefix=thread_prefix)
         return BoundedExecutor(ex, outer_limit) if (outer_limit and outer_limit < mw) else ex
 
     try:
@@ -1628,7 +1632,13 @@ class Thread:
         if getattr(self._tls, "pinned", False) or attempts >= 4:
             return
         self._tls.attempts = attempts + 1
-        core = self._next_core()
+        if self._nogil:
+            with self._lock:
+                if not self._enabled:
+                    return
+                core = self._next_core()
+        else:
+            core = self._next_core()
         ok = False
         if os.name == "nt":
             ok = self._pin_thread_windows(core)
@@ -1663,11 +1673,19 @@ class Thread:
                         == 0
                     )
         self._tls.pinned = bool(ok)
-        self._pin_attempts += 1
-        if ok:
-            self._pin_success += 1
-        if self._pin_attempts >= 16 and self._pin_success == 0 and not self._omp_ok:
-            self._enabled = False
+        if self._nogil:
+            with self._lock:
+                self._pin_attempts += 1
+                if ok:
+                    self._pin_success += 1
+                if self._pin_attempts >= 16 and self._pin_success == 0 and not self._omp_ok:
+                    self._enabled = False
+        else:
+            self._pin_attempts += 1
+            if ok:
+                self._pin_success += 1
+            if self._pin_attempts >= 16 and self._pin_success == 0 and not self._omp_ok:
+                self._enabled = False
 
     def tune_threads(
         self,

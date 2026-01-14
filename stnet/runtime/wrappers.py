@@ -135,19 +135,24 @@ def _get_tensor_shape(model: object, sample_input: object) -> object:
     out_shape = (
         tuple(int(x) for x in getattr(model, "out_shape")) if hasattr(model, "out_shape") else None
     )
-    if (in_dim is None or out_shape is None) and sample_input is not None:
+    if in_dim is not None and out_shape is not None:
+        return (int(in_dim), tuple(int(x) for x in out_shape))
+    if sample_input is not None:
+        if not isinstance(sample_input, torch.Tensor):
+            raise TypeError("sample_input must be a torch.Tensor")
         dev = next((p.device for p in model.parameters() if p is not None), torch.device("cpu"))
         sample = sample_input.to(dev)
         model.eval()
         with torch.no_grad():
-            y_flat = extract_tensor(
-                _forward(model, sample.unsqueeze(0) if sample.ndim == 1 else sample)
-            )
-        in_dim = in_dim or int(sample.numel() // sample.shape[0])
-        out_shape = out_shape or tuple(y_flat.shape[1:])
+            sample_batched = sample.unsqueeze(0) if sample.ndim == 1 else sample
+            y_flat = extract_tensor(_forward(model, sample_batched))
+        if in_dim is None:
+            in_dim = int(sample.numel()) if sample.ndim == 1 else int(sample.numel() // sample.shape[0])
+        if out_shape is None:
+            out_shape = tuple(int(x) for x in tuple(y_flat.shape[1:]))
     if in_dim is None or out_shape is None:
         raise RuntimeError("Failed to infer shapes.")
-    return (int(in_dim), tuple(out_shape))
+    return (int(in_dim), tuple(int(x) for x in out_shape))
 
 
 def _pad_sample(model: object, sample_input: object, *, batch: int = 1) -> object:
