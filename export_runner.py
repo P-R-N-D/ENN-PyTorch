@@ -7,8 +7,6 @@ from typing import Any, Dict
 
 import numpy as np
 import torch
-import onnxruntime as ort
-
 from stnet.core.tensor import from_buffer
 from wsl_nogil_train import build_dataset
 from stnet.api import new_model, train
@@ -33,7 +31,7 @@ def export_and_validate(
         try:
             if fmt is None:
                 raise RuntimeError("no exporter registered")
-            save_kwargs: Dict[str, Any] = {"sample_input": sample}
+            save_kwargs: Dict[str, Any] = {"sample_input": sample, "dynamic_batch": True}
             out = fmt.save(model, path, **save_kwargs)
             results[name] = {
                 "status": "ok",
@@ -65,12 +63,23 @@ def export_and_validate(
                 torch_out = model(sample, return_loss=False)
             pt2_mae = float(torch.mean(torch.abs(pt2_out - torch_out)).item())
             validations["pt2_mae"] = pt2_mae
+            if isinstance(sample, torch.Tensor) and sample.ndim >= 2 and int(sample.shape[0]) > 1:
+                alt_n = max(1, int(sample.shape[0]) // 2)
+                alt = sample[:alt_n]
+                with torch.no_grad():
+                    alt_pt2 = ep.module()(alt)
+                    if hasattr(model, "forward_export"):
+                        alt_torch = model.forward_export(alt)
+                    else:
+                        alt_torch = model(alt, return_loss=False)
+                validations["pt2_mae_alt"] = float(torch.mean(torch.abs(alt_pt2 - alt_torch)).item())
         except Exception as exc:
             validations["pt2_error"] = repr(exc)
 
     onnx_path = targets["onnx"]
     if onnx_path.exists():
         try:
+            import onnxruntime as ort
             sess = ort.InferenceSession(str(onnx_path), providers=["CPUExecutionProvider"])
             inp_name = sess.get_inputs()[0].name
             onnx_out = sess.run(None, {inp_name: sample.detach().cpu().numpy().astype(np.float32)})[

@@ -502,8 +502,7 @@ class TorchInductor(Format):
                 if dynamic_seq and sample.ndim >= 2:
                     spec[1] = torch.export.Dim("seq")
                 if spec:
-                    dynamic_shapes = {"x": spec}
-
+                    dynamic_shapes = (spec,)
             export_kw: dict[str, Any] = {}
             try:
                 sig = inspect.signature(torch_export)
@@ -624,8 +623,7 @@ class TorchExport(Format):
             if dynamic_seq and sample.ndim >= 2:
                 spec[1] = torch.export.Dim("seq")
             if spec:
-                dynamic_shapes = {"x": spec}
-
+                dynamic_shapes = (spec,)
         call_kw: dict[str, Any] = {}
         try:
             sig = inspect.signature(torch_export)
@@ -695,7 +693,16 @@ class ExecuTorch(Format):
                     )
                     exported = torch_export(wrapper, (sample,), strict=False)
             edge = exir.to_edge(exported)
-            exec_prog = exir.to_executorch(edge)
+            if hasattr(exir, "to_executorch"):
+                exec_prog = exir.to_executorch(edge)
+            elif hasattr(edge, "to_executorch"):
+                exec_prog = edge.to_executorch()
+            elif hasattr(edge, "to_executorch_program"):
+                exec_prog = edge.to_executorch_program()
+            else:
+                raise AttributeError(
+                    "ExecuTorch export: could not find `exir.to_executorch(edge)` nor `edge.to_executorch()`."
+                )
             dst.parent.mkdir(parents=True, exist_ok=True)
             with open(dst, "wb") as fh:
                 exec_prog.write_to_file(fh)
