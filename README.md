@@ -8,16 +8,21 @@ This repository also includes a worked example notebook (`notebook.ipynb`) and a
 
 ### Mandatory
 - **Python**: >= 3.12
-- **PyTorch**: >= 2.8.0
-- **Triton**: >= 3.4.0 (core JIT backend; typically installed alongside PyTorch)
-- **torchao**: >= 0.14.0
+- **PyTorch**: >= 2.9.1
+- **Triton**: >= 3.5.1 (core JIT backend; typically installed alongside PyTorch)
+- **torchao**: >= 0.15.0
 - **torchdata**: >= 0.11.0 (`torchdata.nodes`-based pipeline)
 - **tensordict**: >= 0.10.0
-- **numpy**: >= 2.2.5
-- **psutil**: >= 7.0.0
+- **numpy**: >= 2.4.1
+- **psutil**: >= 7.2.1
 - **py-cpuinfo**: >= 9.0.0
 - **tqdm**: >= 4.67.1
-- **h5py**: >= 3.11.0 (required for persisted prediction outputs)
+- **h5py**: >= 3.15.1 (required for persisted prediction outputs)
+- **onnx**: >= 1.20.1
+- **onnxruntime**: >= 1.23.2
+- **onnxscript**: >= 0.5.7
+- **onnx_ir**: >= 0.1.14
+- **ml_dtypes**: >= 0.5.4
 
 ### Recommended
 - **Python**: >= 3.13t (free-threading / no-GIL build)
@@ -31,7 +36,7 @@ This repository also includes a worked example notebook (`notebook.ipynb`) and a
 - **Templated configurations** (`stnet.config`): dataclass configs with coercion/validation and string canonicalizers for modeling type, normalization, and compile options.
 - **Neural network stacks** (`stnet.nn`): spatio-temporal TokenFuser/TokenCollector blocks, attention variants, scaler + recorder modules, AMP negotiation guard band (`ModelConfig.safety_margin_pow2`).
 - **Data pipeline** (`stnet.data`): `torchdata.nodes`-driven memmap pipeline with TensorDict support, prefetch/pin/pool options, and scale-aware dataset metadata.
-- **Runnable tasks** (`stnet.runtime`): thread/NUMA tuning, free-threaded/no-GIL optimizations, mixed-precision helpers, history recorder, and OOM recovery hooks. ONNX/ORT/torch.export (PT2) out of the box; optional platform-dependent backends (TensorRT/CoreML/ExecuTorch/onnx-tf) via extras. elastic launch wiring and group setup for multi-process CPU/GPU runs.
+- **Runnable tasks** (`stnet.runtime`): thread/NUMA tuning, free-threaded/no-GIL optimizations, mixed-precision helpers, history recorder, and OOM recovery hooks. ONNX/ORT/onnxscript/onnx_ir/torch.export (PT2) out of the box; optional platform-dependent backends (TensorRT/CoreML/ExecuTorch/onnx-tf) via extras. elastic launch wiring and group setup for multi-process CPU/GPU runs.
 - **Losses/optimizers/profiling** (`stnet.core`): Student’s t losses, SWA helpers, FLOP/IO timing.
 
 ## Model layout (current)
@@ -61,15 +66,12 @@ Key building blocks:
    ```bash
    pip install --upgrade pip
    # Example (CUDA users should pick the right index-url/wheel for their CUDA version)
-   # pip install --index-url https://download.pytorch.org/whl/cu121 'torch>=2.8.0'
+   # pip install --index-url https://download.pytorch.org/whl/cu121 'torch>=2.9.1'
    pip install -e .
    ```
 
 Optional extras:
 ```bash
-# Minimal ONNX / ORT export helpers
-pip install -e .[deployment]
-
 # Broader export stack (platform/python constraints; some wheels may be unavailable on py3.13/py3.14t)
 # Includes onnx-tf/onnx2tf (py<3.13), CoreML (macOS), TensorRT (Linux/CUDA), ExecuTorch (Linux, py<3.12)
 pip install -e .[deployment_full]
@@ -94,9 +96,9 @@ pip install -e .[nufft]
 pip install -e .[dev]
 ```
 
-> **Note**: Triton >= 3.4.0 is required, but a matching build is normally installed alongside PyTorch—avoid overriding it with a mismatched wheel.
+> **Note**: Triton >= 3.5.1 is required, but a matching build is normally installed alongside PyTorch—avoid overriding it with a mismatched wheel.
 
-> **Platform note**: many `deployment_full` backends are OS/driver/python dependent (e.g., CoreML on macOS, TensorRT on Linux/CUDA, ExecuTorch often lacks wheels for Python ≥3.12). If you only need ONNX export, installing `onnx` (and optionally `onnxruntime`) is usually sufficient.
+> **Platform note**: many `deployment_full` backends are OS/driver/python dependent (e.g., CoreML on macOS, TensorRT on Linux/CUDA, ExecuTorch often lacks wheels for Python ≥3.12). If you only need ONNX export, the mandatory `onnx`/`onnxruntime`/`onnxscript`/`onnx_ir` set is sufficient.
 
 ## Distributed training & inference (HSDP)
 

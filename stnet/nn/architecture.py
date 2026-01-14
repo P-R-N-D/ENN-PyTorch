@@ -1604,9 +1604,7 @@ class Model(nn.Module):
             assembled = assembled + self.linear_branch(
                 self._cast_graph_safe(x, self._device, assembled.dtype)
             )
-        tokens_centered = (
-            tokens - tokens.mean(dim=1, keepdim=True, dtype=tokens.dtype).to(tokens.dtype)
-        ).contiguous()
+        tokens_centered = (tokens - tokens.mean(dim=1, keepdim=True)).contiguous()
         if export:
             refined = self.temporal_token_collector.forward_export(tokens_centered)
         else:
@@ -2180,7 +2178,10 @@ class Model(nn.Module):
                 bl = self.linear_branch(self._cast_graph_safe(features_t, device, assembled.dtype))
                 assembled = assembled + bl
             mean_dtype = torch.float32 if amp_enabled else tokens.dtype
-            mean = tokens.mean(dim=1, keepdim=True, dtype=mean_dtype)
+            if mean_dtype != tokens.dtype:
+                mean = tokens.to(dtype=mean_dtype).mean(dim=1, keepdim=True)
+            else:
+                mean = tokens.mean(dim=1, keepdim=True)
             tokens_centered = tokens - mean.to(dtype=tokens.dtype)
             if not tokens_centered.is_contiguous():
                 tokens_centered = tokens_centered.contiguous()

@@ -25,16 +25,21 @@ classifiers = [
   "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
 dependencies = [
-  "numpy>=2.2.5",
-  "psutil>=7.0.0",
+  "numpy>=2.4.1",
+  "psutil>=7.2.1",
   "py-cpuinfo>=9.0.0",
-  "torch>=2.8.0",
-  "triton>=3.4.0",
-  "torchao>=0.14.0",
+  "torch>=2.9.1",
+  "triton>=3.5.1",
+  "torchao>=0.15.0",
   "torchdata>=0.11.0",
   "tensordict>=0.10.0",
   "tqdm>=4.67.1",
-  "h5py>=3.11.0",
+  "h5py>=3.15.1",
+  "onnx>=1.20.1",
+  "onnxruntime>=1.23.2",
+  "onnxscript>=0.5.7",
+  "onnx_ir>=0.1.14",
+  "ml_dtypes>=0.5.4",
 ]
 
 [project.urls]
@@ -49,13 +54,7 @@ polars = ["polars>=1.30.0", "openpyxl>=3.1.5", "fastexcel>=0.14.0", "xlsxwriter>
 nvidia_te_cu12 = ["transformer-engine-cu12>=2.2.0", "transformer-engine-torch>=2.2.0"]
 nvidia_te_cu13 = ["transformer-engine-cu13>=2.2.0", "transformer-engine-torch>=2.2.0"]
 intel_ai = ["intel-extension-for-pytorch>=2.7.0"]
-deployment = [
-  "onnx>=1.18.0",
-  "onnxruntime>=1.18.0",
-]
 deployment_full = [
-  "onnx>=1.18.0",
-  "onnxruntime>=1.18.0",
   "onnx-tf>=1.10.0; python_version<'3.13'",
   "onnx2tf>=1.28.8",
   "tensorflow>=2.20.0",
