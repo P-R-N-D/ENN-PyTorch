@@ -431,9 +431,9 @@ class CrossTransformer(nn.Module):
         self.cross_t = self.cross[1]
         self.mix_norm = norm_layer(norm_type, 2 * d_model)
         hid = int(2 * d_model * mlp_ratio * (2.0 / 3.0))
-        from .activations import SwiGLU
+        from .activations import GeGLU
 
-        self.mix = SwiGLU(2 * d_model, hid, out_dim=d_model, dropout=dropout)
+        self.mix = GeGLU(2 * d_model, hid, out_dim=d_model, dropout=dropout)
         self.dropout = nn.Dropout(dropout)
         self.drop_path = StochasticDepth(p=drop_path, mode="row")
         self._fixed_mode: Optional[str] = getattr(self, "modeling_type", None)
