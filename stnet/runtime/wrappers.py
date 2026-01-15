@@ -515,17 +515,22 @@ class _ONNXExporter:
                             importlib.util.find_spec("onnx") is not None
                             and importlib.util.find_spec("onnxoptimizer") is not None
                         ):
-                            import onnx
-                            import onnxoptimizer
+                            try:
+                                import onnx
+                                import onnxoptimizer
 
-                            model_onnx = onnx.load(str(onnx_path))
-                            passes = (
-                                list(onnxoptimizer_passes)
-                                if onnxoptimizer_passes is not None
-                                else None
-                            )
-                            model_opt = onnxoptimizer.optimize(model_onnx, passes)
-                            onnx.save(model_opt, str(onnx_path))
+                                model_onnx = onnx.load(str(onnx_path))
+                                passes = (
+                                    list(onnxoptimizer_passes)
+                                    if onnxoptimizer_passes is not None
+                                    else None
+                                )
+                                model_opt = onnxoptimizer.optimize(model_onnx, passes)
+                                onnx.save(model_opt, str(onnx_path))
+                            except Exception as exc:
+                                warnings.warn(
+                                    f"ONNX optimization failed; keeping the exported model. ({exc})"
+                                )
                     if simplify:
                         with contextlib.suppress(Exception):
                             import onnx
@@ -903,13 +908,18 @@ class TensorRT(Format):
                     importlib.util.find_spec("onnx") is not None
                     and importlib.util.find_spec("onnx_graphsurgeon") is not None
                 ):
-                    import onnx
-                    import onnx_graphsurgeon as gs
+                    try:
+                        import onnx
+                        import onnx_graphsurgeon as gs
 
-                    gs_model = onnx.load(str(onnx_path))
-                    graph = gs.import_onnx(gs_model)
-                    graph.cleanup().toposort()
-                    onnx.save(gs.export_onnx(graph), str(onnx_path))
+                        gs_model = onnx.load(str(onnx_path))
+                        graph = gs.import_onnx(gs_model)
+                        graph.cleanup().toposort()
+                        onnx.save(gs.export_onnx(graph), str(onnx_path))
+                    except Exception as exc:
+                        warnings.warn(
+                            f"TensorRT graphsurgeon optimization failed; using unoptimized ONNX. ({exc})"
+                        )
             try:
                 import tensorrt as trt
             except ImportError as exc:
