@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import contextlib
+import glob
 import importlib.util
 import inspect
 import os
@@ -52,9 +53,36 @@ _FORWARD_PARAM_CACHE_LOCK = Mutex()
 _EXPORT_SIG_CACHE: object | None = None
 _EXPORT_SIG_LOCK = Mutex()
 
+_EXPORT_WARN_FILTERS_INSTALLED = False
+
+
+def _install_export_warning_filters() -> None:
+    global _EXPORT_WARN_FILTERS_INSTALLED
+    if _EXPORT_WARN_FILTERS_INSTALLED:
+        return
+    _EXPORT_WARN_FILTERS_INSTALLED = True
+    warnings.filterwarnings(
+        "ignore",
+        message=r".*Converting a tensor to a Python boolean.*",
+    )
+    warnings.filterwarnings(
+        "ignore",
+        category=FutureWarning,
+        message=r".*LeafSpec.*deprecated.*",
+    )
+    with contextlib.suppress(Exception):
+        tw = getattr(torch.jit, "TracerWarning", None)
+        if tw is not None:
+            warnings.filterwarnings(
+                "ignore",
+                category=tw,
+                message=r".*Converting a tensor to a Python boolean.*",
+            )
+
 
 @contextlib.contextmanager
 def _onnx_model(model: object) -> Iterator[object]:
+    _install_export_warning_filters()
     was_training = getattr(model, "training", False)
     removed_top, removed_sub = {}, []
     model.eval()
@@ -943,15 +971,35 @@ class ExecuTorch(Format):
             dyn_seq = bool(kwargs.get("dynamic_seq", False))
             strict = bool(kwargs.get("strict", True))
 
-            exported = _torch_export_program(
-                torch_export,
-                wrapper,
-                sample,
-                dynamic_batch=dyn_batch,
-                dynamic_seq=dyn_seq,
-                strict=strict,
-                tag="ExecuTorch export",
-            )
+            def _do_export(db: bool, ds: bool) -> object:
+                return _torch_export_program(
+                    torch_export,
+                    wrapper,
+                    sample,
+                    dynamic_batch=db,
+                    dynamic_seq=ds,
+                    strict=strict,
+                    tag="ExecuTorch export" + (" (static)" if (not db and not ds) else ""),
+                )
+
+            try:
+                exported = _do_export(dyn_batch, dyn_seq)
+            except Exception:
+                if dyn_batch or dyn_seq:
+                    if os.environ.get("STNET_EXPORT_WARNINGS", "").strip().lower() in (
+                        "1",
+                        "true",
+                        "yes",
+                        "y",
+                        "on",
+                    ):
+                        warnings.warn(
+                            "ExecuTorch export failed with dynamic shapes; retrying with dynamic_batch=False, dynamic_seq=False",
+                            RuntimeWarning,
+                        )
+                    exported = _do_export(False, False)
+                else:
+                    raise
 
             def _to_executorch_program(exported_program: object) -> object:
                 edge = exir.to_edge(exported_program)
@@ -1200,12 +1248,18 @@ class CoreML(Format):
         *args: Any,
         **kwargs: Any,
     ) -> object:
-        import importlib.util as _ilu
-
-        if (
-            _ilu.find_spec("coremltools") is None
-            or _ilu.find_spec("coremltools.libcoremlpython") is None
-        ):
+        if sys.platform != "darwin":
+            raise ImportError(
+                "coremltools is required for this operation (try: pip install coremltools on macOS)"
+            )
+        spec = importlib.util.find_spec("coremltools")
+        if spec is None or not getattr(spec, "submodule_search_locations", None):
+            raise ImportError(
+                "coremltools is required for this operation (try: pip install coremltools on macOS)"
+            )
+        pkg_dirs = list(spec.submodule_search_locations or [])
+        has_native = any(glob.glob(os.path.join(d, "libcoremlpython*")) for d in pkg_dirs)
+        if not has_native:
             raise ImportError(
                 "coremltools is required for this operation (try: pip install coremltools on macOS)"
             )

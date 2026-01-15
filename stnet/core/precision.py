@@ -394,12 +394,18 @@ class Autocast:
                     setattr(cls, f"_preferred_{kind}_backend", "te")
                     return "te"
             elif backend == "ao":
+                ok, why = is_supported(device)
                 mod, attr = (
                     ("torchao.float8", "fp8_autocast")
                     if kind == "fp8"
                     else ("torchao.quantization", "int8_autocast")
                 )
-                if cls._try_load_backend(mod, attr):
+                if cls._try_load_backend(
+                    mod,
+                    attr,
+                    ok,
+                    f"Autocast {kind.upper()} torchao unavailable: {why}",
+                ):
                     setattr(cls, f"_preferred_{kind}_backend", "ao")
                     return "ao"
 
