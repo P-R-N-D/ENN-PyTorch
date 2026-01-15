@@ -108,7 +108,10 @@ def _onnx_model(model: object) -> Iterator[object]:
                         removed_sub.append((module, attr, v))
                         delattr(module, attr)
     try:
-        with _temp_environ({"STNET_MSR_FORCE_TORCH": "1"}, only_if_unset=True):
+        with _temp_environ(
+            {"STNET_MSR_FORCE_TORCH": "1", "STNET_DISABLE_PIECEWISE_CALIB": "1"},
+            only_if_unset=True,
+        ):
             eager_ctx = getattr(model, "eager_for_export", None)
             with eager_ctx() if callable(eager_ctx) else contextlib.nullcontext():
                 yield model
@@ -942,6 +945,11 @@ class TorchExport(Format):
 class ExecuTorch(Format):
     name = "executorch"
 
+    @staticmethod
+    def _truthy_env(name: str) -> bool:
+        v = os.environ.get(name, "")
+        return v.strip().lower() in ("1", "true", "yes", "y", "on")
+
     def save(
         self,
         model: nn.Module,
@@ -970,6 +978,9 @@ class ExecuTorch(Format):
             dyn_batch = bool(kwargs.get("dynamic_batch", True))
             dyn_seq = bool(kwargs.get("dynamic_seq", False))
             strict = bool(kwargs.get("strict", True))
+            silent_fallback = bool(kwargs.get("silent_fallback", False)) or self._truthy_env(
+                "STNET_EXPORT_SILENT_FALLBACK"
+            )
 
             def _do_export(db: bool, ds: bool) -> object:
                 return _torch_export_program(
@@ -1013,6 +1024,8 @@ class ExecuTorch(Format):
                     "ExecuTorch export: could not find `exir.to_executorch(edge)` nor `edge.to_executorch()`."
                 )
 
+            used_dyn_batch, used_dyn_seq = dyn_batch, dyn_seq
+            fallback_error: str | None = None
             with _temp_environ(
                 {"ET_EXIR_SAVE_FLATC_INPUTS_ON_FAILURE": "1"},
                 only_if_unset=True,
@@ -1021,12 +1034,19 @@ class ExecuTorch(Format):
                     exec_prog = _to_executorch_program(exported)
                     with open(dst, "wb") as fh:
                         exec_prog.write_to_file(fh)
-                except Exception:
+                except Exception as exc:
                     if dyn_batch or dyn_seq:
-                        warnings.warn(
-                            "ExecuTorch export failed with dynamic shapes; retrying with dynamic_batch=False, dynamic_seq=False",
-                            RuntimeWarning,
-                        )
+                        used_dyn_batch, used_dyn_seq = False, False
+                        fallback_error = repr(exc)
+                        if not silent_fallback:
+                            warnings.warn(
+                                "ExecuTorch export with dynamic shapes failed; "
+                                "falling back to a static program (dynamic_batch=False, dynamic_seq=False). "
+                                "This static artifact may not accept variable-length inputs. "
+                                "To silence this warning, pass silent_fallback=True or set "
+                                "STNET_EXPORT_SILENT_FALLBACK=1.",
+                                RuntimeWarning,
+                            )
                         exported_static = _torch_export_program(
                             torch_export,
                             wrapper,
@@ -1042,7 +1062,21 @@ class ExecuTorch(Format):
                     else:
                         raise
             with contextlib.suppress(Exception):
-                _write_export_meta(model, dst, format_name=self.name or "executorch")
+                _write_export_meta(
+                    model,
+                    dst,
+                    format_name=self.name or "executorch",
+                    extra={
+                        "requested_dynamic_batch": dyn_batch,
+                        "requested_dynamic_seq": dyn_seq,
+                        "exported_dynamic_batch": used_dyn_batch,
+                        "exported_dynamic_seq": used_dyn_seq,
+                        "static_fallback": bool(
+                            (dyn_batch or dyn_seq) and (not used_dyn_batch and not used_dyn_seq)
+                        ),
+                        "fallback_error": fallback_error,
+                    },
+                )
         return (dst,)
 
 

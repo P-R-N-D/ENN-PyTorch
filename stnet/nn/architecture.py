@@ -40,6 +40,7 @@ from ..core.graph import (
     compile as compile_module,
     canonicalize_compile_mode,
     is_export_or_trace,
+    is_symbolic,
     coerce_checkpoint,
     cudagraph_mark_step_begin,
     cudagraph_mark_step_end,
@@ -2288,6 +2289,13 @@ class Model(nn.Module):
                     def _finite_pair(lo: object, hi: object) -> bool:
                         if not (isinstance(lo, torch.Tensor) and isinstance(hi, torch.Tensor)):
                             return False
+                        if (
+                            is_symbolic()
+                            or is_export_or_trace()
+                            or is_meta_or_fake_tensor(lo)
+                            or is_meta_or_fake_tensor(hi)
+                        ):
+                            return True
                         try:
                             return bool(torch.isfinite(lo).all().item()) and bool(
                                 torch.isfinite(hi).all().item()
