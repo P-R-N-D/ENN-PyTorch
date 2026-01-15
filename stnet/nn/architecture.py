@@ -29,7 +29,7 @@ from tensordict import TensorDictBase
 from ..config import ModelConfig
 from ..core.concurrency import Mutex, is_gil_enabled
 from ..core.datatypes import env_bool, env_first_int, env_int
-from ..core.tensor import is_meta_or_fake_tensor
+from ..core.tensor import is_meta_or_fake_tensor, symint_safe_expand_as
 from ..core.distributed import _from_hsdp_module
 from ..core.graph import (
     graph_break,
@@ -1604,7 +1604,8 @@ class Model(nn.Module):
             assembled = assembled + self.linear_branch(
                 self._cast_graph_safe(x, self._device, assembled.dtype)
             )
-        tokens_centered = (tokens - tokens.mean(dim=1, keepdim=True)).contiguous()
+        tokens_mean = symint_safe_expand_as(tokens.mean(dim=1, keepdim=True), tokens)
+        tokens_centered = (tokens - tokens_mean).contiguous()
         if export:
             refined = self.temporal_token_collector.forward_export(tokens_centered)
         else:
@@ -2182,7 +2183,8 @@ class Model(nn.Module):
                 mean = tokens.to(dtype=mean_dtype).mean(dim=1, keepdim=True)
             else:
                 mean = tokens.mean(dim=1, keepdim=True)
-            tokens_centered = tokens - mean.to(dtype=tokens.dtype)
+            mean_cast = symint_safe_expand_as(mean.to(dtype=tokens.dtype), tokens)
+            tokens_centered = tokens - mean_cast
             if not tokens_centered.is_contiguous():
                 tokens_centered = tokens_centered.contiguous()
             if is_train_path:

@@ -10,6 +10,31 @@ from typing import Any, Iterator
 import torch
 
 
+def symint_safe_expand(
+    t: torch.Tensor,
+    target_shape: tuple[object, ...] | list[object] | torch.Size,
+) -> torch.Tensor:
+    target = tuple(target_shape)
+    if tuple(t.shape) == target:
+        return t
+
+    src = tuple(t.shape)
+    if len(target) < len(src):
+        return t.expand(target)  # type: ignore[arg-type]
+
+    src_aligned = (1,) * (len(target) - len(src)) + src
+
+    sizes: list[object] = []
+    for s_dim, t_dim in zip(src_aligned, target):
+        sizes.append(-1 if s_dim == t_dim else t_dim)
+
+    return t.expand(tuple(sizes))  # type: ignore[arg-type]
+
+
+def symint_safe_expand_as(t: torch.Tensor, ref: torch.Tensor) -> torch.Tensor:
+    return symint_safe_expand(t, ref.shape)
+
+
 def _safe_find_spec(name: str) -> object | None:
     try:
         return importlib.util.find_spec(name)

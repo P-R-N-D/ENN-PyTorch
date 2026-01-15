@@ -1961,16 +1961,18 @@ class Scaler(nn.Module):
                 cache_dict[key] = (mean_b, std_b)
         else:
             mean_b, std_b = cached
+        inv_std_b = torch.reciprocal(std_b + self.eps)
+        bias_b = -mean_b * inv_std_b
         if t.dim() == 1:
-            return (t - mean_b) / (std_b + self.eps)
+            return t * inv_std_b + bias_b
         view_shape = [1] * (t.dim() - 1) + [-1]
         if compiling:
-            mean = mean_b.view(*view_shape)
-            std = std_b.view(*view_shape)
+            inv_std = inv_std_b.view(*view_shape)
+            bias = bias_b.view(*view_shape)
         else:
-            mean = mean_b if mean_b.numel() == 1 else mean_b.view(*view_shape)
-            std = std_b if std_b.numel() == 1 else std_b.view(*view_shape)
-        return (t - mean) / (std + self.eps)
+            inv_std = inv_std_b if inv_std_b.numel() == 1 else inv_std_b.view(*view_shape)
+            bias = bias_b if bias_b.numel() == 1 else bias_b.view(*view_shape)
+        return t * inv_std + bias
 
     def normalize_x(self, x: torch.Tensor) -> torch.Tensor:
         return self._normalize_impl(x, self.x_mean, self.x_std, "x")
