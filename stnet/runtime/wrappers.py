@@ -170,9 +170,9 @@ def _pad_sample(model: object, sample_input: object, *, batch: int = 1) -> objec
 def _onnx_options(kwargs: object, *args: Any, target: str = "onnx") -> object:
     target_l = str(target or "onnx").strip().lower()
     defaults = {
-        "tensorrt": (18, True, True, True, []),
-        "tensorflow": (18, False, True, True, []),
-        "default": (18, False, True, False, []),
+        "tensorrt": (18, True, False, True, []),
+        "tensorflow": (18, False, False, True, []),
+        "default": (18, False, False, False, []),
     }
     key = target_l.replace("-", "").replace("_", "")
     if key == "trt":
@@ -449,10 +449,6 @@ def _torch_export_program(
         raise
     except Exception:
         if call_kw.get("strict", False):
-            warnings.warn(
-                f"{tag} strict=True failed; retrying strict=False",
-                RuntimeWarning,
-            )
             call_kw["strict"] = False
             return _call(**call_kw)
         raise
@@ -527,7 +523,7 @@ class _ONNXExporter:
         opset_version: int = 18,
         opset_fallback: Sequence[int] | None = None,
         dynamic_batch: bool = False,
-        prefer_dynamo: bool = True,
+        prefer_dynamo: bool = False,
         simplify: bool = False,
         optimize_onnx: bool = True,
         onnxoptimizer_passes: Sequence[str] | None = None,
