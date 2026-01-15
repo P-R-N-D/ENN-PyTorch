@@ -204,11 +204,158 @@ def _onnx_options(kwargs: object, *args: Any, target: str = "onnx") -> object:
         "dynamic_batch": kwargs.get("dynamic_batch", d_dyn),
         "prefer_dynamo": kwargs.get("prefer_dynamo", kwargs.get("dynamo", d_pref)),
         "simplify": kwargs.get("simplify_onnx", kwargs.get("onnx_simplify", d_simp)),
+        "optimize_onnx": kwargs.get("optimize_onnx", kwargs.get("onnx_optimize", True)),
+        "onnxoptimizer_passes": kwargs.get(
+            "onnxoptimizer_passes", kwargs.get("onnx_optimizer_passes")
+        ),
     }
 
 
 def _coerce_onnx_path(dst: PathLike, kwargs: object) -> object:
-    return Path(kwargs.get("onnx_path") or dst.with_suffix(".onnx"))
+    dst_p = Path(dst)
+
+    onnx_override = None
+    with contextlib.suppress(Exception):
+        if isinstance(kwargs, dict):
+            onnx_override = kwargs.get("onnx_path")
+        else:
+            onnx_override = getattr(kwargs, "onnx_path", None)
+
+    if onnx_override:
+        return Path(onnx_override)
+
+    if dst_p.suffix.lower() == ".onnx":
+        return dst_p
+
+    return dst_p.with_name(dst_p.name + ".onnx")
+
+
+def _sidecar_json_path(dst: PathLike) -> Path:
+    p = Path(dst)
+    return p.with_name(p.name + ".json")
+
+
+def _write_export_meta(
+    model: nn.Module,
+    dst: PathLike,
+    *,
+    format_name: str,
+    extra: dict[str, Any] | None = None,
+) -> None:
+    p = Path(dst)
+
+    out_shape = getattr(model, "out_shape", None) or ()
+    if not isinstance(out_shape, (list, tuple)):
+        out_shape = (out_shape,)
+
+    payload: dict[str, Any] = {
+        "version": 1,
+        "format": str(format_name),
+        "in_dim": int(getattr(model, "in_dim", 0) or 0),
+        "out_shape": tuple(int(x) for x in out_shape),
+        "config": _load_model_config(model),
+        "pytorch_version": torch.__version__,
+    }
+    if extra:
+        payload["extra"] = extra
+
+    write_json(_sidecar_json_path(p), payload, indent=2)
+
+
+def _pad_to_batch(sample: torch.Tensor, min_batch: int) -> torch.Tensor:
+    if not isinstance(sample, torch.Tensor):
+        return sample
+    if sample.ndim == 0:
+        return sample
+
+    b = int(sample.shape[0]) if sample.shape else 1
+    if b >= int(min_batch):
+        return sample
+
+    pad_shape = (int(min_batch) - b,) + tuple(sample.shape[1:])
+    pad = torch.zeros(pad_shape, dtype=sample.dtype, device=sample.device)
+    return torch.cat([sample, pad], dim=0)
+
+
+def _run_onnx2tf(onnx_path: Path, out_dir: Path, *extra_args: str) -> None:
+    cmd = [
+        sys.executable,
+        "-m",
+        "onnx2tf",
+        "-i",
+        str(onnx_path),
+        "-o",
+        str(out_dir),
+        *extra_args,
+    ]
+    _in_console(cmd, "onnx2tf")
+
+
+def _torch_export_program(
+    torch_export: Callable[..., Any],
+    wrapper: nn.Module,
+    sample: torch.Tensor,
+    *,
+    dynamic_batch: bool = True,
+    dynamic_seq: bool = False,
+    strict: bool = True,
+    tag: str = "torch.export",
+) -> object:
+    if isinstance(sample, torch.Tensor) and sample.ndim == 1:
+        sample = sample.unsqueeze(0)
+
+    if dynamic_batch and isinstance(sample, torch.Tensor) and sample.ndim >= 1:
+        sample = _pad_to_batch(sample, 2)
+
+    dynamic_shapes = None
+    if (dynamic_batch or dynamic_seq) and hasattr(torch, "export") and hasattr(torch.export, "Dim"):
+        spec: dict[int, object] = {}
+        if dynamic_batch:
+            spec[0] = torch.export.Dim("batch")
+        if dynamic_seq and isinstance(sample, torch.Tensor) and sample.ndim >= 2:
+            spec[1] = torch.export.Dim("seq")
+        if spec:
+            dynamic_shapes = (spec,)
+
+    call_kw: dict[str, Any] = {}
+    try:
+        sig = inspect.signature(torch_export)
+        params = sig.parameters
+        if dynamic_shapes is not None and "dynamic_shapes" in params:
+            call_kw["dynamic_shapes"] = dynamic_shapes
+        if "strict" in params:
+            call_kw["strict"] = bool(strict)
+    except Exception:
+        if dynamic_shapes is not None:
+            call_kw["dynamic_shapes"] = dynamic_shapes
+        call_kw["strict"] = bool(strict)
+
+    def _call(**kw: Any) -> Any:
+        with torch.no_grad():
+            return torch_export(wrapper, (sample,), **kw)
+
+    try:
+        return _call(**call_kw)
+    except TypeError as exc:
+        msg = str(exc)
+        stripped = dict(call_kw)
+        retry = False
+        for k in ("dynamic_shapes", "strict"):
+            if k in stripped and f"'{k}'" in msg:
+                stripped.pop(k, None)
+                retry = True
+        if retry:
+            return _call(**stripped)
+        raise
+    except Exception:
+        if call_kw.get("strict", False):
+            warnings.warn(
+                f"{tag} strict=True failed; retrying strict=False",
+                RuntimeWarning,
+            )
+            call_kw["strict"] = False
+            return _call(**call_kw)
+        raise
 
 
 def _in_console(cmd: object, desc: object) -> None:
@@ -282,6 +429,8 @@ class _ONNXExporter:
         dynamic_batch: bool = False,
         prefer_dynamo: bool = True,
         simplify: bool = False,
+        optimize_onnx: bool = True,
+        onnxoptimizer_passes: Sequence[str] | None = None,
     ) -> object:
         is_required("onnx", "pip install onnx")
         wrapper = _TensorOutputModule(model).eval()
@@ -361,6 +510,27 @@ class _ONNXExporter:
                         else:
                             args = (sample,)
                         torch.onnx.export(model=wrapper, args=args, **call_kw)
+                    if optimize_onnx:
+                        if (
+                            importlib.util.find_spec("onnx") is not None
+                            and importlib.util.find_spec("onnxoptimizer") is not None
+                        ):
+                            try:
+                                import onnx
+                                import onnxoptimizer
+
+                                model_onnx = onnx.load(str(onnx_path))
+                                passes = (
+                                    list(onnxoptimizer_passes)
+                                    if onnxoptimizer_passes is not None
+                                    else None
+                                )
+                                model_opt = onnxoptimizer.optimize(model_onnx, passes)
+                                onnx.save(model_opt, str(onnx_path))
+                            except Exception as exc:
+                                warnings.warn(
+                                    f"ONNX optimization failed; keeping the exported model. ({exc})"
+                                )
                     if simplify:
                         with contextlib.suppress(Exception):
                             import onnx
@@ -498,48 +668,15 @@ class TorchInductor(Format):
                 sample = sample.unsqueeze(0)
             wrapper = _TensorOutputModule(serving_model).eval()
 
-            dynamic_batch = bool(kwargs.get("dynamic_batch", True))
-            dynamic_seq = bool(kwargs.get("dynamic_seq", False))
-            strict = bool(kwargs.get("strict", True))
-
-            dynamic_shapes = None
-            if (dynamic_batch or dynamic_seq) and hasattr(torch, "export") and hasattr(torch.export, "Dim"):
-                spec: dict[int, object] = {}
-                if dynamic_batch:
-                    spec[0] = torch.export.Dim("batch")
-                if dynamic_seq and sample.ndim >= 2:
-                    spec[1] = torch.export.Dim("seq")
-                if spec:
-                    dynamic_shapes = (spec,)
-            export_kw: dict[str, Any] = {}
-            try:
-                sig = inspect.signature(torch_export)
-                params = getattr(sig, "parameters", None)
-                if isinstance(params, dict):
-                    if "dynamic_shapes" in params and dynamic_shapes is not None:
-                        export_kw["dynamic_shapes"] = dynamic_shapes
-                    if "strict" in params:
-                        export_kw["strict"] = strict
-            except Exception:
-                if dynamic_shapes is not None:
-                    export_kw["dynamic_shapes"] = dynamic_shapes
-                export_kw["strict"] = strict
-
-            try:
-                with torch.no_grad():
-                    exported = torch_export(wrapper, (sample,), **export_kw)
-            except Exception as exc:
-                strict_supported = "strict" in export_kw
-                if strict_supported and export_kw.get("strict", True):
-                    warnings.warn(
-                        "torch.export strict=True failed; retrying strict=False for TorchInductor export",
-                        RuntimeWarning,
-                    )
-                    export_kw["strict"] = False
-                    with torch.no_grad():
-                        exported = torch_export(wrapper, (sample,), **export_kw)
-                else:
-                    raise
+            exported = _torch_export_program(
+                torch_export,
+                wrapper,
+                sample,
+                dynamic_batch=bool(kwargs.get("dynamic_batch", True)),
+                dynamic_seq=bool(kwargs.get("dynamic_seq", False)),
+                strict=bool(kwargs.get("strict", True)),
+                tag="TorchInductor export",
+            )
 
             dst = Path(dst)
             dst.parent.mkdir(parents=True, exist_ok=True)
@@ -559,7 +696,15 @@ class TorchInductor(Format):
                 if inductor_configs is not None:
                     aoti_kw["inductor_configs"] = inductor_configs
 
-            out_path = aoti_compile_and_package(exported, **aoti_kw)
+            try:
+                out_path = aoti_compile_and_package(exported, **aoti_kw)
+            except TypeError as exc:
+                msg = str(exc)
+                stripped = dict(aoti_kw)
+                for k in ("package_path", "inductor_configs"):
+                    if k in stripped and f"'{k}'" in msg:
+                        stripped.pop(k, None)
+                out_path = aoti_compile_and_package(exported, **stripped)
 
             out = Path(str(out_path))
             if out != dst:
@@ -568,7 +713,7 @@ class TorchInductor(Format):
                 out = dst
 
             with contextlib.suppress(Exception):
-                write_json(dst.with_suffix(".json"), _load_model_config(model), indent=2)
+                _write_export_meta(model, out, format_name=self.name or "aoti")
 
         return (out,)
 
@@ -607,7 +752,7 @@ class TorchExport(Format):
                 torch_save(exported, str(dst))
 
             with contextlib.suppress(Exception):
-                write_json(dst.with_suffix(".json"), _load_model_config(model), indent=2)
+                _write_export_meta(model, dst, format_name=self.name or "pt2")
 
         return (dst,)
 
@@ -619,47 +764,15 @@ class TorchExport(Format):
         except Exception as exc:
             raise ImportError("torch.export is required for PT2 export (PyTorch 2.0+).") from exc
 
-        dynamic_batch = bool(kwargs.get("dynamic_batch", True))
-        dynamic_seq = bool(kwargs.get("dynamic_seq", False))
-        strict = bool(kwargs.get("strict", True))
-
-        dynamic_shapes = None
-        if (dynamic_batch or dynamic_seq) and hasattr(torch, "export") and hasattr(torch.export, "Dim"):
-            spec: dict[int, object] = {}
-            if dynamic_batch:
-                spec[0] = torch.export.Dim("batch")
-            if dynamic_seq and sample.ndim >= 2:
-                spec[1] = torch.export.Dim("seq")
-            if spec:
-                dynamic_shapes = (spec,)
-        call_kw: dict[str, Any] = {}
-        try:
-            sig = inspect.signature(torch_export)
-            params = getattr(sig, "parameters", None)
-            if isinstance(params, dict):
-                if "dynamic_shapes" in params and dynamic_shapes is not None:
-                    call_kw["dynamic_shapes"] = dynamic_shapes
-                if "strict" in params:
-                    call_kw["strict"] = strict
-        except Exception:
-            if dynamic_shapes is not None:
-                call_kw["dynamic_shapes"] = dynamic_shapes
-            call_kw["strict"] = strict
-
-        try:
-            with torch.no_grad():
-                return torch_export(wrapper, (sample,), **call_kw)
-        except Exception as exc:
-            strict_supported = "strict" in call_kw
-            if strict_supported and call_kw.get("strict", True):
-                warnings.warn(
-                    "torch.export strict=True failed; retrying strict=False for PT2 export",
-                    RuntimeWarning,
-                )
-                call_kw["strict"] = False
-                with torch.no_grad():
-                    return torch_export(wrapper, (sample,), **call_kw)
-            raise
+        return _torch_export_program(
+            torch_export,
+            wrapper,
+            sample,
+            dynamic_batch=bool(kwargs.get("dynamic_batch", True)),
+            dynamic_seq=bool(kwargs.get("dynamic_seq", False)),
+            strict=bool(kwargs.get("strict", True)),
+            tag="PT2 export",
+        )
 
 
 class ExecuTorch(Format):
@@ -681,25 +794,22 @@ class ExecuTorch(Format):
             ) from exc
         import executorch.exir as exir
 
+        dst = Path(dst)
         with _onnx_model(model) as serving_model:
             sample = kwargs.get("sample_input")
             sample = _pad_sample(serving_model, sample)
+            if isinstance(sample, torch.Tensor) and sample.ndim == 1:
+                sample = sample.unsqueeze(0)
             wrapper = _TensorOutputModule(serving_model).eval()
-            with torch.no_grad():
-                try:
-                    exported = torch_export(wrapper, (sample,))
-                except Exception as exc:
-                    strict_supported = False
-                    with contextlib.suppress(Exception):
-                        sig = inspect.signature(torch_export)
-                        strict_supported = "strict" in sig.parameters
-                    if not strict_supported:
-                        raise
-                    warnings.warn(
-                        "torch.export strict=True failed; retrying strict=False for ExecuTorch export",
-                        RuntimeWarning,
-                    )
-                    exported = torch_export(wrapper, (sample,), strict=False)
+            exported = _torch_export_program(
+                torch_export,
+                wrapper,
+                sample,
+                dynamic_batch=bool(kwargs.get("dynamic_batch", True)),
+                dynamic_seq=bool(kwargs.get("dynamic_seq", False)),
+                strict=bool(kwargs.get("strict", True)),
+                tag="ExecuTorch export",
+            )
             edge = exir.to_edge(exported)
             if hasattr(exir, "to_executorch"):
                 exec_prog = exir.to_executorch(edge)
@@ -714,6 +824,8 @@ class ExecuTorch(Format):
             dst.parent.mkdir(parents=True, exist_ok=True)
             with open(dst, "wb") as fh:
                 exec_prog.write_to_file(fh)
+            with contextlib.suppress(Exception):
+                _write_export_meta(model, dst, format_name=self.name or "executorch")
         return (dst,)
 
 
@@ -727,8 +839,11 @@ class ONNX(Format):
         *args: Any,
         **kwargs: Any,
     ) -> object:
+        dst = Path(dst)
         with _onnx_model(model) as serving:
             out = _ONNXExporter.export(serving, dst, **_onnx_options(kwargs, target="onnx"))
+        with contextlib.suppress(Exception):
+            _write_export_meta(model, out, format_name=self.name or "onnx")
         return (out,)
 
 
@@ -742,6 +857,7 @@ class ORT(Format):
         *args: Any,
         **kwargs: Any,
     ) -> object:
+        dst = Path(dst)
         with _onnx_model(model) as serving:
             onnx_path = _ONNXExporter.coerce(
                 serving,
@@ -755,6 +871,16 @@ class ORT(Format):
                 optimization_style=str(kwargs.get("optimization_style", "fixed")),
                 target_platform=kwargs.get("target_platform"),
                 save_optimized_onnx_model=bool(kwargs.get("save_optimized_onnx_model", False)),
+            )
+        with contextlib.suppress(Exception):
+            _write_export_meta(
+                model,
+                ort_path,
+                format_name=self.name or "ort",
+                extra={
+                    "onnx_path": str(onnx_path),
+                    "optimized_onnx": str(optimized) if optimized is not None else None,
+                },
             )
         return (ort_path, optimized) if optimized is not None else (ort_path,)
 
@@ -770,12 +896,30 @@ class TensorRT(Format):
         **kwargs: Any,
     ) -> object:
         del args
+        dst = Path(dst)
         with _onnx_model(model) as serving_model:
             onnx_path = _ONNXExporter.coerce(
                 serving_model,
                 _coerce_onnx_path(dst, kwargs),
                 **_onnx_options(kwargs, target="tensorrt"),
             )
+            if bool(kwargs.get("graphsurgeon", True)):
+                if (
+                    importlib.util.find_spec("onnx") is not None
+                    and importlib.util.find_spec("onnx_graphsurgeon") is not None
+                ):
+                    try:
+                        import onnx
+                        import onnx_graphsurgeon as gs
+
+                        gs_model = onnx.load(str(onnx_path))
+                        graph = gs.import_onnx(gs_model)
+                        graph.cleanup().toposort()
+                        onnx.save(gs.export_onnx(graph), str(onnx_path))
+                    except Exception as exc:
+                        warnings.warn(
+                            f"TensorRT graphsurgeon optimization failed; using unoptimized ONNX. ({exc})"
+                        )
             try:
                 import tensorrt as trt
             except ImportError as exc:
@@ -866,6 +1010,14 @@ class TensorRT(Format):
                 dst.parent.mkdir(parents=True, exist_ok=True)
                 with open(dst, "wb") as handle:
                     handle.write(engine_bytes)
+
+                with contextlib.suppress(Exception):
+                    _write_export_meta(
+                        model,
+                        dst,
+                        format_name=self.name or "tensorrt",
+                        extra={"onnx_path": str(onnx_path)},
+                    )
         return (dst,)
 
 
@@ -881,6 +1033,8 @@ class CoreML(Format):
     ) -> object:
         is_required("coremltools", "pip install coremltools")
         import coremltools as ct
+
+        dst = Path(dst)
 
         with _onnx_model(model) as serving_model:
             sample = _pad_sample(serving_model, kwargs.get("sample_input"))
@@ -939,6 +1093,8 @@ class CoreML(Format):
                 ) from last_exc
             dst.parent.mkdir(parents=True, exist_ok=True)
             mlmodel.save(str(dst))
+            with contextlib.suppress(Exception):
+                _write_export_meta(model, dst, format_name=self.name or "coreml")
         return (dst,)
 
 
@@ -952,68 +1108,86 @@ class LiteRT(Format):
         *args: Any,
         **kwargs: Any,
     ) -> object:
+        del args
+        dst = Path(dst)
+        prefer_ai_edge = bool(kwargs.get("prefer_ai_edge_torch", kwargs.get("prefer_ai_edge", True)))
+        have_ai_edge = importlib.util.find_spec("ai_edge_torch") is not None
+        have_onnx2tf = importlib.util.find_spec("onnx2tf") is not None
+
         with _onnx_model(model) as serving_model:
+            if prefer_ai_edge and have_ai_edge:
+                try:
+                    import ai_edge_torch
+
+                    sample = kwargs.get("sample_input")
+                    sample = _pad_sample(serving_model, sample, batch=1)
+                    if isinstance(sample, torch.Tensor) and sample.ndim == 1:
+                        sample = sample.unsqueeze(0)
+
+                    wrapper = _TensorOutputModule(serving_model).eval()
+                    edge_model = ai_edge_torch.convert(wrapper, (sample,))
+                    exporter = getattr(edge_model, "export", None)
+                    if not callable(exporter):
+                        raise AttributeError(
+                            "ai-edge-torch conversion did not return an object with .export()"
+                        )
+                    dst.parent.mkdir(parents=True, exist_ok=True)
+                    exporter(str(dst))
+
+                    with contextlib.suppress(Exception):
+                        _write_export_meta(
+                            model,
+                            dst,
+                            format_name=self.name or "litert",
+                            extra={"backend": "ai-edge-torch"},
+                        )
+                    return (dst,)
+                except Exception as exc:
+                    if have_onnx2tf and bool(kwargs.get("fallback_onnx2tf", True)):
+                        warnings.warn(
+                            f"ai-edge-torch conversion failed; retrying via onnx2tf: {exc}",
+                            RuntimeWarning,
+                        )
+                    else:
+                        raise
+
+            if not have_onnx2tf:
+                raise ImportError(
+                    "LiteRT export requires ai-edge-torch (preferred) or onnx2tf (fallback). "
+                    "Try: pip install ai-edge-torch (or: pip install onnx2tf)"
+                )
+            is_required("onnx2tf", "pip install onnx2tf")
+
             onnx_path = _ONNXExporter.coerce(
                 serving_model,
                 _coerce_onnx_path(dst, kwargs),
                 **_onnx_options(kwargs, target="litert"),
             )
-            if bool(kwargs.get("prefer_onnx2tf", True)) and (
-                importlib.util.find_spec("onnx2tf") is not None
-            ):
-                try:
-                    out_dir = dst.with_suffix("")
-                    out_dir.mkdir(parents=True, exist_ok=True)
-                    cmd = [
-                        sys.executable,
-                        "-m",
-                        "onnx2tf",
-                        "-i",
-                        str(onnx_path),
-                        "-o",
-                        str(out_dir),
-                        "--copy_onnx_input_output_names_to_tflite",
-                    ]
-                    _in_console(cmd, "onnx2tf")
-                    tflites = list(out_dir.glob("*.tflite"))
-                    if not tflites:
-                        raise RuntimeError("onnx2tf did not produce a TFLite model.")
-                    shutil.copyfile(tflites[0], dst)
-                    return (dst,)
-                except Exception as exc:
-                    warnings.warn(
-                        f"Falling back to the onnx-tf export path because onnx2tf failed: {exc}."
-                    )
-            is_required("onnx", "pip install onnx")
-            is_required("onnx-tf", "pip install onnx-tf")
-            import onnx
-            import tensorflow as tf
-            from onnx_tf.backend import prepare
 
-            model_onnx = onnx.load(str(onnx_path))
-            with TemporaryDirectory() as tmpd:
-                saved_model_dir = Path(tmpd) / "saved_model"
-                prepare(model_onnx).export_graph(str(saved_model_dir))
-                converter = tf.lite.TFLiteConverter.from_saved_model(str(saved_model_dir))
-                if bool(kwargs.get("allow_fp16", False)):
-                    converter.target_spec.supported_types = [tf.float16]
-                    converter.optimizations = [tf.lite.Optimize.DEFAULT]
-                if bool(kwargs.get("int8_quantize", False)):
-                    rep_ds = kwargs.get("representative_dataset")
-                    if rep_ds is None:
-                        raise ValueError(
-                            "A representative_dataset is required for INT8 quantization."
-                        )
-                    converter.optimizations = [tf.lite.Optimize.DEFAULT]
-                    converter.representative_dataset = rep_ds
-                    converter.target_spec.supported_ops = [tf.lite.OpsSet.TFLITE_BUILTINS_INT8]
-                    converter.inference_input_type = tf.int8
-                    converter.inference_output_type = tf.int8
-                tflite_model = converter.convert()
-                dst.parent.mkdir(parents=True, exist_ok=True)
-                with open(dst, "wb") as handle:
-                    handle.write(tflite_model)
-        return (dst,)
+            work_dir = dst.with_name(dst.name + ".onnx2tf")
+            if work_dir.exists():
+                shutil.rmtree(work_dir, ignore_errors=True)
+            work_dir.mkdir(parents=True, exist_ok=True)
+
+            _run_onnx2tf(
+                Path(onnx_path),
+                work_dir,
+                "--copy_onnx_input_output_names_to_tflite",
+            )
+            tflites = list(work_dir.rglob("*.tflite"))
+            if not tflites:
+                raise RuntimeError("onnx2tf did not produce a .tflite model.")
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(tflites[0], dst)
+
+            with contextlib.suppress(Exception):
+                _write_export_meta(
+                    model,
+                    dst,
+                    format_name=self.name or "litert",
+                    extra={"backend": "onnx2tf", "onnx_path": str(onnx_path)},
+                )
+            return (dst,)
 
 
 class TensorFlow(Format):
@@ -1026,38 +1200,45 @@ class TensorFlow(Format):
         *args: Any,
         **kwargs: Any,
     ) -> object:
+        del args
+        is_required("onnx2tf", "pip install onnx2tf")
+        dst = Path(dst)
+        suffix = dst.suffix.lower()
+        if suffix == ".savedmodel":
+            saved_model_dir = dst
+        elif suffix in {".pb", ".tf"}:
+            saved_model_dir = dst.with_suffix("")
+        else:
+            saved_model_dir = dst
+
         with _onnx_model(model) as serving_model:
             onnx_path = _ONNXExporter.coerce(
                 serving_model,
-                dst,
+                _coerce_onnx_path(saved_model_dir, kwargs),
                 **_onnx_options(kwargs, target="tensorflow"),
             )
-            saved_model_dir = dst.with_suffix("") if dst.suffix else dst
-            saved_model_dir.parent.mkdir(parents=True, exist_ok=True)
-            prefer_onnx2tf = bool(kwargs.get("prefer_onnx2tf", True))
-            if prefer_onnx2tf and shutil.which("onnx2tf") is not None:
-                with contextlib.suppress(Exception):
-                    _in_console(
-                        [
-                            "onnx2tf",
-                            "-i",
-                            str(onnx_path),
-                            "-o",
-                            str(saved_model_dir),
-                        ],
-                        "onnx2tf",
-                    )
-                    if (saved_model_dir / "saved_model.pb").exists():
-                        return (saved_model_dir,)
-                    found = list(saved_model_dir.rglob("saved_model.pb"))
-                    if len(found) > 0:
-                        return (found[0].parent,)
-            is_required("onnx-tf", "pip install onnx-tf")
-            from onnx_tf.backend import prepare
-            import onnx
 
-            model_onnx = onnx.load(str(onnx_path))
-            prepare(model_onnx).export_graph(str(saved_model_dir))
+            with TemporaryDirectory() as tmpd:
+                tmp_out = Path(tmpd) / "onnx2tf_out"
+                tmp_out.mkdir(parents=True, exist_ok=True)
+                _run_onnx2tf(Path(onnx_path), tmp_out)
+                pb_files = list(tmp_out.rglob("saved_model.pb"))
+                if not pb_files:
+                    raise RuntimeError("onnx2tf did not produce a TensorFlow SavedModel (saved_model.pb)")
+                src_dir = pb_files[0].parent
+                if saved_model_dir.exists():
+                    shutil.rmtree(saved_model_dir)
+                saved_model_dir.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copytree(src_dir, saved_model_dir)
+
+        with contextlib.suppress(Exception):
+            _write_export_meta(
+                model,
+                saved_model_dir,
+                format_name=self.name or "tensorflow",
+                extra={"backend": "onnx2tf", "onnx_path": str(onnx_path)},
+            )
+
         return (saved_model_dir,)
 
 

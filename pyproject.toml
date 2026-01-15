@@ -38,6 +38,7 @@ dependencies = [
   "onnx>=1.20.1",
   "onnxruntime>=1.23.2",
   "onnxscript>=0.5.7",
+  "onnxoptimizer>=0.4.2",
   "onnx_ir>=0.1.14",
   "ml_dtypes>=0.5.4",
 ]
@@ -54,64 +55,37 @@ polars = ["polars>=1.30.0", "openpyxl>=3.1.5", "fastexcel>=0.14.0", "xlsxwriter>
 nvidia_te_cu12 = ["transformer-engine-cu12>=2.2.0", "transformer-engine-torch>=2.2.0"]
 nvidia_te_cu13 = ["transformer-engine-cu13>=2.2.0", "transformer-engine-torch>=2.2.0"]
 intel_ai = ["intel-extension-for-pytorch>=2.7.0"]
-deployment_full = [
-  "onnx-tf>=1.10.0; python_version<'3.13'",
+export_tensorflow = [
   "onnx2tf>=1.28.8",
   "tensorflow>=2.20.0",
-  "ai-edge-litert>=2.1.0; platform_system=='Linux'",
-  "coremltools>=8.3.0; platform_system=='Darwin'",
-  "tensorrt>=10.10.0.31; platform_system=='Linux'",
-  "executorch>=0.6.0; platform_system=='Linux' and python_version<'3.12'",
 ]
-# NVML telemetry (optional)
-# Note: the *module* used by this project is `pynvml`, but the recommended PyPI
-# distribution is `nvidia-ml-py`.
-telemetry = ["nvidia-ml-py>=11.515.48"]
-nufft = ["cufinufft"]
-dev = [
-  "pytest>=8.0.0",
-  "ruff>=0.5.0",
-  "mypy>=1.10.0",
-  "black>=24.0.0",
-  "pre-commit>=3.7.0",
+export_litert = [
+  "ai-edge-torch>=0.7.1",
 ]
-
-[tool.setuptools]
-include-package-data = true
-license-files = ["LICENSE*"]
-
-[tool.setuptools.packages.find]
-where = [""]
-include = ["stnet*"]
-exclude = ["tests*"]
-
-[tool.setuptools.package-data]
-"stnet" = [
-  "**/*.json",
-  "**/*.yaml",
-  "**/*.yml",
-  "**/*.ini",
-  "**/*.cfg",
-  "**/*.md",
-  "**/*.txt",
-  "**/*.pt",
-  "**/*.pth",
-  "**/*.onnx",
-  "**/*.bin",
+export_executorch = [
+  "executorch>=1.0.1; python_version < '3.13'",
 ]
-
-
-[tool.ruff]
-target-version = "py310"
-line-length = 100
-
-[tool.ruff.lint]
-# Start with a small rule set (pyflakes + syntax errors) and tighten over time.
-select = ["F", "E9"]
-
-
-[tool.mypy]
-python_version = "3.10"
-ignore_missing_imports = true
-show_error_codes = true
-warn_unused_ignores = true
+export_coreml = [
+  "coremltools>=9.0; platform_system == 'Darwin'",
+]
+export_tensorrt = [
+  "torch-tensorrt>=2.9.0; platform_system == 'Linux'",
+  "onnx-graphsurgeon>=0.5.8; platform_system == 'Linux'",
+  "torch-tensorrt-bzl>=1.3.0; platform_system == 'Linux'",
+  "torch-tensorrt-rtx>=0.0.1; platform_system == 'Linux'",
+  "onnxruntime-trt-rtx>=1.23.2; platform_system == 'Windows'",
+  "tensorrt>=10.10.0; platform_system == 'Linux'",
+]
+deployment_full = [
+  "onnx2tf>=1.28.8",
+  "tensorflow>=2.20.0",
+  "ai-edge-torch>=0.7.1",
+  "executorch>=1.0.1; python_version < '3.13'",
+  "coremltools>=9.0; platform_system == 'Darwin'",
+  "torch-tensorrt>=2.9.0; platform_system == 'Linux'",
+  "onnx-graphsurgeon>=0.5.8; platform_system == 'Linux'",
+  "torch-tensorrt-bzl>=1.3.0; platform_system == 'Linux'",
+  "torch-tensorrt-rtx>=0.0.1; platform_system == 'Linux'",
+  "onnxruntime-trt-rtx>=1.23.2; platform_system == 'Windows'",
+  "tensorrt>=10.10.0; platform_system == 'Linux'",
+]

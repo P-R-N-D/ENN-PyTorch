@@ -690,7 +690,9 @@ def load_model(
         raise FileNotFoundError(f"Checkpoint file not found: {str(p)!r}")
     suffix = p.suffix.lower()
     if suffix == ".safetensors":
-        meta_path = p.with_suffix(".json")
+        meta_path = p.with_name(p.name + ".json")
+        if not meta_path.exists():
+            meta_path = p.with_suffix(".json")
         if not meta_path.exists():
             raise RuntimeError("Missing sidecar JSON file for the safetensors checkpoint.")
         meta = read_json(meta_path)

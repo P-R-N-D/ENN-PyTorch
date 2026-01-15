@@ -216,7 +216,12 @@ class Builder:
                 finally:
                     with contextlib.suppress(Exception):
                         tmp_path.unlink() if tmp_path.exists() else None
-                write_json(p.with_suffix(".json"), _make_meta(), indent=2)
+                meta = _make_meta()
+                write_json(p.with_name(p.name + ".json"), meta, indent=2)
+                with contextlib.suppress(Exception):
+                    legacy = p.with_suffix(".json")
+                    if legacy != p.with_name(p.name + ".json"):
+                        write_json(legacy, meta, indent=2)
                 return p
             payload = {**_make_meta(), "state_dict": model.state_dict()}
             if optimizer is not None:
