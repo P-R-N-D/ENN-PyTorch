@@ -277,18 +277,118 @@ def _pad_to_batch(sample: torch.Tensor, min_batch: int) -> torch.Tensor:
     return torch.cat([sample, pad], dim=0)
 
 
-def _run_onnx2tf(onnx_path: Path, out_dir: Path, *extra_args: str) -> None:
-    cmd = [
-        sys.executable,
-        "-m",
-        "onnx2tf",
-        "-i",
-        str(onnx_path),
-        "-o",
-        str(out_dir),
-        *extra_args,
-    ]
-    _in_console(cmd, "onnx2tf")
+_ONNX2TF_HELP_CACHE: str | None = None
+_ONNX2TF_HELP_LOCK = Mutex(reentrant=True)
+
+
+def _onnx2tf_help_text() -> str:
+    global _ONNX2TF_HELP_CACHE
+    cached = _ONNX2TF_HELP_CACHE
+    if cached is not None:
+        return cached
+    with _ONNX2TF_HELP_LOCK:
+        cached = _ONNX2TF_HELP_CACHE
+        if cached is not None:
+            return cached
+        try:
+            out = subprocess.check_output(
+                [sys.executable, "-m", "onnx2tf", "-h"],
+                stderr=subprocess.STDOUT,
+                text=True,
+            )
+        except Exception:
+            out = ""
+        _ONNX2TF_HELP_CACHE = out
+        return out
+
+
+def _onnx2tf_supports(flag: str) -> bool:
+    try:
+        return flag in _onnx2tf_help_text()
+    except Exception:
+        return False
+
+
+def _find_latest_onnx2tf_auto_json(out_dir: Path) -> Path | None:
+    try:
+        candidates = list(Path(out_dir).rglob("*_auto.json"))
+    except Exception:
+        return None
+    if not candidates:
+        return None
+    try:
+        candidates.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    except Exception:
+        pass
+    return candidates[0]
+
+
+def _run_onnx2tf(
+    onnx_path: Path,
+    out_dir: Path,
+    *extra_args: str,
+    dynamic_batch: bool = True,
+    retry_auto_prf: bool = True,
+    retry_batch_1: bool = True,
+) -> None:
+    out_dir = Path(out_dir)
+    with contextlib.suppress(Exception):
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+    base_args: list[str] = []
+    if _onnx2tf_supports("-nuo"):
+        base_args.append("-nuo")
+    if dynamic_batch and _onnx2tf_supports("-osd"):
+        base_args.append("-osd")
+
+    def _cmd(*more: str) -> list[str]:
+        cmd = [
+            sys.executable,
+            "-m",
+            "onnx2tf",
+            "-i",
+            str(onnx_path),
+            "-o",
+            str(out_dir),
+        ]
+        cmd.extend([x for x in base_args if x])
+        cmd.extend([x for x in extra_args if x])
+        cmd.extend([x for x in more if x])
+        return cmd
+
+    last_exc: Exception | None = None
+    auto_json: Path | None = None
+    try:
+        _in_console(_cmd(), "onnx2tf")
+        return
+    except Exception as exc:
+        last_exc = exc
+
+    if retry_auto_prf and _onnx2tf_supports("-prf"):
+        auto_json = _find_latest_onnx2tf_auto_json(out_dir)
+        if auto_json is not None:
+            try:
+                _in_console(_cmd("-prf", str(auto_json)), "onnx2tf")
+                return
+            except Exception as exc:
+                last_exc = exc
+
+    if dynamic_batch and retry_batch_1 and _onnx2tf_supports("-b"):
+        try:
+            _in_console(_cmd("-b", "1"), "onnx2tf")
+            return
+        except Exception as exc:
+            last_exc = exc
+
+        if auto_json is not None and _onnx2tf_supports("-prf"):
+            try:
+                _in_console(_cmd("-b", "1", "-prf", str(auto_json)), "onnx2tf")
+                return
+            except Exception as exc:
+                last_exc = exc
+
+    if last_exc is not None:
+        raise last_exc
 
 
 def _torch_export_program(
@@ -801,29 +901,62 @@ class ExecuTorch(Format):
             if isinstance(sample, torch.Tensor) and sample.ndim == 1:
                 sample = sample.unsqueeze(0)
             wrapper = _TensorOutputModule(serving_model).eval()
+            dst.parent.mkdir(parents=True, exist_ok=True)
+
+            dyn_batch = bool(kwargs.get("dynamic_batch", True))
+            dyn_seq = bool(kwargs.get("dynamic_seq", False))
+            strict = bool(kwargs.get("strict", True))
+
             exported = _torch_export_program(
                 torch_export,
                 wrapper,
                 sample,
-                dynamic_batch=bool(kwargs.get("dynamic_batch", True)),
-                dynamic_seq=bool(kwargs.get("dynamic_seq", False)),
-                strict=bool(kwargs.get("strict", True)),
+                dynamic_batch=dyn_batch,
+                dynamic_seq=dyn_seq,
+                strict=strict,
                 tag="ExecuTorch export",
             )
-            edge = exir.to_edge(exported)
-            if hasattr(exir, "to_executorch"):
-                exec_prog = exir.to_executorch(edge)
-            elif hasattr(edge, "to_executorch"):
-                exec_prog = edge.to_executorch()
-            elif hasattr(edge, "to_executorch_program"):
-                exec_prog = edge.to_executorch_program()
-            else:
+
+            def _to_executorch_program(exported_program: object) -> object:
+                edge = exir.to_edge(exported_program)
+                if hasattr(exir, "to_executorch"):
+                    return exir.to_executorch(edge)
+                if hasattr(edge, "to_executorch"):
+                    return edge.to_executorch()
+                if hasattr(edge, "to_executorch_program"):
+                    return edge.to_executorch_program()
                 raise AttributeError(
                     "ExecuTorch export: could not find `exir.to_executorch(edge)` nor `edge.to_executorch()`."
                 )
-            dst.parent.mkdir(parents=True, exist_ok=True)
-            with open(dst, "wb") as fh:
-                exec_prog.write_to_file(fh)
+
+            with _temp_environ(
+                {"ET_EXIR_SAVE_FLATC_INPUTS_ON_FAILURE": "1"},
+                only_if_unset=True,
+            ):
+                try:
+                    exec_prog = _to_executorch_program(exported)
+                    with open(dst, "wb") as fh:
+                        exec_prog.write_to_file(fh)
+                except Exception:
+                    if dyn_batch or dyn_seq:
+                        warnings.warn(
+                            "ExecuTorch export failed with dynamic shapes; retrying with dynamic_batch=False, dynamic_seq=False",
+                            RuntimeWarning,
+                        )
+                        exported_static = _torch_export_program(
+                            torch_export,
+                            wrapper,
+                            sample,
+                            dynamic_batch=False,
+                            dynamic_seq=False,
+                            strict=strict,
+                            tag="ExecuTorch export (static fallback)",
+                        )
+                        exec_prog = _to_executorch_program(exported_static)
+                        with open(dst, "wb") as fh:
+                            exec_prog.write_to_file(fh)
+                    else:
+                        raise
             with contextlib.suppress(Exception):
                 _write_export_meta(model, dst, format_name=self.name or "executorch")
         return (dst,)
@@ -1173,6 +1306,7 @@ class LiteRT(Format):
                 Path(onnx_path),
                 work_dir,
                 "--copy_onnx_input_output_names_to_tflite",
+                dynamic_batch=bool(kwargs.get("dynamic_batch", True)),
             )
             tflites = list(work_dir.rglob("*.tflite"))
             if not tflites:
@@ -1221,7 +1355,11 @@ class TensorFlow(Format):
             with TemporaryDirectory() as tmpd:
                 tmp_out = Path(tmpd) / "onnx2tf_out"
                 tmp_out.mkdir(parents=True, exist_ok=True)
-                _run_onnx2tf(Path(onnx_path), tmp_out)
+                _run_onnx2tf(
+                    Path(onnx_path),
+                    tmp_out,
+                    dynamic_batch=bool(kwargs.get("dynamic_batch", True)),
+                )
                 pb_files = list(tmp_out.rglob("saved_model.pb"))
                 if not pb_files:
                     raise RuntimeError("onnx2tf did not produce a TensorFlow SavedModel (saved_model.pb)")

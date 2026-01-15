@@ -1046,9 +1046,32 @@ def init_python_path() -> str:
     return python_path
 
 
+def _main_module_has_real_file() -> bool:
+    try:
+        import __main__  # type: ignore
+        main_file = getattr(__main__, "__file__", None)
+    except Exception:
+        main_file = None
+    if not main_file:
+        return False
+    main_file = str(main_file)
+    if main_file.startswith("<") and main_file.endswith(">"):
+        return False
+    if main_file in {"-c", "-m", "-"}:
+        return False
+    abs_path = main_file
+    if not os.path.isabs(abs_path):
+        abs_path = os.path.join(os.getcwd(), abs_path)
+    return os.path.isfile(abs_path)
+
+
 def optimal_start_method() -> str:
     current = torch.multiprocessing.get_start_method(allow_none=True)
+    if current == "fork":
+        return current
     platform = sys.platform
+    if platform.startswith(("darwin", "linux")) and not _main_module_has_real_file():
+        return "fork"
     if platform.startswith("win"):
         candidates = ("spawn",)
     elif platform.startswith(("darwin", "linux")):
@@ -1056,7 +1079,7 @@ def optimal_start_method() -> str:
     else:
         candidates = ("spawn",)
     if current in candidates:
-        return str(current)
+        return current
     for method in candidates:
         try:
             multiprocessing.get_context(method)
@@ -1069,11 +1092,16 @@ def optimal_start_method() -> str:
 def init_start_method() -> None:
     with contextlib.suppress(RuntimeError):
         torch.multiprocessing.set_sharing_strategy("file_system")
+    platform = sys.platform
+    if platform.startswith(("darwin", "linux")) and not _main_module_has_real_file():
+        with contextlib.suppress(Exception):
+            for module in (multiprocessing, torch.multiprocessing):
+                module.set_start_method("fork", force=True)
+        return
     existing = torch.multiprocessing.get_start_method(allow_none=True)
     if existing is not None and existing != "fork":
         return
     last_error: Optional[BaseException] = None
-    platform = sys.platform
     if platform.startswith("win"):
         candidates = ("spawn",)
     elif platform.startswith(("darwin", "linux")):

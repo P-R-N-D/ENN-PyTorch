@@ -138,7 +138,6 @@ def _flatten_attn_mask(
                 mask.size(3) == S,
                 "attn_mask S mismatch",
             )
-            _ = mask.expand(B, H, L, S)
         else:
             if s0 != S:
                 raise RuntimeError(f"attn_mask S mismatch: {s0} != {S}")
@@ -1053,7 +1052,7 @@ class MultiScaleRetention(nn.Module):
                     return state_tensor[:, -1]
             lengths = (~attn_mask).to(dtype=torch.int64).sum(dim=1).clamp(min=1)
             idx = (lengths - 1).clamp(min=0, max=L - 1)
-            gather_idx = idx.view(B, 1, 1, 1).expand(B, 1, H, Dh)
+            gather_idx = idx.view(B, 1, 1, 1).expand(-1, -1, H, Dh)
             return torch.gather(state_tensor, dim=1, index=gather_idx).squeeze(1)
         return state_tensor[:, -1]
 
