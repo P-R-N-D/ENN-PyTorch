@@ -12,7 +12,7 @@ license = { file = "LICENSE" }
 authors = [{ name = "Kim Jeseok" }]
 keywords = ["transformer", "spatio-temporal", "pytorch", "time-series", "fp8", "training", "onnx"]
 classifiers = [
-  "Development Status :: 4 - Beta",
+  "Development Status :: 5 - Production/Stable",
   "Intended Audience :: Science/Research",
   "License :: Other/Proprietary License",
   "Programming Language :: Python",
