@@ -740,10 +740,8 @@ class DotProductAttention(nn.Module):
             m = attn_mask
             if m.dtype == torch.bool:
                 mask_bool = m
-            elif torch.is_floating_point(m):
-                bias_float = m
             else:
-                mask_bool = m != 0
+                bias_float = m
 
         mb = mh = mL = 0
         if mask_bool is not None:
