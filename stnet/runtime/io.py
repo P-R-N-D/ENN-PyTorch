@@ -304,8 +304,8 @@ class Exporter:
 
             cls._register_unlocked("onnx", (".onnx",), _w.ONNX())
             cls._register_unlocked("ort", (".ort",), _w.ORT())
-            cls._register_unlocked("tensorrt", (".engine",), _w.TensorRT())
-            cls._register_unlocked("coreml", (".mlmodel",), _w.CoreML())
+            cls._register_unlocked("tensorrt", (".engine", ".plan"), _w.TensorRT())
+            cls._register_unlocked("coreml", (".mlmodel", ".mlpackage"), _w.CoreML())
             cls._register_unlocked("litert", (".tflite",), _w.LiteRT())
             cls._register_unlocked("pt2", (".pt2", ".export"), _w.TorchExport())
             cls._register_unlocked("aoti", (".aoti",), _w.TorchInductor())

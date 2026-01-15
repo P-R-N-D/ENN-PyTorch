@@ -674,40 +674,80 @@ class _ORTBuilder:
             "all": ort.GraphOptimizationLevel.ORT_ENABLE_ALL,
         }
         level = opt_map.get(optimization_level.lower(), ort.GraphOptimizationLevel.ORT_ENABLE_ALL)
-        platform = (target_platform or "").lower()
-        disabled_optimizers = (
-            ["NchwcTransformer"]
-            if level == ort.GraphOptimizationLevel.ORT_ENABLE_ALL and platform not in {"", "amd64"}
-            else None
-        )
+        disabled_optimizers: list[str] | None = None
+        if level == ort.GraphOptimizationLevel.ORT_ENABLE_ALL:
+            disabled_optimizers = ["NchwcTransformer"]
         optimized_onnx_path = None
+
         if save_optimized_onnx_model:
             optimized_onnx_path = ort_path.with_suffix(".optimized.onnx")
-            so_onnx = ort.SessionOptions()
-            so_onnx.optimized_model_filepath = str(optimized_onnx_path)
-            so_onnx.graph_optimization_level = level
-            if optimization_style.lower() == "runtime":
-                so_onnx.add_session_config_entry(
-                    "optimization.minimal_build_optimizations", "apply"
+            try:
+                so_onnx = ort.SessionOptions()
+                so_onnx.optimized_model_filepath = str(optimized_onnx_path)
+                so_onnx.graph_optimization_level = level
+                if optimization_style.lower() == "runtime":
+                    so_onnx.add_session_config_entry(
+                        "optimization.minimal_build_optimizations", "apply"
+                    )
+                ort.InferenceSession(
+                    str(onnx_path),
+                    sess_options=so_onnx,
+                    providers=["CPUExecutionProvider"],
+                    disabled_optimizers=disabled_optimizers,
                 )
-            ort.InferenceSession(
-                str(onnx_path),
-                sess_options=so_onnx,
-                providers=["CPUExecutionProvider"],
-                disabled_optimizers=disabled_optimizers,
+            except Exception as exc:
+                warnings.warn(
+                    f"ORT optimized ONNX save failed; continuing without it. ({exc})",
+                    RuntimeWarning,
+                )
+                optimized_onnx_path = None
+
+        levels_to_try = [level]
+        if level == ort.GraphOptimizationLevel.ORT_ENABLE_ALL:
+            levels_to_try.extend(
+                [
+                    ort.GraphOptimizationLevel.ORT_ENABLE_EXTENDED,
+                    ort.GraphOptimizationLevel.ORT_ENABLE_BASIC,
+                    ort.GraphOptimizationLevel.ORT_DISABLE_ALL,
+                ]
             )
-        so = ort.SessionOptions()
-        so.optimized_model_filepath = str(ort_path)
-        so.graph_optimization_level = level
-        so.add_session_config_entry("session.save_model_format", "ORT")
-        if optimization_style.lower() == "runtime":
-            so.add_session_config_entry("optimization.minimal_build_optimizations", "save")
-        ort.InferenceSession(
-            str(onnx_path),
-            sess_options=so,
-            providers=["CPUExecutionProvider"],
-            disabled_optimizers=disabled_optimizers,
-        )
+        elif level == ort.GraphOptimizationLevel.ORT_ENABLE_EXTENDED:
+            levels_to_try.extend(
+                [
+                    ort.GraphOptimizationLevel.ORT_ENABLE_BASIC,
+                    ort.GraphOptimizationLevel.ORT_DISABLE_ALL,
+                ]
+            )
+        elif level == ort.GraphOptimizationLevel.ORT_ENABLE_BASIC:
+            levels_to_try.append(ort.GraphOptimizationLevel.ORT_DISABLE_ALL)
+
+        last_exc: Exception | None = None
+        for lvl in levels_to_try:
+            try:
+                so = ort.SessionOptions()
+                so.optimized_model_filepath = str(ort_path)
+                so.graph_optimization_level = lvl
+                so.add_session_config_entry("session.save_model_format", "ORT")
+                if optimization_style.lower() == "runtime":
+                    so.add_session_config_entry(
+                        "optimization.minimal_build_optimizations", "save"
+                    )
+                dis = disabled_optimizers if lvl == ort.GraphOptimizationLevel.ORT_ENABLE_ALL else None
+                ort.InferenceSession(
+                    str(onnx_path),
+                    sess_options=so,
+                    providers=["CPUExecutionProvider"],
+                    disabled_optimizers=dis,
+                )
+                last_exc = None
+                break
+            except Exception as exc:
+                last_exc = exc
+                continue
+
+        if last_exc is not None:
+            raise RuntimeError("ORT export failed.") from last_exc
+
         return (ort_path, optimized_onnx_path)
 
 @dataclass(frozen=True, slots=True)
@@ -1164,7 +1204,15 @@ class CoreML(Format):
         *args: Any,
         **kwargs: Any,
     ) -> object:
-        is_required("coremltools", "pip install coremltools")
+        import importlib.util as _ilu
+
+        if (
+            _ilu.find_spec("coremltools") is None
+            or _ilu.find_spec("coremltools.libcoremlpython") is None
+        ):
+            raise ImportError(
+                "coremltools is required for this operation (try: pip install coremltools on macOS)"
+            )
         import coremltools as ct
 
         dst = Path(dst)

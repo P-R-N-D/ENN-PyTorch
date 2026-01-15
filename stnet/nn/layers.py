@@ -1931,92 +1931,103 @@ class Scaler(nn.Module):
     def update_y(self, y: torch.Tensor) -> None:
         self._update_stats_impl(y, self.y_mean, self.y_std)
 
-    def _normalize_impl(self, t, mean_buf, std_buf, cache_key_prefix):
-        compiling = is_symbolic()
-        if not compiling:
-            if t.numel() == 0:
-                return t
-            feat_dim = int(t.shape[0] if t.dim() == 1 else t.shape[-1])
-            if mean_buf.numel() not in (1, feat_dim) or std_buf.numel() not in (
-                1,
-                feat_dim,
-            ):
-                raise RuntimeError(
-                    f"Scaler: feature dimension mismatch: got {feat_dim}, expected {int(mean_buf.numel())}"
-                )
-        key = (
-            t.device.type,
-            int(t.device.index) if t.device.index is not None else -1,
-            t.dtype,
-        )
-        cache_dict = getattr(self, f"_{cache_key_prefix}_stats_cache")
-        with self._stats_cache_lock:
-            cached = cache_dict.get(key)
-        if cached is None:
-            mean_b = mean_buf.to(device=t.device, dtype=t.dtype)
-            std_b = std_buf.to(device=t.device, dtype=t.dtype)
-            with self._stats_cache_lock:
-                if len(cache_dict) >= int(self._stats_cache_max):
-                    cache_dict.clear()
-                cache_dict[key] = (mean_b, std_b)
-        else:
-            mean_b, std_b = cached
-        inv_std_b = torch.reciprocal(std_b + self.eps)
-        bias_b = -mean_b * inv_std_b
+    def _apply_affine_no_broadcast(
+        self, t: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor
+    ) -> torch.Tensor:
+        import torch.nn.functional as F
+
+        if t.dim() == 0:
+            return t
+
+        orig_shape = t.shape
         if t.dim() == 1:
-            return t * inv_std_b + bias_b
-        view_shape = [1] * (t.dim() - 1) + [-1]
-        if compiling:
-            inv_std = inv_std_b.view(*view_shape)
-            bias = bias_b.view(*view_shape)
+            t2 = t.unsqueeze(0)
         else:
-            inv_std = inv_std_b if inv_std_b.numel() == 1 else inv_std_b.view(*view_shape)
-            bias = bias_b if bias_b.numel() == 1 else bias_b.view(*view_shape)
-        return t * inv_std + bias
+            t2 = t.reshape(-1, orig_shape[-1])
+
+        c = t2.shape[-1]
+        w = weight.reshape(-1)
+        b = bias.reshape(-1)
+        if w.numel() == 1 and c != 1:
+            w = w.expand((c,))
+        if b.numel() == 1 and c != 1:
+            b = b.expand((c,))
+
+        running_mean = t2.new_zeros((c,))
+        running_var = t2.new_ones((c,))
+        out2 = F.batch_norm(
+            t2,
+            running_mean,
+            running_var,
+            weight=w.to(dtype=t2.dtype, device=t2.device),
+            bias=b.to(dtype=t2.dtype, device=t2.device),
+            training=False,
+            momentum=0.0,
+            eps=0.0,
+        )
+
+        if t.dim() == 1:
+            return out2.squeeze(0)
+        return out2.reshape(orig_shape)
+
+    def _normalize_impl(self, t, mean_buf, std_buf, cache_key_prefix):
+        if t.numel() == 0:
+            return t
+        feature_dim = t.shape[-1]
+
+        key = (str(t.device), t.dtype, "mean", "std")
+        with self._stats_cache_lock:
+            cache = getattr(self, f"_{cache_key_prefix}_stats_cache")
+            cached = cache.get(key)
+            if cached is None:
+                mean_b = mean_buf.to(device=t.device, dtype=t.dtype)
+                std_b = std_buf.to(device=t.device, dtype=t.dtype)
+                if len(cache) > self._stats_cache_max:
+                    cache.clear()
+                cache[key] = (mean_b, std_b)
+            else:
+                mean_b, std_b = cached
+
+        if not is_symbolic() and mean_b.numel() not in (1, int(feature_dim)):
+            raise RuntimeError(
+                f"Scaler feature dimension mismatch: t.shape={tuple(t.shape)} "
+                f"mean.shape={tuple(mean_b.shape)} std.shape={tuple(std_b.shape)}"
+            )
+
+        denom = std_b + self.eps
+        inv = denom.reciprocal()
+        bias = -mean_b * inv
+        return self._apply_affine_no_broadcast(t, weight=inv, bias=bias)
 
     def normalize_x(self, x: torch.Tensor) -> torch.Tensor:
         return self._normalize_impl(x, self.x_mean, self.x_std, "x")
 
     def _denormalize_impl(self, t, mean_buf, std_buf, cache_key_prefix):
-        compiling = is_symbolic()
-        if not compiling:
-            if t.numel() == 0:
-                return t
-            feat_dim = int(t.shape[0] if t.dim() == 1 else t.shape[-1])
-            if mean_buf.numel() not in (1, feat_dim) or std_buf.numel() not in (
-                1,
-                feat_dim,
-            ):
-                raise RuntimeError(
-                    f"Scaler: feature dimension mismatch: got {feat_dim}, expected {int(mean_buf.numel())}"
-                )
-        key = (
-            t.device.type,
-            int(t.device.index) if t.device.index is not None else -1,
-            t.dtype,
-        )
-        cache_dict = getattr(self, f"_{cache_key_prefix}_stats_cache")
+        if t.numel() == 0:
+            return t
+        feature_dim = t.shape[-1]
+
+        key = (str(t.device), t.dtype, "mean", "std")
         with self._stats_cache_lock:
-            cached = cache_dict.get(key)
-        if cached is None:
-            mean_b = mean_buf.to(device=t.device, dtype=t.dtype)
-            std_b = std_buf.to(device=t.device, dtype=t.dtype)
-            with self._stats_cache_lock:
-                if len(cache_dict) >= int(self._stats_cache_max):
-                    cache_dict.clear()
-                cache_dict[key] = (mean_b, std_b)
-        else:
-            mean_b, std_b = cached
-        if t.dim() == 1:
-            return t * (std_b + self.eps) + mean_b
-        view_shape = [1] * (t.dim() - 1) + [-1]
-        if compiling:
-            std = std_b.view(*view_shape)
-            mean = mean_b.view(*view_shape)
-        else:
-            std = std_b if std_b.numel() == 1 else std_b.view(*view_shape)
-            mean = mean_b if mean_b.numel() == 1 else mean_b.view(*view_shape)
-        return t * (std + self.eps) + mean
+            cache = getattr(self, f"_{cache_key_prefix}_stats_cache")
+            cached = cache.get(key)
+            if cached is None:
+                mean_b = mean_buf.to(device=t.device, dtype=t.dtype)
+                std_b = std_buf.to(device=t.device, dtype=t.dtype)
+                if len(cache) > self._stats_cache_max:
+                    cache.clear()
+                cache[key] = (mean_b, std_b)
+            else:
+                mean_b, std_b = cached
+
+        if not is_symbolic() and mean_b.numel() not in (1, int(feature_dim)):
+            raise RuntimeError(
+                f"Scaler feature dimension mismatch: t.shape={tuple(t.shape)} "
+                f"mean.shape={tuple(mean_b.shape)} std.shape={tuple(std_b.shape)}"
+            )
+
+        scale = std_b + self.eps
+        return self._apply_affine_no_broadcast(t, weight=scale, bias=mean_b)
 
     def denormalize_x(self, x_scaled: torch.Tensor) -> torch.Tensor:
         return self._denormalize_impl(x_scaled, self.x_mean, self.x_std, "x")
@@ -2077,7 +2088,7 @@ class Scaler(nn.Module):
     def affine(self, z_raw: torch.Tensor) -> torch.Tensor:
         a = self.affine_a.to(device=z_raw.device, dtype=z_raw.dtype)
         b = self.affine_b.to(device=z_raw.device, dtype=z_raw.dtype)
-        return z_raw * a + b
+        return self._apply_affine_no_broadcast(z_raw, weight=a, bias=b)
 
     @torch.no_grad()
     def set_affine(self, a: torch.Tensor, b: torch.Tensor) -> None:
