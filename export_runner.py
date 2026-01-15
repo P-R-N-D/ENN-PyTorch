@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import warnings
@@ -33,6 +34,19 @@ def _as_path_list(out: Any, fallback: Path) -> list[str]:
     return [str(out)]
 
 
+@contextlib.contextmanager
+def _temp_env(k: str, v: str):
+    old = os.environ.get(k)
+    os.environ[k] = v
+    try:
+        yield
+    finally:
+        if old is None:
+            os.environ.pop(k, None)
+        else:
+            os.environ[k] = old
+
+
 def export_and_validate(
     model: torch.nn.Module, sample: torch.Tensor, out_dir: Path
 ) -> Dict[str, Any]:
@@ -50,48 +64,61 @@ def export_and_validate(
         "litert": out_dir / "model.tflite",
     }
     results: Dict[str, Any] = {}
-    for name, path in targets.items():
-        fmt = Exporter.for_export(path.suffix if path.suffix else str(path))
-        try:
-            if fmt is None:
-                raise RuntimeError("no exporter registered")
-            save_kwargs: Dict[str, Any] = {
-                "sample_input": sample,
-                "dynamic_batch": True,
-                "prefer_dynamo": False,
-            }
-            out = fmt.save(model, path, **save_kwargs)
-            results[name] = {
-                "status": "ok",
-                "paths": _as_path_list(out, path),
-            }
-        except ImportError as exc:
-            if name in ("pt2", "onnx"):
-                results[name] = {"status": "error", "error": repr(exc)}
-            else:
-                results[name] = {
-                    "status": "skipped",
-                    "reason": "missing_optional_dependency",
-                    "error": repr(exc),
+    with _temp_env("STNET_DISABLE_PIECEWISE_CALIB", "1"):
+        for name, path in targets.items():
+            fmt = Exporter.for_export(path.suffix if path.suffix else str(path))
+            try:
+                if fmt is None:
+                    raise RuntimeError("no exporter registered")
+                save_kwargs: Dict[str, Any] = {
+                    "sample_input": sample,
+                    "dynamic_batch": True,
                 }
-        except Exception as exc:  # pragma: no cover - diagnostic output
-            results[name] = {"status": "error", "error": repr(exc)}
+                out = fmt.save(model, path, **save_kwargs)
+                results[name] = {
+                    "status": "ok",
+                    "paths": _as_path_list(out, path),
+                }
+            except ImportError as exc:
+                if name in ("pt2", "onnx"):
+                    results[name] = {"status": "error", "error": repr(exc)}
+                else:
+                    results[name] = {
+                        "status": "skipped",
+                        "reason": "missing_optional_dependency",
+                        "error": repr(exc),
+                    }
+            except Exception as exc:  # pragma: no cover - diagnostic output
+                results[name] = {"status": "error", "error": repr(exc)}
 
     validations: Dict[str, Any] = {}
     pt2_path = targets["pt2"]
     if pt2_path.exists():
-        try:
-            with from_buffer():
-                ep = torch.export.load(str(pt2_path))
-            with torch.no_grad():
-                pt2_out = ep.module()(sample)
-            if hasattr(model, "forward_export"):
-                torch_out = model.forward_export(sample)
-            else:
-                torch_out = model(sample, return_loss=False)
-            pt2_mae = float(torch.mean(torch.abs(pt2_out - torch_out)).item())
-            validations["pt2_mae"] = pt2_mae
-            if isinstance(sample, torch.Tensor) and sample.ndim >= 2 and int(sample.shape[0]) > 1:
+        with _temp_env("STNET_DISABLE_PIECEWISE_CALIB", "1"):
+            try:
+                with from_buffer():
+                    ep = torch.export.load(str(pt2_path))
+                with torch.no_grad():
+                    pt2_out = ep.module()(sample)
+                if hasattr(model, "forward_export"):
+                    torch_out = model.forward_export(sample)
+                else:
+                    torch_out = model(sample, return_loss=False)
+                validations["pt2_mae"] = float(torch.mean(torch.abs(pt2_out - torch_out)).item())
+            except Exception as exc:
+                validations["pt2_error"] = repr(exc)
+        def _truthy(v: str) -> bool:
+            return v.strip().lower() in ("1", "true", "yes", "y", "on")
+
+        do_alt = _truthy(os.environ.get("STNET_VALIDATE_ALT_BATCH", "0"))
+        if (
+            "pt2_error" not in validations
+            and do_alt
+            and isinstance(sample, torch.Tensor)
+            and sample.ndim >= 2
+            and int(sample.shape[0]) > 1
+        ):
+            try:
                 alt_n = max(1, int(sample.shape[0]) // 2)
                 alt = sample[:alt_n]
                 with torch.no_grad():
@@ -100,28 +127,31 @@ def export_and_validate(
                         alt_torch = model.forward_export(alt)
                     else:
                         alt_torch = model(alt, return_loss=False)
-                validations["pt2_mae_alt"] = float(torch.mean(torch.abs(alt_pt2 - alt_torch)).item())
-        except Exception as exc:
-            validations["pt2_error"] = repr(exc)
+                validations["pt2_mae_alt"] = float(
+                    torch.mean(torch.abs(alt_pt2 - alt_torch)).item()
+                )
+            except Exception as exc:
+                validations["pt2_mae_alt_error"] = repr(exc)
 
     onnx_path = targets["onnx"]
     if onnx_path.exists():
-        try:
-            import onnxruntime as ort
-            sess = ort.InferenceSession(str(onnx_path), providers=["CPUExecutionProvider"])
-            inp_name = sess.get_inputs()[0].name
-            onnx_out = sess.run(None, {inp_name: sample.detach().cpu().numpy().astype(np.float32)})[
-                0
-            ]
-            with torch.no_grad():
-                if hasattr(model, "forward_export"):
-                    torch_out_t = model.forward_export(sample)
-                else:
-                    torch_out_t = model(sample, return_loss=False)
-            torch_out = torch_out_t.detach().cpu().numpy()
-            validations["onnx_mae"] = float(np.mean(np.abs(torch_out - onnx_out)))
-        except Exception as exc:
-            validations["onnx_error"] = repr(exc)
+        with _temp_env("STNET_DISABLE_PIECEWISE_CALIB", "1"):
+            try:
+                import onnxruntime as ort
+                sess = ort.InferenceSession(str(onnx_path), providers=["CPUExecutionProvider"])
+                inp_name = sess.get_inputs()[0].name
+                onnx_out = sess.run(
+                    None, {inp_name: sample.detach().cpu().numpy().astype(np.float32)}
+                )[0]
+                with torch.no_grad():
+                    if hasattr(model, "forward_export"):
+                        torch_out_t = model.forward_export(sample)
+                    else:
+                        torch_out_t = model(sample, return_loss=False)
+                torch_out = torch_out_t.detach().cpu().numpy()
+                validations["onnx_mae"] = float(np.mean(np.abs(torch_out - onnx_out)))
+            except Exception as exc:
+                validations["onnx_error"] = repr(exc)
     return {"exports": results, "validation": validations}
 
 

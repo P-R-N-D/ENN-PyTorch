@@ -1025,9 +1025,12 @@ class DilatedAttention(nn.Module):
                     kpm_check = kpm_k
                 if kpm_check is not None:
                     kpm_b = kpm_check.to(torch.bool)
-                    right_padded = True
-                    if int(kpm_b.shape[1]) >= 2:
-                        right_padded = not (kpm_b[:, :-1] & (~kpm_b[:, 1:])).any().item()
+                    if is_symbolic() or is_meta_or_fake_tensor(kpm_b):
+                        right_padded = False
+                    else:
+                        right_padded = True
+                        if kpm_b.shape[1] >= 2:
+                            right_padded = not (kpm_b[:, :-1] & (~kpm_b[:, 1:])).any().item()
                     if right_padded:
                         y_full = self._call_dot_attn(
                             qh,
@@ -2073,6 +2076,14 @@ class Scaler(nn.Module):
         return y.view(-1) if z.dim() == 1 else y.view(orig_shape)
 
     def calibrate(self, z_raw: torch.Tensor) -> torch.Tensor:
+        disable_pw = env_bool(
+            ("STNET_DISABLE_PIECEWISE_CALIB", "STNET_EXPORT_DISABLE_PIECEWISE_CALIB"),
+            default=False,
+        )
+        if disable_pw or is_symbolic() or is_meta_or_fake_tensor(z_raw):
+            if self.calib_mode in ("piecewise", "affine"):
+                return self.affine(z_raw)
+            return z_raw
         match self.calib_mode:
             case "piecewise":
                 if self.pw_x.numel() >= 2 and self.pw_y.numel() >= 2:
@@ -2140,11 +2151,7 @@ class Scaler(nn.Module):
         denom = (x_centered * x_centered).sum(dim=0)
         num = (x_centered * y_centered).sum(dim=0)
         tiny_mask = denom.abs() < self.eps
-        if bool(tiny_mask.any().item()):
-            denom_safe = denom.clone()
-            denom_safe[tiny_mask] = 1.0
-        else:
-            denom_safe = denom
+        denom_safe = torch.where(tiny_mask, torch.ones_like(denom), denom)
         a64 = num / denom_safe
         b64 = y_mean - a64 * x_mean
         a64[tiny_mask] = 1.0
@@ -2220,6 +2227,11 @@ class Scaler(nn.Module):
         self.affine_b.zero_()
 
     def _piecewise(self, z_raw: torch.Tensor) -> torch.Tensor:
+        if env_bool(
+            ("STNET_DISABLE_PIECEWISE_CALIB", "STNET_EXPORT_DISABLE_PIECEWISE_CALIB"),
+            default=False,
+        ) or is_symbolic() or is_meta_or_fake_tensor(z_raw):
+            return self.affine(z_raw) if self.calib_mode in ("piecewise", "affine") else z_raw
         if self.pw_x.numel() < 2 or self.pw_y.numel() < 2:
             return z_raw
         if self.pw_x.dim() != 2 or self.pw_y.dim() != 2:

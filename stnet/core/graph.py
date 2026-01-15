@@ -248,11 +248,47 @@ def is_compiling() -> bool:
         if dyn is not None and callable(getattr(dyn, "is_compiling", None)):
             if bool(dyn.is_compiling()):
                 return True
+        if dyn is not None and callable(getattr(dyn, "is_dynamo_compiling", None)):
+            if bool(dyn.is_dynamo_compiling()):
+                return True
     with suppress(Exception):
         comp = getattr(torch, "compiler", None)
         fn = getattr(comp, "is_compiling", None)
         if callable(fn) and bool(fn()):
             return True
+    return False
+
+
+def _dispatch_mode_stack() -> list[Any]:
+    try:
+        from torch.utils._python_dispatch import _get_current_dispatch_mode_stack
+
+        stack = _get_current_dispatch_mode_stack()
+        return list(stack) if stack is not None else []
+    except Exception:
+        pass
+    try:
+        from torch.utils._python_dispatch import _get_current_dispatch_mode
+
+        mode = _get_current_dispatch_mode()
+        return [mode] if mode is not None else []
+    except Exception:
+        return []
+
+
+def is_fake_tensor_mode_active() -> bool:
+    try:
+        from torch._subclasses.fake_tensor import FakeTensorMode
+    except Exception:
+        return False
+    for mode in _dispatch_mode_stack():
+        if mode is None:
+            continue
+        try:
+            if isinstance(mode, FakeTensorMode):
+                return True
+        except Exception:
+            continue
     return False
 
 
@@ -271,15 +307,18 @@ def is_tracing_or_exporting() -> bool:
         fn = getattr(onnx, "is_in_onnx_export", None)
         if callable(fn) and bool(fn()):
             return True
+    with suppress(Exception):
+        if is_fake_tensor_mode_active():
+            return True
     return False
 
 
 def is_export_or_trace() -> bool:
-    return bool(is_tracing_or_exporting())
+    return bool(is_tracing_or_exporting() or is_fake_tensor_mode_active())
 
 
 def is_symbolic() -> bool:
-    return bool(is_tracing_or_exporting() or is_compiling())
+    return bool(is_tracing_or_exporting() or is_compiling() or is_fake_tensor_mode_active())
 
 
 def assert_trace(condition: object, message: str = "") -> None:
@@ -290,6 +329,8 @@ def assert_trace(condition: object, message: str = "") -> None:
 
     try:
         if isinstance(condition, torch.Tensor):
+            if is_meta_or_fake_tensor(condition):
+                return
             if condition.numel() == 1:
                 ok = bool(condition.item())
             else:

@@ -18,6 +18,7 @@ from ..core.graph import (
     is_symbolic,
     assert_trace,
 )
+from ..core.tensor import is_meta_or_fake_tensor
 from ..core.profiler import FLOP_PROFILER, capture
 from ..core.system import get_device, get_dpa_backends, get_runtime_config
 
@@ -178,6 +179,13 @@ def _compute_flops_mha(
     label: str = "MultiHeadAttention",
 ) -> None:
     try:
+        if (
+            is_symbolic()
+            or is_tracing_or_exporting()
+            or is_meta_or_fake_tensor(query)
+            or is_meta_or_fake_tensor(key)
+        ):
+            return
         if FLOP_PROFILER is None or torch.jit.is_tracing() or torch.jit.is_scripting():
             return
         if torch.compiler.is_compiling():
@@ -667,7 +675,12 @@ class DotProductAttention(nn.Module):
         if q.dim() != 4 or k.dim() != 4 or v.dim() != 4:
             raise ValueError(f"DPA expects 4D inputs, got {q.shape}, {k.shape}, {v.shape}")
 
-        tracing = bool(is_symbolic())
+        tracing = bool(
+            is_symbolic()
+            or is_meta_or_fake_tensor(q)
+            or is_meta_or_fake_tensor(k)
+            or is_meta_or_fake_tensor(v)
+        )
         if tracing:
             assert_trace(
                 q.size(0) == k.size(0),
@@ -730,17 +743,7 @@ class DotProductAttention(nn.Module):
             elif torch.is_floating_point(m):
                 bias_float = m
             else:
-                if tracing:
-                    mask_bool = m != 0
-                else:
-                    try:
-                        uniq = torch.unique(m if m.numel() <= 4096 else m.reshape(-1)[:4096])
-                    except Exception:
-                        uniq = torch.tensor([], device=m.device, dtype=m.dtype)
-                    if uniq.numel() <= 2 and bool(((uniq == 0) | (uniq == 1)).all().item()):
-                        mask_bool = m != 0
-                    else:
-                        bias_float = m.to(dtype=q_bshd.dtype)
+                mask_bool = m != 0
 
         mb = mh = mL = 0
         if mask_bool is not None:
