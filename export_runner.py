@@ -14,10 +14,28 @@ from stnet.config import ModelConfig, PatchConfig
 from stnet.runtime.io import Exporter
 
 
+def _as_path_list(out: Any, fallback: Path) -> list[str]:
+    if out is None:
+        return [str(fallback)]
+    if isinstance(out, (str, Path)):
+        return [str(out)]
+    if isinstance(out, (tuple, list)):
+        flat: list[str] = []
+        for item in out:
+            if item is None:
+                continue
+            if isinstance(item, (str, Path)):
+                flat.append(str(item))
+            else:
+                flat.append(str(item))
+        return flat if flat else [str(fallback)]
+    return [str(out)]
+
+
 def export_and_validate(
     model: torch.nn.Module, sample: torch.Tensor, out_dir: Path
 ) -> Dict[str, Any]:
-    out_dir.mkdir(exist_ok=True)
+    out_dir.mkdir(parents=True, exist_ok=True)
     targets = {
         "pt2": out_dir / "model.pt2",
         "onnx": out_dir / "model.onnx",
@@ -35,7 +53,7 @@ def export_and_validate(
             out = fmt.save(model, path, **save_kwargs)
             results[name] = {
                 "status": "ok",
-                "path": str(out if out is not None else path),
+                "paths": _as_path_list(out, path),
             }
         except ImportError as exc:
             if name in ("pt2", "onnx"):
