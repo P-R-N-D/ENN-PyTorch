@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import warnings
 from pathlib import Path
 from typing import Any, Dict
 
@@ -36,6 +37,11 @@ def export_and_validate(
     model: torch.nn.Module, sample: torch.Tensor, out_dir: Path
 ) -> Dict[str, Any]:
     out_dir.mkdir(parents=True, exist_ok=True)
+    warnings.filterwarnings(
+        "ignore",
+        category=FutureWarning,
+        message=r".*LeafSpec.*",
+    )
     targets = {
         "pt2": out_dir / "model.pt2",
         "onnx": out_dir / "model.onnx",
@@ -49,7 +55,11 @@ def export_and_validate(
         try:
             if fmt is None:
                 raise RuntimeError("no exporter registered")
-            save_kwargs: Dict[str, Any] = {"sample_input": sample, "dynamic_batch": True}
+            save_kwargs: Dict[str, Any] = {
+                "sample_input": sample,
+                "dynamic_batch": True,
+                "prefer_dynamo": False,
+            }
             out = fmt.save(model, path, **save_kwargs)
             results[name] = {
                 "status": "ok",
