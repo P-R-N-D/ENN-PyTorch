@@ -1604,8 +1604,15 @@ class Model(nn.Module):
             assembled = assembled + self.linear_branch(
                 self._cast_graph_safe(x, self._device, assembled.dtype)
             )
-        tokens_mean = symint_safe_expand_as(tokens.mean(dim=1, keepdim=True), tokens)
-        tokens_centered = (tokens - tokens_mean).contiguous()
+        mean_tok = tokens.mean(dim=1, keepdim=True)
+        if (
+            mean_tok.dim() == 3
+            and tokens.dim() == 3
+            and mean_tok.size(1) == 1
+            and tokens.size(1) != 1
+        ):
+            mean_tok = mean_tok.expand(-1, tokens.size(1), -1)
+        tokens_centered = (tokens - mean_tok).contiguous()
         if export:
             refined = self.temporal_token_collector.forward_export(tokens_centered)
         else:
@@ -1639,9 +1646,17 @@ class Model(nn.Module):
                 )
             )
             p = p.clamp(clip, 1.0 - clip)
+            if (
+                p.dim() == 2
+                and delta.dim() == 2
+                and p.size(1) == 1
+                and p.size(0) == delta.size(0)
+                and delta.size(1) != 1
+            ):
+                p = p.expand(-1, delta.size(1))
             y_hat = assembled + p * delta
         else:
-            y_hat = assembled + assembled.new_tensor(0.5) * delta
+            y_hat = assembled + delta * 0.5
         if sanitize_nan:
             y_hat = _coerce_tensor(y_hat, enabled=True, inplace=not export)
         if calibrate_output:
@@ -2396,7 +2411,7 @@ class Model(nn.Module):
                 if hi > p_eps:
                     p = p.clamp(min=p_eps, max=hi)
             if p is None:
-                y_hat = assembled + assembled.new_tensor(0.5) * delta
+                y_hat = assembled + delta * 0.5
             else:
                 y_hat = assembled + p * delta
             y_hat = _coerce_tensor(y_hat, enabled=sanitize_enabled, inplace=sanitize_inplace)
