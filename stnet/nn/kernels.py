@@ -4,6 +4,7 @@ from __future__ import annotations
 import inspect
 import warnings
 import contextlib
+import math
 from typing import Any, Optional, Tuple, Mapping
 
 import torch
@@ -21,6 +22,11 @@ from ..core.graph import (
 from ..core.tensor import is_meta_or_fake_tensor
 from ..core.profiler import FLOP_PROFILER, capture
 from ..core.system import get_device, get_dpa_backends, get_runtime_config
+
+
+def _exporting_boundary() -> bool:
+    return bool(is_tracing_or_exporting() or is_symbolic())
+
 
 try:
     import triton
@@ -273,6 +279,41 @@ def _call_sdpa_fallback(
         except Exception:
             pass
     return fallback(query, key, value, **call_kwargs)
+
+
+def _attention_math_bshd(
+    q_bshd: torch.Tensor,
+    k_bshd: torch.Tensor,
+    v_bshd: torch.Tensor,
+    *,
+    attn_mask: torch.Tensor | None,
+    is_causal: bool,
+    dropout_p: float,
+    training: bool,
+) -> torch.Tensor:
+    _, _, q_len, head_dim = q_bshd.shape
+    k_len = k_bshd.shape[2]
+    scores = torch.matmul(q_bshd, k_bshd.transpose(-2, -1))
+    if isinstance(head_dim, int) and head_dim > 0:
+        scores = scores * (1.0 / math.sqrt(float(head_dim)))
+
+    if is_causal:
+        try:
+            causal = torch.ones((q_len, k_len), dtype=torch.bool, device=scores.device).tril()
+            scores = scores.masked_fill(causal.logical_not(), torch.finfo(scores.dtype).min)
+        except Exception:
+            pass
+
+    if attn_mask is not None:
+        if attn_mask.dtype == torch.bool:
+            scores = scores.masked_fill(attn_mask.logical_not(), torch.finfo(scores.dtype).min)
+        else:
+            scores = scores + attn_mask
+
+    probs = torch.softmax(scores, dim=-1)
+    if training and float(dropout_p) > 0.0:
+        probs = torch.nn.functional.dropout(probs, p=float(dropout_p), training=True)
+    return torch.matmul(probs, v_bshd)
 
 
 def _is_bshd_contiguous(tensor: torch.Tensor) -> bool:
@@ -746,19 +787,21 @@ class DotProductAttention(nn.Module):
         mb = mh = mL = 0
         if mask_bool is not None:
             mask_bool = mask_bool.to(device=q_bshd.device, dtype=torch.bool, non_blocking=True)
-            mask_bool, mb, mh, mL = _flatten_attn_mask(
-                mask_bool, device=q_bshd.device, B=B, H=H, L=L, S=S
-            )
-            if not tracing and int(mh) == 1 and int(mL) == int(L):
-                with contextlib.suppress(Exception):
-                    if int(mask_bool.stride(-2)) == 0:
-                        mask_bool, mL = mask_bool[..., :1, :], 1
+            if not _exporting_boundary():
+                mask_bool, mb, mh, mL = _flatten_attn_mask(
+                    mask_bool, device=q_bshd.device, B=B, H=H, L=L, S=S
+                )
+                if not tracing and int(mh) == 1 and int(mL) == int(L):
+                    with contextlib.suppress(Exception):
+                        if int(mask_bool.stride(-2)) == 0:
+                            mask_bool, mL = mask_bool[..., :1, :], 1
 
         if bias_float is not None:
             bias_float = bias_float.to(device=q_bshd.device, dtype=q_bshd.dtype, non_blocking=True)
-            bias_float, _, _, _ = _flatten_attn_mask(
-                bias_float, device=q_bshd.device, B=B, H=H, L=L, S=S
-            )
+            if not _exporting_boundary():
+                bias_float, _, _, _ = _flatten_attn_mask(
+                    bias_float, device=q_bshd.device, B=B, H=H, L=L, S=S
+                )
 
         try:
             is_compiling = torch.compiler.is_compiling()
@@ -862,42 +905,64 @@ class DotProductAttention(nn.Module):
                 final_mask = (mask_bias + bias_float).contiguous()
             sdpa_is_causal = False
 
-        sdpa_kwargs = {
-            "attn_mask": final_mask,
-            "dropout_p": dropout_val,
-            "is_causal": bool(sdpa_is_causal),
-        }
-        fm = final_mask
-        if fm is not None:
-            fm = fm.to(
-                device=q_bshd.device,
-                dtype=q_bshd.dtype if not fm.dtype is torch.bool else torch.bool,
-                non_blocking=True,
-            )
-            sdpa_kwargs["attn_mask"], bd, hd, _ = _flatten_attn_mask(
-                fm, device=q_bshd.device, B=B, H=H, L=q_bshd.shape[2], S=k_bshd.shape[2]
-            )
-            if not tracing and (bd not in (1, B) or hd not in (1, H)):
-                raise RuntimeError("Attn mask mismatch")
-            sdpa_kwargs["is_causal"] = False
+        exporting = _exporting_boundary()
+        disable_sdpa = env_bool(("STNET_DISABLE_SDPA",), default=False)
+        force_sdpa = env_bool(("STNET_FORCE_SDPA",), default=False)
 
-        sdpa_out = None
-        backends = get_dpa_backends() or []
-        try:
-            from torch.nn.attention import sdpa_kernel
-
-            if backends:
-                with sdpa_kernel(backends):
-                    sdpa_out = torch.nn.functional.scaled_dot_product_attention(
-                        q_bshd, k_bshd, v_bshd, **sdpa_kwargs
-                    )
-        except:
-            pass
-
-        if sdpa_out is None:
-            sdpa_out = torch.nn.functional.scaled_dot_product_attention(
-                q_bshd, k_bshd, v_bshd, **sdpa_kwargs
+        if (exporting and not force_sdpa) or disable_sdpa or (not q_bshd.is_cuda):
+            fm = final_mask
+            if fm is not None:
+                fm = fm.to(
+                    device=q_bshd.device,
+                    dtype=(torch.bool if fm.dtype is torch.bool else q_bshd.dtype),
+                    non_blocking=True,
+                )
+            sdpa_out = _attention_math_bshd(
+                q_bshd,
+                k_bshd,
+                v_bshd,
+                attn_mask=fm,
+                is_causal=bool(sdpa_is_causal),
+                dropout_p=float(dropout_val),
+                training=bool(training),
             )
+        else:
+            sdpa_kwargs = {
+                "attn_mask": final_mask,
+                "dropout_p": dropout_val,
+                "is_causal": bool(sdpa_is_causal),
+            }
+            fm = final_mask
+            if fm is not None:
+                fm = fm.to(
+                    device=q_bshd.device,
+                    dtype=q_bshd.dtype if not fm.dtype is torch.bool else torch.bool,
+                    non_blocking=True,
+                )
+                sdpa_kwargs["attn_mask"], bd, hd, _ = _flatten_attn_mask(
+                    fm, device=q_bshd.device, B=B, H=H, L=q_bshd.shape[2], S=k_bshd.shape[2]
+                )
+                if not tracing and (bd not in (1, B) or hd not in (1, H)):
+                    raise RuntimeError("Attn mask mismatch")
+                sdpa_kwargs["is_causal"] = False
+
+            sdpa_out = None
+            backends = get_dpa_backends() or []
+            try:
+                from torch.nn.attention import sdpa_kernel
+
+                if backends:
+                    with sdpa_kernel(backends):
+                        sdpa_out = torch.nn.functional.scaled_dot_product_attention(
+                            q_bshd, k_bshd, v_bshd, **sdpa_kwargs
+                        )
+            except Exception:
+                pass
+
+            if sdpa_out is None:
+                sdpa_out = torch.nn.functional.scaled_dot_product_attention(
+                    q_bshd, k_bshd, v_bshd, **sdpa_kwargs
+                )
 
         try:
             flops = 4.0 * B * H * q_bshd.shape[2] * k_bshd.shape[2] * D
