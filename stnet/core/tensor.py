@@ -160,22 +160,29 @@ def coerce_tensor(
     return value
 
 
+def _to_local_if_available(t: torch.Tensor) -> torch.Tensor:
+    try:
+        return t.to_local() if hasattr(t, "to_local") else t
+    except Exception:
+        return t
+
+
 def extract_tensor(out: object) -> torch.Tensor:
     if isinstance(out, TensorDictBase):
         y = out.get("pred", None)
         if not isinstance(y, torch.Tensor):
             y = next((v for v in out.values() if isinstance(v, torch.Tensor)), None)
         if isinstance(y, torch.Tensor):
-            return y
+            return _to_local_if_available(y)
         raise RuntimeError("TensorDict output missing tensors")
     if isinstance(out, torch.Tensor):
-        return out
+        return _to_local_if_available(out)
     if isinstance(out, (tuple, list)) and len(out) > 0:
         if isinstance(out[0], torch.Tensor):
-            return out[0]
+            return _to_local_if_available(out[0])
         y = next((v for v in out if isinstance(v, torch.Tensor)), None)
         if isinstance(y, torch.Tensor):
-            return y
+            return _to_local_if_available(y)
         raise RuntimeError("Sequence output missing tensors")
     raise RuntimeError(f"Unsupported output type: {type(out)}")
 

@@ -201,9 +201,9 @@ def _pad_sample(model: object, sample_input: object, *, batch: int = 1) -> objec
 def _onnx_options(kwargs: object, *args: Any, target: str = "onnx") -> object:
     target_l = str(target or "onnx").strip().lower()
     defaults = {
-        "tensorrt": (18, True, False, True, []),
-        "tensorflow": (18, False, False, True, []),
-        "default": (18, False, False, False, []),
+        "tensorrt": (18, True, True, True, []),
+        "tensorflow": (18, False, True, True, []),
+        "default": (18, False, True, False, []),
     }
     key = target_l.replace("-", "").replace("_", "")
     if key == "trt":
@@ -566,14 +566,21 @@ class _ONNXExporter:
         input_names = ["features"]
         dyn_axes = None
         dyn_shapes = None
-        if dynamic_batch and hasattr(torch, "export") and hasattr(torch.export, "Dim"):
-            try:
-                batch_dim = torch.export.Dim("batch", min=2)
-            except TypeError:
-                dynamic_batch = False
-            else:
-                dyn_axes = {"features": {0: "batch"}, "preds_flat": {0: "batch"}}
-                dyn_shapes = ({0: batch_dim},)
+        if dynamic_batch:
+            dyn_axes = {"features": {0: "batch"}, "preds_flat": {0: "batch"}}
+            if hasattr(torch, "export") and hasattr(torch.export, "Dim"):
+                batch_dim = None
+                try:
+                    batch_dim = torch.export.Dim("batch")
+                except Exception:
+                    batch_dim = None
+                if batch_dim is None:
+                    try:
+                        batch_dim = torch.export.Dim("batch", min=1)
+                    except Exception:
+                        batch_dim = None
+                if batch_dim is not None:
+                    dyn_shapes = ({0: batch_dim},)
         min_export_batch = 2 if dynamic_batch else 1
         sample = _pad_sample(model, sample_input, batch=min_export_batch)
         if isinstance(sample, torch.Tensor) and sample.ndim == 1:
@@ -606,7 +613,7 @@ class _ONNXExporter:
                 "export_params": True,
                 "f": str(onnx_path),
                 "opset_version": int(opset),
-                "do_constant_folding": True,
+                "do_constant_folding": False,
                 "keep_initializers_as_inputs": False,
                 "input_names": input_names,
                 "output_names": ["preds_flat"],
@@ -624,7 +631,7 @@ class _ONNXExporter:
                             message=r"torchvision|Setting ONNX exporter to use operator set version",
                         )
                         call_kw = dict(valid_kw)
-                        if use_dyn and dyn_shapes:
+                        if use_dyn and dyn_shapes and "dynamic_shapes" in sig_keys:
                             call_kw["dynamic_shapes"] = dyn_shapes
                         if has_dynamo:
                             call_kw["dynamo"] = use_dyn

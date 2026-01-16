@@ -9,7 +9,7 @@ from typing import Any, Dict
 
 import numpy as np
 import torch
-from stnet.core.tensor import from_buffer
+from stnet.core.tensor import extract_tensor, from_buffer
 from wsl_nogil_train import build_dataset
 from stnet.api import new_model, train
 from stnet.config import ModelConfig, PatchConfig
@@ -34,6 +34,17 @@ def _as_path_list(out: Any, fallback: Path) -> list[str]:
     return [str(out)]
 
 
+def _stats_np(arr: np.ndarray) -> dict[str, float | list[int]]:
+    arr = np.asarray(arr)
+    return {
+        "shape": list(arr.shape),
+        "min": float(arr.min()),
+        "max": float(arr.max()),
+        "mean": float(arr.mean()),
+        "std": float(arr.std()),
+    }
+
+
 @contextlib.contextmanager
 def _temp_env(k: str, v: str):
     old = os.environ.get(k)
@@ -48,7 +59,7 @@ def _temp_env(k: str, v: str):
 
 
 def export_and_validate(
-    model: torch.nn.Module, sample: torch.Tensor, out_dir: Path
+    model: torch.nn.Module, sample: torch.Tensor, td_train, out_dir: Path
 ) -> Dict[str, Any]:
     out_dir.mkdir(parents=True, exist_ok=True)
     warnings.filterwarnings(
@@ -59,9 +70,12 @@ def export_and_validate(
     targets = {
         "pt2": out_dir / "model.pt2",
         "onnx": out_dir / "model.onnx",
+        "ort": out_dir / "model.ort",
         "executorch": out_dir / "model.pte",
         "tensorflow": out_dir / "model.savedmodel",
         "litert": out_dir / "model.tflite",
+        "coreml": out_dir / "model.mlmodel",
+        "tensorrt": out_dir / "model.engine",
     }
     results: Dict[str, Any] = {}
     with _temp_env("STNET_DISABLE_PIECEWISE_CALIB", "1"):
@@ -91,7 +105,12 @@ def export_and_validate(
             except Exception as exc:  # pragma: no cover - diagnostic output
                 results[name] = {"status": "error", "error": repr(exc)}
 
-    validations: Dict[str, Any] = {}
+    validation: Dict[str, Any] = {}
+    try:
+        y = td_train["Y"].detach().cpu().numpy()
+        validation["label_stats"] = _stats_np(y)
+    except Exception as exc:
+        validation["label_stats_error"] = repr(exc)
     pt2_path = targets["pt2"]
     if pt2_path.exists():
         with _temp_env("STNET_DISABLE_PIECEWISE_CALIB", "1"):
@@ -99,20 +118,24 @@ def export_and_validate(
                 with from_buffer():
                     ep = torch.export.load(str(pt2_path))
                 with torch.no_grad():
-                    pt2_out = ep.module()(sample)
-                if hasattr(model, "forward_export"):
-                    torch_out = model.forward_export(sample)
-                else:
-                    torch_out = model(sample, return_loss=False)
-                validations["pt2_mae"] = float(torch.mean(torch.abs(pt2_out - torch_out)).item())
+                    pt2_out = extract_tensor(ep.module()(sample))
+                    torch_out = extract_tensor(
+                        model.forward_export(sample)
+                        if hasattr(model, "forward_export")
+                        else model(sample, return_loss=False)
+                    )
+                pt2_np = pt2_out.detach().cpu().numpy()
+                torch_np = torch_out.detach().cpu().numpy()
+                validation["pt2_mae"] = float(np.mean(np.abs(pt2_np - torch_np)))
+                validation["pt2_out_stats"] = _stats_np(pt2_np)
             except Exception as exc:
-                validations["pt2_error"] = repr(exc)
+                validation["pt2_error"] = repr(exc)
         def _truthy(v: str) -> bool:
             return v.strip().lower() in ("1", "true", "yes", "y", "on")
 
         do_alt = _truthy(os.environ.get("STNET_VALIDATE_ALT_BATCH", "0"))
         if (
-            "pt2_error" not in validations
+            "pt2_error" not in validation
             and do_alt
             and isinstance(sample, torch.Tensor)
             and sample.ndim >= 2
@@ -122,37 +145,37 @@ def export_and_validate(
                 alt_n = max(1, int(sample.shape[0]) // 2)
                 alt = sample[:alt_n]
                 with torch.no_grad():
-                    alt_pt2 = ep.module()(alt)
-                    if hasattr(model, "forward_export"):
-                        alt_torch = model.forward_export(alt)
-                    else:
-                        alt_torch = model(alt, return_loss=False)
-                validations["pt2_mae_alt"] = float(
-                    torch.mean(torch.abs(alt_pt2 - alt_torch)).item()
+                    alt_pt2 = extract_tensor(ep.module()(alt))
+                    alt_torch = extract_tensor(
+                        model.forward_export(alt)
+                        if hasattr(model, "forward_export")
+                        else model(alt, return_loss=False)
+                    )
+                validation["pt2_mae_alt"] = float(
+                    np.mean(
+                        np.abs(
+                            alt_pt2.detach().cpu().numpy() - alt_torch.detach().cpu().numpy()
+                        )
+                    )
                 )
             except Exception as exc:
-                validations["pt2_mae_alt_error"] = repr(exc)
+                validation["pt2_mae_alt_error"] = repr(exc)
 
-    onnx_path = targets["onnx"]
-    if onnx_path.exists():
-        with _temp_env("STNET_DISABLE_PIECEWISE_CALIB", "1"):
-            try:
-                import onnxruntime as ort
-                sess = ort.InferenceSession(str(onnx_path), providers=["CPUExecutionProvider"])
-                inp_name = sess.get_inputs()[0].name
-                onnx_out = sess.run(
-                    None, {inp_name: sample.detach().cpu().numpy().astype(np.float32)}
-                )[0]
-                with torch.no_grad():
-                    if hasattr(model, "forward_export"):
-                        torch_out_t = model.forward_export(sample)
-                    else:
-                        torch_out_t = model(sample, return_loss=False)
-                torch_out = torch_out_t.detach().cpu().numpy()
-                validations["onnx_mae"] = float(np.mean(np.abs(torch_out - onnx_out)))
-            except Exception as exc:
-                validations["onnx_error"] = repr(exc)
-    return {"exports": results, "validation": validations}
+    for name in ("onnx", "ort"):
+        path = targets[name]
+        if path.exists():
+            with _temp_env("STNET_DISABLE_PIECEWISE_CALIB", "1"):
+                try:
+                    import onnxruntime as ort
+                    sess = ort.InferenceSession(str(path), providers=["CPUExecutionProvider"])
+                    inp_name = sess.get_inputs()[0].name
+                    out = sess.run(
+                        None, {inp_name: sample.detach().cpu().numpy().astype(np.float32)}
+                    )[0]
+                    validation[f"{name}_out_stats"] = _stats_np(out)
+                except Exception as exc:
+                    validation[f"{name}_error"] = repr(exc)
+    return {"exports": results, "validation": validation}
 
 
 def main() -> None:
@@ -196,7 +219,7 @@ def main() -> None:
     )
     model.eval()
     sample = td_train["X"][:4].to(device)
-    stats = export_and_validate(model, sample, Path("export_artifacts"))
+    stats = export_and_validate(model, sample, td_train, Path("export_artifacts"))
     print(json.dumps(stats, indent=2))
 
 
