@@ -132,7 +132,7 @@ def _is_inner_thread_limited(wl: str) -> bool:
     return True
 
 
-def _set_concurrency_env(key: str, value: str, *, force: bool, cap_down: bool = True) -> None:
+def _set_concurrency_env(key: str, value: str, *args: Any, force: bool, cap_down: bool = True) -> None:
     try:
         k = str(key)
         v = str(value)
@@ -156,7 +156,7 @@ def _set_concurrency_env(key: str, value: str, *, force: bool, cap_down: bool = 
         return
 
 
-def _init_env(key: str, value: str, *, force: bool) -> None:
+def _init_env(key: str, value: str, *args: Any, force: bool) -> None:
     try:
         if force or (key not in os.environ) or (str(os.environ.get(key, "")).strip() == ""):
             os.environ[str(key)] = str(value)
@@ -164,7 +164,7 @@ def _init_env(key: str, value: str, *, force: bool) -> None:
         return
 
 
-def _limit_inner_threads(threads: int, *, force: bool = False) -> int:
+def _limit_inner_threads(threads: int, *args: Any, force: bool = False) -> int:
     t = max(1, int(threads))
     ov = env_first_int(("STNET_EXECUTOR_INNER_THREADS",), default=0) or 0
     if int(ov) > 0:
@@ -297,7 +297,7 @@ def _executor_scatter_cpus(cpus: Sequence[int]) -> list[int]:
     return out if out else base
 
 
-def _executor_prefer_smt_lane(cpus: Sequence[int], *, prefer_primary: bool) -> list[int]:
+def _executor_prefer_smt_lane(cpus: Sequence[int], *args: Any, prefer_primary: bool) -> list[int]:
     base = sorted({int(x) for x in (cpus or [])})
     if not base:
         return []
@@ -694,7 +694,7 @@ def new_affinity(io_workers: Optional[int] = None) -> "Thread":
     return _TLB_SINGLETON
 
 
-def new_thread(fn: Callable[[Any], Any], *, io_workers: Optional[int] = None) -> Callable[[Any], Any]:
+def new_thread(fn: Callable[[Any], Any], *args: Any, io_workers: Optional[int] = None) -> Callable[[Any], Any]:
     return new_affinity(io_workers=io_workers).new_thread(fn)
 
 
@@ -1762,7 +1762,7 @@ class Thread:
 class Mutex:
     __slots__ = ("_lock", "_acquire", "_release", "_locked_fn")
 
-    def __init__(self, *, reentrant: bool = False) -> None:
+    def __init__(self, *args: Any, reentrant: bool = False) -> None:
         lock = threading.RLock() if bool(reentrant) else threading.Lock()
         self._lock = lock
         self._acquire = lock.acquire
@@ -1856,7 +1856,7 @@ class BoundedExecutor(futures.Executor):
 
         return _result_iter()
 
-    def shutdown(self, wait: bool = True, *, cancel_futures: bool = False) -> None:
+    def shutdown(self, wait: bool = True, *args: Any, cancel_futures: bool = False) -> None:
         try:
             self._inner.shutdown(wait=wait, cancel_futures=cancel_futures)
         except TypeError:
