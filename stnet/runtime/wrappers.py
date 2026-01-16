@@ -29,6 +29,18 @@ from ..nn.layers import Recorder
 from .io import Format, _load_model_config, _temp_environ, is_required
 
 
+_FORWARD_PARAM_CACHE: dict[object, object] = {}
+_FORWARD_PARAM_CACHE_LOCK = Mutex()
+
+_EXPORT_SIG_CACHE: object | None = None
+_EXPORT_SIG_LOCK = Mutex()
+
+_EXPORT_WARN_FILTERS_INSTALLED = False
+
+_ONNX2TF_HELP_CACHE: str | None = None
+_ONNX2TF_HELP_LOCK = Mutex(reentrant=True)
+
+
 @contextlib.contextmanager
 def _no_empty_tensor(root: nn.Module) -> Iterator[None]:
     patched: list[tuple[nn.Module, str, torch.Tensor]] = []
@@ -45,15 +57,6 @@ def _no_empty_tensor(root: nn.Module) -> Iterator[None]:
         for module, name, old in patched:
             with contextlib.suppress(Exception):
                 setattr(module, name, old)
-
-
-_FORWARD_PARAM_CACHE: dict[object, object] = {}
-_FORWARD_PARAM_CACHE_LOCK = Mutex()
-
-_EXPORT_SIG_CACHE: object | None = None
-_EXPORT_SIG_LOCK = Mutex()
-
-_EXPORT_WARN_FILTERS_INSTALLED = False
 
 
 def _install_export_warning_filters() -> None:
@@ -269,16 +272,14 @@ def _sidecar_json_path(dst: PathLike) -> Path:
 def _write_export_meta(
     model: nn.Module,
     dst: PathLike,
-    *,
+    *args: Any,
     format_name: str,
     extra: dict[str, Any] | None = None,
 ) -> None:
     p = Path(dst)
-
     out_shape = getattr(model, "out_shape", None) or ()
     if not isinstance(out_shape, (list, tuple)):
         out_shape = (out_shape,)
-
     payload: dict[str, Any] = {
         "version": 1,
         "format": str(format_name),
@@ -289,7 +290,6 @@ def _write_export_meta(
     }
     if extra:
         payload["extra"] = extra
-
     write_json(_sidecar_json_path(p), payload, indent=2)
 
 
@@ -298,18 +298,12 @@ def _pad_to_batch(sample: torch.Tensor, min_batch: int) -> torch.Tensor:
         return sample
     if sample.ndim == 0:
         return sample
-
     b = int(sample.shape[0]) if sample.shape else 1
     if b >= int(min_batch):
         return sample
-
     pad_shape = (int(min_batch) - b,) + tuple(sample.shape[1:])
     pad = torch.zeros(pad_shape, dtype=sample.dtype, device=sample.device)
     return torch.cat([sample, pad], dim=0)
-
-
-_ONNX2TF_HELP_CACHE: str | None = None
-_ONNX2TF_HELP_LOCK = Mutex(reentrant=True)
 
 
 def _onnx2tf_help_text() -> str:
@@ -365,7 +359,6 @@ def _run_onnx2tf(
     out_dir = Path(out_dir)
     with contextlib.suppress(Exception):
         out_dir.mkdir(parents=True, exist_ok=True)
-
     base_args: list[str] = []
     if _onnx2tf_supports("-nuo"):
         base_args.append("-nuo")
@@ -417,7 +410,6 @@ def _run_onnx2tf(
                 return
             except Exception as exc:
                 last_exc = exc
-
     if last_exc is not None:
         raise last_exc
 
@@ -426,7 +418,7 @@ def _torch_export_program(
     torch_export: Callable[..., Any],
     wrapper: nn.Module,
     sample: torch.Tensor,
-    *,
+    *args: Any,
     dynamic_batch: bool = True,
     dynamic_seq: bool = False,
     strict: bool = True,
@@ -434,10 +426,8 @@ def _torch_export_program(
 ) -> object:
     if isinstance(sample, torch.Tensor) and sample.ndim == 1:
         sample = sample.unsqueeze(0)
-
     if dynamic_batch and isinstance(sample, torch.Tensor) and sample.ndim >= 1:
         sample = _pad_to_batch(sample, 2)
-
     dynamic_shapes = None
     if (dynamic_batch or dynamic_seq) and hasattr(torch, "export") and hasattr(torch.export, "Dim"):
         spec: dict[int, object] = {}
@@ -447,7 +437,6 @@ def _torch_export_program(
             spec[1] = torch.export.Dim("seq")
         if spec:
             dynamic_shapes = (spec,)
-
     call_kw: dict[str, Any] = {}
     try:
         sig = inspect.signature(torch_export)
@@ -518,7 +507,7 @@ def _export_sig_keys() -> set[str]:
     except Exception:
         pass
     try:
-        return set(sig.parameters.keys())  # type: ignore[attr-defined]
+        return set(sig.parameters.keys())
     except Exception:
         return set()
 
