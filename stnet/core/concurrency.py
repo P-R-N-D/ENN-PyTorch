@@ -105,31 +105,6 @@ def _prod_int(shape: Sequence[int]) -> int:
     return int(max(1, math.prod(int(s) for s in shape)))
 
 
-def is_free_threading_build() -> bool:
-    with contextlib.suppress(Exception):
-        return bool(CPU.is_free_threaded_build())
-    tag = getattr(getattr(sys, "implementation", None), "cache_tag", "") or ""
-    return bool(isinstance(tag, str) and tag.endswith("t"))
-
-
-def is_gil_enabled() -> bool:
-    with contextlib.suppress(Exception):
-        return bool(CPU.is_gil_enabled())
-    fn = getattr(sys, "_is_gil_enabled", None)
-    if callable(fn):
-        with contextlib.suppress(Exception):
-            return bool(fn())
-    return True
-
-
-def python_build_tag() -> str:
-    major, minor = sys.version_info[:2]
-    return f"{major}.{minor}{'t' if is_free_threading_build() else ''}"
-
-
-def is_interpreter_pool_supported() -> bool:
-    return getattr(futures, "InterpreterPoolExecutor", None) is not None
-
 @lru_cache(maxsize=1)
 def _is_affinity_enabled() -> bool:
     return bool(env_flag("STNET_EXECUTOR_AFFINITY", "STNET_AFFINITY", default=True))
@@ -196,17 +171,14 @@ def _limit_inner_threads(threads: int, *, force: bool = False) -> int:
         t = max(1, int(ov))
     force = bool(force) or bool(env_flag("STNET_EXECUTOR_FORCE_INNER_THREADS", default=False))
     cap_down = bool(env_flag("STNET_EXECUTOR_CAP_DOWN_INNER_THREADS", default=True))
-
     for k in _ENV_INNER_THREAD_VARS:
         _set_concurrency_env(k, str(t), force=force, cap_down=cap_down)
     for k, v in _ENV_INNER_BOOL_VARS.items():
         _init_env(k, v, force=force)
-
     with contextlib.suppress(Exception):
         torch.set_num_threads(int(t))
     with contextlib.suppress(Exception):
         torch.set_num_interop_threads(1)
-
     return int(t)
 
 
@@ -394,10 +366,8 @@ def _pick_cores_balanced(
         return []
     i = int(idx) % max(1, int(mw))
     cpw_i = max(1, min(int(cpw), n))
-
     if cpw_i == 1:
         return [int(base[(int(start) + i) % n])]
-
     stride1 = _pick_coprime_stride(n, hint=max(1, n // max(1, int(mw))), salt=salt)
     base_pos = (int(start) + i * stride1) % n
     stride2 = _pick_coprime_stride(n, hint=max(1, n // cpw_i), salt=salt + 7)
@@ -470,7 +440,6 @@ def _executor_thread_initializer(
     cores = _pick_cores_balanced(cpus, start=int(start), idx=int(idx), mw=int(mw), cpw=int(cpw), salt=int(salt))
     if cores:
         _set_current_thread_affinity(cores)
-
     with contextlib.suppress(Exception):
         tlb = new_affinity()
         tlb._tls.pinned = True
@@ -488,13 +457,37 @@ def _executor_process_initializer(
     cores = _pick_cores_balanced(cpus, start=int(start), idx=int(idx), mw=int(mw), cpw=int(cpw), salt=int(salt))
     if cores:
         _set_current_process_affinity(cores)
-
     if cores and _is_inner_thread_limited(wl):
         _limit_inner_threads(max(1, int(len(cores))))
-
     with contextlib.suppress(Exception):
         tlb = new_affinity()
         tlb._tls.pinned = True
+
+
+def is_free_threading_build() -> bool:
+    with contextlib.suppress(Exception):
+        return bool(CPU.is_free_threaded_build())
+    tag = getattr(getattr(sys, "implementation", None), "cache_tag", "") or ""
+    return bool(isinstance(tag, str) and tag.endswith("t"))
+
+
+def is_gil_enabled() -> bool:
+    with contextlib.suppress(Exception):
+        return bool(CPU.is_gil_enabled())
+    fn = getattr(sys, "_is_gil_enabled", None)
+    if callable(fn):
+        with contextlib.suppress(Exception):
+            return bool(fn())
+    return True
+
+
+def python_build_tag() -> str:
+    major, minor = sys.version_info[:2]
+    return f"{major}.{minor}{'t' if is_free_threading_build() else ''}"
+
+
+def is_interpreter_pool_supported() -> bool:
+    return getattr(futures, "InterpreterPoolExecutor", None) is not None
 
 
 def new_prefetcher(
