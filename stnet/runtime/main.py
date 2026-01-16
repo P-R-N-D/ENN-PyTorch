@@ -4105,7 +4105,7 @@ def process(*args: Any, **kwargs: Any) -> object:
             try:
                 wrapped_ids: set[int] = set()
 
-                def _wrap_once(mod: torch.nn.Module | None, *, is_root: bool) -> None:
+                def _wrap_once(mod: torch.nn.Module = None, *args: Any, is_root: bool) -> None:
                     if mod is None or id(mod) in wrapped_ids:
                         return
                     wrapped_ids.add(id(mod))
