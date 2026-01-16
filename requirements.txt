@@ -11,6 +11,7 @@ psutil>=7.2.1
 py-cpuinfo>=9.0.0
 torch>=2.9.1
 torchvision>=0.24.1
+torchaudio>=2.9.1
 torchao>=0.15.0
 torchdata>=0.11.0
 tensordict>=0.10.0
@@ -42,10 +43,10 @@ ml_dtypes>=0.5.4
 # - intel_ai: intel-extension-for-pytorch>=2.7.0
 #
 # Export / deployment (optional)
-# - deployment_full: onnx-tf>=1.10.0 (py<3.13),
-#                    onnx2tf>=1.27.2 (py<3.13), tf-keras>=2.20.1,
+# - deployment_full: onnx2tf>=1.27.2 (py<3.13), tf-keras>=2.20.1, tensorflow>=2.20.0,
 #                    coremltools>=8.3.0 (macOS),
-#                    tensorrt>=10.10.0.31 (Linux/CUDA), executorch>=0.6.0 (Linux, py<3.12; wheel availability varies)
+#                    tensorrt>=10.10.0.31 (Linux/CUDA),
+#                    executorch>=0.6.0 (Linux, py<3.12; wheel availability varies)
 #
 # Telemetry
 # - telemetry: nvidia-ml-py>=11.515.48
