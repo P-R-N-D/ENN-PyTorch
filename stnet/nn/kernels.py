@@ -92,6 +92,42 @@ def _coerce_block_mask_to_dense(mask: Any, *, device: torch.device) -> Optional[
     return None
 
 
+def _expand_block_mask_to_token_mask(
+    mask: Any,
+    dense: Optional[torch.Tensor],
+    *,
+    Lq: int,
+    Lk: int,
+) -> Optional[torch.Tensor]:
+    if dense is None:
+        return None
+    if dense.dim() < 2:
+        return dense
+    if dense.shape[-2] == Lq and dense.shape[-1] == Lk:
+        return dense
+
+    q_block: Optional[int] = None
+    k_block: Optional[int] = None
+    block_size = getattr(mask, "BLOCK_SIZE", None)
+    if isinstance(block_size, tuple) and len(block_size) == 2:
+        q_block, k_block = int(block_size[0]), int(block_size[1])
+    elif isinstance(block_size, int):
+        q_block = int(block_size)
+        k_block = int(block_size)
+
+    if q_block is None or k_block is None:
+        if dense.shape[-2] > 0:
+            q_block = max(1, int(math.ceil(Lq / dense.shape[-2])))
+        if dense.shape[-1] > 0:
+            k_block = max(1, int(math.ceil(Lk / dense.shape[-1])))
+
+    if q_block is None or k_block is None:
+        return dense
+
+    expanded = dense.repeat_interleave(q_block, dim=-2).repeat_interleave(k_block, dim=-1)
+    return expanded[..., :Lq, :Lk]
+
+
 def _apply_allowed_mask(scores: torch.Tensor, allowed: torch.Tensor) -> torch.Tensor:
     if allowed.dtype != torch.bool:
         allowed = allowed != 0
@@ -1201,6 +1237,7 @@ class FlexAttention(nn.Module):
                 scores = scores.masked_fill(causal.logical_not(), torch.finfo(scores.dtype).min)
 
         dense = _coerce_block_mask_to_dense(block_mask, device=scores.device)
+        dense = _expand_block_mask_to_token_mask(block_mask, dense, Lq=Lq, Lk=Lk)
         if dense is not None:
             if dense.dim() == 2:
                 dense = dense[None, None, :, :]
