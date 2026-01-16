@@ -16,10 +16,10 @@ from ..core.tensor import is_meta_or_fake_tensor
 from ..core.graph import coerce_checkpoint, is_export_or_trace, is_symbolic
 from .layers import CrossAttention, DilatedAttention, Retention, norm_layer
 
+
 _STNET_HAS_FLEX_ATTENTION = getattr(
     import_module(".layers", __package__), "_HAS_FLEX_ATTENTION", False
 )
-
 
 _LOGGER = logging.getLogger(__name__)
 
