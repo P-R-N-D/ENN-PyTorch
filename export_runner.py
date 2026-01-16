@@ -3,6 +3,9 @@ from __future__ import annotations
 import contextlib
 import json
 import os
+import re
+import traceback
+import time
 import warnings
 from pathlib import Path
 from typing import Any, Dict
@@ -43,6 +46,150 @@ def _stats_np(arr: np.ndarray) -> dict[str, float | list[int]]:
         "mean": float(arr.mean()),
         "std": float(arr.std()),
     }
+
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+_TL_LOG_RE = re.compile(r"(dedicated_log_torch_trace_[A-Za-z0-9_]+\.log)")
+
+
+def _strip_ansi(s: str) -> str:
+    return _ANSI_RE.sub("", s)
+
+
+def _truncate(s: str, n: int = 4000) -> str:
+    if s is None:
+        return ""
+    s = str(s)
+    if len(s) <= n:
+        return s
+    return s[: n - 3] + "..."
+
+
+def _should_run_draft(err: str) -> bool:
+    e = _strip_ansi(err or "")
+    return ("Constraints violated" in e) or ("torch.export.export" in e)
+
+
+def _extract_tlparse_log_from_text(txt: str) -> str | None:
+    if not txt:
+        return None
+    m = _TL_LOG_RE.search(txt)
+    if not m:
+        return None
+    return f"/tmp/export_root/{m.group(1)}"
+
+
+def _read_log_excerpt(path: str, *, max_lines: int = 220, tail: bool = True) -> str | None:
+    try:
+        p = Path(path)
+        if not p.exists():
+            return None
+        lines = p.read_text(errors="replace").splitlines()
+        if not lines:
+            return None
+        chunk = lines[-max_lines:] if tail else lines[:max_lines]
+        return "\n".join(chunk)
+    except Exception:
+        return None
+
+
+def _report_to_text(ep: object) -> str:
+    for attr in ("_report", "report"):
+        if hasattr(ep, attr):
+            try:
+                return str(getattr(ep, attr))
+            except Exception:
+                pass
+    return ""
+
+
+def _draft_export_diagnostics(model: torch.nn.Module, sample: torch.Tensor) -> dict[str, Any]:
+    info: dict[str, Any] = {"ok": False, "attempts": []}
+    info["ts"] = int(time.time())
+    try:
+        import torch.export as tex
+    except Exception as exc:
+        info["error"] = f"torch.export import failed: {exc!r}"
+        return info
+
+    try:
+        from stnet.runtime.wrappers import _onnx_model, _TensorOutputModule
+    except Exception as exc:
+        info["error"] = f"could not import ONNX wrapper helpers: {exc!r}"
+        return info
+
+    Dim = getattr(tex, "Dim", None)
+    dyn_candidates: list[Any] = [None]
+    if Dim is not None:
+        try:
+            bdim = Dim("batch", min=1)
+        except Exception:
+            try:
+                bdim = Dim("batch")
+            except Exception:
+                bdim = None
+        if bdim is not None:
+            dyn_candidates = [
+                ({0: bdim},),
+                {0: bdim},
+            ] + dyn_candidates
+
+    try:
+        with _onnx_model(model) as serving_model:
+            wrapper = _TensorOutputModule(serving_model).eval()
+            args = (sample,)
+            for strict in (False, True):
+                for dyn in dyn_candidates:
+                    try:
+                        kw = {"strict": strict}
+                        if dyn is not None:
+                            kw["dynamic_shapes"] = dyn
+                        with warnings.catch_warnings(record=True) as wrec:
+                            warnings.simplefilter("always")
+                            res = tex.draft_export(wrapper, args, **kw)
+                        info["ok"] = True
+                        info["strict"] = strict
+                        info["dynamic_shapes_repr"] = repr(dyn)
+                        rep_txt = _report_to_text(res)
+                        if rep_txt:
+                            info["report"] = _truncate(rep_txt, 12000)
+                            tl = _extract_tlparse_log_from_text(rep_txt)
+                            if tl:
+                                info["tlparse_log"] = tl
+                                ex = _read_log_excerpt(tl)
+                                if ex:
+                                    info["tlparse_log_excerpt_tail"] = _truncate(ex, 12000)
+                        if wrec:
+                            info["warnings"] = [
+                                _truncate(_strip_ansi(str(w.message)), 2000) for w in wrec
+                            ]
+                            if "tlparse_log" not in info:
+                                for w in info["warnings"]:
+                                    tl = _extract_tlparse_log_from_text(w)
+                                    if tl:
+                                        info["tlparse_log"] = tl
+                                        ex = _read_log_excerpt(tl)
+                                        if ex:
+                                            info["tlparse_log_excerpt_tail"] = _truncate(ex, 12000)
+                                        break
+                        for attr in ("errors", "constraints", "guards", "help"):
+                            if hasattr(res, attr):
+                                try:
+                                    info[attr] = _truncate(repr(getattr(res, attr)))
+                                except Exception:
+                                    pass
+                        return info
+                    except Exception as e:
+                        info["attempts"].append(
+                            {
+                                "strict": strict,
+                                "dynamic_shapes_repr": repr(dyn),
+                                "error": _truncate(repr(e)),
+                            }
+                        )
+    except Exception as exc:
+        info["error"] = _truncate(repr(exc))
+        info["traceback"] = _truncate(traceback.format_exc(), 6000)
+    return info
 
 
 @contextlib.contextmanager
@@ -103,7 +250,8 @@ def export_and_validate(
                         "error": repr(exc),
                     }
             except Exception as exc:  # pragma: no cover - diagnostic output
-                results[name] = {"status": "error", "error": repr(exc)}
+                err_s = repr(exc)
+                results[name] = {"status": "error", "error": err_s}
 
     validation: Dict[str, Any] = {}
     try:
@@ -130,6 +278,7 @@ def export_and_validate(
                 validation["pt2_out_stats"] = _stats_np(pt2_np)
             except Exception as exc:
                 validation["pt2_error"] = repr(exc)
+
         def _truthy(v: str) -> bool:
             return v.strip().lower() in ("1", "true", "yes", "y", "on")
 
@@ -160,6 +309,13 @@ def export_and_validate(
                 )
             except Exception as exc:
                 validation["pt2_mae_alt_error"] = repr(exc)
+
+    onnx_res = results.get("onnx", {})
+    if isinstance(onnx_res, dict) and onnx_res.get("status") == "error":
+        err = str(onnx_res.get("error", ""))
+        if _should_run_draft(err):
+            if os.environ.get("STNET_ONNX_DRAFT_EXPORT", "1") != "0":
+                validation["onnx_draft_export"] = _draft_export_diagnostics(model, sample)
 
     for name in ("onnx", "ort"):
         path = targets[name]

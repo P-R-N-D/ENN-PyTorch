@@ -15,7 +15,14 @@ from ..core.concurrency import Mutex
 from ..core.datatypes import env_bool, env_int
 from ..core.compat import StochasticDepth
 from ..core.system import empty_device_cache, is_oom_error
-from ..core.graph import coerce_checkpoint, torch_compiler_disable, is_symbolic, is_checkpoint, is_meta_or_fake_tensor
+from ..core.graph import (
+    coerce_checkpoint,
+    torch_compiler_disable,
+    is_symbolic,
+    is_checkpoint,
+    is_meta_or_fake_tensor,
+    is_export_or_trace,
+)
 from .kernels import DotProductAttention, MultiHeadAttention, MultiScaleRetention
 
 _Norm = nn.LayerNorm
@@ -1025,7 +1032,9 @@ class DilatedAttention(nn.Module):
                     kpm_check = kpm_k
                 if kpm_check is not None:
                     kpm_b = kpm_check.to(torch.bool)
-                    if is_symbolic() or is_meta_or_fake_tensor(kpm_b):
+                    if is_export_or_trace():
+                        right_padded = False
+                    elif is_symbolic() or is_meta_or_fake_tensor(kpm_b):
                         right_padded = False
                     else:
                         right_padded = True
