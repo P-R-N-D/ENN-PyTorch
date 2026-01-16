@@ -61,6 +61,42 @@ if torch.cuda.is_available() and getattr(get_device(), "type", "cpu") == "cuda":
     except Exception:
         pass
 
+_HAS_TORCH_FLEX, _torch_flex_attention, _torch_create_block_mask = False, None, None
+_FLEX_KWARGS: set[str] = set()
+try:
+    from torch.nn.attention.flex_attention import flex_attention as _torch_flex_attention
+    from torch.nn.attention.flex_attention import create_block_mask as _torch_create_block_mask
+
+    _HAS_TORCH_FLEX = True
+    with contextlib.suppress(Exception):
+        _FLEX_KWARGS = set(inspect.signature(_torch_flex_attention).parameters.keys())
+except Exception:
+    _HAS_TORCH_FLEX = False
+    _torch_flex_attention = None
+    _torch_create_block_mask = None
+
+if env_bool("STNET_DISABLE_FLEX_ATTENTION", False):
+    _HAS_TORCH_FLEX = False
+
+
+def _coerce_block_mask_to_dense(mask: Any, *, device: torch.device) -> Optional[torch.Tensor]:
+    if mask is None:
+        return None
+    if torch.is_tensor(mask):
+        return mask.to(device)
+    if hasattr(mask, "to_dense"):
+        with contextlib.suppress(Exception):
+            dense = mask.to_dense()
+            if torch.is_tensor(dense):
+                return dense.to(device)
+    return None
+
+
+def _apply_allowed_mask(scores: torch.Tensor, allowed: torch.Tensor) -> torch.Tensor:
+    if allowed.dtype != torch.bool:
+        allowed = allowed != 0
+    return scores.masked_fill(allowed.logical_not(), torch.finfo(scores.dtype).min)
+
 
 def _flatten_attn_mask(
     mask: torch.Tensor,
@@ -598,6 +634,19 @@ class _MultiHeadAttentionNvidia(nn.Module):
         is_causal: Optional[bool] = None,
         average_attn_weights: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        if _exporting_boundary():
+            return _call_sdpa_fallback(
+                self._fallback,
+                query,
+                key,
+                value,
+                attn_mask=attn_mask,
+                key_padding_mask=key_padding_mask,
+                need_weights=need_weights,
+                average_attn_weights=average_attn_weights,
+                is_causal=is_causal,
+            )
+
         def _fallback_call():
             return _call_sdpa_fallback(
                 self._fallback,
@@ -728,7 +777,7 @@ class _MultiHeadAttentionCompat(nn.Module):
         kwargs = dict(key_padding_mask=key_padding_mask, need_weights=need_weights)
         if need_weights:
             kwargs["average_attn_weights"] = bool(average_attn_weights)
-        if is_tracing_or_exporting():
+        if _exporting_boundary():
             out, w = _mha_export_safe(
                 self.mha,
                 query,
@@ -1111,6 +1160,143 @@ class DotProductAttention(nn.Module):
         return tensor
 
 
+class FlexAttention(nn.Module):
+    def __init__(self, *, prefer_torch: bool = True) -> None:
+        super().__init__()
+        self.prefer_torch = bool(prefer_torch)
+
+    @property
+    def has_torch_backend(self) -> bool:
+        return bool(_HAS_TORCH_FLEX and _torch_flex_attention is not None)
+
+    def _reference(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        *,
+        block_mask: Any = None,
+        scale: float | None = None,
+        dropout_p: float = 0.0,
+        training: bool = False,
+        is_causal: bool = False,
+        score_mod: Any = None,
+    ) -> torch.Tensor:
+        if score_mod is not None:
+            raise RuntimeError("FlexAttention reference path does not support score_mod")
+
+        if q.dim() != 4 or k.dim() != 4 or v.dim() != 4:
+            raise ValueError(f"FlexAttention expects (B,H,L,D), got {tuple(q.shape)}")
+
+        q_bshd, k_bshd, v_bshd = q, k, v
+        _, _, Lq, Dh = q_bshd.shape
+        Lk = k_bshd.shape[2]
+        sc = float(scale) if scale is not None else (1.0 / math.sqrt(float(Dh)))
+
+        scores = torch.matmul(q_bshd, k_bshd.transpose(-2, -1)) * sc
+
+        if is_causal:
+            with contextlib.suppress(Exception):
+                causal = torch.ones((Lq, Lk), dtype=torch.bool, device=scores.device).tril()
+                scores = scores.masked_fill(causal.logical_not(), torch.finfo(scores.dtype).min)
+
+        dense = _coerce_block_mask_to_dense(block_mask, device=scores.device)
+        if dense is not None:
+            if dense.dim() == 2:
+                dense = dense[None, None, :, :]
+            elif dense.dim() == 3:
+                dense = dense[:, None, :, :]
+            if dense.dtype == torch.bool or not torch.is_floating_point(dense):
+                scores = _apply_allowed_mask(scores, dense)
+            else:
+                scores = scores + dense
+
+        attn = torch.softmax(scores, dim=-1)
+        if training and float(dropout_p) > 0.0:
+            attn = torch.nn.functional.dropout(attn, p=float(dropout_p), training=True)
+        return torch.matmul(attn, v_bshd)
+
+    def forward(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        *args: Any,
+        score_mod: Any = None,
+        block_mask: Any = None,
+        scale: float | None = None,
+        enable_gqa: bool = False,
+        return_lse: bool = False,
+        kernel_options: Any = None,
+        dropout_p: float = 0.0,
+        is_causal: bool = False,
+        training: Optional[bool] = None,
+        **kwargs: Any,
+    ) -> Any:
+        del args, kwargs
+        training = bool(training) if training is not None else self.training
+
+        if _exporting_boundary():
+            return self._reference(
+                q,
+                k,
+                v,
+                block_mask=block_mask,
+                scale=scale,
+                dropout_p=float(dropout_p),
+                training=training,
+                is_causal=bool(is_causal),
+                score_mod=score_mod,
+            )
+
+        if self.prefer_torch and self.has_torch_backend and (not env_bool("STNET_DISABLE_FLEX_ATTENTION", False)):
+            if (not q.is_cuda) or _torch_flex_attention is None:
+                return self._reference(
+                    q,
+                    k,
+                    v,
+                    block_mask=block_mask,
+                    scale=scale,
+                    dropout_p=float(dropout_p),
+                    training=training,
+                    is_causal=bool(is_causal),
+                    score_mod=score_mod,
+                )
+
+            flex_kwargs: dict[str, Any] = {}
+            if "score_mod" in _FLEX_KWARGS and score_mod is not None:
+                flex_kwargs["score_mod"] = score_mod
+            if "block_mask" in _FLEX_KWARGS and block_mask is not None:
+                flex_kwargs["block_mask"] = block_mask
+            if "scale" in _FLEX_KWARGS and scale is not None:
+                flex_kwargs["scale"] = float(scale)
+            if "enable_gqa" in _FLEX_KWARGS:
+                flex_kwargs["enable_gqa"] = bool(enable_gqa)
+            if "return_lse" in _FLEX_KWARGS:
+                flex_kwargs["return_lse"] = bool(return_lse)
+            if float(dropout_p) > 0.0:
+                if "dropout_p" in _FLEX_KWARGS:
+                    flex_kwargs["dropout_p"] = float(dropout_p)
+                elif "dropout" in _FLEX_KWARGS:
+                    flex_kwargs["dropout"] = float(dropout_p)
+            if "kernel_options" in _FLEX_KWARGS and kernel_options is not None:
+                flex_kwargs["kernel_options"] = kernel_options
+
+            return _torch_flex_attention(q, k, v, **flex_kwargs)
+
+        return self._reference(
+            q,
+            k,
+            v,
+            block_mask=block_mask,
+            scale=scale,
+            dropout_p=float(dropout_p),
+            training=training,
+            is_causal=bool(is_causal),
+            score_mod=score_mod,
+        )
+
+
 class MultiScaleRetention(nn.Module):
     def __init__(self, d_model: int, nhead: int, use_gate: bool = True) -> None:
         super().__init__()
@@ -1343,7 +1529,7 @@ class MultiScaleRetention(nn.Module):
             and self._triton_ok
             and v.is_cuda
             and torch.cuda.is_available()
-            and (not is_tracing_or_exporting())
+            and (not _exporting_boundary())
             and (not is_compiling())
         )
         if use_triton:
