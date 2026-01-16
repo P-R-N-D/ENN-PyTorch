@@ -59,7 +59,6 @@ intel_ai = ["intel-extension-for-pytorch>=2.7.0"]
 export_tensorflow = [
   "onnx2tf>=1.28.8",
   "tf-keras>=2.20.1",
-  "tensorflow>=2.20.0",
 ]
 export_litert = [
   "ai-edge-torch>=0.7.1",
