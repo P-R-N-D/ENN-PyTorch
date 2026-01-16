@@ -58,6 +58,7 @@ nvidia_te_cu13 = ["transformer-engine-cu13>=2.2.0", "transformer-engine-torch>=2
 intel_ai = ["intel-extension-for-pytorch>=2.7.0"]
 export_tensorflow = [
   "onnx2tf>=1.28.8",
+  "tf-keras>=2.20.1",
   "tensorflow>=2.20.0",
 ]
 export_litert = [
@@ -79,6 +80,7 @@ export_tensorrt = [
 ]
 deployment_full = [
   "onnx2tf>=1.28.8",
+  "tf-keras>=2.20.1",
   "tensorflow>=2.20.0",
   "ai-edge-torch>=0.7.1",
   "executorch>=1.0.1; python_version < '3.13'",

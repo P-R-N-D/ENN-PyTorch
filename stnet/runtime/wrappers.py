@@ -569,14 +569,19 @@ class _ONNXExporter:
         if dynamic_batch:
             dyn_axes = {"features": {0: "batch"}, "preds_flat": {0: "batch"}}
             if hasattr(torch, "export") and hasattr(torch.export, "Dim"):
+                mode = os.environ.get("STNET_EXPORT_BATCH_DIM", "auto").strip().lower()
                 batch_dim = None
-                try:
-                    batch_dim = torch.export.Dim("batch")
-                except Exception:
-                    batch_dim = None
-                if batch_dim is None:
+                if mode == "explicit":
                     try:
                         batch_dim = torch.export.Dim("batch", min=1)
+                    except Exception:
+                        try:
+                            batch_dim = torch.export.Dim("batch")
+                        except Exception:
+                            batch_dim = None
+                else:
+                    try:
+                        batch_dim = getattr(torch.export.Dim, "AUTO")
                     except Exception:
                         batch_dim = None
                 if batch_dim is not None:

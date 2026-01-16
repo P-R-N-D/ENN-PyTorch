@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import argparse
 import contextlib
 import json
 import os
 import re
+import subprocess
+import sys
 import traceback
 import time
 import warnings
@@ -46,6 +49,132 @@ def _stats_np(arr: np.ndarray) -> dict[str, float | list[int]]:
         "mean": float(arr.mean()),
         "std": float(arr.std()),
     }
+
+
+def _build_model_and_sample(device: torch.device):
+    data = build_dataset("raw_data.xlsx")
+    td_train = data["td_train"]
+    S = data["S"]
+    T = data["T"]
+    patch = PatchConfig(
+        is_cube=True, grid_size_3d=(S, T, 1), patch_size_3d=(1, 1, 1), use_padding=True
+    )
+    cfg = ModelConfig(
+        device=device,
+        patch=patch,
+        normalization_method="layernorm",
+        d_model=192,
+        heads=2,
+        mlp_ratio=2.0,
+        dropout=0.05,
+        drop_path=0.05,
+        spatial_depth=2,
+        temporal_depth=2,
+        spatial_latents=24,
+        temporal_latents=24,
+        modeling_type="spatiotemporal",
+        compile_mode="disabled",
+    )
+    model = new_model(in_dim=td_train["X"].shape[1], out_shape=(S, T), config=cfg).to(device)
+    sample = td_train["X"][:4].to(device)
+    return data, td_train, model, sample
+
+
+def _run_isolated_export(fmt_name: str, out_path: str, state_path: str) -> dict[str, Any]:
+    cmd = [
+        sys.executable,
+        __file__,
+        "--export-only",
+        fmt_name,
+        "--out",
+        out_path,
+        "--state",
+        state_path,
+    ]
+    env = dict(os.environ)
+    env.setdefault("OMP_NUM_THREADS", "1")
+    env.setdefault("MKL_NUM_THREADS", "1")
+    env.setdefault("OPENBLAS_NUM_THREADS", "1")
+    env.setdefault("NUMEXPR_NUM_THREADS", "1")
+    env.setdefault("TORCH_NUM_THREADS", "1")
+    p = subprocess.run(cmd, capture_output=True, text=True, env=env)
+    if p.returncode == 0:
+        def _parse_last_json_line(text: str) -> dict[str, Any] | None:
+            if not text:
+                return None
+            lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+            for ln in reversed(lines):
+                if ln.startswith("{") and ln.endswith("}"):
+                    try:
+                        return json.loads(ln)
+                    except Exception:
+                        continue
+            return None
+
+        obj = _parse_last_json_line(p.stdout)
+        if obj is not None:
+            obj.setdefault("_stdout_tail", (p.stdout or "")[-2000:])
+            obj.setdefault("_stderr_tail", (p.stderr or "")[-2000:])
+            return obj
+        return {
+            "status": "error",
+            "error": "subprocess returned non-json output",
+            "stdout": (p.stdout or "")[-2000:],
+            "stderr": (p.stderr or "")[-2000:],
+        }
+    return {
+        "status": "error",
+        "error": f"subprocess export failed (returncode={p.returncode})",
+        "stdout_tail": (p.stdout or "")[-2000:],
+        "stderr_tail": (p.stderr or "")[-2000:],
+    }
+
+
+def _ensure_state_shapes_for_scaler(model: torch.nn.Module, sd: dict[str, object]) -> None:
+    if not isinstance(sd, dict):
+        return
+
+    def _is_scaler_key(k: str) -> bool:
+        return k.startswith("scaler.") or ".scaler." in k
+
+    for full_key, val in sd.items():
+        if not isinstance(full_key, str) or not _is_scaler_key(full_key):
+            continue
+        if not torch.is_tensor(val):
+            continue
+
+        parts = full_key.split(".")
+        mod = model
+        ok = True
+        for p in parts[:-1]:
+            if not hasattr(mod, p):
+                ok = False
+                break
+            mod = getattr(mod, p)
+            if not isinstance(mod, torch.nn.Module):
+                ok = False
+                break
+        if not ok:
+            continue
+
+        name = parts[-1]
+        tgt = val.detach()
+
+        if hasattr(mod, "_buffers") and name in getattr(mod, "_buffers", {}):
+            buf = mod._buffers.get(name)
+            if torch.is_tensor(buf) and tuple(buf.shape) != tuple(tgt.shape):
+                mod._buffers[name] = torch.empty_like(tgt)
+                setattr(mod, name, mod._buffers[name])
+            continue
+
+        if hasattr(mod, "_parameters") and name in getattr(mod, "_parameters", {}):
+            prm = mod._parameters.get(name)
+            if prm is not None and torch.is_tensor(prm) and tuple(prm.shape) != tuple(tgt.shape):
+                mod._parameters[name] = torch.nn.Parameter(
+                    torch.empty_like(tgt), requires_grad=prm.requires_grad
+                )
+                setattr(mod, name, mod._parameters[name])
+            continue
 
 _ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 _TL_LOG_RE = re.compile(r"(dedicated_log_torch_trace_[A-Za-z0-9_]+\.log)")
@@ -129,8 +258,9 @@ def _draft_export_diagnostics(model: torch.nn.Module, sample: torch.Tensor) -> d
                 bdim = None
         if bdim is not None:
             dyn_candidates = [
+                ({"x": {0: bdim}},),
+                {"x": {0: bdim}},
                 ({0: bdim},),
-                {0: bdim},
             ] + dyn_candidates
 
     try:
@@ -225,8 +355,25 @@ def export_and_validate(
         "tensorrt": out_dir / "model.engine",
     }
     results: Dict[str, Any] = {}
+    state_path = out_dir / "model.state_dict.pt"
+    try:
+        torch.save(model.state_dict(), state_path)
+    except Exception as exc:
+        state_path = None
+        results["_state_save_error"] = repr(exc)
     with _temp_env("STNET_DISABLE_PIECEWISE_CALIB", "1"):
         for name, path in targets.items():
+            if state_path is not None and name in ("onnx", "ort", "tensorrt"):
+                results[name] = _run_isolated_export(name, str(path), str(state_path))
+                if results[name].get("status") == "ok":
+                    results[name] = {"status": "ok", "paths": [str(path)]}
+                elif results[name].get("status") == "skipped":
+                    results[name] = {
+                        "status": "skipped",
+                        "reason": "missing_optional_dependency",
+                        "error": results[name].get("error", "skipped"),
+                    }
+                continue
             fmt = Exporter.for_export(path.suffix if path.suffix else str(path))
             try:
                 if fmt is None:
@@ -272,10 +419,35 @@ def export_and_validate(
                         if hasattr(model, "forward_export")
                         else model(sample, return_loss=False)
                     )
-                pt2_np = pt2_out.detach().cpu().numpy()
-                torch_np = torch_out.detach().cpu().numpy()
-                validation["pt2_mae"] = float(np.mean(np.abs(pt2_np - torch_np)))
-                validation["pt2_out_stats"] = _stats_np(pt2_np)
+                def _to_numpy_materialized(t: torch.Tensor) -> np.ndarray:
+                    t = extract_tensor(t).detach()
+                    try:
+                        from torch._subclasses.functional_tensor import disable_functional_mode
+                    except Exception:
+                        disable_functional_mode = None
+                    cm = (
+                        disable_functional_mode()
+                        if disable_functional_mode is not None
+                        else contextlib.nullcontext()
+                    )
+                    with cm:
+                        tt = t
+                        if hasattr(tt, "to_local"):
+                            with contextlib.suppress(Exception):
+                                tt = tt.to_local()
+                        tt = tt.to("cpu").contiguous()
+                        base = torch.empty(tuple(tt.shape), dtype=tt.dtype, device="cpu")
+                        base.copy_(tt)
+                        return base.numpy()
+
+                try:
+                    pt2_np = _to_numpy_materialized(pt2_out)
+                    torch_np = _to_numpy_materialized(torch_out)
+                    validation["pt2_mae"] = float(np.mean(np.abs(pt2_np - torch_np)))
+                    validation["pt2_out_stats"] = _stats_np(pt2_np)
+                except Exception as conv_exc:
+                    validation["pt2_error"] = repr(conv_exc)
+                    validation["pt2_out_repr"] = repr(pt2_out)
             except Exception as exc:
                 validation["pt2_error"] = repr(exc)
 
@@ -334,35 +506,45 @@ def export_and_validate(
     return {"exports": results, "validation": validation}
 
 
+def _export_only_main(fmt_name: str, out_path: str, state_path: str) -> int:
+    device = torch.device("cpu")
+    data, td_train, model, sample = _build_model_and_sample(device)
+    sd = torch.load(state_path, map_location="cpu")
+    with contextlib.suppress(Exception):
+        _ensure_state_shapes_for_scaler(model, sd)
+    model.load_state_dict(sd, strict=True)
+    model.eval()
+    fmt = Exporter.for_export(Path(out_path).suffix if Path(out_path).suffix else out_path)
+    if fmt is None:
+        print(json.dumps({"status": "error", "error": "no exporter registered"}))
+        return 1
+    try:
+        fmt.save(model, out_path, sample_input=sample, dynamic_batch=True)
+        print(json.dumps({"status": "ok"}))
+        return 0
+    except ImportError as exc:
+        print(json.dumps({"status": "skipped", "error": repr(exc)}))
+        return 0
+    except Exception as exc:
+        print(json.dumps({"status": "error", "error": repr(exc)}))
+        return 1
+
+
 def main() -> None:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--export-only", default=None)
+    ap.add_argument("--out", default=None)
+    ap.add_argument("--state", default=None)
+    args, _ = ap.parse_known_args()
+    if args.export_only:
+        raise SystemExit(_export_only_main(args.export_only, args.out, args.state))
+
     os.environ.setdefault("STNET_PREBATCH", "1")
     os.environ.setdefault("STNET_PREFETCH_FACTOR", "1")
-    data = build_dataset("raw_data.xlsx")
-    td_train = data["td_train"]
+    data, td_train, model, sample = _build_model_and_sample(torch.device("cpu"))
     S = data["S"]
     T = data["T"]
     print(f"[export] dataset groups={data['B']} grid={S}x{T}")
-    device = torch.device("cpu")
-    patch = PatchConfig(
-        is_cube=True, grid_size_3d=(S, T, 1), patch_size_3d=(1, 1, 1), use_padding=True
-    )
-    cfg = ModelConfig(
-        device=device,
-        patch=patch,
-        normalization_method="layernorm",
-        d_model=192,
-        heads=2,
-        mlp_ratio=2.0,
-        dropout=0.05,
-        drop_path=0.05,
-        spatial_depth=2,
-        temporal_depth=2,
-        spatial_latents=24,
-        temporal_latents=24,
-        modeling_type="spatiotemporal",
-        compile_mode="disabled",
-    )
-    model = new_model(in_dim=td_train["X"].shape[1], out_shape=(S, T), config=cfg).to(device)
     print("[export] training short run (epochs=2) for exportable weights")
     train(
         model,
@@ -374,7 +556,6 @@ def main() -> None:
         max_nodes=1,
     )
     model.eval()
-    sample = td_train["X"][:4].to(device)
     stats = export_and_validate(model, sample, td_train, Path("export_artifacts"))
     print(json.dumps(stats, indent=2))
 

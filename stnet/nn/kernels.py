@@ -250,6 +250,103 @@ def _call_mha_compat(
     return mha(q, k, v, **call_kwargs)
 
 
+def _mha_export_safe(
+    mha: torch.nn.MultiheadAttention,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    *,
+    attn_mask: Optional[torch.Tensor],
+    key_padding_mask: Optional[torch.Tensor],
+    need_weights: bool,
+    average_attn_weights: bool,
+    is_causal: Optional[bool],
+    batch_first: bool,
+    training: bool,
+) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+    if not batch_first:
+        query = query.transpose(0, 1)
+        key = key.transpose(0, 1)
+        value = value.transpose(0, 1)
+
+    B = query.shape[0]
+    Lq = query.shape[1]
+    Lk = key.shape[1]
+    E = mha.embed_dim
+    H = mha.num_heads
+    Dh = E // H
+
+    w = mha.in_proj_weight
+    b = mha.in_proj_bias
+    if (query is key) and (key is value):
+        qkv = torch.nn.functional.linear(query, w, b)
+        q, k, v = qkv.split(E, dim=-1)
+    else:
+        wq, wk, wv = w.split(E, dim=0)
+        if b is not None:
+            bq, bk, bv = b.split(E, dim=0)
+        else:
+            bq = bk = bv = None
+        q = torch.nn.functional.linear(query, wq, bq)
+        k = torch.nn.functional.linear(key, wk, bk)
+        v = torch.nn.functional.linear(value, wv, bv)
+
+    q = q.reshape(B, Lq, H, Dh).transpose(1, 2)
+    k = k.reshape(B, Lk, H, Dh).transpose(1, 2)
+    v = v.reshape(B, Lk, H, Dh).transpose(1, 2)
+
+    scores = torch.matmul(q, k.transpose(-2, -1)) * (1.0 / math.sqrt(float(Dh)))
+
+    if is_causal:
+        try:
+            causal = torch.ones((Lq, Lk), dtype=torch.bool, device=scores.device).tril()
+            scores = scores.masked_fill(causal.logical_not(), torch.finfo(scores.dtype).min)
+        except Exception:
+            pass
+
+    if key_padding_mask is not None:
+        kpm = key_padding_mask.to(dtype=torch.bool, device=scores.device)
+        scores = scores.masked_fill(kpm[:, None, None, :], torch.finfo(scores.dtype).min)
+
+    if attn_mask is not None:
+        m = attn_mask.to(device=scores.device)
+        if m.dtype == torch.bool:
+            if m.dim() == 2:
+                scores = scores.masked_fill(m[None, None, :, :], torch.finfo(scores.dtype).min)
+            elif m.dim() == 3:
+                scores = scores.masked_fill(m[:, None, :, :], torch.finfo(scores.dtype).min)
+            elif m.dim() == 4:
+                scores = scores.masked_fill(m, torch.finfo(scores.dtype).min)
+        else:
+            if m.dim() == 2:
+                scores = scores + m[None, None, :, :]
+            elif m.dim() == 3:
+                scores = scores + m[:, None, :, :]
+            else:
+                scores = scores + m
+
+    attn = torch.softmax(scores, dim=-1)
+    if training and float(mha.dropout) > 0.0:
+        attn = torch.nn.functional.dropout(attn, p=float(mha.dropout), training=True)
+
+    out = torch.matmul(attn, v)
+    out = out.transpose(1, 2).reshape(B, Lq, E)
+    out = mha.out_proj(out)
+
+    weights: Optional[torch.Tensor] = None
+    if need_weights:
+        if average_attn_weights:
+            weights = attn.mean(dim=1)
+        else:
+            weights = attn
+
+    if not batch_first:
+        out = out.transpose(0, 1)
+        if weights is not None and weights.dim() >= 3:
+            pass
+    return out, weights
+
+
 def _call_sdpa_fallback(
     fallback: Any,
     query: torch.Tensor,
@@ -623,15 +720,30 @@ class _MultiHeadAttentionCompat(nn.Module):
         kwargs = dict(key_padding_mask=key_padding_mask, need_weights=need_weights)
         if need_weights:
             kwargs["average_attn_weights"] = bool(average_attn_weights)
-        out, w = _call_mha_compat(
-            self.mha,
-            query,
-            key,
-            value,
-            attn_mask=attn_mask,
-            is_causal=is_causal,
-            kwargs=kwargs,
-        )
+        if is_tracing_or_exporting():
+            out, w = _mha_export_safe(
+                self.mha,
+                query,
+                key,
+                value,
+                attn_mask=attn_mask,
+                key_padding_mask=key_padding_mask,
+                need_weights=need_weights,
+                average_attn_weights=bool(average_attn_weights),
+                is_causal=is_causal,
+                batch_first=self.batch_first,
+                training=bool(self.training),
+            )
+        else:
+            out, w = _call_mha_compat(
+                self.mha,
+                query,
+                key,
+                value,
+                attn_mask=attn_mask,
+                is_causal=is_causal,
+                kwargs=kwargs,
+            )
         _compute_flops_mha(
             query,
             key,
