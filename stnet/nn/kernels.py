@@ -264,7 +264,13 @@ def _mha_export_safe(
     batch_first: bool,
     training: bool,
 ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
-    if not batch_first:
+    unbatched = False
+    if query.dim() == 2:
+        unbatched = True
+        query = query.unsqueeze(0)
+        key = key.unsqueeze(0)
+        value = value.unsqueeze(0)
+    elif not batch_first:
         query = query.transpose(0, 1)
         key = key.transpose(0, 1)
         value = value.transpose(0, 1)
@@ -340,10 +346,12 @@ def _mha_export_safe(
         else:
             weights = attn
 
-    if not batch_first:
+    if unbatched:
+        out = out.squeeze(0)
+        if weights is not None:
+            weights = weights.squeeze(0)
+    elif not batch_first:
         out = out.transpose(0, 1)
-        if weights is not None and weights.dim() >= 3:
-            pass
     return out, weights
 
 
