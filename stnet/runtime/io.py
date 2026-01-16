@@ -269,7 +269,7 @@ class Exporter:
         except Exception:
             pass
         try:
-            return set(sig.parameters.keys())  # type: ignore[attr-defined]
+            return set(sig.parameters.keys())
         except Exception:
             return set()
 
