@@ -917,6 +917,15 @@ class DotProductAttention(nn.Module):
                     dtype=(torch.bool if fm.dtype is torch.bool else q_bshd.dtype),
                     non_blocking=True,
                 )
+                if fm.dim() != 4:
+                    fm, _, _, _ = _flatten_attn_mask(
+                        fm,
+                        device=q_bshd.device,
+                        B=B,
+                        H=H,
+                        L=q_bshd.shape[2],
+                        S=k_bshd.shape[2],
+                    )
             sdpa_out = _attention_math_bshd(
                 q_bshd,
                 k_bshd,
