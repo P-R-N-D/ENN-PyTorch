@@ -242,23 +242,6 @@ def _decorate_compiler_disable(
     return _identity
 
 
-def is_compiling() -> bool:
-    with suppress(Exception):
-        dyn = getattr(torch, "_dynamo", None)
-        if dyn is not None and callable(getattr(dyn, "is_compiling", None)):
-            if bool(dyn.is_compiling()):
-                return True
-        if dyn is not None and callable(getattr(dyn, "is_dynamo_compiling", None)):
-            if bool(dyn.is_dynamo_compiling()):
-                return True
-    with suppress(Exception):
-        comp = getattr(torch, "compiler", None)
-        fn = getattr(comp, "is_compiling", None)
-        if callable(fn) and bool(fn()):
-            return True
-    return False
-
-
 def _dispatch_mode_stack() -> list[Any]:
     try:
         from torch.utils._python_dispatch import _get_current_dispatch_mode_stack
@@ -274,6 +257,23 @@ def _dispatch_mode_stack() -> list[Any]:
         return [mode] if mode is not None else []
     except Exception:
         return []
+
+
+def is_compiling() -> bool:
+    with suppress(Exception):
+        dyn = getattr(torch, "_dynamo", None)
+        if dyn is not None and callable(getattr(dyn, "is_compiling", None)):
+            if bool(dyn.is_compiling()):
+                return True
+        if dyn is not None and callable(getattr(dyn, "is_dynamo_compiling", None)):
+            if bool(dyn.is_dynamo_compiling()):
+                return True
+    with suppress(Exception):
+        comp = getattr(torch, "compiler", None)
+        fn = getattr(comp, "is_compiling", None)
+        if callable(fn) and bool(fn()):
+            return True
+    return False
 
 
 def is_fake_tensor_mode_active() -> bool:
