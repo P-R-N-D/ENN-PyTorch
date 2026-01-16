@@ -88,7 +88,7 @@ def _exporting_boundary() -> bool:
     return bool(is_tracing_or_exporting() or is_symbolic())
 
 
-def _coerce_block_mask_to_dense(mask: Any, *, device: torch.device) -> Optional[torch.Tensor]:
+def _coerce_block_mask_to_dense(mask: Any, *args: Any, device: torch.device) -> Optional[torch.Tensor]:
     if mask is None:
         return None
     if torch.is_tensor(mask):
@@ -1226,7 +1226,7 @@ class DotProductAttention(nn.Module):
 
 
 class FlexAttention(nn.Module):
-    def __init__(self, *, prefer_torch: bool = True) -> None:
+    def __init__(self, *args: Any, prefer_torch: bool = True) -> None:
         super().__init__()
         self.prefer_torch = bool(prefer_torch)
 
