@@ -43,7 +43,8 @@ ml_dtypes>=0.5.4
 #
 # Export / deployment (optional)
 # - deployment_full: onnx-tf>=1.10.0 (py<3.13),
-#                    onnx2tf>=1.27.2 (py<3.13), coremltools>=8.3.0 (macOS),
+#                    onnx2tf>=1.27.2 (py<3.13), tf-keras>=2.20.1,
+#                    coremltools>=8.3.0 (macOS),
 #                    tensorrt>=10.10.0.31 (Linux/CUDA), executorch>=0.6.0 (Linux, py<3.12; wheel availability varies)
 #
 # Telemetry

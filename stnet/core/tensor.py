@@ -168,21 +168,45 @@ def _to_local_if_available(t: torch.Tensor) -> torch.Tensor:
 
 
 def extract_tensor(out: object) -> torch.Tensor:
+    def _to_plain(t: torch.Tensor) -> torch.Tensor:
+        try:
+            if hasattr(t, "to_local"):
+                tl = t.to_local()  # type: ignore[attr-defined]
+                if isinstance(tl, torch.Tensor):
+                    t = tl
+        except Exception:
+            pass
+
+        try:
+            from torch._subclasses.functional_tensor import (
+                disable_functional_mode,
+                mb_unwrap_functional_tensor,
+            )
+
+            with disable_functional_mode():
+                u = mb_unwrap_functional_tensor(t)
+                if isinstance(u, torch.Tensor):
+                    t = u
+        except Exception:
+            pass
+
+        return t
+
     if isinstance(out, TensorDictBase):
         y = out.get("pred", None)
         if not isinstance(y, torch.Tensor):
             y = next((v for v in out.values() if isinstance(v, torch.Tensor)), None)
         if isinstance(y, torch.Tensor):
-            return _to_local_if_available(y)
+            return _to_plain(y)
         raise RuntimeError("TensorDict output missing tensors")
     if isinstance(out, torch.Tensor):
-        return _to_local_if_available(out)
+        return _to_plain(out)
     if isinstance(out, (tuple, list)) and len(out) > 0:
         if isinstance(out[0], torch.Tensor):
-            return _to_local_if_available(out[0])
+            return _to_plain(out[0])
         y = next((v for v in out if isinstance(v, torch.Tensor)), None)
         if isinstance(y, torch.Tensor):
-            return _to_local_if_available(y)
+            return _to_plain(y)
         raise RuntimeError("Sequence output missing tensors")
     raise RuntimeError(f"Unsupported output type: {type(out)}")
 

@@ -73,7 +73,7 @@ Key building blocks:
 Optional extras:
 ```bash
 # Broader export stack (platform/python constraints; some wheels may be unavailable on py3.13/py3.14t)
-# Includes onnx-tf/onnx2tf (py<3.13), CoreML (macOS), TensorRT (Linux/CUDA), ExecuTorch (Linux, py<3.12)
+# Includes onnx-tf/onnx2tf (py<3.13; requires tf-keras), CoreML (macOS), TensorRT (Linux/CUDA), ExecuTorch (Linux, py<3.12)
 pip install -e .[deployment_full]
 
 # Dataframe integrations
