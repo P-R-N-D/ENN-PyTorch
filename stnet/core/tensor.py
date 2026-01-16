@@ -20,7 +20,7 @@ def symint_safe_expand(
 
     src = tuple(t.shape)
     if len(target) < len(src):
-        return t.expand(target)  # type: ignore[arg-type]
+        return t.expand(target)
 
     src_aligned = (1,) * (len(target) - len(src)) + src
 
@@ -28,7 +28,7 @@ def symint_safe_expand(
     for s_dim, t_dim in zip(src_aligned, target):
         sizes.append(-1 if s_dim == t_dim else t_dim)
 
-    return t.expand(tuple(sizes))  # type: ignore[arg-type]
+    return t.expand(tuple(sizes))
 
 
 def symint_safe_expand_as(t: torch.Tensor, ref: torch.Tensor) -> torch.Tensor:
@@ -132,7 +132,7 @@ def is_meta_or_fake_tensor(value: Any) -> bool:
 
 def coerce_tensor(
     value: object,
-    *,
+    *args: Any,
     materialize_meta: bool = True,
     make_contiguous: bool = True,
 ) -> object:
@@ -171,25 +171,22 @@ def extract_tensor(out: object) -> torch.Tensor:
     def _to_plain(t: torch.Tensor) -> torch.Tensor:
         try:
             if hasattr(t, "to_local"):
-                tl = t.to_local()  # type: ignore[attr-defined]
+                tl = t.to_local()
                 if isinstance(tl, torch.Tensor):
                     t = tl
         except Exception:
             pass
-
         try:
             from torch._subclasses.functional_tensor import (
                 disable_functional_mode,
                 mb_unwrap_functional_tensor,
             )
-
             with disable_functional_mode():
                 u = mb_unwrap_functional_tensor(t)
                 if isinstance(u, torch.Tensor):
                     t = u
         except Exception:
             pass
-
         return t
 
     if isinstance(out, TensorDictBase):
@@ -220,11 +217,10 @@ def to_tensor_like(x: Any, ref: torch.Tensor) -> torch.Tensor:
 
 
 @contextlib.contextmanager
-def from_buffer(*, coerce_requires_grad: bool = True) -> Iterator[None]:
+def from_buffer(*args: Any, coerce_requires_grad: bool = True) -> Iterator[None]:
     if not hasattr(torch, "frombuffer"):
         yield
         return
-
     _original = torch.frombuffer
 
     def _patched(
@@ -248,7 +244,6 @@ def from_buffer(*, coerce_requires_grad: bool = True) -> Iterator[None]:
             readonly = bool(getattr(mv, "readonly", False))
         except Exception:
             readonly = False
-
         if readonly:
             with warnings.catch_warnings():
                 warnings.filterwarnings("ignore", message=r".*buffer is not writable.*")
