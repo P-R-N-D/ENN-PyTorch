@@ -25,10 +25,6 @@ from ..core.profiler import FLOP_PROFILER, capture
 from ..core.system import get_device, get_dpa_backends, get_runtime_config
 
 
-def _exporting_boundary() -> bool:
-    return bool(is_tracing_or_exporting() or is_symbolic())
-
-
 try:
     import triton
     import triton.language as tl
@@ -68,6 +64,7 @@ _HAS_TORCH_FLEX, _torch_flex_attention, _torch_create_block_mask, _torch_create_
     None,
     None,
 )
+
 _FLEX_KWARGS: set[str] = set()
 try:
     from torch.nn.attention.flex_attention import flex_attention as _torch_flex_attention
@@ -85,6 +82,10 @@ except Exception:
 
 if env_bool("STNET_DISABLE_FLEX_ATTENTION", False):
     _HAS_TORCH_FLEX = False
+
+
+def _exporting_boundary() -> bool:
+    return bool(is_tracing_or_exporting() or is_symbolic())
 
 
 def _coerce_block_mask_to_dense(mask: Any, *, device: torch.device) -> Optional[torch.Tensor]:
@@ -119,7 +120,7 @@ def _env_int(name: str, default: int) -> int:
 
 def _python_token_mask_from_mask_mod(
     mask_mod: Any,
-    *,
+    *args: Any,
     B: int,
     H: int,
     Lq: int,
@@ -144,7 +145,7 @@ def _python_token_mask_from_mask_mod(
 
 def _blockmask_to_token_mask(
     mask: Any,
-    *,
+    *args: Any,
     B: int,
     H: int,
     Lq: int,
@@ -153,7 +154,6 @@ def _blockmask_to_token_mask(
 ) -> Optional[torch.Tensor]:
     if mask is None:
         return None
-
     mask_mod = getattr(mask, "mask_mod", None)
     if mask_mod is not None and _torch_create_mask is not None:
         if isinstance(B, int) and isinstance(H, int) and isinstance(Lq, int) and isinstance(Lk, int):
@@ -161,7 +161,6 @@ def _blockmask_to_token_mask(
                 tok = _torch_create_mask(mask_mod, B, H, Lq, Lk, device=str(device))
                 if torch.is_tensor(tok):
                     return tok.to(device)
-
     if _exporting_boundary() and (mask_mod is not None):
         b_i = _int_or_none(B)
         h_i = _int_or_none(H)
@@ -180,7 +179,6 @@ def _blockmask_to_token_mask(
             )
             if py_mask is not None:
                 return py_mask
-
     dense = _coerce_block_mask_to_dense(mask, device=device)
     if dense is None:
         return None
@@ -188,7 +186,6 @@ def _blockmask_to_token_mask(
         return dense
     if dense.shape[-2] == Lq and dense.shape[-1] == Lk:
         return dense
-
     q_block: Optional[int] = None
     k_block: Optional[int] = None
     block_size = getattr(mask, "BLOCK_SIZE", None)
@@ -197,16 +194,13 @@ def _blockmask_to_token_mask(
     elif isinstance(block_size, int):
         q_block = int(block_size)
         k_block = int(block_size)
-
     if q_block is None or k_block is None:
         if dense.shape[-2] > 0:
             q_block = max(1, int(math.ceil(Lq / dense.shape[-2])))
         if dense.shape[-1] > 0:
             k_block = max(1, int(math.ceil(Lk / dense.shape[-1])))
-
     if q_block is None or k_block is None:
         return dense
-
     expanded = dense.repeat_interleave(q_block, dim=-2).repeat_interleave(k_block, dim=-1)
     return expanded[..., :Lq, :Lk]
 
@@ -230,10 +224,8 @@ def _flatten_attn_mask(
     trace_like = bool(is_symbolic())
     mask = mask.to(device)
     dim = mask.dim()
-
     if dim == 0:
         return mask.view(1, 1, 1, 1).expand(1, 1, 1, S), 1, 1, 1
-
     if dim == 1:
         if trace_like:
             assert_trace(
@@ -244,7 +236,6 @@ def _flatten_attn_mask(
             if mask.shape[0] != S:
                 raise RuntimeError(f"attn_mask S mismatch: {mask.shape} != {S}")
         return mask.view(1, 1, 1, mask.shape[0]), 1, 1, 1
-
     if dim == 2:
         a, b = mask.shape
         if trace_like:
@@ -267,7 +258,6 @@ def _flatten_attn_mask(
         if a == B:
             return mask.view(B, 1, 1, S), B, 1, 1
         raise RuntimeError(f"Unsupported 2D mask {mask.shape} for B={B},L={L}")
-
     if dim == 3:
         a, b, c = mask.shape
         if trace_like:
@@ -292,7 +282,6 @@ def _flatten_attn_mask(
         if a == B and b == H:
             return mask.view(B, H, 1, S), B, H, 1
         raise RuntimeError(f"Unsupported 3D mask {mask.shape}")
-
     if dim == 4:
         b0, h0, l0, s0 = mask.shape
         if trace_like:
@@ -310,7 +299,6 @@ def _flatten_attn_mask(
             if l0 not in (1, L):
                 raise RuntimeError(f"Len mismatch {l0} != {L}")
         return mask, b0, h0, l0
-
     raise RuntimeError(f"attn_mask rank {dim} not supported")
 
 
@@ -353,7 +341,6 @@ def _compute_flops_mha(
             return
     except:
         return
-
     try:
         if query.dim() < 3 or key.dim() < 3:
             return
@@ -365,7 +352,6 @@ def _compute_flops_mha(
         H, E = int(num_heads), int(embed_dim)
         if B <= 0 or Lq <= 0 or Sk <= 0 or H <= 0 or E <= 0 or E % H != 0:
             return
-
         Dh = E // H
         core = 2.0 * B * H * Lq * Dh * Sk + 2.0 * B * H * Lq * Sk * Dh
         proj = 0.0
@@ -410,7 +396,7 @@ def _mha_export_safe(
     query: torch.Tensor,
     key: torch.Tensor,
     value: torch.Tensor,
-    *,
+    *args: Any,
     attn_mask: Optional[torch.Tensor],
     key_padding_mask: Optional[torch.Tensor],
     need_weights: bool,
@@ -429,14 +415,12 @@ def _mha_export_safe(
         query = query.transpose(0, 1)
         key = key.transpose(0, 1)
         value = value.transpose(0, 1)
-
     B = query.shape[0]
     Lq = query.shape[1]
     Lk = key.shape[1]
     E = mha.embed_dim
     H = mha.num_heads
     Dh = E // H
-
     w = mha.in_proj_weight
     b = mha.in_proj_bias
     if (query is key) and (key is value):
@@ -451,24 +435,19 @@ def _mha_export_safe(
         q = torch.nn.functional.linear(query, wq, bq)
         k = torch.nn.functional.linear(key, wk, bk)
         v = torch.nn.functional.linear(value, wv, bv)
-
     q = q.reshape(B, Lq, H, Dh).transpose(1, 2)
     k = k.reshape(B, Lk, H, Dh).transpose(1, 2)
     v = v.reshape(B, Lk, H, Dh).transpose(1, 2)
-
     scores = torch.matmul(q, k.transpose(-2, -1)) * (1.0 / math.sqrt(float(Dh)))
-
     if is_causal:
         try:
             causal = torch.ones((Lq, Lk), dtype=torch.bool, device=scores.device).tril()
             scores = scores.masked_fill(causal.logical_not(), torch.finfo(scores.dtype).min)
         except Exception:
             pass
-
     if key_padding_mask is not None:
         kpm = key_padding_mask.to(dtype=torch.bool, device=scores.device)
         scores = scores.masked_fill(kpm[:, None, None, :], torch.finfo(scores.dtype).min)
-
     if attn_mask is not None:
         m = attn_mask.to(device=scores.device)
         if m.dtype == torch.bool:
@@ -485,22 +464,18 @@ def _mha_export_safe(
                 scores = scores + m[:, None, :, :]
             else:
                 scores = scores + m
-
     attn = torch.softmax(scores, dim=-1)
     if training and float(mha.dropout) > 0.0:
         attn = torch.nn.functional.dropout(attn, p=float(mha.dropout), training=True)
-
     out = torch.matmul(attn, v)
     out = out.transpose(1, 2).reshape(B, Lq, E)
     out = mha.out_proj(out)
-
     weights: Optional[torch.Tensor] = None
     if need_weights:
         if average_attn_weights:
             weights = attn.mean(dim=1)
         else:
             weights = attn
-
     if unbatched:
         out = out.squeeze(0)
         if weights is not None:
@@ -533,7 +508,7 @@ def _call_sdpa_fallback(
     if backends:
         try:
             from torch.nn.attention import sdpa_kernel
-
+            
             with sdpa_kernel(backends):
                 return fallback(query, key, value, **call_kwargs)
         except Exception:
@@ -545,7 +520,7 @@ def _attention_math_bshd(
     q_bshd: torch.Tensor,
     k_bshd: torch.Tensor,
     v_bshd: torch.Tensor,
-    *,
+    *args: Any,
     attn_mask: torch.Tensor | None,
     is_causal: bool,
     dropout_p: float,
@@ -556,20 +531,17 @@ def _attention_math_bshd(
     scores = torch.matmul(q_bshd, k_bshd.transpose(-2, -1))
     if isinstance(head_dim, int) and head_dim > 0:
         scores = scores * (1.0 / math.sqrt(float(head_dim)))
-
     if is_causal:
         try:
             causal = torch.ones((q_len, k_len), dtype=torch.bool, device=scores.device).tril()
             scores = scores.masked_fill(causal.logical_not(), torch.finfo(scores.dtype).min)
         except Exception:
             pass
-
     if attn_mask is not None:
         if attn_mask.dtype == torch.bool:
             scores = scores.masked_fill(attn_mask.logical_not(), torch.finfo(scores.dtype).min)
         else:
             scores = scores + attn_mask
-
     probs = torch.softmax(scores, dim=-1)
     if training and float(dropout_p) > 0.0:
         probs = torch.nn.functional.dropout(probs, p=float(dropout_p), training=True)
@@ -697,7 +669,6 @@ class _MultiHeadAttentionNvidia(nn.Module):
         self._te_supports_is_causal: bool = False
         self._te_supports_training: bool = False
         self._te_supports_tuple_mask: bool = True
-
         if self._te_mha is not None:
             _fwd = getattr(self._te_mha, "forward", getattr(self._te_mha, "__call__", None))
             try:
@@ -788,18 +759,14 @@ class _MultiHeadAttentionNvidia(nn.Module):
             or query.dtype not in (torch.float16, torch.bfloat16)
         ):
             return _fallback_call()
-
         with contextlib.suppress(Exception):
             if torch._dynamo.is_compiling():
                 return _fallback_call()
-
         bf = bool(self.batch_first)
         _q, _k, _v = query, key, value
         if not bf:
             _q, _k, _v = query.transpose(0, 1), key.transpose(0, 1), value.transpose(0, 1)
-
         te_kwargs, te_mask, mask_type = {}, None, None
-
         if key_padding_mask is not None:
             B0, Lq, Lk = int(_q.shape[0]), int(_q.shape[1]), int(_k.shape[1])
             if key_padding_mask.shape != (B0, Lk):
@@ -819,7 +786,6 @@ class _MultiHeadAttentionNvidia(nn.Module):
             mask_type = "padding_causal" if bool(is_causal) else "padding"
         else:
             mask_type = "causal" if bool(is_causal) else "no_mask"
-
         if (
             te_mask is not None
             and mask_type
@@ -831,14 +797,12 @@ class _MultiHeadAttentionNvidia(nn.Module):
             if self._te_mask_param is None:
                 return _fallback_call()
             te_kwargs[self._te_mask_param] = te_mask
-
         if mask_type and self._te_mask_type_param:
             te_kwargs[self._te_mask_type_param] = mask_type
         elif self._te_supports_is_causal and (is_causal is not None):
             te_kwargs["is_causal"] = bool(is_causal)
         if self._te_supports_training:
             te_kwargs["training"] = bool(self.training)
-
         try:
             out = self._te_mha(_q, _k, _v, **te_kwargs)
         except Exception as e:
@@ -846,7 +810,6 @@ class _MultiHeadAttentionNvidia(nn.Module):
                 self._te_supports_tuple_mask = False
             self._force_pt = True
             return _fallback_call()
-
         y, w = (out[0] if isinstance(out, tuple) and len(out) >= 1 else out), None
         if not bf and isinstance(y, torch.Tensor) and y.dim() >= 2:
             y = y.transpose(0, 1)
@@ -952,7 +915,6 @@ class DotProductAttention(nn.Module):
         )
         self._force_pt: bool = False
         self._te_attn, self._te_mask_param, self._te_mask_type_param = None, None, None
-
         if self._te_ok:
             self._te = te
             try:
@@ -964,7 +926,6 @@ class DotProductAttention(nn.Module):
                 )
             except Exception:
                 self._te_attn, self._force_pt = None, True
-
             if self._te_attn is not None:
                 _forward = getattr(
                     self._te_attn, "forward", getattr(self._te_attn, "__call__", None)
@@ -1003,7 +964,6 @@ class DotProductAttention(nn.Module):
         training = bool(training) if training is not None else self.training
         if q.dim() != 4 or k.dim() != 4 or v.dim() != 4:
             raise ValueError(f"DPA expects 4D inputs, got {q.shape}, {k.shape}, {v.shape}")
-
         tracing = bool(
             is_symbolic()
             or is_meta_or_fake_tensor(q)
@@ -1049,7 +1009,6 @@ class DotProductAttention(nn.Module):
                 raise ValueError("K/V length mismatch")
             if q.size(3) != k.size(3) or k.size(3) != v.size(3):
                 raise ValueError("Embed dim mismatch")
-
         q_bshd, k_bshd, v_bshd = [self._negotiate_dtype(t).contiguous() for t in (q, k, v)]
         if not tracing and _is_bshd_contiguous(q_bshd) and _is_bshd_contiguous(k_bshd):
             with contextlib.suppress(Exception):
@@ -1059,19 +1018,16 @@ class DotProductAttention(nn.Module):
                     dropout_p=float(dropout_p),
                     training=training,
                 )
-
         dropout_val = float(dropout_p) if training else 0.0
         B, H, L, D = q_bshd.shape
         S = k_bshd.shape[2]
         mask_bool, bias_float = None, None
-
         if attn_mask is not None:
             m = attn_mask
             if m.dtype == torch.bool:
                 mask_bool = m
             else:
                 bias_float = m
-
         mb = mh = mL = 0
         if mask_bool is not None:
             mask_bool = mask_bool.to(device=q_bshd.device, dtype=torch.bool, non_blocking=True)
@@ -1083,19 +1039,16 @@ class DotProductAttention(nn.Module):
                     with contextlib.suppress(Exception):
                         if int(mask_bool.stride(-2)) == 0:
                             mask_bool, mL = mask_bool[..., :1, :], 1
-
         if bias_float is not None:
             bias_float = bias_float.to(device=q_bshd.device, dtype=q_bshd.dtype, non_blocking=True)
             if not _exporting_boundary():
                 bias_float, _, _, _ = _flatten_attn_mask(
                     bias_float, device=q_bshd.device, B=B, H=H, L=L, S=S
                 )
-
         try:
             is_compiling = torch.compiler.is_compiling()
         except:
             is_compiling = False
-
         use_te = (
             self._te_ok
             and self.te_first
@@ -1107,7 +1060,6 @@ class DotProductAttention(nn.Module):
             and q_bshd.dtype in (torch.float16, torch.bfloat16)
         )
         te_mask, te_mask_type = None, None
-
         if use_te:
             if bias_float is not None:
                 use_te = False
@@ -1135,7 +1087,6 @@ class DotProductAttention(nn.Module):
             if use_te and (te_mask is None) and bool(is_causal):
                 if not (self._te_supports_mask_type or self._te_supports_is_causal):
                     use_te = False
-
         if use_te:
             q_te = q_bshd.transpose(1, 2).contiguous()
             k_te = k_bshd.transpose(1, 2).contiguous()
@@ -1170,7 +1121,6 @@ class DotProductAttention(nn.Module):
                 except:
                     pass
                 return out_te
-
         final_mask: torch.Tensor | None = None
         sdpa_is_causal = bool(is_causal)
         if bias_float is None:
@@ -1196,7 +1146,6 @@ class DotProductAttention(nn.Module):
         exporting = _exporting_boundary()
         disable_sdpa = env_bool(("STNET_DISABLE_SDPA",), default=False)
         force_sdpa = env_bool(("STNET_FORCE_SDPA",), default=False)
-
         if (exporting and not force_sdpa) or disable_sdpa or (not q_bshd.is_cuda):
             fm = final_mask
             if fm is not None:
@@ -1242,7 +1191,6 @@ class DotProductAttention(nn.Module):
                 if not tracing and (bd not in (1, B) or hd not in (1, H)):
                     raise RuntimeError("Attn mask mismatch")
                 sdpa_kwargs["is_causal"] = False
-
             sdpa_out = None
             backends = get_dpa_backends() or []
             try:
@@ -1255,12 +1203,10 @@ class DotProductAttention(nn.Module):
                         )
             except Exception:
                 pass
-
             if sdpa_out is None:
                 sdpa_out = torch.nn.functional.scaled_dot_product_attention(
                     q_bshd, k_bshd, v_bshd, **sdpa_kwargs
                 )
-
         try:
             flops = 4.0 * B * H * q_bshd.shape[2] * k_bshd.shape[2] * D
             if FLOP_PROFILER is not None and not tracing:
@@ -1293,7 +1239,7 @@ class FlexAttention(nn.Module):
         q: torch.Tensor,
         k: torch.Tensor,
         v: torch.Tensor,
-        *,
+        *args: Any,
         block_mask: Any = None,
         scale: float | None = None,
         dropout_p: float = 0.0,
@@ -1303,22 +1249,17 @@ class FlexAttention(nn.Module):
     ) -> torch.Tensor:
         if score_mod is not None:
             raise RuntimeError("FlexAttention reference path does not support score_mod")
-
         if q.dim() != 4 or k.dim() != 4 or v.dim() != 4:
             raise ValueError(f"FlexAttention expects (B,H,L,D), got {tuple(q.shape)}")
-
         q_bshd, k_bshd, v_bshd = q, k, v
         _, _, Lq, Dh = q_bshd.shape
         Lk = k_bshd.shape[2]
         sc = float(scale) if scale is not None else (1.0 / math.sqrt(float(Dh)))
-
         scores = torch.matmul(q_bshd, k_bshd.transpose(-2, -1)) * sc
-
         if is_causal:
             with contextlib.suppress(Exception):
                 causal = torch.ones((Lq, Lk), dtype=torch.bool, device=scores.device).tril()
                 scores = scores.masked_fill(causal.logical_not(), torch.finfo(scores.dtype).min)
-
         dense = _blockmask_to_token_mask(
             block_mask,
             B=q_bshd.shape[0],
@@ -1336,7 +1277,6 @@ class FlexAttention(nn.Module):
                 scores = _apply_allowed_mask(scores, dense)
             else:
                 scores = scores + dense
-
         attn = torch.softmax(scores, dim=-1)
         if training and float(dropout_p) > 0.0:
             attn = torch.nn.functional.dropout(attn, p=float(dropout_p), training=True)
@@ -1361,7 +1301,6 @@ class FlexAttention(nn.Module):
     ) -> Any:
         del args, kwargs
         training = bool(training) if training is not None else self.training
-
         if _exporting_boundary():
             return self._reference(
                 q,
@@ -1374,7 +1313,6 @@ class FlexAttention(nn.Module):
                 is_causal=bool(is_causal),
                 score_mod=score_mod,
             )
-
         if self.prefer_torch and self.has_torch_backend and (not env_bool("STNET_DISABLE_FLEX_ATTENTION", False)):
             if (not q.is_cuda) or _torch_flex_attention is None:
                 return self._reference(
@@ -1388,7 +1326,6 @@ class FlexAttention(nn.Module):
                     is_causal=bool(is_causal),
                     score_mod=score_mod,
                 )
-
             flex_kwargs: dict[str, Any] = {}
             if "score_mod" in _FLEX_KWARGS and score_mod is not None:
                 flex_kwargs["score_mod"] = score_mod
@@ -1407,9 +1344,7 @@ class FlexAttention(nn.Module):
                     flex_kwargs["dropout"] = float(dropout_p)
             if "kernel_options" in _FLEX_KWARGS and kernel_options is not None:
                 flex_kwargs["kernel_options"] = kernel_options
-
             return _torch_flex_attention(q, k, v, **flex_kwargs)
-
         return self._reference(
             q,
             k,
@@ -1459,7 +1394,6 @@ class MultiScaleRetention(nn.Module):
             beta = float(self._decay_init) + float(self._decay_range) * (
                 torch.arange(H, device=device, dtype=calc_dtype) / float(max(H, 1))
             )
-
         gammas = (1.0 - torch.pow(2.0, -beta.to(device=device, dtype=calc_dtype))).clamp(
             min=torch.finfo(calc_dtype).tiny, max=1.0 - 1e-9
         )
@@ -1789,7 +1723,6 @@ class MultiHeadAttention(nn.Module):
         self.impl = _MultiHeadAttentionCompat(
             embed_dim, num_heads, bias=bias, dropout=dropout, batch_first=batch_first, **kwargs
         )
-
         if _is_nvidia_mha_preferred():
             try:
                 impl = _MultiHeadAttentionNvidia(
@@ -1804,7 +1737,6 @@ class MultiHeadAttention(nn.Module):
                     self.impl, self._backend = impl, "te"
             except Exception:
                 pass
-
         if isinstance(self.impl, _MultiHeadAttentionNvidia):
             self.impl._fallback = _MultiHeadAttentionCompat(
                 embed_dim,
