@@ -2143,23 +2143,33 @@ class Model(nn.Module):
                 raise ValueError(
                     f"Expected features shaped (B, {self.in_dim}), got {tuple(features_t.shape)}"
                 )
-            b = int(features_t.shape[0])
-            do_auto_mb = False
-            with self._runtime_lock:
-                if self._auto_microbatch_pending:
-                    self._auto_microbatch_pending = False
-                    do_auto_mb = True
-            if do_auto_mb:
-                try:
-                    mb_enc = self._auto_microbatch(features_t, device)
-                    with self._runtime_lock:
-                        self.microbatch = max(1, int(mb_enc))
-                except Exception:
-                    with self._runtime_lock:
-                        self.microbatch = max(1, int(getattr(self, "microbatch", 64) or 64))
-            with self._runtime_lock:
-                mb_cfg = int(self.microbatch) if self.microbatch else int(b)
-            mb = max(1, min(int(b), mb_cfg))
+            exporting = False
+            try:
+                exporting = bool(is_export_or_trace())
+            except Exception:
+                exporting = False
+
+            b = features_t.shape[0] if exporting else int(features_t.shape[0])
+
+            if exporting:
+                mb = None
+            else:
+                do_auto_mb = False
+                with self._runtime_lock:
+                    if self._auto_microbatch_pending:
+                        self._auto_microbatch_pending = False
+                        do_auto_mb = True
+                if do_auto_mb:
+                    try:
+                        mb_enc = self._auto_microbatch(features_t, device)
+                        with self._runtime_lock:
+                            self.microbatch = max(1, int(mb_enc))
+                    except Exception:
+                        with self._runtime_lock:
+                            self.microbatch = max(1, int(getattr(self, "microbatch", 64) or 64))
+                with self._runtime_lock:
+                    mb_cfg = int(self.microbatch) if self.microbatch else int(b)
+                mb = max(1, min(int(b), mb_cfg))
 
             def _encode(inp: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
                 with (
@@ -2171,26 +2181,32 @@ class Model(nn.Module):
 
             enc_ctx = inference_mode(self.fuser) if infer_mode else contextlib.nullcontext()
             with enc_ctx:
-                tokens, context = cast(
-                    Tuple[torch.Tensor, torch.Tensor],
-                    _prealloc_microbatch(
-                        features_t,
-                        mb,
-                        _encode,
-                        pad_to=int(mb) if self._pad_compiled_microbatch else None,
-                        out_dtype=base_dtype,
-                        cast_slice=lambda t: self._cast_graph_safe(t, device, base_dtype),
-                        stage="encoder",
-                    ),
-                )
+                if exporting:
+                    tokens, context = cast(Tuple[torch.Tensor, torch.Tensor], _encode(features_t))
+                else:
+                    tokens, context = cast(
+                        Tuple[torch.Tensor, torch.Tensor],
+                        _prealloc_microbatch(
+                            features_t,
+                            mb,
+                            _encode,
+                            pad_to=int(mb) if self._pad_compiled_microbatch else None,
+                            out_dtype=base_dtype,
+                            cast_slice=lambda t: self._cast_graph_safe(t, device, base_dtype),
+                            stage="encoder",
+                        ),
+                    )
             tokens = _coerce_tensor(tokens, enabled=sanitize_enabled, inplace=sanitize_inplace)
             context = _coerce_tensor(context, enabled=sanitize_enabled, inplace=sanitize_inplace)
-            if int(tokens.shape[0]) != int(b):
+            if exporting:
+                assembled = context.reshape(context.shape[0], -1)
+            else:
+                assembled = context.reshape(b, -1)
+            if (not exporting) and int(tokens.shape[0]) != int(b):
                 raise RuntimeError(
                     "Internal error: token batch mismatch after microbatch concat. "
                     f"got={int(tokens.shape[0])}, expected={int(b)}"
                 )
-            assembled = context.reshape(b, -1)
             if self.is_norm_linear and self.linear_branch is not None:
                 bl = self.linear_branch(self._cast_graph_safe(features_t, device, assembled.dtype))
                 assembled = assembled + bl

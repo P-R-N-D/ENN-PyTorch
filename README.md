@@ -9,6 +9,7 @@ This repository also includes a worked example notebook (`notebook.ipynb`) and a
 ### Mandatory
 - **python**: >= 3.12
 - **torch**: >= 2.9.1
+- **torchvision**: >= 0.24.1
 - **torchao**: >= 0.15.0
 - **torchdata**: >= 0.11.0 (`torchdata.nodes`-based pipeline)
 - **tensordict**: >= 0.10.0
