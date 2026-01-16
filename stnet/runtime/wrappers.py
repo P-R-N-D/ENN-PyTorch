@@ -189,7 +189,7 @@ def _get_tensor_shape(model: object, sample_input: object) -> object:
     return (int(in_dim), tuple(int(x) for x in out_shape))
 
 
-def _pad_sample(model: object, sample_input: object, *, batch: int = 1) -> object:
+def _pad_sample(model: object, sample_input: object, *args: Any, batch: int = 1) -> object:
     if sample_input is not None:
         return sample_input
     in_dim, _ = _get_tensor_shape(model, sample_input)
@@ -1593,7 +1593,7 @@ class GraphSequential(nn.Module):
         return OwnedModule(module=module, name=name)
 
     @staticmethod
-    def path(path: str, *, name: str | None = None) -> ModulePath:
+    def path(path: str, *args: Any, name: str | None = None) -> ModulePath:
         return ModulePath(path=str(path), name=name)
 
     @staticmethod
