@@ -5,6 +5,7 @@ import inspect
 import warnings
 import contextlib
 import math
+import os
 from typing import Any, Optional, Tuple, Mapping
 
 import torch
@@ -61,11 +62,17 @@ if torch.cuda.is_available() and getattr(get_device(), "type", "cpu") == "cuda":
     except Exception:
         pass
 
-_HAS_TORCH_FLEX, _torch_flex_attention, _torch_create_block_mask = False, None, None
+_HAS_TORCH_FLEX, _torch_flex_attention, _torch_create_block_mask, _torch_create_mask = (
+    False,
+    None,
+    None,
+    None,
+)
 _FLEX_KWARGS: set[str] = set()
 try:
     from torch.nn.attention.flex_attention import flex_attention as _torch_flex_attention
     from torch.nn.attention.flex_attention import create_block_mask as _torch_create_block_mask
+    from torch.nn.attention.flex_attention import create_mask as _torch_create_mask
 
     _HAS_TORCH_FLEX = True
     with contextlib.suppress(Exception):
@@ -74,6 +81,7 @@ except Exception:
     _HAS_TORCH_FLEX = False
     _torch_flex_attention = None
     _torch_create_block_mask = None
+    _torch_create_mask = None
 
 if env_bool("STNET_DISABLE_FLEX_ATTENTION", False):
     _HAS_TORCH_FLEX = False
@@ -92,13 +100,88 @@ def _coerce_block_mask_to_dense(mask: Any, *, device: torch.device) -> Optional[
     return None
 
 
-def _expand_block_mask_to_token_mask(
-    mask: Any,
-    dense: Optional[torch.Tensor],
+def _int_or_none(x: Any) -> Optional[int]:
+    try:
+        return int(x)
+    except Exception:
+        return None
+
+
+def _env_int(name: str, default: int) -> int:
+    v = os.environ.get(name)
+    if v is None:
+        return int(default)
+    try:
+        return int(v)
+    except Exception:
+        return int(default)
+
+
+def _python_token_mask_from_mask_mod(
+    mask_mod: Any,
     *,
+    B: int,
+    H: int,
     Lq: int,
     Lk: int,
+    device: torch.device,
+    max_elems: int,
 ) -> Optional[torch.Tensor]:
+    total = B * H * Lq * Lk
+    if total <= 0 or total > max_elems:
+        return None
+    try:
+        out = torch.empty((B, H, Lq, Lk), dtype=torch.bool, device=device)
+        for b in range(B):
+            for h in range(H):
+                for qi in range(Lq):
+                    for ki in range(Lk):
+                        out[b, h, qi, ki] = bool(mask_mod(b, h, qi, ki))
+        return out
+    except Exception:
+        return None
+
+
+def _blockmask_to_token_mask(
+    mask: Any,
+    *,
+    B: int,
+    H: int,
+    Lq: int,
+    Lk: int,
+    device: torch.device,
+) -> Optional[torch.Tensor]:
+    if mask is None:
+        return None
+
+    mask_mod = getattr(mask, "mask_mod", None)
+    if mask_mod is not None and _torch_create_mask is not None:
+        if isinstance(B, int) and isinstance(H, int) and isinstance(Lq, int) and isinstance(Lk, int):
+            with contextlib.suppress(Exception):
+                tok = _torch_create_mask(mask_mod, B, H, Lq, Lk, device=str(device))
+                if torch.is_tensor(tok):
+                    return tok.to(device)
+
+    if _exporting_boundary() and (mask_mod is not None):
+        b_i = _int_or_none(B)
+        h_i = _int_or_none(H)
+        lq_i = _int_or_none(Lq)
+        lk_i = _int_or_none(Lk)
+        if (b_i is not None) and (h_i is not None) and (lq_i is not None) and (lk_i is not None):
+            max_elems = _env_int("STNET_FLEX_PY_MASK_MAX_ELEMS", 2_000_000)
+            py_mask = _python_token_mask_from_mask_mod(
+                mask_mod,
+                B=b_i,
+                H=h_i,
+                Lq=lq_i,
+                Lk=lk_i,
+                device=device,
+                max_elems=max_elems,
+            )
+            if py_mask is not None:
+                return py_mask
+
+    dense = _coerce_block_mask_to_dense(mask, device=device)
     if dense is None:
         return None
     if dense.dim() < 2:
@@ -1236,8 +1319,14 @@ class FlexAttention(nn.Module):
                 causal = torch.ones((Lq, Lk), dtype=torch.bool, device=scores.device).tril()
                 scores = scores.masked_fill(causal.logical_not(), torch.finfo(scores.dtype).min)
 
-        dense = _coerce_block_mask_to_dense(block_mask, device=scores.device)
-        dense = _expand_block_mask_to_token_mask(block_mask, dense, Lq=Lq, Lk=Lk)
+        dense = _blockmask_to_token_mask(
+            block_mask,
+            B=q_bshd.shape[0],
+            H=q_bshd.shape[1],
+            Lq=Lq,
+            Lk=Lk,
+            device=scores.device,
+        )
         if dense is not None:
             if dense.dim() == 2:
                 dense = dense[None, None, :, :]
