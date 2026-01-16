@@ -23,31 +23,26 @@ from ..core.graph import (
     is_meta_or_fake_tensor,
     is_export_or_trace,
 )
-from .kernels import DotProductAttention, MultiHeadAttention, MultiScaleRetention
+from .kernels import DotProductAttention, MultiHeadAttention, MultiScaleRetention, FlexAttention
 
 _Norm = nn.LayerNorm
 
 try:
-    from torch.nn.attention.flex_attention import create_block_mask, flex_attention
+    from torch.nn.attention.flex_attention import create_block_mask
 
     _HAS_FLEX_ATTENTION = True
 except Exception:
     create_block_mask = None
-    flex_attention = None
     _HAS_FLEX_ATTENTION = False
 
 
 if env_bool("STNET_DISABLE_FLEX_ATTENTION", False):
     _HAS_FLEX_ATTENTION = False
 
+_FLEX_KERNEL = FlexAttention(prefer_torch=True)
+_HAS_FLEX_ATTENTION = bool(_HAS_FLEX_ATTENTION and _FLEX_KERNEL.has_torch_backend)
+
 _GATE_STATS_CKPT_FWD = env_bool("STNET_GATE_STATS_CKPT_FWD", False)
-
-_FLEX_ATTENTION_KWARGS: set[str] = set()
-if _HAS_FLEX_ATTENTION and flex_attention is not None:
-    with contextlib.suppress(Exception):
-        import inspect
-
-        _FLEX_ATTENTION_KWARGS = set(inspect.signature(flex_attention).parameters.keys())
 
 _FLEX_BLOCK_MASK_CACHE_MAX = 16
 _FLEX_BLOCK_MASK_CACHE_EST_MAX_BYTES = env_int(
@@ -141,8 +136,8 @@ def _stream_flex_attention(
     kpm_k: Optional[torch.Tensor],
     q_pad: Optional[torch.Tensor],
 ) -> torch.Tensor:
-    if flex_attention is None:
-        raise RuntimeError("flex_attention was not imported")
+    if not _HAS_FLEX_ATTENTION:
+        raise RuntimeError("FlexAttention backend is not available")
     B, H, L_q, _ = qh.shape
     L_k = int(kh.shape[2])
     embed_dim = int(self.embed_dim)
@@ -161,31 +156,15 @@ def _stream_flex_attention(
             block_mask_g = create_block_mask(
                 mask_mod, B_g, H, L_q, L_k, device=qh.device, BLOCK_SIZE=block_size
             )
-        if _FLEX_ATTENTION_KWARGS:
-            flex_kwargs: dict[str, Any] = {"block_mask": block_mask_g}
-            if "scale" in _FLEX_ATTENTION_KWARGS:
-                flex_kwargs["scale"] = scale
-            if dropout_p > 0.0:
-                for name in ("dropout_p", "dropout"):
-                    if name in _FLEX_ATTENTION_KWARGS:
-                        flex_kwargs[name] = dropout_p
-                        break
-            y_g = flex_attention(qh_g, kh_g, vh_g, **flex_kwargs)
-        else:
-            try:
-                y_g = flex_attention(
-                    qh_g,
-                    kh_g,
-                    vh_g,
-                    block_mask=block_mask_g,
-                    scale=scale,
-                    dropout_p=dropout_p,
-                )
-            except TypeError:
-                try:
-                    y_g = flex_attention(qh_g, kh_g, vh_g, block_mask=block_mask_g, scale=scale)
-                except TypeError:
-                    y_g = flex_attention(qh_g, kh_g, vh_g, block_mask=block_mask_g)
+        y_g = _FLEX_KERNEL(
+            qh_g,
+            kh_g,
+            vh_g,
+            block_mask=block_mask_g,
+            scale=scale,
+            dropout_p=dropout_p,
+            training=bool(self.training),
+        )
 
         out_g = self.out_proj(y_g.transpose(1, 2).contiguous().view(B_g, L_q, embed_dim))
         if q_pad is not None:

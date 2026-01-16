@@ -5,6 +5,7 @@ import inspect
 import warnings
 import contextlib
 import math
+import os
 from typing import Any, Optional, Tuple, Mapping
 
 import torch
@@ -60,6 +61,160 @@ if torch.cuda.is_available() and getattr(get_device(), "type", "cpu") == "cuda":
         _HAS_TE = True
     except Exception:
         pass
+
+_HAS_TORCH_FLEX, _torch_flex_attention, _torch_create_block_mask, _torch_create_mask = (
+    False,
+    None,
+    None,
+    None,
+)
+_FLEX_KWARGS: set[str] = set()
+try:
+    from torch.nn.attention.flex_attention import flex_attention as _torch_flex_attention
+    from torch.nn.attention.flex_attention import create_block_mask as _torch_create_block_mask
+    from torch.nn.attention.flex_attention import create_mask as _torch_create_mask
+
+    _HAS_TORCH_FLEX = True
+    with contextlib.suppress(Exception):
+        _FLEX_KWARGS = set(inspect.signature(_torch_flex_attention).parameters.keys())
+except Exception:
+    _HAS_TORCH_FLEX = False
+    _torch_flex_attention = None
+    _torch_create_block_mask = None
+    _torch_create_mask = None
+
+if env_bool("STNET_DISABLE_FLEX_ATTENTION", False):
+    _HAS_TORCH_FLEX = False
+
+
+def _coerce_block_mask_to_dense(mask: Any, *, device: torch.device) -> Optional[torch.Tensor]:
+    if mask is None:
+        return None
+    if torch.is_tensor(mask):
+        return mask.to(device)
+    if hasattr(mask, "to_dense"):
+        with contextlib.suppress(Exception):
+            dense = mask.to_dense()
+            if torch.is_tensor(dense):
+                return dense.to(device)
+    return None
+
+
+def _int_or_none(x: Any) -> Optional[int]:
+    try:
+        return int(x)
+    except Exception:
+        return None
+
+
+def _env_int(name: str, default: int) -> int:
+    v = os.environ.get(name)
+    if v is None:
+        return int(default)
+    try:
+        return int(v)
+    except Exception:
+        return int(default)
+
+
+def _python_token_mask_from_mask_mod(
+    mask_mod: Any,
+    *,
+    B: int,
+    H: int,
+    Lq: int,
+    Lk: int,
+    device: torch.device,
+    max_elems: int,
+) -> Optional[torch.Tensor]:
+    total = B * H * Lq * Lk
+    if total <= 0 or total > max_elems:
+        return None
+    try:
+        out = torch.empty((B, H, Lq, Lk), dtype=torch.bool, device=device)
+        for b in range(B):
+            for h in range(H):
+                for qi in range(Lq):
+                    for ki in range(Lk):
+                        out[b, h, qi, ki] = bool(mask_mod(b, h, qi, ki))
+        return out
+    except Exception:
+        return None
+
+
+def _blockmask_to_token_mask(
+    mask: Any,
+    *,
+    B: int,
+    H: int,
+    Lq: int,
+    Lk: int,
+    device: torch.device,
+) -> Optional[torch.Tensor]:
+    if mask is None:
+        return None
+
+    mask_mod = getattr(mask, "mask_mod", None)
+    if mask_mod is not None and _torch_create_mask is not None:
+        if isinstance(B, int) and isinstance(H, int) and isinstance(Lq, int) and isinstance(Lk, int):
+            with contextlib.suppress(Exception):
+                tok = _torch_create_mask(mask_mod, B, H, Lq, Lk, device=str(device))
+                if torch.is_tensor(tok):
+                    return tok.to(device)
+
+    if _exporting_boundary() and (mask_mod is not None):
+        b_i = _int_or_none(B)
+        h_i = _int_or_none(H)
+        lq_i = _int_or_none(Lq)
+        lk_i = _int_or_none(Lk)
+        if (b_i is not None) and (h_i is not None) and (lq_i is not None) and (lk_i is not None):
+            max_elems = _env_int("STNET_FLEX_PY_MASK_MAX_ELEMS", 2_000_000)
+            py_mask = _python_token_mask_from_mask_mod(
+                mask_mod,
+                B=b_i,
+                H=h_i,
+                Lq=lq_i,
+                Lk=lk_i,
+                device=device,
+                max_elems=max_elems,
+            )
+            if py_mask is not None:
+                return py_mask
+
+    dense = _coerce_block_mask_to_dense(mask, device=device)
+    if dense is None:
+        return None
+    if dense.dim() < 2:
+        return dense
+    if dense.shape[-2] == Lq and dense.shape[-1] == Lk:
+        return dense
+
+    q_block: Optional[int] = None
+    k_block: Optional[int] = None
+    block_size = getattr(mask, "BLOCK_SIZE", None)
+    if isinstance(block_size, tuple) and len(block_size) == 2:
+        q_block, k_block = int(block_size[0]), int(block_size[1])
+    elif isinstance(block_size, int):
+        q_block = int(block_size)
+        k_block = int(block_size)
+
+    if q_block is None or k_block is None:
+        if dense.shape[-2] > 0:
+            q_block = max(1, int(math.ceil(Lq / dense.shape[-2])))
+        if dense.shape[-1] > 0:
+            k_block = max(1, int(math.ceil(Lk / dense.shape[-1])))
+
+    if q_block is None or k_block is None:
+        return dense
+
+    expanded = dense.repeat_interleave(q_block, dim=-2).repeat_interleave(k_block, dim=-1)
+    return expanded[..., :Lq, :Lk]
+
+
+def _apply_allowed_mask(scores: torch.Tensor, allowed: torch.Tensor) -> torch.Tensor:
+    if allowed.dtype != torch.bool:
+        allowed = allowed != 0
+    return scores.masked_fill(allowed.logical_not(), torch.finfo(scores.dtype).min)
 
 
 def _flatten_attn_mask(
@@ -598,6 +753,19 @@ class _MultiHeadAttentionNvidia(nn.Module):
         is_causal: Optional[bool] = None,
         average_attn_weights: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        if _exporting_boundary():
+            return _call_sdpa_fallback(
+                self._fallback,
+                query,
+                key,
+                value,
+                attn_mask=attn_mask,
+                key_padding_mask=key_padding_mask,
+                need_weights=need_weights,
+                average_attn_weights=average_attn_weights,
+                is_causal=is_causal,
+            )
+
         def _fallback_call():
             return _call_sdpa_fallback(
                 self._fallback,
@@ -728,7 +896,7 @@ class _MultiHeadAttentionCompat(nn.Module):
         kwargs = dict(key_padding_mask=key_padding_mask, need_weights=need_weights)
         if need_weights:
             kwargs["average_attn_weights"] = bool(average_attn_weights)
-        if is_tracing_or_exporting():
+        if _exporting_boundary():
             out, w = _mha_export_safe(
                 self.mha,
                 query,
@@ -1111,6 +1279,150 @@ class DotProductAttention(nn.Module):
         return tensor
 
 
+class FlexAttention(nn.Module):
+    def __init__(self, *, prefer_torch: bool = True) -> None:
+        super().__init__()
+        self.prefer_torch = bool(prefer_torch)
+
+    @property
+    def has_torch_backend(self) -> bool:
+        return bool(_HAS_TORCH_FLEX and _torch_flex_attention is not None)
+
+    def _reference(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        *,
+        block_mask: Any = None,
+        scale: float | None = None,
+        dropout_p: float = 0.0,
+        training: bool = False,
+        is_causal: bool = False,
+        score_mod: Any = None,
+    ) -> torch.Tensor:
+        if score_mod is not None:
+            raise RuntimeError("FlexAttention reference path does not support score_mod")
+
+        if q.dim() != 4 or k.dim() != 4 or v.dim() != 4:
+            raise ValueError(f"FlexAttention expects (B,H,L,D), got {tuple(q.shape)}")
+
+        q_bshd, k_bshd, v_bshd = q, k, v
+        _, _, Lq, Dh = q_bshd.shape
+        Lk = k_bshd.shape[2]
+        sc = float(scale) if scale is not None else (1.0 / math.sqrt(float(Dh)))
+
+        scores = torch.matmul(q_bshd, k_bshd.transpose(-2, -1)) * sc
+
+        if is_causal:
+            with contextlib.suppress(Exception):
+                causal = torch.ones((Lq, Lk), dtype=torch.bool, device=scores.device).tril()
+                scores = scores.masked_fill(causal.logical_not(), torch.finfo(scores.dtype).min)
+
+        dense = _blockmask_to_token_mask(
+            block_mask,
+            B=q_bshd.shape[0],
+            H=q_bshd.shape[1],
+            Lq=Lq,
+            Lk=Lk,
+            device=scores.device,
+        )
+        if dense is not None:
+            if dense.dim() == 2:
+                dense = dense[None, None, :, :]
+            elif dense.dim() == 3:
+                dense = dense[:, None, :, :]
+            if dense.dtype == torch.bool or not torch.is_floating_point(dense):
+                scores = _apply_allowed_mask(scores, dense)
+            else:
+                scores = scores + dense
+
+        attn = torch.softmax(scores, dim=-1)
+        if training and float(dropout_p) > 0.0:
+            attn = torch.nn.functional.dropout(attn, p=float(dropout_p), training=True)
+        return torch.matmul(attn, v_bshd)
+
+    def forward(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        *args: Any,
+        score_mod: Any = None,
+        block_mask: Any = None,
+        scale: float | None = None,
+        enable_gqa: bool = False,
+        return_lse: bool = False,
+        kernel_options: Any = None,
+        dropout_p: float = 0.0,
+        is_causal: bool = False,
+        training: Optional[bool] = None,
+        **kwargs: Any,
+    ) -> Any:
+        del args, kwargs
+        training = bool(training) if training is not None else self.training
+
+        if _exporting_boundary():
+            return self._reference(
+                q,
+                k,
+                v,
+                block_mask=block_mask,
+                scale=scale,
+                dropout_p=float(dropout_p),
+                training=training,
+                is_causal=bool(is_causal),
+                score_mod=score_mod,
+            )
+
+        if self.prefer_torch and self.has_torch_backend and (not env_bool("STNET_DISABLE_FLEX_ATTENTION", False)):
+            if (not q.is_cuda) or _torch_flex_attention is None:
+                return self._reference(
+                    q,
+                    k,
+                    v,
+                    block_mask=block_mask,
+                    scale=scale,
+                    dropout_p=float(dropout_p),
+                    training=training,
+                    is_causal=bool(is_causal),
+                    score_mod=score_mod,
+                )
+
+            flex_kwargs: dict[str, Any] = {}
+            if "score_mod" in _FLEX_KWARGS and score_mod is not None:
+                flex_kwargs["score_mod"] = score_mod
+            if "block_mask" in _FLEX_KWARGS and block_mask is not None:
+                flex_kwargs["block_mask"] = block_mask
+            if "scale" in _FLEX_KWARGS and scale is not None:
+                flex_kwargs["scale"] = float(scale)
+            if "enable_gqa" in _FLEX_KWARGS:
+                flex_kwargs["enable_gqa"] = bool(enable_gqa)
+            if "return_lse" in _FLEX_KWARGS:
+                flex_kwargs["return_lse"] = bool(return_lse)
+            if float(dropout_p) > 0.0:
+                if "dropout_p" in _FLEX_KWARGS:
+                    flex_kwargs["dropout_p"] = float(dropout_p)
+                elif "dropout" in _FLEX_KWARGS:
+                    flex_kwargs["dropout"] = float(dropout_p)
+            if "kernel_options" in _FLEX_KWARGS and kernel_options is not None:
+                flex_kwargs["kernel_options"] = kernel_options
+
+            return _torch_flex_attention(q, k, v, **flex_kwargs)
+
+        return self._reference(
+            q,
+            k,
+            v,
+            block_mask=block_mask,
+            scale=scale,
+            dropout_p=float(dropout_p),
+            training=training,
+            is_causal=bool(is_causal),
+            score_mod=score_mod,
+        )
+
+
 class MultiScaleRetention(nn.Module):
     def __init__(self, d_model: int, nhead: int, use_gate: bool = True) -> None:
         super().__init__()
@@ -1343,7 +1655,7 @@ class MultiScaleRetention(nn.Module):
             and self._triton_ok
             and v.is_cuda
             and torch.cuda.is_available()
-            and (not is_tracing_or_exporting())
+            and (not _exporting_boundary())
             and (not is_compiling())
         )
         if use_triton:
