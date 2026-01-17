@@ -17,10 +17,7 @@ import numpy as np
 import torch
 from tensordict import TensorDict
 from stnet.core.tensor import extract_tensor, from_buffer
-REPO_ROOT = Path(__file__).resolve().parents[1]
-if str(REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(REPO_ROOT))
-from debug.lifecycle import build_dataset
+from .lifecycle import build_dataset
 from stnet.api import new_model, train
 from stnet.config import ModelConfig, PatchConfig
 from stnet.runtime.io import Exporter
