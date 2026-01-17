@@ -87,7 +87,11 @@ def _is_compiled_for_inference(model: torch.nn.Module) -> bool:
     jit = getattr(torch, "jit", None)
     script_like_types: List[type] = []
     if jit is not None:
-        for name in ("ScriptModule", "RecursiveScriptModule", "TopLevelTracedModule"):
+        for name in (
+            "ScriptModule",
+            "RecursiveScriptModule",
+            "TopLevelTracedModule",
+        ):
             typ = getattr(jit, name, None)
             if isinstance(typ, type):
                 script_like_types.append(typ)
@@ -244,7 +248,9 @@ def _decorate_compiler_disable(
 
 def _dispatch_mode_stack() -> list[Any]:
     try:
-        from torch.utils._python_dispatch import _get_current_dispatch_mode_stack
+        from torch.utils._python_dispatch import (
+            _get_current_dispatch_mode_stack,
+        )
 
         stack = _get_current_dispatch_mode_stack()
         return list(stack) if stack is not None else []
@@ -265,7 +271,9 @@ def is_compiling() -> bool:
         if dyn is not None and callable(getattr(dyn, "is_compiling", None)):
             if bool(dyn.is_compiling()):
                 return True
-        if dyn is not None and callable(getattr(dyn, "is_dynamo_compiling", None)):
+        if dyn is not None and callable(
+            getattr(dyn, "is_dynamo_compiling", None)
+        ):
             if bool(dyn.is_dynamo_compiling()):
                 return True
     with suppress(Exception):
@@ -295,7 +303,9 @@ def is_fake_tensor_mode_active() -> bool:
 def is_tracing_or_exporting() -> bool:
     with suppress(Exception):
         jit = getattr(torch, "jit", None)
-        if jit is not None and (torch.jit.is_tracing() or torch.jit.is_scripting()):
+        if jit is not None and (
+            torch.jit.is_tracing() or torch.jit.is_scripting()
+        ):
             return True
     with suppress(Exception):
         comp = getattr(torch, "compiler", None)
@@ -318,7 +328,11 @@ def is_export_or_trace() -> bool:
 
 
 def is_symbolic() -> bool:
-    return bool(is_tracing_or_exporting() or is_compiling() or is_fake_tensor_mode_active())
+    return bool(
+        is_tracing_or_exporting()
+        or is_compiling()
+        or is_fake_tensor_mode_active()
+    )
 
 
 def assert_trace(condition: object, message: str = "") -> None:
@@ -346,7 +360,9 @@ def assert_trace(condition: object, message: str = "") -> None:
 def canonicalize_compile_mode(mode: object | None) -> str:
     if not isinstance(mode, str):
         return "disabled"
-    compact_mode = mode.lower().replace("_", "").replace("-", "").replace(" ", "")
+    compact_mode = (
+        mode.lower().replace("_", "").replace("-", "").replace(" ", "")
+    )
     mode_map = {
         "default": "default",
         "aoteager": "aot-eager",
@@ -389,7 +405,9 @@ def is_nvidia_te_available(model: torch.nn.Module) -> bool:
         return True
     for module in model.modules():
         mod_name = getattr(module.__class__, "__module__", "")
-        if isinstance(mod_name, str) and mod_name.startswith("transformer_engine"):
+        if isinstance(mod_name, str) and mod_name.startswith(
+            "transformer_engine"
+        ):
             try:
                 setattr(model, "__stnet_cached_is_nvidia_te_available__", True)
             except Exception:
@@ -448,15 +466,25 @@ def compile(
     if _inductor_config is not None:
         with _INDUCTOR_CONFIG_LOCK:
             try:
-                if getattr(_inductor_config, "compile_threads", None) is not None:
+                if (
+                    getattr(_inductor_config, "compile_threads", None)
+                    is not None
+                ):
                     override = env_first(
-                        ("STNET_INDUCTOR_COMPILE_THREADS", "STNET_COMPILE_THREADS"),
+                        (
+                            "STNET_INDUCTOR_COMPILE_THREADS",
+                            "STNET_COMPILE_THREADS",
+                        ),
                         None,
                     )
                     if override is None:
-                        override = env_first(("TORCHINDUCTOR_COMPILE_THREADS",), None)
+                        override = env_first(
+                            ("TORCHINDUCTOR_COMPILE_THREADS",), None
+                        )
                     if override is not None:
-                        _inductor_config.compile_threads = max(1, int(override))
+                        _inductor_config.compile_threads = max(
+                            1, int(override)
+                        )
                     else:
                         local_world = env_first_int(
                             (
@@ -468,11 +496,18 @@ def compile(
                         )
                         if int(local_world) > 1:
                             cpu_count = int(CPU.count() or 1)
-                            per_rank = max(1, int(cpu_count) // max(1, int(local_world)))
-                            _inductor_config.compile_threads = max(1, min(4, int(per_rank) // 2))
+                            per_rank = max(
+                                1, int(cpu_count) // max(1, int(local_world))
+                            )
+                            _inductor_config.compile_threads = max(
+                                1, min(4, int(per_rank) // 2)
+                            )
             except Exception:
                 pass
-            if canonical_mode in {"max-autotune", "max-autotune-no-cudagraphs"}:
+            if canonical_mode in {
+                "max-autotune",
+                "max-autotune-no-cudagraphs",
+            }:
                 with suppress(Exception):
                     _inductor_config.autotune_in_subproc = True
                 with suppress(Exception):
@@ -481,18 +516,35 @@ def compile(
                     _inductor_config.autotune_remote_cache = None
                 with suppress(Exception):
                     if (
-                        getattr(_inductor_config, "max_autotune_gemm_search_space", None)
+                        getattr(
+                            _inductor_config,
+                            "max_autotune_gemm_search_space",
+                            None,
+                        )
                         is not None
                     ):
-                        _inductor_config.max_autotune_gemm_search_space = "DEFAULT"
+                        _inductor_config.max_autotune_gemm_search_space = (
+                            "DEFAULT"
+                        )
                 with suppress(Exception):
-                    if getattr(_inductor_config, "max_autotune_pointwise", None) is not None:
+                    if (
+                        getattr(
+                            _inductor_config, "max_autotune_pointwise", None
+                        )
+                        is not None
+                    ):
                         _inductor_config.max_autotune_pointwise = False
                 with suppress(Exception):
-                    if getattr(_inductor_config, "max_autotune_gemm", None) is not None:
+                    if (
+                        getattr(_inductor_config, "max_autotune_gemm", None)
+                        is not None
+                    ):
                         _inductor_config.max_autotune_gemm = True
                 with suppress(Exception):
-                    if getattr(_inductor_config, "compile_threads", None) is not None:
+                    if (
+                        getattr(_inductor_config, "compile_threads", None)
+                        is not None
+                    ):
                         override_raw = env_first(
                             (
                                 "STNET_INDUCTOR_COMPILE_THREADS",
@@ -532,7 +584,11 @@ def compile(
         compile_kwargs["options"] = options_merged
     if isinstance(compile_kwargs.get("options", None), dict):
         inductor_cfg = _get_inductor_config()
-        patch = getattr(inductor_cfg, "patch", None) if inductor_cfg is not None else None
+        patch = (
+            getattr(inductor_cfg, "patch", None)
+            if inductor_cfg is not None
+            else None
+        )
 
         def _has_cfg_key(cfg: Any, key: str) -> bool:
             obj = cfg
@@ -575,7 +631,9 @@ def torch_compiler_supported() -> bool:
         pass
     try:
         comp = getattr(torch, "compiler", None)
-        is_exporting = getattr(comp, "is_exporting", None) if comp is not None else None
+        is_exporting = (
+            getattr(comp, "is_exporting", None) if comp is not None else None
+        )
         if callable(is_exporting) and bool(is_exporting()):
             return False
     except Exception:
@@ -653,7 +711,9 @@ def torch_compiler_disable(
         fn = getattr(target, attr)
         if getattr(fn, _NO_COMPILE_SENTINEL, False):
             return True
-        decorator = _decorate_compiler_disable(reason=reason, recursive=recursive)
+        decorator = _decorate_compiler_disable(
+            reason=reason, recursive=recursive
+        )
         try:
             wrapped = decorator(fn)
         except Exception:
@@ -671,8 +731,12 @@ def torch_compiler_disable(
     return decorator
 
 
-def compile_distributed_safe(*args: Any, collectives: tuple[str, ...] = _COLLECTIVE_NAMES) -> bool:
-    if _TORCH_DYNAMO is None or not hasattr(_TORCH_DYNAMO, "disallow_in_graph"):
+def compile_distributed_safe(
+    *args: Any, collectives: tuple[str, ...] = _COLLECTIVE_NAMES
+) -> bool:
+    if _TORCH_DYNAMO is None or not hasattr(
+        _TORCH_DYNAMO, "disallow_in_graph"
+    ):
         return False
     try:
         import torch.distributed as dist
@@ -697,18 +761,28 @@ def compile_distributed_safe(*args: Any, collectives: tuple[str, ...] = _COLLECT
 
 
 def compile_safe(
-    *args: Any, runtime_module: Any | None = None, layers_module: Any | None = None
+    *args: Any,
+    runtime_module: Any | None = None,
+    layers_module: Any | None = None,
 ) -> None:
     if not torch_compiler_supported():
         return
     with suppress(Exception):
         compile_distributed_safe()
     if layers_module is None:
-        for mod_name in ("stnet.nn.layers", "stnet.nn.blocks", "stnet.nn.architecture"):
+        for mod_name in (
+            "stnet.nn.layers",
+            "stnet.nn.blocks",
+            "stnet.nn.architecture",
+        ):
             with suppress(Exception):
                 layers_module = importlib.import_module(mod_name)
                 break
-    scaler_cls = getattr(layers_module, "Scaler", None) if layers_module is not None else None
+    scaler_cls = (
+        getattr(layers_module, "Scaler", None)
+        if layers_module is not None
+        else None
+    )
     if scaler_cls is None:
         for mod_name in ("stnet.nn.layers", "stnet.nn.blocks"):
             with suppress(Exception):
@@ -731,7 +805,11 @@ def compile_safe(
                 reason="Scaler uses Python-side caches/loops; keep eager",
                 recursive=False,
             )
-    history_cls = getattr(layers_module, "Recorder", None) if layers_module is not None else None
+    history_cls = (
+        getattr(layers_module, "Recorder", None)
+        if layers_module is not None
+        else None
+    )
     if history_cls is None:
         for mod_name in ("stnet.nn.layers", "stnet.nn.blocks"):
             with suppress(Exception):
@@ -776,7 +854,9 @@ def iter_checkpoint(root: nn.Module) -> Iterator[nn.Module]:
 
         if isinstance(root, nn.Module):
             for mod in root.modules():
-                if hasattr(mod, "_ckpt_min_bytes") and hasattr(mod, "_ckpt_enabled"):
+                if hasattr(mod, "_ckpt_min_bytes") and hasattr(
+                    mod, "_ckpt_enabled"
+                ):
                     yield mod
     except Exception:
         return
@@ -790,7 +870,9 @@ def to_checkpoint(
     ttl_steps: int,
     min_bytes: int,
 ) -> bool:
-    inst = to_submodule(model) or (model.module if hasattr(model, "module") else model)
+    inst = to_submodule(model) or (
+        model.module if hasattr(model, "module") else model
+    )
     if inst is None:
         return False
     try:
@@ -808,7 +890,8 @@ def to_checkpoint(
     cur_until = int(getattr(inst, "_stnet_ckpt_pressure_until", 0) or 0)
     if (
         cur_until >= until
-        and int(getattr(inst, "_stnet_ckpt_pressure_min_bytes", 0) or 0) <= min_bytes
+        and int(getattr(inst, "_stnet_ckpt_pressure_min_bytes", 0) or 0)
+        <= min_bytes
     ):
         return False
     changed = False
@@ -841,12 +924,18 @@ def to_checkpoint(
         if prev_mb <= 0:
             setattr(inst, "_stnet_ckpt_pressure_min_bytes", int(min_bytes))
         else:
-            setattr(inst, "_stnet_ckpt_pressure_min_bytes", int(min(prev_mb, min_bytes)))
+            setattr(
+                inst,
+                "_stnet_ckpt_pressure_min_bytes",
+                int(min(prev_mb, min_bytes)),
+            )
     return bool(changed)
 
 
 def from_checkpoint(model: nn.Module, *args: Any, step_total: int) -> None:
-    inst = to_submodule(model) or (model.module if hasattr(model, "module") else model)
+    inst = to_submodule(model) or (
+        model.module if hasattr(model, "module") else model
+    )
     if inst is None:
         return
     try:
@@ -870,7 +959,10 @@ def from_checkpoint(model: nn.Module, *args: Any, step_total: int) -> None:
                     "_ckpt_enabled",
                     bool(getattr(mod, "_stnet_ckpt_saved_enabled", True)),
                 )
-            for k in ("_stnet_ckpt_saved_min_bytes", "_stnet_ckpt_saved_enabled"):
+            for k in (
+                "_stnet_ckpt_saved_min_bytes",
+                "_stnet_ckpt_saved_enabled",
+            ):
                 with contextlib.suppress(Exception):
                     delattr(mod, k)
         except Exception:
@@ -895,7 +987,9 @@ def coerce_checkpoint(
         isinstance(a, torch.Tensor) and a.requires_grad for a in args
     ):
         return fn(*args)
-    force_reentrant = env_first(("STNET_CKPT_REQUIRE_REENTRANT",), default=None)
+    force_reentrant = env_first(
+        ("STNET_CKPT_REQUIRE_REENTRANT",), default=None
+    )
     require_reentrant = (
         env_bool("STNET_CKPT_REQUIRE_REENTRANT", default=False)
         if force_reentrant is not None
@@ -931,7 +1025,9 @@ def coerce_checkpoint(
         {k: v for k, v in ck_opts.items() if k != "determinism_check"},
     ]
     if require_reentrant:
-        opts_list.extend([{k: v for k, v in ck_opts.items() if k == "use_reentrant"}])
+        opts_list.extend(
+            [{k: v for k, v in ck_opts.items() if k == "use_reentrant"}]
+        )
     else:
         opts_list.extend(
             [

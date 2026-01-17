@@ -106,17 +106,26 @@ def _onnx_model(model: object) -> Iterator[object]:
     with contextlib.suppress(Exception):
         for module in model.modules():
             for attr in ("logger", "history"):
-                if hasattr(module, attr) and isinstance(v := getattr(module, attr), Recorder):
+                if hasattr(module, attr) and isinstance(
+                    v := getattr(module, attr), Recorder
+                ):
                     with contextlib.suppress(Exception):
                         removed_sub.append((module, attr, v))
                         delattr(module, attr)
     try:
         with _temp_environ(
-            {"STNET_MSR_FORCE_TORCH": "1", "STNET_DISABLE_PIECEWISE_CALIB": "1"},
+            {
+                "STNET_MSR_FORCE_TORCH": "1",
+                "STNET_DISABLE_PIECEWISE_CALIB": "1",
+            },
             only_if_unset=True,
         ):
             eager_ctx = getattr(model, "eager_for_export", None)
-            with eager_ctx() if callable(eager_ctx) else contextlib.nullcontext():
+            with (
+                eager_ctx()
+                if callable(eager_ctx)
+                else contextlib.nullcontext()
+            ):
                 yield model
     finally:
         for module, attr, v in removed_sub:
@@ -141,7 +150,10 @@ def _get_forward_parameters(model_cls: object) -> object:
         return None
     info = (
         set(sig.parameters.keys()),
-        any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()),
+        any(
+            p.kind == inspect.Parameter.VAR_KEYWORD
+            for p in sig.parameters.values()
+        ),
     )
     with _FORWARD_PARAM_CACHE_LOCK:
         if len(_FORWARD_PARAM_CACHE) > 512:
@@ -165,23 +177,36 @@ def _forward(model: object, x: object) -> object:
 
 
 def _get_tensor_shape(model: object, sample_input: object) -> object:
-    in_dim = int(getattr(model, "in_dim")) if hasattr(model, "in_dim") else None
+    in_dim = (
+        int(getattr(model, "in_dim")) if hasattr(model, "in_dim") else None
+    )
     out_shape = (
-        tuple(int(x) for x in getattr(model, "out_shape")) if hasattr(model, "out_shape") else None
+        tuple(int(x) for x in getattr(model, "out_shape"))
+        if hasattr(model, "out_shape")
+        else None
     )
     if in_dim is not None and out_shape is not None:
         return (int(in_dim), tuple(int(x) for x in out_shape))
     if sample_input is not None:
         if not isinstance(sample_input, torch.Tensor):
             raise TypeError("sample_input must be a torch.Tensor")
-        dev = next((p.device for p in model.parameters() if p is not None), torch.device("cpu"))
+        dev = next(
+            (p.device for p in model.parameters() if p is not None),
+            torch.device("cpu"),
+        )
         sample = sample_input.to(dev)
         model.eval()
         with torch.no_grad():
-            sample_batched = sample.unsqueeze(0) if sample.ndim == 1 else sample
+            sample_batched = (
+                sample.unsqueeze(0) if sample.ndim == 1 else sample
+            )
             y_flat = extract_tensor(_forward(model, sample_batched))
         if in_dim is None:
-            in_dim = int(sample.numel()) if sample.ndim == 1 else int(sample.numel() // sample.shape[0])
+            in_dim = (
+                int(sample.numel())
+                if sample.ndim == 1
+                else int(sample.numel() // sample.shape[0])
+            )
         if out_shape is None:
             out_shape = tuple(int(x) for x in tuple(y_flat.shape[1:]))
     if in_dim is None or out_shape is None:
@@ -189,13 +214,17 @@ def _get_tensor_shape(model: object, sample_input: object) -> object:
     return (int(in_dim), tuple(int(x) for x in out_shape))
 
 
-def _pad_sample(model: object, sample_input: object, *args: Any, batch: int = 1) -> object:
+def _pad_sample(
+    model: object, sample_input: object, *args: Any, batch: int = 1
+) -> object:
     if sample_input is not None:
         return sample_input
     in_dim, _ = _get_tensor_shape(model, sample_input)
     param = next(model.parameters(), None)
     dtype, device = (
-        (param.dtype, param.device) if param is not None else (torch.float32, torch.device("cpu"))
+        (param.dtype, param.device)
+        if param is not None
+        else (torch.float32, torch.device("cpu"))
     )
     b = max(1, int(batch))
     return torch.zeros(b, in_dim, dtype=dtype, device=device)
@@ -236,9 +265,15 @@ def _onnx_options(kwargs: object, *args: Any, target: str = "onnx") -> object:
         "opset_version": opset,
         "opset_fallback": clean_fb,
         "dynamic_batch": kwargs.get("dynamic_batch", d_dyn),
-        "prefer_dynamo": kwargs.get("prefer_dynamo", kwargs.get("dynamo", d_pref)),
-        "simplify": kwargs.get("simplify_onnx", kwargs.get("onnx_simplify", d_simp)),
-        "optimize_onnx": kwargs.get("optimize_onnx", kwargs.get("onnx_optimize", True)),
+        "prefer_dynamo": kwargs.get(
+            "prefer_dynamo", kwargs.get("dynamo", d_pref)
+        ),
+        "simplify": kwargs.get(
+            "simplify_onnx", kwargs.get("onnx_simplify", d_simp)
+        ),
+        "optimize_onnx": kwargs.get(
+            "optimize_onnx", kwargs.get("onnx_optimize", True)
+        ),
         "onnxoptimizer_passes": kwargs.get(
             "onnxoptimizer_passes", kwargs.get("onnx_optimizer_passes")
         ),
@@ -429,11 +464,19 @@ def _torch_export_program(
     if dynamic_batch and isinstance(sample, torch.Tensor) and sample.ndim >= 1:
         sample = _pad_to_batch(sample, 2)
     dynamic_shapes = None
-    if (dynamic_batch or dynamic_seq) and hasattr(torch, "export") and hasattr(torch.export, "Dim"):
+    if (
+        (dynamic_batch or dynamic_seq)
+        and hasattr(torch, "export")
+        and hasattr(torch.export, "Dim")
+    ):
         spec: dict[int, object] = {}
         if dynamic_batch:
             spec[0] = torch.export.Dim("batch")
-        if dynamic_seq and isinstance(sample, torch.Tensor) and sample.ndim >= 2:
+        if (
+            dynamic_seq
+            and isinstance(sample, torch.Tensor)
+            and sample.ndim >= 2
+        ):
             spec[1] = torch.export.Dim("seq")
         if spec:
             dynamic_shapes = (spec,)
@@ -558,7 +601,11 @@ class _ONNXExporter:
         if dynamic_batch:
             dyn_axes = {"features": {0: "batch"}, "preds_flat": {0: "batch"}}
             if hasattr(torch, "export") and hasattr(torch.export, "Dim"):
-                mode = os.environ.get("STNET_EXPORT_BATCH_DIM", "auto").strip().lower()
+                mode = (
+                    os.environ.get("STNET_EXPORT_BATCH_DIM", "auto")
+                    .strip()
+                    .lower()
+                )
                 batch_dim = None
                 if mode == "explicit":
                     try:
@@ -586,7 +633,8 @@ class _ONNXExporter:
             and int(sample.shape[0]) < min_export_batch
         ):
             pad = torch.zeros(
-                (min_export_batch - int(sample.shape[0]),) + tuple(sample.shape[1:]),
+                (min_export_batch - int(sample.shape[0]),)
+                + tuple(sample.shape[1:]),
                 device=sample.device,
                 dtype=sample.dtype,
             )
@@ -625,7 +673,11 @@ class _ONNXExporter:
                             message=r"torchvision|Setting ONNX exporter to use operator set version",
                         )
                         call_kw = dict(valid_kw)
-                        if use_dyn and dyn_shapes and "dynamic_shapes" in sig_keys:
+                        if (
+                            use_dyn
+                            and dyn_shapes
+                            and "dynamic_shapes" in sig_keys
+                        ):
                             call_kw["dynamic_shapes"] = dyn_shapes
                         if has_dynamo:
                             call_kw["dynamo"] = use_dyn
@@ -641,7 +693,8 @@ class _ONNXExporter:
                     if optimize_onnx:
                         if (
                             importlib.util.find_spec("onnx") is not None
-                            and importlib.util.find_spec("onnxoptimizer") is not None
+                            and importlib.util.find_spec("onnxoptimizer")
+                            is not None
                         ):
                             try:
                                 import onnx
@@ -653,7 +706,9 @@ class _ONNXExporter:
                                     if onnxoptimizer_passes is not None
                                     else None
                                 )
-                                model_opt = onnxoptimizer.optimize(model_onnx, passes)
+                                model_opt = onnxoptimizer.optimize(
+                                    model_onnx, passes
+                                )
                                 onnx.save(model_opt, str(onnx_path))
                             except Exception as exc:
                                 warnings.warn(
@@ -674,7 +729,9 @@ class _ONNXExporter:
         raise RuntimeError("ONNX export failed. " + "; ".join(errors[-6:]))
 
     @staticmethod
-    def coerce(model: nn.Module, onnx_path: PathLike, *args: Any, **kwargs: Any) -> object:
+    def coerce(
+        model: nn.Module, onnx_path: PathLike, *args: Any, **kwargs: Any
+    ) -> object:
         if not onnx_path.exists():
             return _ONNXExporter.export(model, onnx_path, **kwargs)
         return onnx_path
@@ -701,7 +758,10 @@ class _ORTBuilder:
             "extended": ort.GraphOptimizationLevel.ORT_ENABLE_EXTENDED,
             "all": ort.GraphOptimizationLevel.ORT_ENABLE_ALL,
         }
-        level = opt_map.get(optimization_level.lower(), ort.GraphOptimizationLevel.ORT_ENABLE_ALL)
+        level = opt_map.get(
+            optimization_level.lower(),
+            ort.GraphOptimizationLevel.ORT_ENABLE_ALL,
+        )
         disabled_optimizers: list[str] | None = None
         if level == ort.GraphOptimizationLevel.ORT_ENABLE_ALL:
             disabled_optimizers = ["NchwcTransformer"]
@@ -760,7 +820,11 @@ class _ORTBuilder:
                     so.add_session_config_entry(
                         "optimization.minimal_build_optimizations", "save"
                     )
-                dis = disabled_optimizers if lvl == ort.GraphOptimizationLevel.ORT_ENABLE_ALL else None
+                dis = (
+                    disabled_optimizers
+                    if lvl == ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+                    else None
+                )
                 ort.InferenceSession(
                     str(onnx_path),
                     sess_options=so,
@@ -777,6 +841,7 @@ class _ORTBuilder:
             raise RuntimeError("ORT export failed.") from last_exc
 
         return (ort_path, optimized_onnx_path)
+
 
 @dataclass(frozen=True, slots=True)
 class BorrowedModule:
@@ -857,7 +922,10 @@ class TorchInductor(Format):
                 if isinstance(params, dict):
                     if "package_path" in params:
                         aoti_kw["package_path"] = str(dst)
-                    if inductor_configs is not None and "inductor_configs" in params:
+                    if (
+                        inductor_configs is not None
+                        and "inductor_configs" in params
+                    ):
                         aoti_kw["inductor_configs"] = inductor_configs
             except Exception:
                 aoti_kw["package_path"] = str(dst)
@@ -902,7 +970,9 @@ class TorchExport(Format):
 
             torch_save = torch.export.save
         except Exception as exc:
-            raise ImportError("torch.export is required for PT2 export (PyTorch 2.0+).") from exc
+            raise ImportError(
+                "torch.export is required for PT2 export (PyTorch 2.0+)."
+            ) from exc
 
         with _onnx_model(model) as serving_model:
             sample = kwargs.get("sample_input")
@@ -924,13 +994,17 @@ class TorchExport(Format):
 
         return (dst,)
 
-    def _export_program(self, wrapper: nn.Module, sample: torch.Tensor, **kwargs: Any) -> object:
+    def _export_program(
+        self, wrapper: nn.Module, sample: torch.Tensor, **kwargs: Any
+    ) -> object:
         try:
             import torch.export
 
             torch_export = torch.export.export
         except Exception as exc:
-            raise ImportError("torch.export is required for PT2 export (PyTorch 2.0+).") from exc
+            raise ImportError(
+                "torch.export is required for PT2 export (PyTorch 2.0+)."
+            ) from exc
 
         return _torch_export_program(
             torch_export,
@@ -979,9 +1053,9 @@ class ExecuTorch(Format):
             dyn_batch = bool(kwargs.get("dynamic_batch", True))
             dyn_seq = bool(kwargs.get("dynamic_seq", False))
             strict = bool(kwargs.get("strict", True))
-            silent_fallback = bool(kwargs.get("silent_fallback", False)) or self._truthy_env(
-                "STNET_EXPORT_SILENT_FALLBACK"
-            )
+            silent_fallback = bool(
+                kwargs.get("silent_fallback", False)
+            ) or self._truthy_env("STNET_EXPORT_SILENT_FALLBACK")
 
             def _do_export(db: bool, ds: bool) -> object:
                 return _torch_export_program(
@@ -991,14 +1065,17 @@ class ExecuTorch(Format):
                     dynamic_batch=db,
                     dynamic_seq=ds,
                     strict=strict,
-                    tag="ExecuTorch export" + (" (static)" if (not db and not ds) else ""),
+                    tag="ExecuTorch export"
+                    + (" (static)" if (not db and not ds) else ""),
                 )
 
             try:
                 exported = _do_export(dyn_batch, dyn_seq)
             except Exception:
                 if dyn_batch or dyn_seq:
-                    if os.environ.get("STNET_EXPORT_WARNINGS", "").strip().lower() in (
+                    if os.environ.get(
+                        "STNET_EXPORT_WARNINGS", ""
+                    ).strip().lower() in (
                         "1",
                         "true",
                         "yes",
@@ -1073,7 +1150,8 @@ class ExecuTorch(Format):
                         "exported_dynamic_batch": used_dyn_batch,
                         "exported_dynamic_seq": used_dyn_seq,
                         "static_fallback": bool(
-                            (dyn_batch or dyn_seq) and (not used_dyn_batch and not used_dyn_seq)
+                            (dyn_batch or dyn_seq)
+                            and (not used_dyn_batch and not used_dyn_seq)
                         ),
                         "fallback_error": fallback_error,
                     },
@@ -1093,7 +1171,9 @@ class ONNX(Format):
     ) -> object:
         dst = Path(dst)
         with _onnx_model(model) as serving:
-            out = _ONNXExporter.export(serving, dst, **_onnx_options(kwargs, target="onnx"))
+            out = _ONNXExporter.export(
+                serving, dst, **_onnx_options(kwargs, target="onnx")
+            )
         with contextlib.suppress(Exception):
             _write_export_meta(model, out, format_name=self.name or "onnx")
         return (out,)
@@ -1119,10 +1199,16 @@ class ORT(Format):
             ort_path, optimized = _ORTBuilder.to_ort(
                 onnx_path,
                 dst,
-                optimization_level=str(kwargs.get("optimization_level", "all")),
-                optimization_style=str(kwargs.get("optimization_style", "fixed")),
+                optimization_level=str(
+                    kwargs.get("optimization_level", "all")
+                ),
+                optimization_style=str(
+                    kwargs.get("optimization_style", "fixed")
+                ),
                 target_platform=kwargs.get("target_platform"),
-                save_optimized_onnx_model=bool(kwargs.get("save_optimized_onnx_model", False)),
+                save_optimized_onnx_model=bool(
+                    kwargs.get("save_optimized_onnx_model", False)
+                ),
             )
         with contextlib.suppress(Exception):
             _write_export_meta(
@@ -1131,7 +1217,9 @@ class ORT(Format):
                 format_name=self.name or "ort",
                 extra={
                     "onnx_path": str(onnx_path),
-                    "optimized_onnx": str(optimized) if optimized is not None else None,
+                    "optimized_onnx": (
+                        str(optimized) if optimized is not None else None
+                    ),
                 },
             )
         return (ort_path, optimized) if optimized is not None else (ort_path,)
@@ -1158,7 +1246,8 @@ class TensorRT(Format):
             if bool(kwargs.get("graphsurgeon", True)):
                 if (
                     importlib.util.find_spec("onnx") is not None
-                    and importlib.util.find_spec("onnx_graphsurgeon") is not None
+                    and importlib.util.find_spec("onnx_graphsurgeon")
+                    is not None
                 ):
                     try:
                         import onnx
@@ -1175,41 +1264,61 @@ class TensorRT(Format):
             try:
                 import tensorrt as trt
             except ImportError as exc:
-                raise ImportError("TensorRT is required for this export.") from exc
+                raise ImportError(
+                    "TensorRT is required for this export."
+                ) from exc
             trt_logger = trt.Logger(trt.Logger.WARNING)
             explicit_batch_flag = 0
             with contextlib.suppress(Exception):
-                explicit_batch_flag = 1 << int(trt.NetworkDefinitionCreationFlag.EXPLICIT_BATCH)
+                explicit_batch_flag = 1 << int(
+                    trt.NetworkDefinitionCreationFlag.EXPLICIT_BATCH
+                )
             with contextlib.ExitStack() as stack:
                 builder = stack.enter_context(trt.Builder(trt_logger))
                 create_network = getattr(builder, "create_network", None)
                 if not callable(create_network):
-                    raise RuntimeError("TensorRT builder.create_network is not available.")
+                    raise RuntimeError(
+                        "TensorRT builder.create_network is not available."
+                    )
                 try:
-                    network = stack.enter_context(create_network(explicit_batch_flag))
+                    network = stack.enter_context(
+                        create_network(explicit_batch_flag)
+                    )
                 except TypeError:
                     network = stack.enter_context(create_network())
 
-                parser = stack.enter_context(trt.OnnxParser(network, trt_logger))
+                parser = stack.enter_context(
+                    trt.OnnxParser(network, trt_logger)
+                )
                 config = stack.enter_context(builder.create_builder_config())
 
-                workspace_size_bytes = int(kwargs.get("workspace_size_bytes", 1 << 30))
+                workspace_size_bytes = int(
+                    kwargs.get("workspace_size_bytes", 1 << 30)
+                )
                 if hasattr(config, "set_memory_pool_limit"):
-                    config.set_memory_pool_limit(trt.MemoryPoolType.WORKSPACE, workspace_size_bytes)
+                    config.set_memory_pool_limit(
+                        trt.MemoryPoolType.WORKSPACE, workspace_size_bytes
+                    )
                 else:
                     config.max_workspace_size = workspace_size_bytes
                 with open(onnx_path, "rb") as handle:
                     if not parser.parse(handle.read()):
                         for i in range(parser.num_errors):
                             print(parser.get_error(i))
-                        raise RuntimeError("TensorRT could not parse the ONNX model.")
+                        raise RuntimeError(
+                            "TensorRT could not parse the ONNX model."
+                        )
                 use_fp16 = bool(kwargs.get("fp16", True))
                 use_int8 = bool(kwargs.get("int8", False))
-                if use_fp16 and bool(getattr(builder, "platform_has_fast_fp16", False)):
+                if use_fp16 and bool(
+                    getattr(builder, "platform_has_fast_fp16", False)
+                ):
                     with contextlib.suppress(Exception):
                         config.set_flag(trt.BuilderFlag.FP16)
                 if use_int8:
-                    if not bool(getattr(builder, "platform_has_fast_int8", False)):
+                    if not bool(
+                        getattr(builder, "platform_has_fast_int8", False)
+                    ):
                         warnings.warn(
                             "INT8 precision is not supported on this platform; ignoring request."
                         )
@@ -1224,26 +1333,34 @@ class TensorRT(Format):
                 sample = _pad_sample(serving_model, kwargs.get("sample_input"))
                 shape = tuple((int(x) for x in sample.shape))
                 min_batch = max(1, int(kwargs.get("min_batch", 1)))
-                opt_batch = max(min_batch, int(kwargs.get("opt_batch", shape[0])))
+                opt_batch = max(
+                    min_batch, int(kwargs.get("opt_batch", shape[0]))
+                )
                 max_batch = max(opt_batch, int(kwargs.get("max_batch", 8)))
                 min_shape = (min_batch, *shape[1:])
                 opt_shape = (opt_batch, *shape[1:])
                 max_shape = (max_batch, *shape[1:])
                 profile = builder.create_optimization_profile()
-                profile.set_shape(input_tensor.name, min_shape, opt_shape, max_shape)
+                profile.set_shape(
+                    input_tensor.name, min_shape, opt_shape, max_shape
+                )
                 config.add_optimization_profile(profile)
                 engine_blob = None
-                build_serialized = getattr(builder, "build_serialized_network", None)
+                build_serialized = getattr(
+                    builder, "build_serialized_network", None
+                )
                 if callable(build_serialized):
                     engine_blob = build_serialized(network, config)
                 else:
-                    build_engine = getattr(builder, "build_engine", None) or getattr(
-                        builder, "build_cuda_engine", None
-                    )
+                    build_engine = getattr(
+                        builder, "build_engine", None
+                    ) or getattr(builder, "build_cuda_engine", None)
                     if callable(build_engine):
                         engine = build_engine(network, config)
                         if engine is not None:
-                            engine_blob = getattr(engine, "serialize", lambda: None)()
+                            engine_blob = getattr(
+                                engine, "serialize", lambda: None
+                            )()
 
                 if engine_blob is None:
                     raise RuntimeError("Failed to build the TensorRT engine.")
@@ -1288,12 +1405,16 @@ class CoreML(Format):
                 "coremltools is required for this operation (try: pip install coremltools on macOS)"
             )
         spec = importlib.util.find_spec("coremltools")
-        if spec is None or not getattr(spec, "submodule_search_locations", None):
+        if spec is None or not getattr(
+            spec, "submodule_search_locations", None
+        ):
             raise ImportError(
                 "coremltools is required for this operation (try: pip install coremltools on macOS)"
             )
         pkg_dirs = list(spec.submodule_search_locations or [])
-        has_native = any(glob.glob(os.path.join(d, "libcoremlpython*")) for d in pkg_dirs)
+        has_native = any(
+            glob.glob(os.path.join(d, "libcoremlpython*")) for d in pkg_dirs
+        )
         if not has_native:
             raise ImportError(
                 "coremltools is required for this operation (try: pip install coremltools on macOS)"
@@ -1327,7 +1448,9 @@ class CoreML(Format):
                 str(kwargs.get("compute_units", "ALL")).upper(), cu_map["ALL"]
             )
             kwargs_dict = {
-                "inputs": [ct.TensorType(shape=tuple((int(x) for x in sample.shape)))],
+                "inputs": [
+                    ct.TensorType(shape=tuple((int(x) for x in sample.shape)))
+                ],
                 "convert_to": convert_to,
                 "compute_units": compute_units,
             }
@@ -1360,7 +1483,9 @@ class CoreML(Format):
             dst.parent.mkdir(parents=True, exist_ok=True)
             mlmodel.save(str(dst))
             with contextlib.suppress(Exception):
-                _write_export_meta(model, dst, format_name=self.name or "coreml")
+                _write_export_meta(
+                    model, dst, format_name=self.name or "coreml"
+                )
         return (dst,)
 
 
@@ -1376,7 +1501,11 @@ class LiteRT(Format):
     ) -> object:
         del args
         dst = Path(dst)
-        prefer_ai_edge = bool(kwargs.get("prefer_ai_edge_torch", kwargs.get("prefer_ai_edge", True)))
+        prefer_ai_edge = bool(
+            kwargs.get(
+                "prefer_ai_edge_torch", kwargs.get("prefer_ai_edge", True)
+            )
+        )
         have_ai_edge = importlib.util.find_spec("ai_edge_torch") is not None
         have_onnx2tf = importlib.util.find_spec("onnx2tf") is not None
 
@@ -1409,7 +1538,9 @@ class LiteRT(Format):
                         )
                     return (dst,)
                 except Exception as exc:
-                    if have_onnx2tf and bool(kwargs.get("fallback_onnx2tf", True)):
+                    if have_onnx2tf and bool(
+                        kwargs.get("fallback_onnx2tf", True)
+                    ):
                         warnings.warn(
                             f"ai-edge-torch conversion failed; retrying via onnx2tf: {exc}",
                             RuntimeWarning,
@@ -1495,7 +1626,9 @@ class TensorFlow(Format):
                 )
                 pb_files = list(tmp_out.rglob("saved_model.pb"))
                 if not pb_files:
-                    raise RuntimeError("onnx2tf did not produce a TensorFlow SavedModel (saved_model.pb)")
+                    raise RuntimeError(
+                        "onnx2tf did not produce a TensorFlow SavedModel (saved_model.pb)"
+                    )
                 src_dir = pb_files[0].parent
                 if saved_model_dir.exists():
                     shutil.rmtree(saved_model_dir)
@@ -1525,6 +1658,7 @@ class ReduceMean(nn.Module):
 
 class GraphSequential(nn.Module):
     _CONTROL_ATTR = "__stnet_subgraph_control_op__"
+
     def __init__(
         self,
         steps: Sequence[object],
@@ -1544,7 +1678,9 @@ class GraphSequential(nn.Module):
         self._path_cache: dict[str, weakref.ReferenceType[nn.Module]] = {}
         self._path_cache_lock = threading.Lock()
 
-        self._out_shape_kind, self._out_shape_spec = self._normalize_out_shape(out_shape)
+        self._out_shape_kind, self._out_shape_spec = self._normalize_out_shape(
+            out_shape
+        )
 
         compiled_steps: list[tuple[object, ...]] = []
         for raw in steps:
@@ -1554,41 +1690,72 @@ class GraphSequential(nn.Module):
             if isinstance(step, BorrowedModule):
                 if step.name:
                     meta = {"name": str(step.name)}
-                compiled_steps.append(("ref", weakref.ref(step.module), extra_args, extra_kwargs, meta))
+                compiled_steps.append(
+                    (
+                        "ref",
+                        weakref.ref(step.module),
+                        extra_args,
+                        extra_kwargs,
+                        meta,
+                    )
+                )
                 continue
             if isinstance(step, ModulePath):
-                meta = {"path": str(step.path), "name": (str(step.name) if step.name else None)}
-                compiled_steps.append(("path", str(step.path), extra_args, extra_kwargs, meta))
+                meta = {
+                    "path": str(step.path),
+                    "name": (str(step.name) if step.name else None),
+                }
+                compiled_steps.append(
+                    ("path", str(step.path), extra_args, extra_kwargs, meta)
+                )
                 continue
             if isinstance(step, OwnedModule):
                 if step.name:
                     meta = {"name": str(step.name)}
                 self._owned.append(step.module)
-                compiled_steps.append(("owned", len(self._owned) - 1, extra_args, extra_kwargs, meta))
+                compiled_steps.append(
+                    (
+                        "owned",
+                        len(self._owned) - 1,
+                        extra_args,
+                        extra_kwargs,
+                        meta,
+                    )
+                )
                 continue
             if isinstance(step, nn.Module):
-                compiled_steps.append(("ref", weakref.ref(step), extra_args, extra_kwargs, meta))
+                compiled_steps.append(
+                    ("ref", weakref.ref(step), extra_args, extra_kwargs, meta)
+                )
                 continue
             if callable(step):
                 tag = getattr(step, self._CONTROL_ATTR, None)
                 if tag is not None:
                     meta = {"control": str(tag)}
-                compiled_steps.append(("fn", step, extra_args, extra_kwargs, meta))
+                compiled_steps.append(
+                    ("fn", step, extra_args, extra_kwargs, meta)
+                )
                 continue
 
-            raise TypeError(f"Unsupported GraphSequential step: {type(step)!r}")
+            raise TypeError(
+                f"Unsupported GraphSequential step: {type(step)!r}"
+            )
 
         if not compiled_steps:
             raise ValueError("GraphSequential requires at least one step.")
         self._steps: list[tuple[object, ...]] = compiled_steps
 
     @staticmethod
-    def ref(module: nn.Module, *args: Any, name: str | None = None) -> BorrowedModule:
+    def ref(
+        module: nn.Module, *args: Any, name: str | None = None
+    ) -> BorrowedModule:
         del args
         return BorrowedModule(module=module, name=name)
 
     @staticmethod
-    def own(module: nn.Module, *args: Any, name: str | None = None) -> OwnedModule:
+    def own(
+        module: nn.Module, *args: Any, name: str | None = None
+    ) -> OwnedModule:
         del args
         return OwnedModule(module=module, name=name)
 
@@ -1599,7 +1766,9 @@ class GraphSequential(nn.Module):
     @staticmethod
     def mean(dim: int = 1, *args: Any, keepdim: bool = False) -> OwnedModule:
         del args
-        return OwnedModule(module=ReduceMean(dim=int(dim), keepdim=bool(keepdim)), name="mean")
+        return OwnedModule(
+            module=ReduceMean(dim=int(dim), keepdim=bool(keepdim)), name="mean"
+        )
 
     @staticmethod
     def io(*args: Any, **kwargs: Any) -> CallArguments:
@@ -1628,8 +1797,13 @@ class GraphSequential(nn.Module):
         return GraphSequential._tag_control(_op, "graph_break")
 
     @staticmethod
-    def cudagraph_begin(*args: Any, disable_compile: bool = True) -> Callable[..., Any]:
-        from ..core.graph import cudagraph_mark_step_begin, torch_compiler_disable
+    def cudagraph_begin(
+        *args: Any, disable_compile: bool = True
+    ) -> Callable[..., Any]:
+        from ..core.graph import (
+            cudagraph_mark_step_begin,
+            torch_compiler_disable,
+        )
 
         def _op(*a: Any, **kw: Any) -> Any:
             cudagraph_mark_step_begin()
@@ -1641,14 +1815,21 @@ class GraphSequential(nn.Module):
 
         _op = GraphSequential._tag_control(_op, "cudagraph_begin")
         return (
-            torch_compiler_disable(_op, reason="subgraph:cudagraph_begin", recursive=False)
+            torch_compiler_disable(
+                _op, reason="subgraph:cudagraph_begin", recursive=False
+            )
             if disable_compile
             else _op
         )
 
     @staticmethod
-    def cudagraph_end(*args: Any, disable_compile: bool = True) -> Callable[..., Any]:
-        from ..core.graph import cudagraph_mark_step_end, torch_compiler_disable
+    def cudagraph_end(
+        *args: Any, disable_compile: bool = True
+    ) -> Callable[..., Any]:
+        from ..core.graph import (
+            cudagraph_mark_step_end,
+            torch_compiler_disable,
+        )
 
         def _op(*a: Any, **kw: Any) -> Any:
             cudagraph_mark_step_end()
@@ -1660,7 +1841,9 @@ class GraphSequential(nn.Module):
 
         _op = GraphSequential._tag_control(_op, "cudagraph_end")
         return (
-            torch_compiler_disable(_op, reason="subgraph:cudagraph_end", recursive=False)
+            torch_compiler_disable(
+                _op, reason="subgraph:cudagraph_end", recursive=False
+            )
             if disable_compile
             else _op
         )
@@ -1750,27 +1933,41 @@ class GraphSequential(nn.Module):
             self._path_cache.clear()
         return self
 
-    def bind(self, root: nn.Module | None = None, *args: Any, strict: bool = True) -> "GraphSequential":
+    def bind(
+        self, root: nn.Module | None = None, *args: Any, strict: bool = True
+    ) -> "GraphSequential":
         if root is not None:
             self.set_root(root)
 
         rebound: list[tuple[object, ...]] = []
         for item in list(self._steps):
-            kind, payload, extra_args, extra_kwargs, meta = self._split_step(item)
+            kind, payload, extra_args, extra_kwargs, meta = self._split_step(
+                item
+            )
 
             if kind == "path":
                 path = str(payload)
                 mod = self._resolve_path(path)
                 m = dict(meta) if isinstance(meta, dict) else {}
                 m["path"] = path
-                rebound.append(("ref", weakref.ref(mod), extra_args, extra_kwargs, m))
+                rebound.append(
+                    ("ref", weakref.ref(mod), extra_args, extra_kwargs, m)
+                )
                 continue
 
             if kind == "ref" and payload is None:
                 path = meta.get("path") if isinstance(meta, dict) else None
                 if isinstance(path, str):
                     mod = self._resolve_path(path)
-                    rebound.append(("ref", weakref.ref(mod), extra_args, extra_kwargs, meta))
+                    rebound.append(
+                        (
+                            "ref",
+                            weakref.ref(mod),
+                            extra_args,
+                            extra_kwargs,
+                            meta,
+                        )
+                    )
                     continue
                 if strict:
                     raise RuntimeError(
@@ -1789,8 +1986,12 @@ class GraphSequential(nn.Module):
             cur = args[0] if len(args) == 1 else tuple(args)
 
         for item in self._steps:
-            kind, payload, extra_args, extra_kwargs, meta = self._split_step(item)
-            cur = self._apply_step(kind, payload, cur, extra_args, extra_kwargs, meta=meta)
+            kind, payload, extra_args, extra_kwargs, meta = self._split_step(
+                item
+            )
+            cur = self._apply_step(
+                kind, payload, cur, extra_args, extra_kwargs, meta=meta
+            )
 
         return self._apply_out_shape(cur)
 
@@ -1804,11 +2005,17 @@ class GraphSequential(nn.Module):
         sanitized: list[tuple[object, ...]] = []
         if isinstance(steps, list):
             for item in steps:
-                kind, payload, extra_args, extra_kwargs, meta = self._split_step(item)
+                kind, payload, extra_args, extra_kwargs, meta = (
+                    self._split_step(item)
+                )
                 if kind == "ref":
-                    sanitized.append((kind, None, extra_args, extra_kwargs, meta))
+                    sanitized.append(
+                        (kind, None, extra_args, extra_kwargs, meta)
+                    )
                 else:
-                    sanitized.append((kind, payload, extra_args, extra_kwargs, meta))
+                    sanitized.append(
+                        (kind, payload, extra_args, extra_kwargs, meta)
+                    )
             state["_steps"] = sanitized
 
         state["_root_ref"] = None
@@ -1826,11 +2033,17 @@ class GraphSequential(nn.Module):
             self._root_ref = None
 
     @staticmethod
-    def _parse_step(raw: object) -> tuple[object, tuple[Any, ...], dict[str, Any]]:
+    def _parse_step(
+        raw: object,
+    ) -> tuple[object, tuple[Any, ...], dict[str, Any]]:
         if isinstance(raw, (tuple, list)):
             if len(raw) == 2 and isinstance(raw[1], dict):
                 return raw[0], (), dict(raw[1])
-            if len(raw) == 3 and isinstance(raw[1], (tuple, list)) and isinstance(raw[2], dict):
+            if (
+                len(raw) == 3
+                and isinstance(raw[1], (tuple, list))
+                and isinstance(raw[2], dict)
+            ):
                 return raw[0], tuple(raw[1]), dict(raw[2])
         return raw, (), {}
 
@@ -1860,13 +2073,17 @@ class GraphSequential(nn.Module):
         elif isinstance(raw_kwargs, dict):
             extra_kwargs = dict(raw_kwargs)
         else:
-            extra_kwargs = dict(raw_kwargs) if hasattr(raw_kwargs, "items") else {}
+            extra_kwargs = (
+                dict(raw_kwargs) if hasattr(raw_kwargs, "items") else {}
+            )
 
         meta = item[4] if len(item) >= 5 else None
         return kind, payload, extra_args, extra_kwargs, meta
 
     @staticmethod
-    def _normalize_out_shape(out_shape: object | None) -> tuple[str | None, object | None]:
+    def _normalize_out_shape(
+        out_shape: object | None,
+    ) -> tuple[str | None, object | None]:
         if out_shape is None:
             return None, None
         if isinstance(out_shape, dict):
@@ -1932,12 +2149,16 @@ class GraphSequential(nn.Module):
                 else:
                     nxt = getattr(cur, part, None)
                 if not isinstance(nxt, nn.Module):
-                    raise AttributeError(f"Failed to resolve submodule path {path!r} at {part!r}.")
+                    raise AttributeError(
+                        f"Failed to resolve submodule path {path!r} at {part!r}."
+                    )
                 cur = nxt
             mod = cur
 
         if not isinstance(mod, nn.Module):
-            raise TypeError(f"get_submodule({path!r}) did not return an nn.Module")
+            raise TypeError(
+                f"get_submodule({path!r}) did not return an nn.Module"
+            )
 
         with self._path_cache_lock:
             self._path_cache[path] = weakref.ref(mod)
@@ -1972,7 +2193,9 @@ class GraphSequential(nn.Module):
                         "A shared submodule reference was cleared (or not bound) before GraphSequential.forward()."
                     )
             if not isinstance(mod, nn.Module):
-                raise TypeError(f"GraphSequential ref step did not resolve to nn.Module: {type(mod)!r}")
+                raise TypeError(
+                    f"GraphSequential ref step did not resolve to nn.Module: {type(mod)!r}"
+                )
             return mod(*args, **kwargs)
         if kind == "owned":
             return self._owned[int(payload)](*args, **kwargs)
@@ -1986,40 +2209,58 @@ class GraphSequential(nn.Module):
         if kind is None or spec is None:
             return out
 
-        def _reshape_one(t: torch.Tensor, shape: tuple[int, ...]) -> torch.Tensor:
+        def _reshape_one(
+            t: torch.Tensor, shape: tuple[int, ...]
+        ) -> torch.Tensor:
             if t.ndim == 0:
-                raise RuntimeError("Cannot reshape a scalar output in GraphSequential.")
+                raise RuntimeError(
+                    "Cannot reshape a scalar output in GraphSequential."
+                )
             return t.reshape(t.shape[0], *shape)
 
         if kind == "single":
             if not isinstance(out, torch.Tensor):
-                raise RuntimeError("out_shape is set but the pipeline output is not a Tensor.")
+                raise RuntimeError(
+                    "out_shape is set but the pipeline output is not a Tensor."
+                )
             return _reshape_one(out, spec)
 
         if kind == "seq":
             if not isinstance(out, (tuple, list)):
-                raise RuntimeError("out_shape expects tuple/list output but got a different type.")
+                raise RuntimeError(
+                    "out_shape expects tuple/list output but got a different type."
+                )
             shapes = list(spec)
             if len(out) != len(shapes):
-                raise RuntimeError("out_shape length does not match tuple/list output length.")
+                raise RuntimeError(
+                    "out_shape length does not match tuple/list output length."
+                )
             out_list = list(out)
             for i, sh in enumerate(shapes):
                 if sh is None:
                     continue
                 if not isinstance(out_list[i], torch.Tensor):
-                    raise RuntimeError("out_shape expects Tensor outputs in tuple/list.")
+                    raise RuntimeError(
+                        "out_shape expects Tensor outputs in tuple/list."
+                    )
                 out_list[i] = _reshape_one(out_list[i], sh)
             return tuple(out_list) if isinstance(out, tuple) else out_list
         if not isinstance(out, dict):
-            raise RuntimeError("out_shape expects dict output but got a different type.")
+            raise RuntimeError(
+                "out_shape expects dict output but got a different type."
+            )
         out_dict = dict(out)
         for k, sh in spec.items():
             if sh is None:
                 continue
             if k not in out_dict:
-                raise RuntimeError(f"out_shape missing key in output dict: {k!r}")
+                raise RuntimeError(
+                    f"out_shape missing key in output dict: {k!r}"
+                )
             if not isinstance(out_dict[k], torch.Tensor):
-                raise RuntimeError("out_shape expects Tensor values in dict output.")
+                raise RuntimeError(
+                    "out_shape expects Tensor values in dict output."
+                )
             out_dict[k] = _reshape_one(out_dict[k], sh)
         return out_dict
 
@@ -2038,11 +2279,15 @@ class GraphSequential(nn.Module):
 
         steps_out: list[object] = []
         for item in list(self._steps):
-            kind, payload, extra_args, extra_kwargs, meta = self._split_step(item)
+            kind, payload, extra_args, extra_kwargs, meta = self._split_step(
+                item
+            )
 
             if kind == "fn":
                 fn = payload
-                if strip_control_ops and bool(getattr(fn, self._CONTROL_ATTR, "")):
+                if strip_control_ops and bool(
+                    getattr(fn, self._CONTROL_ATTR, "")
+                ):
                     continue
                 step_obj: object = fn
             else:
@@ -2053,10 +2298,16 @@ class GraphSequential(nn.Module):
                     mod = self._resolve_path(str(payload))
                 elif kind == "ref":
                     mod = payload() if callable(payload) else None
-                    if mod is None and isinstance(meta, dict) and isinstance(meta.get("path"), str):
+                    if (
+                        mod is None
+                        and isinstance(meta, dict)
+                        and isinstance(meta.get("path"), str)
+                    ):
                         mod = self._resolve_path(str(meta.get("path")))
                 else:
-                    raise TypeError(f"Unknown GraphSequential step kind: {kind!r}")
+                    raise TypeError(
+                        f"Unknown GraphSequential step kind: {kind!r}"
+                    )
 
                 if not isinstance(mod, nn.Module):
                     raise RuntimeError(
@@ -2085,7 +2336,11 @@ class GraphSequential(nn.Module):
 
         out = GraphSequential(
             steps=steps_out,
-            out_shape=(self._out_shape_spec if self._out_shape_kind is not None else None),
+            out_shape=(
+                self._out_shape_spec
+                if self._out_shape_kind is not None
+                else None
+            ),
             name=str(name or f"{self._name}_serving"),
             root=None,
         )

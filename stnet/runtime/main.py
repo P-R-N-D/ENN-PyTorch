@@ -26,7 +26,12 @@ import torch
 import torch.distributed
 import torch.nn as nn
 from tensordict import TensorDictBase
-from torch.distributed.checkpoint import FileSystemReader, FileSystemWriter, load, save
+from torch.distributed.checkpoint import (
+    FileSystemReader,
+    FileSystemWriter,
+    load,
+    save,
+)
 from torch.distributed.checkpoint.state_dict import (
     StateDictOptions,
     get_model_state_dict,
@@ -37,7 +42,12 @@ from torch.distributed.checkpoint.state_dict import (
 from torch.distributed.elastic.control_plane import worker_main
 
 from ..config import RuntimeConfig, coerce_model_config
-from ..core.concurrency import TensorSpooler, Mutex, TensorPagePool, new_affinity
+from ..core.concurrency import (
+    TensorSpooler,
+    Mutex,
+    TensorPagePool,
+    new_affinity,
+)
 from ..core.system import (
     CPU,
     Memory,
@@ -66,7 +76,14 @@ from ..core.system import (
     sync_accelerator,
     posix_time,
 )
-from ..core.datatypes import env_bool, env_first, env_first_int, env_float, env_int, env_str
+from ..core.datatypes import (
+    env_bool,
+    env_first,
+    env_first_int,
+    env_float,
+    env_int,
+    env_str,
+)
 from ..core.tensor import is_meta_or_fake_tensor, to_torch_tensor
 from ..core.distributed import (
     broadcast_scalar,
@@ -105,7 +122,11 @@ from .losses import (
     StudentsTLoss,
     TiledLoss,
 )
-from .optimizers import AdamW, ExponentialMovingAverage, StochasticWeightAverage
+from .optimizers import (
+    AdamW,
+    ExponentialMovingAverage,
+    StochasticWeightAverage,
+)
 from ..data import collate
 from ..data.collate import ShardCollector
 from ..data.pipeline import Dataset
@@ -134,7 +155,9 @@ except Exception:
 MB_DIV = 1024.0 * 1024.0
 PathLike: TypeAlias = str | os.PathLike[str] | Path
 JsonPrimitive: TypeAlias = str | int | float | bool | None
-JsonValue: TypeAlias = JsonPrimitive | list["JsonValue"] | dict[str, "JsonValue"]
+JsonValue: TypeAlias = (
+    JsonPrimitive | list["JsonValue"] | dict[str, "JsonValue"]
+)
 TorchDeviceLike: TypeAlias = torch.device | str | int
 ReturnSink: TypeAlias = MutableMapping[str, object]
 
@@ -173,7 +196,9 @@ _IGNORED_WARNING_PATTERNS: tuple[str, ...] = (
     "Either mode or options can be specified, but both can't be specified at the same time\\.",
 )
 _IGNORED_WARNING_MESSAGE_RE = re.compile(
-    r".*(?:" + "|".join((f"(?:{p})" for p in _IGNORED_WARNING_PATTERNS)) + r").*"
+    r".*(?:"
+    + "|".join((f"(?:{p})" for p in _IGNORED_WARNING_PATTERNS))
+    + r").*"
 )
 
 _DL_STATE_FILE = "dataloader.json"
@@ -181,11 +206,17 @@ _DL_STATE_FILE = "dataloader.json"
 
 @lru_cache(maxsize=4)
 def _is_nvml_disabled() -> bool:
-    return env_bool("STNET_NVML_DISABLE", False) or not env_bool("STNET_NVML", True)
+    return env_bool("STNET_NVML_DISABLE", False) or not env_bool(
+        "STNET_NVML", True
+    )
 
 
 def _nvml_cfg(key: str, default: object, cast_fn: type = int) -> object:
-    return cast_fn(env_first((f"STNET_NVML_{key}", f"STNET_NVML_{key}_S"), default=default))
+    return cast_fn(
+        env_first(
+            (f"STNET_NVML_{key}", f"STNET_NVML_{key}_S"), default=default
+        )
+    )
 
 
 def _is_nvml_blocked(now: object | None = None) -> object:
@@ -253,7 +284,9 @@ def _validate_compile_safe() -> None:
 
 @lru_cache(maxsize=8)
 def _is_clock_synchronized(dev_type: str) -> bool:
-    if _env_flag("STNET_TIMER_SYNC", False) or _env_flag("STNET_WALLCLOCK_TIMER_SYNC", False):
+    if _env_flag("STNET_TIMER_SYNC", False) or _env_flag(
+        "STNET_WALLCLOCK_TIMER_SYNC", False
+    ):
         return True
     dt = str(dev_type or "cpu")
     return _env_flag(f"STNET_{dt.upper()}_TIMER_SYNC", False)
@@ -261,7 +294,9 @@ def _is_clock_synchronized(dev_type: str) -> bool:
 
 def _is_event_timer_available(device: torch.device) -> bool:
     try:
-        return bool(is_accelerator_timer_supported(str(getattr(device, "type", "cpu"))))
+        return bool(
+            is_accelerator_timer_supported(str(getattr(device, "type", "cpu")))
+        )
     except Exception:
         return False
 
@@ -351,14 +386,23 @@ def _get_torch_profiler(
     warmup = max(0, int(_env_int("STNET_TORCH_PROFILE_WARMUP", 2)))
     active = max(
         1,
-        int(_env_int("STNET_TORCH_PROFILE_ACTIVE", _env_int("STNET_TORCH_PROFILE_STEPS", 8))),
+        int(
+            _env_int(
+                "STNET_TORCH_PROFILE_ACTIVE",
+                _env_int("STNET_TORCH_PROFILE_STEPS", 8),
+            )
+        ),
     )
     repeat = max(1, int(_env_int("STNET_TORCH_PROFILE_REPEAT", 1)))
     record_shapes = bool(_env_flag("STNET_TORCH_PROFILE_RECORD_SHAPES", False))
-    profile_memory = bool(_env_flag("STNET_TORCH_PROFILE_PROFILE_MEMORY", True))
+    profile_memory = bool(
+        _env_flag("STNET_TORCH_PROFILE_PROFILE_MEMORY", True)
+    )
     with_stack = bool(_env_flag("STNET_TORCH_PROFILE_WITH_STACK", False))
     with_flops = bool(_env_flag("STNET_TORCH_PROFILE_WITH_FLOPS", False))
-    group_by_shape = bool(_env_flag("STNET_TORCH_PROFILE_GROUP_BY_SHAPE", False))
+    group_by_shape = bool(
+        _env_flag("STNET_TORCH_PROFILE_GROUP_BY_SHAPE", False)
+    )
     row_limit = max(5, int(_env_int("STNET_TORCH_PROFILE_TOPK", 40)))
     if not out_dir:
         out_dir = os.path.join(os.getcwd(), "torch_profiler")
@@ -367,8 +411,12 @@ def _get_torch_profiler(
         os.makedirs(out_dir, exist_ok=True)
     worker_name = f"{str(tag)}-rank{int(rank)}"
     try:
-        schedule = tp.schedule(wait=wait, warmup=warmup, active=active, repeat=repeat)
-        on_trace = tp.tensorboard_trace_handler(out_dir, worker_name=worker_name)
+        schedule = tp.schedule(
+            wait=wait, warmup=warmup, active=active, repeat=repeat
+        )
+        on_trace = tp.tensorboard_trace_handler(
+            out_dir, worker_name=worker_name
+        )
         prof = tp.profile(
             activities=activities,
             schedule=schedule,
@@ -408,7 +456,11 @@ def _get_profiler_summary(
         if "ka" not in locals():
             return
     table = None
-    for sk in ("self_cuda_time_total", "self_xpu_time_total", "self_cpu_time_total"):
+    for sk in (
+        "self_cuda_time_total",
+        "self_xpu_time_total",
+        "self_cpu_time_total",
+    ):
         with contextlib.suppress(Exception):
             table = ka.table(sort_by=str(sk), row_limit=row_limit)
             if table:
@@ -445,7 +497,10 @@ def _oom_max_retries(phase: object) -> object:
             _env_int("STNET_OOM_MAX_RETRIES_PER_BATCH", 4),
         )
     elif phase in {"val", "valid", "validation"}:
-        v = _env_int("STNET_OOM_MAX_RETRIES_VAL", _env_int("STNET_OOM_MAX_RETRIES_PER_BATCH", 2))
+        v = _env_int(
+            "STNET_OOM_MAX_RETRIES_VAL",
+            _env_int("STNET_OOM_MAX_RETRIES_PER_BATCH", 2),
+        )
     else:
         v = _env_int("STNET_OOM_MAX_RETRIES_PER_BATCH", 3)
     return max(0, int(v))
@@ -454,9 +509,13 @@ def _oom_max_retries(phase: object) -> object:
 def _is_batch_skippable(phase: object) -> bool:
     phase = str(phase).strip().lower()
     if phase == "train":
-        return _env_flag("STNET_OOM_SKIP_TRAIN", _env_flag("STNET_OOM_SKIP_BATCH", True))
+        return _env_flag(
+            "STNET_OOM_SKIP_TRAIN", _env_flag("STNET_OOM_SKIP_BATCH", True)
+        )
     elif phase in {"val", "valid", "validation"}:
-        return _env_flag("STNET_OOM_SKIP_VAL", _env_flag("STNET_OOM_SKIP_BATCH", True))
+        return _env_flag(
+            "STNET_OOM_SKIP_VAL", _env_flag("STNET_OOM_SKIP_BATCH", True)
+        )
     return _env_flag("STNET_OOM_SKIP_BATCH", True)
 
 
@@ -476,7 +535,9 @@ def _is_scale_rate_logged(
     min_interval_s: float | None = None,
 ) -> None:
     if min_interval_s is None:
-        min_interval_s = _env_float("STNET_SAMPLER_SCALE_LOG_MIN_INTERVAL_S", 5.0)
+        min_interval_s = _env_float(
+            "STNET_SAMPLER_SCALE_LOG_MIN_INTERVAL_S", 5.0
+        )
     try:
         min_interval_s = float(min_interval_s)
     except Exception:
@@ -499,7 +560,9 @@ def _is_scale_rate_logged(
         pass
 
 
-def _get_sampler_scaler(loader: object, *args: Any, max_depth: int = 4) -> object:
+def _get_sampler_scaler(
+    loader: object, *args: Any, max_depth: int = 4
+) -> object:
     obj = loader
     try:
         depth = max(1, int(max_depth))
@@ -548,7 +611,9 @@ def _recover_oom(
     max_tries = _oom_max_retries(ph)
     log_fn = _LOGGER.error if oom_try <= 1 else _LOGGER.warning
     context = "Reducing MB/GA" if oom_try <= 1 else "Retrying"
-    gs_info = f" (global_step={global_step})" if global_step is not None else ""
+    gs_info = (
+        f" (global_step={global_step})" if global_step is not None else ""
+    )
     log_fn(
         "[epochs] OOM in %s step %d%s. %s. (try=%d/%d)",
         str(ph),
@@ -568,7 +633,9 @@ def _recover_oom(
             with contextlib.suppress(Exception):
                 _clear_oom_retries(loader, ph, int(step_idx))
             with contextlib.suppress(Exception):
-                empty_device_cache(device=device, do_gc=False, min_interval_s=0.0)
+                empty_device_cache(
+                    device=device, do_gc=False, min_interval_s=0.0
+                )
             if optimizer is not None:
                 with contextlib.suppress(Exception):
                     optimizer.zero_grad(set_to_none=True)
@@ -595,9 +662,13 @@ def _recover_oom(
         with contextlib.suppress(Exception):
             optimizer.zero_grad(set_to_none=True)
 
-    inst_pressure = to_submodule(model) or (model.module if hasattr(model, "module") else model)
+    inst_pressure = to_submodule(model) or (
+        model.module if hasattr(model, "module") else model
+    )
     if inst_pressure is not None and int(oom_try) <= 1:
-        cur_step_total = int(getattr(inst_pressure, "_stnet_step_total", 0) or 0)
+        cur_step_total = int(
+            getattr(inst_pressure, "_stnet_step_total", 0) or 0
+        )
         if to_checkpoint(
             model,
             device=device,
@@ -626,7 +697,11 @@ def _recover_oom(
                 with contextlib.suppress(Exception):
                     inst.microbatch = int(new_mb)
                     inst._auto_microbatch_pending = False
-                _LOGGER.info("[epochs] reduced microbatch %d->%d", int(cur_mb), int(new_mb))
+                _LOGGER.info(
+                    "[epochs] reduced microbatch %d->%d",
+                    int(cur_mb),
+                    int(new_mb),
+                )
                 reduced_any = True
     if ph == "train" and grad_accum_steps is not None:
         try:
@@ -640,7 +715,11 @@ def _recover_oom(
             except Exception:
                 pass
             if int(new_ga) != int(cur_ga):
-                _LOGGER.info("[epochs] reduced grad_accum %d->%d", int(cur_ga), int(new_ga))
+                _LOGGER.info(
+                    "[epochs] reduced grad_accum %d->%d",
+                    int(cur_ga),
+                    int(new_ga),
+                )
                 grad_accum_steps = int(new_ga)
                 reduced_any = True
     if not reduced_any:
@@ -649,7 +728,9 @@ def _recover_oom(
             with contextlib.suppress(Exception):
                 _clear_oom_retries(loader, ph, int(step_idx))
             with contextlib.suppress(Exception):
-                empty_device_cache(device=device, do_gc=False, min_interval_s=0.0)
+                empty_device_cache(
+                    device=device, do_gc=False, min_interval_s=0.0
+                )
             if optimizer is not None:
                 with contextlib.suppress(Exception):
                     optimizer.zero_grad(set_to_none=True)
@@ -688,7 +769,9 @@ def _get_batch_length(loader: object) -> object:
     return 0
 
 
-def _float8_log(msg: str, *args: Any, only_main_rank: bool = True, **kwargs: Any) -> None:
+def _float8_log(
+    msg: str, *args: Any, only_main_rank: bool = True, **kwargs: Any
+) -> None:
     try:
         if (
             only_main_rank
@@ -714,7 +797,9 @@ def _validate_no_meta_tensors(module: object) -> None:
         raise RuntimeError("Found meta tensors in model:\n" + "\n".join(hits))
 
 
-def _hook_meta_monitor(module: object, inputs: object, warn_only: object) -> None:
+def _hook_meta_monitor(
+    module: object, inputs: object, warn_only: object
+) -> None:
     for arg in inputs:
         if isinstance(arg, torch.Tensor) and is_meta_or_fake_tensor(arg):
             message = f"[META] {module.__class__.__name__} got meta input"
@@ -726,7 +811,10 @@ def _hook_meta_monitor(module: object, inputs: object, warn_only: object) -> Non
 
 def _enable_meta_monitor(model: object) -> None:
     hook_mode = (
-        str(env_first(("STNET_META_MONITOR", "STNET_META_HOOK"), default="off") or "off")
+        str(
+            env_first(("STNET_META_MONITOR", "STNET_META_HOOK"), default="off")
+            or "off"
+        )
         .strip()
         .lower()
     )
@@ -739,7 +827,9 @@ def _enable_meta_monitor(model: object) -> None:
         )
 
 
-def _validate_no_fake_dtensor(root: nn.Module, *args: Any, **kwargs: Any) -> None:
+def _validate_no_fake_dtensor(
+    root: nn.Module, *args: Any, **kwargs: Any
+) -> None:
     bad = []
     for name, module in root.named_modules():
         if not isinstance(module, nn.LayerNorm):
@@ -754,7 +844,8 @@ def _validate_no_fake_dtensor(root: nn.Module, *args: Any, **kwargs: Any) -> Non
                 bad.append(f"{module_name}.{attr}{tuple(tensor.shape)}")
     if bad:
         raise RuntimeError(
-            "LayerNorm parameters must be materialized as a real Tensor: " + ", ".join(bad)
+            "LayerNorm parameters must be materialized as a real Tensor: "
+            + ", ".join(bad)
         )
 
 
@@ -841,7 +932,9 @@ def _touch_tensors(obj: object) -> None:
         return
 
 
-def _cast_batchnorm_buffers_dtype(module: object, dtype: torch.dtype | None) -> None:
+def _cast_batchnorm_buffers_dtype(
+    module: object, dtype: torch.dtype | None
+) -> None:
     if dtype is None:
         return
     if not isinstance(dtype, torch.dtype):
@@ -871,7 +964,11 @@ def _cast_batchnorm_buffers_dtype(module: object, dtype: torch.dtype | None) -> 
 def _get_layernorm_dtype(device: TorchDeviceLike) -> object:
     try:
         meta = Autocast.coerce_metadata(device)
-        cands = tuple(getattr(meta, "float_dtypes", ())) if meta is not None else ()
+        cands = (
+            tuple(getattr(meta, "float_dtypes", ()))
+            if meta is not None
+            else ()
+        )
         if not cands:
             cands = (torch.float32,)
         chosen = Autocast.negotiate(
@@ -899,29 +996,51 @@ def _preload_layers(model: object, device: TorchDeviceLike) -> None:
         else:
             target_dtype = None
             for tensor in (weight, bias):
-                if isinstance(tensor, torch.Tensor) and tensor.is_floating_point():
+                if (
+                    isinstance(tensor, torch.Tensor)
+                    and tensor.is_floating_point()
+                ):
                     if not is_meta_or_fake_tensor(tensor):
                         target_dtype = tensor.dtype
                         break
             if target_dtype is None:
                 target_dtype = torch.get_default_dtype()
         if module.elementwise_affine:
-            if not isinstance(weight, torch.Tensor) or is_meta_or_fake_tensor(weight):
-                data = torch.ones(module.normalized_shape, device=device, dtype=target_dtype)
-                _set_requires_grad(module, "weight", data, requires_grad=requires_grad_w)
+            if not isinstance(weight, torch.Tensor) or is_meta_or_fake_tensor(
+                weight
+            ):
+                data = torch.ones(
+                    module.normalized_shape, device=device, dtype=target_dtype
+                )
+                _set_requires_grad(
+                    module, "weight", data, requires_grad=requires_grad_w
+                )
                 weight = module.weight
-            if not isinstance(bias, torch.Tensor) or is_meta_or_fake_tensor(bias):
-                data = torch.zeros(module.normalized_shape, device=device, dtype=target_dtype)
-                _set_requires_grad(module, "bias", data, requires_grad=requires_grad_b)
+            if not isinstance(bias, torch.Tensor) or is_meta_or_fake_tensor(
+                bias
+            ):
+                data = torch.zeros(
+                    module.normalized_shape, device=device, dtype=target_dtype
+                )
+                _set_requires_grad(
+                    module, "bias", data, requires_grad=requires_grad_b
+                )
                 bias = module.bias
         if device.type == "cpu":
-            if isinstance(weight, torch.Tensor) and weight.dtype != target_dtype:
+            if (
+                isinstance(weight, torch.Tensor)
+                and weight.dtype != target_dtype
+            ):
                 data = weight.to(device=device, dtype=target_dtype)
-                _set_requires_grad(module, "weight", data, requires_grad=requires_grad_w)
+                _set_requires_grad(
+                    module, "weight", data, requires_grad=requires_grad_w
+                )
                 weight = module.weight
             if isinstance(bias, torch.Tensor) and bias.dtype != target_dtype:
                 data = bias.to(device=device, dtype=target_dtype)
-                _set_requires_grad(module, "bias", data, requires_grad=requires_grad_b)
+                _set_requires_grad(
+                    module, "bias", data, requires_grad=requires_grad_b
+                )
                 bias = module.bias
         elif (
             isinstance(weight, torch.Tensor)
@@ -931,11 +1050,15 @@ def _preload_layers(model: object, device: TorchDeviceLike) -> None:
             and (bias.dtype != weight.dtype)
         ):
             data = bias.to(device=device, dtype=weight.dtype)
-            _set_requires_grad(module, "bias", data, requires_grad=requires_grad_b)
+            _set_requires_grad(
+                module, "bias", data, requires_grad=requires_grad_b
+            )
             bias = module.bias
 
 
-def _validate_model_dtype_unity(model: object, device: TorchDeviceLike) -> None:
+def _validate_model_dtype_unity(
+    model: object, device: TorchDeviceLike
+) -> None:
     mismatches = []
     for name, module in model.named_modules():
         if not isinstance(module, nn.LayerNorm):
@@ -950,7 +1073,10 @@ def _validate_model_dtype_unity(model: object, device: TorchDeviceLike) -> None:
         else:
             expected = None
         for label, tensor in tensors:
-            if not isinstance(tensor, torch.Tensor) or not tensor.is_floating_point():
+            if (
+                not isinstance(tensor, torch.Tensor)
+                or not tensor.is_floating_point()
+            ):
                 continue
             if expected is None:
                 expected = tensor.dtype
@@ -963,13 +1089,19 @@ def _validate_model_dtype_unity(model: object, device: TorchDeviceLike) -> None:
             dtypes = {
                 tensor.dtype
                 for _, tensor in tensors
-                if isinstance(tensor, torch.Tensor) and tensor.is_floating_point()
+                if isinstance(tensor, torch.Tensor)
+                and tensor.is_floating_point()
             }
             if len(dtypes) > 1:
                 module_name = name or module.__class__.__name__
-                mismatches.append(f"{module_name} parameters disagree on dtype: {sorted(dtypes)}")
+                mismatches.append(
+                    f"{module_name} parameters disagree on dtype: {sorted(dtypes)}"
+                )
     if mismatches:
-        raise RuntimeError("LayerNorm parameter dtype mismatch detected:\n" + "\n".join(mismatches))
+        raise RuntimeError(
+            "LayerNorm parameter dtype mismatch detected:\n"
+            + "\n".join(mismatches)
+        )
 
 
 def _coerce_dcp_keys(state: object) -> object:
@@ -1073,7 +1205,9 @@ def _unify_model_dtype(model: object, prefer: object | None = None) -> object:
         for name, p in params.items():
             if p is None or p.dtype == tgt:
                 continue
-            new_p = torch.nn.Parameter(p.detach().to(tgt), requires_grad=p.requires_grad)
+            new_p = torch.nn.Parameter(
+                p.detach().to(tgt), requires_grad=p.requires_grad
+            )
             setattr(mod, name, new_p)
     return tgt
 
@@ -1115,7 +1249,11 @@ def _get_sample_size(
     except Exception:
         out_dim = 1
     elem_size = torch.empty((), dtype=torch.float64).element_size()
-    floor_bytes = int((in_dim + out_dim) * elem_size * 10240) if in_dim + out_dim > 0 else 0
+    floor_bytes = (
+        int((in_dim + out_dim) * elem_size * 10240)
+        if in_dim + out_dim > 0
+        else 0
+    )
     dev_type = getattr(device, "type", "")
     if dev_type not in {"cuda", "xpu", "mps"}:
         return
@@ -1143,7 +1281,11 @@ def _get_sample_size(
         batch = ds.get(0, B0)
         forward_ran = False
         training_mode = bool(model.training)
-        meta = dataset if isinstance(dataset, Dataset) else Dataset.for_device(device)
+        meta = (
+            dataset
+            if isinstance(dataset, Dataset)
+            else Dataset.for_device(device)
+        )
         try:
             from ..core.graph import inference_mode
             from ..core.precision import Autocast
@@ -1151,8 +1293,12 @@ def _get_sample_size(
             feats, labels, *_rest = meta.preprocess(batch, return_keys=False)
             X = to_torch_tensor(feats)
             X = torch.atleast_2d(X)
-            if X.dim() == 2 and int(X.shape[1]) == int(getattr(ops, "in_dim", X.shape[1])):
-                X = X.to(device=device, non_blocking=is_pin_supported(device.type))
+            if X.dim() == 2 and int(X.shape[1]) == int(
+                getattr(ops, "in_dim", X.shape[1])
+            ):
+                X = X.to(
+                    device=device, non_blocking=is_pin_supported(device.type)
+                )
                 if with_backward:
                     model.train()
                     with Autocast.float(device):
@@ -1183,14 +1329,23 @@ def _get_sample_size(
                         forward_ran = True
                 else:
                     with inference_mode(model), Autocast.float(device):
-                        warmup_iters = int(_env_int("STNET_SERVE_WARMUP_ITERS", 0) or 0)
+                        warmup_iters = int(
+                            _env_int("STNET_SERVE_WARMUP_ITERS", 0) or 0
+                        )
                         if (
                             warmup_iters <= 0
-                            and str(getattr(ops, "mode", "") or "") in ("predict", "infer")
+                            and str(getattr(ops, "mode", "") or "")
+                            in ("predict", "infer")
                             and _env_flag("STNET_MAX_PERF", True)
                         ):
-                            m_eval = model.module if hasattr(model, "module") else model
-                            compiled = getattr(m_eval, "_compiled_submodules", None)
+                            m_eval = (
+                                model.module
+                                if hasattr(model, "module")
+                                else model
+                            )
+                            compiled = getattr(
+                                m_eval, "_compiled_submodules", None
+                            )
                             warmup_iters = (
                                 3
                                 if (
@@ -1241,9 +1396,16 @@ def _get_sample_size(
         if per_sample <= 0:
             return
         with contextlib.suppress(Exception):
-            if torch.distributed.is_available() and torch.distributed.is_initialized():
-                t = torch.tensor([int(per_sample)], device=device, dtype=torch.long)
-                torch.distributed.all_reduce(t, op=torch.distributed.ReduceOp.MAX)
+            if (
+                torch.distributed.is_available()
+                and torch.distributed.is_initialized()
+            ):
+                t = torch.tensor(
+                    [int(per_sample)], device=device, dtype=torch.long
+                )
+                torch.distributed.all_reduce(
+                    t, op=torch.distributed.ReduceOp.MAX
+                )
                 per_sample = int(t.item())
         try:
             Sampler._per_sample_mem_bytes = int(per_sample)
@@ -1263,8 +1425,12 @@ def _init_tensor(
     fused: bool,
     **kwargs: Any,
 ) -> torch.Tensor:
-    desired_device = param.device if capturable or fused else torch.device("cpu")
-    desired_dtype = param.dtype if torch.is_floating_point(param) else torch.float32
+    desired_device = (
+        param.device if capturable or fused else torch.device("cpu")
+    )
+    desired_dtype = (
+        param.dtype if torch.is_floating_point(param) else torch.float32
+    )
     if isinstance(value, torch.Tensor):
         step_tensor = value.detach()
         if step_tensor.ndim != 0:
@@ -1275,7 +1441,9 @@ def _init_tensor(
             step_tensor = step_tensor.to(desired_dtype)
     else:
         base = float(value) if value is not None else 0.0
-        step_tensor = torch.tensor(base, dtype=desired_dtype, device=desired_device)
+        step_tensor = torch.tensor(
+            base, dtype=desired_dtype, device=desired_device
+        )
     return step_tensor
 
 
@@ -1313,13 +1481,19 @@ def _schedule(
     **kwargs: Any,
 ) -> float:
     if warmup_steps > 0 and step < warmup_steps:
-        return start_factor + (1.0 - start_factor) * (step / max(1, warmup_steps))
+        return start_factor + (1.0 - start_factor) * (
+            step / max(1, warmup_steps)
+        )
     t = step - warmup_steps
     frac_min = emin / base if base > 0.0 else 0.0
-    return frac_min + (1.0 - frac_min) * 0.5 * (1.0 + math.cos(math.pi * t / max(1, main_steps)))
+    return frac_min + (1.0 - frac_min) * 0.5 * (
+        1.0 + math.cos(math.pi * t / max(1, main_steps))
+    )
 
 
-def _init_distributed_group(backend: object, device: TorchDeviceLike, local_rank: int) -> None:
+def _init_distributed_group(
+    backend: object, device: TorchDeviceLike, local_rank: int
+) -> None:
     dev_id = None
     dev_type = getattr(device, "type", "cpu")
     if dev_type in ("cuda", "xpu", "mps"):
@@ -1334,7 +1508,9 @@ def _init_distributed_group(backend: object, device: TorchDeviceLike, local_rank
             dev_id = index
     try:
         if dev_id is not None:
-            torch.distributed.init_process_group(backend=backend, device_id=dev_id)
+            torch.distributed.init_process_group(
+                backend=backend, device_id=dev_id
+            )
         else:
             torch.distributed.init_process_group(backend=backend)
     except TypeError:
@@ -1344,7 +1520,11 @@ def _init_distributed_group(backend: object, device: TorchDeviceLike, local_rank
 def _gpu_nvml_utils(device: TorchDeviceLike) -> object:
     if getattr(device, "type", "") != "cuda":
         return (None, None)
-    idx = device.index if device.index is not None else get_accelerator_index("cuda")
+    idx = (
+        device.index
+        if device.index is not None
+        else get_accelerator_index("cuda")
+    )
     idx_i = int(idx)
     gpu_util = None
     mem_util = None
@@ -1375,7 +1555,9 @@ def _gpu_nvml_utils(device: TorchDeviceLike) -> object:
                     if now - float(ts) < min_interval:
                         return (cg, cm)
             try:
-                h = _NVML_HANDLE_CACHE.setdefault(idx_i, _nvml.nvmlDeviceGetHandleByIndex(idx_i))
+                h = _NVML_HANDLE_CACHE.setdefault(
+                    idx_i, _nvml.nvmlDeviceGetHandleByIndex(idx_i)
+                )
                 u = _nvml.nvmlDeviceGetUtilizationRates(h)
                 mi = _nvml.nvmlDeviceGetMemoryInfo(h)
                 gpu_util = float(getattr(u, "gpu", 0.0))
@@ -1401,8 +1583,12 @@ def _gpu_nvml_utils(device: TorchDeviceLike) -> object:
                 trigger_backoff = False
                 with _NVML_LOCK:
                     _NVML_FAIL_COUNT = int(_NVML_FAIL_COUNT) + 1
-                    if backoff_s > 0.0 and int(_NVML_FAIL_COUNT) >= int(fail_max):
-                        _NVML_BACKOFF_UNTIL = float(time.perf_counter()) + float(backoff_s)
+                    if backoff_s > 0.0 and int(_NVML_FAIL_COUNT) >= int(
+                        fail_max
+                    ):
+                        _NVML_BACKOFF_UNTIL = float(
+                            time.perf_counter()
+                        ) + float(backoff_s)
                         _NVML_FAIL_COUNT = 0
                         trigger_backoff = True
                 if trigger_backoff:
@@ -1411,7 +1597,9 @@ def _gpu_nvml_utils(device: TorchDeviceLike) -> object:
                     with contextlib.suppress(Exception):
                         _NVML_UTIL_CACHE.clear()
                     with contextlib.suppress(Exception):
-                        _LOGGER.warning("[NVML] backing off %.1fs", float(backoff_s))
+                        _LOGGER.warning(
+                            "[NVML] backing off %.1fs", float(backoff_s)
+                        )
                 gpu_util = None
                 mem_util = None
             if gpu_util is not None or mem_util is not None:
@@ -1457,7 +1645,9 @@ def _pool_tensor(
     pinned_ok: bool | None = None,
 ) -> tuple[torch.Tensor, TensorPagePool.Token | None, bool]:
     if not torch.is_tensor(tensor):
-        raise TypeError(f"stage_tensor expects a torch.Tensor, got {type(tensor)}")
+        raise TypeError(
+            f"stage_tensor expects a torch.Tensor, got {type(tensor)}"
+        )
     if dev_type is None:
         dev_type = str(getattr(device, "type", "cpu"))
     if pinned_ok is None:
@@ -1472,7 +1662,9 @@ def _pool_tensor(
         if callable(is_pinned) and bool(is_pinned()) and tensor.dtype == dtype:
             return tensor, None, True
     if cpu_pool is not None and bool(pinned_ok):
-        buf, token = cpu_pool.get(tuple(tensor.shape), dtype, return_handle=True)
+        buf, token = cpu_pool.get(
+            tuple(tensor.shape), dtype, return_handle=True
+        )
         buf.copy_(tensor, non_blocking=False)
         pinned = False
         with contextlib.suppress(Exception):
@@ -1526,7 +1718,9 @@ def _stream_tensor(
                 cpu_pool.release(handle)
         return out
     if handle is None:
-        return tensor.to(device, non_blocking=bool(non_blocking_ok and pinned and pinned_ok))
+        return tensor.to(
+            device, non_blocking=bool(non_blocking_ok and pinned and pinned_ok)
+        )
     if backend is None:
         backend = accelerator_type(dev_type)
     if stream_fn is None and backend is not None:
@@ -1535,7 +1729,10 @@ def _stream_tensor(
         Event = getattr(backend, "Event", None)
     if can_stream_release is None:
         can_stream_release = bool(
-            pinned and pinned_ok and callable(stream_fn) and (Event is not None)
+            pinned
+            and pinned_ok
+            and callable(stream_fn)
+            and (Event is not None)
         )
     if (not bool(pinned)) or (not bool(can_stream_release)):
         out = tensor.to(device, non_blocking=False)
@@ -1614,7 +1811,12 @@ def _move_staged_pair_to_device(
     y_tok: TensorPagePool.Token | None,
     y_pinned: bool,
     to_device: object,
-) -> tuple[object, object | None, TensorPagePool.Token | None, TensorPagePool.Token | None]:
+) -> tuple[
+    object,
+    object | None,
+    TensorPagePool.Token | None,
+    TensorPagePool.Token | None,
+]:
     X_dev = to_device(X_st, handle=x_tok, pinned=x_pinned)
     x_tok = None
     Y_dev = None
@@ -1732,7 +1934,9 @@ def _pin(
 def _validate_distributed_group(meta: object, model: object) -> object:
     candidates = [(meta, "process_group"), (meta, "distributed_process_group")]
     tm = model.module if hasattr(model, "module") else model
-    candidates.extend([(tm, "process_group"), (tm, "distributed_process_group")])
+    candidates.extend(
+        [(tm, "process_group"), (tm, "distributed_process_group")]
+    )
     for obj, attr in candidates:
         try:
             pg = getattr(obj, attr, None)
@@ -1756,7 +1960,9 @@ def _reduce_sum(t: object, pg: object) -> None:
     if pg is None:
         torch.distributed.all_reduce(t, op=torch.distributed.ReduceOp.SUM)
     else:
-        torch.distributed.all_reduce(t, op=torch.distributed.ReduceOp.SUM, group=pg)
+        torch.distributed.all_reduce(
+            t, op=torch.distributed.ReduceOp.SUM, group=pg
+        )
 
 
 @torch.no_grad()
@@ -1807,8 +2013,16 @@ def _set_gate_factor(
     alpha = max(0.0, min(1.0, alpha))
     ema_low_buf = getattr(target_module, "p_gate_auto_k_ema_low_buf", None)
     ema_high_buf = getattr(target_module, "p_gate_auto_k_ema_high_buf", None)
-    ema_low_prev = float(ema_low_buf.item()) if isinstance(ema_low_buf, torch.Tensor) else 0.0
-    ema_high_prev = float(ema_high_buf.item()) if isinstance(ema_high_buf, torch.Tensor) else 0.0
+    ema_low_prev = (
+        float(ema_low_buf.item())
+        if isinstance(ema_low_buf, torch.Tensor)
+        else 0.0
+    )
+    ema_high_prev = (
+        float(ema_high_buf.item())
+        if isinstance(ema_high_buf, torch.Tensor)
+        else 0.0
+    )
     ema_low_new = (1.0 - alpha) * ema_low_prev + alpha * active_low_rate
     ema_high_new = (1.0 - alpha) * ema_high_prev + alpha * active_high_rate
     if isinstance(ema_low_buf, torch.Tensor):
@@ -1822,20 +2036,36 @@ def _set_gate_factor(
     if isinstance(ema_buf, torch.Tensor):
         with contextlib.suppress(Exception):
             ema_buf.fill_(float(ema_overall))
-    edge_enabled = bool(getattr(target_module, "p_gate_auto_k_edge_enabled", False))
-    edge_alpha = float(getattr(target_module, "p_gate_auto_k_edge_ema_alpha", alpha))
+    edge_enabled = bool(
+        getattr(target_module, "p_gate_auto_k_edge_enabled", False)
+    )
+    edge_alpha = float(
+        getattr(target_module, "p_gate_auto_k_edge_ema_alpha", alpha)
+    )
     edge_alpha = max(0.0, min(1.0, edge_alpha))
-    edge_ema_low_buf = getattr(target_module, "p_gate_auto_k_edge_ema_low_buf", None)
-    edge_ema_high_buf = getattr(target_module, "p_gate_auto_k_edge_ema_high_buf", None)
+    edge_ema_low_buf = getattr(
+        target_module, "p_gate_auto_k_edge_ema_low_buf", None
+    )
+    edge_ema_high_buf = getattr(
+        target_module, "p_gate_auto_k_edge_ema_high_buf", None
+    )
     edge_ema_buf = getattr(target_module, "p_gate_auto_k_edge_ema_buf", None)
     edge_ema_low_prev = (
-        float(edge_ema_low_buf.item()) if isinstance(edge_ema_low_buf, torch.Tensor) else 0.0
+        float(edge_ema_low_buf.item())
+        if isinstance(edge_ema_low_buf, torch.Tensor)
+        else 0.0
     )
     edge_ema_high_prev = (
-        float(edge_ema_high_buf.item()) if isinstance(edge_ema_high_buf, torch.Tensor) else 0.0
+        float(edge_ema_high_buf.item())
+        if isinstance(edge_ema_high_buf, torch.Tensor)
+        else 0.0
     )
-    edge_ema_low_new = (1.0 - edge_alpha) * edge_ema_low_prev + edge_alpha * edge_low_rate
-    edge_ema_high_new = (1.0 - edge_alpha) * edge_ema_high_prev + edge_alpha * edge_high_rate
+    edge_ema_low_new = (
+        1.0 - edge_alpha
+    ) * edge_ema_low_prev + edge_alpha * edge_low_rate
+    edge_ema_high_new = (
+        1.0 - edge_alpha
+    ) * edge_ema_high_prev + edge_alpha * edge_high_rate
     if isinstance(edge_ema_low_buf, torch.Tensor):
         with contextlib.suppress(Exception):
             edge_ema_low_buf.fill_(float(edge_ema_low_new))
@@ -1844,18 +2074,29 @@ def _set_gate_factor(
             edge_ema_high_buf.fill_(float(edge_ema_high_new))
     if isinstance(edge_ema_buf, torch.Tensor):
         with contextlib.suppress(Exception):
-            edge_ema_buf.fill_(float(0.5 * (edge_ema_low_new + edge_ema_high_new)))
+            edge_ema_buf.fill_(
+                float(0.5 * (edge_ema_low_new + edge_ema_high_new))
+            )
     k_low_buf = getattr(target_module, "p_gate_fallback_k_low_buf", None)
     k_high_buf = getattr(target_module, "p_gate_fallback_k_high_buf", None)
     k_legacy_buf = getattr(target_module, "p_gate_fallback_k_buf", None)
-    use_legacy = not (isinstance(k_low_buf, torch.Tensor) and isinstance(k_high_buf, torch.Tensor))
+    use_legacy = not (
+        isinstance(k_low_buf, torch.Tensor)
+        and isinstance(k_high_buf, torch.Tensor)
+    )
     if use_legacy:
         if not isinstance(k_legacy_buf, torch.Tensor):
             return
         k_low_buf = k_legacy_buf
         k_high_buf = k_legacy_buf
-    k_low_prev = float(k_low_buf.item()) if isinstance(k_low_buf, torch.Tensor) else 0.0
-    k_high_prev = float(k_high_buf.item()) if isinstance(k_high_buf, torch.Tensor) else 0.0
+    k_low_prev = (
+        float(k_low_buf.item()) if isinstance(k_low_buf, torch.Tensor) else 0.0
+    )
+    k_high_prev = (
+        float(k_high_buf.item())
+        if isinstance(k_high_buf, torch.Tensor)
+        else 0.0
+    )
     k_low_new = k_low_prev
     k_high_new = k_high_prev
     target = float(getattr(target_module, "p_gate_auto_k_target_tight", 0.02))
@@ -1864,24 +2105,44 @@ def _set_gate_factor(
     lo = max(0.0, target * (1.0 - tol))
     step_up = float(getattr(target_module, "p_gate_auto_k_step_up", 0.1))
     step_down = float(getattr(target_module, "p_gate_auto_k_step_down", 0.02))
-    step_up_low = float(getattr(target_module, "p_gate_auto_k_step_up_low", step_up))
-    step_down_low = float(getattr(target_module, "p_gate_auto_k_step_down_low", step_down))
-    step_up_high = float(getattr(target_module, "p_gate_auto_k_step_up_high", step_up))
-    step_down_high = float(getattr(target_module, "p_gate_auto_k_step_down_high", step_down))
-    edge_target = float(getattr(target_module, "p_gate_auto_k_target_edge", 0.05))
-    edge_tol = float(getattr(target_module, "p_gate_auto_k_edge_tolerance", 0.5))
+    step_up_low = float(
+        getattr(target_module, "p_gate_auto_k_step_up_low", step_up)
+    )
+    step_down_low = float(
+        getattr(target_module, "p_gate_auto_k_step_down_low", step_down)
+    )
+    step_up_high = float(
+        getattr(target_module, "p_gate_auto_k_step_up_high", step_up)
+    )
+    step_down_high = float(
+        getattr(target_module, "p_gate_auto_k_step_down_high", step_down)
+    )
+    edge_target = float(
+        getattr(target_module, "p_gate_auto_k_target_edge", 0.05)
+    )
+    edge_tol = float(
+        getattr(target_module, "p_gate_auto_k_edge_tolerance", 0.5)
+    )
     edge_hi = edge_target * (1.0 + edge_tol)
-    edge_step_down_low = float(getattr(target_module, "p_gate_auto_k_edge_step_down_low", 0.01))
-    edge_step_down_high = float(getattr(target_module, "p_gate_auto_k_edge_step_down_high", 0.01))
+    edge_step_down_low = float(
+        getattr(target_module, "p_gate_auto_k_edge_step_down_low", 0.01)
+    )
+    edge_step_down_high = float(
+        getattr(target_module, "p_gate_auto_k_edge_step_down_high", 0.01)
+    )
     k_min = float(getattr(target_module, "p_gate_auto_k_min", 1.0))
     k_max = float(getattr(target_module, "p_gate_auto_k_max", 16.0))
     if k_max < k_min:
         k_max = k_min
     edge_low_eff = (
-        float(edge_ema_low_new) if math.isfinite(edge_ema_low_new) else float(edge_low_rate)
+        float(edge_ema_low_new)
+        if math.isfinite(edge_ema_low_new)
+        else float(edge_low_rate)
     )
     edge_high_eff = (
-        float(edge_ema_high_new) if math.isfinite(edge_ema_high_new) else float(edge_high_rate)
+        float(edge_ema_high_new)
+        if math.isfinite(edge_ema_high_new)
+        else float(edge_high_rate)
     )
     if math.isfinite(ema_low_new):
         if ema_low_new > hi and step_up_low > 0.0:
@@ -1911,8 +2172,12 @@ def _set_gate_factor(
         k_low_new = max(k_min, min(k_max, k_low_new))
     if math.isfinite(k_high_new):
         k_high_new = max(k_min, min(k_max, k_high_new))
-    k_low_changed = bool(math.isfinite(k_low_new) and abs(k_low_new - k_low_prev) > 1e-12)
-    k_high_changed = bool(math.isfinite(k_high_new) and abs(k_high_new - k_high_prev) > 1e-12)
+    k_low_changed = bool(
+        math.isfinite(k_low_new) and abs(k_low_new - k_low_prev) > 1e-12
+    )
+    k_high_changed = bool(
+        math.isfinite(k_high_new) and abs(k_high_new - k_high_prev) > 1e-12
+    )
     k_changed = bool(k_low_changed or k_high_changed)
     if k_changed:
         with contextlib.suppress(Exception):
@@ -1933,8 +2198,14 @@ def _set_gate_factor(
         if isinstance(upd_buf, torch.Tensor):
             with contextlib.suppress(Exception):
                 upd_buf.add_(1)
-    log_interval = int(getattr(target_module, "p_gate_auto_k_log_interval", 0) or 0)
-    log_due = bool(k_changed) if log_interval <= 0 else bool(int(step) % int(log_interval) == 0)
+    log_interval = int(
+        getattr(target_module, "p_gate_auto_k_log_interval", 0) or 0
+    )
+    log_due = (
+        bool(k_changed)
+        if log_interval <= 0
+        else bool(int(step) % int(log_interval) == 0)
+    )
     if int(local_rank) == 0 and log_due:
         _LOGGER.info(
             "[p_gate] auto_k step=%d seen=%d activeL_sma=%.4f activeH_sma=%.4f width_mean=%.4f edgeL_sma=%.4f edgeH_sma=%.4f activeL_ema=%.4f activeH_ema=%.4f edgeL_ema=%.4f edgeH_ema=%.4f kL=%.4f -> %.4f kH=%.4f -> %.4f",
@@ -1996,7 +2267,10 @@ def get_progress_bar(
     **kwargs: Any,
 ) -> object:
     try:
-        if torch.distributed.is_initialized() and torch.distributed.get_rank() != 0:
+        if (
+            torch.distributed.is_initialized()
+            and torch.distributed.get_rank() != 0
+        ):
             return None
     except Exception:
         pass
@@ -2036,8 +2310,14 @@ def update_progress_bar(
         tflops_val = float(tflops) if tflops is not None else 0.0
     except Exception:
         tflops_val = 0.0
-    io_expr = f"I/O = {mbps_val:.2f} MB/s" if mbps_val >= 0.01 else "I/O < 0.01 MB/s"
-    com_expr = f"COM = {tflops_val:.2f} TFLOPS" if tflops_val >= 0.01 else "COM < 0.01 TFLOPS"
+    io_expr = (
+        f"I/O = {mbps_val:.2f} MB/s" if mbps_val >= 0.01 else "I/O < 0.01 MB/s"
+    )
+    com_expr = (
+        f"COM = {tflops_val:.2f} TFLOPS"
+        if tflops_val >= 0.01
+        else "COM < 0.01 TFLOPS"
+    )
     bar.unit = io_expr + ", " + com_expr
     try:
         inc = int(finish)
@@ -2047,7 +2327,9 @@ def update_progress_bar(
         bar.update(inc)
 
 
-def _warmup_scaler_stats(model: object, train_loader: object, ops: object) -> None:
+def _warmup_scaler_stats(
+    model: object, train_loader: object, ops: object
+) -> None:
     model_for_scaler = model.module if hasattr(model, "module") else model
     dev_x = model_for_scaler.scaler.x_mean.device
     dev_y = model_for_scaler.scaler.y_mean.device
@@ -2106,7 +2388,9 @@ def _warmup_scaler_stats(model: object, train_loader: object, ops: object) -> No
         if is_distributed():
             for tensor in (x_sum, x_ss, y_sum, y_ss):
                 if tensor is not None:
-                    torch.distributed.all_reduce(tensor, torch.distributed.ReduceOp.SUM)
+                    torch.distributed.all_reduce(
+                        tensor, torch.distributed.ReduceOp.SUM
+                    )
             for tensor, op in (
                 (y_min, torch.distributed.ReduceOp.MIN),
                 (y_max, torch.distributed.ReduceOp.MAX),
@@ -2114,19 +2398,35 @@ def _warmup_scaler_stats(model: object, train_loader: object, ops: object) -> No
                 if tensor is not None:
                     torch.distributed.all_reduce(tensor, op)
             counts = torch.tensor([x_cnt, y_cnt], device=dev_x)
-            torch.distributed.all_reduce(counts, torch.distributed.ReduceOp.SUM)
+            torch.distributed.all_reduce(
+                counts, torch.distributed.ReduceOp.SUM
+            )
             x_cnt = int(counts[0])
             y_cnt = int(counts[1])
 
     eps = float(model_for_scaler.scaler.eps)
     for cnt, sm, ss, mean_buf, std_buf in (
-        (x_cnt, x_sum, x_ss, model_for_scaler.scaler.x_mean, model_for_scaler.scaler.x_std),
-        (y_cnt, y_sum, y_ss, model_for_scaler.scaler.y_mean, model_for_scaler.scaler.y_std),
+        (
+            x_cnt,
+            x_sum,
+            x_ss,
+            model_for_scaler.scaler.x_mean,
+            model_for_scaler.scaler.x_std,
+        ),
+        (
+            y_cnt,
+            y_sum,
+            y_ss,
+            model_for_scaler.scaler.y_mean,
+            model_for_scaler.scaler.y_std,
+        ),
     ):
         if cnt > 0 and sm is not None and ss is not None:
             mean = sm / cnt
             mean_buf.resize_(mean.shape).copy_(mean)
-            std_buf.resize_(mean.shape).copy_((ss / cnt - mean**2).clamp_min(eps).sqrt())
+            std_buf.resize_(mean.shape).copy_(
+                (ss / cnt - mean**2).clamp_min(eps).sqrt()
+            )
 
     if y_min is not None:
         model_for_scaler.scaler.y_min.resize_(y_min.shape).copy_(y_min)
@@ -2162,7 +2462,9 @@ def epochs(
 
     if train_loader is None:
         raise RuntimeError("epochs requires a training dataloader")
-    meta = dataset if isinstance(dataset, Dataset) else Dataset.for_device(device)
+    meta = (
+        dataset if isinstance(dataset, Dataset) else Dataset.for_device(device)
+    )
     autocast_dtype = None
     with contextlib.suppress(Exception):
         import inspect
@@ -2178,14 +2480,18 @@ def epochs(
             except Exception:
                 autocast_dtype = f(device)
     with contextlib.suppress(Exception):
-        set_float32_precision(device, dtype=param_dtype, autocast_dtype=autocast_dtype)
+        set_float32_precision(
+            device, dtype=param_dtype, autocast_dtype=autocast_dtype
+        )
     cpu_pool = None
     pool_capacity = 0
     if is_pin_supported(str(getattr(device, "type", "cpu"))):
         with contextlib.suppress(Exception):
             Memory.prefer_local_numa()
         try:
-            cpu_pool_cap = max(2, int(_env_int("STNET_RUNTIME_PIN_POOL_CAPACITY", 8)))
+            cpu_pool_cap = max(
+                2, int(_env_int("STNET_RUNTIME_PIN_POOL_CAPACITY", 8))
+            )
             cpu_pool = TensorPagePool(capacity=cpu_pool_cap)
             pool_capacity = int(getattr(cpu_pool, "capacity", 8))
         except Exception:
@@ -2197,12 +2503,20 @@ def epochs(
         v = getattr(Sampler, "_per_sample_mem_bytes", 0)
         if isinstance(v, int) and v > 0:
             est_bytes_per_sample = int(v)
-    if per_batch is None or int(per_batch) <= 0 or est_bytes_per_sample is None:
+    if (
+        per_batch is None
+        or int(per_batch) <= 0
+        or est_bytes_per_sample is None
+    ):
         try:
             it = iter(train_loader)
             sample = next(it)
             bs, bytes_ps = _compute_batch_bytes_per_sample(sample)
-            if (per_batch is None or int(per_batch) <= 0) and bs is not None and (bs > 0):
+            if (
+                (per_batch is None or int(per_batch) <= 0)
+                and bs is not None
+                and (bs > 0)
+            ):
                 per_batch = int(bs)
             if est_bytes_per_sample is None and bytes_ps > 0:
                 est_bytes_per_sample = int(bytes_ps)
@@ -2226,11 +2540,15 @@ def epochs(
     dev_budget_ratio = env_float("STNET_DEVICE_BUDGET_RATIO", 1.0)
     dev_budget_min_bytes = env_int("STNET_DEVICE_BUDGET_MIN_BYTES", 0)
     _dev_budget_max_raw = env_int("STNET_DEVICE_BUDGET_MAX_BYTES", 0)
-    dev_budget_max_bytes = None if int(_dev_budget_max_raw) <= 0 else int(_dev_budget_max_raw)
+    dev_budget_max_bytes = (
+        None if int(_dev_budget_max_raw) <= 0 else int(_dev_budget_max_raw)
+    )
     host_budget_ratio = env_float("STNET_HOST_BUDGET_RATIO", 1.0)
     host_budget_min_bytes = env_int("STNET_HOST_BUDGET_MIN_BYTES", 0)
     _host_budget_max_raw = env_int("STNET_HOST_BUDGET_MAX_BYTES", 0)
-    host_budget_max_bytes = None if int(_host_budget_max_raw) <= 0 else int(_host_budget_max_raw)
+    host_budget_max_bytes = (
+        None if int(_host_budget_max_raw) <= 0 else int(_host_budget_max_raw)
+    )
     dev_margin = max(0.0, min(1.0, float(dev_margin)))
     host_margin = max(0.0, min(1.0, float(host_margin)))
     dev_budget_ratio = max(0.0, min(1.0, float(dev_budget_ratio)))
@@ -2238,17 +2556,25 @@ def epochs(
     dev_budget_min_bytes = max(0, int(dev_budget_min_bytes))
     host_budget_min_bytes = max(0, int(host_budget_min_bytes))
     dev_budget_max_bytes = (
-        None if dev_budget_max_bytes is None else max(0, int(dev_budget_max_bytes))
+        None
+        if dev_budget_max_bytes is None
+        else max(0, int(dev_budget_max_bytes))
     )
     host_budget_max_bytes = (
-        None if host_budget_max_bytes is None else max(0, int(host_budget_max_bytes))
+        None
+        if host_budget_max_bytes is None
+        else max(0, int(host_budget_max_bytes))
     )
     if dev_budget_max_bytes is not None and int(dev_budget_max_bytes) <= 0:
         dev_budget_max_bytes = None
     if host_budget_max_bytes is not None and int(host_budget_max_bytes) <= 0:
         host_budget_max_bytes = None
     tpl = None
-    if est_bytes_per_sample is not None and est_bytes_per_sample > 0 and (max_grad_accum > 0):
+    if (
+        est_bytes_per_sample is not None
+        and est_bytes_per_sample > 0
+        and (max_grad_accum > 0)
+    ):
         try:
             effective_streams = 1 + max(0, pool_capacity)
             tpl = BatchPolicy(
@@ -2266,12 +2592,16 @@ def epochs(
                 host_budget_ratio=float(host_budget_ratio),
                 host_budget_min_bytes=int(host_budget_min_bytes),
                 host_budget_max_bytes=(
-                    None if host_budget_max_bytes is None else int(host_budget_max_bytes)
+                    None
+                    if host_budget_max_bytes is None
+                    else int(host_budget_max_bytes)
                 ),
                 device_budget_ratio=float(dev_budget_ratio),
                 device_budget_min_bytes=int(dev_budget_min_bytes),
                 device_budget_max_bytes=(
-                    None if dev_budget_max_bytes is None else int(dev_budget_max_bytes)
+                    None
+                    if dev_budget_max_bytes is None
+                    else int(dev_budget_max_bytes)
                 ),
             )
         except Exception:
@@ -2291,21 +2621,36 @@ def epochs(
                 if host_total is not None and host_total > 0:
                     safe_host_total = int(host_total)
             safe_dev_bytes, safe_dev_total = _device_mem_get_info(device)
-            if tpl.device_budget_max_bytes is None or tpl.host_budget_max_bytes is None:
+            if (
+                tpl.device_budget_max_bytes is None
+                or tpl.host_budget_max_bytes is None
+            ):
                 try:
-                    target_total_samples = max(1, int(per_batch or 1)) * max(1, int(min_grad_accum))
+                    target_total_samples = max(1, int(per_batch or 1)) * max(
+                        1, int(min_grad_accum)
+                    )
                     new_dev_cap = tpl.device_budget_max_bytes
                     new_host_cap = tpl.host_budget_max_bytes
                     if new_dev_cap is None and int(tpl.sample_bytes or 0) > 0:
-                        base_dev = int(tpl.sample_bytes) * int(target_total_samples)
+                        base_dev = int(tpl.sample_bytes) * int(
+                            target_total_samples
+                        )
                         cap_dev = int(float(base_dev) * float(budget_slack))
-                        if safe_dev_total is not None and int(safe_dev_total) > 0:
+                        if (
+                            safe_dev_total is not None
+                            and int(safe_dev_total) > 0
+                        ):
                             cap_dev = min(int(cap_dev), int(safe_dev_total))
                         cap_dev = max(0, int(cap_dev))
                         new_dev_cap = None if cap_dev <= 0 else cap_dev
-                    if new_host_cap is None and int(tpl.host_sample_bytes or 0) > 0:
+                    if (
+                        new_host_cap is None
+                        and int(tpl.host_sample_bytes or 0) > 0
+                    ):
                         inflight = int(tpl.host_inflight_batches_per_proc())
-                        lw = max(1, int(getattr(tpl, "local_world_size", 1) or 1))
+                        lw = max(
+                            1, int(getattr(tpl, "local_world_size", 1) or 1)
+                        )
                         base_host = (
                             int(tpl.host_sample_bytes)
                             * max(1, inflight)
@@ -2313,7 +2658,10 @@ def epochs(
                             * int(target_total_samples)
                         )
                         cap_host = int(float(base_host) * float(budget_slack))
-                        if safe_host_total is not None and int(safe_host_total) > 0:
+                        if (
+                            safe_host_total is not None
+                            and int(safe_host_total) > 0
+                        ):
                             cap_host = min(int(cap_host), int(safe_host_total))
                         cap_host = max(0, int(cap_host))
                         new_host_cap = None if cap_host <= 0 else cap_host
@@ -2336,14 +2684,18 @@ def epochs(
                     host_total=safe_host_total,
                 )
                 if total_samples_cap > 0:
-                    max_from_mem = max(1, int(total_samples_cap) // int(per_batch or 1))
+                    max_from_mem = max(
+                        1, int(total_samples_cap) // int(per_batch or 1)
+                    )
         except Exception:
             safe_host_bytes = None
             safe_host_total = None
             safe_dev_bytes = None
             safe_dev_total = None
     if max_from_mem is not None:
-        max_grad_accum = max(int(min_grad_accum), min(int(max_grad_accum), int(max_from_mem)))
+        max_grad_accum = max(
+            int(min_grad_accum), min(int(max_grad_accum), int(max_from_mem))
+        )
     grad_accum_steps = int(min_grad_accum)
     grad_accum_steps = broadcast_scalar(grad_accum_steps, device=device, src=0)
     proc = None
@@ -2365,7 +2717,9 @@ def epochs(
     util_adjust_interval = 0
     util_warmup_steps = 0
     if buffers_dtype is not None:
-        target_for_buffers = model.module if hasattr(model, "module") else model
+        target_for_buffers = (
+            model.module if hasattr(model, "module") else model
+        )
         _cast_batchnorm_buffers_dtype(target_for_buffers, buffers_dtype)
     model_for_hist = model.module if hasattr(model, "module") else model
     hist = None
@@ -2393,10 +2747,17 @@ def epochs(
                 pretty = None
                 with contextlib.suppress(Exception):
                     if os.path.exists("/etc/os-release"):
-                        with open("/etc/os-release", "r", encoding="utf-8") as f:
+                        with open(
+                            "/etc/os-release", "r", encoding="utf-8"
+                        ) as f:
                             for line in f:
                                 if line.startswith("PRETTY_NAME="):
-                                    pretty = line.strip().split("=", 1)[1].strip().strip('"')
+                                    pretty = (
+                                        line.strip()
+                                        .split("=", 1)[1]
+                                        .strip()
+                                        .strip('"')
+                                    )
                                     break
                 os_full = pretty or f"{os_name} {platform.release()}"
             case "Darwin":
@@ -2444,12 +2805,21 @@ def epochs(
     non_blocking_ok = bool(dev_type in ("cuda", "xpu"))
     pinned_ok = bool(is_pin_supported(dev_type))
     backend = accelerator_type(dev_type)
-    stream_fn = getattr(backend, "current_stream", None) if backend is not None else None
+    stream_fn = (
+        getattr(backend, "current_stream", None)
+        if backend is not None
+        else None
+    )
     Event = getattr(backend, "Event", None) if backend is not None else None
     can_stream_release = bool(
-        pinned_ok and non_blocking_ok and callable(stream_fn) and (Event is not None)
+        pinned_ok
+        and non_blocking_ok
+        and callable(stream_fn)
+        and (Event is not None)
     )
-    make_fence_event = partial(new_accelerator_event, device, enable_timing=False)
+    make_fence_event = partial(
+        new_accelerator_event, device, enable_timing=False
+    )
     use_timer = _is_event_timer_available(device)
     timer_sync = (not use_timer) and bool(_is_clock_synchronized(dev_type))
     train_steps = _get_batch_length(train_loader)
@@ -2458,7 +2828,8 @@ def epochs(
     if train_steps > 0:
         util_adjust_interval = max(10, int(train_steps * 0.05))
         util_warmup_steps = max(
-            util_adjust_interval, min(int(train_steps), max(50, int(train_steps * 0.1)))
+            util_adjust_interval,
+            min(int(train_steps), max(50, int(train_steps * 0.1))),
         )
     status_bar = (
         get_progress_bar(title="Training", total=total_updates, device=device)
@@ -2503,14 +2874,19 @@ def epochs(
                 comp_ev_s, comp_ev_e = pair
         torch_prof = None
         prof_enabled = _env_flag(
-            "STNET_TORCH_PROFILE_TRAIN", _env_flag("STNET_TORCH_PROFILE", False)
+            "STNET_TORCH_PROFILE_TRAIN",
+            _env_flag("STNET_TORCH_PROFILE", False),
         )
         prof_all_ranks = _env_flag("STNET_TORCH_PROFILE_ALL_RANKS", False)
-        prof_rank = int(torch.distributed.get_rank()) if is_distributed() else 0
+        prof_rank = (
+            int(torch.distributed.get_rank()) if is_distributed() else 0
+        )
         if prof_enabled and (prof_all_ranks or prof_rank == 0):
             prof_dir = env_str("STNET_TORCH_PROFILE_DIR")
             if not prof_dir:
-                prof_dir = os.path.join(str(ops.ckpt_dir or "."), "torch_profiler")
+                prof_dir = os.path.join(
+                    str(ops.ckpt_dir or "."), "torch_profiler"
+                )
             torch_prof = _get_torch_profiler(
                 enabled=True,
                 tag=f"train-{str(run_id)}",
@@ -2523,7 +2899,9 @@ def epochs(
                     torch_prof.start()
         flop_counter_train = FlopCounter(model, mode="train", device=device)
         flop_counter_val = (
-            FlopCounter(model, mode="eval", device=device) if val_loader is not None else None
+            FlopCounter(model, mode="eval", device=device)
+            if val_loader is not None
+            else None
         )
         for epoch_idx in range(int(total_epochs)):
             with contextlib.suppress(Exception):
@@ -2534,14 +2912,20 @@ def epochs(
                         if callable(fn):
                             fn(int(epoch_idx))
                 else:
-                    fn = getattr(getattr(train_loader, "sampler", None), "set_epoch", None)
+                    fn = getattr(
+                        getattr(train_loader, "sampler", None),
+                        "set_epoch",
+                        None,
+                    )
                     if callable(fn):
                         fn(int(epoch_idx))
                     fn = getattr(train_loader, "set_epoch", None)
                     if callable(fn):
                         fn(int(epoch_idx))
             if is_distributed():
-                target_module = model.module if hasattr(model, "module") else model
+                target_module = (
+                    model.module if hasattr(model, "module") else model
+                )
                 distributed_sync(target_module, device=device)
             flop_breakdown_epoch = {}
             io_time = 0.0
@@ -2551,7 +2935,11 @@ def epochs(
             train_samples_epoch = 0.0
             with flop_counter_train:
                 model.train()
-                train_pg = _validate_distributed_group(meta, model) if is_distributed() else None
+                train_pg = (
+                    _validate_distributed_group(meta, model)
+                    if is_distributed()
+                    else None
+                )
                 global_step = 0
                 optimizer.zero_grad(set_to_none=True)
                 t_fetch_start = time.perf_counter_ns()
@@ -2600,20 +2988,37 @@ def epochs(
                             should_sync = (step_idx + 1) % max(
                                 1, grad_accum_steps
                             ) == 0 or step_idx + 1 == total_batches
-                            if use_timer and comp_ev_s is not None and comp_ev_e is not None:
+                            if (
+                                use_timer
+                                and comp_ev_s is not None
+                                and comp_ev_e is not None
+                            ):
                                 comp_ev_s.record()
                             else:
                                 t_comp_s = time.perf_counter_ns()
-                            with no_sync(model, enable=grad_accum_steps > 1 and (not should_sync)):
-                                with flop_counter_train.step(display=False) as train_counter:
-                                    if getattr(device, "type", None) == "cuda" and bool(
-                                        getattr(model, "_compile_cudagraphs", False)
+                            with no_sync(
+                                model,
+                                enable=grad_accum_steps > 1
+                                and (not should_sync),
+                            ):
+                                with flop_counter_train.step(
+                                    display=False
+                                ) as train_counter:
+                                    if getattr(
+                                        device, "type", None
+                                    ) == "cuda" and bool(
+                                        getattr(
+                                            model, "_compile_cudagraphs", False
+                                        )
                                     ):
                                         cudagraph_mark_step_begin()
                                         mark_cudagraph = True
                                     with Autocast.float(device):
                                         Y_flat = Y.reshape(Y.shape[0], -1)
-                                        if Y_flat.device != device or Y_flat.dtype != param_dtype:
+                                        if (
+                                            Y_flat.device != device
+                                            or Y_flat.dtype != param_dtype
+                                        ):
                                             Y_flat = Y_flat.to(
                                                 device,
                                                 dtype=param_dtype,
@@ -2633,7 +3038,10 @@ def epochs(
                                             calibrate_output=False,
                                             return_loss_components=True,
                                         )
-                                    if isinstance(loss_val, torch.Tensor) and loss_val.ndim > 0:
+                                    if (
+                                        isinstance(loss_val, torch.Tensor)
+                                        and loss_val.ndim > 0
+                                    ):
                                         loss_val = loss_val.mean()
                                     if (
                                         isinstance(loss_top_val, torch.Tensor)
@@ -2641,32 +3049,55 @@ def epochs(
                                     ):
                                         loss_top_val = loss_top_val.mean()
                                     if (
-                                        isinstance(loss_bottom_val, torch.Tensor)
+                                        isinstance(
+                                            loss_bottom_val, torch.Tensor
+                                        )
                                         and loss_bottom_val.ndim > 0
                                     ):
-                                        loss_bottom_val = loss_bottom_val.mean()
+                                        loss_bottom_val = (
+                                            loss_bottom_val.mean()
+                                        )
                                     if loss_val is None:
                                         raise RuntimeError(
                                             "Model returned no loss value during training. Ensure loss functions are provided and returning valid outputs."
                                         )
                                     if not isinstance(loss_val, torch.Tensor):
                                         loss_val = torch.as_tensor(
-                                            loss_val, device=device, dtype=param_dtype
+                                            loss_val,
+                                            device=device,
+                                            dtype=param_dtype,
                                         )
                                     else:
-                                        loss_val = loss_val.to(device=device, dtype=param_dtype)
+                                        loss_val = loss_val.to(
+                                            device=device, dtype=param_dtype
+                                        )
                                     accum_scale = max(1, grad_accum_steps)
-                                    loss_for_backprop = loss_val / float(accum_scale)
+                                    loss_for_backprop = loss_val / float(
+                                        accum_scale
+                                    )
                                     scaler.scale(loss_for_backprop).backward()
-                                    if loss_top_val is not None or loss_bottom_val is not None:
+                                    if (
+                                        loss_top_val is not None
+                                        or loss_bottom_val is not None
+                                    ):
                                         lw_count += 1
-                                        if isinstance(loss_top_val, torch.Tensor):
+                                        if isinstance(
+                                            loss_top_val, torch.Tensor
+                                        ):
                                             v = loss_top_val.detach()
-                                            lw_top_sum = v if lw_top_sum is None else lw_top_sum + v
-                                        if isinstance(loss_bottom_val, torch.Tensor):
+                                            lw_top_sum = (
+                                                v
+                                                if lw_top_sum is None
+                                                else lw_top_sum + v
+                                            )
+                                        if isinstance(
+                                            loss_bottom_val, torch.Tensor
+                                        ):
                                             v = loss_bottom_val.detach()
                                             lw_bottom_sum = (
-                                                v if lw_bottom_sum is None else lw_bottom_sum + v
+                                                v
+                                                if lw_bottom_sum is None
+                                                else lw_bottom_sum + v
                                             )
                                     if should_sync:
                                         scaler.unscale_(optimizer)
@@ -2676,20 +3107,32 @@ def epochs(
 
                                         if ema_helper is not None:
                                             ema_target = (
-                                                model.module if hasattr(model, "module") else model
+                                                model.module
+                                                if hasattr(model, "module")
+                                                else model
                                             )
                                             ema_helper.update(ema_target)
 
-                                        if swa_helper is not None and epoch_idx >= swa_start_epoch:
+                                        if (
+                                            swa_helper is not None
+                                            and epoch_idx >= swa_start_epoch
+                                        ):
                                             swa_target = (
-                                                model.module if hasattr(model, "module") else model
+                                                model.module
+                                                if hasattr(model, "module")
+                                                else model
                                             )
                                             swa_helper.update(swa_target)
 
                                         target_for_step = (
-                                            model.module if hasattr(model, "module") else model
+                                            model.module
+                                            if hasattr(model, "module")
+                                            else model
                                         )
-                                        inst_step = to_submodule(target_for_step) or target_for_step
+                                        inst_step = (
+                                            to_submodule(target_for_step)
+                                            or target_for_step
+                                        )
                                         with contextlib.suppress(Exception):
                                             setattr(
                                                 inst_step,
@@ -2700,9 +3143,15 @@ def epochs(
                                         free = None
                                         total = None
                                         with contextlib.suppress(Exception):
-                                            peak = int(accelerator_max_allocated_memory(device))
+                                            peak = int(
+                                                accelerator_max_allocated_memory(
+                                                    device
+                                                )
+                                            )
                                         with contextlib.suppress(Exception):
-                                            free, total = _device_mem_get_info(device)
+                                            free, total = _device_mem_get_info(
+                                                device
+                                            )
                                         if (
                                             isinstance(peak, int)
                                             and peak > 0
@@ -2712,36 +3161,53 @@ def epochs(
                                         ):
                                             frac = float(peak) / float(total)
                                             prev_ema = float(
-                                                getattr(inst_step, "_stnet_peak_ema", 0.0) or 0.0
+                                                getattr(
+                                                    inst_step,
+                                                    "_stnet_peak_ema",
+                                                    0.0,
+                                                )
+                                                or 0.0
                                             )
                                             ema = (
                                                 frac
                                                 if prev_ema <= 0.0
-                                                else (0.9 * prev_ema + 0.1 * frac)
+                                                else (
+                                                    0.9 * prev_ema + 0.1 * frac
+                                                )
                                             )
-                                            with contextlib.suppress(Exception):
+                                            with contextlib.suppress(
+                                                Exception
+                                            ):
                                                 setattr(
                                                     inst_step,
                                                     "_stnet_peak_ema",
                                                     float(ema),
                                                 )
-                                            spike = prev_ema > 0.0 and frac > max(
-                                                0.92, prev_ema * 1.25
+                                            spike = (
+                                                prev_ema > 0.0
+                                                and frac
+                                                > max(0.92, prev_ema * 1.25)
                                             )
                                             if frac > 0.92 or spike:
                                                 to_checkpoint(
                                                     model,
                                                     device=device,
-                                                    step_total=int(p_gate_auto_step_total),
+                                                    step_total=int(
+                                                        p_gate_auto_step_total
+                                                    ),
                                                     ttl_steps=128,
                                                     min_bytes=16 * 1024 * 1024,
                                                 )
                                         from_checkpoint(
                                             model,
-                                            step_total=int(p_gate_auto_step_total),
+                                            step_total=int(
+                                                p_gate_auto_step_total
+                                            ),
                                         )
                                         if scheduler_step_per_batch:
-                                            with contextlib.suppress(Exception):
+                                            with contextlib.suppress(
+                                                Exception
+                                            ):
                                                 sched.step()
                                         if lw_count > 0:
                                             top_avg_t = (
@@ -2757,25 +3223,50 @@ def epochs(
                                             if is_distributed():
                                                 ws = _get_world_size(train_pg)
                                                 if top_avg_t is not None:
-                                                    _reduce_sum(top_avg_t, train_pg)
-                                                    top_avg_t = top_avg_t / float(ws)
+                                                    _reduce_sum(
+                                                        top_avg_t, train_pg
+                                                    )
+                                                    top_avg_t = (
+                                                        top_avg_t / float(ws)
+                                                    )
                                                 if bottom_avg_t is not None:
-                                                    _reduce_sum(bottom_avg_t, train_pg)
-                                                    bottom_avg_t = bottom_avg_t / float(ws)
-                                            loss_controller.update(top_avg_t, bottom_avg_t)
+                                                    _reduce_sum(
+                                                        bottom_avg_t, train_pg
+                                                    )
+                                                    bottom_avg_t = (
+                                                        bottom_avg_t
+                                                        / float(ws)
+                                                    )
+                                            loss_controller.update(
+                                                top_avg_t, bottom_avg_t
+                                            )
                                         lw_top_sum = None
                                         lw_bottom_sum = None
                                         lw_count = 0
                                     with contextlib.suppress(Exception):
-                                        flops += max(0.0, float(train_counter.get_total_flops()))
+                                        flops += max(
+                                            0.0,
+                                            float(
+                                                train_counter.get_total_flops()
+                                            ),
+                                        )
                                     breakdown_getter = getattr(
-                                        train_counter, "get_manual_breakdown", None
+                                        train_counter,
+                                        "get_manual_breakdown",
+                                        None,
                                     )
                                     if callable(breakdown_getter):
-                                        for name, value in breakdown_getter().items():
-                                            with contextlib.suppress(Exception):
+                                        for (
+                                            name,
+                                            value,
+                                        ) in breakdown_getter().items():
+                                            with contextlib.suppress(
+                                                Exception
+                                            ):
                                                 flop_breakdown_epoch[name] = (
-                                                    flop_breakdown_epoch.get(name, 0.0)
+                                                    flop_breakdown_epoch.get(
+                                                        name, 0.0
+                                                    )
                                                     + float(value)
                                                 )
                             if should_sync:
@@ -2783,7 +3274,9 @@ def epochs(
                                 p_gate_auto_step_total += 1
                                 with contextlib.suppress(Exception):
                                     target_for_autok = (
-                                        model.module if hasattr(model, "module") else model
+                                        model.module
+                                        if hasattr(model, "module")
+                                        else model
                                     )
                                     _set_gate_factor(
                                         target_for_autok,
@@ -2793,7 +3286,9 @@ def epochs(
                                     )
                                 match device.type:
                                     case "cuda":
-                                        util_now, mem_now = _gpu_nvml_utils(device)
+                                        util_now, mem_now = _gpu_nvml_utils(
+                                            device
+                                        )
                                     case "xpu":
                                         util_now, mem_now = (
                                             None,
@@ -2812,57 +3307,78 @@ def epochs(
                                         gpu_util_ema = util_now
                                     else:
                                         gpu_util_ema = (
-                                            1.0 - util_alpha
-                                        ) * gpu_util_ema + util_alpha * util_now
+                                            (1.0 - util_alpha) * gpu_util_ema
+                                            + util_alpha * util_now
+                                        )
                                 if mem_now is not None:
                                     mem_now = float(mem_now)
                                     if mem_util_ema is None:
                                         mem_util_ema = mem_now
                                     else:
                                         mem_util_ema = (
-                                            1.0 - util_alpha
-                                        ) * mem_util_ema + util_alpha * mem_now
+                                            (1.0 - util_alpha) * mem_util_ema
+                                            + util_alpha * mem_now
+                                        )
                                 if (
                                     util_adjust_interval > 0
                                     and global_step >= util_warmup_steps
-                                    and (global_step % util_adjust_interval == 0)
+                                    and (
+                                        global_step % util_adjust_interval == 0
+                                    )
                                 ):
                                     new_grad_accum = grad_accum_steps
                                     util_frac = None
                                     mem_frac = None
                                     if gpu_util_ema is not None:
-                                        util_frac = max(0.0, min(1.0, gpu_util_ema / 100.0))
+                                        util_frac = max(
+                                            0.0, min(1.0, gpu_util_ema / 100.0)
+                                        )
                                     if mem_util_ema is not None:
-                                        mem_frac = max(0.0, min(1.0, mem_util_ema / 100.0))
+                                        mem_frac = max(
+                                            0.0, min(1.0, mem_util_ema / 100.0)
+                                        )
                                     if util_frac is None:
-                                        total_t_local = float(io_time + comp_time)
+                                        total_t_local = float(
+                                            io_time + comp_time
+                                        )
                                         if total_t_local > 0.0:
                                             util_frac = max(
                                                 0.0,
                                                 min(
                                                     1.0,
-                                                    float(comp_time) / total_t_local,
+                                                    float(comp_time)
+                                                    / total_t_local,
                                                 ),
                                             )
                                         else:
                                             util_frac = 0.0
                                     if util_frac is not None:
                                         if mem_frac is not None:
-                                            if util_frac < 0.88 and mem_frac < 0.9:
+                                            if (
+                                                util_frac < 0.88
+                                                and mem_frac < 0.9
+                                            ):
                                                 new_grad_accum = min(
-                                                    max_grad_accum, grad_accum_steps + 1
+                                                    max_grad_accum,
+                                                    grad_accum_steps + 1,
                                                 )
-                                            elif util_frac > 0.97 or mem_frac > 0.92:
+                                            elif (
+                                                util_frac > 0.97
+                                                or mem_frac > 0.92
+                                            ):
                                                 new_grad_accum = max(
-                                                    min_grad_accum, grad_accum_steps - 1
+                                                    min_grad_accum,
+                                                    grad_accum_steps - 1,
                                                 )
                                         elif util_frac < 0.88:
                                             new_grad_accum = min(
-                                                max_grad_accum, grad_accum_steps + 1
+                                                max_grad_accum,
+                                                grad_accum_steps + 1,
                                             )
                                         elif util_frac > 0.97:
                                             new_grad_accum = max(
-                                                min_grad_accum, grad_accum_steps - 1
+                                                min_grad_accum,
+                                                grad_accum_steps - 1,
                                             )
                                     host_avail_now = None
                                     host_total_now = None
@@ -2870,12 +3386,22 @@ def epochs(
                                         host_avail_now = Memory.available()
                                         host_total_now = Memory.total()
                                     host_low = False
-                                    if host_avail_now is not None and host_avail_now > 0:
-                                        host_low_abs = host_avail_now < 512 * 1024 * 1024
+                                    if (
+                                        host_avail_now is not None
+                                        and host_avail_now > 0
+                                    ):
+                                        host_low_abs = (
+                                            host_avail_now < 512 * 1024 * 1024
+                                        )
                                         host_low_rel = False
-                                        if host_total_now is not None and host_total_now > 0:
+                                        if (
+                                            host_total_now is not None
+                                            and host_total_now > 0
+                                        ):
                                             host_low_rel = (
-                                                float(host_avail_now) / float(host_total_now) < 0.1
+                                                float(host_avail_now)
+                                                / float(host_total_now)
+                                                < 0.1
                                             )
                                         host_low = host_low_abs or host_low_rel
                                     if host_low:
@@ -2885,7 +3411,9 @@ def epochs(
                                             new_grad_accum = min_grad_accum
                                     if new_grad_accum != grad_accum_steps:
                                         new_grad_accum = broadcast_scalar(
-                                            new_grad_accum, device=device, src=0
+                                            new_grad_accum,
+                                            device=device,
+                                            src=0,
                                         )
                                         _LOGGER.info(
                                             "[epochs] adjusted grad_accum_steps=%d (gpu_util_ema=%s, mem_util_ema=%s)",
@@ -2894,21 +3422,42 @@ def epochs(
                                             str(mem_util_ema),
                                         )
                                         grad_accum_steps = new_grad_accum
-                            if use_timer and comp_ev_s is not None and comp_ev_e is not None:
+                            if (
+                                use_timer
+                                and comp_ev_s is not None
+                                and comp_ev_e is not None
+                            ):
                                 comp_ev_e.record()
                                 comp_ev_e.synchronize()
-                                comp_time += float(comp_ev_s.elapsed_time(comp_ev_e)) / 1000.0
+                                comp_time += (
+                                    float(comp_ev_s.elapsed_time(comp_ev_e))
+                                    / 1000.0
+                                )
                             else:
                                 if timer_sync:
                                     sync_accelerator(device)
-                                comp_time += (time.perf_counter_ns() - t_comp_s) / 1000000000.0
+                                comp_time += (
+                                    time.perf_counter_ns() - t_comp_s
+                                ) / 1000000000.0
                             if local_rank == 0 and should_sync:
                                 io_elapsed = prev_io_time + float(io_time)
-                                io_transferred = prev_io_bytes + float(io_bytes)
-                                comp_elapsed = prev_comp_time + float(comp_time)
+                                io_transferred = prev_io_bytes + float(
+                                    io_bytes
+                                )
+                                comp_elapsed = prev_comp_time + float(
+                                    comp_time
+                                )
                                 flop_total = prev_flops + float(flops)
-                                mbps_cur = io_transferred / max(io_elapsed, 1e-06) / MB_DIV
-                                tflops_cur = flop_total / max(comp_elapsed, 1e-06) / 1000000000000.0
+                                mbps_cur = (
+                                    io_transferred
+                                    / max(io_elapsed, 1e-06)
+                                    / MB_DIV
+                                )
+                                tflops_cur = (
+                                    flop_total
+                                    / max(comp_elapsed, 1e-06)
+                                    / 1000000000000.0
+                                )
                                 update_progress_bar(
                                     status_bar,
                                     finish=train_accum_since_last,
@@ -2920,51 +3469,103 @@ def epochs(
                                 try:
                                     if (
                                         train_steps <= 0
-                                        or step_idx % max(1, int(train_steps * 0.01)) == 0
+                                        or step_idx
+                                        % max(1, int(train_steps * 0.01))
+                                        == 0
                                     ):
                                         x_rec = X
                                         y_rec = Y
                                         with contextlib.suppress(Exception):
                                             model_for_scaler = (
-                                                model.module if hasattr(model, "module") else model
+                                                model.module
+                                                if hasattr(model, "module")
+                                                else model
                                             )
-                                            data_scaler = getattr(model_for_scaler, "scaler", None)
+                                            data_scaler = getattr(
+                                                model_for_scaler,
+                                                "scaler",
+                                                None,
+                                            )
                                             if data_scaler is not None:
-                                                dy = getattr(data_scaler, "denormalize_y", None)
+                                                dy = getattr(
+                                                    data_scaler,
+                                                    "denormalize_y",
+                                                    None,
+                                                )
                                                 if callable(dy):
                                                     y_flat = y_rec
                                                     if (
-                                                        isinstance(y_flat, torch.Tensor)
+                                                        isinstance(
+                                                            y_flat,
+                                                            torch.Tensor,
+                                                        )
                                                         and y_flat.ndim != 2
                                                     ):
-                                                        y_flat = y_flat.reshape(y_flat.shape[0], -1)
+                                                        y_flat = (
+                                                            y_flat.reshape(
+                                                                y_flat.shape[
+                                                                    0
+                                                                ],
+                                                                -1,
+                                                            )
+                                                        )
                                                     need_denorm = True
                                                     scale_max = getattr(
-                                                        meta, "scale_max_value", None
-                                                    ) or getattr(meta, "scale_max_abs", None)
+                                                        meta,
+                                                        "scale_max_value",
+                                                        None,
+                                                    ) or getattr(
+                                                        meta,
+                                                        "scale_max_abs",
+                                                        None,
+                                                    )
                                                     if (
-                                                        isinstance(y_flat, torch.Tensor)
-                                                        and scale_max is not None
+                                                        isinstance(
+                                                            y_flat,
+                                                            torch.Tensor,
+                                                        )
+                                                        and scale_max
+                                                        is not None
                                                     ):
-                                                        with contextlib.suppress(Exception):
+                                                        with contextlib.suppress(
+                                                            Exception
+                                                        ):
                                                             max_obs = float(
-                                                                y_flat.detach().abs().max().item()
+                                                                y_flat.detach()
+                                                                .abs()
+                                                                .max()
+                                                                .item()
                                                             )
-                                                            if max_obs >= float(scale_max) * 0.5:
-                                                                need_denorm = False
+                                                            if (
+                                                                max_obs
+                                                                >= float(
+                                                                    scale_max
+                                                                )
+                                                                * 0.5
+                                                            ):
+                                                                need_denorm = (
+                                                                    False
+                                                                )
                                                     if need_denorm:
-                                                        y_rec = dy(y_flat).view_as(y_rec)
+                                                        y_rec = dy(
+                                                            y_flat
+                                                        ).view_as(y_rec)
                                         hist.record_batch(x_rec, y_rec)
                                 except Exception:
                                     pass
                             if torch_prof is not None:
                                 torch_prof.step()
                             t_fetch_start = time.perf_counter_ns()
-                            if cpu_pool is not None and step_idx + 1 & 255 == 0:
+                            if (
+                                cpu_pool is not None
+                                and step_idx + 1 & 255 == 0
+                            ):
                                 with contextlib.suppress(Exception):
                                     cpu_pool.collect()
                             with contextlib.suppress(Exception):
-                                _clear_oom_retries(train_loader, "train", step_idx)
+                                _clear_oom_retries(
+                                    train_loader, "train", step_idx
+                                )
                             break
                         except RuntimeError as e:
                             if is_oom_error(e):
@@ -2988,9 +3589,15 @@ def epochs(
                             if mark_cudagraph:
                                 cudagraph_mark_step_end()
             if lw_count > 0:
-                top_avg_t = lw_top_sum / float(lw_count) if lw_top_sum is not None else None
+                top_avg_t = (
+                    lw_top_sum / float(lw_count)
+                    if lw_top_sum is not None
+                    else None
+                )
                 bottom_avg_t = (
-                    lw_bottom_sum / float(lw_count) if lw_bottom_sum is not None else None
+                    lw_bottom_sum / float(lw_count)
+                    if lw_bottom_sum is not None
+                    else None
                 )
                 if is_distributed():
                     ws = _get_world_size(train_pg)
@@ -3042,7 +3649,9 @@ def epochs(
                                         raise RuntimeError(
                                             f"labels.ndim={Y.ndim} (expect >= 1). got shape={tuple(Y.shape)}"
                                         )
-                                    wait_s = (t_ready - t_fetch_start) / 1000000000.0
+                                    wait_s = (
+                                        t_ready - t_fetch_start
+                                    ) / 1000000000.0
                                     io_time += float(wait_s + h2d_s)
                                     with contextlib.suppress(Exception):
                                         io_bytes += float(
@@ -3057,14 +3666,24 @@ def epochs(
                                         comp_ev_s.record()
                                     else:
                                         t_comp_s = time.perf_counter_ns()
-                                    with flop_counter_val.step(display=False) as val_counter:
-                                        if getattr(device, "type", None) == "cuda" and bool(
-                                            getattr(model, "_compile_cudagraphs", False)
+                                    with flop_counter_val.step(
+                                        display=False
+                                    ) as val_counter:
+                                        if getattr(
+                                            device, "type", None
+                                        ) == "cuda" and bool(
+                                            getattr(
+                                                model,
+                                                "_compile_cudagraphs",
+                                                False,
+                                            )
                                         ):
                                             cudagraph_mark_step_begin()
                                             mark_cudagraph = True
                                         with Autocast.float(device):
-                                            Yv_flat = Y.reshape(Y.shape[0], -1).to(
+                                            Yv_flat = Y.reshape(
+                                                Y.shape[0], -1
+                                            ).to(
                                                 device,
                                                 dtype=param_dtype,
                                                 non_blocking=non_blocking_ok,
@@ -3088,10 +3707,14 @@ def epochs(
                                         )
                                     if not isinstance(_loss_val, torch.Tensor):
                                         _loss_val = torch.as_tensor(
-                                            _loss_val, device=device, dtype=param_dtype
+                                            _loss_val,
+                                            device=device,
+                                            dtype=param_dtype,
                                         )
                                     else:
-                                        _loss_val = _loss_val.to(device=device, dtype=param_dtype)
+                                        _loss_val = _loss_val.to(
+                                            device=device, dtype=param_dtype
+                                        )
                                     if (
                                         use_timer
                                         and comp_ev_s is not None
@@ -3100,7 +3723,12 @@ def epochs(
                                         comp_ev_e.record()
                                         comp_ev_e.synchronize()
                                         comp_time += (
-                                            float(comp_ev_s.elapsed_time(comp_ev_e)) / 1000.0
+                                            float(
+                                                comp_ev_s.elapsed_time(
+                                                    comp_ev_e
+                                                )
+                                            )
+                                            / 1000.0
                                         )
                                     else:
                                         if timer_sync:
@@ -3109,25 +3737,51 @@ def epochs(
                                             time.perf_counter_ns() - t_comp_s
                                         ) / 1000000000.0
                                     with contextlib.suppress(Exception):
-                                        flops += max(0.0, float(val_counter.get_total_flops()))
+                                        flops += max(
+                                            0.0,
+                                            float(
+                                                val_counter.get_total_flops()
+                                            ),
+                                        )
                                     breakdown_getter = getattr(
-                                        val_counter, "get_manual_breakdown", None
+                                        val_counter,
+                                        "get_manual_breakdown",
+                                        None,
                                     )
                                     if callable(breakdown_getter):
-                                        for name, value in breakdown_getter().items():
-                                            with contextlib.suppress(Exception):
+                                        for (
+                                            name,
+                                            value,
+                                        ) in breakdown_getter().items():
+                                            with contextlib.suppress(
+                                                Exception
+                                            ):
                                                 flop_breakdown_epoch[name] = (
-                                                    flop_breakdown_epoch.get(name, 0.0)
+                                                    flop_breakdown_epoch.get(
+                                                        name, 0.0
+                                                    )
                                                     + float(value)
                                                 )
                                     if local_rank == 0:
-                                        io_elapsed = prev_io_time + float(io_time)
-                                        io_transferred = prev_io_bytes + float(io_bytes)
-                                        comp_elapsed = prev_comp_time + float(comp_time)
+                                        io_elapsed = prev_io_time + float(
+                                            io_time
+                                        )
+                                        io_transferred = prev_io_bytes + float(
+                                            io_bytes
+                                        )
+                                        comp_elapsed = prev_comp_time + float(
+                                            comp_time
+                                        )
                                         flop_total = prev_flops + float(flops)
-                                        mbps_cur = io_transferred / max(io_elapsed, 1e-06) / MB_DIV
+                                        mbps_cur = (
+                                            io_transferred
+                                            / max(io_elapsed, 1e-06)
+                                            / MB_DIV
+                                        )
                                         tflops_cur = (
-                                            flop_total / max(comp_elapsed, 1e-06) / 1000000000000.0
+                                            flop_total
+                                            / max(comp_elapsed, 1e-06)
+                                            / 1000000000000.0
                                         )
                                         update_progress_bar(
                                             status_bar,
@@ -3138,11 +3792,16 @@ def epochs(
                                     if torch_prof is not None:
                                         torch_prof.step()
                                     t_fetch_start = time.perf_counter_ns()
-                                    if cpu_pool is not None and _vstep + 1 & 255 == 0:
+                                    if (
+                                        cpu_pool is not None
+                                        and _vstep + 1 & 255 == 0
+                                    ):
                                         with contextlib.suppress(Exception):
                                             cpu_pool.collect()
                                     with contextlib.suppress(Exception):
-                                        _clear_oom_retries(val_loader, "val", _vstep)
+                                        _clear_oom_retries(
+                                            val_loader, "val", _vstep
+                                        )
                                     break
                                 except RuntimeError as e:
                                     if is_oom_error(e):
@@ -3168,7 +3827,8 @@ def epochs(
             if is_distributed():
                 stats_dtype = (
                     param_dtype
-                    if isinstance(param_dtype, torch.dtype) and param_dtype.is_floating_point
+                    if isinstance(param_dtype, torch.dtype)
+                    and param_dtype.is_floating_point
                     else torch.float64
                 )
                 stats = torch.tensor(
@@ -3176,7 +3836,9 @@ def epochs(
                     device=device,
                     dtype=stats_dtype,
                 )
-                torch.distributed.all_reduce(stats, op=torch.distributed.ReduceOp.SUM)
+                torch.distributed.all_reduce(
+                    stats, op=torch.distributed.ReduceOp.SUM
+                )
                 world = max(1, get_world_size(device))
                 stats /= world
                 stats_cpu = stats.detach().cpu()
@@ -3225,12 +3887,16 @@ def epochs(
                 z_pred_raw, _ = out
             else:
                 z_pred_raw = out
-            z_pred = z_pred_raw.detach().to(device=scaler_y_device, dtype=scaler_y_dtype)
+            z_pred = z_pred_raw.detach().to(
+                device=scaler_y_device, dtype=scaler_y_dtype
+            )
             if z_pred.ndim >= 2:
                 z_pred = z_pred.reshape(z_pred.shape[0], -1)
             else:
                 z_pred = z_pred.view(-1, 1)
-            z_true = model_for_scaler.scaler.normalize_y(y_flat.detach()).to(dtype=scaler_y_dtype)
+            z_true = model_for_scaler.scaler.normalize_y(y_flat.detach()).to(
+                dtype=scaler_y_dtype
+            )
             if z_true.ndim >= 2:
                 z_true = z_true.reshape(z_true.shape[0], -1)
             else:
@@ -3240,7 +3906,9 @@ def epochs(
                 f_true = z_true.shape[-1]
                 if f_true % f_pred == 0:
                     group = f_true // f_pred
-                    z_true = z_true.view(z_true.shape[0], group, f_pred).mean(dim=1)
+                    z_true = z_true.view(z_true.shape[0], group, f_pred).mean(
+                        dim=1
+                    )
                 elif f_pred % f_true == 0:
                     group = f_pred // f_true
                     z_true = z_true.repeat_interleave(group, dim=1)
@@ -3271,17 +3939,29 @@ def epochs(
                 sum_x2 += sx2
                 sum_xy += sxy
         if is_distributed():
-            n_t = torch.tensor(float(total_n), device=scaler_y_device, dtype=scaler_y_dtype)
-            torch.distributed.all_reduce(n_t, op=torch.distributed.ReduceOp.SUM)
+            n_t = torch.tensor(
+                float(total_n), device=scaler_y_device, dtype=scaler_y_dtype
+            )
+            torch.distributed.all_reduce(
+                n_t, op=torch.distributed.ReduceOp.SUM
+            )
             total_n = int(n_t.item())
             if sum_x is not None:
-                torch.distributed.all_reduce(sum_x, op=torch.distributed.ReduceOp.SUM)
+                torch.distributed.all_reduce(
+                    sum_x, op=torch.distributed.ReduceOp.SUM
+                )
             if sum_y is not None:
-                torch.distributed.all_reduce(sum_y, op=torch.distributed.ReduceOp.SUM)
+                torch.distributed.all_reduce(
+                    sum_y, op=torch.distributed.ReduceOp.SUM
+                )
             if sum_x2 is not None:
-                torch.distributed.all_reduce(sum_x2, op=torch.distributed.ReduceOp.SUM)
+                torch.distributed.all_reduce(
+                    sum_x2, op=torch.distributed.ReduceOp.SUM
+                )
             if sum_xy is not None:
-                torch.distributed.all_reduce(sum_xy, op=torch.distributed.ReduceOp.SUM)
+                torch.distributed.all_reduce(
+                    sum_xy, op=torch.distributed.ReduceOp.SUM
+                )
         if (
             total_n > 0
             and sum_x is not None
@@ -3302,18 +3982,24 @@ def epochs(
             denom[tiny_mask] = 1.0
             affine_dtype = model_for_scaler.scaler.affine_a.dtype
             a = (cov_xy / denom).to(dtype=affine_dtype)
-            b = (mean_y - a.to(dtype=affine_dtype) * mean_x).to(dtype=affine_dtype)
+            b = (mean_y - a.to(dtype=affine_dtype) * mean_x).to(
+                dtype=affine_dtype
+            )
             a[tiny_mask] = 1.0
             b[tiny_mask] = 0.0
             model_for_scaler.scaler.set_affine(a, b)
     if torch_prof is not None:
         with contextlib.suppress(Exception):
             torch_prof.stop()
-        _get_profiler_summary(torch_prof, device=device, logger=_LOGGER, header="train/val")
+        _get_profiler_summary(
+            torch_prof, device=device, logger=_LOGGER, header="train/val"
+        )
     if local_rank == 0 and status_bar is not None:
         mbps = prev_io_bytes / max(prev_io_time, 1e-06) / MB_DIV
         tflops = prev_flops / max(prev_comp_time, 1e-06) / 1000000000000.0
-        status_bar.set_postfix_str(f"{mbps:.2f} MB/s, {tflops:.2f} TFLOPS", refresh=True)
+        status_bar.set_postfix_str(
+            f"{mbps:.2f} MB/s, {tflops:.2f} TFLOPS", refresh=True
+        )
         status_bar.close()
     end_kst_ns = posix_time()
     try:
@@ -3329,9 +4015,7 @@ def epochs(
         util_fallback = (
             util_from_sps
             if util_from_sps > 0.0
-            else prev_comp_time / total_t
-            if total_t > 0.0
-            else 0.0
+            else prev_comp_time / total_t if total_t > 0.0 else 0.0
         )
         gpu_util_frac = None
         mem_util_frac = None
@@ -3340,7 +4024,9 @@ def epochs(
         if mem_util_ema is not None:
             mem_util_frac = max(0.0, min(1.0, mem_util_ema / 100.0))
         if dev_t != "cpu":
-            util_for_cap = gpu_util_frac if gpu_util_frac is not None else util_fallback
+            util_for_cap = (
+                gpu_util_frac if gpu_util_frac is not None else util_fallback
+            )
             util_for_cap = max(0.0, min(1.0, util_for_cap))
             try:
                 if train_loader is not None:
@@ -3367,7 +4053,9 @@ def epochs(
                                         ),
                                         level="debug",
                                     )
-                        elif util_for_cap < 0.9 and (mem_util_frac is None or mem_util_frac < 0.88):
+                        elif util_for_cap < 0.9 and (
+                            mem_util_frac is None or mem_util_frac < 0.88
+                        ):
                             prev = None
                             with contextlib.suppress(Exception):
                                 prev = float(scale_ctl.get())
@@ -3400,18 +4088,25 @@ def epochs(
         if isinstance(hist, Recorder):
             try:
                 end_sec = round(float(end_kst_ns) / 1000000000.0, 6)
-                world = max(1, get_world_size(device)) if is_distributed() else 1
+                world = (
+                    max(1, get_world_size(device)) if is_distributed() else 1
+                )
                 hist.end_session(end_sec, peers=world)
                 if ops.ckpt_dir and (
-                    not is_distributed() or int(torch.distributed.get_rank()) == 0
+                    not is_distributed()
+                    or int(torch.distributed.get_rank()) == 0
                 ):
                     history_path = os.path.join(ops.ckpt_dir, "history.json")
                     records = hist.save()
                     sampled_n_total = None
                     with contextlib.suppress(Exception):
-                        sampled_n_total = int(round(float(prev_samples) * float(max(1, world))))
+                        sampled_n_total = int(
+                            round(float(prev_samples) * float(max(1, world)))
+                        )
                     meta = {
-                        "start_posix": float(round(float(hist.start.item()), 6)),
+                        "start_posix": float(
+                            round(float(hist.start.item()), 6)
+                        ),
                         "end_posix": float(round(float(hist.end.item()), 6)),
                         "timezone": hist.timezone,
                         "peers": int(hist.peers.item()),
@@ -3447,15 +4142,21 @@ def infer(
     if data_loader is None:
         return None
     if dataset is None:
-        dataset = Dataset.for_device(str(device) if isinstance(device, torch.device) else "cpu")
+        dataset = Dataset.for_device(
+            str(device) if isinstance(device, torch.device) else "cpu"
+        )
     if chunk_dir is None:
         if not ops.ckpt_dir:
-            raise RuntimeError("infer: ckpt_dir is required when chunk_dir is not provided")
+            raise RuntimeError(
+                "infer: ckpt_dir is required when chunk_dir is not provided"
+            )
         chunk_dir = os.path.join(ops.ckpt_dir, "pred_chunks")
     rank = torch.distributed.get_rank() if is_distributed() else 0
     world_size = get_world_size(device) if is_distributed() else 1
     torch_prof = None
-    prof_enabled = _env_flag("STNET_TORCH_PROFILE_INFER", _env_flag("STNET_TORCH_PROFILE", False))
+    prof_enabled = _env_flag(
+        "STNET_TORCH_PROFILE_INFER", _env_flag("STNET_TORCH_PROFILE", False)
+    )
     prof_all_ranks = _env_flag("STNET_TORCH_PROFILE_ALL_RANKS", False)
     if prof_enabled and (prof_all_ranks or int(rank) == 0):
         prof_dir = env_str("STNET_TORCH_PROFILE_DIR")
@@ -3491,10 +4192,16 @@ def infer(
     )
     dev_type = str(getattr(device, "type", "cpu"))
     use_async_write = bool(_env_flag("STNET_PRED_ASYNC_WRITE", True))
-    use_mmt_pred_parts = bool(_env_flag("STNET_PRED_MMT_PARTS", dev_type != "cpu"))
+    use_mmt_pred_parts = bool(
+        _env_flag("STNET_PRED_MMT_PARTS", dev_type != "cpu")
+    )
     if not use_async_write:
         use_mmt_pred_parts = False
-    cache = TensorSpooler(chunk_dir, max_queue=cache_q) if use_async_write else None
+    cache = (
+        TensorSpooler(chunk_dir, max_queue=cache_q)
+        if use_async_write
+        else None
+    )
     target_rows = int(_env_int("STNET_PRED_CHUNK_ROWS", 0))
     if target_rows <= 0:
         out_shape = tuple((int(x) for x in ops.out_shape or ()))
@@ -3502,9 +4209,13 @@ def infer(
         for d in out_shape:
             out_numel *= max(1, int(d))
         est_row_bytes = max(1, out_numel * 4)
-        target_bytes = int(_env_int("STNET_PRED_CHUNK_BYTES", 64 * 1024 * 1024))
+        target_bytes = int(
+            _env_int("STNET_PRED_CHUNK_BYTES", 64 * 1024 * 1024)
+        )
         target_rows = max(256, min(65536, target_bytes // est_row_bytes))
-    dev_obj = device if isinstance(device, torch.device) else torch.device(device)
+    dev_obj = (
+        device if isinstance(device, torch.device) else torch.device(device)
+    )
     run_model: torch.nn.Module = model
     if (
         is_distributed()
@@ -3524,9 +4235,14 @@ def infer(
             sync_module_states=True,
         )
     run_model.eval()
-    module_eval = run_model.module if hasattr(run_model, "module") else run_model
+    module_eval = (
+        run_model.module if hasattr(run_model, "module") else run_model
+    )
     distributed_sync(module_eval, device=dev_obj)
-    cg_enabled = bool(dev_type == "cuda" and getattr(module_eval, "_compile_cudagraphs", False))
+    cg_enabled = bool(
+        dev_type == "cuda"
+        and getattr(module_eval, "_compile_cudagraphs", False)
+    )
     td_cg_candidate = bool(
         (not cg_enabled)
         and dev_type == "cuda"
@@ -3537,12 +4253,21 @@ def infer(
     non_blocking_ok = bool(dev_type in ("cuda", "xpu"))
     pinned_ok = bool(is_pin_supported(dev_type))
     backend = accelerator_type(dev_type)
-    stream_fn = getattr(backend, "current_stream", None) if backend is not None else None
+    stream_fn = (
+        getattr(backend, "current_stream", None)
+        if backend is not None
+        else None
+    )
     Event = getattr(backend, "Event", None) if backend is not None else None
     can_stream_release = bool(
-        pinned_ok and non_blocking_ok and callable(stream_fn) and (Event is not None)
+        pinned_ok
+        and non_blocking_ok
+        and callable(stream_fn)
+        and (Event is not None)
     )
-    make_fence_event = partial(new_accelerator_event, device, enable_timing=False)
+    make_fence_event = partial(
+        new_accelerator_event, device, enable_timing=False
+    )
     cpu_pool = None
     if pinned_ok and TensorPagePool is not None:
         with contextlib.suppress(Exception):
@@ -3555,14 +4280,23 @@ def infer(
                     _cpu_default = max(8, min(64, int(os.cpu_count() or 8)))
                 except Exception:
                     _cpu_default = 16
-            cpu_pool_cap = max(2, int(_env_int("STNET_RUNTIME_PIN_POOL_CAPACITY", _cpu_default)))
+            cpu_pool_cap = max(
+                2,
+                int(_env_int("STNET_RUNTIME_PIN_POOL_CAPACITY", _cpu_default)),
+            )
             cpu_pool = TensorPagePool(capacity=cpu_pool_cap)
     pred_pool = None
-    if non_blocking_ok and TensorPagePool is not None and _env_flag("STNET_PRED_PINNED", True):
+    if (
+        non_blocking_ok
+        and TensorPagePool is not None
+        and _env_flag("STNET_PRED_PINNED", True)
+    ):
         with contextlib.suppress(Exception):
             _nogil = bool(CPU.is_optimized_for_no_gil())
             _pred_default = 2 if not _nogil else 4
-            pred_pool_cap = max(2, int(_env_int("STNET_PRED_PIN_POOL_CAPACITY", _pred_default)))
+            pred_pool_cap = max(
+                2, int(_env_int("STNET_PRED_PIN_POOL_CAPACITY", _pred_default))
+            )
             pred_pool = TensorPagePool(capacity=pred_pool_cap, pin_memory=True)
     stage_tensor = partial(
         _pool_tensor,
@@ -3614,7 +4348,7 @@ def infer(
             td_cg_max_bs = 0
             td_cg_target = None
             td_cg_x_inner_shape = None
-        
+
             def _td_predict(x: torch.Tensor) -> torch.Tensor:
                 out = run_model(x, calibrate_output=True, return_loss=False)
                 if isinstance(out, tuple):
@@ -3626,7 +4360,11 @@ def infer(
             def _td_benchmark(bs_now: int) -> int:
                 mb_cfg = int(getattr(model, "microbatch", 0) or 0)
                 dl_bs = int(getattr(data_loader, "batch_size", 0) or 0)
-                mb_target = int(mb_cfg) if int(mb_cfg) > 0 else (int(dl_bs) if int(dl_bs) > 0 else int(bs_now))
+                mb_target = (
+                    int(mb_cfg)
+                    if int(mb_cfg) > 0
+                    else (int(dl_bs) if int(dl_bs) > 0 else int(bs_now))
+                )
                 if int(dl_bs) > 0:
                     mb_target = min(int(mb_target), int(dl_bs))
                 return int(max(1, int(mb_target)))
@@ -3634,7 +4372,12 @@ def infer(
             def _td_cudagraph(bs_now: int, X_now: torch.Tensor) -> None:
                 nonlocal td_cg_active, td_cg_disabled, td_cg_mb, td_cg_mod
                 nonlocal td_cg_pad_buf, td_cg_seen, td_cg_max_bs, td_cg_target, td_cg_x_inner_shape
-                if td_cg_disabled or td_cg_active or (TD_CudaGraphModule is None) or (td_cg_mod is not None):
+                if (
+                    td_cg_disabled
+                    or td_cg_active
+                    or (TD_CudaGraphModule is None)
+                    or (td_cg_mod is not None)
+                ):
                     return
                 td_cg_seen += 1
                 td_cg_max_bs = max(int(td_cg_max_bs), int(bs_now))
@@ -3648,15 +4391,23 @@ def infer(
                 if mb_cap is None:
                     return
                 mb_cap = int(max(1, int(mb_cap)))
-                td_cg_x_inner_shape = tuple(int(d) for d in tuple(X_now.shape[1:]))
+                td_cg_x_inner_shape = tuple(
+                    int(d) for d in tuple(X_now.shape[1:])
+                )
                 td_cg_mb = int(mb_cap)
-                td_cg_pad_buf = X_now.new_empty((int(td_cg_mb),) + tuple(td_cg_x_inner_shape))
-                td_cg_mod = TD_CudaGraphModule(_td_predict, warmup=2, device=device)
+                td_cg_pad_buf = X_now.new_empty(
+                    (int(td_cg_mb),) + tuple(td_cg_x_inner_shape)
+                )
+                td_cg_mod = TD_CudaGraphModule(
+                    _td_predict, warmup=2, device=device
+                )
                 n0 = int(min(int(bs_now), int(td_cg_mb)))
                 td_cg_pad_buf[:n0].copy_(X_now[:n0])
                 if n0 < int(td_cg_mb):
                     td_cg_pad_buf[n0:].copy_(
-                        X_now[n0 - 1 : n0].expand(int(td_cg_mb) - n0, *tuple(td_cg_x_inner_shape))
+                        X_now[n0 - 1 : n0].expand(
+                            int(td_cg_mb) - n0, *tuple(td_cg_x_inner_shape)
+                        )
                     )
                 try:
                     for _ in range(3):
@@ -3701,7 +4452,11 @@ def infer(
                 except Exception:
                     raise
                 X = torch.atleast_2d(X)
-                bs = int(getattr(X, "shape", [0])[0]) if hasattr(X, "shape") else 0
+                bs = (
+                    int(getattr(X, "shape", [0])[0])
+                    if hasattr(X, "shape")
+                    else 0
+                )
                 if bs <= 0:
                     if status_bar is not None:
                         status_bar.update(1)
@@ -3710,7 +4465,9 @@ def infer(
                     _td_cudagraph(int(bs), X)
                 if row_ids is None:
                     if row_ids_buf is None or int(row_ids_buf.numel()) < bs:
-                        row_ids_buf = torch.empty((bs,), device="cpu", dtype=torch.int64)
+                        row_ids_buf = torch.empty(
+                            (bs,), device="cpu", dtype=torch.int64
+                        )
                     view = row_ids_buf[:bs]
                     torch.arange(
                         int(row_cursor),
@@ -3739,9 +4496,15 @@ def infer(
                     mb_eager = min(bs, int(mb_cfg))
                 mb_eager = max(1, int(mb_eager))
 
-                use_td_cg = bool(td_cg_active and (td_cg_mod is not None) and (td_cg_mb is not None))
+                use_td_cg = bool(
+                    td_cg_active
+                    and (td_cg_mod is not None)
+                    and (td_cg_mb is not None)
+                )
                 if use_td_cg and (td_cg_x_inner_shape is not None):
-                    if tuple(int(d) for d in tuple(X.shape[1:])) != tuple(td_cg_x_inner_shape):
+                    if tuple(int(d) for d in tuple(X.shape[1:])) != tuple(
+                        td_cg_x_inner_shape
+                    ):
                         td_cg_active = False
                         td_cg_disabled = True
                         td_cg_mb = None
@@ -3764,12 +4527,22 @@ def infer(
                     if (cg_enabled or use_td_cg) and n_i < mb:
                         pad_n = int(mb - n_i)
                         try:
-                            if use_td_cg and (td_cg_pad_buf is not None) and (td_cg_x_inner_shape is not None):
-                                if tuple(int(d) for d in tuple(Xi.shape[1:])) != tuple(td_cg_x_inner_shape):
-                                    raise RuntimeError("infer: input shape changed during td-cudagraph run")
+                            if (
+                                use_td_cg
+                                and (td_cg_pad_buf is not None)
+                                and (td_cg_x_inner_shape is not None)
+                            ):
+                                if tuple(
+                                    int(d) for d in tuple(Xi.shape[1:])
+                                ) != tuple(td_cg_x_inner_shape):
+                                    raise RuntimeError(
+                                        "infer: input shape changed during td-cudagraph run"
+                                    )
                                 Xi_pad = td_cg_pad_buf
                                 Xi_pad[:n_i].copy_(Xi)
-                                Xi_pad[n_i:].copy_(Xi[-1:].expand(pad_n, *tuple(Xi.shape[1:])))
+                                Xi_pad[n_i:].copy_(
+                                    Xi[-1:].expand(pad_n, *tuple(Xi.shape[1:]))
+                                )
                                 Xi_run = Xi_pad
                             else:
                                 want_shape = (int(mb),) + tuple(Xi.shape[1:])
@@ -3782,7 +4555,9 @@ def infer(
                                     pad_buf = Xi.new_empty(want_shape)
                                 Xi_pad = pad_buf
                                 Xi_pad[:n_i].copy_(Xi)
-                                Xi_pad[n_i:].copy_(Xi[-1:].expand(pad_n, *tuple(Xi.shape[1:])))
+                                Xi_pad[n_i:].copy_(
+                                    Xi[-1:].expand(pad_n, *tuple(Xi.shape[1:]))
+                                )
                                 Xi_run = Xi_pad
                         except Exception:
                             Xi_pad = None
@@ -3795,7 +4570,11 @@ def infer(
                     except RuntimeError as e:
                         if is_oom_error(e) and mb > 1:
                             with contextlib.suppress(Exception):
-                                empty_device_cache(device=device, do_gc=False, min_interval_s=0.0)
+                                empty_device_cache(
+                                    device=device,
+                                    do_gc=False,
+                                    min_interval_s=0.0,
+                                )
                             mb = max(1, mb // 2)
                             try:
                                 setattr(model, "microbatch", mb)
@@ -3819,10 +4598,16 @@ def infer(
                             cudagraph_mark_step_end()
                     preds = out
                     if not isinstance(preds, torch.Tensor):
-                        raise RuntimeError("infer: unexpected model output type")
+                        raise RuntimeError(
+                            "infer: unexpected model output type"
+                        )
                     if pad_n > 0:
                         preds = preds[:n_i]
-                    rows_cpu = rows_i if rows_i.device.type == "cpu" else rows_i.to(device="cpu")
+                    rows_cpu = (
+                        rows_i
+                        if rows_i.device.type == "cpu"
+                        else rows_i.to(device="cpu")
+                    )
                     writer.append(rows_cpu, preds)
                     del Xi, Xi_pad, rows_i, out, preds, rows_cpu
                     start = end
@@ -3836,28 +4621,36 @@ def infer(
         if torch_prof is not None:
             with contextlib.suppress(Exception):
                 torch_prof.stop()
-            _get_profiler_summary(torch_prof, device=device, logger=_LOGGER, header="infer")
+            _get_profiler_summary(
+                torch_prof, device=device, logger=_LOGGER, header="infer"
+            )
         if cache is not None:
             cache.close()
         exc_type, _, _ = sys.exc_info()
         if exc_type is None and cache is not None:
             had_error = False
             with contextlib.suppress(Exception):
-                had_error = bool(getattr(cache, "had_error", None) and cache.had_error())
+                had_error = bool(
+                    getattr(cache, "had_error", None) and cache.had_error()
+                )
             if had_error:
                 err = getattr(cache, "_err", None)
                 if isinstance(err, BaseException):
                     raise RuntimeError(
                         f"infer: prediction writer encountered an error: {type(err).__name__}: {err}"
                     ) from err
-                raise RuntimeError("infer: prediction writer encountered an error")
+                raise RuntimeError(
+                    "infer: prediction writer encountered an error"
+                )
         if status_bar is not None:
             status_bar.close()
         with contextlib.suppress(Exception):
             distributed_barrier(device)
         if exc_type is None and rank == 0:
             parts = []
-            for rows_path in sorted(glob.glob(os.path.join(chunk_dir, "part-r*-c*-rows.pt"))):
+            for rows_path in sorted(
+                glob.glob(os.path.join(chunk_dir, "part-r*-c*-rows.pt"))
+            ):
                 base = rows_path[: -len("-rows.pt")]
                 pred_mmt = base + "-pred.mmt"
                 pred_pt = base + "-pred.pt"
@@ -3881,7 +4674,9 @@ def infer(
                     }
                 )
             if not parts:
-                raise RuntimeError(f"infer: no prediction parts produced in {chunk_dir}")
+                raise RuntimeError(
+                    f"infer: no prediction parts produced in {chunk_dir}"
+                )
             manifest = {
                 "format": "stnet.pred.v2",
                 "rank_count": int(world_size),
@@ -3898,11 +4693,16 @@ def infer(
 
 
 @overload
-def process(ops: RuntimeConfig, ret_sink: ReturnSink | None = None) -> object: ...
+def process(
+    ops: RuntimeConfig, ret_sink: ReturnSink | None = None
+) -> object: ...
 
 
 @overload
-def process(local_rank: int, ops: RuntimeConfig, ret_sink: ReturnSink | None = None) -> object: ...
+def process(
+    local_rank: int, ops: RuntimeConfig, ret_sink: ReturnSink | None = None
+) -> object: ...
+
 
 @worker_main()
 def process(*args: Any, **kwargs: Any) -> object:
@@ -3963,7 +4763,9 @@ def process(*args: Any, **kwargs: Any) -> object:
         backend = _get_backend_type(device)
         enable_tf32 = bool(getattr(ops, "enable_tf32", True))
         _init_distributed_group(backend, device, local_rank)
-        cfg = coerce_model_config(ops.cfg_dict if isinstance(ops.cfg_dict, dict) else ops.cfg_dict)
+        cfg = coerce_model_config(
+            ops.cfg_dict if isinstance(ops.cfg_dict, dict) else ops.cfg_dict
+        )
         cfg = replace(cfg, device=device)
         model = Model(ops.in_dim, ops.out_shape, config=cfg)
         if ops.init_ckpt_dir is not None and os.path.isdir(ops.init_ckpt_dir):
@@ -3977,7 +4779,9 @@ def process(*args: Any, **kwargs: Any) -> object:
             else:
                 m_sd = get_model_state_dict(
                     model,
-                    options=StateDictOptions(full_state_dict=True, cpu_offload=False),
+                    options=StateDictOptions(
+                        full_state_dict=True, cpu_offload=False
+                    ),
                 )
                 m_sd = _coerce_dcp_keys(m_sd)
                 with _filtered_warnings():
@@ -3986,7 +4790,9 @@ def process(*args: Any, **kwargs: Any) -> object:
                         storage_reader=FileSystemReader(ops.init_ckpt_dir),
                     )
                 resize_scaler_buffer(model, m_sd)
-                set_model_state_dict(model, m_sd, options=StateDictOptions(strict=False))
+                set_model_state_dict(
+                    model, m_sd, options=StateDictOptions(strict=False)
+                )
         if ops.sources is None:
             raise RuntimeError("RuntimeConfig.sources is required but None")
         metadata = Dataset.for_device(device)
@@ -4009,7 +4815,12 @@ def process(*args: Any, **kwargs: Any) -> object:
         fractions = meta_info.get("fractions", [1.0, 0.0])
         if isinstance(fractions, (list, tuple)) and len(fractions) >= 2:
             actual_val_frac = float(fractions[-1])
-            if not math.isclose(actual_val_frac, float(ops.val_frac), rel_tol=0.001, abs_tol=0.001):
+            if not math.isclose(
+                actual_val_frac,
+                float(ops.val_frac),
+                rel_tol=0.001,
+                abs_tol=0.001,
+            ):
                 warnings.warn(
                     "val_frac=%s differs from memmap metadata (%s); using metadata value for loaders"
                     % (ops.val_frac, actual_val_frac)
@@ -4027,9 +4838,9 @@ def process(*args: Any, **kwargs: Any) -> object:
         metadata.scale_max_abs = meta_info.get("scale_max_abs")
         metadata.scale_min_value = meta_info.get("scale_min_value")
         metadata.scale_max_value = meta_info.get("scale_max_value")
-        metadata.scale_min_positive = meta_info.get("scale_min_positive") or meta_info.get(
-            "scale_min_abs"
-        )
+        metadata.scale_min_positive = meta_info.get(
+            "scale_min_positive"
+        ) or meta_info.get("scale_min_abs")
         metadata.scale_is_integral = meta_info.get("scale_is_integral")
         if meta_info.get("is_negotiable") is not None:
             metadata.is_negotiable = bool(meta_info.get("is_negotiable"))
@@ -4039,7 +4850,9 @@ def process(*args: Any, **kwargs: Any) -> object:
         lab_dtype_name = str(meta_info.get("labels_dtype", "")).lower()
         if "float64" in feat_dtype_name or "float64" in lab_dtype_name:
             metadata.is_negotiable = False
-        precision = PrecisionPolicy.from_metadata(device=device, metadata=metadata, logger=_LOGGER)
+        precision = PrecisionPolicy.from_metadata(
+            device=device, metadata=metadata, logger=_LOGGER
+        )
         param_dtype = precision.master_float
         model, _, _ = ModelPolicy.use_nvidia_layers(
             model,
@@ -4061,8 +4874,10 @@ def process(*args: Any, **kwargs: Any) -> object:
         if param_dtype is torch.float64:
             disable_note = "master dtype is float64"
         elif fp8_ok:
-            model, fp8_enabled, fp8_backend = ModelPolicy.enable_float8_training(
-                model, metadata=metadata, logger=_float8_log
+            model, fp8_enabled, fp8_backend = (
+                ModelPolicy.enable_float8_training(
+                    model, metadata=metadata, logger=_float8_log
+                )
             )
             if not fp8_enabled:
                 disable_note = fp8_backend or fp8_reason
@@ -4096,7 +4911,11 @@ def process(*args: Any, **kwargs: Any) -> object:
         _validate_model_dtype_unity(_m_pre, device)
         _validate_no_meta_tensors(_m_pre)
         _validate_no_fake_dtensor(_m_pre)
-        if is_distributed() and get_world_size(device) > 1 and device.type in ("cuda", "xpu"):
+        if (
+            is_distributed()
+            and get_world_size(device) > 1
+            and device.type in ("cuda", "xpu")
+        ):
             mesh, mesh_kind = get_distributed_mesh(device)
             if mesh_kind != "hsdp2":
                 _LOGGER.warning(
@@ -4105,7 +4924,9 @@ def process(*args: Any, **kwargs: Any) -> object:
             try:
                 wrapped_ids: set[int] = set()
 
-                def _wrap_once(mod: torch.nn.Module = None, *args: Any, is_root: bool) -> None:
+                def _wrap_once(
+                    mod: torch.nn.Module = None, *args: Any, is_root: bool
+                ) -> None:
                     if mod is None or id(mod) in wrapped_ids:
                         return
                     wrapped_ids.add(id(mod))
@@ -4117,7 +4938,10 @@ def process(*args: Any, **kwargs: Any) -> object:
                         sync_module_states=bool(is_root),
                     )
 
-                for root_mod in (getattr(model, "processor", None), getattr(model, "controller", None)):
+                for root_mod in (
+                    getattr(model, "processor", None),
+                    getattr(model, "controller", None),
+                ):
                     if isinstance(root_mod, torch.nn.Module):
                         blocks = getattr(root_mod, "blocks", None)
                         if isinstance(blocks, torch.nn.ModuleList):
@@ -4134,7 +4958,9 @@ def process(*args: Any, **kwargs: Any) -> object:
                     sync_module_states=True,
                 )
             except Exception as e:
-                _LOGGER.warning(f"HSDP2 wrapping fallback to root-only FSDP: {e}")
+                _LOGGER.warning(
+                    f"HSDP2 wrapping fallback to root-only FSDP: {e}"
+                )
                 model = to_hsdp_module(
                     model,
                     mesh=mesh,
@@ -4211,13 +5037,19 @@ def process(*args: Any, **kwargs: Any) -> object:
         )
         loss_controller = LossWeightController(top_avg=0.5, bottom_avg=0.5)
         ckpt_state_path = get_loader_state(ops.ckpt_dir or "")
-        init_state_path = get_loader_state(ops.init_ckpt_dir) if ops.init_ckpt_dir else None
+        init_state_path = (
+            get_loader_state(ops.init_ckpt_dir) if ops.init_ckpt_dir else None
+        )
         state_train = {}
         state_val = {}
         _dlp = (
             ckpt_state_path
             if os.path.isfile(ckpt_state_path)
-            else (init_state_path if init_state_path and os.path.isfile(init_state_path) else None)
+            else (
+                init_state_path
+                if init_state_path and os.path.isfile(init_state_path)
+                else None
+            )
         )
         restore_dl_state = False
         if _dlp:
@@ -4297,9 +5129,13 @@ def process(*args: Any, **kwargs: Any) -> object:
                 main_steps=main_steps,
                 emin=emin,
             )
-            sched = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
+            sched = torch.optim.lr_scheduler.LambdaLR(
+                optimizer, lr_lambda=lr_lambda
+            )
             scheduler_step_per_batch = True
-            tracked_module = model.module if hasattr(model, "module") else model
+            tracked_module = (
+                model.module if hasattr(model, "module") else model
+            )
             ema_helper = None
             swa_helper = None
             swa_start_epoch = total_epochs
@@ -4309,19 +5145,27 @@ def process(*args: Any, **kwargs: Any) -> object:
                     isinstance(m, nn.modules.batchnorm._BatchNorm)
                     for m in tracked_module.modules()
                 )
-                fixed_accum = 2 if getattr(device, "type", None) == "cpu" else 4
+                fixed_accum = (
+                    2 if getattr(device, "type", None) == "cpu" else 4
+                )
                 approx_optim_steps = max(
                     1,
                     (int(total_epochs) * max(1, int(train_steps)))
                     // max(1, int(fixed_accum)),
                 )
-                use_swa = (not has_bn) and (int(total_epochs) >= 4) and (approx_optim_steps >= 200)
+                use_swa = (
+                    (not has_bn)
+                    and (int(total_epochs) >= 4)
+                    and (approx_optim_steps >= 200)
+                )
             except Exception:
                 use_swa = False
 
             if use_swa:
                 swa_start_epoch = max(1, int(total_epochs) // 2)
-                swa_helper = StochasticWeightAverage(tracked_module, metadata=metadata)
+                swa_helper = StochasticWeightAverage(
+                    tracked_module, metadata=metadata
+                )
             else:
                 ema_helper = ExponentialMovingAverage(
                     tracked_module, decay=0.9999, metadata=metadata
@@ -4329,7 +5173,9 @@ def process(*args: Any, **kwargs: Any) -> object:
             amp_dtype = getattr(precision, "amp_float", None)
             compute_dtype = amp_dtype or param_dtype
             scaler = torch.amp.GradScaler(
-                enabled=bool(device.type == "cuda" and compute_dtype == torch.float16)
+                enabled=bool(
+                    device.type == "cuda" and compute_dtype == torch.float16
+                )
             )
             try:
                 new_affinity().pin_thread()
@@ -4364,10 +5210,15 @@ def process(*args: Any, **kwargs: Any) -> object:
                 session.close()
         if local_rank == 0:
             model_sd = get_model_state_dict(
-                model, options=StateDictOptions(full_state_dict=True, cpu_offload=True)
+                model,
+                options=StateDictOptions(
+                    full_state_dict=True, cpu_offload=True
+                ),
             )
             optim_sd = get_optimizer_state_dict(model, optimizers=optimizer)
-            writer = FileSystemWriter(ops.ckpt_dir or "", sync_files=True, overwrite=True)
+            writer = FileSystemWriter(
+                ops.ckpt_dir or "", sync_files=True, overwrite=True
+            )
             with _filtered_warnings():
                 save(
                     state_dict={"model": model_sd, "optimizer": optim_sd},
@@ -4381,11 +5232,19 @@ def process(*args: Any, **kwargs: Any) -> object:
                 with contextlib.suppress(Exception):
                     _dl = {
                         "train": (
-                            raw_train_loader.state_dict() if raw_train_loader is not None else {}
+                            raw_train_loader.state_dict()
+                            if raw_train_loader is not None
+                            else {}
                         ),
-                        "val": (raw_val_loader.state_dict() if raw_val_loader is not None else {}),
+                        "val": (
+                            raw_val_loader.state_dict()
+                            if raw_val_loader is not None
+                            else {}
+                        ),
                     }
-                    collate.write_json(get_loader_state(ops.ckpt_dir or ""), _dl, indent=2)
+                    collate.write_json(
+                        get_loader_state(ops.ckpt_dir or ""), _dl, indent=2
+                    )
                 avg_tag = None
                 avg_helper = None
                 if swa_helper is not None:
@@ -4408,8 +5267,14 @@ def process(*args: Any, **kwargs: Any) -> object:
                                 if mk in avg_fallback:
                                     avg_fallback[mk] = v
                         _coerce_dcp_keys(avg_fallback)
-                        torch.save(avg_fallback, os.path.join(ops.ckpt_dir, f"model_{avg_tag}.pt"))
-                        torch.save(avg_fallback, os.path.join(ops.ckpt_dir, "model_avg.pt"))
+                        torch.save(
+                            avg_fallback,
+                            os.path.join(ops.ckpt_dir, f"model_{avg_tag}.pt"),
+                        )
+                        torch.save(
+                            avg_fallback,
+                            os.path.join(ops.ckpt_dir, "model_avg.pt"),
+                        )
         torch.distributed.barrier(
             device_ids=[local_rank] if device.type in ("cuda", "xpu") else None
         )
@@ -4428,7 +5293,9 @@ def process(*args: Any, **kwargs: Any) -> object:
         backend = _get_backend_type(device)
         if not torch.distributed.is_initialized():
             _init_distributed_group(backend, device, local_rank)
-        cfg = coerce_model_config(ops.cfg_dict if isinstance(ops.cfg_dict, dict) else ops.cfg_dict)
+        cfg = coerce_model_config(
+            ops.cfg_dict if isinstance(ops.cfg_dict, dict) else ops.cfg_dict
+        )
         cfg = replace(cfg, device=device)
         if _env_flag("STNET_MAX_PERF", True):
             cm = canonicalize_compile_mode(getattr(cfg, "compile_mode", None))
@@ -4468,7 +5335,9 @@ def process(*args: Any, **kwargs: Any) -> object:
             raise RuntimeError(
                 f"predict/infer: model_ckpt_dir does not exist or is not a directory: {ops.model_ckpt_dir!r}"
             )
-        if ops.model_ckpt_dir is not None and os.path.isdir(ops.model_ckpt_dir):
+        if ops.model_ckpt_dir is not None and os.path.isdir(
+            ops.model_ckpt_dir
+        ):
             fallback_model = os.path.join(ops.model_ckpt_dir, "model.pt")
             if os.path.isfile(fallback_model):
                 cpu_state = _torch_load_checkpoint(
@@ -4479,7 +5348,9 @@ def process(*args: Any, **kwargs: Any) -> object:
             else:
                 m_sd = get_model_state_dict(
                     model,
-                    options=StateDictOptions(full_state_dict=True, cpu_offload=True),
+                    options=StateDictOptions(
+                        full_state_dict=True, cpu_offload=True
+                    ),
                 )
                 m_sd = _coerce_dcp_keys(m_sd)
                 load(
@@ -4487,7 +5358,9 @@ def process(*args: Any, **kwargs: Any) -> object:
                     storage_reader=FileSystemReader(ops.model_ckpt_dir),
                 )
                 resize_scaler_buffer(model, m_sd)
-                set_model_state_dict(model, m_sd, options=StateDictOptions(strict=False))
+                set_model_state_dict(
+                    model, m_sd, options=StateDictOptions(strict=False)
+                )
         model.to(device, non_blocking=device.type in ("cuda", "xpu")).eval()
         metadata = Dataset.for_device(device)
         model, _, _ = ModelPolicy.use_nvidia_layers(model, device=device)
@@ -4501,7 +5374,8 @@ def process(*args: Any, **kwargs: Any) -> object:
             model,
             prefer=(
                 torch.bfloat16
-                if getattr(device, "type", None) == "cuda" and is_cuda_bf16_supported(device)
+                if getattr(device, "type", None) == "cuda"
+                and is_cuda_bf16_supported(device)
                 else None
             ),
         )
@@ -4511,7 +5385,9 @@ def process(*args: Any, **kwargs: Any) -> object:
             param_dtype = next(
                 (
                     p.dtype
-                    for p in (model.module if hasattr(model, "module") else model).parameters()
+                    for p in (
+                        model.module if hasattr(model, "module") else model
+                    ).parameters()
                 ),
                 None,
             )
@@ -4557,7 +5433,11 @@ def process(*args: Any, **kwargs: Any) -> object:
             val_weights=getattr(ops, "val_weights", None),
         ).open()
         data_loader = session.training_loader
-        chunk_dir = os.path.join(ops.ckpt_dir, "pred_chunks") if ops.ckpt_dir or "" else None
+        chunk_dir = (
+            os.path.join(ops.ckpt_dir, "pred_chunks")
+            if ops.ckpt_dir or ""
+            else None
+        )
         if chunk_dir and torch.distributed.get_rank() == 0:
             with contextlib.suppress(Exception):
                 os.makedirs(chunk_dir, exist_ok=True)
@@ -4565,7 +5445,9 @@ def process(*args: Any, **kwargs: Any) -> object:
             pass
         if ops.mode in ("predict", "infer"):
             if not chunk_dir:
-                raise RuntimeError("predict/infer requires chunk_dir (streaming enforced)")
+                raise RuntimeError(
+                    "predict/infer requires chunk_dir (streaming enforced)"
+                )
         try:
             result = infer(
                 model=model,

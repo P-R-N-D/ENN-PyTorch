@@ -46,20 +46,32 @@ def _worker(
         if barrier is not None:
             barrier.wait()
         for _ in range(int(iters)):
-            x = torch.randn(int(batch), int(seq), int(in_dim), device=device, dtype=dtype)
+            x = torch.randn(
+                int(batch), int(seq), int(in_dim), device=device, dtype=dtype
+            )
             y, state = model.forward_stream(x, temporal_state=state)
             if not isinstance(y, torch.Tensor):
-                raise RuntimeError("forward_stream did not return Tensor output")
+                raise RuntimeError(
+                    "forward_stream did not return Tensor output"
+                )
             if not isinstance(state, torch.Tensor):
-                raise RuntimeError("forward_stream did not return Tensor state")
+                raise RuntimeError(
+                    "forward_stream did not return Tensor state"
+                )
             if state.dim() != 4:
-                raise RuntimeError(f"state dim mismatch: expected 4D, got {state.dim()}D")
+                raise RuntimeError(
+                    f"state dim mismatch: expected 4D, got {state.dim()}D"
+                )
             if not state.is_contiguous():
                 raise RuntimeError("state is not contiguous")
             if state.device != device:
-                raise RuntimeError(f"state device mismatch: {state.device} vs {device}")
+                raise RuntimeError(
+                    f"state device mismatch: {state.device} vs {device}"
+                )
             if state.dtype != dtype:
-                raise RuntimeError(f"state dtype mismatch: {state.dtype} vs {dtype}")
+                raise RuntimeError(
+                    f"state dtype mismatch: {state.dtype} vs {dtype}"
+                )
             if not y.is_contiguous():
                 raise RuntimeError("output is not contiguous")
     except Exception as exc:
@@ -95,7 +107,9 @@ def main() -> int:
 
     device = torch.device(args.device)
     dtype = _dtype_from_str(args.dtype)
-    out_shape = tuple(int(p.strip()) for p in str(args.out_shape).split(",") if p.strip())
+    out_shape = tuple(
+        int(p.strip()) for p in str(args.out_shape).split(",") if p.strip()
+    )
     if not out_shape:
         raise ValueError("out-shape must be like '8,8'")
 

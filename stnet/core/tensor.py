@@ -148,13 +148,28 @@ def coerce_tensor(
         return t
     if isinstance(value, (list, tuple)):
         out = [
-            coerce_tensor(v, materialize_meta=materialize_meta, make_contiguous=make_contiguous)
+            coerce_tensor(
+                v,
+                materialize_meta=materialize_meta,
+                make_contiguous=make_contiguous,
+            )
             for v in value
         ]
-        return type(value)(*out) if hasattr(value, "_fields") else type(value)(out)
+        return (
+            type(value)(*out)
+            if hasattr(value, "_fields")
+            else type(value)(out)
+        )
     if isinstance(value, Mapping):
         return type(value)(
-            (k, coerce_tensor(v, materialize_meta=materialize_meta, make_contiguous=make_contiguous))
+            (
+                k,
+                coerce_tensor(
+                    v,
+                    materialize_meta=materialize_meta,
+                    make_contiguous=make_contiguous,
+                ),
+            )
             for k, v in value.items()
         )
     return value
@@ -181,6 +196,7 @@ def extract_tensor(out: object) -> torch.Tensor:
                 disable_functional_mode,
                 mb_unwrap_functional_tensor,
             )
+
             with disable_functional_mode():
                 u = mb_unwrap_functional_tensor(t)
                 if isinstance(u, torch.Tensor):
@@ -192,7 +208,9 @@ def extract_tensor(out: object) -> torch.Tensor:
     if isinstance(out, TensorDictBase):
         y = out.get("pred", None)
         if not isinstance(y, torch.Tensor):
-            y = next((v for v in out.values() if isinstance(v, torch.Tensor)), None)
+            y = next(
+                (v for v in out.values() if isinstance(v, torch.Tensor)), None
+            )
         if isinstance(y, torch.Tensor):
             return _to_plain(y)
         raise RuntimeError("TensorDict output missing tensors")
@@ -217,7 +235,9 @@ def to_tensor_like(x: Any, ref: torch.Tensor) -> torch.Tensor:
 
 
 @contextlib.contextmanager
-def from_buffer(*args: Any, coerce_requires_grad: bool = True) -> Iterator[None]:
+def from_buffer(
+    *args: Any, coerce_requires_grad: bool = True
+) -> Iterator[None]:
     if not hasattr(torch, "frombuffer"):
         yield
         return
@@ -239,14 +259,20 @@ def from_buffer(*args: Any, coerce_requires_grad: bool = True) -> Iterator[None]
             if int(count) == 0:
                 return torch.zeros((0,), dtype=dtype)
             if nbytes <= off:
-                n = int(count) if isinstance(count, int) and int(count) > 0 else 0
+                n = (
+                    int(count)
+                    if isinstance(count, int) and int(count) > 0
+                    else 0
+                )
                 return torch.zeros((n,), dtype=dtype)
             readonly = bool(getattr(mv, "readonly", False))
         except Exception:
             readonly = False
         if readonly:
             with warnings.catch_warnings():
-                warnings.filterwarnings("ignore", message=r".*buffer is not writable.*")
+                warnings.filterwarnings(
+                    "ignore", message=r".*buffer is not writable.*"
+                )
                 return _call_from_buffer(
                     _original,
                     buffer,

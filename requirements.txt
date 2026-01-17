@@ -1,6 +1,8 @@
 # Notes
-# - Install the correct PyTorch build for your accelerator (CUDA/ROCm/XPU/CPU) **before** installing this project.
-# - Python >= 3.10 is required; Python 3.14t (free-threading) is recommended for higher data pipeline throughput.
+# - Install the correct PyTorch build for your accelerator (CUDA/ROCm/XPU/CPU)
+#   **before** installing this project.
+# - Python >= 3.10 is required; Python 3.14t (free-threading) is recommended for
+#   higher data pipeline throughput.
 #
 # This file is kept as a convenience for environments that still prefer `pip install -r requirements.txt`.
 # The canonical dependency set is in `pyproject.toml`.
@@ -32,21 +34,26 @@ ml_dtypes>=0.5.4
 # Optional extras (install via `pip install -e .[extra]`)
 #
 # DataFrame integrations
-# - pandas: pandas>=2.2.0, openpyxl>=3.1.5, fastexcel>=0.14.0, xlsxwriter>=3.2.0
-# - polars: polars>=1.30.0, openpyxl>=3.1.5, fastexcel>=0.14.0, xlsxwriter>=3.2.0
-# - pandas_on_spark: pyspark[pandas_on_spark]>=4.0.0, openpyxl>=3.1.5, fastexcel>=0.14.0, xlsxwriter>=3.2.0
+# - pandas: pandas>=2.2.0, openpyxl>=3.1.5, fastexcel>=0.14.0,
+#   xlsxwriter>=3.2.0
+# - polars: polars>=1.30.0, openpyxl>=3.1.5, fastexcel>=0.14.0,
+#   xlsxwriter>=3.2.0
+# - pandas_on_spark: pyspark[pandas_on_spark]>=4.0.0, openpyxl>=3.1.5,
+#   fastexcel>=0.14.0, xlsxwriter>=3.2.0
 #
 # Hardware / optimizer backends
 # - torchao: torchao>=0.15.0
-# - nvidia_te_cu12: transformer-engine-cu12>=2.2.0, transformer-engine-torch>=2.2.0
-# - nvidia_te_cu13: transformer-engine-cu13>=2.2.0, transformer-engine-torch>=2.2.0
+# - nvidia_te_cu12: transformer-engine-cu12>=2.2.0,
+#   transformer-engine-torch>=2.2.0
+# - nvidia_te_cu13: transformer-engine-cu13>=2.2.0,
+#   transformer-engine-torch>=2.2.0
 # - intel_ai: intel-extension-for-pytorch>=2.7.0
 #
 # Export / deployment (optional)
-# - deployment_full: onnx2tf>=1.27.2 (py<3.13), tf-keras>=2.20.1, tensorflow>=2.20.0,
-#                    coremltools>=8.3.0 (macOS),
-#                    tensorrt>=10.10.0.31 (Linux/CUDA),
-#                    executorch>=0.6.0 (Linux, py<3.12; wheel availability varies)
+# - deployment_full: onnx2tf>=1.27.2 (py<3.13), tf-keras>=2.20.1,
+#   tensorflow>=2.20.0, coremltools>=8.3.0 (macOS),
+#   tensorrt>=10.10.0.31 (Linux/CUDA), executorch>=0.6.0 (Linux, py<3.12;
+#   wheel availability varies)
 #
 # Telemetry
 # - telemetry: nvidia-ml-py>=11.515.48

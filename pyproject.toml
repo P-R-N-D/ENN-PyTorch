@@ -10,7 +10,15 @@ readme = { file = "README.md", content-type = "text/markdown" }
 requires-python = ">=3.12"
 license = { file = "LICENSE" }
 authors = [{ name = "Kim Jeseok" }]
-keywords = ["transformer", "spatio-temporal", "pytorch", "time-series", "fp8", "training", "onnx"]
+keywords = [
+  "transformer",
+  "spatio-temporal",
+  "pytorch",
+  "time-series",
+  "fp8",
+  "training",
+  "onnx",
+]
 classifiers = [
   "Development Status :: 5 - Production/Stable",
   "Intended Audience :: Science/Research",
@@ -51,11 +59,32 @@ Issues = "https://github.com/P-R-N-D/STNet-PyTorch/issues"
 
 [project.optional-dependencies]
 safetensors = ["safetensors>=0.4.0"]
-pandas = ["pandas>=2.2.0", "openpyxl>=3.1.5", "fastexcel>=0.14.0", "xlsxwriter>=3.2.0"]
-pandas_on_spark = ["pyspark[pandas_on_spark]>=4.0.0", "openpyxl>=3.1.5", "fastexcel>=0.14.0", "xlsxwriter>=3.2.0"]
-polars = ["polars>=1.30.0", "openpyxl>=3.1.5", "fastexcel>=0.14.0", "xlsxwriter>=3.2.0"]
-nvidia_te_cu12 = ["transformer-engine-cu12>=2.2.0", "transformer-engine-torch>=2.2.0"]
-nvidia_te_cu13 = ["transformer-engine-cu13>=2.2.0", "transformer-engine-torch>=2.2.0"]
+pandas = [
+  "pandas>=2.2.0",
+  "openpyxl>=3.1.5",
+  "fastexcel>=0.14.0",
+  "xlsxwriter>=3.2.0",
+]
+pandas_on_spark = [
+  "pyspark[pandas_on_spark]>=4.0.0",
+  "openpyxl>=3.1.5",
+  "fastexcel>=0.14.0",
+  "xlsxwriter>=3.2.0",
+]
+polars = [
+  "polars>=1.30.0",
+  "openpyxl>=3.1.5",
+  "fastexcel>=0.14.0",
+  "xlsxwriter>=3.2.0",
+]
+nvidia_te_cu12 = [
+  "transformer-engine-cu12>=2.2.0",
+  "transformer-engine-torch>=2.2.0",
+]
+nvidia_te_cu13 = [
+  "transformer-engine-cu13>=2.2.0",
+  "transformer-engine-torch>=2.2.0",
+]
 intel_ai = ["intel-extension-for-pytorch>=2.7.0"]
 export_tensorflow = [
   "onnx2tf>=1.28.8",

@@ -70,7 +70,11 @@ def _iter_batch(items: Iterable[Any], key: str) -> Iterator[torch.Tensor]:
             tensor = item.get(key)
         elif isinstance(item, torch.Tensor):
             tensor = item
-        elif isinstance(item, (tuple, list)) and item and torch.is_tensor(item[0]):
+        elif (
+            isinstance(item, (tuple, list))
+            and item
+            and torch.is_tensor(item[0])
+        ):
             tensor = item[0]
         if isinstance(tensor, torch.Tensor):
             yield tensor
@@ -87,7 +91,12 @@ def _log_optimizer(
         logging.DEBUG if str(level).lower() == "debug" else logging.INFO
     ):
         return
-    key = key or ("opt", payload.get("mode"), payload.get("device"), payload.get("selected"))
+    key = key or (
+        "opt",
+        payload.get("mode"),
+        payload.get("device"),
+        payload.get("selected"),
+    )
     if not _is_hashable(key):
         key = _to_immutable(key)
     with _OPT_LOGGED_LOCK:
@@ -98,7 +107,9 @@ def _log_optimizer(
         if len(_OPT_LOGGED_KEYS) > _OPT_LOGGED_MAX:
             _OPT_LOGGED_KEYS.popitem(last=False)
     try:
-        msg = "[OPT][DECISION] " + json.dumps(payload, sort_keys=True, default=str)
+        msg = "[OPT][DECISION] " + json.dumps(
+            payload, sort_keys=True, default=str
+        )
     except Exception:
         msg = f"[OPT][DECISION] {payload}"
     if logger is not None:
@@ -114,7 +125,10 @@ def _get_expected_args(ctor: Any) -> Optional[frozenset[str]]:
         sig = inspect.signature(ctor)
         return (
             None
-            if any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values())
+            if any(
+                p.kind == inspect.Parameter.VAR_KEYWORD
+                for p in sig.parameters.values()
+            )
             else frozenset(sig.parameters.keys())
         )
     except Exception:
@@ -128,7 +142,10 @@ def _coerce_kwargs(ctor: Any, kwargs: Dict[str, Any]) -> Dict[str, Any]:
     if allowed is None:
         try:
             sig = inspect.signature(ctor)
-            if any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()):
+            if any(
+                p.kind == inspect.Parameter.VAR_KEYWORD
+                for p in sig.parameters.values()
+            ):
                 return dict(kwargs)
             allowed = frozenset(sig.parameters.keys())
         except Exception:
@@ -137,13 +154,19 @@ def _coerce_kwargs(ctor: Any, kwargs: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _dataset_for_device(
-    model_or_params: Union[nn.Module, Iterable[nn.Parameter], Sequence[Dict[str, Any]]],
+    model_or_params: Union[
+        nn.Module, Iterable[nn.Parameter], Sequence[Dict[str, Any]]
+    ],
     metadata: Optional["Dataset[Any]"] = None,
 ) -> Tuple[torch.device, "Dataset[Any]"]:
     ref_tensor: Optional[torch.Tensor] = None
     if isinstance(model_or_params, nn.Module):
         ref_tensor = ModelPolicy._peek_layer(model_or_params)
-    elif metadata is None and isinstance(model_or_params, Sequence) and model_or_params:
+    elif (
+        metadata is None
+        and isinstance(model_or_params, Sequence)
+        and model_or_params
+    ):
         try:
             first = model_or_params[0]
             if isinstance(first, dict):
@@ -164,16 +187,16 @@ def _dataset_for_device(
     dev = (
         torch.device(metadata.device)
         if metadata
-        else ref_tensor.device
-        if ref_tensor is not None
-        else get_device()
+        else ref_tensor.device if ref_tensor is not None else get_device()
     )
     meta = Autocast.coerce_metadata(dev, metadata=metadata)
     return torch.device(meta.device), meta
 
 
 def _coerce_params(
-    model_or_params: Union[nn.Module, Iterable[nn.Parameter], Sequence[Dict[str, Any]]],
+    model_or_params: Union[
+        nn.Module, Iterable[nn.Parameter], Sequence[Dict[str, Any]]
+    ],
 ) -> Union[List[nn.Parameter], List[Dict[str, Any]]]:
     if isinstance(model_or_params, nn.Module):
         return list(model_or_params.parameters())
@@ -225,7 +248,9 @@ def _cpu_offload(
     if src.device.type == "cpu":
         if pin_memory:
             with contextlib.suppress(Exception):
-                out = torch.empty(src.shape, device="cpu", dtype=dtype, pin_memory=True)
+                out = torch.empty(
+                    src.shape, device="cpu", dtype=dtype, pin_memory=True
+                )
                 out.copy_(src, non_blocking=nb)
                 return out
             with contextlib.suppress(Exception):
@@ -233,14 +258,20 @@ def _cpu_offload(
         return src.clone()
     if pin_memory:
         with contextlib.suppress(Exception):
-            out = torch.empty(src.shape, device="cpu", dtype=dtype, pin_memory=True)
+            out = torch.empty(
+                src.shape, device="cpu", dtype=dtype, pin_memory=True
+            )
             out.copy_(src, non_blocking=nb)
             return out
     return src.to(device="cpu", dtype=dtype)
 
 
 def _safe_copy(dst: torch.Tensor, src: torch.Tensor) -> None:
-    if torch.is_tensor(dst) and torch.is_tensor(src) and dst.data_ptr() != src.data_ptr():
+    if (
+        torch.is_tensor(dst)
+        and torch.is_tensor(src)
+        and dst.data_ptr() != src.data_ptr()
+    ):
         with contextlib.suppress(Exception):
             dst.copy_(src)
             return
@@ -270,7 +301,11 @@ def _sync_optimizer_state(optimizer: optim.Optimizer) -> None:
                         v_is_float = bool(v.is_floating_point())
                         target_dtype = (
                             p.dtype
-                            if (p_is_float and v_is_float and v.shape == p.shape)
+                            if (
+                                p_is_float
+                                and v_is_float
+                                and v.shape == p.shape
+                            )
                             else v.dtype
                         )
                         p_state[k] = v.to(device=p.device, dtype=target_dtype)
@@ -312,14 +347,21 @@ def stochastic_weight_average(
     **kwargs: Any,
 ) -> "StochasticWeightAverage":
     return StochasticWeightAverage(
-        model, *args, device=device, use_buffers=use_buffers, avg_fn=avg_fn, **kwargs
+        model,
+        *args,
+        device=device,
+        use_buffers=use_buffers,
+        avg_fn=avg_fn,
+        **kwargs,
     )
 
 
 class AdamW:
     @staticmethod
     def float(
-        model_or_params: Union[nn.Module, Iterable[nn.Parameter], Sequence[Dict[str, Any]]],
+        model_or_params: Union[
+            nn.Module, Iterable[nn.Parameter], Sequence[Dict[str, Any]]
+        ],
         lr: float,
         *args: Any,
         weight_decay: float = 0.0,
@@ -328,12 +370,20 @@ class AdamW:
         **kwargs: Any,
     ) -> optim.Optimizer:
         return AdamW._try_backends(
-            model_or_params, lr, weight_decay, metadata, logger, kwargs, mode="float"
+            model_or_params,
+            lr,
+            weight_decay,
+            metadata,
+            logger,
+            kwargs,
+            mode="float",
         )
 
     @staticmethod
     def integer(
-        model_or_params: Union[nn.Module, Iterable[nn.Parameter], Sequence[Dict[str, Any]]],
+        model_or_params: Union[
+            nn.Module, Iterable[nn.Parameter], Sequence[Dict[str, Any]]
+        ],
         lr: float,
         *args: Any,
         weight_decay: float = 0.0,
@@ -342,12 +392,20 @@ class AdamW:
         **kwargs: Any,
     ) -> optim.Optimizer:
         return AdamW._try_backends(
-            model_or_params, lr, weight_decay, metadata, logger, kwargs, mode="integer"
+            model_or_params,
+            lr,
+            weight_decay,
+            metadata,
+            logger,
+            kwargs,
+            mode="integer",
         )
 
     @staticmethod
     def _try_backends(
-        model_or_params: Union[nn.Module, Iterable[nn.Parameter], Sequence[Dict[str, Any]]],
+        model_or_params: Union[
+            nn.Module, Iterable[nn.Parameter], Sequence[Dict[str, Any]]
+        ],
         lr: float,
         weight_decay: float,
         metadata: Optional[Dataset[Any]],
@@ -357,7 +415,11 @@ class AdamW:
     ) -> optim.Optimizer:
         params = _coerce_params(model_or_params)
         dev, meta = _dataset_for_device(
-            model_or_params if isinstance(model_or_params, nn.Module) else params,
+            (
+                model_or_params
+                if isinstance(model_or_params, nn.Module)
+                else params
+            ),
             metadata,
         )
 
@@ -399,7 +461,8 @@ class AdamW:
         if not selected_opt and mode == "float" and dev.type == "cuda":
             float8_dtypes = Autocast.float8_formats()
             safe_fp8 = not getattr(meta, "has_scale", False) or any(
-                is_scale_safe(dtype, meta, safety_margin=2.0) for dtype in float8_dtypes
+                is_scale_safe(dtype, meta, safety_margin=2.0)
+                for dtype in float8_dtypes
             )
             hw_ok, _ = Dataset.is_float8_supported(dev)
             if safe_fp8 and hw_ok:
@@ -417,6 +480,7 @@ class AdamW:
                 and getattr(meta, "scale_is_integral", None) is not False
             )
             if use_int:
+
                 def _scale_safe_int(meta: Any, bits: int) -> bool:
                     if not getattr(meta, "has_scale", False):
                         return True
@@ -425,7 +489,9 @@ class AdamW:
                     if getattr(meta, "scale_is_integral", None) is False:
                         return False
                     lo, hi = (-128.0, 127.0) if bits == 8 else (-8.0, 7.0)
-                    if (mn := getattr(meta, "scale_min_value", None)) is not None and (
+                    if (
+                        mn := getattr(meta, "scale_min_value", None)
+                    ) is not None and (
                         mx := getattr(meta, "scale_max_value", None)
                     ) is not None:
                         try:
@@ -460,16 +526,22 @@ class AdamW:
                         target_bits = 4
                 if target_bits is not None:
                     cls_name = f"AdamW{target_bits}bit"
-                    for pkg in ("torchao.optim", "torchao.prototype.low_bit_optim"):
+                    for pkg in (
+                        "torchao.optim",
+                        "torchao.prototype.low_bit_optim",
+                    ):
                         selected_opt = _attempt_load(pkg, cls_name, attempts)
                         if selected_opt:
                             selected_name = f"torchao.{cls_name}"
                             break
 
         if not selected_opt:
-            flags = optimal_optimizer_params(dev, use_foreach=None, use_fused=False)
+            flags = optimal_optimizer_params(
+                dev, use_foreach=None, use_fused=False
+            )
             selected_opt = optim.AdamW(
-                params, **_coerce_kwargs(optim.AdamW, {**common_kwargs, **flags})
+                params,
+                **_coerce_kwargs(optim.AdamW, {**common_kwargs, **flags}),
             )
             selected_name = "torch.optim.AdamW"
 
@@ -496,7 +568,13 @@ class AdamW:
         }
         _log_optimizer(
             logger,
-            ("opt", f"adamw-{mode}", dev.type, dev.index, tuple(scale_info.values())),
+            (
+                "opt",
+                f"adamw-{mode}",
+                dev.type,
+                dev.index,
+                tuple(scale_info.values()),
+            ),
             payload,
         )
         return selected_opt
@@ -518,9 +596,13 @@ class ExponentialMovingAverage(nn.Module):
         self.decay = float(decay)
         self.pin_memory = bool(pin_memory) if pin_memory is not None else False
         self.update_every = max(1, int(update_every))
-        self.non_blocking = bool(non_blocking) if non_blocking is not None else False
+        self.non_blocking = (
+            bool(non_blocking) if non_blocking is not None else False
+        )
         meta = metadata if isinstance(metadata, Dataset) else None
-        dev = torch.device(Autocast.coerce_metadata(get_device(), metadata=meta).device)
+        dev = torch.device(
+            Autocast.coerce_metadata(get_device(), metadata=meta).device
+        )
         self.master_float, self.master_int = _master_cpu_dtypes(dev, meta)
         self.shadow: Dict[str, torch.Tensor] = {}
         self.collected: Dict[str, torch.Tensor] = {}
@@ -529,7 +611,9 @@ class ExponentialMovingAverage(nn.Module):
         with torch.no_grad():
             self._init_shadow(model)
 
-    def _iter_named_params(self, model: nn.Module) -> Iterator[tuple[str, torch.Tensor]]:
+    def _iter_named_params(
+        self, model: nn.Module
+    ) -> Iterator[tuple[str, torch.Tensor]]:
         for name, p in model.named_parameters(recurse=True):
             if not isinstance(p, torch.Tensor):
                 continue
@@ -545,10 +629,16 @@ class ExponentialMovingAverage(nn.Module):
         if t.is_floating_point():
             return self.master_float
         if t.is_complex():
-            return torch.complex128 if t.dtype == torch.complex128 else torch.complex64
+            return (
+                torch.complex128
+                if t.dtype == torch.complex128
+                else torch.complex64
+            )
         return self.master_int
 
-    def _scratch_view(self, numel: int, shape: torch.Size, dtype: torch.dtype) -> torch.Tensor:
+    def _scratch_view(
+        self, numel: int, shape: torch.Size, dtype: torch.dtype
+    ) -> torch.Tensor:
         buf = self._scratch.get(dtype, None)
         if buf is None or buf.numel() < numel:
             self._scratch[dtype] = torch.empty(
@@ -573,7 +663,9 @@ class ExponentialMovingAverage(nn.Module):
         self.shadow = shadow
 
     @torch.no_grad()
-    def update(self, model: nn.Module, optimizer: object | None = None) -> None:
+    def update(
+        self, model: nn.Module, optimizer: object | None = None
+    ) -> None:
         _ = optimizer
         self._step += 1
         if self.update_every > 1 and (self._step % self.update_every) != 0:
@@ -634,7 +726,9 @@ class ExponentialMovingAverage(nn.Module):
             )
 
     @torch.no_grad()
-    def restore(self, model: nn.Module, optimizer: object | None = None) -> None:
+    def restore(
+        self, model: nn.Module, optimizer: object | None = None
+    ) -> None:
         _ = optimizer
         if not self.collected:
             return
@@ -643,7 +737,9 @@ class ExponentialMovingAverage(nn.Module):
             if not isinstance(prev, torch.Tensor):
                 continue
             try:
-                p.copy_(prev.to(device=p.device, dtype=p.dtype), non_blocking=False)
+                p.copy_(
+                    prev.to(device=p.device, dtype=p.dtype), non_blocking=False
+                )
             except Exception:
                 with contextlib.suppress(Exception):
                     p.data = prev.to(device=p.device, dtype=p.dtype)
@@ -659,7 +755,10 @@ class ExponentialMovingAverage(nn.Module):
             if not isinstance(ema_v, torch.Tensor):
                 continue
             try:
-                p.copy_(ema_v.to(device=p.device, dtype=p.dtype), non_blocking=False)
+                p.copy_(
+                    ema_v.to(device=p.device, dtype=p.dtype),
+                    non_blocking=False,
+                )
             except Exception:
                 with contextlib.suppress(Exception):
                     p.data = ema_v.to(device=p.device, dtype=p.dtype)
@@ -685,7 +784,9 @@ class StochasticWeightAverage:
             avg_fn=avg_fn,
         )
         self.n_averaged: int = 0
-        dev = torch.device(Autocast.coerce_metadata(get_device(), metadata=metadata).device)
+        dev = torch.device(
+            Autocast.coerce_metadata(get_device(), metadata=metadata).device
+        )
         self.master_float, _ = _master_cpu_dtypes(dev, meta=metadata)
         self.shadow: Dict[str, torch.Tensor] = {}
 
@@ -701,14 +802,18 @@ class StochasticWeightAverage:
     def update(self, model: Optional[nn.Module] = None) -> None:
         target = model if model is not None else self._source
         if target is None:
-            raise RuntimeError("StochasticWeightAverage was initialised without a source model")
+            raise RuntimeError(
+                "StochasticWeightAverage was initialised without a source model"
+            )
         self.update_weight(target)
         self._update_shadow(target)
 
     def update_weight(self, model: Optional[nn.Module] = None) -> None:
         target = model if model is not None else self._source
         if target is None:
-            raise RuntimeError("StochasticWeightAverage was initialised without a source model")
+            raise RuntimeError(
+                "StochasticWeightAverage was initialised without a source model"
+            )
         with torch.no_grad():
             try:
                 self._averaged.update_parameters(target)
@@ -732,8 +837,14 @@ class StochasticWeightAverage:
 
             key = str(name)
             cur = self.shadow.get(key)
-            if cur is None or (not torch.is_tensor(cur)) or cur.shape != p.shape:
-                self.shadow[key] = _cpu_offload(p, self.master_float, pin_memory=False)
+            if (
+                cur is None
+                or (not torch.is_tensor(cur))
+                or cur.shape != p.shape
+            ):
+                self.shadow[key] = _cpu_offload(
+                    p, self.master_float, pin_memory=False
+                )
                 continue
 
             src_cpu = _cpu_offload(p, dtype=cur.dtype, pin_memory=False)
@@ -775,7 +886,9 @@ class StochasticWeightAverage:
 
     def update_batch_norm(
         self,
-        feature_iter: Iterable[TensorDictBase | Dict[str, Any] | torch.Tensor | Any],
+        feature_iter: Iterable[
+            TensorDictBase | Dict[str, Any] | torch.Tensor | Any
+        ],
         *args: Any,
         device: Optional[torch.device] = None,
         in_key: str = "features",

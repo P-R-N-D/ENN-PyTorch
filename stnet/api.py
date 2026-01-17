@@ -69,7 +69,11 @@ from .core.system import (
     optimal_start_method,
 )
 from .data import collate
-from .data.collate import MappingSlicer, TensorDictSlicer, postprocess as _postprocess_pipeline
+from .data.collate import (
+    MappingSlicer,
+    TensorDictSlicer,
+    postprocess as _postprocess_pipeline,
+)
 from .data.pipeline import (
     Dataset,
     preload_memmap,
@@ -117,7 +121,9 @@ _IGNORED_WARNING_PATTERNS: tuple[str, ...] = (
     "Either mode or options can be specified, but both can't be specified at the same time\\.",
 )
 _IGNORED_WARNING_MESSAGE_RE = re.compile(
-    r".*(?:" + "|".join((f"(?:{p})" for p in _IGNORED_WARNING_PATTERNS)) + r").*"
+    r".*(?:"
+    + "|".join((f"(?:{p})" for p in _IGNORED_WARNING_PATTERNS))
+    + r").*"
 )
 
 
@@ -154,7 +160,10 @@ def _parse_meta(p: PathLike) -> Mapping[str, Any]:
 
 @lru_cache(maxsize=1)
 def _is_execution_time_logged() -> bool:
-    return env_bool(("STNET_LOG_TIMINGS", "STNET_TIMINGS", "STNET_DEBUG_TIMINGS"), default=False)
+    return env_bool(
+        ("STNET_LOG_TIMINGS", "STNET_TIMINGS", "STNET_DEBUG_TIMINGS"),
+        default=False,
+    )
 
 
 def _timed_invoke(
@@ -178,7 +187,10 @@ def _clear_process_group() -> None:
     try:
         import torch.distributed
 
-        if torch.distributed.is_available() and torch.distributed.is_initialized():
+        if (
+            torch.distributed.is_available()
+            and torch.distributed.is_initialized()
+        ):
             with contextlib.suppress(Exception):
                 torch.distributed.barrier()
             with contextlib.suppress(Exception):
@@ -202,9 +214,15 @@ def _clear_device_caches() -> None:
 
         gc.collect()
     with contextlib.suppress(Exception):
-        from .core.system import collect_accelerator_ipc, empty_device_cache, get_device
+        from .core.system import (
+            collect_accelerator_ipc,
+            empty_device_cache,
+            get_device,
+        )
 
-        empty_device_cache(device=get_device(), do_gc=False, min_interval_s=0.0)
+        empty_device_cache(
+            device=get_device(), do_gc=False, min_interval_s=0.0
+        )
         collect_accelerator_ipc()
 
 
@@ -245,7 +263,10 @@ def _save_model_checkpoint(
     if save_dcp:
         with _filtered_warnings():
             m_sd = get_model_state_dict(
-                model, options=StateDictOptions(full_state_dict=True, cpu_offload=True)
+                model,
+                options=StateDictOptions(
+                    full_state_dict=True, cpu_offload=True
+                ),
             )
             save(
                 state_dict={"model": m_sd},
@@ -258,7 +279,9 @@ def _save_model_checkpoint(
             pt_state = dict(m_sd)
             _coerce_dcp_keys(pt_state)
         else:
-            pt_state = {k: v.detach().cpu() for k, v in model.state_dict().items()}
+            pt_state = {
+                k: v.detach().cpu() for k, v in model.state_dict().items()
+            }
         torch.save(pt_state, os.path.join(out_dir, "model.pt"))
     return m_sd
 
@@ -271,18 +294,24 @@ def _get_label_shape(
 ) -> Tuple[Any]:
     if first_in_dim is None:
         return (int(in_dim), tuple(lshape))
-    if int(in_dim) != int(first_in_dim) or tuple(lshape) != tuple(first_label_shape):
+    if int(in_dim) != int(first_in_dim) or tuple(lshape) != tuple(
+        first_label_shape
+    ):
         raise RuntimeError(
             f"Shape mismatch: {first_in_dim}/{first_label_shape} vs {in_dim}/{lshape}"
         )
     return (first_in_dim, first_label_shape)
 
 
-def _adapt_source(d: Any, allow_columns: bool = True) -> Tuple[int, Optional[Callable], bool]:
+def _adapt_source(
+    d: Any, allow_columns: bool = True
+) -> Tuple[int, Optional[Callable], bool]:
     def _value_len(value: object) -> Optional[int]:
         if isinstance(value, (str, bytes, bytearray)):
             return None
-        if isinstance(value, Mapping) and not isinstance(value, TensorDictBase):
+        if isinstance(value, Mapping) and not isinstance(
+            value, TensorDictBase
+        ):
             return None
         if hasattr(value, "__len__"):
             with contextlib.suppress(Exception):
@@ -319,7 +348,11 @@ def _adapt_source(d: Any, allow_columns: bool = True) -> Tuple[int, Optional[Cal
             else:
                 slices.append((key, value))
         slices_t = tuple(slices)
-        constants = {key: value for key, value in constants.items() if key not in dict(slices_t)}
+        constants = {
+            key: value
+            for key, value in constants.items()
+            if key not in dict(slices_t)
+        }
         return count, MappingSlicer(constants, slices_t), False
     if isinstance(d, (list, tuple)):
         return len(d), (lambda s, e: {"features": d[int(s) : int(e)]}), False
@@ -427,11 +460,11 @@ def _reduce_batch_stats(recs: object) -> Optional[Mapping[str, Any]]:
                 f"sampled_{k}_{s}": float(
                     last.get(
                         f"reduced_{k}_{s}",
-                        0.0
-                        if s in ("mean", "var")
-                        else float("inf")
-                        if s == "min"
-                        else float("-inf"),
+                        (
+                            0.0
+                            if s in ("mean", "var")
+                            else float("inf") if s == "min" else float("-inf")
+                        ),
                     )
                 )
                 for k in ("x", "y")
@@ -456,10 +489,12 @@ def _reduce_batch_stats(recs: object) -> Optional[Mapping[str, Any]]:
             sums[axis] += mean * bs
             sums[f"{axis}2"] += (var + mean * mean) * bs
             ext[f"{axis}_min"] = min(
-                ext[f"{axis}_min"], float(r.get(f"batch_{axis}_min", float("inf")))
+                ext[f"{axis}_min"],
+                float(r.get(f"batch_{axis}_min", float("inf"))),
             )
             ext[f"{axis}_max"] = max(
-                ext[f"{axis}_max"], float(r.get(f"batch_{axis}_max", float("-inf")))
+                ext[f"{axis}_max"],
+                float(r.get(f"batch_{axis}_max", float("-inf"))),
             )
     if sums["bs"] <= 0:
         return None
@@ -469,7 +504,9 @@ def _reduce_batch_stats(recs: object) -> Optional[Mapping[str, Any]]:
         out.update(
             {
                 f"sampled_{axis}_mean": mean,
-                f"sampled_{axis}_var": max(0.0, sums[f"{axis}2"] / sums["bs"] - mean * mean),
+                f"sampled_{axis}_var": max(
+                    0.0, sums[f"{axis}2"] / sums["bs"] - mean * mean
+                ),
                 f"sampled_{axis}_min": ext[f"{axis}_min"],
                 f"sampled_{axis}_max": ext[f"{axis}_max"],
             }
@@ -477,7 +514,9 @@ def _reduce_batch_stats(recs: object) -> Optional[Mapping[str, Any]]:
     return out
 
 
-def _update_batch_stats(prev: object, n_prev: object, inc: object, n_inc: object) -> Any:
+def _update_batch_stats(
+    prev: object, n_prev: object, inc: object, n_inc: object
+) -> Any:
     if inc is None or n_inc <= 0:
         return prev
     if prev is None or n_prev <= 0:
@@ -489,7 +528,9 @@ def _update_batch_stats(prev: object, n_prev: object, inc: object, n_inc: object
     out = {}
     for axis in ("x", "y"):
 
-        def _get(dct: Mapping[str, Any], prefix: str, suffix: str, default: float) -> float:
+        def _get(
+            dct: Mapping[str, Any], prefix: str, suffix: str, default: float
+        ) -> float:
             return float(dct.get(f"{prefix}_{axis}_{suffix}", default))
 
         m_prev = _get(prev, "reduced", "mean", 0.0)
@@ -500,7 +541,11 @@ def _update_batch_stats(prev: object, n_prev: object, inc: object, n_inc: object
         m_new = (m_prev * n_prev + m_inc * n_inc) / n_new
         v_new = max(
             0.0,
-            ((v_prev + m_prev * m_prev) * n_prev + (v_inc + m_inc * m_inc) * n_inc) / n_new
+            (
+                (v_prev + m_prev * m_prev) * n_prev
+                + (v_inc + m_inc * m_inc) * n_inc
+            )
+            / n_new
             - m_new * m_new,
         )
         out.update(
@@ -541,15 +586,29 @@ def _update_history(
             records = raw if isinstance(raw, list) else []
             meta = {}
         run_stats = _reduce_batch_stats(records)
-        sampled_n = int(meta.get("sampled_n", 0)) if isinstance(meta, dict) else 0
+        sampled_n = (
+            int(meta.get("sampled_n", 0)) if isinstance(meta, dict) else 0
+        )
         if sampled_n <= 0:
-            epochs_val = int(meta.get("epochs", epochs)) if isinstance(meta, dict) else int(epochs)
+            epochs_val = (
+                int(meta.get("epochs", epochs))
+                if isinstance(meta, dict)
+                else int(epochs)
+            )
             frac_val = (
-                float(meta.get("val_frac", val_frac)) if isinstance(meta, dict) else float(val_frac)
+                float(meta.get("val_frac", val_frac))
+                if isinstance(meta, dict)
+                else float(val_frac)
             )
             frac_val = max(0.0, min(1.0, frac_val))
             sampled_n = (
-                int(round(num_samples_dataset * max(0.0, 1.0 - frac_val) * max(1, epochs_val)))
+                int(
+                    round(
+                        num_samples_dataset
+                        * max(0.0, 1.0 - frac_val)
+                        * max(1, epochs_val)
+                    )
+                )
                 or num_samples_dataset
             )
         prev_n = int(getattr(model, "_history_total_samples", 0))
@@ -609,16 +668,24 @@ def _get_float_precision(obj: object) -> torch.dtype:
                 X_td = torch.as_tensor(X_td)
             dt = _to_torch_dtype(getattr(X_td, "dtype", None))
             return torch.float64 if dt == torch.float64 else torch.float32
-        if isinstance(obj, Mapping) and collate.is_feature_label_batch_mapping(obj):
+        if isinstance(obj, Mapping) and collate.is_feature_label_batch_mapping(
+            obj
+        ):
             f_key = collate.get_feature_key(obj)
             if f_key is not None and f_key in obj:
                 X_all = obj.get(f_key)
                 dt = _to_torch_dtype(getattr(X_all, "dtype", None))
                 if dt is not None:
-                    return torch.float64 if dt == torch.float64 else torch.float32
+                    return (
+                        torch.float64 if dt == torch.float64 else torch.float32
+                    )
                 if isinstance(X_all, (list, tuple)) and X_all:
                     dt0 = _to_torch_dtype(getattr(X_all[0], "dtype", None))
-                    return torch.float64 if dt0 == torch.float64 else torch.float32
+                    return (
+                        torch.float64
+                        if dt0 == torch.float64
+                        else torch.float32
+                    )
         if torch.is_tensor(obj):
             dt = _to_torch_dtype(getattr(obj, "dtype", None))
             return torch.float64 if dt == torch.float64 else torch.float32
@@ -662,12 +729,22 @@ def load_model(
     weights_only: bool = True,
 ) -> Model:
     p = Path(checkpoint_path)
-    load_dev = torch.device(map_location) if map_location is not None else torch.device("cpu")
+    load_dev = (
+        torch.device(map_location)
+        if map_location is not None
+        else torch.device("cpu")
+    )
     if p.is_dir():
         meta = _parse_meta(p)
-        use_in_dim = int(in_dim if in_dim is not None else meta.get("in_dim") or 0)
-        out_shape_meta = out_shape if out_shape is not None else meta.get("out_shape") or ()
-        use_out_shape = tuple((int(x) for x in out_shape_meta)) if out_shape_meta else ()
+        use_in_dim = int(
+            in_dim if in_dim is not None else meta.get("in_dim") or 0
+        )
+        out_shape_meta = (
+            out_shape if out_shape is not None else meta.get("out_shape") or ()
+        )
+        use_out_shape = (
+            tuple((int(x) for x in out_shape_meta)) if out_shape_meta else ()
+        )
         user_provided_config = config is not None
         raw_cfg = config if user_provided_config else meta.get("config")
         use_config = coerce_model_config(raw_cfg)
@@ -682,9 +759,13 @@ def load_model(
         model = new_model(use_in_dim, use_out_shape, use_config)
         opts = StateDictOptions(full_state_dict=True)
         m_sd = get_model_state_dict(model, options=opts)
-        load(state_dict={"model": m_sd}, storage_reader=FileSystemReader(str(p)))
+        load(
+            state_dict={"model": m_sd}, storage_reader=FileSystemReader(str(p))
+        )
         resize_scaler_buffer(model, m_sd)
-        set_model_state_dict(model, m_sd, options=StateDictOptions(strict=False))
+        set_model_state_dict(
+            model, m_sd, options=StateDictOptions(strict=False)
+        )
         return model
     if not p.exists():
         raise FileNotFoundError(f"Checkpoint file not found: {str(p)!r}")
@@ -694,17 +775,25 @@ def load_model(
         if not meta_path.exists():
             meta_path = p.with_suffix(".json")
         if not meta_path.exists():
-            raise RuntimeError("Missing sidecar JSON file for the safetensors checkpoint.")
+            raise RuntimeError(
+                "Missing sidecar JSON file for the safetensors checkpoint."
+            )
         meta = read_json(meta_path)
         if not isinstance(meta, dict):
             raise RuntimeError(
                 f"Invalid sidecar JSON file for the safetensors checkpoint: {str(meta_path)!r}"
             )
         use_in_dim = int(in_dim if in_dim is not None else meta.get("in_dim"))
-        out_shape_meta = out_shape if out_shape is not None else meta.get("out_shape") or ()
-        use_out_shape = tuple((int(x) for x in out_shape_meta)) if out_shape_meta else ()
+        out_shape_meta = (
+            out_shape if out_shape is not None else meta.get("out_shape") or ()
+        )
+        use_out_shape = (
+            tuple((int(x) for x in out_shape_meta)) if out_shape_meta else ()
+        )
         user_provided_config = config is not None
-        use_config = coerce_model_config(config if user_provided_config else meta.get("config"))
+        use_config = coerce_model_config(
+            config if user_provided_config else meta.get("config")
+        )
         if not user_provided_config:
             use_config.device = load_dev
         elif map_location is not None and use_config.device is None:
@@ -729,7 +818,9 @@ def load_model(
         resize_scaler_buffer(model, sd)
         model.load_state_dict(sd, strict=False)
         return model
-    obj = _torch_load_checkpoint(p, map_location=map_location or "cpu", weights_only=weights_only)
+    obj = _torch_load_checkpoint(
+        p, map_location=map_location or "cpu", weights_only=weights_only
+    )
     if isinstance(obj, dict):
         meta_in_dim = obj.get("in_dim")
         meta_out_shape = obj.get("out_shape")
@@ -741,10 +832,14 @@ def load_model(
         meta_cfg = None
         sd = obj
     use_in_dim = int(in_dim if in_dim is not None else meta_in_dim)
-    out_shape_meta = out_shape if out_shape is not None else meta_out_shape or ()
+    out_shape_meta = (
+        out_shape if out_shape is not None else meta_out_shape or ()
+    )
     use_out_shape = tuple((int(x) for x in out_shape_meta))
     user_provided_config = config is not None
-    use_config = coerce_model_config(config if user_provided_config else meta_cfg)
+    use_config = coerce_model_config(
+        config if user_provided_config else meta_cfg
+    )
     if not user_provided_config:
         use_config.device = load_dev
     elif map_location is not None and use_config.device is None:
@@ -786,7 +881,9 @@ def save_model(
         if swa_averager is not None and hasattr(swa_averager, "state_dict"):
             with contextlib.suppress(Exception):
                 merged_extra["swa_averager_state"] = swa_averager.state_dict()
-        out = Builder.save(model, p, optimizer=optimizer, extra=merged_extra or None, **kwargs)
+        out = Builder.save(
+            model, p, optimizer=optimizer, extra=merged_extra or None, **kwargs
+        )
         return str(out)
     conv = Exporter.for_export(p.suffix)
     if conv is None:
@@ -824,7 +921,8 @@ def train(
     seed_value = _coerce_seed(seed)
     _set_seed(seed_value)
     underflow_action = normalize_underflow_action(
-        kwargs.pop("underflow_action", None), default=default_underflow_action()
+        kwargs.pop("underflow_action", None),
+        default=default_underflow_action(),
     )
     ds_meta = Dataset.for_device(
         "cpu", feature_dtype=torch.float64, label_float_dtype=torch.float64
@@ -851,14 +949,24 @@ def train(
                 underflow_action=underflow_action,
                 shuffle=bool(shuffle),
             )
-            first_in_dim, label_shape = _get_label_shape(first_in_dim, in_dim, label_shape, lshape)
+            first_in_dim, label_shape = _get_label_shape(
+                first_in_dim, in_dim, label_shape, lshape
+            )
             num_samples_dataset += int(n)
         if first_in_dim is None or not label_shape:
             raise RuntimeError("No training data")
         if manifest is not None:
-            payload = manifest if isinstance(manifest, dict) else list(manifest)
-            collate.write_json(os.path.join(memmap_dir, "multinode.json"), payload, indent=None)
-        if env_bool("STNET_SAVE_DCP", True) or env_bool("STNET_SAVE_MODEL_PT", True):
+            payload = (
+                manifest if isinstance(manifest, dict) else list(manifest)
+            )
+            collate.write_json(
+                os.path.join(memmap_dir, "multinode.json"),
+                payload,
+                indent=None,
+            )
+        if env_bool("STNET_SAVE_DCP", True) or env_bool(
+            "STNET_SAVE_MODEL_PT", True
+        ):
             init_dir = new_dir("init_dcp")
             _save_model_checkpoint(
                 model,
@@ -868,13 +976,19 @@ def train(
                 overwrite=True,
             )
         rdzv = get_available_host(
-            rdzv_endpoint or get_preferred_ip(allow_loopback=True) or "127.0.0.1"
+            rdzv_endpoint
+            or get_preferred_ip(allow_loopback=True)
+            or "127.0.0.1"
         )
         master_addr, _master_port = init_master_addr(rdzv)
         _wp = WorkerPolicy.optimize()
         _wp.set_thread_setting()
         cfg_raw = _extract_model_config_dict(model)
-        cfg_dict = coerce_model_config(cfg_raw).to_dict() if cfg_raw else ModelConfig().to_dict()
+        cfg_dict = (
+            coerce_model_config(cfg_raw).to_dict()
+            if cfg_raw
+            else ModelConfig().to_dict()
+        )
         lc = LaunchConfig(
             min_nodes=1,
             max_nodes=max_nodes,
@@ -914,7 +1028,11 @@ def train(
         for key in RuntimeConfig.TRAIN_POS_ORDER[: len(args)]:
             default_kwargs.pop(key, None)
         default_kwargs.update(
-            {key: value for key, value in kwargs.items() if key in default_kwargs}
+            {
+                key: value
+                for key, value in kwargs.items()
+                if key in default_kwargs
+            }
         )
         ops = runtime_config("train", base, *args, **default_kwargs, **kwargs)
         with contextlib.suppress(Exception):
@@ -924,14 +1042,19 @@ def train(
         fallback = os.path.join(ckpt_dir, "model.pt")
         if os.path.isfile(fallback):
             cpu_state = coerce_tensor(
-                _torch_load_checkpoint(fallback, map_location="cpu", weights_only=True)
+                _torch_load_checkpoint(
+                    fallback, map_location="cpu", weights_only=True
+                )
             )
             resize_scaler_buffer(model, cpu_state)
             model.load_state_dict(cpu_state, strict=False)
         else:
             m_sd = _coerce_dcp_keys(
                 get_model_state_dict(
-                    model, options=StateDictOptions(full_state_dict=True, cpu_offload=True)
+                    model,
+                    options=StateDictOptions(
+                        full_state_dict=True, cpu_offload=True
+                    ),
                 )
             )
             load(
@@ -939,7 +1062,9 @@ def train(
                 storage_reader=FileSystemReader(ckpt_dir),
             )
             resize_scaler_buffer(model, m_sd)
-            set_model_state_dict(model, m_sd, options=StateDictOptions(strict=False))
+            set_model_state_dict(
+                model, m_sd, options=StateDictOptions(strict=False)
+            )
         _update_history(model, ckpt_dir, epochs, val_frac, num_samples_dataset)
         return model
     finally:
@@ -970,24 +1095,34 @@ def predict(
         raise ValueError("predict: model must not be None")
     _init_distributed()
     out_shape = tuple(
-        int(x) for x in (kwargs.pop("out_shape", getattr(model, "out_shape", None)) or ())
+        int(x)
+        for x in (
+            kwargs.pop("out_shape", getattr(model, "out_shape", None)) or ()
+        )
     )
     if not out_shape or any(x <= 0 for x in out_shape):
         raise ValueError(f"Invalid out_shape {out_shape}")
     multi_sources: dict[str, TensorDictBase] | None = None
-    if not isinstance(data, TensorDictBase) and isinstance(data, (Mapping, Sequence)):
+    if not isinstance(data, TensorDictBase) and isinstance(
+        data, (Mapping, Sequence)
+    ):
         items = data.items() if isinstance(data, Mapping) else enumerate(data)
         if all(isinstance(v, TensorDictBase) for _, v in items):
             multi_sources = {str(k): v for k, v in items}
     if multi_sources is not None:
         base_kwargs = dict(kwargs)
-        base_run_id = str(base_kwargs.get("run_id", f"predict-{os.getpid()}-{int(seed)}"))
+        base_run_id = str(
+            base_kwargs.get("run_id", f"predict-{os.getpid()}-{int(seed)}")
+        )
         output_mode0 = collate._coerce_prediction_output(output)
         path_n0 = collate._coerce_path(path) if path is not None else None
         out_multi: dict[str, TensorDictBase] = {}
         for k, td in multi_sources.items():
             key = str(k)
-            safe = str(k).replace(os.sep, "_").replace(os.altsep or os.sep, "_") or "0"
+            safe = (
+                str(k).replace(os.sep, "_").replace(os.altsep or os.sep, "_")
+                or "0"
+            )
             per_run_id = f"{base_run_id}-{safe}" if safe else base_run_id
             per_path: PathLike | None = path
             if output_mode0 == "file" and path_n0 is not None:
@@ -1015,11 +1150,17 @@ def predict(
                     output=output,
                     path=per_path,
                     overwrite=overwrite,
-                    **{**base_kwargs, "run_id": per_run_id, "out_shape": out_shape},
+                    **{
+                        **base_kwargs,
+                        "run_id": per_run_id,
+                        "out_shape": out_shape,
+                    },
                 ),
             )
         return out_multi
-    underflow_action = kwargs.pop("underflow_action", default_underflow_action())
+    underflow_action = kwargs.pop(
+        "underflow_action", default_underflow_action()
+    )
     chunk_size = kwargs.pop("chunk_size", None)
     output_mode = collate._coerce_prediction_output(output)
     overwrite_mode = collate._coerce_prediction_overwrite(overwrite)
@@ -1048,13 +1189,19 @@ def predict(
             output_mode = "memory"
     if output_mode == "file" and out_path and os.path.exists(out_path):
         if overwrite_mode == "resume" and os.path.isfile(out_path):
-            collate.validate_predictions_h5(os.fspath(out_path), out_shape=out_shape)
+            collate.validate_predictions_h5(
+                os.fspath(out_path), out_shape=out_shape
+            )
             return PersistentTensorDict(filename=out_path, mode="r")
         if overwrite_mode == "error":
-            raise FileExistsError(f"predict: destination already exists: {out_path!r}")
+            raise FileExistsError(
+                f"predict: destination already exists: {out_path!r}"
+            )
     writer_chunk_size = int(chunk_size) if chunk_size is not None else 8192
     master_dtype = _get_float_precision(data)
-    ds = Dataset.for_device("cpu", feature_dtype=master_dtype, label_float_dtype=master_dtype)
+    ds = Dataset.for_device(
+        "cpu", feature_dtype=master_dtype, label_float_dtype=master_dtype
+    )
     ds.underflow_action = underflow_action
     tmp_dir = new_dir("infer")
     ckpt_dir = os.path.join(tmp_dir, "ckpt")
@@ -1071,7 +1218,11 @@ def predict(
             if not (save_dcp or save_pt):
                 save_pt = True
             _save_model_checkpoint(
-                model, dcp_dir, save_dcp=save_dcp, save_pt=save_pt, overwrite=True
+                model,
+                dcp_dir,
+                save_dcp=save_dcp,
+                save_pt=save_pt,
+                overwrite=True,
             )
             count, getter, _needs_preprocess = _adapt_source(data)
             if count <= 0:
@@ -1091,7 +1242,9 @@ def predict(
             )
             cfg_raw = _extract_model_config_dict(model)
             cfg_dict = (
-                coerce_model_config(cfg_raw).to_dict() if cfg_raw else ModelConfig().to_dict()
+                coerce_model_config(cfg_raw).to_dict()
+                if cfg_raw
+                else ModelConfig().to_dict()
             )
             base = {
                 "sources": {"kind": "memmap", "path": memmap_dir},
@@ -1111,7 +1264,11 @@ def predict(
             master_addr, _ = init_master_addr(rdzv)
             lc = LaunchConfig(
                 min_nodes=1,
-                max_nodes=int(max_nodes) if max_nodes is not None else int(_wp.nproc_per_node),
+                max_nodes=(
+                    int(max_nodes)
+                    if max_nodes is not None
+                    else int(_wp.nproc_per_node)
+                ),
                 nproc_per_node=int(_wp.nproc_per_node),
                 rdzv_backend=str(rdzv_backend or "c10d"),
                 rdzv_endpoint=rdzv,
@@ -1127,7 +1284,9 @@ def predict(
             elastic_launch(lc, process)(ops)
             chunks_dir = os.path.join(ckpt_dir, "pred_chunks")
             if not os.path.isdir(chunks_dir):
-                raise RuntimeError(f"predict: missing pred_chunks at {chunks_dir!r}")
+                raise RuntimeError(
+                    f"predict: missing pred_chunks at {chunks_dir!r}"
+                )
             store_float = collate._get_prediction_dtype(chunks_dir)
             pred_mmt_path = os.path.join(tmp_dir, "pred.mmt")
             collate.concat_memory_mapped_tensor(
@@ -1140,7 +1299,9 @@ def predict(
             X_mmt = collate.load_memmap_features(os.fspath(memmap_dir))
             Y_mmt = collate.open_memory_mapped_tensor(os.fspath(pred_mmt_path))
             if Y_mmt is None:
-                raise RuntimeError("predict: failed to open assembled pred.mmt")
+                raise RuntimeError(
+                    "predict: failed to open assembled pred.mmt"
+                )
             if out_path is not None:
                 out_td = collate.write_predictions_h5_atomic(
                     os.fspath(out_path),
@@ -1156,8 +1317,12 @@ def predict(
                 )
                 cleanup_ok = True
                 return out_td
-            X_t = collate.copy_mmt_to_cpu_tensor(X_mmt, count=count, chunk_size=writer_chunk_size)
-            Y_t = collate.copy_mmt_to_cpu_tensor(Y_mmt, count=count, chunk_size=writer_chunk_size)
+            X_t = collate.copy_mmt_to_cpu_tensor(
+                X_mmt, count=count, chunk_size=writer_chunk_size
+            )
+            Y_t = collate.copy_mmt_to_cpu_tensor(
+                Y_mmt, count=count, chunk_size=writer_chunk_size
+            )
             td_out = TensorDict({"X": X_t, "Y": Y_t}, batch_size=[int(count)])
             cleanup_ok = True
             return td_out

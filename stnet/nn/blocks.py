@@ -45,7 +45,9 @@ _MODELING_TYPE_ALIASES: dict[str, str] = {
 }
 
 
-def _size_of_retnet(x: torch.Tensor, blk0: nn.Module, *args: Any, mode: str) -> int:
+def _size_of_retnet(
+    x: torch.Tensor, blk0: nn.Module, *args: Any, mode: str
+) -> int:
     if not isinstance(x, torch.Tensor) or x.dim() != 3:
         return 0
     B, L, D = map(int, x.shape)
@@ -53,16 +55,22 @@ def _size_of_retnet(x: torch.Tensor, blk0: nn.Module, *args: Any, mode: str) -> 
         return 0
     bytes_e = int(x.element_size())
     base_bytes = int(B) * int(L) * int(D) * int(bytes_e)
-    ret_factor = 8 if str(mode or "temporal").strip().lower() == "spatial" else 6
+    ret_factor = (
+        8 if str(mode or "temporal").strip().lower() == "spatial" else 6
+    )
     ffn = getattr(blk0, "ffn", None)
     hid = (
-        getattr(ffn, "hidden_dim", 0) or getattr(ffn, "hid", 0) or int(float(D) * 4.0 * (2.0 / 3.0))
+        getattr(ffn, "hidden_dim", 0)
+        or getattr(ffn, "hid", 0)
+        or int(float(D) * 4.0 * (2.0 / 3.0))
     )
     ffn_bytes = int(B) * int(L) * (int(3) * int(hid) + int(D)) * bytes_e
     return int(base_bytes * ret_factor + ffn_bytes + base_bytes * 2)
 
 
-def _infer_module_device(module: nn.Module, fallback: torch.device) -> torch.device:
+def _infer_module_device(
+    module: nn.Module, fallback: torch.device
+) -> torch.device:
     p = next(module.parameters(), None)
     if p is not None:
         return p.device
@@ -70,7 +78,9 @@ def _infer_module_device(module: nn.Module, fallback: torch.device) -> torch.dev
     return b.device if b is not None else fallback
 
 
-def _autofit_microbatch(device: torch.device, hard_max: int, per_sample_bytes: int) -> int:
+def _autofit_microbatch(
+    device: torch.device, hard_max: int, per_sample_bytes: int
+) -> int:
     if hard_max <= 0 or per_sample_bytes <= 0:
         return 1
     from ..core.system import Memory as _Mem
@@ -83,13 +93,19 @@ def _autofit_microbatch(device: torch.device, hard_max: int, per_sample_bytes: i
     if device.type in {"cuda", "xpu", "mps"}:
         with contextlib.suppress(Exception):
             dev_free = int(_Mem.mem_get_info(device)[0])
-    eff = min(host_free, dev_free) if (host_free and dev_free) else (dev_free or host_free)
+    eff = (
+        min(host_free, dev_free)
+        if (host_free and dev_free)
+        else (dev_free or host_free)
+    )
     if not eff or eff <= 0:
         return hard_max
     return max(1, min(hard_max, int((eff * 0.35) // max(per_sample_bytes, 1))))
 
 
-def _coerce_tensor(t: torch.Tensor, *args, enabled: bool, inplace: bool) -> torch.Tensor:
+def _coerce_tensor(
+    t: torch.Tensor, *args, enabled: bool, inplace: bool
+) -> torch.Tensor:
     return (
         torch.nan_to_num(t, nan=0.0, posinf=0.0, neginf=0.0)
         if enabled and (t.is_floating_point() or t.is_complex())
@@ -155,7 +171,9 @@ def _prealloc_microbatch(
                 y = y.to(dtype=out_dtype)
             processed.append(y)
         if out_bufs is None:
-            out_bufs = [y.new_empty((total_b, *y.shape[1:])) for y in processed]
+            out_bufs = [
+                y.new_empty((total_b, *y.shape[1:])) for y in processed
+            ]
         else:
             if len(out_bufs) != len(processed):
                 raise RuntimeError(f"{stage}: arity mismatch")
@@ -182,7 +200,9 @@ def stochastic_depth_schedule(drop_path: float, depth: int) -> List[float]:
         return []
     if drop_path <= 0.0 or depth == 1:
         return [float(drop_path) if depth == 1 else 0.0] * depth
-    return [float(i * float(drop_path) / float(depth - 1)) for i in range(depth)]
+    return [
+        float(i * float(drop_path) / float(depth - 1)) for i in range(depth)
+    ]
 
 
 class RetNet(nn.Module):
@@ -210,7 +230,9 @@ class RetNet(nn.Module):
         hid = int(self.d_model * mlp_ratio * (2.0 / 3.0))
         from .activations import SwiGLU
 
-        self.ffn = SwiGLU(self.d_model, hid, out_dim=self.d_model, dropout=dropout)
+        self.ffn = SwiGLU(
+            self.d_model, hid, out_dim=self.d_model, dropout=dropout
+        )
 
     def forward(
         self,
@@ -220,7 +242,9 @@ class RetNet(nn.Module):
         mode: Optional[str] = None,
     ) -> Tuple[torch.Tensor, Optional[dict]]:
         if getattr(x, "is_meta", False) and (not is_symbolic()):
-            strict = str(os.environ.get("STNET_STRICT_META_FAKE", "0")).strip().lower() in {"1", "true", "yes", "y"}
+            strict = str(
+                os.environ.get("STNET_STRICT_META_FAKE", "0")
+            ).strip().lower() in {"1", "true", "yes", "y"}
             if strict:
                 raise RuntimeError("meta tensor reached RetNet.forward")
             try:
@@ -305,7 +329,9 @@ class LongNet(nn.Module):
     def using(self) -> str:
         return self._using
 
-    def _should_enable_checkpoint(self, out, layout_batch_first, need_weights, key_padding_mask):
+    def _should_enable_checkpoint(
+        self, out, layout_batch_first, need_weights, key_padding_mask
+    ):
         if not (
             self.training
             and torch.is_grad_enabled()
@@ -322,9 +348,13 @@ class LongNet(nn.Module):
             )
             H, bytes_e = int(self.nhead), int(out.element_size())
             base = int(B) * int(L) * int(D) * bytes_e
-            score_b = 4 if out.dtype in (torch.float16, torch.bfloat16) else bytes_e
+            score_b = (
+                4 if out.dtype in (torch.float16, torch.bfloat16) else bytes_e
+            )
             peak = 0
-            flex = _STNET_HAS_FLEX_ATTENTION and out.is_cuda and not need_weights
+            flex = (
+                _STNET_HAS_FLEX_ATTENTION and out.is_cuda and not need_weights
+            )
             for lyr in self.layers:
                 dense = not (
                     out.is_cuda
@@ -337,7 +367,11 @@ class LongNet(nn.Module):
                         )
                     )
                 )
-                scores = (int(B) * int(H) * int(L) * int(L) * score_b) if dense else 0
+                scores = (
+                    (int(B) * int(H) * int(L) * int(L) * score_b)
+                    if dense
+                    else 0
+                )
                 hid = 0
                 if (
                     (ffn := getattr(lyr, "ffn", None))
@@ -345,7 +379,11 @@ class LongNet(nn.Module):
                     and len(ffn) > 0
                 ):
                     hid = getattr(ffn[0], "out_features", 0)
-                ffn_b = (int(B) * int(L) * (2 * hid + int(D)) * bytes_e) if hid > 0 else base * 9
+                ffn_b = (
+                    (int(B) * int(L) * (2 * hid + int(D)) * bytes_e)
+                    if hid > 0
+                    else base * 9
+                )
                 peak = max(peak, int(base * 5 + scores + ffn_b))
             return (peak * len(self.layers)) >= self._ckpt_min_bytes
         except:
@@ -374,8 +412,16 @@ class LongNet(nn.Module):
         attn_w: Optional[torch.Tensor] = None
         out, need_transpose_fallback = x, False
         layout_batch_first = self.batch_first
-        if out.dim() == 3 and not self.batch_first and out.shape[0] != out.shape[1]:
-            out, layout_batch_first, need_transpose_fallback = out.transpose(0, 1), True, True
+        if (
+            out.dim() == 3
+            and not self.batch_first
+            and out.shape[0] != out.shape[1]
+        ):
+            out, layout_batch_first, need_transpose_fallback = (
+                out.transpose(0, 1),
+                True,
+                True,
+            )
         do_ckpt = self._should_enable_checkpoint(
             out, layout_batch_first, need_weights, key_padding_mask
         )
@@ -398,7 +444,11 @@ class LongNet(nn.Module):
                     average_attn_weights=average_attn_weights,
                 )
         out = self.norm(out)
-        if need_transpose_fallback and out.dim() == 3 and out.shape[0] != out.shape[1]:
+        if (
+            need_transpose_fallback
+            and out.dim() == 3
+            and out.shape[0] != out.shape[1]
+        ):
             out = out.transpose(0, 1)
         return out, attn_w
 
@@ -419,13 +469,19 @@ class CrossTransformer(nn.Module):
         super().__init__()
         if cross is None:
             cross_mods: List[nn.Module] = [
-                CrossAttention(d_model, nhead, dropout=dropout, norm_type=norm_type),
-                CrossAttention(d_model, nhead, dropout=dropout, norm_type=norm_type),
+                CrossAttention(
+                    d_model, nhead, dropout=dropout, norm_type=norm_type
+                ),
+                CrossAttention(
+                    d_model, nhead, dropout=dropout, norm_type=norm_type
+                ),
             ]
         else:
             cross_mods = list(cross)
             if len(cross_mods) != 2:
-                raise ValueError(f"CrossTransformer expects 2 modules, got {len(cross_mods)}")
+                raise ValueError(
+                    f"CrossTransformer expects 2 modules, got {len(cross_mods)}"
+                )
         self.cross = nn.ModuleList(cross_mods)
         self.cross_s = self.cross[0]
         self.cross_t = self.cross[1]
@@ -462,12 +518,20 @@ class CrossTransformer(nn.Module):
             s_context = self.cross[0](a, b)
             t_context = self.cross[1](b, a)
             base_s = torch.cat(
-                [s_context, t_context.mean(dim=1, keepdim=True).expand_as(s_context)], dim=-1
+                [
+                    s_context,
+                    t_context.mean(dim=1, keepdim=True).expand_as(s_context),
+                ],
+                dim=-1,
             )
             fused_s = self.mix(self.mix_norm(base_s))
             out_s = s_context + self.drop_path(self.dropout(fused_s))
             base_t = torch.cat(
-                [t_context, s_context.mean(dim=1, keepdim=True).expand_as(t_context)], dim=-1
+                [
+                    t_context,
+                    s_context.mean(dim=1, keepdim=True).expand_as(t_context),
+                ],
+                dim=-1,
             )
             fused_t = self.mix(self.mix_norm(base_t))
             out_t = t_context + self.drop_path(self.dropout(fused_t))
@@ -478,7 +542,11 @@ class CrossTransformer(nn.Module):
                 _from_hsdp_module(self)
             return _impl(a, b)
 
-        if self.training and torch.is_grad_enabled() and not is_export_or_trace():
+        if (
+            self.training
+            and torch.is_grad_enabled()
+            and not is_export_or_trace()
+        ):
             return coerce_checkpoint(
                 _ckpt_impl,
                 spatial_tokens,

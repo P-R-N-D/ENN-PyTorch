@@ -114,14 +114,23 @@ def build_dataset(xlsx_path: str) -> Dict[str, Any]:
         raise RuntimeError("No valid sheets found in workbook")
     long_df = pd.concat(frames, axis=0, ignore_index=True)
     long_df["시간"] = (
-        long_df["시간"].astype(str).str.replace(HOUR_SUFFIX, "", regex=False).astype(int)
+        long_df["시간"]
+        .astype(str)
+        .str.replace(HOUR_SUFFIX, "", regex=False)
+        .astype(int)
     )
     long_df["지표"] = long_df["지표"].astype(float)
     long_df["요일타입_id"] = long_df["일종"].map(DAY_MAP).astype(int)
-    long_df["방향_id"] = long_df[COL_DIR].map({DIR_UP: 0, DIR_DOWN: 1}).astype(int)
-    long_df["canonical_section"] = long_df[COL_SECTION].apply(_canonical_section)
+    long_df["방향_id"] = (
+        long_df[COL_DIR].map({DIR_UP: 0, DIR_DOWN: 1}).astype(int)
+    )
+    long_df["canonical_section"] = long_df[COL_SECTION].apply(
+        _canonical_section
+    )
     long_df["seg_key"] = (
-        long_df[COL_ROUTE].astype(str).str.strip() + "|" + long_df["canonical_section"]
+        long_df[COL_ROUTE].astype(str).str.strip()
+        + "|"
+        + long_df["canonical_section"]
     )
     seg_meta = (
         long_df[["seg_key", COL_ROUTE, "canonical_section"]]
@@ -130,12 +139,21 @@ def build_dataset(xlsx_path: str) -> Dict[str, Any]:
         .reset_index(drop=True)
     )
     seg_meta["seg_idx"] = np.arange(len(seg_meta), dtype=np.int64)
-    long_df = long_df.merge(seg_meta[["seg_key", "seg_idx"]], on="seg_key", how="left")
+    long_df = long_df.merge(
+        seg_meta[["seg_key", "seg_idx"]], on="seg_key", how="left"
+    )
     S_orig = int(seg_meta.shape[0])
     T_orig = 24
     group_cols = ["월", "요일타입_id", "방향_id"]
-    groups_df = long_df[group_cols].drop_duplicates().sort_values(group_cols).reset_index(drop=True)
-    X_keys: List[Tuple[int, int, int]] = [tuple(map(int, row)) for row in groups_df.to_numpy()]
+    groups_df = (
+        long_df[group_cols]
+        .drop_duplicates()
+        .sort_values(group_cols)
+        .reset_index(drop=True)
+    )
+    X_keys: List[Tuple[int, int, int]] = [
+        tuple(map(int, row)) for row in groups_df.to_numpy()
+    ]
     B = len(X_keys)
     full_grid = groups_df.merge(seg_meta[["seg_idx"]], how="cross")
     pivot = (
@@ -156,13 +174,19 @@ def build_dataset(xlsx_path: str) -> Dict[str, Any]:
     )
     y_vals = y_full[list(range(T_orig))].to_numpy(dtype=np.float32)
     Y_np = y_vals.reshape(B, S_orig, T_orig)
-    row_map = long_df.groupby(group_cols + ["seg_idx"])["row_in_sheet"].min().reset_index()
+    row_map = (
+        long_df.groupby(group_cols + ["seg_idx"])["row_in_sheet"]
+        .min()
+        .reset_index()
+    )
     row_full = (
         full_grid.merge(row_map, on=group_cols + ["seg_idx"], how="left")
         .fillna(-1)
         .sort_values(group_cols + ["seg_idx"])
     )
-    row_ids_np = row_full["row_in_sheet"].to_numpy(dtype=np.int64).reshape(B, S_orig)
+    row_ids_np = (
+        row_full["row_in_sheet"].to_numpy(dtype=np.int64).reshape(B, S_orig)
+    )
     grid_dim = max(S_orig, T_orig)
     Y_pad = np.zeros((B, grid_dim, grid_dim), dtype=np.float32)
     Y_pad[:, :S_orig, :T_orig] = Y_np
@@ -171,7 +195,10 @@ def build_dataset(xlsx_path: str) -> Dict[str, Any]:
     X_tensor = torch.tensor(X_keys, dtype=torch.float32)
     Y_tensor = torch.from_numpy(Y_pad)
     row_ids_tensor = torch.from_numpy(row_ids_pad)
-    td_train = TensorDict({"X": X_tensor, "Y": Y_tensor, "row_ids": row_ids_tensor}, batch_size=[B])
+    td_train = TensorDict(
+        {"X": X_tensor, "Y": Y_tensor, "row_ids": row_ids_tensor},
+        batch_size=[B],
+    )
     return {
         "td_train": td_train,
         "S": grid_dim,
@@ -248,7 +275,9 @@ def main():
     td_train = info["td_train"]
     S, T, B = info["S"], info["T"], info["B"]
     S_orig, T_orig = info["S_orig"], info["T_orig"]
-    print(f"Dataset built: B={B} groups, S_orig={S_orig}, T_orig={T_orig}, padded_grid={S}x{T}")
+    print(
+        f"Dataset built: B={B} groups, S_orig={S_orig}, T_orig={T_orig}, padded_grid={S}x{T}"
+    )
     print(
         f"td_train batch_size={td_train.batch_size}, X shape={tuple(td_train['X'].shape)}, Y shape={tuple(td_train['Y'].shape)}"
     )
@@ -256,7 +285,10 @@ def main():
     device = get_device()
     print("Device:", device)
     patch = PatchConfig(
-        is_cube=True, grid_size_3d=(S, T, 1), patch_size_3d=(1, 1, 1), use_padding=True
+        is_cube=True,
+        grid_size_3d=(S, T, 1),
+        patch_size_3d=(1, 1, 1),
+        use_padding=True,
     )
     config = ModelConfig(
         device=device,
@@ -274,7 +306,9 @@ def main():
         modeling_type="spatiotemporal",
         compile_mode="disabled",
     )
-    model = new_model(in_dim=td_train["X"].shape[1], out_shape=(S, T), config=config).to(device)
+    model = new_model(
+        in_dim=td_train["X"].shape[1], out_shape=(S, T), config=config
+    ).to(device)
     train_epochs = 6
     print("[train] starting... (elastic_launch inside stnet.api.train)")
     trained_model, train_metrics = monitor_run(
@@ -292,7 +326,9 @@ def main():
     print("train duration (s):", train_metrics["duration_s"])
     print("train CPU avg per core:", train_metrics["cpu_avg"])
     print("train CPU peak per core:", train_metrics["cpu_peak"])
-    print("train peak RSS MB:", round(train_metrics["mem_peak"] / (1024**2), 2))
+    print(
+        "train peak RSS MB:", round(train_metrics["mem_peak"] / (1024**2), 2)
+    )
 
     hist = []
     with contextlib.suppress(Exception):
@@ -323,7 +359,9 @@ def main():
     print("predict duration (s):", pred_metrics["duration_s"])
     print("predict CPU avg per core:", pred_metrics["cpu_avg"])
     print("predict CPU peak per core:", pred_metrics["cpu_peak"])
-    print("predict peak RSS MB:", round(pred_metrics["mem_peak"] / (1024**2), 2))
+    print(
+        "predict peak RSS MB:", round(pred_metrics["mem_peak"] / (1024**2), 2)
+    )
 
     Y_pred = pred_result["Y"]
     if hasattr(Y_pred, "detach"):
