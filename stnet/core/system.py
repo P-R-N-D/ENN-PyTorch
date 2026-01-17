@@ -1215,14 +1215,9 @@ def _main_module_has_real_file() -> bool:
 
 def optimal_start_method() -> str:
     platform = sys.platform
-    if (
-        platform.startswith(("darwin", "linux"))
-        and not _main_module_has_real_file()
-    ):
-        return "fork"
     if platform.startswith("win"):
         candidates = ("spawn",)
-    elif platform.startswith(("darwin", "linux")):
+    elif os.name == "posix":
         candidates = ("forkserver", "spawn")
     else:
         candidates = ("spawn",)
@@ -1241,26 +1236,11 @@ def init_start_method() -> None:
     with contextlib.suppress(RuntimeError):
         torch.multiprocessing.set_sharing_strategy("file_system")
     platform = sys.platform
-    if (
-        platform.startswith(("darwin", "linux"))
-        and not _main_module_has_real_file()
-    ):
-        with contextlib.suppress(Exception):
-            for module in (multiprocessing, torch.multiprocessing):
-                module.set_start_method("fork", force=True)
-        return
-    existing = torch.multiprocessing.get_start_method(allow_none=True)
     if platform.startswith("win"):
-        if existing == "spawn":
-            return
         candidates = ("spawn",)
-    elif platform.startswith(("darwin", "linux")):
-        if existing == "forkserver":
-            return
+    elif os.name == "posix":
         candidates = ("forkserver", "spawn")
     else:
-        if existing == "spawn":
-            return
         candidates = ("spawn",)
     last_error: Optional[BaseException] = None
     for method in candidates:
