@@ -1217,6 +1217,9 @@ def _ensure_importable_main_for_spawn_forkserver() -> None:
         return
     with contextlib.suppress(Exception):
         setattr(main_mod, "__file__", stub_path)
+    with contextlib.suppress(Exception):
+        if sys.argv:
+            sys.argv[0] = stub_path
 
 
 def optimal_start_method() -> str:
