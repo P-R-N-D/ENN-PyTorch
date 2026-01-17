@@ -1,7 +1,6 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
-import threading
 from contextlib import contextmanager, suppress
 from functools import partial
 from typing import Any, Iterator

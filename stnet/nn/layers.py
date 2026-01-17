@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import contextlib
 import math
-import threading
 from collections import OrderedDict
 from typing import (
     Any,

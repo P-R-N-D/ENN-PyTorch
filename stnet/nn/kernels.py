@@ -50,7 +50,6 @@ except Exception:
     tl = _TLStub()
 
 _torch_flex_attention = None
-_torch_create_block_mask = None
 _torch_create_mask = None
 _te = None
 
@@ -62,9 +61,6 @@ _FLEX_KWARGS: set[str] = set()
 try:
     from torch.nn.attention.flex_attention import (
         flex_attention as _torch_flex_attention,
-    )
-    from torch.nn.attention.flex_attention import (
-        create_block_mask as _torch_create_block_mask,
     )
     from torch.nn.attention.flex_attention import (
         create_mask as _torch_create_mask,

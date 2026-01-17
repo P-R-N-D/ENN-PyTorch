@@ -5,14 +5,13 @@ import logging
 import contextlib
 import os
 from importlib import import_module
-from typing import Any, Callable, List, Optional, Sequence, Tuple, Union, cast
+from typing import Any, Callable, List, Optional, Sequence, Tuple
 
 import torch
 import torch.nn as nn
 
 from ..core.distributed import _from_hsdp_module
 from ..core.compat import StochasticDepth
-from ..core.tensor import is_meta_or_fake_tensor
 from ..core.graph import coerce_checkpoint, is_export_or_trace, is_symbolic
 from .layers import CrossAttention, DilatedAttention, Retention, norm_layer
 

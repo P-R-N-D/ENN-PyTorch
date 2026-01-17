@@ -2,22 +2,18 @@
 from __future__ import annotations
 
 import contextlib
-import io
 import logging
 import math
-import threading
 from functools import lru_cache
 from typing import (
     Any,
     Callable,
     Dict,
-    List,
     Mapping,
     Optional,
     Sequence,
     Tuple,
     Union,
-    Protocol,
     cast,
 )
 
@@ -34,7 +30,6 @@ from ..core.distributed import _from_hsdp_module
 from ..core.graph import (
     graph_break,
     inference_mode,
-    clear_model_cache,
     torch_compiler_disable,
     torch_compiler_supported,
     compile as compile_module,
@@ -45,17 +40,13 @@ from ..core.graph import (
     cudagraph_mark_step_begin,
     cudagraph_mark_step_end,
 )
-from ..core.precision import Autocast, is_scale_safe
+from ..core.precision import Autocast
 from ..core.policies import LossWeightPolicy
-from ..core.profiler import FLOP_PROFILER
 from ..core.system import (
-    _log_debug,
-    _log_info,
     CPU,
     empty_device_cache,
     get_device,
 )
-from ..data.pipeline import Dataset
 from ..data.collate import get_feature_key, get_label_key
 from .blocks import (
     CrossTransformer,

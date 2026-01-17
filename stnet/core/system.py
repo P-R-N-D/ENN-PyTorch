@@ -16,7 +16,7 @@ import sysconfig
 import threading
 import time
 from functools import lru_cache
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from datetime import timezone, tzinfo
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
@@ -30,7 +30,6 @@ from .datatypes import (
     env_first,
     env_first_float,
     env_first_int,
-    env_int,
     parse_bool,
 )
 

@@ -1,7 +1,6 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
-import contextlib
 import math
 import os
 from dataclasses import dataclass, field, fields

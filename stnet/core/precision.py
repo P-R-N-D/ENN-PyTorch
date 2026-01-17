@@ -8,7 +8,6 @@ import json
 import logging
 import math
 import threading
-import weakref
 from collections import OrderedDict
 from contextlib import AbstractContextManager
 from dataclasses import dataclass

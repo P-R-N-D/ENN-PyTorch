@@ -16,7 +16,7 @@ import warnings
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from dataclasses import dataclass
-from typing import Any, Callable, Iterator, Sequence, TypeAlias
+from typing import Any, Callable, Iterator, Sequence
 
 import torch
 from tensordict import TensorDict
@@ -59,7 +59,7 @@ def _no_empty_tensor(root: nn.Module) -> Iterator[None]:
                 setattr(module, name, old)
 
 
-def _install_export_warning_filters() -> None:
+def _suppress_export_warnings() -> None:
     global _EXPORT_WARN_FILTERS_INSTALLED
     if _EXPORT_WARN_FILTERS_INSTALLED:
         return
@@ -85,7 +85,7 @@ def _install_export_warning_filters() -> None:
 
 @contextlib.contextmanager
 def _onnx_model(model: object) -> Iterator[object]:
-    _install_export_warning_filters()
+    _suppress_export_warnings()
     was_training = getattr(model, "training", False)
     removed_top, removed_sub = {}, []
     model.eval()

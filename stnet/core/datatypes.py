@@ -5,9 +5,9 @@ import contextlib
 import json
 import os
 import tempfile
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Sequence
 from pathlib import Path
-from typing import Any, Optional, TypeAlias
+from typing import Any, TypeAlias
 
 import numpy
 import torch

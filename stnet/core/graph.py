@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import contextlib
 import importlib
-import sys
 import threading
 import traceback
 from contextlib import AbstractContextManager, suppress, nullcontext
@@ -14,7 +13,7 @@ from torch import nn
 
 from .concurrency import Mutex
 from .datatypes import env_bool, env_first, env_first_int
-from .distributed import broadcast_scalar, is_distributed, is_dtensor_active
+from .distributed import broadcast_scalar, is_dtensor_active
 from .system import CPU, is_accelerator_available
 from .tensor import is_meta_or_fake_tensor
 

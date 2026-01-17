@@ -18,18 +18,16 @@ from typing import (
     Callable,
     Dict,
     Iterator,
-    Literal,
     Mapping,
     Optional,
     Sequence,
     Tuple,
-    TypedDict,
 )
 
 import torch
 import torch.utils.data
 import torchdata.nodes
-from tensordict import MemoryMappedTensor, TensorDict
+from tensordict import MemoryMappedTensor
 from torchdata.nodes import (
     BaseNode,
     MultiNodeWeightedSampler,
@@ -39,7 +37,6 @@ from torchdata.nodes import (
 
 from ..core.concurrency import (
     BufferQueue,
-    Disposable,
     Mutex,
     TensorPagePool,
     ProducerError,
@@ -52,7 +49,6 @@ from ..core.datatypes import (
     dtype_from_name,
     env_bool,
     env_first_int,
-    env_str,
     read_json,
 )
 from ..core.graph import inference_mode

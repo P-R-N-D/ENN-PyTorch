@@ -7,7 +7,6 @@ import os
 import re
 import sys
 import tempfile
-import threading
 import warnings
 import weakref
 from pathlib import Path
