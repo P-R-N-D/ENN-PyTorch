@@ -1826,7 +1826,7 @@ class Model(nn.Module):
     def _run_forward_core(
         self,
         features: torch.Tensor,
-        *,
+        *args: Any,
         export: bool = False,
         temporal_state: Optional[torch.Tensor] = None,
         causal_mask: Optional[torch.Tensor] = None,
