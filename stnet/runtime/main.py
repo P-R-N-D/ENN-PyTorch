@@ -1122,13 +1122,88 @@ def _coerce_dcp_keys(state: object) -> object:
 
 
 def _get_backend_type(device: TorchDeviceLike) -> object:
-    match str(getattr(device, "type", "cpu")):
-        case "cuda":
-            return "nccl"
-        case "xpu":
-            return "xccl"
-        case _:
-            return "gloo"
+    def _is_backend_available(name: str) -> bool:
+        if not name:
+            return False
+        try:
+            if not (torch.distributed.is_available() and hasattr(torch, "distributed")):
+                return False
+        except Exception:
+            return False
+        check = getattr(torch.distributed, f"is_{str(name).lower()}_available", None)
+        if callable(check):
+            try:
+                return bool(check())
+            except Exception:
+                return False
+        return str(name).lower() == "gloo"
+
+    forced = env_str("STNET_DISTRIBUTED_BACKEND")
+    if forced:
+        forced_l = str(forced).strip().lower()
+        if forced_l and forced_l not in {"auto", "default"}:
+            if _is_backend_available(forced_l):
+                return forced_l
+
+    dev_type = str(getattr(device, "type", "cpu"))
+    get_default = getattr(torch.distributed, "get_default_backend_for_device", None)
+    if callable(get_default):
+        with contextlib.suppress(Exception):
+            b = str(get_default(device)).lower()
+            if b and _is_backend_available(b):
+                return b
+
+    if dev_type == "cuda":
+        return "nccl" if _is_backend_available("nccl") else "gloo"
+    if dev_type == "xpu":
+        return "xccl" if _is_backend_available("xccl") else "gloo"
+    return "gloo"
+
+
+def _ensure_default_socket_ifname() -> None:
+    iface = None
+    gloo_if = os.environ.get("GLOO_SOCKET_IFNAME")
+    tp_if = os.environ.get("TP_SOCKET_IFNAME")
+    if gloo_if or tp_if:
+        if gloo_if and (not tp_if):
+            os.environ.setdefault("TP_SOCKET_IFNAME", str(gloo_if))
+        elif tp_if and (not gloo_if):
+            os.environ.setdefault("GLOO_SOCKET_IFNAME", str(tp_if))
+        return
+    try:
+        with open("/proc/net/route", "r", encoding="utf-8") as f:
+            for line in f.readlines()[1:]:
+                fields = line.strip().split()
+                if len(fields) >= 2 and fields[1] == "00000000":
+                    iface = fields[0]
+                    if iface:
+                        break
+    except Exception:
+        iface = None
+    if iface is None and psutil is not None:
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            try:
+                s.connect(("8.8.8.8", 80))
+                ip = s.getsockname()[0]
+            finally:
+                s.close()
+            if ip:
+                for name, addrs in psutil.net_if_addrs().items():
+                    for a in addrs:
+                        if (
+                            getattr(a, "family", None) == socket.AF_INET
+                            and getattr(a, "address", None) == ip
+                        ):
+                            iface = str(name)
+                            break
+                    if iface:
+                        break
+        except Exception:
+            iface = None
+    if iface:
+        os.environ.setdefault("GLOO_SOCKET_IFNAME", iface)
+        os.environ.setdefault("TP_SOCKET_IFNAME", iface)
 
 
 def _configure_torch_nccl_env(device: TorchDeviceLike) -> None:
@@ -1152,6 +1227,24 @@ def _configure_torch_nccl_env(device: TorchDeviceLike) -> None:
         os.environ["TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC"] = str(int(hb))
 
 
+def _configure_torch_gloo_env(device: TorchDeviceLike) -> None:
+    _ensure_default_socket_ifname()
+
+
+def _configure_torch_xccl_env(device: TorchDeviceLike) -> None:
+    return
+
+
+def _configure_backend_env(backend: object, device: TorchDeviceLike) -> None:
+    b = str(backend).lower() if backend is not None else ""
+    if b == "nccl":
+        _configure_torch_nccl_env(device)
+    elif b == "xccl":
+        _configure_torch_xccl_env(device)
+    elif b == "gloo":
+        _configure_torch_gloo_env(device)
+
+
 def _init_backend(device: TorchDeviceLike) -> None:
     with contextlib.suppress(Exception):
         if device.type == "cuda" and hasattr(torch.backends, "cudnn"):
@@ -1161,49 +1254,7 @@ def _init_backend(device: TorchDeviceLike) -> None:
         n = max(1, int(get_num_accelerators(device.type) or 1))
         set_accelerator_index(device.type, int(rank) % int(n))
     else:
-        iface = None
-        gloo_if = os.environ.get("GLOO_SOCKET_IFNAME")
-        tp_if = os.environ.get("TP_SOCKET_IFNAME")
-        if gloo_if or tp_if:
-            if gloo_if and (not tp_if):
-                os.environ.setdefault("TP_SOCKET_IFNAME", str(gloo_if))
-            elif tp_if and (not gloo_if):
-                os.environ.setdefault("GLOO_SOCKET_IFNAME", str(tp_if))
-            return
-        try:
-            with open("/proc/net/route", "r", encoding="utf-8") as f:
-                for line in f.readlines()[1:]:
-                    fields = line.strip().split()
-                    if len(fields) >= 2 and fields[1] == "00000000":
-                        iface = fields[0]
-                        if iface:
-                            break
-        except Exception:
-            iface = None
-        if iface is None and psutil is not None:
-            try:
-                s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-                try:
-                    s.connect(("8.8.8.8", 80))
-                    ip = s.getsockname()[0]
-                finally:
-                    s.close()
-                if ip:
-                    for name, addrs in psutil.net_if_addrs().items():
-                        for a in addrs:
-                            if (
-                                getattr(a, "family", None) == socket.AF_INET
-                                and getattr(a, "address", None) == ip
-                            ):
-                                iface = str(name)
-                                break
-                        if iface:
-                            break
-            except Exception:
-                iface = None
-        if iface:
-            os.environ.setdefault("GLOO_SOCKET_IFNAME", iface)
-            os.environ.setdefault("TP_SOCKET_IFNAME", iface)
+        _ensure_default_socket_ifname()
 
 
 def _unify_model_dtype(model: object, prefer: object | None = None) -> object:
@@ -1516,7 +1567,8 @@ def _init_distributed_group(
 ) -> None:
     dev_id = None
     dev_type = getattr(device, "type", "cpu")
-    if dev_type in ("cuda", "xpu", "mps"):
+    backend_name = str(backend).lower() if backend is not None else ""
+    if backend_name in ("nccl", "xccl") and dev_type in ("cuda", "xpu"):
         index = (
             device.index
             if getattr(device, "index", None) is not None
@@ -1529,7 +1581,7 @@ def _init_distributed_group(
     timeout = None
     try:
         to_s = int(env_int("STNET_PROCESS_GROUP_TIMEOUT_SEC", 0) or 0)
-        if to_s <= 0 and str(backend) == "nccl":
+        if to_s <= 0 and backend_name in ("nccl", "xccl"):
             ws = int(env_int("WORLD_SIZE", 1) or 1)
             if ws <= 1:
                 to_s = 3600
@@ -4797,8 +4849,7 @@ def process(*args: Any, **kwargs: Any) -> object:
         device = get_device()
         _init_backend(device)
         backend = _get_backend_type(device)
-        if str(backend) == "nccl":
-            _configure_torch_nccl_env(device)
+        _configure_backend_env(backend, device)
         enable_tf32 = bool(getattr(ops, "enable_tf32", True))
         _init_distributed_group(backend, device, local_rank)
         cfg = coerce_model_config(
@@ -5329,6 +5380,7 @@ def process(*args: Any, **kwargs: Any) -> object:
         device = get_device()
         _init_backend(device)
         backend = _get_backend_type(device)
+        _configure_backend_env(backend, device)
         if not torch.distributed.is_initialized():
             _init_distributed_group(backend, device, local_rank)
         cfg = coerce_model_config(

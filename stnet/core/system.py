@@ -1193,6 +1193,24 @@ def _main_module_has_real_file() -> bool:
     return os.path.isfile(abs_path)
 
 
+_STNET_MP_MAIN_STUB_PATH: Optional[str] = None
+
+
+@contextlib.contextmanager
+def _stnet_spawn_argv0_context() -> Any:
+    stub = _STNET_MP_MAIN_STUB_PATH
+    if not stub or not sys.argv:
+        yield
+        return
+    old = sys.argv[0]
+    try:
+        sys.argv[0] = str(stub)
+        yield
+    finally:
+        with contextlib.suppress(Exception):
+            sys.argv[0] = old
+
+
 def _ensure_importable_main_for_spawn_forkserver() -> None:
     if _main_module_has_real_file():
         return
@@ -1217,6 +1235,8 @@ def _ensure_importable_main_for_spawn_forkserver() -> None:
         return
     with contextlib.suppress(Exception):
         setattr(main_mod, "__file__", stub_path)
+    global _STNET_MP_MAIN_STUB_PATH
+    _STNET_MP_MAIN_STUB_PATH = stub_path
 
 
 def optimal_start_method() -> str:

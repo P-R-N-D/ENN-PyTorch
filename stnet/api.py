@@ -62,6 +62,7 @@ from .core.distributed import (
 from .core.graph import inference_mode
 from .core.policies import WorkerPolicy
 from .core.system import (
+    _stnet_spawn_argv0_context,
     init_python_path,
     init_start_method,
     new_dir,
@@ -1037,7 +1038,8 @@ def train(
         with contextlib.suppress(Exception):
             model.to("cpu")
         _clear_device_caches()
-        elastic_launch(lc, process)(ops)
+        with _stnet_spawn_argv0_context():
+            elastic_launch(lc, process)(ops)
         fallback = os.path.join(ckpt_dir, "model.pt")
         if os.path.isfile(fallback):
             cpu_state = coerce_tensor(
@@ -1280,7 +1282,8 @@ def predict(
             with contextlib.suppress(Exception):
                 model.to("cpu")
             _clear_device_caches()
-            elastic_launch(lc, process)(ops)
+            with _stnet_spawn_argv0_context():
+                elastic_launch(lc, process)(ops)
             chunks_dir = os.path.join(ckpt_dir, "pred_chunks")
             if not os.path.isdir(chunks_dir):
                 raise RuntimeError(
