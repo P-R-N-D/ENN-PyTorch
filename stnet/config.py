@@ -218,8 +218,6 @@ def _effective_source_count(sources: Any) -> int:
 def _validate_out_shape_dims(out_shape: Tuple[int, ...]) -> Tuple[int, ...]:
     if not out_shape or any(d <= 0 for d in out_shape):
         raise ValueError(f"Invalid shape {out_shape}")
-    if len(set(out_shape)) != 1:
-        raise ValueError("Shape must be isotropic")
     return out_shape
 
 
