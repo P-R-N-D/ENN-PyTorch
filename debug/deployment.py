@@ -17,7 +17,7 @@ import numpy as np
 import torch
 from tensordict import TensorDict
 from stnet.core.tensor import extract_tensor, from_buffer
-from wsl_nogil_train import build_dataset
+from debug.lifecycle import build_dataset
 from stnet.api import new_model, train
 from stnet.config import ModelConfig, PatchConfig
 from stnet.runtime.io import Exporter
