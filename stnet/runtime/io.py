@@ -25,14 +25,6 @@ except ImportError:
     add_safe_globals = None
 
 
-class Format(Protocol):
-    name: str | None
-
-    def save(
-        self, model: nn.Module, dst: PathLike, *args: Any, **kwargs: Any
-    ) -> object: ...
-
-
 _IGNORED_WARNINGS = (
     "torch.distributed is disabled",
     "TypedStorage is deprecated",
@@ -163,6 +155,14 @@ def is_required(module: str, pip_hint: str | None = None) -> None:
         raise ImportError(
             f"{module} is required for this operation{hint}"
         ) from err
+
+
+class Format(Protocol):
+    name: str | None
+
+    def save(
+        self, model: nn.Module, dst: PathLike, *args: Any, **kwargs: Any
+    ) -> object: ...
 
 
 class Builder:
