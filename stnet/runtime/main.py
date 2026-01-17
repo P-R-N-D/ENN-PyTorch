@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import contextlib
+import datetime
 import glob
 import random
 import re
@@ -1130,6 +1131,27 @@ def _get_backend_type(device: TorchDeviceLike) -> object:
             return "gloo"
 
 
+def _configure_torch_nccl_env(device: TorchDeviceLike) -> None:
+    try:
+        if str(getattr(device, "type", "cpu")) != "cuda":
+            return
+    except Exception:
+        return
+    world = 1
+    with contextlib.suppress(Exception):
+        world = int(env_int("WORLD_SIZE", 1) or 1)
+
+    if "TORCH_NCCL_ENABLE_MONITORING" not in os.environ:
+        default_mon = 0 if int(world) <= 1 else 1
+        mon = int(env_int("STNET_TORCH_NCCL_ENABLE_MONITORING", default_mon))
+        os.environ["TORCH_NCCL_ENABLE_MONITORING"] = str(int(mon))
+
+    if "TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC" not in os.environ:
+        default_hb = 3600 if int(world) <= 1 else 600
+        hb = int(env_int("STNET_TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC", default_hb))
+        os.environ["TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC"] = str(int(hb))
+
+
 def _init_backend(device: TorchDeviceLike) -> None:
     with contextlib.suppress(Exception):
         if device.type == "cuda" and hasattr(torch.backends, "cudnn"):
@@ -1504,15 +1526,31 @@ def _init_distributed_group(
             dev_id = torch.device(dev_type, index)
         except Exception:
             dev_id = index
+    timeout = None
     try:
+        to_s = int(env_int("STNET_PROCESS_GROUP_TIMEOUT_SEC", 0) or 0)
+        if to_s <= 0 and str(backend) == "nccl":
+            ws = int(env_int("WORLD_SIZE", 1) or 1)
+            if ws <= 1:
+                to_s = 3600
+        if int(to_s) > 0:
+            timeout = datetime.timedelta(seconds=int(to_s))
+    except Exception:
+        timeout = None
+    try:
+        kwargs = {"backend": backend}
         if dev_id is not None:
-            torch.distributed.init_process_group(
-                backend=backend, device_id=dev_id
-            )
-        else:
-            torch.distributed.init_process_group(backend=backend)
+            kwargs["device_id"] = dev_id
+        if timeout is not None:
+            kwargs["timeout"] = timeout
+        torch.distributed.init_process_group(**kwargs)
     except TypeError:
-        torch.distributed.init_process_group(backend=backend)
+        try:
+            kwargs.pop("device_id", None)
+            torch.distributed.init_process_group(**kwargs)
+        except TypeError:
+            kwargs.pop("timeout", None)
+            torch.distributed.init_process_group(**kwargs)
 
 
 def _gpu_nvml_utils(device: TorchDeviceLike) -> object:
@@ -4759,6 +4797,8 @@ def process(*args: Any, **kwargs: Any) -> object:
         device = get_device()
         _init_backend(device)
         backend = _get_backend_type(device)
+        if str(backend) == "nccl":
+            _configure_torch_nccl_env(device)
         enable_tf32 = bool(getattr(ops, "enable_tf32", True))
         _init_distributed_group(backend, device, local_rank)
         cfg = coerce_model_config(
