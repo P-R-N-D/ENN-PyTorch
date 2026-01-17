@@ -152,7 +152,9 @@ def _aoti_run(path: Path, x: torch.Tensor, device: torch.device) -> bool:
     try:
         from torch._inductor import aoti_load_package
     except Exception as exc:
-        print(f"[skip] aoti run: torch._inductor not available ({type(exc).__name__}: {exc})")
+        print(
+            f"[skip] aoti run: torch._inductor not available ({type(exc).__name__}: {exc})"
+        )
         return True
     try:
         dev_index = int(device.index or 0) if device.type == "cuda" else -1
@@ -179,7 +181,9 @@ def _aoti_run(path: Path, x: torch.Tensor, device: torch.device) -> bool:
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--out", type=str, default="export_smoke_out", help="Output directory")
+    ap.add_argument(
+        "--out", type=str, default="export_smoke_out", help="Output directory"
+    )
     ap.add_argument("--device", type=str, default="cpu", help="cpu|cuda")
     ap.add_argument("--dtype", type=str, default="fp32", help="fp32|fp16|bf16")
     ap.add_argument("--batch", type=int, default=2)
@@ -248,9 +252,13 @@ def main() -> int:
     model = Model(args.in_dim, out_shape, cfg).to(device=device)
     model.eval()
 
-    x = torch.randn(args.batch, args.seq, args.in_dim, device=device, dtype=dtype)
+    x = torch.randn(
+        args.batch, args.seq, args.in_dim, device=device, dtype=dtype
+    )
 
-    print(f"Model: in_dim={args.in_dim}, out_shape={out_shape}, device={device}, dtype={dtype}")
+    print(
+        f"Model: in_dim={args.in_dim}, out_shape={out_shape}, device={device}, dtype={dtype}"
+    )
     print(f"Input: {tuple(x.shape)}")
 
     verify = _bool_verify(args)
@@ -261,11 +269,15 @@ def main() -> int:
             with torch.no_grad():
                 y_ref = model.forward_export(x)
             if isinstance(y_ref, torch.Tensor):
-                print(f"Ref output: {tuple(y_ref.shape)} dtype={y_ref.dtype} device={y_ref.device}")
+                print(
+                    f"Ref output: {tuple(y_ref.shape)} dtype={y_ref.dtype} device={y_ref.device}"
+                )
             else:
                 y_ref = None
         except Exception as exc:
-            print(f"[warn] failed to compute reference output: {type(exc).__name__}: {exc}")
+            print(
+                f"[warn] failed to compute reference output: {type(exc).__name__}: {exc}"
+            )
             y_ref = None
 
     ok = True

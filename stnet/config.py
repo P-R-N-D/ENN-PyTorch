@@ -59,9 +59,7 @@ def _coerce_str(
     s = (
         str(value).strip()
         if strip and value is not None
-        else str(value)
-        if value is not None
-        else ""
+        else str(value) if value is not None else ""
     )
     return (s.lower() if lower else s) or default
 
@@ -143,7 +141,9 @@ def _coerce_int_tuple(
         return ivalue if keep_scalar else (ivalue,) * dims
     if isinstance(value, (list, tuple)):
         if len(value) != dims:
-            raise ValueError(f"{name} must have length {dims}, got {len(value)}")
+            raise ValueError(
+                f"{name} must have length {dims}, got {len(value)}"
+            )
         return tuple(_coerce_num(v, int, name, min=1) for v in value)
     raise TypeError(f"{name} must be an int or sequence of {dims} integers")
 
@@ -186,7 +186,9 @@ def _coerce_weights_spec(
         if not any(v > 0 for v in out.values()):
             raise ValueError(f"{name} needs >0 weight")
         return out
-    if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+    if isinstance(value, Sequence) and not isinstance(
+        value, (str, bytes, bytearray)
+    ):
         if not value:
             raise ValueError(f"{name} empty seq")
         out_seq = [_coerce_one(v, f"[{i}]") for i, v in enumerate(value)]
@@ -222,7 +224,9 @@ def _validate_out_shape_dims(out_shape: Tuple[int, ...]) -> Tuple[int, ...]:
     return out_shape
 
 
-def _coerce_device(value: Any, *args: Any, name: str = "device") -> Optional[torch.device]:
+def _coerce_device(
+    value: Any, *args: Any, name: str = "device"
+) -> Optional[torch.device]:
     if not value or (isinstance(value, str) and not value.strip()):
         return None
     if isinstance(value, torch.device):
@@ -230,7 +234,9 @@ def _coerce_device(value: Any, *args: Any, name: str = "device") -> Optional[tor
     try:
         return torch.device(value)
     except (TypeError, RuntimeError) as exc:
-        raise ValueError(f"{name} has invalid device specification: {value!r}") from exc
+        raise ValueError(
+            f"{name} has invalid device specification: {value!r}"
+        ) from exc
 
 
 def _to_tuple(
@@ -240,7 +246,9 @@ def _to_tuple(
         return (value,) * dims
     if isinstance(value, tuple):
         if len(value) != dims:
-            raise ValueError(f"{name} must have length {dims}, got {len(value)}")
+            raise ValueError(
+                f"{name} must have length {dims}, got {len(value)}"
+            )
         return value
     raise TypeError(f"{name} must be int or tuple of length {dims}")
 
@@ -251,11 +259,15 @@ def _validate_equal_dims(
     t = _to_tuple(value, dims=dims, name=name)
     first = t[0]
     if any(v != first for v in t[1:]):
-        raise ValueError(f"{name} must have equal dimensions (dims={dims}), got {t}")
+        raise ValueError(
+            f"{name} must have equal dimensions (dims={dims}), got {t}"
+        )
 
 
 def _extract_model_config_dict(model: Any) -> Dict[str, Any]:
-    cfg_obj = getattr(model, "config", None) or getattr(model, "__stnet_instance_config__", None)
+    cfg_obj = getattr(model, "config", None) or getattr(
+        model, "__stnet_instance_config__", None
+    )
     if not cfg_obj:
         for submodule in model.modules():
             cfg_obj = getattr(submodule, "config", None) or getattr(
@@ -270,14 +282,14 @@ def _extract_model_config_dict(model: Any) -> Dict[str, Any]:
     return {}
 
 
-def coerce_patch_config(config: PatchConfig | Dict[str, Any] | None) -> PatchConfig:
+def coerce_patch_config(
+    config: PatchConfig | Dict[str, Any] | None,
+) -> PatchConfig:
     d = PatchConfig()
     data = (
         _to_dict_strict(config)
         if isinstance(config, PatchConfig)
-        else dict(config)
-        if isinstance(config, dict)
-        else {}
+        else dict(config) if isinstance(config, dict) else {}
     )
     get = lambda k, def_: data.get(k, def_)
     is_square = _coerce_bool(get("is_square", d.is_square), name="is_square")
@@ -319,10 +331,14 @@ def coerce_patch_config(config: PatchConfig | Dict[str, Any] | None) -> PatchCon
         minimum=0.0,
         maximum=1.0,
     )
-    use_padding = _coerce_bool(get("use_padding", d.use_padding), name="use_padding")
+    use_padding = _coerce_bool(
+        get("use_padding", d.use_padding), name="use_padding"
+    )
     if is_square:
         if patch_size_2d is None:
-            raise ValueError("patch_size_2d is required when is_square is True")
+            raise ValueError(
+                "patch_size_2d is required when is_square is True"
+            )
         _validate_equal_dims(patch_size_2d, dims=2, name="patch_size_2d")
     if is_cube:
         if patch_size_3d is None:
@@ -341,18 +357,20 @@ def coerce_patch_config(config: PatchConfig | Dict[str, Any] | None) -> PatchCon
     )
 
 
-def coerce_model_config(config: ModelConfig | Dict[str, Any] | None) -> ModelConfig:
+def coerce_model_config(
+    config: ModelConfig | Dict[str, Any] | None,
+) -> ModelConfig:
     _MODEL_DEFAULTS = ModelConfig()
     data = (
         _to_dict_strict(config)
         if isinstance(config, ModelConfig)
-        else dict(config)
-        if isinstance(config, dict)
-        else {}
+        else dict(config) if isinstance(config, dict) else {}
     )
     get = data.get
     patch_cfg = coerce_patch_config(get("patch", _MODEL_DEFAULTS.patch))
-    device = _coerce_device(get("device", _MODEL_DEFAULTS.device), name="device")
+    device = _coerce_device(
+        get("device", _MODEL_DEFAULTS.device), name="device"
+    )
     params: Dict[str, Any] = {}
 
     def _f(
@@ -415,7 +433,9 @@ def coerce_model_config(config: ModelConfig | Dict[str, Any] | None) -> ModelCon
         _MODEL_DEFAULTS.normalization_method,
         lower=True,
     )
-    norm_key = normalization_method.replace(" ", "").replace("_", "").replace("-", "")
+    norm_key = (
+        normalization_method.replace(" ", "").replace("_", "").replace("-", "")
+    )
     if norm_key in ("ln", "layernorm"):
         normalization_method = "layernorm"
     elif norm_key in ("bn", "batchnorm"):
@@ -448,11 +468,14 @@ def coerce_model_config(config: ModelConfig | Dict[str, Any] | None) -> ModelCon
 
     raw_tile_shape = get("p_gate_tile_shape", None)
     p_gate_tile_shape = None
-    if isinstance(raw_tile_shape, int) and not isinstance(raw_tile_shape, bool):
+    if isinstance(raw_tile_shape, int) and not isinstance(
+        raw_tile_shape, bool
+    ):
         p_gate_tile_shape = (raw_tile_shape,)
     elif isinstance(raw_tile_shape, (list, tuple)):
         p_gate_tile_shape = tuple(
-            _coerce_int(v, name="p_gate_tile_shape", minimum=1) for v in raw_tile_shape
+            _coerce_int(v, name="p_gate_tile_shape", minimum=1)
+            for v in raw_tile_shape
         )
     elif isinstance(raw_tile_shape, str):
         parts = [
@@ -466,7 +489,8 @@ def coerce_model_config(config: ModelConfig | Dict[str, Any] | None) -> ModelCon
         ]
         if parts:
             p_gate_tile_shape = tuple(
-                _coerce_int(p, name="p_gate_tile_shape", minimum=1) for p in parts
+                _coerce_int(p, name="p_gate_tile_shape", minimum=1)
+                for p in parts
             )
 
     _f("p_gate_fallback_k")
@@ -525,30 +549,42 @@ def coerce_model_config(config: ModelConfig | Dict[str, Any] | None) -> ModelCon
             "patch": patch_cfg,
             "compile_mode": compile_mode,
             "p_gate_tile_shape": p_gate_tile_shape,
-            "p_gate_tile_size": _coerce_int(
-                get("p_gate_tile_size"), name="p_gate_tile_size", minimum=1
-            )
-            if get("p_gate_tile_size")
-            else None,
+            "p_gate_tile_size": (
+                _coerce_int(
+                    get("p_gate_tile_size"), name="p_gate_tile_size", minimum=1
+                )
+                if get("p_gate_tile_size")
+                else None
+            ),
         }
     )
     return ModelConfig(**params)
 
 
-def coerce_build_config(config: ModelConfig | Dict[str, Any] | None) -> ModelConfig:
+def coerce_build_config(
+    config: ModelConfig | Dict[str, Any] | None,
+) -> ModelConfig:
     return coerce_model_config(config)
 
 
-def patch_config_to_dict(config: PatchConfig | Dict[str, Any] | None) -> Dict[str, Any]:
+def patch_config_to_dict(
+    config: PatchConfig | Dict[str, Any] | None,
+) -> Dict[str, Any]:
     cfg = coerce_patch_config(config)
     data = _to_dict_strict(cfg)
     return {k: _to_dict(v) for k, v in data.items()}
 
 
-def model_config_to_dict(config: ModelConfig | Dict[str, Any] | None) -> Dict[str, Any]:
+def model_config_to_dict(
+    config: ModelConfig | Dict[str, Any] | None,
+) -> Dict[str, Any]:
     if config is None:
         return {}
-    cfg = config if isinstance(config, ModelConfig) else coerce_model_config(config)
+    cfg = (
+        config
+        if isinstance(config, ModelConfig)
+        else coerce_model_config(config)
+    )
     return cfg.to_dict()
 
 
@@ -590,7 +626,9 @@ def build_config(
     return model_config(base, **overrides)
 
 
-def coerce_runtime_config(config: RuntimeConfig | Dict[str, Any]) -> RuntimeConfig:
+def coerce_runtime_config(
+    config: RuntimeConfig | Dict[str, Any],
+) -> RuntimeConfig:
     if isinstance(config, RuntimeConfig):
         data: Dict[str, Any] = _to_dict_strict(config)
     elif isinstance(config, dict):
@@ -721,7 +759,9 @@ class RuntimeConfig:
     in_dim: int
     out_shape: Tuple[int, ...]
     cfg_dict: Dict[str, Any]
-    sources: Optional[Union[Source, Sequence[Source], Dict[str, Source]]] = None
+    sources: Optional[Union[Source, Sequence[Source], Dict[str, Source]]] = (
+        None
+    )
     ckpt_dir: Optional[str] = None
     init_ckpt_dir: Optional[str] = None
     epochs: int = 5
@@ -757,7 +797,9 @@ class RuntimeConfig:
         "loss_skew",
     )
     PRED_POS_ORDER: ClassVar[Tuple[str, ...]] = ("seed",)
-    _COMMON_KEYS: ClassVar[frozenset[str]] = frozenset({"in_dim", "out_shape", "cfg_dict"})
+    _COMMON_KEYS: ClassVar[frozenset[str]] = frozenset(
+        {"in_dim", "out_shape", "cfg_dict"}
+    )
     _TRAIN_KEYS: ClassVar[frozenset[str]] = _COMMON_KEYS | frozenset(
         {
             "sources",
@@ -796,14 +838,18 @@ class RuntimeConfig:
     )
 
     @staticmethod
-    def from_partial(mode: OpsMode, *args: Any, **kwargs: Any) -> "RuntimeConfig":
+    def from_partial(
+        mode: OpsMode, *args: Any, **kwargs: Any
+    ) -> "RuntimeConfig":
         if "mode" in kwargs:
             raise TypeError("No mode in kwargs")
         mode_norm = str(mode).lower()
         if mode_norm not in ("train", "predict", "infer"):
             raise ValueError(f"Invalid mode {mode}")
         order = (
-            RuntimeConfig.TRAIN_POS_ORDER if mode_norm == "train" else RuntimeConfig.PRED_POS_ORDER
+            RuntimeConfig.TRAIN_POS_ORDER
+            if mode_norm == "train"
+            else RuntimeConfig.PRED_POS_ORDER
         )
         if len(args) > len(order):
             raise TypeError(f"Too many args for {mode_norm}")
@@ -819,10 +865,14 @@ class RuntimeConfig:
                 raise ValueError(f"Missing {k}")
         in_dim = _coerce_int(data["in_dim"], name="in_dim", minimum=1)
         out_shape = _validate_out_shape_dims(
-            _coerce_int_sequence(data["out_shape"], name="out_shape", minimum=1)
+            _coerce_int_sequence(
+                data["out_shape"], name="out_shape", minimum=1
+            )
         )
         cfg_dict = (
-            data["cfg_dict"] if isinstance(data["cfg_dict"], dict) else dict(data["cfg_dict"])
+            data["cfg_dict"]
+            if isinstance(data["cfg_dict"], dict)
+            else dict(data["cfg_dict"])
         )
 
         def _get_val(
@@ -868,7 +918,11 @@ class RuntimeConfig:
                 cfg_dict=cfg_dict,
                 sources=data["sources"],
                 ckpt_dir=str(data["ckpt_dir"]),
-                init_ckpt_dir=str(data.get("init_ckpt_dir")) if data.get("init_ckpt_dir") else None,
+                init_ckpt_dir=(
+                    str(data.get("init_ckpt_dir"))
+                    if data.get("init_ckpt_dir")
+                    else None
+                ),
                 epochs=_get_val("epochs", int, 1, def_=5),
                 val_frac=_get_val("val_frac", float, 0.0, 1.0, 0.1),
                 base_lr=_get_val("base_lr", float, 0.0, def_=1e-3),
@@ -876,25 +930,45 @@ class RuntimeConfig:
                 warmup_ratio=_get_val("warmup_ratio", float, 0.0, 1.0, 0.0),
                 eta_min=_get_val("eta_min", float, 0.0, def_=0.0),
                 seed=_get_val("seed", int, def_=42),
-                shuffle=_coerce_bool(data.get("shuffle", True), name="shuffle"),
-                deterministic=_coerce_bool(data.get("deterministic", False), name="deterministic"),
-                train_weights=_coerce_weights_spec(data.get("train_weights"), name="train_weights")
-                if src_n > 1
-                else None,
-                val_weights=_coerce_weights_spec(data.get("val_weights"), name="val_weights")
-                if src_n > 1
-                else None,
-                loss_tile_dim=_get_val("loss_tile_dim", int, 1)
-                if data.get("loss_tile_dim")
-                else None,
-                loss_tile_size=_get_val("loss_tile_size", int, 1)
-                if data.get("loss_tile_size")
-                else None,
+                shuffle=_coerce_bool(
+                    data.get("shuffle", True), name="shuffle"
+                ),
+                deterministic=_coerce_bool(
+                    data.get("deterministic", False), name="deterministic"
+                ),
+                train_weights=(
+                    _coerce_weights_spec(
+                        data.get("train_weights"), name="train_weights"
+                    )
+                    if src_n > 1
+                    else None
+                ),
+                val_weights=(
+                    _coerce_weights_spec(
+                        data.get("val_weights"), name="val_weights"
+                    )
+                    if src_n > 1
+                    else None
+                ),
+                loss_tile_dim=(
+                    _get_val("loss_tile_dim", int, 1)
+                    if data.get("loss_tile_dim")
+                    else None
+                ),
+                loss_tile_size=(
+                    _get_val("loss_tile_size", int, 1)
+                    if data.get("loss_tile_size")
+                    else None
+                ),
                 loss_mask_mode=loss_mode,
-                loss_mask_value=_get_val("loss_mask_value", float)
-                if data.get("loss_mask_value")
-                else None,
-                loss_skew=_coerce_bool(data.get("loss_skew", True), name="loss_skew"),
+                loss_mask_value=(
+                    _get_val("loss_mask_value", float)
+                    if data.get("loss_mask_value")
+                    else None
+                ),
+                loss_skew=_coerce_bool(
+                    data.get("loss_skew", True), name="loss_skew"
+                ),
             )
         for k in ("sources", "ckpt_dir"):
             if k not in data or data[k] is None:
@@ -909,15 +983,29 @@ class RuntimeConfig:
             cfg_dict=cfg_dict,
             sources=data["sources"],
             ckpt_dir=str(data["ckpt_dir"]),
-            model_ckpt_dir=str(data["model_ckpt_dir"]) if data.get("model_ckpt_dir") else None,
+            model_ckpt_dir=(
+                str(data["model_ckpt_dir"])
+                if data.get("model_ckpt_dir")
+                else None
+            ),
             keys=data.get("keys"),
             seed=_get_val("seed", int, def_=7),
             shuffle=_coerce_bool(data.get("shuffle", False), name="shuffle"),
-            loss_skew=_coerce_bool(data.get("loss_skew", True), name="loss_skew"),
-            train_weights=_coerce_weights_spec(data.get("train_weights"), name="train_weights")
-            if src_n > 1
-            else None,
-            val_weights=_coerce_weights_spec(data.get("val_weights"), name="val_weights")
-            if src_n > 1
-            else None,
+            loss_skew=_coerce_bool(
+                data.get("loss_skew", True), name="loss_skew"
+            ),
+            train_weights=(
+                _coerce_weights_spec(
+                    data.get("train_weights"), name="train_weights"
+                )
+                if src_n > 1
+                else None
+            ),
+            val_weights=(
+                _coerce_weights_spec(
+                    data.get("val_weights"), name="val_weights"
+                )
+                if src_n > 1
+                else None
+            ),
         )

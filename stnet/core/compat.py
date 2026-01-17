@@ -27,7 +27,9 @@ def _fmin_impl(tm, a, b):
 
 def _nan_mm_impl(tm, x, dim, keepdim, op, fill):
     if isinstance(x, torch.Tensor) and not tm.is_floating_point(x):
-        return getattr(x, op)(**({"dim": dim, "keepdim": keepdim} if dim is not None else {}))
+        return getattr(x, op)(
+            **({"dim": dim, "keepdim": keepdim} if dim is not None else {})
+        )
     mask = tm.isfinite(x)
     xp = tm.where(mask, x, tm.full_like(x, float(fill)))
     if dim is None:
@@ -58,11 +60,16 @@ def _nansum_impl(tm, x, dim=None, keepdim=False, *args, dtype=None, **kwargs):
     if callable(n2n := getattr(tm, "nan_to_num", None)):
         with suppress(Exception):
             return tm.sum(
-                n2n(x_cast, nan=0.0, posinf=0.0, neginf=0.0), dim=dim, keepdim=keepdim, **kwargs
+                n2n(x_cast, nan=0.0, posinf=0.0, neginf=0.0),
+                dim=dim,
+                keepdim=keepdim,
+                **kwargs,
             )
     return tm.sum(
         tm.where(
-            tm.isfinite(x_cast), x_cast, tm.zeros((), device=x_cast.device, dtype=x_cast.dtype)
+            tm.isfinite(x_cast),
+            x_cast,
+            tm.zeros((), device=x_cast.device, dtype=x_cast.dtype),
         ),
         dim=dim,
         keepdim=keepdim,
@@ -70,7 +77,9 @@ def _nansum_impl(tm, x, dim=None, keepdim=False, *args, dtype=None, **kwargs):
     )
 
 
-def torch_compat(module: Any | None = None, nn_module: Any | None = None) -> TorchCompat:
+def torch_compat(
+    module: Any | None = None, nn_module: Any | None = None
+) -> TorchCompat:
     global _TORCH_COMPAT
     with _PATCH_LOCK:
         compat = (
@@ -86,7 +95,9 @@ def torch_compat(module: Any | None = None, nn_module: Any | None = None) -> Tor
 class _RMSNormFallback(nn.Module):
     def __init__(self, d_model: int, eps: float = 1e-06) -> None:
         super().__init__()
-        self.eps, self.weight = float(eps), nn.Parameter(torch.ones(int(d_model)))
+        self.eps, self.weight = float(eps), nn.Parameter(
+            torch.ones(int(d_model))
+        )
 
     def forward(self, x: Any) -> Any:
         inv_rms = x.pow(2).mean(dim=-1, keepdim=True).add(self.eps).rsqrt()
@@ -104,7 +115,9 @@ class _StochasticDepthFallback(nn.Module):
         if (keep := 1.0 - self.p) <= 0.0:
             return torch.zeros_like(x)
         shape = (
-            (x.shape[0],) + (1,) * (x.dim() - 1) if self.mode == "row" and x.dim() >= 2 else x.shape
+            (x.shape[0],) + (1,) * (x.dim() - 1)
+            if self.mode == "row" and x.dim() >= 2
+            else x.shape
         )
         return x * x.new_empty(shape).bernoulli_(keep).div_(keep)
 
@@ -114,9 +127,15 @@ class _SDPBackendFallback:
 
 
 class TorchCompat:
-    def __init__(self, module: Any | None = None, nn_module: Any | None = None) -> None:
+    def __init__(
+        self, module: Any | None = None, nn_module: Any | None = None
+    ) -> None:
         self.module = module if module is not None else torch
-        self.nn_module = nn_module if nn_module is not None else getattr(self.module, "nn", nn)
+        self.nn_module = (
+            nn_module
+            if nn_module is not None
+            else getattr(self.module, "nn", nn)
+        )
 
     def apply(self) -> None:
         with _PATCH_LOCK:
@@ -147,4 +166,7 @@ except Exception:
         _ = backends
         yield
 
-StochasticDepth = getattr(nn, "StochasticDepth", None) or _StochasticDepthFallback
+
+StochasticDepth = (
+    getattr(nn, "StochasticDepth", None) or _StochasticDepthFallback
+)

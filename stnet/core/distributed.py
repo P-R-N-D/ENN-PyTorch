@@ -56,12 +56,16 @@ def _set_dtensor_active() -> None:
 
 
 def _from_hsdp_module(module: torch.nn.Module) -> None:
-    if not (is_distributed() and callable(unshard := getattr(module, "unshard", None))):
+    if not (
+        is_distributed()
+        and callable(unshard := getattr(module, "unshard", None))
+    ):
         return
     try:
         if (p0 := next(module.parameters(recurse=False), None)) is not None:
             is_dt = (
-                isinstance(p0, _DTensor) or isinstance(getattr(p0, "data", None), _DTensor)
+                isinstance(p0, _DTensor)
+                or isinstance(getattr(p0, "data", None), _DTensor)
                 if _DTensor
                 else (
                     type(p0).__name__ == "DTensor"
@@ -72,7 +76,9 @@ def _from_hsdp_module(module: torch.nn.Module) -> None:
                 _set_dtensor_active()
             if not is_dt:
                 return
-        if (handle := unshard(async_op=True)) and callable(wait := getattr(handle, "wait", None)):
+        if (handle := unshard(async_op=True)) and callable(
+            wait := getattr(handle, "wait", None)
+        ):
             wait()
     except:
         pass
@@ -95,7 +101,9 @@ def _is_ip_addr(value: str) -> bool:
         return False
 
 
-def _canonize_ip(value: Any, loopback: bool = False, link_local: bool = False) -> str | None:
+def _canonize_ip(
+    value: Any, loopback: bool = False, link_local: bool = False
+) -> str | None:
     s = _coerce_ip_addr(value)
     if not s:
         return None
@@ -116,7 +124,12 @@ def _format_endpoint(host: str, port: int) -> str:
         host_text = host_text[1:-1].strip()
     h, p = host_text or "127.0.0.1", int(port)
     try:
-        h = f"[{h}]" if ipaddress.ip_address(_coerce_ip_addr(h)).version == 6 and ":" in h else h
+        h = (
+            f"[{h}]"
+            if ipaddress.ip_address(_coerce_ip_addr(h)).version == 6
+            and ":" in h
+            else h
+        )
     except:
         pass
     return f"{h}:{p}"
@@ -128,7 +141,9 @@ def _parse_endpoint(text: str) -> tuple[str, int]:
         return "", 0
     if text.startswith("["):
         host, _, rest = text[1:].partition("]")
-        return host.strip(), int(rest[1:]) if rest.startswith(":") and rest[1:].isdigit() else 0
+        return host.strip(), (
+            int(rest[1:]) if rest.startswith(":") and rest[1:].isdigit() else 0
+        )
     if _is_ip_addr(text):
         return text, 0
     host, sep, port = text.rpartition(":")
@@ -141,9 +156,9 @@ def _canonize_host(ep: str, default: str, link_local: bool) -> tuple[str, int]:
     if not ep:
         return default, 0
     host, port = _parse_endpoint(ep)
-    host = _canonize_ip(host or default, loopback=True, link_local=link_local) or (
-        default if _is_ip_addr(host) else host
-    )
+    host = _canonize_ip(
+        host or default, loopback=True, link_local=link_local
+    ) or (default if _is_ip_addr(host) else host)
     return host, port if 0 < port <= 65535 else 0
 
 
@@ -154,14 +169,18 @@ def _has_join_hook(obj: Any | None) -> bool:
 def _get_device_id(device: Optional[torch.device]) -> Optional[Iterable[int]]:
     return (
         [int(device.index)]
-        if device and device.type in {"cuda", "xpu"} and device.index is not None
+        if device
+        and device.type in {"cuda", "xpu"}
+        and device.index is not None
         else None
     )
 
 
 def _safe_getaddrinfo(host: str) -> list[tuple[Any, ...]]:
     with contextlib.suppress(Exception):
-        return socket.getaddrinfo(host, None, family=socket.AF_UNSPEC, type=socket.SOCK_STREAM)
+        return socket.getaddrinfo(
+            host, None, family=socket.AF_UNSPEC, type=socket.SOCK_STREAM
+        )
     return []
 
 
@@ -178,7 +197,9 @@ def _get_preferred_ip_cached(
     for name in names:
         for info in _safe_getaddrinfo(name):
             if not info[4] or not (
-                canon := _canonize_ip(info[4][0], loopback=True, link_local=allow_link_local)
+                canon := _canonize_ip(
+                    info[4][0], loopback=True, link_local=allow_link_local
+                )
             ):
                 continue
             try:
@@ -192,9 +213,13 @@ def _get_preferred_ip_cached(
             seen.add((ip.version, canon))
 
             score = 1 if ip.is_loopback else (2 if ip.is_link_local else 3)
-            if (score == 1 and not allow_loopback) or (score == 2 and not allow_link_local):
+            if (score == 1 and not allow_loopback) or (
+                score == 2 and not allow_link_local
+            ):
                 continue
-            found.append((score, ip.version == (6 if prefer_ipv6 else 4), canon))
+            found.append(
+                (score, ip.version == (6 if prefer_ipv6 else 4), canon)
+            )
     found.sort(key=lambda x: x[:2], reverse=True)
     if found:
         return found[0][2]
@@ -238,7 +263,9 @@ def resolve_ip_expr(
         if allow_link_local is not None
         else env_bool("STNET_ALLOW_LINK_LOCAL", False)
     )
-    if lit := _canonize_ip(host_text, loopback=allow_loopback, link_local=link_local):
+    if lit := _canonize_ip(
+        host_text, loopback=allow_loopback, link_local=link_local
+    ):
         return lit
     addrs = _safe_getaddrinfo(_coerce_ip_addr(host_text))
     if not addrs:
@@ -246,10 +273,14 @@ def resolve_ip_expr(
     res = {4: [], 6: []}
     for a in addrs:
         if a[4] and (
-            canon := _canonize_ip(a[4][0], loopback=allow_loopback, link_local=link_local)
+            canon := _canonize_ip(
+                a[4][0], loopback=allow_loopback, link_local=link_local
+            )
         ):
             with contextlib.suppress(Exception):
-                res[ipaddress.ip_address(_coerce_ip_addr(canon)).version].append(canon)
+                res[
+                    ipaddress.ip_address(_coerce_ip_addr(canon)).version
+                ].append(canon)
     vers = (6, 4) if (prefer_ipv6 is None or prefer_ipv6) else (4, 6)
     for v in vers:
         if res[v]:
@@ -257,7 +288,10 @@ def resolve_ip_expr(
     if "%" in host_text and link_local:
         for v in vers:
             for ip in res[v]:
-                if v == 6 and ipaddress.ip_address(_coerce_ip_addr(ip)).is_link_local:
+                if (
+                    v == 6
+                    and ipaddress.ip_address(_coerce_ip_addr(ip)).is_link_local
+                ):
                     return f"{ip}%{host_text.partition('%')[2]}"
     return None
 
@@ -281,7 +315,9 @@ def validate_ip_expr(
         txt = str(h).strip() if h else ""
         if txt:
             if _is_ip_addr(txt):
-                if lit := _canonize_ip(txt, loopback=allow_loopback, link_local=link_local):
+                if lit := _canonize_ip(
+                    txt, loopback=allow_loopback, link_local=link_local
+                ):
                     return lit
             elif allow_hostname:
                 return txt
@@ -298,8 +334,13 @@ def is_port_available(
         if allow_link_local is not None
         else env_bool("STNET_ALLOW_LINK_LOCAL", False)
     )
-    host_ip = _canonize_ip(host, loopback=True, link_local=link_local) or resolve_ip_expr(
-        host, allow_loopback=True, prefer_ipv6=True, allow_link_local=link_local
+    host_ip = _canonize_ip(
+        host, loopback=True, link_local=link_local
+    ) or resolve_ip_expr(
+        host,
+        allow_loopback=True,
+        prefer_ipv6=True,
+        allow_link_local=link_local,
     )
     if not host_ip:
         return False
@@ -307,7 +348,9 @@ def is_port_available(
         ver = ipaddress.ip_address(_coerce_ip_addr(host_ip)).version
         family = socket.AF_INET6 if ver == 6 else socket.AF_INET
         addr = (host_ip, port, 0, 0) if ver == 6 else (host_ip, port)
-        with contextlib.closing(socket.socket(family, socket.SOCK_STREAM)) as sock:
+        with contextlib.closing(
+            socket.socket(family, socket.SOCK_STREAM)
+        ) as sock:
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             if ver == 6 and hasattr(socket, "IPV6_V6ONLY"):
                 with contextlib.suppress(OSError):
@@ -342,15 +385,24 @@ def get_available_host(
     )
     host = (
         _canonize_ip(cand, loopback=True, link_local=link_local)
-        or resolve_ip_expr(cand, allow_loopback=True, prefer_ipv6=True, allow_link_local=link_local)
+        or resolve_ip_expr(
+            cand,
+            allow_loopback=True,
+            prefer_ipv6=True,
+            allow_link_local=link_local,
+        )
         or "127.0.0.1"
     )
     try:
         ver = ipaddress.ip_address(_coerce_ip_addr(host)).version
         family, addr = (
-            (socket.AF_INET6, (host, 0, 0, 0)) if ver == 6 else (socket.AF_INET, (host, 0))
+            (socket.AF_INET6, (host, 0, 0, 0))
+            if ver == 6
+            else (socket.AF_INET, (host, 0))
         )
-        with contextlib.closing(socket.socket(family, socket.SOCK_STREAM)) as sock:
+        with contextlib.closing(
+            socket.socket(family, socket.SOCK_STREAM)
+        ) as sock:
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             if ver == 6 and hasattr(socket, "IPV6_V6ONLY"):
                 with contextlib.suppress(OSError):
@@ -361,12 +413,16 @@ def get_available_host(
         return _format_endpoint(host, 0)
 
 
-def supported_ip_ver(*args: Any, allow_loopback: bool = True, **kwargs: Any) -> tuple[bool, bool]:
+def supported_ip_ver(
+    *args: Any, allow_loopback: bool = True, **kwargs: Any
+) -> tuple[bool, bool]:
     ipv4_ok = False
     ipv6_ok = False
     ipv4_host = "127.0.0.1" if allow_loopback else "0.0.0.0"
     try:
-        with contextlib.closing(socket.socket(socket.AF_INET, socket.SOCK_STREAM)) as sock4:
+        with contextlib.closing(
+            socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        ) as sock4:
             sock4.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             sock4.bind((ipv4_host, 0))
             ipv4_ok = True
@@ -375,10 +431,16 @@ def supported_ip_ver(*args: Any, allow_loopback: bool = True, **kwargs: Any) -> 
     if getattr(socket, "has_ipv6", False):
         ipv6_host = "::1" if allow_loopback else "::"
         try:
-            with contextlib.closing(socket.socket(socket.AF_INET6, socket.SOCK_STREAM)) as sock6:
-                if hasattr(socket, "IPPROTO_IPV6") and hasattr(socket, "IPV6_V6ONLY"):
+            with contextlib.closing(
+                socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
+            ) as sock6:
+                if hasattr(socket, "IPPROTO_IPV6") and hasattr(
+                    socket, "IPV6_V6ONLY"
+                ):
                     with contextlib.suppress(OSError):
-                        sock6.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
+                        sock6.setsockopt(
+                            socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1
+                        )
                 sock6.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
                 sock6.bind((ipv6_host, 0, 0, 0))
                 ipv6_ok = True
@@ -417,7 +479,9 @@ def init_master_addr(
         else env_bool("STNET_ALLOW_LINK_LOCAL", False)
     )
     default_host = get_preferred_ip(
-        allow_loopback=allow_loopback, prefer_ipv6=prefer_ipv6, allow_link_local=link_local
+        allow_loopback=allow_loopback,
+        prefer_ipv6=prefer_ipv6,
+        allow_link_local=link_local,
     )
     default_host = default_host or ("::1" if prefer_ipv6 else "127.0.0.1")
 
@@ -426,7 +490,9 @@ def init_master_addr(
         host = default_host
 
     master_addr = (
-        _canonize_ip(host, loopback=allow_loopback, link_local=link_local) or host or default_host
+        _canonize_ip(host, loopback=allow_loopback, link_local=link_local)
+        or host
+        or default_host
     )
     os.environ.setdefault("MASTER_ADDR", master_addr)
     if port > 0:
@@ -449,7 +515,11 @@ def get_world_size(device: Optional[torch.device] = None) -> int:
     match getattr(dev, "type", "cpu"):
         case "cuda" | "xpu" | "mps":
             with contextlib.suppress(Exception):
-                count = int(get_num_accelerators(str(getattr(dev, "type", "cpu") or "cpu")))
+                count = int(
+                    get_num_accelerators(
+                        str(getattr(dev, "type", "cpu") or "cpu")
+                    )
+                )
                 if count > 0:
                     return count
             return 1
@@ -485,7 +555,9 @@ def joining(
     return Join(joinables, throw_on_early_termination=True)
 
 
-def broadcast_scalar(value: int | float, device: torch.device, src: int = 0) -> int:
+def broadcast_scalar(
+    value: int | float, device: torch.device, src: int = 0
+) -> int:
     if not is_distributed():
         return int(value)
     try:
@@ -529,7 +601,6 @@ def is_rank0() -> bool:
     return int(r or 0) == 0
 
 
-
 def distributed_barrier(device: Optional[torch.device] = None) -> None:
     if not is_distributed():
         return
@@ -549,8 +620,16 @@ def distributed_broadcast(
 ) -> None:
     if not is_distributed():
         return
-    mb = coalesce_mb if coalesce_mb is not None else env_int("STNET_BROADCAST_COALESCE_MB", 25)
-    strict = strict if strict is not None else env_bool("STNET_DISTRIBUTED_STRICT", False)
+    mb = (
+        coalesce_mb
+        if coalesce_mb is not None
+        else env_int("STNET_BROADCAST_COALESCE_MB", 25)
+    )
+    strict = (
+        strict
+        if strict is not None
+        else env_bool("STNET_DISTRIBUTED_STRICT", False)
+    )
 
     tensors: list[torch.Tensor] = []
     seen: set[int] = set()
@@ -656,13 +735,23 @@ def to_hsdp_module(
         sharded.set_requires_gradient_sync(True)
     with contextlib.suppress(ImportError):
         from torch.distributed.fsdp import register_fsdp_forward_method
-        for _name in ("forward", "decode", "predict", "forward_export", "forward_state", "forward_stream"):
+
+        for _name in (
+            "forward",
+            "decode",
+            "predict",
+            "forward_export",
+            "forward_state",
+            "forward_stream",
+        ):
             if hasattr(sharded, _name):
                 register_fsdp_forward_method(sharded, _name)
     return sharded
 
 
-def get_distributed_mesh(device: torch.device | None = None) -> tuple[Any | None, str]:
+def get_distributed_mesh(
+    device: torch.device | None = None,
+) -> tuple[Any | None, str]:
     if not is_distributed():
         return (None, "none")
     dev = device
@@ -700,7 +789,9 @@ def get_distributed_mesh(device: torch.device | None = None) -> tuple[Any | None
     is_consistent = True
     if dist.is_initialized():
         try:
-            my_size = torch.tensor([local_world_size], device=dev, dtype=torch.long)
+            my_size = torch.tensor(
+                [local_world_size], device=dev, dtype=torch.long
+            )
             gathered = [torch.zeros_like(my_size) for _ in range(world)]
             dist.all_gather(gathered, my_size)
             all_sizes = [t.item() for t in gathered]
@@ -713,7 +804,11 @@ def get_distributed_mesh(device: torch.device | None = None) -> tuple[Any | None
     init_device_mesh = getattr(device_mesh, "init_device_mesh", None)
     if init_device_mesh is None:
         return (None, "none")
-    if is_consistent and world > local_world_size and world % local_world_size == 0:
+    if (
+        is_consistent
+        and world > local_world_size
+        and world % local_world_size == 0
+    ):
         dp_replicate = world // local_world_size
         dp_shard = local_world_size
         try:

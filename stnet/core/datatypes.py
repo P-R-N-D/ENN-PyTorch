@@ -117,7 +117,9 @@ _DEF_UNDERFLOW_ACTIONS = {"allow", "warn", "forbid"}
 
 PathLike: TypeAlias = str | os.PathLike[str] | Path
 JsonPrimitive: TypeAlias = str | int | float | bool | None
-JsonValue: TypeAlias = JsonPrimitive | list["JsonValue"] | dict[str, "JsonValue"]
+JsonValue: TypeAlias = (
+    JsonPrimitive | list["JsonValue"] | dict[str, "JsonValue"]
+)
 
 
 def _env_cast(name: str, cast: Callable[[str], Any], default: Any) -> Any:
@@ -174,7 +176,9 @@ def _atomic_swap(path: PathLike):
     p = os.fspath(path)
     parent = os.path.dirname(p) or "."
     os.makedirs(parent, exist_ok=True)
-    fd, tmp_name = tempfile.mkstemp(prefix=os.path.basename(p) + ".", suffix=".tmp", dir=parent)
+    fd, tmp_name = tempfile.mkstemp(
+        prefix=os.path.basename(p) + ".", suffix=".tmp", dir=parent
+    )
     os.close(fd)
     try:
         yield tmp_name
@@ -206,7 +210,9 @@ def env_str(name: str, default: str | None = None) -> str | None:
 
 def env_bool(name: str | Sequence[str], default: bool = False) -> bool:
     raw: object | None
-    if isinstance(name, Sequence) and not isinstance(name, (str, bytes, bytearray)):
+    if isinstance(name, Sequence) and not isinstance(
+        name, (str, bytes, bytearray)
+    ):
         raw = env_first(list(name), default=None)
     else:
         raw = os.environ.get(str(name))
@@ -281,11 +287,15 @@ def to_platform_dtype(src: Any, platform: str) -> Any:
         return canonical
     mapping = _CANONICAL_DTYPES.get(canonical)
     if mapping is None:
-        raise TypeError(f"unsupported dtype conversion: {src!r} -> {platform!r}")
+        raise TypeError(
+            f"unsupported dtype conversion: {src!r} -> {platform!r}"
+        )
     try:
         return mapping[normalized]
     except KeyError as e:
-        raise TypeError(f"unsupported dtype conversion: {src!r} -> {platform!r}") from e
+        raise TypeError(
+            f"unsupported dtype conversion: {src!r} -> {platform!r}"
+        ) from e
 
 
 def parse_torch_dtype(src: Any) -> torch.dtype | None:
@@ -345,7 +355,9 @@ def coerce_json(obj: object) -> JsonValue:
     return str(obj)
 
 
-def write_json(path: PathLike, payload: Any, *args: Any, indent: int | None = 2) -> None:
+def write_json(
+    path: PathLike, payload: Any, *args: Any, indent: int | None = 2
+) -> None:
     with _atomic_swap(path) as tmp, open(tmp, "w", encoding="utf-8") as f:
         json.dump(payload, f, indent=indent)
 
@@ -358,7 +370,10 @@ def save_temp(path: PathLike, payload: Any, **opts: Any) -> None:
 def default_underflow_action() -> str:
     raw = (
         str(
-            env_first(("STNET_DATA_UNDERFLOW_ACTION", "STNET_UNDERFLOW_ACTION"), default="warn")
+            env_first(
+                ("STNET_DATA_UNDERFLOW_ACTION", "STNET_UNDERFLOW_ACTION"),
+                default="warn",
+            )
             or "warn"
         )
         .strip()
@@ -367,10 +382,11 @@ def default_underflow_action() -> str:
     return raw if raw in _DEF_UNDERFLOW_ACTIONS else "warn"
 
 
-def normalize_underflow_action(value: object, *args: Any, default: str = "warn") -> str:
+def normalize_underflow_action(
+    value: object, *args: Any, default: str = "warn"
+) -> str:
     r = str(value if value is not None else default).strip().lower()
     if r in _DEF_UNDERFLOW_ACTIONS:
         return r
     d = str(default).strip().lower()
     return d if d in _DEF_UNDERFLOW_ACTIONS else "warn"
-

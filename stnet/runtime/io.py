@@ -28,11 +28,18 @@ except ImportError:
 class Format(Protocol):
     name: str | None
 
-    def save(self, model: nn.Module, dst: PathLike, *args: Any, **kwargs: Any) -> object: ...
+    def save(
+        self, model: nn.Module, dst: PathLike, *args: Any, **kwargs: Any
+    ) -> object: ...
 
 
-_IGNORED_WARNINGS = ("torch.distributed is disabled", "TypedStorage is deprecated")
-_IGNORED_RE = r".*(?:" + "|".join(re.escape(s) for s in _IGNORED_WARNINGS) + r").*"
+_IGNORED_WARNINGS = (
+    "torch.distributed is disabled",
+    "TypedStorage is deprecated",
+)
+_IGNORED_RE = (
+    r".*(?:" + "|".join(re.escape(s) for s in _IGNORED_WARNINGS) + r").*"
+)
 
 _WARNINGS_FILTER_LOCK = Mutex()
 
@@ -49,12 +56,16 @@ def _register_safe_globals():
 
 
 @contextlib.contextmanager
-def _filtered_warnings(sentences: Sequence[str] | None = None) -> Iterator[None]:
+def _filtered_warnings(
+    sentences: Sequence[str] | None = None,
+) -> Iterator[None]:
     msg_re = (
         _IGNORED_RE
         if sentences is None
         else (
-            r".*(?:" + "|".join(re.escape(str(s)) for s in sentences) + r").*" if sentences else ""
+            r".*(?:" + "|".join(re.escape(str(s)) for s in sentences) + r").*"
+            if sentences
+            else ""
         )
     )
     if not msg_re:
@@ -102,7 +113,9 @@ def _save_lock(path: PathLike | None = None) -> Mutex:
 
 
 @contextlib.contextmanager
-def _save_sync(path: PathLike | None = None, *args: Any, barrier: bool = False) -> Iterator[None]:
+def _save_sync(
+    path: PathLike | None = None, *args: Any, barrier: bool = False
+) -> Iterator[None]:
     with _save_lock(path):
         if barrier:
             distributed_barrier()
@@ -123,10 +136,17 @@ def _load_model_config(model: object) -> object:
 
 
 def _torch_load_checkpoint(
-    path: PathLike, *args: Any, map_location: object = None, weights_only: bool = True
+    path: PathLike,
+    *args: Any,
+    map_location: object = None,
+    weights_only: bool = True,
 ) -> object:
     try:
-        return torch.load(str(path), map_location=map_location or "cpu", weights_only=weights_only)
+        return torch.load(
+            str(path),
+            map_location=map_location or "cpu",
+            weights_only=weights_only,
+        )
     except TypeError:
         return torch.load(str(path), map_location=map_location or "cpu")
     except Exception as exc:
@@ -140,7 +160,9 @@ def is_required(module: str, pip_hint: str | None = None) -> None:
         __import__(module)
     except ImportError as err:
         hint = f" (try: {pip_hint})" if pip_hint else ""
-        raise ImportError(f"{module} is required for this operation{hint}") from err
+        raise ImportError(
+            f"{module} is required for this operation{hint}"
+        ) from err
 
 
 class Builder:
@@ -165,7 +187,9 @@ class Builder:
             return {
                 "version": 1,
                 "in_dim": int(getattr(model, "in_dim", 0)),
-                "out_shape": tuple(int(x) for x in getattr(model, "out_shape", ())),
+                "out_shape": tuple(
+                    int(x) for x in getattr(model, "out_shape", ())
+                ),
                 "config": _load_model_config(model),
                 "pytorch_version": torch.__version__,
                 "extra": coerce_json(extra or {}),
@@ -178,17 +202,23 @@ class Builder:
             )
             from torch.distributed.checkpoint import FileSystemWriter
             from torch.distributed.checkpoint import save as dcp_save
+
             with _save_sync(p, barrier=True):
                 dcp_save(
                     state_dict={
                         "model": get_model_state_dict(
-                            model, options=StateDictOptions(full_state_dict=True)
+                            model,
+                            options=StateDictOptions(full_state_dict=True),
                         )
                     },
                     storage_writer=FileSystemWriter(str(p)),
                 )
                 if is_rank0():
-                    write_json(p / "meta.json", {**_make_meta(), "format": "dcp-dir-v1"}, indent=2)
+                    write_json(
+                        p / "meta.json",
+                        {**_make_meta(), "format": "dcp-dir-v1"},
+                        indent=2,
+                    )
             return p
         if not p.suffix:
             p = p.with_suffix(".pt")
@@ -202,13 +232,18 @@ class Builder:
                 from ..core.tensor import coerce_tensor
 
                 fd, tmp_name = tempfile.mkstemp(
-                    prefix=p.name + ".", suffix=p.suffix + ".tmp", dir=str(p.parent)
+                    prefix=p.name + ".",
+                    suffix=p.suffix + ".tmp",
+                    dir=str(p.parent),
                 )
                 os.close(fd)
                 tmp_path = Path(tmp_name)
                 try:
                     save_tensors(
-                        {k: coerce_tensor(v) for k, v in model.state_dict().items()},
+                        {
+                            k: coerce_tensor(v)
+                            for k, v in model.state_dict().items()
+                        },
                         str(tmp_path),
                         metadata={"format": "safetensors-v1"},
                     )
@@ -279,7 +314,9 @@ class Exporter:
             cls._register_unlocked(name, exts, impl)
 
     @classmethod
-    def _register_unlocked(cls, name: str, exts: tuple[str, ...], impl: Format) -> None:
+    def _register_unlocked(
+        cls, name: str, exts: tuple[str, ...], impl: Format
+    ) -> None:
         cls._by_name[name] = impl
         for ext in exts:
             cls._ext_map[ext.lower()] = name
@@ -304,13 +341,21 @@ class Exporter:
 
             cls._register_unlocked("onnx", (".onnx",), _w.ONNX())
             cls._register_unlocked("ort", (".ort",), _w.ORT())
-            cls._register_unlocked("tensorrt", (".engine", ".plan"), _w.TensorRT())
-            cls._register_unlocked("coreml", (".mlmodel", ".mlpackage"), _w.CoreML())
+            cls._register_unlocked(
+                "tensorrt", (".engine", ".plan"), _w.TensorRT()
+            )
+            cls._register_unlocked(
+                "coreml", (".mlmodel", ".mlpackage"), _w.CoreML()
+            )
             cls._register_unlocked("litert", (".tflite",), _w.LiteRT())
-            cls._register_unlocked("pt2", (".pt2", ".export"), _w.TorchExport())
+            cls._register_unlocked(
+                "pt2", (".pt2", ".export"), _w.TorchExport()
+            )
             cls._register_unlocked("aoti", (".aoti",), _w.TorchInductor())
             cls._register_unlocked("executorch", (".pte",), _w.ExecuTorch())
-            cls._register_unlocked("tensorflow", (".savedmodel", ".pb", ".tf"), _w.TensorFlow())
+            cls._register_unlocked(
+                "tensorflow", (".savedmodel", ".pb", ".tf"), _w.TensorFlow()
+            )
             cls._defaults_registered = True
 
     @classmethod

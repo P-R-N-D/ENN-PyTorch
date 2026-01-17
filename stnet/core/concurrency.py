@@ -27,8 +27,21 @@ from typing import Any, Callable, Optional, Protocol, Tuple, runtime_checkable
 
 import torch
 
-from .datatypes import env_first, env_first_float, env_first_int, env_flag, get_meta_path, save_temp, write_json
-from .system import CPU, _default_thread_limit, _optimal_local_worlds, _optimal_threads
+from .datatypes import (
+    env_first,
+    env_first_float,
+    env_first_int,
+    env_flag,
+    get_meta_path,
+    save_temp,
+    write_json,
+)
+from .system import (
+    CPU,
+    _default_thread_limit,
+    _optimal_local_worlds,
+    _optimal_threads,
+)
 
 
 _EXECUTOR_ORDINAL = itertools.count(0)
@@ -63,7 +76,11 @@ def _get_throttle_state() -> str:
     s = (
         str(
             env_first(
-                ("STNET_CACHE_BACKPRESSURE_MODE", "STNET_CACHE_BACKPRESSURE", "STNET_CACHE_MODE"),
+                (
+                    "STNET_CACHE_BACKPRESSURE_MODE",
+                    "STNET_CACHE_BACKPRESSURE",
+                    "STNET_CACHE_MODE",
+                ),
                 default="block",
             )
             or "block"
@@ -84,7 +101,11 @@ def _get_throttle_timeout() -> float:
         0.0,
         float(
             env_first_float(
-                ("STNET_CACHE_BACKPRESSURE_TIMEOUT_S", "STNET_CACHE_SUBMIT_TIMEOUT_S"), default=0.05
+                (
+                    "STNET_CACHE_BACKPRESSURE_TIMEOUT_S",
+                    "STNET_CACHE_SUBMIT_TIMEOUT_S",
+                ),
+                default=0.05,
             )
             or 0.05
         ),
@@ -93,12 +114,20 @@ def _get_throttle_timeout() -> float:
 
 @lru_cache(maxsize=1)
 def _is_early_release_enabled() -> bool:
-    return bool(env_flag("STNET_CACHE_EARLY_RELEASE", "STNET_CACHE_RELEASE_EARLY", default=True))
+    return bool(
+        env_flag(
+            "STNET_CACHE_EARLY_RELEASE",
+            "STNET_CACHE_RELEASE_EARLY",
+            default=True,
+        )
+    )
 
 
 @lru_cache(maxsize=1)
 def _is_force_unpin_enabled() -> bool:
-    return bool(env_flag("STNET_CACHE_FORCE_UNPIN", "STNET_CACHE_UNPIN", default=False))
+    return bool(
+        env_flag("STNET_CACHE_FORCE_UNPIN", "STNET_CACHE_UNPIN", default=False)
+    )
 
 
 def _prod_int(shape: Sequence[int]) -> int:
@@ -107,12 +136,20 @@ def _prod_int(shape: Sequence[int]) -> int:
 
 @lru_cache(maxsize=1)
 def _is_affinity_enabled() -> bool:
-    return bool(env_flag("STNET_EXECUTOR_AFFINITY", "STNET_AFFINITY", default=True))
+    return bool(
+        env_flag("STNET_EXECUTOR_AFFINITY", "STNET_AFFINITY", default=True)
+    )
 
 
 @lru_cache(maxsize=1)
 def _is_affinity_strict() -> bool:
-    return bool(env_flag("STNET_EXECUTOR_AFFINITY_STRICT", "STNET_AFFINITY_STRICT", default=False))
+    return bool(
+        env_flag(
+            "STNET_EXECUTOR_AFFINITY_STRICT",
+            "STNET_AFFINITY_STRICT",
+            default=False,
+        )
+    )
 
 
 def _next_ordinal() -> int:
@@ -121,18 +158,23 @@ def _next_ordinal() -> int:
             return int(next(_EXECUTOR_ORDINAL))
     return 0
 
+
 def _is_inner_thread_limited(wl: str) -> bool:
     wl = str(wl or "").strip().lower()
     if wl not in {"cpu", "compute"}:
         return False
     if not bool(env_flag("STNET_EXECUTOR_LIMIT_INNER_THREADS", default=True)):
         return False
-    if not bool(env_flag("STNET_EXECUTOR_TORCH_OUTER_PARALLELISM", default=True)):
+    if not bool(
+        env_flag("STNET_EXECUTOR_TORCH_OUTER_PARALLELISM", default=True)
+    ):
         return False
     return True
 
 
-def _set_concurrency_env(key: str, value: str, *args: Any, force: bool, cap_down: bool = True) -> None:
+def _set_concurrency_env(
+    key: str, value: str, *args: Any, force: bool, cap_down: bool = True
+) -> None:
     try:
         k = str(key)
         v = str(value)
@@ -158,7 +200,11 @@ def _set_concurrency_env(key: str, value: str, *args: Any, force: bool, cap_down
 
 def _init_env(key: str, value: str, *args: Any, force: bool) -> None:
     try:
-        if force or (key not in os.environ) or (str(os.environ.get(key, "")).strip() == ""):
+        if (
+            force
+            or (key not in os.environ)
+            or (str(os.environ.get(key, "")).strip() == "")
+        ):
             os.environ[str(key)] = str(value)
     except Exception:
         return
@@ -169,8 +215,12 @@ def _limit_inner_threads(threads: int, *args: Any, force: bool = False) -> int:
     ov = env_first_int(("STNET_EXECUTOR_INNER_THREADS",), default=0) or 0
     if int(ov) > 0:
         t = max(1, int(ov))
-    force = bool(force) or bool(env_flag("STNET_EXECUTOR_FORCE_INNER_THREADS", default=False))
-    cap_down = bool(env_flag("STNET_EXECUTOR_CAP_DOWN_INNER_THREADS", default=True))
+    force = bool(force) or bool(
+        env_flag("STNET_EXECUTOR_FORCE_INNER_THREADS", default=False)
+    )
+    cap_down = bool(
+        env_flag("STNET_EXECUTOR_CAP_DOWN_INNER_THREADS", default=True)
+    )
     for k in _ENV_INNER_THREAD_VARS:
         _set_concurrency_env(k, str(t), force=force, cap_down=cap_down)
     for k, v in _ENV_INNER_BOOL_VARS.items():
@@ -184,7 +234,9 @@ def _limit_inner_threads(threads: int, *args: Any, force: bool = False) -> int:
 
 @lru_cache(maxsize=1)
 def _is_outer_concurrency_limited() -> bool:
-    return bool(env_flag("STNET_EXECUTOR_LIMIT_OUTER_CONCURRENCY", default=True))
+    return bool(
+        env_flag("STNET_EXECUTOR_LIMIT_OUTER_CONCURRENCY", default=True)
+    )
 
 
 @lru_cache(maxsize=1)
@@ -200,7 +252,16 @@ def _max_outer_concurrency() -> int:
 
 @lru_cache(maxsize=1)
 def _outer_concurrency_mode() -> str:
-    s = str(env_first(("STNET_EXECUTOR_OUTER_CONCURRENCY_MODE",), default="auto") or "auto").strip().lower()
+    s = (
+        str(
+            env_first(
+                ("STNET_EXECUTOR_OUTER_CONCURRENCY_MODE",), default="auto"
+            )
+            or "auto"
+        )
+        .strip()
+        .lower()
+    )
     return s if s in {"auto", "logical", "physical"} else "auto"
 
 
@@ -211,10 +272,15 @@ def _are_processes_limited() -> bool:
 
 @lru_cache(maxsize=1)
 def _target_process_workers() -> int:
-    return int(env_first_int(("STNET_EXECUTOR_PROCESS_TARGET_WORKERS",), default=0) or 0)
+    return int(
+        env_first_int(("STNET_EXECUTOR_PROCESS_TARGET_WORKERS",), default=0)
+        or 0
+    )
 
 
-def _outer_concurrency_limit(wl: str, executor_kind: str, nlogical: int, nphysical: int, mw: int) -> int:
+def _outer_concurrency_limit(
+    wl: str, executor_kind: str, nlogical: int, nphysical: int, mw: int
+) -> int:
     wl = str(wl or "").strip().lower()
     if wl not in {"cpu", "compute"}:
         return 0
@@ -261,7 +327,9 @@ def _parse_cpu_list(spec: str) -> list[int]:
 
 
 @lru_cache(maxsize=8)
-def _linux_thread_sibling_groups(cpus_key: tuple[int, ...]) -> list[tuple[int, ...]]:
+def _linux_thread_sibling_groups(
+    cpus_key: tuple[int, ...],
+) -> list[tuple[int, ...]]:
     if not sys.platform.startswith("linux"):
         return []
     groups: dict[tuple[int, ...], None] = {}
@@ -293,11 +361,15 @@ def _executor_scatter_cpus(cpus: Sequence[int]) -> list[int]:
             if int(x) not in primary:
                 secondary.append(int(x))
     allowed = set(base)
-    out = [c for c in primary if c in allowed] + [c for c in secondary if c in allowed]
+    out = [c for c in primary if c in allowed] + [
+        c for c in secondary if c in allowed
+    ]
     return out if out else base
 
 
-def _executor_prefer_smt_lane(cpus: Sequence[int], *args: Any, prefer_primary: bool) -> list[int]:
+def _executor_prefer_smt_lane(
+    cpus: Sequence[int], *args: Any, prefer_primary: bool
+) -> list[int]:
     base = sorted({int(x) for x in (cpus or [])})
     if not base:
         return []
@@ -345,8 +417,12 @@ def _pick_coprime_stride(n: int, hint: int, salt: int) -> int:
     return 1
 
 
-def _executor_scope_start(role: str, wl: str, prefix: str, mw: int, cpw: int, ordinal: int, ncpu: int) -> int:
-    seed = env_first(("STNET_EXECUTOR_AFFINITY_SEED", "STNET_AFFINITY_SEED"), default="0")
+def _executor_scope_start(
+    role: str, wl: str, prefix: str, mw: int, cpw: int, ordinal: int, ncpu: int
+) -> int:
+    seed = env_first(
+        ("STNET_EXECUTOR_AFFINITY_SEED", "STNET_AFFINITY_SEED"), default="0"
+    )
     key = f"{seed}|pid={os.getpid()}|role={role}|wl={wl}|pfx={prefix}|mw={mw}|cpw={cpw}|ord={ordinal}"
     h = _hash32(key)
     return int(h % max(1, int(ncpu)))
@@ -368,7 +444,9 @@ def _pick_cores_balanced(
     cpw_i = max(1, min(int(cpw), n))
     if cpw_i == 1:
         return [int(base[(int(start) + i) % n])]
-    stride1 = _pick_coprime_stride(n, hint=max(1, n // max(1, int(mw))), salt=salt)
+    stride1 = _pick_coprime_stride(
+        n, hint=max(1, n // max(1, int(mw))), salt=salt
+    )
     base_pos = (int(start) + i * stride1) % n
     stride2 = _pick_coprime_stride(n, hint=max(1, n // cpw_i), salt=salt + 7)
     out: list[int] = []
@@ -399,6 +477,7 @@ def _thread_worker_index(max_workers: int) -> int:
 def _process_worker_index(max_workers: int) -> int:
     with contextlib.suppress(Exception):
         import multiprocessing as _mp
+
         ident = getattr(_mp.current_process(), "_identity", None)
         if ident and len(ident) >= 1:
             return max(0, int(ident[0]) - 1) % max(1, int(max_workers))
@@ -437,7 +516,14 @@ def _executor_thread_initializer(
     salt: int,
 ) -> None:
     idx = _thread_worker_index(max_workers=int(mw))
-    cores = _pick_cores_balanced(cpus, start=int(start), idx=int(idx), mw=int(mw), cpw=int(cpw), salt=int(salt))
+    cores = _pick_cores_balanced(
+        cpus,
+        start=int(start),
+        idx=int(idx),
+        mw=int(mw),
+        cpw=int(cpw),
+        salt=int(salt),
+    )
     if cores:
         _set_current_thread_affinity(cores)
     with contextlib.suppress(Exception):
@@ -454,7 +540,14 @@ def _executor_process_initializer(
     salt: int,
 ) -> None:
     idx = _process_worker_index(max_workers=int(mw))
-    cores = _pick_cores_balanced(cpus, start=int(start), idx=int(idx), mw=int(mw), cpw=int(cpw), salt=int(salt))
+    cores = _pick_cores_balanced(
+        cpus,
+        start=int(start),
+        idx=int(idx),
+        mw=int(mw),
+        cpw=int(cpw),
+        salt=int(salt),
+    )
     if cores:
         _set_current_process_affinity(cores)
     if cores and _is_inner_thread_limited(wl):
@@ -497,7 +590,9 @@ def new_prefetcher(
     name: str = "buffer",
     daemon: bool = True,
 ) -> Prefetcher:
-    return Prefetcher(iterable, max_batches=max_batches, name=name, daemon=daemon)
+    return Prefetcher(
+        iterable, max_batches=max_batches, name=name, daemon=daemon
+    )
 
 
 def new_executor(
@@ -517,7 +612,9 @@ def new_executor(
             executor_kind = "thread"
         else:
             if prefer_interpreters is None:
-                prefer_interpreters = bool(env_flag("STNET_PREFER_INTERPRETER_POOL", default=True))
+                prefer_interpreters = bool(
+                    env_flag("STNET_PREFER_INTERPRETER_POOL", default=True)
+                )
             if bool(prefer_interpreters) and is_interpreter_pool_supported():
                 executor_kind = "interpreter"
             else:
@@ -528,7 +625,9 @@ def new_executor(
     elif executor_kind == "interpreter":
         thread_prefix = f"{prefix}-interp"
     else:
-        thread_prefix = f"{prefix}-thr" if wl in {"cpu", "compute"} else f"{prefix}-io"
+        thread_prefix = (
+            f"{prefix}-thr" if wl in {"cpu", "compute"} else f"{prefix}-io"
+        )
 
     init_fn: Callable[..., Any] | None = None
     init_args: tuple[Any, ...] = ()
@@ -542,7 +641,9 @@ def new_executor(
             cpus_scatter = _executor_scatter_cpus(allowed)
             if cpus_scatter:
                 groups = _linux_thread_sibling_groups(tuple(cpus_scatter))
-                nphysical_for_limit = int(len(groups) if groups else len(cpus_scatter))
+                nphysical_for_limit = int(
+                    len(groups) if groups else len(cpus_scatter)
+                )
                 ordinal = _next_ordinal()
                 if executor_kind == "process" and wl in {"cpu", "compute"}:
                     mw_eff = int(mw)
@@ -551,13 +652,27 @@ def new_executor(
                         if tgt > 0:
                             mw_eff = min(int(mw_eff), max(1, int(tgt)))
                         else:
-                            mw_eff = min(int(mw_eff), max(1, int(nphysical_for_limit or len(cpus_scatter))))
+                            mw_eff = min(
+                                int(mw_eff),
+                                max(
+                                    1,
+                                    int(
+                                        nphysical_for_limit
+                                        or len(cpus_scatter)
+                                    ),
+                                ),
+                            )
                     mw_eff = max(1, int(mw_eff))
                 if executor_kind == "process":
-                    default_cpw = max(1, int(len(cpus_scatter) // max(1, mw_eff)))
+                    default_cpw = max(
+                        1, int(len(cpus_scatter) // max(1, mw_eff))
+                    )
                     cpw = int(
                         env_first_int(
-                            ("STNET_EXECUTOR_CORES_PER_WORKER_CPU", "STNET_AFFINITY_CORES_PER_WORKER_CPU"),
+                            (
+                                "STNET_EXECUTOR_CORES_PER_WORKER_CPU",
+                                "STNET_AFFINITY_CORES_PER_WORKER_CPU",
+                            ),
                             default=default_cpw,
                         )
                         or default_cpw
@@ -573,10 +688,19 @@ def new_executor(
                         ncpu=len(cpus_scatter),
                     )
                     init_fn = _executor_process_initializer
-                    init_args = (wl, cpus_scatter, int(start), int(mw_eff), int(cpw), 11)
+                    init_args = (
+                        wl,
+                        cpus_scatter,
+                        int(start),
+                        int(mw_eff),
+                        int(cpw),
+                        11,
+                    )
 
                 elif executor_kind == "interpreter":
-                    cpus_pref = _executor_prefer_smt_lane(cpus_scatter, prefer_primary=True)
+                    cpus_pref = _executor_prefer_smt_lane(
+                        cpus_scatter, prefer_primary=True
+                    )
                     nlogical_for_limit = int(len(cpus_pref))
                     start = _executor_scope_start(
                         role="interpreter",
@@ -588,10 +712,20 @@ def new_executor(
                         ncpu=max(1, len(cpus_pref)),
                     )
                     init_fn = _executor_thread_initializer
-                    init_args = ("interpreter", wl, cpus_pref, int(start), int(mw), 1, 23)
+                    init_args = (
+                        "interpreter",
+                        wl,
+                        cpus_pref,
+                        int(start),
+                        int(mw),
+                        1,
+                        23,
+                    )
 
                 else:
-                    cpus_pref = _executor_prefer_smt_lane(cpus_scatter, prefer_primary=False)
+                    cpus_pref = _executor_prefer_smt_lane(
+                        cpus_scatter, prefer_primary=False
+                    )
                     nlogical_for_limit = int(len(cpus_pref))
                     start = _executor_scope_start(
                         role="thread",
@@ -603,7 +737,15 @@ def new_executor(
                         ncpu=max(1, len(cpus_pref)),
                     )
                     init_fn = _executor_thread_initializer
-                    init_args = ("thread", wl, cpus_pref, int(start), int(mw), 1, 37)
+                    init_args = (
+                        "thread",
+                        wl,
+                        cpus_pref,
+                        int(start),
+                        int(mw),
+                        1,
+                        37,
+                    )
 
         except Exception:
             if _is_affinity_strict():
@@ -614,7 +756,9 @@ def new_executor(
             nphysical_for_limit = 0
             mw_eff = int(mw)
 
-    if executor_kind in {"thread", "interpreter"} and _is_inner_thread_limited(wl):
+    if executor_kind in {"thread", "interpreter"} and _is_inner_thread_limited(
+        wl
+    ):
         _limit_inner_threads(1)
 
     if nlogical_for_limit <= 0:
@@ -632,9 +776,17 @@ def new_executor(
     )
 
     mw_outer = int(mw)
-    if executor_kind in {"thread", "interpreter"} and outer_limit and int(outer_limit) < int(mw_outer):
+    if (
+        executor_kind in {"thread", "interpreter"}
+        and outer_limit
+        and int(outer_limit) < int(mw_outer)
+    ):
         mw_outer = int(outer_limit)
-        if init_fn is _executor_thread_initializer and init_args and len(init_args) >= 5:
+        if (
+            init_fn is _executor_thread_initializer
+            and init_args
+            and len(init_args) >= 5
+        ):
             init_args = (*init_args[:4], int(mw_outer), *init_args[5:])
 
     if executor_kind == "thread":
@@ -644,7 +796,11 @@ def new_executor(
             initializer=init_fn,
             initargs=init_args,
         )
-        return BoundedExecutor(ex, outer_limit) if (outer_limit and outer_limit < mw) else ex
+        return (
+            BoundedExecutor(ex, outer_limit)
+            if (outer_limit and outer_limit < mw)
+            else ex
+        )
 
     if executor_kind == "interpreter":
         cls = getattr(futures, "InterpreterPoolExecutor", None)
@@ -655,7 +811,11 @@ def new_executor(
                 initializer=init_fn,
                 initargs=init_args,
             )
-            return BoundedExecutor(ex, outer_limit) if (outer_limit and outer_limit < mw) else ex
+            return (
+                BoundedExecutor(ex, outer_limit)
+                if (outer_limit and outer_limit < mw)
+                else ex
+            )
 
         try:
             ex = cls(
@@ -666,7 +826,11 @@ def new_executor(
             )
         except TypeError:
             ex = cls(max_workers=mw_outer, thread_name_prefix=thread_prefix)
-        return BoundedExecutor(ex, outer_limit) if (outer_limit and outer_limit < mw) else ex
+        return (
+            BoundedExecutor(ex, outer_limit)
+            if (outer_limit and outer_limit < mw)
+            else ex
+        )
 
     try:
         return futures.ProcessPoolExecutor(
@@ -694,7 +858,9 @@ def new_affinity(io_workers: Optional[int] = None) -> "Thread":
     return _TLB_SINGLETON
 
 
-def new_thread(fn: Callable[[Any], Any], *args: Any, io_workers: Optional[int] = None) -> Callable[[Any], Any]:
+def new_thread(
+    fn: Callable[[Any], Any], *args: Any, io_workers: Optional[int] = None
+) -> Callable[[Any], Any]:
     return new_affinity(io_workers=io_workers).new_thread(fn)
 
 
@@ -711,9 +877,11 @@ def close(obj: Any, *args: Any, join_timeout: float | None = 1.0) -> None:
     ):
         if callable(fn := getattr(obj, name, None)):
             with contextlib.suppress(Exception):
-                fn(
-                    timeout=float(join_timeout)
-                ) if name == "join" and join_timeout is not None else fn()
+                (
+                    fn(timeout=float(join_timeout))
+                    if name == "join" and join_timeout is not None
+                    else fn()
+                )
             return
     with contextlib.suppress(Exception):
         obj() if callable(obj) else None
@@ -799,11 +967,19 @@ class Affinity:
         self._tls.count = count
         do_sample = count % self._sample_every == 0
         t0 = self._perf_counter_ns() if do_sample else 0
-        c0 = self._thread_time_ns() if do_sample and callable(self._thread_time_ns) else 0
+        c0 = (
+            self._thread_time_ns()
+            if do_sample and callable(self._thread_time_ns)
+            else 0
+        )
         out = self._fn(*args, **kwargs)
         if do_sample:
             t1 = self._perf_counter_ns()
-            c1 = self._thread_time_ns() if callable(self._thread_time_ns) else None
+            c1 = (
+                self._thread_time_ns()
+                if callable(self._thread_time_ns)
+                else None
+            )
             try:
                 with self._lock:
                     self._parent._total_time += max(0, int(t1) - int(t0))
@@ -842,7 +1018,14 @@ class Disposable:
 
 
 class Prefetcher:
-    __slots__ = ("_src", "_max_batches", "_name", "_daemon", "_session", "_join_timeout_s")
+    __slots__ = (
+        "_src",
+        "_max_batches",
+        "_name",
+        "_daemon",
+        "_session",
+        "_join_timeout_s",
+    )
 
     def __init__(
         self,
@@ -860,7 +1043,10 @@ class Prefetcher:
         self._session = bool(_session)
         self._join_timeout_s = 0.5
         with contextlib.suppress(Exception):
-            jt_ms = int(env_first_int(("STNET_THREAD_JOIN_TIMEOUT_MS",), default=500) or 500)
+            jt_ms = int(
+                env_first_int(("STNET_THREAD_JOIN_TIMEOUT_MS",), default=500)
+                or 500
+            )
             self._join_timeout_s = max(0.0, float(jt_ms) / 1000.0)
 
     @property
@@ -886,7 +1072,9 @@ class Prefetcher:
             )
         return self._iter_session()
 
-    def _producer_loop(self, it: Iterator[Any], buf: "BufferQueue", sentinel: object) -> None:
+    def _producer_loop(
+        self, it: Iterator[Any], buf: "BufferQueue", sentinel: object
+    ) -> None:
         try:
             while not buf.is_stopped():
                 if not buf.block(timeout=None):
@@ -947,7 +1135,13 @@ class Prefetcher:
 class TensorPage:
     __slots__ = ("_buf", "_numel", "_dtype", "_pinned")
 
-    def __init__(self, numel: int, dtype: torch.dtype, *args: Any, pin_memory: bool = True) -> None:
+    def __init__(
+        self,
+        numel: int,
+        dtype: torch.dtype,
+        *args: Any,
+        pin_memory: bool = True,
+    ) -> None:
         self._numel = int(max(1, int(numel)))
         self._dtype = dtype
         self._pinned = bool(pin_memory)
@@ -992,7 +1186,9 @@ class TensorPagePool:
     Token = _PoolToken
     _Entry = _PoolEntry
 
-    def __init__(self, capacity: int = 4, *args: Any, pin_memory: bool = True) -> None:
+    def __init__(
+        self, capacity: int = 4, *args: Any, pin_memory: bool = True
+    ) -> None:
         self._cap = max(1, int(capacity))
         self._pin = bool(pin_memory)
         self._pages: list[TensorPagePool._Entry] = []
@@ -1012,7 +1208,11 @@ class TensorPagePool:
     def _scavenge_lock(self) -> int:
         freed = 0
         for e in self._pages:
-            if e.busy and e.fence is not None and self._event_finished(e.fence):
+            if (
+                e.busy
+                and e.fence is not None
+                and self._event_finished(e.fence)
+            ):
                 e.busy = False
                 e.fence = None
                 freed += 1
@@ -1033,7 +1233,11 @@ class TensorPagePool:
     ) -> torch.Tensor | tuple[torch.Tensor, TensorPagePool.Token | None]:
         shape_t = tuple(int(s) for s in shape)
         need = _prod_int(shape_t)
-        deadline = (time.monotonic() + float(timeout)) if timeout is not None else None
+        deadline = (
+            (time.monotonic() + float(timeout))
+            if timeout is not None
+            else None
+        )
         check_interval = 0.01
 
         while True:
@@ -1046,7 +1250,12 @@ class TensorPagePool:
                         j = (self._rr + k) % n
                         e = self._pages[j]
                         if not e.busy:
-                            e.busy, e.fence, idx, self._rr = True, None, j, (j + 1) % max(1, n)
+                            e.busy, e.fence, idx, self._rr = (
+                                True,
+                                None,
+                                j,
+                                (j + 1) % max(1, n),
+                            )
                             need_new = (
                                 (e.page.dtype != dtype)
                                 or (e.page.numel < need)
@@ -1057,27 +1266,42 @@ class TensorPagePool:
                     if n < self._cap:
                         grow = True
                     elif block:
-                        if deadline and (wait := deadline - time.monotonic()) <= 0:
+                        if (
+                            deadline
+                            and (wait := deadline - time.monotonic()) <= 0
+                        ):
                             break
                         self._cv.wait(
-                            timeout=min(check_interval, wait) if deadline else check_interval
+                            timeout=(
+                                min(check_interval, wait)
+                                if deadline
+                                else check_interval
+                            )
                         )
                         continue
                     else:
                         break
 
             if idx is not None:
-                new_page = TensorPage(numel=need, dtype=dtype, pin_memory=self._pin) if need_new else None
+                new_page = (
+                    TensorPage(numel=need, dtype=dtype, pin_memory=self._pin)
+                    if need_new
+                    else None
+                )
                 with self._cv:
                     e = self._pages[idx]
                     if new_page:
                         e.page, e.gen = new_page, e.gen + 1
-                    view, token = e.page.view(*shape_t), TensorPagePool.Token(int(idx), int(e.gen))
+                    view, token = e.page.view(*shape_t), TensorPagePool.Token(
+                        int(idx), int(e.gen)
+                    )
                 return (view, token) if return_handle else view
 
             if grow:
                 entry = TensorPagePool._Entry(
-                    page=TensorPage(numel=need, dtype=dtype, pin_memory=self._pin),
+                    page=TensorPage(
+                        numel=need, dtype=dtype, pin_memory=self._pin
+                    ),
                     busy=True,
                     fence=None,
                     gen=0,
@@ -1086,12 +1310,16 @@ class TensorPagePool:
                     if len(self._pages) < self._cap:
                         self._pages.append(entry)
                         self._rr = len(self._pages) % self._cap
-                        view, token = entry.page.view(*shape_t), TensorPagePool.Token(len(self._pages) - 1, 0)
+                        view, token = entry.page.view(
+                            *shape_t
+                        ), TensorPagePool.Token(len(self._pages) - 1, 0)
                         return (view, token) if return_handle else view
                 continue
             break
 
-        view = torch.empty(need, dtype=dtype, device="cpu", pin_memory=False).view(*shape_t)
+        view = torch.empty(
+            need, dtype=dtype, device="cpu", pin_memory=False
+        ).view(*shape_t)
         return (view, None) if return_handle else view
 
     def get_like(
@@ -1122,7 +1350,11 @@ class TensorPagePool:
         if i < 0:
             return None
         with self._cv:
-            if 0 <= i < len(self._pages) and self._pages[i].gen == g and self._pages[i].fence_evt:
+            if (
+                0 <= i < len(self._pages)
+                and self._pages[i].gen == g
+                and self._pages[i].fence_evt
+            ):
                 return self._pages[i].fence_evt
 
         try:
@@ -1139,7 +1371,9 @@ class TensorPagePool:
                 return self._pages[i].fence_evt
         return ev_new
 
-    def release_after(self, token: TensorPagePool.Token | None, wait_event: object | None) -> None:
+    def release_after(
+        self, token: TensorPagePool.Token | None, wait_event: object | None
+    ) -> None:
         if token is None:
             return
         with self._cv:
@@ -1171,7 +1405,9 @@ class TensorSpooler:
         os.makedirs(self._root, exist_ok=True)
         max_q = max(1, int(max_queue))
         self._sem = threading.Semaphore(max_q)
-        self._q: "queue.SimpleQueue[tuple[Any, Any, Any, Any]]" = queue.SimpleQueue()
+        self._q: "queue.SimpleQueue[tuple[Any, Any, Any, Any]]" = (
+            queue.SimpleQueue()
+        )
         self._bp_mode = str(_get_throttle_state() or "block")
         self._bp_timeout_s = float(_get_throttle_timeout() or 0.0)
         self._early_release = bool(_is_early_release_enabled())
@@ -1220,11 +1456,15 @@ class TensorSpooler:
         if buf.device.type != "cpu":
             buf = buf.to(device="cpu", non_blocking=False)
 
-        early = early_release if early_release is not None else self._early_release
+        early = (
+            early_release if early_release is not None else self._early_release
+        )
         unpin = force_unpin if force_unpin is not None else self._force_unpin
         released = False
 
-        if TensorSpooler._is_cpu_pinned(buf) and (unpin or (early and callable(release_cb))):
+        if TensorSpooler._is_cpu_pinned(buf) and (
+            unpin or (early and callable(release_cb))
+        ):
             try:
                 tmp = torch.empty_like(buf, device="cpu", pin_memory=False)
                 tmp.copy_(buf, non_blocking=False)
@@ -1261,14 +1501,19 @@ class TensorSpooler:
             )
             os.close(fd)
             try:
-                MemoryMappedTensor.from_tensor(buf, filename=tmp_name, existsok=True)
+                MemoryMappedTensor.from_tensor(
+                    buf, filename=tmp_name, existsok=True
+                )
                 os.replace(tmp_name, path)
             finally:
                 with contextlib.suppress(Exception):
                     os.remove(tmp_name)
             write_json(
                 get_meta_path(path),
-                {"shape": list(map(int, buf.shape)), "dtype": str(buf.dtype).replace("torch.", "")},
+                {
+                    "shape": list(map(int, buf.shape)),
+                    "dtype": str(buf.dtype).replace("torch.", ""),
+                },
                 indent=None,
             )
             return
@@ -1295,7 +1540,9 @@ class TensorSpooler:
             rel_cb = rel if callable(rel) else None
             try:
                 self._wait(evt)
-                buf, released_early = self._init_tensor(tensor, release_cb=rel_cb)
+                buf, released_early = self._init_tensor(
+                    tensor, release_cb=rel_cb
+                )
                 self._save_tensor(buf, path)
                 if rel_cb is not None and not released_early:
                     with contextlib.suppress(Exception):
@@ -1343,7 +1590,11 @@ class TensorSpooler:
                             release_cb()
                     return
             else:
-                acquired = self._sem.acquire(timeout=timeout) if timeout > 0 else False
+                acquired = (
+                    self._sem.acquire(timeout=timeout)
+                    if timeout > 0
+                    else False
+                )
                 while not acquired:
                     if self._err_event.is_set() or self._closed.is_set():
                         raise RuntimeError("TensorSpooler unavailable")
@@ -1376,7 +1627,9 @@ class BufferQueue:
         self._buf: "collections.deque[Any]" = collections.deque()
         self._stop = threading.Event()
         self._cv = threading.Condition()
-        self._warn_blocking = env_flag("STNET_BUFFER_WARN_BLOCKING", "STNET_DEBUG", default=False)
+        self._warn_blocking = env_flag(
+            "STNET_BUFFER_WARN_BLOCKING", "STNET_DEBUG", default=False
+        )
 
     def put(self, item: Any, *args: Any, timeout: float | None = None) -> bool:
         if self._stop.is_set():
@@ -1386,7 +1639,9 @@ class BufferQueue:
         with self._cv:
             if self._stop.is_set():
                 return False
-            while len(self._buf) >= self.max_batches and not self._stop.is_set():
+            while (
+                len(self._buf) >= self.max_batches and not self._stop.is_set()
+            ):
                 if deadline is None:
                     self._cv.wait()
                 else:
@@ -1449,7 +1704,9 @@ class BufferQueue:
         t0 = time.monotonic()
         deadline = None if timeout is None else (t0 + float(timeout))
         with self._cv:
-            while len(self._buf) >= self.max_batches and not self._stop.is_set():
+            while (
+                len(self._buf) >= self.max_batches and not self._stop.is_set()
+            ):
                 if deadline is None:
                     self._cv.wait()
                 else:
@@ -1484,7 +1741,9 @@ class Thread:
         self._proc_cycle = itertools.cycle(list(self._allowed_cpus))
         self._enabled = bool(enabled) and bool(self._allowed_cpus)
         self._nogil = bool(CPU.is_optimized_for_no_gil())
-        self._io_workers = max(1, min(int(io_workers), max(1, len(self._allowed_cpus))))
+        self._io_workers = max(
+            1, min(int(io_workers), max(1, len(self._allowed_cpus)))
+        )
         self._pin_attempts = 0
         self._pin_success = 0
         self._tls = threading.local()
@@ -1493,8 +1752,12 @@ class Thread:
         self._total_cpu = 0
         self._omp_ok = bool(allow_omp_bind) and bool(self.spread_threads())
 
-        self._flush_every = max(1, int(env_first_int(("STNET_TLB_FLUSH_EVERY",), 256)))
-        self._sample_every = max(1, int(env_first_int(("STNET_TLB_SAMPLE_EVERY",), 8)))
+        self._flush_every = max(
+            1, int(env_first_int(("STNET_TLB_FLUSH_EVERY",), 256))
+        )
+        self._sample_every = max(
+            1, int(env_first_int(("STNET_TLB_SAMPLE_EVERY",), 8))
+        )
 
     @staticmethod
     def _import_psutil() -> Optional[ModuleType]:
@@ -1513,7 +1776,10 @@ class Thread:
             k32.GetCurrentThread.restype = ctypes.c_void_p
             handle = k32.GetCurrentThread()
             mask = ctypes.c_size_t(1 << int(core))
-            k32.SetThreadAffinityMask.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
+            k32.SetThreadAffinityMask.argtypes = [
+                ctypes.c_void_p,
+                ctypes.c_size_t,
+            ]
             k32.SetThreadAffinityMask.restype = ctypes.c_size_t
             prev = k32.SetThreadAffinityMask(handle, mask)
             return bool(prev)
@@ -1533,7 +1799,9 @@ class Thread:
 
     def tune(self, io_workers: Optional[int] = None) -> None:
         if io_workers is not None:
-            self._io_workers = max(1, min(int(io_workers), max(1, len(self._allowed_cpus))))
+            self._io_workers = max(
+                1, min(int(io_workers), max(1, len(self._allowed_cpus)))
+            )
         self.tune_threads(io_workers=self._io_workers, initial=True)
 
     def _retune_threads(self) -> None:
@@ -1544,14 +1812,19 @@ class Thread:
         self._tls.in_retune = True
         try:
             from .policies import WorkerPolicy, optimize_threads
+
             dev_type, nacc = WorkerPolicy._available_accelerator()
             is_accel = bool(nacc and int(nacc) > 0)
             cpus = max(1, len(self._allowed_cpus))
-            cap_mult = _default_thread_limit(cpus, is_accel=is_accel, nogil=bool(self._nogil))
+            cap_mult = _default_thread_limit(
+                cpus, is_accel=is_accel, nogil=bool(self._nogil)
+            )
             local_world = _optimal_local_worlds(1)
             distribute_default = local_world > 1
             distribute = bool(
-                env_first_int(("STNET_DISTRIBUTE_THREAD_CAP",), int(distribute_default))
+                env_first_int(
+                    ("STNET_DISTRIBUTE_THREAD_CAP",), int(distribute_default)
+                )
             )
             thread_cap = _optimal_threads(
                 ncpu=cpus,
@@ -1589,7 +1862,12 @@ class Thread:
     def spread_threads() -> bool:
         plat = sys.platform
         if plat.startswith("linux"):
-            candidates = ["libgomp.so.1", "libgomp.so", "libiomp5.so", "libomp.so"]
+            candidates = [
+                "libgomp.so.1",
+                "libgomp.so",
+                "libiomp5.so",
+                "libomp.so",
+            ]
         elif plat == "darwin":
             candidates = ["libomp.dylib", "libiomp5.dylib"]
         elif os.name == "nt":
@@ -1671,13 +1949,21 @@ class Thread:
                 self._pin_attempts += 1
                 if ok:
                     self._pin_success += 1
-                if self._pin_attempts >= 16 and self._pin_success == 0 and not self._omp_ok:
+                if (
+                    self._pin_attempts >= 16
+                    and self._pin_success == 0
+                    and not self._omp_ok
+                ):
                     self._enabled = False
         else:
             self._pin_attempts += 1
             if ok:
                 self._pin_success += 1
-            if self._pin_attempts >= 16 and self._pin_success == 0 and not self._omp_ok:
+            if (
+                self._pin_attempts >= 16
+                and self._pin_success == 0
+                and not self._omp_ok
+            ):
                 self._enabled = False
 
     def tune_threads(
@@ -1694,19 +1980,28 @@ class Thread:
             tuned_workers = max(
                 1,
                 min(
-                    int(io_workers if io_workers is not None else self._io_workers),
+                    int(
+                        io_workers
+                        if io_workers is not None
+                        else self._io_workers
+                    ),
                     cpus,
                 ),
             )
             self._io_workers = tuned_workers
             from .policies import WorkerPolicy, optimize_threads
+
             dev_type, nacc = WorkerPolicy._available_accelerator()
             is_accel = bool(nacc and int(nacc) > 0)
-            cap_mult = _default_thread_limit(cpus, is_accel=is_accel, nogil=bool(self._nogil))
+            cap_mult = _default_thread_limit(
+                cpus, is_accel=is_accel, nogil=bool(self._nogil)
+            )
             local_world = _optimal_local_worlds(1)
             distribute_default = local_world > 1
             distribute = bool(
-                env_first_int(("STNET_DISTRIBUTE_THREAD_CAP",), int(distribute_default))
+                env_first_int(
+                    ("STNET_DISTRIBUTE_THREAD_CAP",), int(distribute_default)
+                )
             )
             thread_cap = _optimal_threads(
                 ncpu=cpus,
@@ -1721,13 +2016,18 @@ class Thread:
             want_inter = max(1, min(tuned_workers // 2, 4))
             total = int(intra_now) + int(want_inter) + int(tuned_workers)
             if total > int(thread_cap):
-                new_intra = max(1, int(thread_cap) - int(want_inter) - int(tuned_workers))
+                new_intra = max(
+                    1, int(thread_cap) - int(want_inter) - int(tuned_workers)
+                )
                 if int(new_intra) != int(intra_now):
                     optimize_threads(intra=int(new_intra))
                     intra_now = int(new_intra)
                 total = int(intra_now) + int(want_inter) + int(tuned_workers)
                 if total > int(thread_cap):
-                    want_inter = max(1, int(thread_cap) - int(tuned_workers) - int(intra_now))
+                    want_inter = max(
+                        1,
+                        int(thread_cap) - int(tuned_workers) - int(intra_now),
+                    )
             optimize_threads(inter=int(want_inter))
             return
         self._retune_threads()
@@ -1735,8 +2035,12 @@ class Thread:
     def new_thread(self, fn: Callable[[Any], Any]) -> Callable[[Any], Any]:
         if not self._enabled:
             return fn
-        sample_every = int(self._sample_every) if int(self._sample_every) > 0 else 1
-        flush_every = int(self._flush_every) if int(self._flush_every) > 0 else 1
+        sample_every = (
+            int(self._sample_every) if int(self._sample_every) > 0 else 1
+        )
+        flush_every = (
+            int(self._flush_every) if int(self._flush_every) > 0 else 1
+        )
         return Affinity(
             parent=self,
             fn=fn,
@@ -1773,7 +2077,9 @@ class Mutex:
     def raw(self) -> threading.Lock | threading.RLock:
         return self._lock
 
-    def acquire(self, blocking: bool = True, timeout: float | None = None) -> bool:
+    def acquire(
+        self, blocking: bool = True, timeout: float | None = None
+    ) -> bool:
         if timeout is None:
             return bool(self._acquire(blocking))
         return bool(self._acquire(blocking, float(timeout)))
@@ -1801,7 +2107,9 @@ class BoundedExecutor(futures.Executor):
         self._limit = max(1, int(limit))
         self._sem = threading.BoundedSemaphore(value=self._limit)
 
-    def submit(self, fn: Callable[..., Any], /, *args: Any, **kwargs: Any) -> futures.Future:
+    def submit(
+        self, fn: Callable[..., Any], /, *args: Any, **kwargs: Any
+    ) -> futures.Future:
         sem = self._sem
         sem.acquire()
         try:
@@ -1856,7 +2164,9 @@ class BoundedExecutor(futures.Executor):
 
         return _result_iter()
 
-    def shutdown(self, wait: bool = True, *args: Any, cancel_futures: bool = False) -> None:
+    def shutdown(
+        self, wait: bool = True, *args: Any, cancel_futures: bool = False
+    ) -> None:
         try:
             self._inner.shutdown(wait=wait, cancel_futures=cancel_futures)
         except TypeError:

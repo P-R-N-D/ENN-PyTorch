@@ -48,7 +48,13 @@ from ..core.graph import (
 from ..core.precision import Autocast, is_scale_safe
 from ..core.policies import LossWeightPolicy
 from ..core.profiler import FLOP_PROFILER
-from ..core.system import _log_debug, _log_info, CPU, empty_device_cache, get_device
+from ..core.system import (
+    _log_debug,
+    _log_info,
+    CPU,
+    empty_device_cache,
+    get_device,
+)
 from ..data.pipeline import Dataset
 from ..data.collate import get_feature_key, get_label_key
 from .blocks import (
@@ -115,7 +121,9 @@ def _tile_counts_grid(
         if g <= 0:
             counts_1d.append(torch.zeros((0,), device=device, dtype=dtype))
         elif g == 1:
-            counts_1d.append(torch.tensor([float(d)], device=device, dtype=dtype))
+            counts_1d.append(
+                torch.tensor([float(d)], device=device, dtype=dtype)
+            )
         else:
             last = max(1, int(d - (g - 1) * t))
             head = torch.full((g - 1,), float(t), device=device, dtype=dtype)
@@ -157,7 +165,9 @@ def _reduce_flat_to_grid(
     sum_v = blk.sum(dim=tile_dims)
     if reduce == "sum":
         return sum_v
-    counts = _tile_counts_grid(ev, ts, device=blk.device, dtype=blk.dtype).unsqueeze(0)
+    counts = _tile_counts_grid(
+        ev, ts, device=blk.device, dtype=blk.dtype
+    ).unsqueeze(0)
     return sum_v / torch.clamp(counts, min=float(eps))
 
 
@@ -182,7 +192,6 @@ def _dot_product_attention_cls() -> Any:
         return DotProductAttention
     except Exception:
         return None
-
 
 
 class SpatialExtractor(nn.Module):
@@ -243,8 +252,14 @@ class SpatialExtractor(nn.Module):
                     per_blk = _size_of_retnet(out, blk0, mode="spatial")
                     est = int(per_blk) * int(len(self.blocks))
                 else:
-                    est = int(out.numel()) * int(out.element_size()) * int(len(self.blocks))
-            do_ckpt = bool(est >= int(getattr(self, "_ckpt_min_bytes", 0) or 0))
+                    est = (
+                        int(out.numel())
+                        * int(out.element_size())
+                        * int(len(self.blocks))
+                    )
+            do_ckpt = bool(
+                est >= int(getattr(self, "_ckpt_min_bytes", 0) or 0)
+            )
         for blk in self.blocks:
             if do_ckpt:
 
@@ -252,15 +267,21 @@ class SpatialExtractor(nn.Module):
                     if torch.is_grad_enabled():
                         _from_hsdp_module(self)
                         _from_hsdp_module(_blk)
-                    y, _ = _blk(t, causal_mask=attn_mask, state=None, mode="spatial")
+                    y, _ = _blk(
+                        t, causal_mask=attn_mask, state=None, mode="spatial"
+                    )
                     return y
 
                 out = cast(
                     torch.Tensor,
-                    coerce_checkpoint(_f, out, use_reentrant=True, preserve_rng_state=True),
+                    coerce_checkpoint(
+                        _f, out, use_reentrant=True, preserve_rng_state=True
+                    ),
                 )
             else:
-                out, _ = blk(out, causal_mask=attn_mask, state=None, mode="spatial")
+                out, _ = blk(
+                    out, causal_mask=attn_mask, state=None, mode="spatial"
+                )
         return self.norm(out)
 
 
@@ -315,7 +336,10 @@ class TemporalExtractor(nn.Module):
     ) -> Optional[torch.Tensor]:
         if state is None:
             return None
-        strict = env_bool(("STNET_STRICT_TEMPORAL_STATE", "STNET_STRICT_STATE"), default=False)
+        strict = env_bool(
+            ("STNET_STRICT_TEMPORAL_STATE", "STNET_STRICT_STATE"),
+            default=False,
+        )
 
         def _bad(reason: str) -> Optional[torch.Tensor]:
             if not strict:
@@ -340,7 +364,12 @@ class TemporalExtractor(nn.Module):
             if layers is not None:
                 cand = layers
             else:
-                for key in ("state", "temporal_state", "retention_state", "msr_state"):
+                for key in (
+                    "state",
+                    "temporal_state",
+                    "retention_state",
+                    "msr_state",
+                ):
                     v = state.get(key, None)
                     if isinstance(v, torch.Tensor):
                         cand = v
@@ -493,11 +522,19 @@ class TemporalExtractor(nn.Module):
                     per_blk = _size_of_retnet(x, blk0, mode="temporal")
                     est = int(per_blk) * int(len(self.blocks))
                 else:
-                    est = int(x.numel()) * int(x.element_size()) * int(len(self.blocks))
-            do_ckpt = bool(est >= int(getattr(self, "_ckpt_min_bytes", 0) or 0))
+                    est = (
+                        int(x.numel())
+                        * int(x.element_size())
+                        * int(len(self.blocks))
+                    )
+            do_ckpt = bool(
+                est >= int(getattr(self, "_ckpt_min_bytes", 0) or 0)
+            )
         next_state: Optional[torch.Tensor] = None
         if return_state:
-            next_state = x.new_empty((int(self.depth), B, int(self.nhead), int(self.head_dim)))
+            next_state = x.new_empty(
+                (int(self.depth), B, int(self.nhead), int(self.head_dim))
+            )
         for i, blk in enumerate(self.blocks):
             blk_state = None
             if st_tensor is not None and i < int(self.depth):
@@ -508,20 +545,29 @@ class TemporalExtractor(nn.Module):
                     if torch.is_grad_enabled():
                         _from_hsdp_module(self)
                         _from_hsdp_module(_blk)
-                    y, _ = _blk(t, causal_mask=causal_mask, state=None, mode="temporal")
+                    y, _ = _blk(
+                        t, causal_mask=causal_mask, state=None, mode="temporal"
+                    )
                     return y
 
                 x = cast(
                     torch.Tensor,
-                    coerce_checkpoint(_f, x, use_reentrant=True, preserve_rng_state=True),
+                    coerce_checkpoint(
+                        _f, x, use_reentrant=True, preserve_rng_state=True
+                    ),
                 )
             else:
                 x, blk_next_state = blk(
-                    x, causal_mask=causal_mask, state=blk_state, mode="temporal"
+                    x,
+                    causal_mask=causal_mask,
+                    state=blk_state,
+                    mode="temporal",
                 )
                 if next_state is not None:
                     if blk_next_state is None:
-                        blk_next_state = x.new_zeros((B, int(self.nhead), int(self.head_dim)))
+                        blk_next_state = x.new_zeros(
+                            (B, int(self.nhead), int(self.head_dim))
+                        )
                     next_state[i] = blk_next_state
         x = self.norm(x)
         if next_state is not None:
@@ -638,8 +684,14 @@ class TokenCollector(nn.Module):
         with self._runtime_lock:
             mb_cur = int(self.microbatch) if self.microbatch else B
         mb = max(1, min(B, mb_cur))
-        infer_mode = (not torch.is_grad_enabled()) and (not is_export_or_trace())
-        controller_ctx = inference_mode(self.backbone) if infer_mode else contextlib.nullcontext()
+        infer_mode = (not torch.is_grad_enabled()) and (
+            not is_export_or_trace()
+        )
+        controller_ctx = (
+            inference_mode(self.backbone)
+            if infer_mode
+            else contextlib.nullcontext()
+        )
         backbone = self.backbone
 
         def runner(chunk: torch.Tensor) -> torch.Tensor:
@@ -650,6 +702,7 @@ class TokenCollector(nn.Module):
             ):
                 out, _ = backbone(chunk)
             return cast(torch.Tensor, out)
+
         with controller_ctx:
             refined = cast(
                 torch.Tensor,
@@ -659,7 +712,9 @@ class TokenCollector(nn.Module):
 
 
 class TokenizedView(nn.Module):
-    def __init__(self, in_dim: int, tokens: int, d_model: int, extractor: nn.Module) -> None:
+    def __init__(
+        self, in_dim: int, tokens: int, d_model: int, extractor: nn.Module
+    ) -> None:
         super().__init__()
         self.in_dim = int(in_dim)
         self.tokens = int(tokens)
@@ -681,7 +736,11 @@ class TokenizedView(nn.Module):
 
     def forward(self, x: torch.Tensor, *args: Any, **kwargs: Any) -> Any:
         B = x.size(0)
-        tokens = self.tokenizer(x).reshape(B, self.tokens, self.d_model).contiguous()
+        tokens = (
+            self.tokenizer(x)
+            .reshape(B, self.tokens, self.d_model)
+            .contiguous()
+        )
         return self.extractor(tokens, *args, **kwargs)
 
 
@@ -692,7 +751,9 @@ class TokenFuser(nn.Module):
         out_shape: Sequence[int],
         config: ModelConfig,
         *args: Any,
-        views: Optional[Mapping[str, nn.Module] | Sequence[Tuple[str, nn.Module]]] = None,
+        views: Optional[
+            Mapping[str, nn.Module] | Sequence[Tuple[str, nn.Module]]
+        ] = None,
         fusions: Optional[
             Mapping[str | Tuple[str, str], nn.Module]
             | Sequence[Tuple[str | Tuple[str, str], nn.Module]]
@@ -705,17 +766,31 @@ class TokenFuser(nn.Module):
         self.d_model = int(config.d_model)
         self.nhead = int(config.heads)
         self.modeling_type = _coerce_modeling_types(config.modeling_type)
-        self.spatial_tokens = max(1, int(getattr(config, "spatial_latents", 1)))
-        self.temporal_tokens = max(1, int(getattr(config, "temporal_latents", 1)))
-        self.fused_tokens = max(1, int(self.spatial_tokens + self.temporal_tokens))
+        self.spatial_tokens = max(
+            1, int(getattr(config, "spatial_latents", 1))
+        )
+        self.temporal_tokens = max(
+            1, int(getattr(config, "temporal_latents", 1))
+        )
+        self.fused_tokens = max(
+            1, int(self.spatial_tokens + self.temporal_tokens)
+        )
         self.mlp_ratio = float(getattr(config, "mlp_ratio", 4.0))
         self.dropout = float(getattr(config, "dropout", 0.0))
         self.drop_path = float(getattr(config, "drop_path", 0.0))
-        self.norm_type = str(getattr(config, "normalization_method", "layernorm"))
-        self.gate_blend_alpha = float(
-            getattr(config, "fuser_blend_alpha", getattr(config, "fuser_gate_blend", 0.0))
+        self.norm_type = str(
+            getattr(config, "normalization_method", "layernorm")
         )
-        self.gate_blend_alpha = float(min(max(self.gate_blend_alpha, 0.0), 1.0))
+        self.gate_blend_alpha = float(
+            getattr(
+                config,
+                "fuser_blend_alpha",
+                getattr(config, "fuser_gate_blend", 0.0),
+            )
+        )
+        self.gate_blend_alpha = float(
+            min(max(self.gate_blend_alpha, 0.0), 1.0)
+        )
         self.view_encoders = nn.ModuleDict()
         if views is None:
             spatial_extractor = SpatialExtractor(
@@ -737,13 +812,21 @@ class TokenFuser(nn.Module):
                 norm_type=self.norm_type,
             )
             self.view_encoders["spatial"] = TokenizedView(
-                self.in_dim, self.spatial_tokens, self.d_model, spatial_extractor
+                self.in_dim,
+                self.spatial_tokens,
+                self.d_model,
+                spatial_extractor,
             )
             self.view_encoders["temporal"] = TokenizedView(
-                self.in_dim, self.temporal_tokens, self.d_model, temporal_extractor
+                self.in_dim,
+                self.temporal_tokens,
+                self.d_model,
+                temporal_extractor,
             )
         else:
-            items = views.items() if isinstance(views, Mapping) else list(views)
+            items = (
+                views.items() if isinstance(views, Mapping) else list(views)
+            )
             for name, mod in items:
                 key = str(name)
                 if not isinstance(mod, nn.Module):
@@ -769,7 +852,11 @@ class TokenFuser(nn.Module):
             )
             self._pair_endpoints[key] = (a, b)
         else:
-            items = fusions.items() if isinstance(fusions, Mapping) else list(fusions)
+            items = (
+                fusions.items()
+                if isinstance(fusions, Mapping)
+                else list(fusions)
+            )
             for raw_key, mod in items:
                 if not isinstance(mod, nn.Module):
                     raise TypeError("fusions must contain modules")
@@ -795,7 +882,9 @@ class TokenFuser(nn.Module):
             nn.GELU(),
             nn.Linear(hid, 1),
         )
-        self._token_generator = nn.Linear(self.d_model, self.fused_tokens * self.d_model)
+        self._token_generator = nn.Linear(
+            self.d_model, self.fused_tokens * self.d_model
+        )
         self.norm = norm_layer(self.norm_type, self.d_model)
         self.head_hidden_dim = hid
         self.head = nn.Sequential(
@@ -824,7 +913,9 @@ class TokenFuser(nn.Module):
         x, y = (a, b) if a <= b else (b, a)
         return f"{x}|{y}", (x, y)
 
-    def _canon_pair_key(self, raw: str | Tuple[str, str]) -> tuple[str, tuple[str, str]]:
+    def _canon_pair_key(
+        self, raw: str | Tuple[str, str]
+    ) -> tuple[str, tuple[str, str]]:
         return self._canon_pair_key_static(raw)
 
     @staticmethod
@@ -832,13 +923,19 @@ class TokenFuser(nn.Module):
         if t.dim() == 2:
             return t.unsqueeze(1)
         if t.dim() != 3:
-            raise ValueError(f"expected tokens shaped (B,N,D) or (B,D), got {tuple(t.shape)}")
+            raise ValueError(
+                f"expected tokens shaped (B,N,D) or (B,D), got {tuple(t.shape)}"
+            )
         return t
 
-    def _aggregate_tokens(self, token_sets: Sequence[torch.Tensor]) -> torch.Tensor:
+    def _aggregate_tokens(
+        self, token_sets: Sequence[torch.Tensor]
+    ) -> torch.Tensor:
         if len(token_sets) < 1:
             raise ValueError("no token sets to aggregate")
-        summaries = torch.stack([self._agg_norm(ts.mean(dim=1)) for ts in token_sets], dim=1)
+        summaries = torch.stack(
+            [self._agg_norm(ts.mean(dim=1)) for ts in token_sets], dim=1
+        )
         feats = self._agg_phi(summaries)
         logits = self._agg_gate(feats).squeeze(-1)
         w_soft = torch.softmax(logits, dim=1)
@@ -904,7 +1001,9 @@ class TokenFuser(nn.Module):
             out[name] = tokens
         return out, next_state
 
-    def _run_fusions(self, views: Mapping[str, torch.Tensor]) -> list[torch.Tensor]:
+    def _run_fusions(
+        self, views: Mapping[str, torch.Tensor]
+    ) -> list[torch.Tensor]:
         out: list[torch.Tensor] = []
         for key, fuser in self.pair_fusers.items():
             a, b = self._pair_endpoints.get(key, (None, None))
@@ -916,7 +1015,8 @@ class TokenFuser(nn.Module):
         return out
 
     @torch_compiler_disable(
-        reason="TokenFuser orchestrates eager + compiled submodules", recursive=False
+        reason="TokenFuser orchestrates eager + compiled submodules",
+        recursive=False,
     )
     def forward(
         self,
@@ -969,12 +1069,16 @@ class TokenFuser(nn.Module):
         if tn is not None:
             depth = int(getattr(tn, "depth", 0))
             nhead = int(getattr(tn, "nhead", self.nhead))
-            head_dim = int(getattr(tn, "head_dim", max(1, self.d_model // max(1, nhead))))
+            head_dim = int(
+                getattr(tn, "head_dim", max(1, self.d_model // max(1, nhead)))
+            )
         else:
             depth = 0
             nhead = int(self.nhead)
             head_dim = int(max(1, self.d_model // max(1, nhead)))
-        filler = tokens.new_zeros((max(1, depth), B, max(1, nhead), max(1, head_dim)))
+        filler = tokens.new_zeros(
+            (max(1, depth), B, max(1, nhead), max(1, head_dim))
+        )
         return tokens, context, filler
 
     def forward_stream(
@@ -991,17 +1095,23 @@ class TokenFuser(nn.Module):
         )
         return tokens, context, next_state
 
-    def decode(self, tokens: torch.Tensor, *args: Any, apply_norm: bool = False) -> torch.Tensor:
+    def decode(
+        self, tokens: torch.Tensor, *args: Any, apply_norm: bool = False
+    ) -> torch.Tensor:
         if apply_norm:
             tokens = self.norm(tokens)
         pooled = tokens.mean(dim=1)
         flat = self.head(pooled)
         return flat.reshape(tokens.shape[0], *self.out_shape)
 
-    def forward_export(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def forward_export(
+        self, x: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         if not isinstance(x, torch.Tensor):
             raise TypeError("forward_export expects a Tensor")
-        views, _ = self._run_views(x, temporal_state=None, want_state=False, causal_mask=None)
+        views, _ = self._run_views(
+            x, temporal_state=None, want_state=False, causal_mask=None
+        )
         mode_l = _coerce_modeling_types(self.modeling_type)
         if mode_l == "ss":
             chosen = [self._pick_view(views, ("spatial", "s"))]
@@ -1021,18 +1131,25 @@ class Model(nn.Module):
     def _get_cfg(cfg, name, default, type_=float):
         return type_(getattr(cfg, name, default))
 
-    def __init__(self, in_dim: int, out_shape: Sequence[int], config: ModelConfig) -> None:
+    def __init__(
+        self, in_dim: int, out_shape: Sequence[int], config: ModelConfig
+    ) -> None:
         super().__init__()
         self.in_dim = int(in_dim)
         self.out_shape = tuple((int(x) for x in out_shape))
         self.out_dim = int(math.prod(self.out_shape))
         if config.device is not None:
             self._device = torch.device(config.device)
-            if self._device.type in {"cuda", "xpu"} and self._device.index is not None:
+            if (
+                self._device.type in {"cuda", "xpu"}
+                and self._device.index is not None
+            ):
                 with contextlib.suppress(Exception):
                     from ..core.system import set_accelerator_index
 
-                    set_accelerator_index(self._device.type, int(self._device.index))
+                    set_accelerator_index(
+                        self._device.type, int(self._device.index)
+                    )
         else:
             self._device = get_device()
         self.scaler = Scaler().to(self._device)
@@ -1045,9 +1162,13 @@ class Model(nn.Module):
         self.logger = Recorder()
         self.is_norm_linear = bool(getattr(config, "use_linear_branch", False))
         self.linear_branch = (
-            nn.Linear(self.in_dim, self.out_dim).to(self._device) if self.is_norm_linear else None
+            nn.Linear(self.in_dim, self.out_dim).to(self._device)
+            if self.is_norm_linear
+            else None
         )
-        self.fuser = TokenFuser(self.in_dim, self.out_shape, config=config).to(self._device)
+        self.fuser = TokenFuser(self.in_dim, self.out_shape, config=config).to(
+            self._device
+        )
         self.processor = self.fuser
         bucket = self._get_cfg(config, "length_bucket_multiple", 64, int)
         self.temporal_token_collector = TokenCollector(
@@ -1063,7 +1184,9 @@ class Model(nn.Module):
         self.p_gate: Optional[SigmoidGate]
         k_def = self._get_cfg(config, "p_gate_fallback_k", 6.0)
         self.p_gate_fallback_k: float = float(k_def)
-        self.p_gate_fallback_k_low = float(getattr(config, "p_gate_fallback_k_low", k_def) or k_def)
+        self.p_gate_fallback_k_low = float(
+            getattr(config, "p_gate_fallback_k_low", k_def) or k_def
+        )
         self.p_gate_fallback_k_high = float(
             getattr(config, "p_gate_fallback_k_high", k_def) or k_def
         )
@@ -1071,12 +1194,24 @@ class Model(nn.Module):
         self.p_gate_auto_k_interval = max(
             1, self._get_cfg(config, "p_gate_auto_k_interval", 100, int)
         )
-        self.p_gate_auto_k_warmup = max(0, self._get_cfg(config, "p_gate_auto_k_warmup", 0, int))
-        self.p_gate_auto_k_ema_alpha = self._get_cfg(config, "p_gate_auto_k_ema_alpha", 0.1)
-        self.p_gate_auto_k_target_tight = self._get_cfg(config, "p_gate_auto_k_target_tight", 0.02)
-        self.p_gate_auto_k_tolerance = self._get_cfg(config, "p_gate_auto_k_tolerance", 0.5)
-        self.p_gate_auto_k_step_up = self._get_cfg(config, "p_gate_auto_k_step_up", 0.1)
-        self.p_gate_auto_k_step_down = self._get_cfg(config, "p_gate_auto_k_step_down", 0.02)
+        self.p_gate_auto_k_warmup = max(
+            0, self._get_cfg(config, "p_gate_auto_k_warmup", 0, int)
+        )
+        self.p_gate_auto_k_ema_alpha = self._get_cfg(
+            config, "p_gate_auto_k_ema_alpha", 0.1
+        )
+        self.p_gate_auto_k_target_tight = self._get_cfg(
+            config, "p_gate_auto_k_target_tight", 0.02
+        )
+        self.p_gate_auto_k_tolerance = self._get_cfg(
+            config, "p_gate_auto_k_tolerance", 0.5
+        )
+        self.p_gate_auto_k_step_up = self._get_cfg(
+            config, "p_gate_auto_k_step_up", 0.1
+        )
+        self.p_gate_auto_k_step_down = self._get_cfg(
+            config, "p_gate_auto_k_step_down", 0.02
+        )
         self.p_gate_auto_k_step_up_low = self._get_cfg(
             config, "p_gate_auto_k_step_up_low", self.p_gate_auto_k_step_up
         )
@@ -1087,15 +1222,23 @@ class Model(nn.Module):
             config, "p_gate_auto_k_step_up_high", self.p_gate_auto_k_step_up
         )
         self.p_gate_auto_k_step_down_high = self._get_cfg(
-            config, "p_gate_auto_k_step_down_high", self.p_gate_auto_k_step_down
+            config,
+            "p_gate_auto_k_step_down_high",
+            self.p_gate_auto_k_step_down,
         )
         self.p_gate_auto_k_edge_enabled: bool = True
-        self.p_gate_auto_k_target_edge = self._get_cfg(config, "p_gate_auto_k_target_edge", 0.05)
+        self.p_gate_auto_k_target_edge = self._get_cfg(
+            config, "p_gate_auto_k_target_edge", 0.05
+        )
         self.p_gate_auto_k_edge_tolerance = self._get_cfg(
             config, "p_gate_auto_k_edge_tolerance", 0.5
         )
         self.p_gate_auto_k_edge_ema_alpha: float = float(
-            getattr(config, "p_gate_auto_k_edge_ema_alpha", self.p_gate_auto_k_ema_alpha)
+            getattr(
+                config,
+                "p_gate_auto_k_edge_ema_alpha",
+                self.p_gate_auto_k_ema_alpha,
+            )
         )
         self.p_gate_auto_k_edge_step_down_low: float = float(
             getattr(config, "p_gate_auto_k_edge_step_down_low", 0.01)
@@ -1103,8 +1246,12 @@ class Model(nn.Module):
         self.p_gate_auto_k_edge_step_down_high: float = float(
             getattr(config, "p_gate_auto_k_edge_step_down_high", 0.01)
         )
-        self.p_gate_auto_k_min: float = float(getattr(config, "p_gate_auto_k_min", 1.0))
-        self.p_gate_auto_k_max: float = float(getattr(config, "p_gate_auto_k_max", 16.0))
+        self.p_gate_auto_k_min: float = float(
+            getattr(config, "p_gate_auto_k_min", 1.0)
+        )
+        self.p_gate_auto_k_max: float = float(
+            getattr(config, "p_gate_auto_k_max", 16.0)
+        )
         self.p_gate_auto_k_width_frac: float = float(
             getattr(config, "p_gate_auto_k_width_frac", 0.05)
         )
@@ -1115,22 +1262,28 @@ class Model(nn.Module):
             getattr(config, "p_gate_auto_k_log_interval", 200) or 0
         )
         if self.p_gate_auto_k_enabled and (
-            self.p_gate_fallback_k_low <= 0.0 or self.p_gate_fallback_k_high <= 0.0
+            self.p_gate_fallback_k_low <= 0.0
+            or self.p_gate_fallback_k_high <= 0.0
         ):
             m = max(float(self.p_gate_auto_k_min), 1e-6)
             self.p_gate_fallback_k_low = max(self.p_gate_fallback_k_low, m)
             self.p_gate_fallback_k_high = max(self.p_gate_fallback_k_high, m)
         self.p_gate_fallback_enabled: bool = bool(
-            self.p_gate_fallback_k_low > 0.0 and self.p_gate_fallback_k_high > 0.0
+            self.p_gate_fallback_k_low > 0.0
+            and self.p_gate_fallback_k_high > 0.0
         )
-        self.p_gate_tile_size: Optional[int] = getattr(config, "p_gate_tile_size", None)
+        self.p_gate_tile_size: Optional[int] = getattr(
+            config, "p_gate_tile_size", None
+        )
         raw_tile_shape = getattr(config, "p_gate_tile_shape", None)
         tile_shape: Optional[Tuple[int, ...]]
         try:
             if raw_tile_shape is None:
                 tile_shape = None
             else:
-                if isinstance(raw_tile_shape, int) and not isinstance(raw_tile_shape, bool):
+                if isinstance(raw_tile_shape, int) and not isinstance(
+                    raw_tile_shape, bool
+                ):
                     tile_shape = (int(raw_tile_shape),)
                 else:
                     tile_shape = tuple(int(v) for v in raw_tile_shape)
@@ -1141,7 +1294,9 @@ class Model(nn.Module):
                     if len(tile_shape) == 1:
                         tile_shape = tile_shape * out_ndim
                     elif len(tile_shape) < out_ndim:
-                        tile_shape = (1,) * (out_ndim - len(tile_shape)) + tile_shape
+                        tile_shape = (1,) * (
+                            out_ndim - len(tile_shape)
+                        ) + tile_shape
                     elif len(tile_shape) > out_ndim:
                         tile_shape = tile_shape[-out_ndim:]
         except Exception:
@@ -1150,8 +1305,12 @@ class Model(nn.Module):
         self.p_gate_bounds_use_quantile: bool = bool(
             getattr(config, "p_gate_bounds_use_quantile", False)
         )
-        self.p_gate_bounds_q_low: float = float(getattr(config, "p_gate_bounds_q_low", 0.005))
-        self.p_gate_bounds_q_high: float = float(getattr(config, "p_gate_bounds_q_high", 0.995))
+        self.p_gate_bounds_q_low: float = float(
+            getattr(config, "p_gate_bounds_q_low", 0.005)
+        )
+        self.p_gate_bounds_q_high: float = float(
+            getattr(config, "p_gate_bounds_q_high", 0.995)
+        )
         self.p_gate_bounds_q_max_samples: int = int(
             getattr(config, "p_gate_bounds_q_max_samples", 8192) or 0
         )
@@ -1161,18 +1320,28 @@ class Model(nn.Module):
         try:
             self.register_buffer(
                 "p_gate_fallback_k_low_buf",
-                torch.tensor(float(self.p_gate_fallback_k_low), dtype=torch.float32),
+                torch.tensor(
+                    float(self.p_gate_fallback_k_low), dtype=torch.float32
+                ),
                 persistent=True,
             )
             self.register_buffer(
                 "p_gate_fallback_k_high_buf",
-                torch.tensor(float(self.p_gate_fallback_k_high), dtype=torch.float32),
+                torch.tensor(
+                    float(self.p_gate_fallback_k_high), dtype=torch.float32
+                ),
                 persistent=True,
             )
             self.register_buffer(
                 "p_gate_fallback_k_buf",
                 torch.tensor(
-                    float(0.5 * (self.p_gate_fallback_k_low + self.p_gate_fallback_k_high)),
+                    float(
+                        0.5
+                        * (
+                            self.p_gate_fallback_k_low
+                            + self.p_gate_fallback_k_high
+                        )
+                    ),
                     dtype=torch.float32,
                 ),
                 persistent=True,
@@ -1230,15 +1399,21 @@ class Model(nn.Module):
             event_shape=self.out_shape,
             clip_eps=float(getattr(config, "p_gate_clip_eps", 1e-6)),
             eps=float(getattr(config, "p_gate_eps", 1e-6)),
-            stat_width_frac=float(getattr(config, "p_gate_auto_k_width_frac", 0.05)),
-            stat_edge_frac=float(getattr(config, "p_gate_auto_k_edge_frac", 0.02)),
+            stat_width_frac=float(
+                getattr(config, "p_gate_auto_k_width_frac", 0.05)
+            ),
+            stat_edge_frac=float(
+                getattr(config, "p_gate_auto_k_edge_frac", 0.02)
+            ),
         ).to(self._device)
         self.unsup_xx_weight = float(getattr(config, "unsup_xx_weight", 0.0))
         self.unsup_yy_weight = float(getattr(config, "unsup_yy_weight", 0.0))
         self.p_prior_weight = float(getattr(config, "p_prior_weight", 0.0))
         self.p_prior_alpha = float(getattr(config, "p_prior_alpha", 2.0))
         self.p_prior_beta = float(getattr(config, "p_prior_beta", 2.0))
-        self.p_gate_edge_reg_weight = float(getattr(config, "p_gate_edge_reg_weight", 0.0))
+        self.p_gate_edge_reg_weight = float(
+            getattr(config, "p_gate_edge_reg_weight", 0.0)
+        )
         self.p_gate_edge_reg_frac = float(
             getattr(
                 config,
@@ -1253,27 +1428,49 @@ class Model(nn.Module):
                 getattr(config, "p_gate_auto_k_width_frac", 0.05),
             )
         )
-        self.p_gate_edge_reg_power = float(getattr(config, "p_gate_edge_reg_power", 2.0))
-        self.p_gate_budget_weight = float(getattr(config, "p_gate_budget_weight", 0.0))
-        self.p_gate_budget_target = float(getattr(config, "p_gate_budget_target", 0.5))
+        self.p_gate_edge_reg_power = float(
+            getattr(config, "p_gate_edge_reg_power", 2.0)
+        )
+        self.p_gate_budget_weight = float(
+            getattr(config, "p_gate_budget_weight", 0.0)
+        )
+        self.p_gate_budget_target = float(
+            getattr(config, "p_gate_budget_target", 0.5)
+        )
         self.p_gate_tv_weight = float(getattr(config, "p_gate_tv_weight", 0.0))
         self.p_gate_tv_power = float(getattr(config, "p_gate_tv_power", 1.0))
-        self.p_gate_teacher_weight = float(getattr(config, "p_gate_teacher_weight", 0.0))
-        self.p_gate_teacher_temp = float(getattr(config, "p_gate_teacher_temp", 0.25))
-        self.p_gate_teacher_tau = float(getattr(config, "p_gate_teacher_tau", 0.0))
-        self.p_gate_teacher_relu = bool(getattr(config, "p_gate_teacher_relu", False))
+        self.p_gate_teacher_weight = float(
+            getattr(config, "p_gate_teacher_weight", 0.0)
+        )
+        self.p_gate_teacher_temp = float(
+            getattr(config, "p_gate_teacher_temp", 0.25)
+        )
+        self.p_gate_teacher_tau = float(
+            getattr(config, "p_gate_teacher_tau", 0.0)
+        )
+        self.p_gate_teacher_relu = bool(
+            getattr(config, "p_gate_teacher_relu", False)
+        )
         try:
             w_low_cfg = getattr(config, "p_gate_edge_reg_weight_low", None)
             w_high_cfg = getattr(config, "p_gate_edge_reg_weight_high", None)
             self.p_gate_edge_reg_weight_low = (
-                float(self.p_gate_edge_reg_weight) if w_low_cfg is None else float(w_low_cfg)
+                float(self.p_gate_edge_reg_weight)
+                if w_low_cfg is None
+                else float(w_low_cfg)
             )
             self.p_gate_edge_reg_weight_high = (
-                float(self.p_gate_edge_reg_weight) if w_high_cfg is None else float(w_high_cfg)
+                float(self.p_gate_edge_reg_weight)
+                if w_high_cfg is None
+                else float(w_high_cfg)
             )
         except Exception:
-            self.p_gate_edge_reg_weight_low = float(self.p_gate_edge_reg_weight)
-            self.p_gate_edge_reg_weight_high = float(self.p_gate_edge_reg_weight)
+            self.p_gate_edge_reg_weight_low = float(
+                self.p_gate_edge_reg_weight
+            )
+            self.p_gate_edge_reg_weight_high = float(
+                self.p_gate_edge_reg_weight
+            )
         self.p_gate_edge_reg_fallback_only = bool(
             getattr(config, "p_gate_edge_reg_fallback_only", False)
         )
@@ -1291,8 +1488,12 @@ class Model(nn.Module):
         self.microbatch: int = 0
         self._auto_microbatch_pending: bool = True
         self._runtime_lock = Mutex()
-        self._eager_processor_temporal_net = getattr(self.processor, "temporal_net", None)
-        self._eager_processor_perception = getattr(self.processor, "perception", None)
+        self._eager_processor_temporal_net = getattr(
+            self.processor, "temporal_net", None
+        )
+        self._eager_processor_perception = getattr(
+            self.processor, "perception", None
+        )
         self._decode_compiled: Optional[nn.Module] = None
         try:
             self.register_buffer(
@@ -1304,7 +1505,11 @@ class Model(nn.Module):
             pass
         raw_mode = getattr(config, "compile_mode", "disabled")
         compile_mode_canonical = canonicalize_compile_mode(raw_mode)
-        compile_mode_arg = None if compile_mode_canonical == "disabled" else compile_mode_canonical
+        compile_mode_arg = (
+            None
+            if compile_mode_canonical == "disabled"
+            else compile_mode_canonical
+        )
         compile_requested = compile_mode_arg is not None
         compile_available = bool(torch_compiler_supported())
         compile_enabled = bool(compile_requested and compile_available)
@@ -1322,15 +1527,25 @@ class Model(nn.Module):
                 raw_mode,
             )
         compile_dynamic = bool(
-            getattr(config, "compile_dynamic", compile_mode_canonical == "reduce-overhead")
+            getattr(
+                config,
+                "compile_dynamic",
+                compile_mode_canonical == "reduce-overhead",
+            )
         )
-        compile_cudagraphs_default = (not bool(nogil_opt)) and compile_mode_canonical not in {
+        compile_cudagraphs_default = (
+            not bool(nogil_opt)
+        ) and compile_mode_canonical not in {
             "reduce-overhead",
             "max-autotune-no-cudagraphs",
         }
-        compile_cudagraphs = bool(getattr(config, "compile_cudagraphs", compile_cudagraphs_default))
+        compile_cudagraphs = bool(
+            getattr(config, "compile_cudagraphs", compile_cudagraphs_default)
+        )
         self._compile_cudagraphs = bool(
-            compile_enabled and compile_cudagraphs and getattr(self._device, "type", None) == "cuda"
+            compile_enabled
+            and compile_cudagraphs
+            and getattr(self._device, "type", None) == "cuda"
         )
         compile_patch_ctx = contextlib.nullcontext()
         compile_options = (
@@ -1342,17 +1557,24 @@ class Model(nn.Module):
             )
             else None
         )
-        compile_heavy_submodules_default = (not bool(nogil_opt)) and compile_mode_canonical not in {
+        compile_heavy_submodules_default = (
+            not bool(nogil_opt)
+        ) and compile_mode_canonical not in {
             "max-autotune",
             "max-autotune-no-cudagraphs",
         }
         compile_heavy_submodules = bool(
-            getattr(config, "compile_heavy_submodules", compile_heavy_submodules_default)
+            getattr(
+                config,
+                "compile_heavy_submodules",
+                compile_heavy_submodules_default,
+            )
         )
         if (
             compile_enabled
             and (not compile_heavy_submodules)
-            and compile_mode_canonical in {"max-autotune", "max-autotune-no-cudagraphs"}
+            and compile_mode_canonical
+            in {"max-autotune", "max-autotune-no-cudagraphs"}
         ):
             _LOGGER.warning(
                 "max-autotune hotfix: compiling only decode head (skip temporal/perception). "
@@ -1398,7 +1620,9 @@ class Model(nn.Module):
                         exc_info=True,
                     )
                 if getattr(self._device, "type", None) == "cuda":
-                    empty_device_cache(device=self._device, do_gc=True, min_interval_s=0.0)
+                    empty_device_cache(
+                        device=self._device, do_gc=True, min_interval_s=0.0
+                    )
                 if compile_heavy_submodules:
                     try:
                         _orig = self._eager_processor_temporal_net
@@ -1414,10 +1638,14 @@ class Model(nn.Module):
                             )
                             self.processor.temporal_net = _compiled
                             with contextlib.suppress(Exception):
-                                if hasattr(self.processor, "view_encoders") and (
+                                if hasattr(
+                                    self.processor, "view_encoders"
+                                ) and (
                                     "temporal" in self.processor.view_encoders
                                 ):
-                                    self.processor.view_encoders["temporal"] = _compiled
+                                    self.processor.view_encoders[
+                                        "temporal"
+                                    ] = _compiled
                             compiled_temporal = _compiled is not _orig
                     except Exception:
                         _LOGGER.warning(
@@ -1425,7 +1653,9 @@ class Model(nn.Module):
                             exc_info=True,
                         )
                 if getattr(self._device, "type", None) == "cuda":
-                    empty_device_cache(device=self._device, do_gc=True, min_interval_s=0.0)
+                    empty_device_cache(
+                        device=self._device, do_gc=True, min_interval_s=0.0
+                    )
                 if compile_heavy_submodules:
                     try:
                         _orig = self._eager_processor_perception
@@ -1442,11 +1672,22 @@ class Model(nn.Module):
                             self.processor.perception = _compiled
                             with contextlib.suppress(Exception):
                                 if hasattr(self.processor, "pair_fusers"):
-                                    if "spatial|temporal" in self.processor.pair_fusers:
-                                        self.processor.pair_fusers["spatial|temporal"] = _compiled
+                                    if (
+                                        "spatial|temporal"
+                                        in self.processor.pair_fusers
+                                    ):
+                                        self.processor.pair_fusers[
+                                            "spatial|temporal"
+                                        ] = _compiled
                                     elif len(self.processor.pair_fusers) == 1:
-                                        _pair = next(iter(self.processor.pair_fusers.keys()))
-                                        self.processor.pair_fusers[_pair] = _compiled
+                                        _pair = next(
+                                            iter(
+                                                self.processor.pair_fusers.keys()
+                                            )
+                                        )
+                                        self.processor.pair_fusers[_pair] = (
+                                            _compiled
+                                        )
                             compiled_perception = _compiled is not _orig
                     except Exception:
                         _LOGGER.warning(
@@ -1454,7 +1695,9 @@ class Model(nn.Module):
                             exc_info=True,
                         )
                 if getattr(self._device, "type", None) == "cuda":
-                    empty_device_cache(device=self._device, do_gc=True, min_interval_s=0.0)
+                    empty_device_cache(
+                        device=self._device, do_gc=True, min_interval_s=0.0
+                    )
         self._compiled_submodules = {
             "decode": bool(compiled_decode),
             "temporal_net": bool(compiled_temporal),
@@ -1530,20 +1773,26 @@ class Model(nn.Module):
         def _sync_after_swap(swapped: str) -> None:
             if swapped == "temporal_net":
                 with contextlib.suppress(Exception):
-                    if hasattr(proc, "view_encoders") and ("temporal" in proc.view_encoders):
+                    if hasattr(proc, "view_encoders") and (
+                        "temporal" in proc.view_encoders
+                    ):
                         proc.view_encoders["temporal"] = proc.temporal_net
             elif swapped == "perception":
                 with contextlib.suppress(Exception):
                     if hasattr(proc, "pair_fusers"):
                         if "spatial|temporal" in proc.pair_fusers:
-                            proc.pair_fusers["spatial|temporal"] = proc.perception
+                            proc.pair_fusers["spatial|temporal"] = (
+                                proc.perception
+                            )
                         elif len(proc.pair_fusers) == 1:
                             k = next(iter(proc.pair_fusers.keys()))
                             proc.pair_fusers[k] = proc.perception
 
         swaps: list[tuple[object, str, Any]] = []
         with contextlib.suppress(Exception):
-            eager_temporal = getattr(self, "_eager_processor_temporal_net", None)
+            eager_temporal = getattr(
+                self, "_eager_processor_temporal_net", None
+            )
             if isinstance(eager_temporal, nn.Module):
                 cur = getattr(proc, "temporal_net", None)
                 if cur is not eager_temporal and cur is not None:
@@ -1551,7 +1800,9 @@ class Model(nn.Module):
                     proc.temporal_net = eager_temporal
                     _sync_after_swap("temporal_net")
         with contextlib.suppress(Exception):
-            eager_perception = getattr(self, "_eager_processor_perception", None)
+            eager_perception = getattr(
+                self, "_eager_processor_perception", None
+            )
             if isinstance(eager_perception, nn.Module):
                 cur = getattr(proc, "perception", None)
                 if cur is not eager_perception and cur is not None:
@@ -1584,7 +1835,9 @@ class Model(nn.Module):
         device: Optional[torch.device] = None,
         base_dtype: Optional[torch.dtype] = None,
     ):
-        x = self._cast_graph_safe(features, device or self._device, base_dtype or features.dtype)
+        x = self._cast_graph_safe(
+            features, device or self._device, base_dtype or features.dtype
+        )
         x = self.scaler.normalize_x(x)
         b = x.size(0)
         if export:
@@ -1615,14 +1868,18 @@ class Model(nn.Module):
             mean_tok = mean_tok.expand(-1, tokens.size(1), -1)
         tokens_centered = (tokens - mean_tok).contiguous()
         if export:
-            refined = self.temporal_token_collector.forward_export(tokens_centered)
+            refined = self.temporal_token_collector.forward_export(
+                tokens_centered
+            )
         else:
             refined = self.temporal_token_collector.forward(tokens_centered)[0]
         if sanitize_nan:
             refined = _coerce_tensor(refined, enabled=True, inplace=not export)
         residual = self.fuser.decode(refined, apply_norm=True)
         if sanitize_nan:
-            residual = _coerce_tensor(residual, enabled=True, inplace=not export)
+            residual = _coerce_tensor(
+                residual, enabled=True, inplace=not export
+            )
         enhanced = residual.reshape(b, -1).to(dtype=assembled.dtype)
         delta = enhanced - assembled
         p = None
@@ -1736,10 +1993,15 @@ class Model(nn.Module):
                 else:
                     w = p.detach().mean(dim=1).clamp(min=0.0)
                 loss_yy = (
-                    F.smooth_l1_loss(assembled, y_hat.detach(), reduction="none").mean(dim=1) * w
+                    F.smooth_l1_loss(
+                        assembled, y_hat.detach(), reduction="none"
+                    ).mean(dim=1)
+                    * w
                 ).mean()
             else:
-                loss_yy = F.smooth_l1_loss(assembled, y_hat.detach(), reduction="mean")
+                loss_yy = F.smooth_l1_loss(
+                    assembled, y_hat.detach(), reduction="mean"
+                )
             aux_total += self.unsup_yy_weight * loss_yy.to(aux_total.dtype)
             aux_used = True
         if self.p_prior_weight > 0.0 and p is not None:
@@ -1764,9 +2026,13 @@ class Model(nn.Module):
             p_ceil = 1.0
             if self.p_gate is not None:
                 with contextlib.suppress(Exception):
-                    gate_eps = float(getattr(self.p_gate, "clip_eps", gate_eps))
+                    gate_eps = float(
+                        getattr(self.p_gate, "clip_eps", gate_eps)
+                    )
                 with contextlib.suppress(Exception):
-                    gate_eps = max(gate_eps, float(getattr(self.p_gate, "eps", 0.0)))
+                    gate_eps = max(
+                        gate_eps, float(getattr(self.p_gate, "eps", 0.0))
+                    )
                 with contextlib.suppress(Exception):
                     p_floor = float(getattr(self.p_gate, "p_floor", p_floor))
                 with contextlib.suppress(Exception):
@@ -1776,17 +2042,25 @@ class Model(nn.Module):
                 tgt = float(self.p_gate_budget_target)
                 if p_ceil >= p_floor:
                     tgt = max(p_floor, min(p_ceil, tgt))
-                loss_budget = (p.to(dtype=torch.float32).mean() - p.new_tensor(tgt)).square()
-                aux_total += self.p_gate_budget_weight * loss_budget.to(aux_total.dtype)
+                loss_budget = (
+                    p.to(dtype=torch.float32).mean() - p.new_tensor(tgt)
+                ).square()
+                aux_total += self.p_gate_budget_weight * loss_budget.to(
+                    aux_total.dtype
+                )
                 aux_used = True
             p_grid = None
             w_grid = None
             tile_shape = None
-            if (self.p_gate_tv_weight > 0.0 or self.p_gate_teacher_weight > 0.0) and self.out_shape:
+            if (
+                self.p_gate_tv_weight > 0.0 or self.p_gate_teacher_weight > 0.0
+            ) and self.out_shape:
                 tile_shape = _normalize_tile_shape(
                     getattr(self, "p_gate_tile_shape", None), self.out_shape
                 )
-            if (self.p_gate_tv_weight > 0.0 or self.p_gate_teacher_weight > 0.0) and self.out_shape:
+            if (
+                self.p_gate_tv_weight > 0.0 or self.p_gate_teacher_weight > 0.0
+            ) and self.out_shape:
                 try:
                     if tile_shape is not None:
                         p_grid = _reduce_flat_to_grid(
@@ -1804,13 +2078,19 @@ class Model(nn.Module):
                             dtype=torch.float32,
                         ).unsqueeze(0)
                     else:
-                        p_grid = p.to(dtype=torch.float32).mean(dim=1, keepdim=True)
+                        p_grid = p.to(dtype=torch.float32).mean(
+                            dim=1, keepdim=True
+                        )
                 except Exception:
                     p_grid = None
                     w_grid = None
             if self.p_gate_tv_weight > 0.0 and p_grid is not None:
-                tv = _tv_loss_grid(p_grid, power=float(self.p_gate_tv_power), eps=gate_eps)
-                aux_total += self.p_gate_tv_weight * tv.to(dtype=aux_total.dtype)
+                tv = _tv_loss_grid(
+                    p_grid, power=float(self.p_gate_tv_power), eps=gate_eps
+                )
+                aux_total += self.p_gate_tv_weight * tv.to(
+                    dtype=aux_total.dtype
+                )
                 aux_used = True
             if (
                 self.p_gate_teacher_weight > 0.0
@@ -1820,7 +2100,9 @@ class Model(nn.Module):
             ):
                 base_det = assembled.detach().to(dtype=torch.float32)
                 ref_det = enhanced.detach().to(dtype=torch.float32)
-                tgt_det = z_true.detach().to(device=base_det.device, dtype=torch.float32)
+                tgt_det = z_true.detach().to(
+                    device=base_det.device, dtype=torch.float32
+                )
                 err_base = (base_det - tgt_det).square()
                 err_ref = (ref_det - tgt_det).square()
                 improve = err_base - err_ref
@@ -1849,9 +2131,10 @@ class Model(nn.Module):
                     scale_grid = scale.mean(dim=1, keepdim=True)
                 scale_grid = torch.clamp(scale_grid, min=float(gate_eps))
                 temp = max(float(self.p_gate_teacher_temp), float(gate_eps))
-                score = ((imp_grid / scale_grid - float(self.p_gate_teacher_tau)) / temp).clamp(
-                    min=-20.0, max=20.0
-                )
+                score = (
+                    (imp_grid / scale_grid - float(self.p_gate_teacher_tau))
+                    / temp
+                ).clamp(min=-20.0, max=20.0)
                 p01 = torch.sigmoid(score)
                 p_target = p01 * float(p_ceil - p_floor) + float(p_floor)
                 lo = float(p_floor) + float(gate_eps)
@@ -1861,22 +2144,36 @@ class Model(nn.Module):
                 if w_grid is not None:
                     w = w_grid.to(device=p_grid.device, dtype=torch.float32)
                     loss_teacher = (
-                        (p_grid.to(dtype=torch.float32) - p_target).square() * w
+                        (p_grid.to(dtype=torch.float32) - p_target).square()
+                        * w
                     ).sum() / w.sum().clamp_min(float(gate_eps))
                 else:
                     loss_teacher = F.mse_loss(
-                        p_grid.to(dtype=torch.float32), p_target, reduction="mean"
+                        p_grid.to(dtype=torch.float32),
+                        p_target,
+                        reduction="mean",
                     )
-                aux_total += self.p_gate_teacher_weight * loss_teacher.to(dtype=aux_total.dtype)
+                aux_total += self.p_gate_teacher_weight * loss_teacher.to(
+                    dtype=aux_total.dtype
+                )
                 aux_used = True
         if self.p_gate_edge_reg_weight_low > 0.0 and edge_reg_low is not None:
-            aux_total += self.p_gate_edge_reg_weight_low * edge_reg_low.to(dtype=aux_total.dtype)
+            aux_total += self.p_gate_edge_reg_weight_low * edge_reg_low.to(
+                dtype=aux_total.dtype
+            )
             aux_used = True
-        if self.p_gate_edge_reg_weight_high > 0.0 and edge_reg_high is not None:
-            aux_total += self.p_gate_edge_reg_weight_high * edge_reg_high.to(dtype=aux_total.dtype)
+        if (
+            self.p_gate_edge_reg_weight_high > 0.0
+            and edge_reg_high is not None
+        ):
+            aux_total += self.p_gate_edge_reg_weight_high * edge_reg_high.to(
+                dtype=aux_total.dtype
+            )
             aux_used = True
         if aux_used:
-            return (loss_val + aux_total) if (loss_val is not None) else aux_total
+            return (
+                (loss_val + aux_total) if (loss_val is not None) else aux_total
+            )
         return loss_val
 
     def _auto_microbatch(
@@ -1898,7 +2195,10 @@ class Model(nn.Module):
         hard_max = max(1, min(hard_max, b))
         per_sample = int(
             env_first_int(
-                ("STNET_PER_SAMPLE_MEM_BYTES", "STNET_DEVICE_BYTES_PER_SAMPLE"),
+                (
+                    "STNET_PER_SAMPLE_MEM_BYTES",
+                    "STNET_DEVICE_BYTES_PER_SAMPLE",
+                ),
                 default=0,
             )
             or 0
@@ -1909,7 +2209,9 @@ class Model(nn.Module):
             per_sample = int(bytes_per_sample * 8)
         stage_div = max(1, int(env_int("STNET_MICROBATCH_STAGE_DIV", 4)))
         per_sample = max(1, int(per_sample // stage_div))
-        mb_size = _autofit_microbatch(device=device, hard_max=hard_max, per_sample_bytes=per_sample)
+        mb_size = _autofit_microbatch(
+            device=device, hard_max=hard_max, per_sample_bytes=per_sample
+        )
         return int(mb_size)
 
     def forward(
@@ -1920,7 +2222,9 @@ class Model(nn.Module):
         net_loss: Optional[nn.Module] = None,
         global_loss: Optional[nn.Module] = None,
         local_loss: Optional[nn.Module] = None,
-        loss_weights: Optional[Union[Tuple[float, float], LossWeightPolicy]] = None,
+        loss_weights: Optional[
+            Union[Tuple[float, float], LossWeightPolicy]
+        ] = None,
         calibrate_output: bool = True,
         sanitize_nan: bool = True,
         return_loss: Optional[bool] = None,
@@ -1991,7 +2295,11 @@ class Model(nn.Module):
                 loss_weights = td_loss_weights
         device = _infer_module_device(self.fuser, self._device)
         x_raw = features
-        if isinstance(x_raw, torch.Tensor) and x_raw.ndim == 3 and x_raw.shape[1] == 1:
+        if (
+            isinstance(x_raw, torch.Tensor)
+            and x_raw.ndim == 3
+            and x_raw.shape[1] == 1
+        ):
             x_raw = x_raw.reshape(x_raw.shape[0], -1)
         if isinstance(x_raw, torch.Tensor) and x_raw.device != device:
             x_raw = x_raw.to(device=device, non_blocking=True)
@@ -2002,7 +2310,10 @@ class Model(nn.Module):
             meta = Autocast.coerce_metadata(device)
         except Exception:
             meta = None
-            _LOGGER.debug("Autocast.coerce_metadata failed; falling back to fp32", exc_info=True)
+            _LOGGER.debug(
+                "Autocast.coerce_metadata failed; falling back to fp32",
+                exc_info=True,
+            )
         amp_candidates: Tuple[torch.dtype, ...] = ()
         if meta is not None:
             try:
@@ -2013,11 +2324,17 @@ class Model(nn.Module):
             amp_candidates = (torch.float32,)
         safety_margin_pow2 = 3
         try:
-            safety_margin_pow2 = int(getattr(self.__config, "safety_margin_pow2", 3))
+            safety_margin_pow2 = int(
+                getattr(self.__config, "safety_margin_pow2", 3)
+            )
         except Exception:
             safety_margin_pow2 = 3
         safety_margin_pow2 = max(0, min(30, safety_margin_pow2))
-        dev_index = int(device.index) if getattr(device, "index", None) is not None else -1
+        dev_index = (
+            int(device.index)
+            if getattr(device, "index", None) is not None
+            else -1
+        )
         if meta is None:
             cache_key = (
                 device.type,
@@ -2079,7 +2396,9 @@ class Model(nn.Module):
                     amp_dtype = self._amp_dtype_cache.get(cache_key)
                     if amp_dtype is None:
                         amp_dtype = negotiated
-                        if len(self._amp_dtype_cache) >= int(self._amp_dtype_cache_max):
+                        if len(self._amp_dtype_cache) >= int(
+                            self._amp_dtype_cache_max
+                        ):
                             self._amp_dtype_cache.clear()
                         self._amp_dtype_cache[cache_key] = amp_dtype
                     self._amp_dtype_cache_last_dtype = amp_dtype
@@ -2088,7 +2407,9 @@ class Model(nn.Module):
                 amp_dtype = self._amp_dtype_cache.get(cache_key)
                 if amp_dtype is None:
                     amp_dtype = negotiated
-                    if len(self._amp_dtype_cache) >= int(self._amp_dtype_cache_max):
+                    if len(self._amp_dtype_cache) >= int(
+                        self._amp_dtype_cache_max
+                    ):
                         self._amp_dtype_cache.clear()
                     self._amp_dtype_cache[cache_key] = amp_dtype
                 self._amp_dtype_cache_last_dtype = amp_dtype
@@ -2108,10 +2429,14 @@ class Model(nn.Module):
             else False
         )
         has_any_loss = (
-            (net_loss is not None) or (global_loss is not None) or (local_loss is not None)
+            (net_loss is not None)
+            or (global_loss is not None)
+            or (local_loss is not None)
         )
         has_supervision = labels_flat is not None and has_any_loss
-        is_train_path = bool(self.training and grad_enabled and has_supervision)
+        is_train_path = bool(
+            self.training and grad_enabled and has_supervision
+        )
         _did_unshard_fuser = False
         _unshard = getattr(self.fuser, "unshard", None)
         _reshard = getattr(self.fuser, "reshard", None)
@@ -2128,7 +2453,9 @@ class Model(nn.Module):
             except Exception:
                 _did_unshard_fuser = False
         try:
-            requested_base = getattr(self, "base_dtype", None) or getattr(self, "_base_dtype", None)
+            requested_base = getattr(self, "base_dtype", None) or getattr(
+                self, "_base_dtype", None
+            )
             if requested_base is not None:
                 base_dtype = requested_base
             else:
@@ -2136,9 +2463,16 @@ class Model(nn.Module):
                     base_dtype = next(self.parameters()).dtype
                 except Exception:
                     base_dtype = torch.float32 if amp_enabled else amp_dtype
-            if isinstance(x_scaled, torch.Tensor) and x_scaled.device != device:
+            if (
+                isinstance(x_scaled, torch.Tensor)
+                and x_scaled.device != device
+            ):
                 x_scaled = x_scaled.to(device=device, non_blocking=True)
-            features_t = x_scaled.to(dtype=base_dtype) if x_scaled.dtype != base_dtype else x_scaled
+            features_t = (
+                x_scaled.to(dtype=base_dtype)
+                if x_scaled.dtype != base_dtype
+                else x_scaled
+            )
             if features_t.ndim != 2 or features_t.shape[1] != self.in_dim:
                 raise ValueError(
                     f"Expected features shaped (B, {self.in_dim}), got {tuple(features_t.shape)}"
@@ -2166,12 +2500,18 @@ class Model(nn.Module):
                             self.microbatch = max(1, int(mb_enc))
                     except Exception:
                         with self._runtime_lock:
-                            self.microbatch = max(1, int(getattr(self, "microbatch", 64) or 64))
+                            self.microbatch = max(
+                                1, int(getattr(self, "microbatch", 64) or 64)
+                            )
                 with self._runtime_lock:
-                    mb_cfg = int(self.microbatch) if self.microbatch else int(b)
+                    mb_cfg = (
+                        int(self.microbatch) if self.microbatch else int(b)
+                    )
                 mb = max(1, min(int(b), mb_cfg))
 
-            def _encode(inp: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+            def _encode(
+                inp: torch.Tensor,
+            ) -> Tuple[torch.Tensor, torch.Tensor]:
                 with (
                     Autocast.float(device, metadata=meta)
                     if amp_enabled
@@ -2179,10 +2519,16 @@ class Model(nn.Module):
                 ):
                     return self.fuser(inp)
 
-            enc_ctx = inference_mode(self.fuser) if infer_mode else contextlib.nullcontext()
+            enc_ctx = (
+                inference_mode(self.fuser)
+                if infer_mode
+                else contextlib.nullcontext()
+            )
             with enc_ctx:
                 if exporting:
-                    tokens, context = cast(Tuple[torch.Tensor, torch.Tensor], _encode(features_t))
+                    tokens, context = cast(
+                        Tuple[torch.Tensor, torch.Tensor], _encode(features_t)
+                    )
                 else:
                     tokens, context = cast(
                         Tuple[torch.Tensor, torch.Tensor],
@@ -2190,14 +2536,24 @@ class Model(nn.Module):
                             features_t,
                             mb,
                             _encode,
-                            pad_to=int(mb) if self._pad_compiled_microbatch else None,
+                            pad_to=(
+                                int(mb)
+                                if self._pad_compiled_microbatch
+                                else None
+                            ),
                             out_dtype=base_dtype,
-                            cast_slice=lambda t: self._cast_graph_safe(t, device, base_dtype),
+                            cast_slice=lambda t: self._cast_graph_safe(
+                                t, device, base_dtype
+                            ),
                             stage="encoder",
                         ),
                     )
-            tokens = _coerce_tensor(tokens, enabled=sanitize_enabled, inplace=sanitize_inplace)
-            context = _coerce_tensor(context, enabled=sanitize_enabled, inplace=sanitize_inplace)
+            tokens = _coerce_tensor(
+                tokens, enabled=sanitize_enabled, inplace=sanitize_inplace
+            )
+            context = _coerce_tensor(
+                context, enabled=sanitize_enabled, inplace=sanitize_inplace
+            )
             if exporting:
                 assembled = context.reshape(context.shape[0], -1)
             else:
@@ -2208,14 +2564,18 @@ class Model(nn.Module):
                     f"got={int(tokens.shape[0])}, expected={int(b)}"
                 )
             if self.is_norm_linear and self.linear_branch is not None:
-                bl = self.linear_branch(self._cast_graph_safe(features_t, device, assembled.dtype))
+                bl = self.linear_branch(
+                    self._cast_graph_safe(features_t, device, assembled.dtype)
+                )
                 assembled = assembled + bl
             mean_dtype = torch.float32 if amp_enabled else tokens.dtype
             if mean_dtype != tokens.dtype:
                 mean = tokens.to(dtype=mean_dtype).mean(dim=1, keepdim=True)
             else:
                 mean = tokens.mean(dim=1, keepdim=True)
-            mean_cast = symint_safe_expand_as(mean.to(dtype=tokens.dtype), tokens)
+            mean_cast = symint_safe_expand_as(
+                mean.to(dtype=tokens.dtype), tokens
+            )
             tokens_centered = tokens - mean_cast
             if not tokens_centered.is_contiguous():
                 tokens_centered = tokens_centered.contiguous()
@@ -2234,9 +2594,19 @@ class Model(nn.Module):
                 enabled=sanitize_enabled,
                 inplace=sanitize_inplace,
             )
-            ctrl_mb = max(1, min(int(b), int(self.temporal_token_collector.microbatch) or int(b)))
+            ctrl_mb = max(
+                1,
+                min(
+                    int(b),
+                    int(self.temporal_token_collector.microbatch) or int(b),
+                ),
+            )
             graph_break()
-            processor_ctx = inference_mode(self.fuser) if infer_mode else contextlib.nullcontext()
+            processor_ctx = (
+                inference_mode(self.fuser)
+                if infer_mode
+                else contextlib.nullcontext()
+            )
             with processor_ctx:
                 dc = getattr(self, "_decode_compiled", None)
 
@@ -2247,7 +2617,10 @@ class Model(nn.Module):
                         else Autocast.suspend(device)
                     ):
                         if dc is not None:
-                            if self._compile_cudagraphs and getattr(device, "type", None) == "cuda":
+                            if (
+                                self._compile_cudagraphs
+                                and getattr(device, "type", None) == "cuda"
+                            ):
                                 cudagraph_mark_step_begin()
                                 out = cast(torch.Tensor, dc(chunk))
                                 cudagraph_mark_step_end()
@@ -2263,7 +2636,10 @@ class Model(nn.Module):
                         _run_decode_chunk,
                         pad_to=(
                             int(ctrl_mb)
-                            if (dc is not None and self._pad_compiled_microbatch)
+                            if (
+                                dc is not None
+                                and self._pad_compiled_microbatch
+                            )
                             else None
                         ),
                         stage="decoder",
@@ -2298,12 +2674,19 @@ class Model(nn.Module):
                     y_max = getattr(self.scaler, "y_max", None)
                     y_q_low = getattr(self.scaler, "y_q_low", None)
                     y_q_high = getattr(self.scaler, "y_q_high", None)
-                    mean = self.scaler.y_mean.to(device=assembled.device, dtype=assembled.dtype)
-                    std = self.scaler.y_std.to(device=assembled.device, dtype=assembled.dtype)
+                    mean = self.scaler.y_mean.to(
+                        device=assembled.device, dtype=assembled.dtype
+                    )
+                    std = self.scaler.y_std.to(
+                        device=assembled.device, dtype=assembled.dtype
+                    )
                     denom = std + float(self.scaler.eps)
 
                     def _finite_pair(lo: object, hi: object) -> bool:
-                        if not (isinstance(lo, torch.Tensor) and isinstance(hi, torch.Tensor)):
+                        if not (
+                            isinstance(lo, torch.Tensor)
+                            and isinstance(hi, torch.Tensor)
+                        ):
                             return False
                         if (
                             is_symbolic()
@@ -2313,16 +2696,20 @@ class Model(nn.Module):
                         ):
                             return True
                         try:
-                            return bool(torch.isfinite(lo).all().item()) and bool(
-                                torch.isfinite(hi).all().item()
-                            )
+                            return bool(
+                                torch.isfinite(lo).all().item()
+                            ) and bool(torch.isfinite(hi).all().item())
                         except Exception:
                             return False
 
                     have_minmax = _finite_pair(y_min, y_max)
                     have_quant = _finite_pair(y_q_low, y_q_high)
-                    use_quant = bool(getattr(self, "p_gate_bounds_use_quantile", False))
-                    clip_quant = bool(getattr(self, "p_gate_bounds_clip_to_minmax", True))
+                    use_quant = bool(
+                        getattr(self, "p_gate_bounds_use_quantile", False)
+                    )
+                    clip_quant = bool(
+                        getattr(self, "p_gate_bounds_clip_to_minmax", True)
+                    )
                     ylo_t: Optional[torch.Tensor] = None
                     yhi_t: Optional[torch.Tensor] = None
                     if use_quant and have_quant:
@@ -2352,24 +2739,36 @@ class Model(nn.Module):
                         z_min = (ylo_t - mean) / denom
                         z_max = (yhi_t - mean) / denom
                     else:
-                        if bool(getattr(self, "p_gate_fallback_enabled", False)):
-                            k_low_buf = getattr(self, "p_gate_fallback_k_low_buf", None)
-                            k_high_buf = getattr(self, "p_gate_fallback_k_high_buf", None)
+                        if bool(
+                            getattr(self, "p_gate_fallback_enabled", False)
+                        ):
+                            k_low_buf = getattr(
+                                self, "p_gate_fallback_k_low_buf", None
+                            )
+                            k_high_buf = getattr(
+                                self, "p_gate_fallback_k_high_buf", None
+                            )
                             if isinstance(k_low_buf, torch.Tensor):
-                                k_low = k_low_buf.to(device=assembled.device, dtype=assembled.dtype)
+                                k_low = k_low_buf.to(
+                                    device=assembled.device,
+                                    dtype=assembled.dtype,
+                                )
                             else:
                                 k_low = mean.new_tensor(
                                     float(
                                         getattr(
                                             self,
                                             "p_gate_fallback_k_low",
-                                            getattr(self, "p_gate_fallback_k", 0.0),
+                                            getattr(
+                                                self, "p_gate_fallback_k", 0.0
+                                            ),
                                         )
                                     )
                                 )
                             if isinstance(k_high_buf, torch.Tensor):
                                 k_high = k_high_buf.to(
-                                    device=assembled.device, dtype=assembled.dtype
+                                    device=assembled.device,
+                                    dtype=assembled.dtype,
                                 )
                             else:
                                 k_high = mean.new_tensor(
@@ -2377,7 +2776,9 @@ class Model(nn.Module):
                                         getattr(
                                             self,
                                             "p_gate_fallback_k_high",
-                                            getattr(self, "p_gate_fallback_k", 0.0),
+                                            getattr(
+                                                self, "p_gate_fallback_k", 0.0
+                                            ),
                                         )
                                     )
                                 )
@@ -2397,7 +2798,10 @@ class Model(nn.Module):
                     )
                     and (z_min is not None)
                     and (z_max is not None)
-                    and ((not self.p_gate_edge_reg_fallback_only) or bool(fallback_bounds))
+                    and (
+                        (not self.p_gate_edge_reg_fallback_only)
+                        or bool(fallback_bounds)
+                    )
                 )
                 if do_edge_reg:
                     p, edge_reg_low, edge_reg_high = self.p_gate(
@@ -2410,7 +2814,9 @@ class Model(nn.Module):
                         fallback_bounds=bool(fallback_bounds),
                         return_edge_reg_lr=True,
                         edge_reg_frac=float(self.p_gate_edge_reg_frac),
-                        edge_reg_min_width_frac=float(self.p_gate_edge_reg_min_width_frac),
+                        edge_reg_min_width_frac=float(
+                            self.p_gate_edge_reg_min_width_frac
+                        ),
                         edge_reg_power=float(self.p_gate_edge_reg_power),
                     )
                 else:
@@ -2438,7 +2844,9 @@ class Model(nn.Module):
                 y_hat = assembled + delta * 0.5
             else:
                 y_hat = assembled + p * delta
-            y_hat = _coerce_tensor(y_hat, enabled=sanitize_enabled, inplace=sanitize_inplace)
+            y_hat = _coerce_tensor(
+                y_hat, enabled=sanitize_enabled, inplace=sanitize_inplace
+            )
             pred = y_hat.reshape(b, *self.out_shape)
             loss_val: Optional[torch.Tensor] = None
             top_component: Optional[torch.Tensor] = None
@@ -2446,7 +2854,11 @@ class Model(nn.Module):
             use_global_local = labels_flat is not None and (
                 global_loss is not None or local_loss is not None
             )
-            use_net = labels_flat is not None and (net_loss is not None) and (not use_global_local)
+            use_net = (
+                labels_flat is not None
+                and (net_loss is not None)
+                and (not use_global_local)
+            )
             if use_global_local:
                 if loss_weights is None:
                     weights = (1.0, 0.0)
@@ -2458,13 +2870,17 @@ class Model(nn.Module):
                 else:
                     weights = cast(LossWeightPolicy, loss_weights).weights()
                 if z_true is None:
-                    raise RuntimeError("Internal error: z_true missing for regression loss path")
+                    raise RuntimeError(
+                        "Internal error: z_true missing for regression loss path"
+                    )
                 tgt = z_true.to(device=y_hat.device, dtype=y_hat.dtype)
                 total = y_hat.new_tensor(0.0, dtype=y_hat.dtype)
                 y_bot = assembled.to(device=y_hat.device, dtype=y_hat.dtype)
                 if global_loss is not None:
                     use_base_detach = bool(
-                        is_train_path and (local_loss is not None) and (float(weights[1]) > 1e-12)
+                        is_train_path
+                        and (local_loss is not None)
+                        and (float(weights[1]) > 1e-12)
                     )
                     if use_base_detach:
                         base_det = assembled.detach()
@@ -2472,7 +2888,9 @@ class Model(nn.Module):
                         z_top = _coerce_tensor(
                             base_det
                             + (
-                                base_det.new_tensor(0.5) * delta_det if p is None else p * delta_det
+                                base_det.new_tensor(0.5) * delta_det
+                                if p is None
+                                else p * delta_det
                             ),
                             enabled=sanitize_enabled,
                             inplace=sanitize_inplace,
@@ -2483,10 +2901,14 @@ class Model(nn.Module):
                             enabled=sanitize_enabled,
                             inplace=sanitize_inplace,
                         )
-                    top_component = cast(torch.Tensor, global_loss(z_top, z_true))
+                    top_component = cast(
+                        torch.Tensor, global_loss(z_top, z_true)
+                    )
                     total = total + weights[0] * top_component
                 if local_loss is not None:
-                    bottom_component = cast(torch.Tensor, local_loss(y_bot, tgt))
+                    bottom_component = cast(
+                        torch.Tensor, local_loss(y_bot, tgt)
+                    )
                     total = total + weights[1] * bottom_component
                 loss_val = total
             elif use_net:
@@ -2501,7 +2923,9 @@ class Model(nn.Module):
                     tgt = z_true.to(device=y_hat.device, dtype=y_hat.dtype)
                     loss_val = cast(torch.Tensor, net_loss(y_hat, tgt))
             if loss_val is not None and not isinstance(loss_val, torch.Tensor):
-                loss_val = torch.as_tensor(loss_val, device=y_hat.device, dtype=y_hat.dtype)
+                loss_val = torch.as_tensor(
+                    loss_val, device=y_hat.device, dtype=y_hat.dtype
+                )
             loss_val = self._compute_aux_losses(
                 loss_val,
                 y_hat,
@@ -2517,7 +2941,9 @@ class Model(nn.Module):
             )
             if infer_mode and calibrate_output and (not is_cls_loss):
                 z_cal = self.scaler.calibrate(y_hat)
-                pred = self.scaler.denormalize_y(z_cal).reshape(b, *self.out_shape)
+                pred = self.scaler.denormalize_y(z_cal).reshape(
+                    b, *self.out_shape
+                )
             if td_input is not None:
                 if hasattr(td_input, "copy"):
                     out_td = td_input.copy()
@@ -2561,7 +2987,10 @@ class Model(nn.Module):
                         out_td.del_("loss_top")
                 if bottom_component is not None:
                     bottom_td = bottom_component
-                    if isinstance(bottom_td, torch.Tensor) and bottom_td.ndim == 0:
+                    if (
+                        isinstance(bottom_td, torch.Tensor)
+                        and bottom_td.ndim == 0
+                    ):
                         batch_size = tuple(out_td.batch_size)
                         if len(batch_size):
                             bottom_td = bottom_td.expand(batch_size)
@@ -2581,7 +3010,10 @@ class Model(nn.Module):
                     _reshard()
 
     def predict(
-        self, features: torch.Tensor | TensorDictBase, *args: Any, **kwargs: Any
+        self,
+        features: torch.Tensor | TensorDictBase,
+        *args: Any,
+        **kwargs: Any,
     ) -> torch.Tensor | TensorDictBase:
         kwargs.setdefault("return_loss", False)
         return self.forward(features, *args, **kwargs)
