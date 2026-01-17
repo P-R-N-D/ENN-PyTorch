@@ -1143,18 +1143,12 @@ def _configure_torch_nccl_env(device: TorchDeviceLike) -> None:
 
     if "TORCH_NCCL_ENABLE_MONITORING" not in os.environ:
         default_mon = 0 if int(world) <= 1 else 1
-        mon = int(
-            env_int("STNET_TORCH_NCCL_ENABLE_MONITORING", default_mon)
-            or default_mon
-        )
+        mon = int(env_int("STNET_TORCH_NCCL_ENABLE_MONITORING", default_mon))
         os.environ["TORCH_NCCL_ENABLE_MONITORING"] = str(int(mon))
 
     if "TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC" not in os.environ:
         default_hb = 3600 if int(world) <= 1 else 600
-        hb = int(
-            env_int("STNET_TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC", default_hb)
-            or default_hb
-        )
+        hb = int(env_int("STNET_TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC", default_hb))
         os.environ["TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC"] = str(int(hb))
 
 
