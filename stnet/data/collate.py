@@ -2626,7 +2626,7 @@ class Collator:
 
     def __init__(
         self,
-        *,
+        *args: Any,
         labels_dtype: Optional[torch.dtype] = None,
         sanitize: bool = False,
         flatten_features: bool = False,
