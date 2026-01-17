@@ -49,31 +49,16 @@ except Exception:
     triton = _TritonStub()
     tl = _TLStub()
 
-_HAS_TE, te = False, None
-if (
-    torch.cuda.is_available()
-    and getattr(get_device(), "type", "cpu") == "cuda"
-):
-    try:
-        import transformer_engine.pytorch as te
+_torch_flex_attention = None
+_torch_create_block_mask = None
+_torch_create_mask = None
+_te = None
 
-        _HAS_TE = True
-    except Exception:
-        pass
-
-(
-    _HAS_TORCH_FLEX,
-    _torch_flex_attention,
-    _torch_create_block_mask,
-    _torch_create_mask,
-) = (
-    False,
-    None,
-    None,
-    None,
-)
+_HAS_TORCH_FLEX = False
+_HAS_TE = False
 
 _FLEX_KWARGS: set[str] = set()
+
 try:
     from torch.nn.attention.flex_attention import (
         flex_attention as _torch_flex_attention,
@@ -91,10 +76,18 @@ try:
             inspect.signature(_torch_flex_attention).parameters.keys()
         )
 except Exception:
-    _HAS_TORCH_FLEX = False
-    _torch_flex_attention = None
-    _torch_create_block_mask = None
-    _torch_create_mask = None
+    pass
+
+if (
+    torch.cuda.is_available()
+    and getattr(get_device(), "type", "cpu") == "cuda"
+):
+    try:
+        import transformer_engine.pytorch as te
+
+        _HAS_TE = True
+    except Exception:
+        pass
 
 if env_bool("STNET_DISABLE_FLEX_ATTENTION", False):
     _HAS_TORCH_FLEX = False
