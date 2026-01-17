@@ -29,9 +29,9 @@ try:
 except Exception:
     _TORCH_DYNAMO = None
 
-_TORCH_COMPILER = getattr(torch, "compiler", None)
-
 _INDUCTOR_CONFIG_LOCK = Mutex(reentrant=True)
+
+_TORCH_COMPILER = getattr(torch, "compiler", None)
 _TORCH_COMPILE_LOCK = Mutex(reentrant=True)
 
 _CKPT_TL = threading.local()
