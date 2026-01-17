@@ -4,48 +4,43 @@ import contextlib
 import importlib
 import inspect
 import warnings
-from collections.abc import Mapping
-from typing import Any, Iterator
+from collections.abc import Mapping, Callable
+from typing import Any, Iterator, TypeVar
 
 import torch
 
 
-def _safe_find_spec(name: str) -> object | None:
-    try:
-        return importlib.util.find_spec(name)
-    except (ModuleNotFoundError, ImportError):
-        return None
-    except Exception:
-        return None
+_T = TypeVar("_T")
+
+_tdx_is_fake = None
+
+FakeTensor = ()
+TensorDictBase = ()
 
 
-spec = _safe_find_spec("torchdistx.fake")
-if spec is not None:
+def _optional_attr(
+    module: str,
+    attr: str,
+    default: _T,
+    *args: Any,
+    predicate: Callable[[Any], bool] | None = None,
+) -> Any | _T:
     try:
-        torchdistx_fake = importlib.import_module("torchdistx.fake")
-        _tdx_is_fake = getattr(torchdistx_fake, "is_fake", None)
+        if importlib.util.find_spec(module) is None:
+            return default
     except Exception:
-        _tdx_is_fake = None
-else:
-    _tdx_is_fake = None
-
-spec = _safe_find_spec("torch._subclasses.fake_tensor")
-if spec is not None:
+        return default
     try:
-        from torch._subclasses.fake_tensor import FakeTensor
+        mod = importlib.import_module(module)
     except Exception:
-        FakeTensor = tuple()
-else:
-    FakeTensor = tuple()
-
-spec = _safe_find_spec("tensordict")
-if spec is not None:
+        return default
     try:
-        from tensordict import TensorDictBase
+        val = getattr(mod, attr)
     except Exception:
-        TensorDictBase = ()
-else:
-    TensorDictBase = ()
+        return default
+    if predicate is not None and not predicate(val):
+        return default
+    return val
 
 
 def _call_from_buffer(
@@ -295,3 +290,14 @@ def symint_safe_expand(
 
 def symint_safe_expand_as(t: torch.Tensor, ref: torch.Tensor) -> torch.Tensor:
     return symint_safe_expand(t, ref.shape)
+
+
+_tdx_is_fake = _optional_attr(
+    "torchdistx.fake", "is_fake", None, predicate=callable
+)
+FakeTensor = _optional_attr(
+    "torch._subclasses.fake_tensor", "FakeTensor", (), predicate=inspect.isclass
+)
+TensorDictBase = _optional_attr(
+    "tensordict", "TensorDictBase", (), predicate=inspect.isclass
+)
