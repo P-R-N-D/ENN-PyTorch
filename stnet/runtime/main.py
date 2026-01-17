@@ -1226,6 +1226,21 @@ def _configure_torch_nccl_env(device: TorchDeviceLike) -> None:
         hb = int(env_int("STNET_TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC", default_hb))
         os.environ["TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC"] = str(int(hb))
 
+    if "TORCH_NCCL_DUMP_ON_TIMEOUT" not in os.environ:
+        default_dump = 0 if int(world) <= 1 else 1
+        dump = int(env_int("STNET_TORCH_NCCL_DUMP_ON_TIMEOUT", default_dump))
+        os.environ["TORCH_NCCL_DUMP_ON_TIMEOUT"] = str(int(dump))
+
+    if "TORCH_NCCL_ASYNC_ERROR_HANDLING" not in os.environ:
+        default_ae = 0 if int(world) <= 1 else 3
+        ae = int(env_int("STNET_TORCH_NCCL_ASYNC_ERROR_HANDLING", default_ae))
+        os.environ["TORCH_NCCL_ASYNC_ERROR_HANDLING"] = str(int(ae))
+
+    if "TORCH_NCCL_BLOCKING_WAIT" not in os.environ:
+        default_bw = 1 if int(world) <= 1 else 0
+        bw = int(env_int("STNET_TORCH_NCCL_BLOCKING_WAIT", default_bw))
+        os.environ["TORCH_NCCL_BLOCKING_WAIT"] = str(int(bw))
+
 
 def _configure_torch_gloo_env(device: TorchDeviceLike) -> None:
     _ensure_default_socket_ifname()
