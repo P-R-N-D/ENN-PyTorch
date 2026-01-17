@@ -17,10 +17,10 @@ import numpy as np
 import torch
 from tensordict import TensorDict
 from stnet.core.tensor import extract_tensor, from_buffer
-from .lifecycle import build_dataset
 from stnet.api import new_model, train
 from stnet.config import ModelConfig, PatchConfig
 from stnet.runtime.io import Exporter
+from .lifecycle import build_dataset
 
 
 def _as_path_list(out: Any, fallback: Path) -> list[str]:
