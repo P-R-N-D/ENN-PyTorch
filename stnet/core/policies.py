@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import contextlib
 import logging
-import threading
 from dataclasses import dataclass, replace
 from typing import (
     Any,
@@ -12,7 +11,6 @@ from typing import (
     List,
     Optional,
     Protocol,
-    Sequence,
     Tuple,
     Union,
     TYPE_CHECKING,
@@ -1119,8 +1117,6 @@ class ModelPolicy:
         metadata: Optional[Dataset[Any]] = None,
         logger: Optional[Callable[[str], None]] = None,
     ) -> Tuple[nn.Module, bool, str]:
-        from ..data.pipeline import Dataset
-
         meta = ModelPolicy._coerce_metadata(model, metadata)
         device = torch.device(meta.device)
         with contextlib.suppress(Exception):
@@ -1145,8 +1141,6 @@ class ModelPolicy:
         metadata: Optional[Dataset[Any]] = None,
         logger: Optional[Callable[[str], None]] = None,
     ) -> Tuple[nn.Module, bool, str]:
-        from ..data.pipeline import Dataset
-
         meta = ModelPolicy._coerce_metadata(model, metadata)
         device = torch.device(meta.device)
         with contextlib.suppress(Exception):

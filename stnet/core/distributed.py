@@ -11,7 +11,7 @@ import os
 import socket
 import warnings
 from contextlib import AbstractContextManager
-from typing import TYPE_CHECKING, Any, Iterable
+from typing import Any, Iterable
 
 import torch
 import torch.distributed as dist
@@ -32,9 +32,6 @@ try:
     from torch.distributed.algorithms.join import Join as _TorchJoin
 except ImportError:
     _TorchJoin = None
-
-if TYPE_CHECKING:
-    from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 
 try:
     from torch.distributed.tensor import DTensor as _DTensor

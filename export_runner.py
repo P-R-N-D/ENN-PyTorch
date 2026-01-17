@@ -11,10 +11,11 @@ import traceback
 import time
 import warnings
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, Iterator
 
 import numpy as np
 import torch
+from tensordict import TensorDict
 from stnet.core.tensor import extract_tensor, from_buffer
 from wsl_nogil_train import build_dataset
 from stnet.api import new_model, train
@@ -51,7 +52,9 @@ def _stats_np(arr: np.ndarray) -> dict[str, float | list[int]]:
     }
 
 
-def _build_model_and_sample(device: torch.device):
+def _build_model_and_sample(
+    device: torch.device,
+) -> tuple[dict[str, Any], TensorDict, torch.nn.Module, torch.Tensor]:
     data = build_dataset("raw_data.xlsx")
     td_train = data["td_train"]
     S = data["S"]
@@ -104,7 +107,17 @@ def _run_isolated_export(
     env.setdefault("OPENBLAS_NUM_THREADS", "1")
     env.setdefault("NUMEXPR_NUM_THREADS", "1")
     env.setdefault("TORCH_NUM_THREADS", "1")
-    p = subprocess.run(cmd, capture_output=True, text=True, env=env)
+    try:
+        p = subprocess.run(
+            cmd, capture_output=True, text=True, env=env, timeout=120
+        )
+    except subprocess.TimeoutExpired as exc:
+        return {
+            "status": "error",
+            "error": "subprocess export timed out",
+            "stdout_tail": (exc.stdout or "")[-2000:],
+            "stderr_tail": (exc.stderr or "")[-2000:],
+        }
     if p.returncode == 0:
 
         def _parse_last_json_line(text: str) -> dict[str, Any] | None:
@@ -356,7 +369,7 @@ def _draft_export_diagnostics(
 
 
 @contextlib.contextmanager
-def _temp_env(k: str, v: str):
+def _temp_env(k: str, v: str) -> Iterator[None]:
     old = os.environ.get(k)
     os.environ[k] = v
     try:
@@ -369,7 +382,10 @@ def _temp_env(k: str, v: str):
 
 
 def export_and_validate(
-    model: torch.nn.Module, sample: torch.Tensor, td_train, out_dir: Path
+    model: torch.nn.Module,
+    sample: torch.Tensor,
+    td_train: TensorDict,
+    out_dir: Path,
 ) -> Dict[str, Any]:
     out_dir.mkdir(parents=True, exist_ok=True)
     warnings.filterwarnings(

@@ -2,12 +2,10 @@
 from __future__ import annotations
 
 import contextlib
-import copy
 import inspect
 import json
 import logging
 import math
-import threading
 from collections import OrderedDict
 from functools import lru_cache
 from typing import (
@@ -24,9 +22,9 @@ from typing import (
 )
 
 import torch
-from tensordict import TensorDict, TensorDictBase
+from tensordict import TensorDictBase
 from torch import nn, optim
-from torch.optim.swa_utils import AveragedModel, SWALR, update_bn
+from torch.optim.swa_utils import AveragedModel, update_bn
 
 from .wrappers import _TensorDictPack
 

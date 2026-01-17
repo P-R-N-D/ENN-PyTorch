@@ -8,7 +8,6 @@ import importlib
 import math
 import os
 import random
-import threading
 import time
 from itertools import chain
 from dataclasses import dataclass, field, replace
@@ -18,7 +17,6 @@ from typing import (
     Callable,
     Dict,
     Generic,
-    TYPE_CHECKING,
     Mapping,
     MutableMapping,
     Optional,
@@ -34,7 +32,7 @@ from typing import (
 )
 
 import torch
-from tensordict import MemoryMappedTensor, TensorDict, TensorDictBase
+from tensordict import MemoryMappedTensor, TensorDictBase
 from torchdata.nodes import BaseNode
 
 from ..core.concurrency import Disposable, Mutex, new_affinity
@@ -43,7 +41,6 @@ from ..core.datatypes import (
     env_first,
     env_first_float,
     env_first_int,
-    read_json,
 )
 from ..core.policies import BatchPolicy, LoaderPolicy, WorkerPolicy
 from ..core.system import (

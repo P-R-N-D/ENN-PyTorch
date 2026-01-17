@@ -3,15 +3,10 @@ from __future__ import annotations
 import collections.abc
 import contextlib
 import logging
-import math
-import multiprocessing
 import os
-import queue
 import shutil
 import tempfile
-import threading
 import time
-import traceback
 from contextlib import suppress
 from functools import lru_cache, partial
 from pathlib import Path
@@ -19,73 +14,41 @@ from typing import (
     Any,
     Callable,
     Dict,
-    Iterator,
-    Literal,
     Mapping,
     Optional,
     Sequence,
     Tuple,
-    TypedDict,
 )
 
 import h5py
 import numpy
 import torch
 import torch.utils.data
-import torchdata.nodes
 from tensordict import (
     MemoryMappedTensor,
     PersistentTensorDict,
     TensorDict,
     TensorDictBase,
 )
-from torchdata.nodes import (
-    BaseNode,
-    MultiNodeWeightedSampler,
-    ParallelMapper,
-    SamplerWrapper,
-)
 
 from ..core.concurrency import (
-    BufferQueue,
-    Disposable,
-    Mutex,
     TensorPagePool,
     TensorSpooler,
-    ProducerError,
-    close,
-    new_affinity,
-    new_executor,
-    new_thread,
 )
 from ..core.datatypes import (
     PathLike,
     dtype_from_name,
-    env_bool,
     env_first_int,
     env_str,
     parse_torch_dtype,
-    default_underflow_action,
     get_meta_path,
     read_json,
     save_temp,
     write_json,
-    normalize_underflow_action,
 )
-from ..core.graph import inference_mode
-from ..core.policies import WorkerPolicy
 from ..core.system import (
-    CPU,
     Memory,
-    accelerator_stream,
-    accelerator_type,
-    current_accelerator_stream,
-    get_accelerator_index,
-    get_num_accelerators,
     is_accelerator_available,
-    is_stream_supported,
-    new_accelerator_event,
-    new_accelerator_stream,
 )
 
 
@@ -187,13 +150,7 @@ def _td_batch_size_from_X(x: Any) -> list[int]:
 def _coerce_path(path: PathLike) -> Optional[str]:
     if path is None:
         return None
-    p = (
-        str(path)
-        .replace("\\n", "")
-        .replace("\r", "")
-        .replace("\n", "")
-        .strip()
-    )
+    p = str(path).replace("\r", "").replace("\n", "").strip()
     if not p or p.lower() in ("none", "null", "nil"):
         return None
     return os.path.abspath(os.path.expanduser(p))

@@ -14,7 +14,6 @@ from pathlib import Path
 from typing import (
     Any,
     Callable,
-    Generic,
     Mapping,
     Optional,
     ParamSpec,

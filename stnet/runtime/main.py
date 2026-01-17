@@ -37,7 +37,6 @@ from torch.distributed.checkpoint.state_dict import (
     get_model_state_dict,
     get_optimizer_state_dict,
     set_model_state_dict,
-    set_optimizer_state_dict,
 )
 from torch.distributed.elastic.control_plane import worker_main
 
@@ -104,7 +103,6 @@ from ..core.graph import (
     cudagraph_mark_step_begin,
     cudagraph_mark_step_end,
     from_checkpoint,
-    iter_checkpoint,
     to_submodule,
     to_checkpoint,
 )

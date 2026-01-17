@@ -60,7 +60,7 @@ def _call_from_buffer(
         return fn(**kw)
 
 
-def _to_local_if_available(t: torch.Tensor) -> torch.Tensor:
+def _to_local(t: torch.Tensor) -> torch.Tensor:
     try:
         return t.to_local() if hasattr(t, "to_local") else t
     except Exception:

@@ -6,7 +6,6 @@ import ctypes
 import importlib
 import hashlib
 import itertools
-import platform
 import sys
 import concurrent.futures as futures
 import traceback
