@@ -264,7 +264,7 @@ def _read_int_file(path: str) -> Optional[int]:
 
 
 
-def _main_module_has_real_file() -> bool:
+def _is_main_importable() -> bool:
     try:
         import __main__
 
@@ -285,7 +285,7 @@ def _main_module_has_real_file() -> bool:
 
 
 @contextlib.contextmanager
-def _stnet_spawn_argv0_context() -> Any:
+def _start_context() -> Any:
     stub = _STNET_MP_MAIN_STUB_PATH
     if not stub or not sys.argv:
         yield
@@ -299,8 +299,8 @@ def _stnet_spawn_argv0_context() -> Any:
             sys.argv[0] = old
 
 
-def _ensure_importable_main_for_spawn_forkserver() -> None:
-    if _main_module_has_real_file():
+def _validate_main_importability() -> None:
+    if _is_main_importable():
         return
     try:
         import __main__
@@ -1246,7 +1246,7 @@ def optimal_start_method() -> str:
     if platform.startswith("win"):
         candidates = ("spawn",)
     elif os.name == "posix":
-        _ensure_importable_main_for_spawn_forkserver()
+        _validate_main_importability()
         candidates = ("forkserver", "spawn")
     else:
         candidates = ("spawn",)
@@ -1267,7 +1267,7 @@ def init_start_method() -> None:
     platform = sys.platform
     existing = torch.multiprocessing.get_start_method(allow_none=True)
     if os.name == "posix":
-        _ensure_importable_main_for_spawn_forkserver()
+        _validate_main_importability()
     if platform.startswith("win"):
         if existing == "spawn":
             return

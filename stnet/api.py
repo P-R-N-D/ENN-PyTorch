@@ -62,7 +62,7 @@ from .core.distributed import (
 from .core.graph import inference_mode
 from .core.policies import WorkerPolicy
 from .core.system import (
-    _stnet_spawn_argv0_context,
+    _start_context,
     init_python_path,
     init_start_method,
     new_dir,
@@ -1038,7 +1038,7 @@ def train(
         with contextlib.suppress(Exception):
             model.to("cpu")
         _clear_device_caches()
-        with _stnet_spawn_argv0_context():
+        with _start_context():
             elastic_launch(lc, process)(ops)
         fallback = os.path.join(ckpt_dir, "model.pt")
         if os.path.isfile(fallback):
@@ -1282,7 +1282,7 @@ def predict(
             with contextlib.suppress(Exception):
                 model.to("cpu")
             _clear_device_caches()
-            with _stnet_spawn_argv0_context():
+            with _start_context():
                 elastic_launch(lc, process)(ops)
             chunks_dir = os.path.join(ckpt_dir, "pred_chunks")
             if not os.path.isdir(chunks_dir):
