@@ -165,6 +165,18 @@ class WorkerPolicy:
                 )
             ),
         )
+        if is_accel and int(nacc) > 0:
+            allow_over = int(
+                env_first_int(
+                    (
+                        "STNET_ALLOW_ACCELERATOR_OVERSUBSCRIBE",
+                        "STNET_ALLOW_GPU_OVERSUBSCRIBE",
+                    ),
+                    0,
+                )
+            )
+            if not allow_over and int(local_world_guess) > int(nacc):
+                local_world_guess = int(nacc)
         _nogil = bool(CPU.is_optimized_for_no_gil())
         cap_mult = _default_thread_limit(
             ncpu_raw, is_accel=is_accel, nogil=_nogil

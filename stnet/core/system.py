@@ -1111,26 +1111,6 @@ def get_runtime_config() -> SimpleNamespace:
     return _RUNTIME_CFG
 
 
-def is_main_loadable() -> bool:
-    main_mod = sys.modules.get("__main__")
-    if main_mod is None:
-        return False
-    main_path = getattr(main_mod, "__file__", None)
-    if not main_path:
-        return False
-    try:
-        main_path = os.fspath(main_path)
-    except TypeError:
-        return False
-    if (
-        isinstance(main_path, str)
-        and main_path.startswith("<")
-        and main_path.endswith(">")
-    ):
-        return False
-    return os.path.exists(main_path)
-
-
 def init_python_path() -> str:
     separator = os.pathsep
     current_env = os.environ.get("PYTHONPATH", "")
