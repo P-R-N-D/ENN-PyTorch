@@ -1214,9 +1214,6 @@ def _main_module_has_real_file() -> bool:
 
 
 def optimal_start_method() -> str:
-    current = torch.multiprocessing.get_start_method(allow_none=True)
-    if current == "fork":
-        return current
     platform = sys.platform
     if (
         platform.startswith(("darwin", "linux"))
@@ -1229,8 +1226,6 @@ def optimal_start_method() -> str:
         candidates = ("forkserver", "spawn")
     else:
         candidates = ("spawn",)
-    if current in candidates:
-        return current
     for method in candidates:
         try:
             multiprocessing.get_context(method)
@@ -1255,15 +1250,19 @@ def init_start_method() -> None:
                 module.set_start_method("fork", force=True)
         return
     existing = torch.multiprocessing.get_start_method(allow_none=True)
-    if existing is not None and existing != "fork":
-        return
-    last_error: Optional[BaseException] = None
     if platform.startswith("win"):
+        if existing == "spawn":
+            return
         candidates = ("spawn",)
     elif platform.startswith(("darwin", "linux")):
+        if existing == "forkserver":
+            return
         candidates = ("forkserver", "spawn")
     else:
+        if existing == "spawn":
+            return
         candidates = ("spawn",)
+    last_error: Optional[BaseException] = None
     for method in candidates:
         try:
             multiprocessing.get_context(method)
