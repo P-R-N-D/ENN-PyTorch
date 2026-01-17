@@ -10,31 +10,6 @@ from typing import Any, Iterator
 import torch
 
 
-def symint_safe_expand(
-    t: torch.Tensor,
-    target_shape: tuple[object, ...] | list[object] | torch.Size,
-) -> torch.Tensor:
-    target = tuple(target_shape)
-    if tuple(t.shape) == target:
-        return t
-
-    src = tuple(t.shape)
-    if len(target) < len(src):
-        return t.expand(target)
-
-    src_aligned = (1,) * (len(target) - len(src)) + src
-
-    sizes: list[object] = []
-    for s_dim, t_dim in zip(src_aligned, target):
-        sizes.append(-1 if s_dim == t_dim else t_dim)
-
-    return t.expand(tuple(sizes))
-
-
-def symint_safe_expand_as(t: torch.Tensor, ref: torch.Tensor) -> torch.Tensor:
-    return symint_safe_expand(t, ref.shape)
-
-
 def _safe_find_spec(name: str) -> object | None:
     try:
         return importlib.util.find_spec(name)
@@ -88,6 +63,13 @@ def _call_from_buffer(
         return fn(**kw, requires_grad=requires_grad)
     except TypeError:
         return fn(**kw)
+
+
+def _to_local_if_available(t: torch.Tensor) -> torch.Tensor:
+    try:
+        return t.to_local() if hasattr(t, "to_local") else t
+    except Exception:
+        return t
 
 
 def to_torch_tensor(obj: Any) -> torch.Tensor:
@@ -173,13 +155,6 @@ def coerce_tensor(
             for k, v in value.items()
         )
     return value
-
-
-def _to_local_if_available(t: torch.Tensor) -> torch.Tensor:
-    try:
-        return t.to_local() if hasattr(t, "to_local") else t
-    except Exception:
-        return t
 
 
 def extract_tensor(out: object) -> torch.Tensor:
@@ -295,3 +270,28 @@ def from_buffer(
         yield
     finally:
         setattr(torch, "frombuffer", _original)
+
+
+def symint_safe_expand(
+    t: torch.Tensor,
+    target_shape: tuple[object, ...] | list[object] | torch.Size,
+) -> torch.Tensor:
+    target = tuple(target_shape)
+    if tuple(t.shape) == target:
+        return t
+
+    src = tuple(t.shape)
+    if len(target) < len(src):
+        return t.expand(target)
+
+    src_aligned = (1,) * (len(target) - len(src)) + src
+
+    sizes: list[object] = []
+    for s_dim, t_dim in zip(src_aligned, target):
+        sizes.append(-1 if s_dim == t_dim else t_dim)
+
+    return t.expand(tuple(sizes))
+
+
+def symint_safe_expand_as(t: torch.Tensor, ref: torch.Tensor) -> torch.Tensor:
+    return symint_safe_expand(t, ref.shape)
