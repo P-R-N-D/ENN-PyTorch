@@ -1122,41 +1122,11 @@ def _coerce_dcp_keys(state: object) -> object:
 
 
 def _get_backend_type(device: TorchDeviceLike) -> object:
-    def _is_backend_available(name: str) -> bool:
-        if not name:
-            return False
-        try:
-            if not (torch.distributed.is_available() and hasattr(torch, "distributed")):
-                return False
-        except Exception:
-            return False
-        check = getattr(torch.distributed, f"is_{str(name).lower()}_available", None)
-        if callable(check):
-            try:
-                return bool(check())
-            except Exception:
-                return False
-        return str(name).lower() == "gloo"
-
-    forced = env_str("STNET_DISTRIBUTED_BACKEND")
-    if forced:
-        forced_l = str(forced).strip().lower()
-        if forced_l and forced_l not in {"auto", "default"}:
-            if _is_backend_available(forced_l):
-                return forced_l
-
     dev_type = str(getattr(device, "type", "cpu"))
-    get_default = getattr(torch.distributed, "get_default_backend_for_device", None)
-    if callable(get_default):
-        with contextlib.suppress(Exception):
-            b = str(get_default(device)).lower()
-            if b and _is_backend_available(b):
-                return b
-
     if dev_type == "cuda":
-        return "nccl" if _is_backend_available("nccl") else "gloo"
+        return "nccl"
     if dev_type == "xpu":
-        return "xccl" if _is_backend_available("xccl") else "gloo"
+        return "xccl"
     return "gloo"
 
 
