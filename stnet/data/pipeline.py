@@ -1461,9 +1461,10 @@ class Dataset(Generic[TExtra]):
             lkey = collate.get_label_key(data, required=False)
             labels = data.get(lkey, None) if lkey is not None else None
             if bool(return_keys):
-                keys = (
-                    data.get("row_ids", None) or data.get("keys", None) or ()
-                )
+                row_ids = data.get("row_ids", None)
+                if row_ids is None:
+                    row_ids = data.get("keys", None)
+                keys = row_ids if row_ids is not None else ()
         elif isinstance(data, Mapping):
             if (
                 collate._resolve_key(
@@ -1480,11 +1481,10 @@ class Dataset(Generic[TExtra]):
                 lkey = collate.get_label_key(data, required=False)
                 labels = data.get(lkey, None) if lkey is not None else None
                 if bool(return_keys):
-                    keys = (
-                        data.get("row_ids", None)
-                        or data.get("keys", None)
-                        or ()
-                    )
+                    row_ids = data.get("row_ids", None)
+                    if row_ids is None:
+                        row_ids = data.get("keys", None)
+                    keys = row_ids if row_ids is not None else ()
             else:
                 it = iter(data.items())
                 try:
