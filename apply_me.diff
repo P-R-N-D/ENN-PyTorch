@@ -1,0 +1,325 @@
+--- a/stnet/data/collate.py
++++ b/stnet/data/collate.py
+@@ -785,9 +785,17 @@
+         chunk_size = int(env_chunk)
+     req_chunk = int(chunk_size or 0)
+     auto_chunk = req_chunk <= 0
+-    chunk_first = max(
+-        1, min(count_i, req_chunk if req_chunk > 0 else min(count_i, 256))
+-    )
++    # In auto-chunk mode, a single row can be extremely large (e.g., huge
++    # spatio-temporal label grids). The previous heuristic always forced
++    # a minimum of 32 rows per chunk in pass2 (and up to 256 in pass1), which
++    # can easily exceed Colab-sized RAM and crash the runtime.
++    #
++    # Start with a tiny probe chunk (1 row) so we can infer row_bytes, then
++    # select a safe chunk size for the remaining pass1 iterations.
++    if not auto_chunk:
++        chunk_first = max(1, min(count_i, req_chunk))
++    else:
++        chunk_first = 1
+     allow_missing = bool(allow_missing_labels) or bool(features_only)
+     default_lshape = (
+         tuple(default_label_shape) if default_label_shape is not None else (1,)
+@@ -803,18 +811,30 @@
+     }
+     in_dim: Optional[int] = None
+     label_shape: Optional[Tuple[int, ...]] = None
+-    for s in range(0, count_i, int(chunk_first)):
+-        e = min(count_i, s + int(chunk_first))
+-        batch = get_batch(int(s), int(e))
++    # Pass 1: infer shapes + stats.
++    #
++    # In auto-chunk mode, a single row can be extremely large (e.g., huge
++    # spatio-temporal label grids). Forcing a fixed minimum chunk size can
++    # explode peak host RAM usage and trigger OOM kills (e.g. Colab).
++    #
++    # We start with a small probe chunk, infer the per-row footprint, then
++    # adapt chunk_first for the remainder of pass1.
++    s_i = 0
++    auto_chunk_adjusted = not bool(auto_chunk)
++    while int(s_i) < int(count_i):
++        e_i = min(int(count_i), int(s_i) + int(chunk_first))
++        batch = get_batch(int(s_i), int(e_i))
+         fx, lb, _, _ = ds.preprocess(batch, return_keys=False)
+         n = _batch_n(fx)
+         if n <= 0:
++            s_i = int(e_i)
+             continue
+-        expected = int(e) - int(s)
+-        if n != expected:
++        expected = int(e_i) - int(s_i)
++        if int(n) != int(expected):
+             raise RuntimeError(
+-                f"Pass1 batch size mismatch for out_dir={out_dir!r}: expected {expected}, got {n} (s={s}, e={e})."
++                f"Pass1 batch size mismatch for out_dir={out_dir!r}: expected {expected}, got {n} (s={s_i}, e={e_i})."
+             )
++
+         fx_flat = _flat2d_cpu_contig(fx, n)
+         cur_in_dim = int(fx_flat.shape[1])
+         if in_dim is None:
+@@ -823,6 +843,7 @@
+             raise RuntimeError(
+                 f"feature dim mismatch: expected {in_dim}, got {cur_in_dim}"
+             )
++
+         if lb is None:
+             if not allow_missing:
+                 raise RuntimeError("memmap writer requires labels (got None)")
+@@ -831,12 +852,50 @@
+         else:
+             cur_label_shape = tuple(lb.shape[1:])
+             lb_flat = _flat2d_cpu_contig(lb, n)
++
+         if label_shape is None:
+             label_shape = cur_label_shape
+         elif tuple(label_shape) != tuple(cur_label_shape):
+             raise RuntimeError(
+                 f"label shape mismatch: expected {label_shape}, got {cur_label_shape}"
+             )
++
++        # Auto-chunk: after the first non-empty batch, pick a safe chunk size.
++        # NOTE: pass1 uses ds_meta dtypes (often float64), so we estimate using
++        # the batch's actual element sizes to protect peak RAM.
++        if not bool(auto_chunk_adjusted):
++            try:
++                target_bytes = int(env_first_int(("STNET_MEMMAP_CHUNK_BYTES",), 0))
++                if target_bytes <= 0:
++                    target_mb = int(env_first_int(("STNET_MEMMAP_CHUNK_MB",), 64))
++                    target_bytes = int(target_mb) * 1024 * 1024
++                avail = int(Memory.available() or 0)
++                if avail > 0:
++                    target_bytes = int(
++                        min(
++                            int(target_bytes),
++                            max(8 * 1024 * 1024, int(avail) // 16),
++                        )
++                    )
++                elem_size = int(fx_flat.element_size())
++                if lb_flat is not None:
++                    elem_size = max(elem_size, int(lb_flat.element_size()))
++                label_numel = (
++                    0 if bool(features_only) else int(numpy.prod(label_shape))
++                )
++                row_bytes = max(1, (int(in_dim) + int(label_numel)) * elem_size)
++                new_chunk = int(
++                    max(1, min(int(count_i), int(target_bytes) // int(row_bytes)))
++                )
++                pass1_max = int(env_first_int(("STNET_MEMMAP_PASS1_CHUNK_MAX",), 256))
++                if pass1_max > 0:
++                    new_chunk = min(new_chunk, pass1_max)
++                chunk_first = int(max(1, new_chunk))
++            except Exception:
++                # Keep the conservative chunk_first if sizing logic fails.
++                pass
++            auto_chunk_adjusted = True
++
+         f_stats = Dataset.tensor_scale_stats(fx_flat)
+         if bool(features_only):
+             stats = Dataset.merge_scale_stats(stats, f_stats)
+@@ -856,6 +915,8 @@
+             stats = Dataset.merge_scale_stats(
+                 stats, Dataset.merge_scale_stats(f_stats, l_stats)
+             )
++
++        s_i = int(e_i)
+     if in_dim is None or label_shape is None:
+         raise RuntimeError("Failed to infer in_dim/label_shape from data")
+     negotiable = Dataset.is_fp32_castable(
+@@ -883,7 +944,7 @@
+         except Exception:
+             pass
+         chunk_second = int(
+-            max(1, min(count_i, max(32, int(target_bytes) // int(row_bytes))))
++            max(1, min(count_i, int(target_bytes) // int(row_bytes)))
+         )
+     else:
+         chunk_second = int(max(1, min(count_i, req_chunk)))
+--- a/stnet/data/nodes.py
++++ b/stnet/data/nodes.py
+@@ -1413,7 +1413,11 @@
+                 hasattr(t, "is_pinned") and t.is_pinned()
+             ):
+                 return t
+-            buf, tok = pool.get_like(obj, return_handle=True, block=False)
++            # Allocate a page that matches the specific tensor we are staging.
++            # Using the outer `obj` here can accidentally key the allocation on
++            # a non-tensor container (e.g., dict/tuple batches), which both
++            # breaks correctness and defeats the pool.
++            buf, tok = pool.get_like(t, return_handle=True, block=False)
+             buf.copy_(t, non_blocking=False)
+             tokens.append(tok)
+             return buf
+--- a/stnet/data/pipeline.py
++++ b/stnet/data/pipeline.py
+@@ -198,55 +198,94 @@
+     _y_cpu: Optional[torch.Tensor],
+     _device: torch.device,
+     _bs: int,
+-    _steps: int = 8,
++    _steps: int = 10,
+     _warmup: int = 2,
+ ) -> float:
+     N = int(_x_cpu.shape[0])
+-    bs, times = max(1, min(int(_bs), N)), []
++    bs = max(1, min(int(_bs), N))
+     dev_t = str(getattr(_device, "type", "cpu") or "cpu")
+-    pin_ok = bool(is_pin_supported(dev_t))
++
++    # Guard against huge pinned copies during probing on CUDA/XPU.
++    # In low-RAM notebook environments, a single pin_memory() of a large batch
++    # can OOM the kernel before training even starts.
++    max_probe_bytes = int(
++        env_first_int(
++            (
++                "STNET_H2D_PROBE_MAX_BYTES",
++                "STNET_H2D_PROBE_BYTES",
++                "STNET_H2D_COUNTER_MAX_BYTES",
++            ),
++            default=256 * 1024 * 1024,
++        )
++        or 0
++    )
++    if max_probe_bytes > 0:
++        sample_bytes = int(_get_sample_size(_x_cpu, _y_cpu) or 0)
++        if sample_bytes > 0:
++            bs_cap = max(1, int(max_probe_bytes) // max(1, sample_bytes))
++            bs = max(1, min(bs, bs_cap))
++
++    pin_supported = bool(is_pin_supported(dev_t))
++    max_pin_bytes = int(
++        env_first_int(
++            (
++                "STNET_H2D_PROBE_MAX_PIN_BYTES",
++                "STNET_H2D_PROBE_PIN_MAX_BYTES",
++            ),
++            default=max_probe_bytes,
++        )
++        or 0
++    )
++    if max_pin_bytes < 0:
++        max_pin_bytes = 0
++
+     ev0 = ev1 = None
+     if is_accelerator_timer_supported(dev_t):
+         ev0 = new_accelerator_event(_device, enable_timing=True)
+         ev1 = new_accelerator_event(_device, enable_timing=True)
+-    for s in range(_steps + _warmup):
++
++    times: list[float] = []
++    for s in range(int(_steps) + int(_warmup)):
+         start = random.randint(0, N - bs) if N > bs else 0
+         xb = _x_cpu[start : start + bs]
+         yb = _y_cpu[start : start + bs] if _y_cpu is not None else None
+-        if pin_ok:
++
++        # Avoid pinning extremely large batches; page-locked allocations can exhaust host RAM.
++        pin_batch = bool(pin_supported)
++        if pin_batch and max_pin_bytes > 0:
++            bbytes = int(xb.element_size() * xb.numel())
++            if yb is not None:
++                bbytes += int(yb.element_size() * yb.numel())
++            if bbytes > int(max_pin_bytes):
++                pin_batch = False
++
++        if pin_batch:
+             with contextlib.suppress(Exception):
+-                xb = (
+-                    xb
+-                    if (hasattr(xb, "is_pinned") and xb.is_pinned())
+-                    else xb.pin_memory()
+-                )
++                xb = xb if (hasattr(xb, "is_pinned") and xb.is_pinned()) else xb.pin_memory()
+             if yb is not None:
+                 with contextlib.suppress(Exception):
+-                    yb = (
+-                        yb
+-                        if (hasattr(yb, "is_pinned") and yb.is_pinned())
+-                        else yb.pin_memory()
+-                    )
++                    yb = yb if (hasattr(yb, "is_pinned") and yb.is_pinned()) else yb.pin_memory()
++
+         _sync_device(_device)
+         if ev0 is not None and ev1 is not None:
+             with accelerator(_device):
+                 ev0.record()
+-                xb.to(_device, non_blocking=pin_ok)
+-                yb.to(_device, non_blocking=pin_ok) if yb is not None else None
++                xb.to(_device, non_blocking=bool(pin_batch))
++                yb.to(_device, non_blocking=bool(pin_batch)) if yb is not None else None
+                 ev1.record()
+             _sync_device(_device)
+             ms = float(ev0.elapsed_time(ev1))
+         else:
+             tns0 = time.perf_counter_ns()
+-            xb.to(_device, non_blocking=pin_ok)
+-            yb.to(_device, non_blocking=pin_ok) if yb is not None else None
++            xb.to(_device, non_blocking=bool(pin_batch))
++            yb.to(_device, non_blocking=bool(pin_batch)) if yb is not None else None
+             _sync_device(_device)
+             ms = (time.perf_counter_ns() - tns0) / 1e6
+-        if s >= _warmup:
+-            times.append(ms)
+-    return float(sorted(times)[len(times) // 2]) if times else 0.0
+ 
++        if s >= int(_warmup):
++            times.append(ms)
+ 
++    return float(sorted(times)[len(times) // 2]) if times else 0.0
+ def _set_batch_interval(
+     _ds: "Sampler",
+     _dev: torch.device,
+@@ -276,6 +315,10 @@
+     if sbytes <= 0:
+         return (max(1, min(256, len(_ds))), 0.0)
+     B_cap = 1 << 16
++
++    max_batch_env = int(
++        env_first_int(("STNET_MAX_BATCH_SIZE", "STNET_MAX_BATCH"), default=0) or 0
++    )
+     per_sample = int(getattr(_ds, "_per_sample_mem_bytes", 0) or 0)
+     if per_sample <= 0:
+         per_sample = int(
+@@ -384,6 +427,24 @@
+                 )
+             )
+             probe_bs = max(1, min(int(B_cap), 64))
++            if int(max_batch_env) > 0:
++                probe_bs = max(1, min(int(probe_bs), int(max_batch_env)))
++            probe_max_bytes = int(
++                env_first_int(
++                    (
++                        "STNET_H2D_PROBE_MAX_BYTES",
++                        "STNET_H2D_PROBE_BYTES",
++                        "STNET_H2D_COUNTER_MAX_BYTES",
++                    ),
++                    default=256 * 1024 * 1024,
++                )
++                or 0
++            )
++            if probe_max_bytes > 0 and int(sbytes) > 0:
++                probe_bs = max(
++                    1,
++                    min(int(probe_bs), int(probe_max_bytes) // max(1, int(sbytes))),
++                )
+             med_probe = 0.0
+             with contextlib.suppress(Exception):
+                 med_probe = float(
+@@ -454,15 +515,8 @@
+     if cap_from_mem > 0:
+         B_cap = min(B_cap, cap_from_mem)
+     B_cap = max(1, min(int(B_cap), len(_ds)))
+-    if (
+-        env_max := int(
+-            env_first_int(
+-                ("STNET_MAX_BATCH_SIZE", "STNET_MAX_BATCH"), default=0
+-            )
+-            or 0
+-        )
+-    ) > 0:
+-        B_cap = max(1, min(B_cap, int(env_max)))
++    if int(max_batch_env) > 0:
++        B_cap = max(1, min(B_cap, int(max_batch_env)))
+     with contextlib.suppress(Exception):
+         setattr(_ds, "_S_B_cap", int(B_cap))
+     candidates = _get_random_batch(sbytes, _dev, len(_ds))
