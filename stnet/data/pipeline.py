@@ -198,51 +198,79 @@ def _h2d_counter(
     _y_cpu: Optional[torch.Tensor],
     _device: torch.device,
     _bs: int,
-    _steps: int = 8,
+    _steps: int = 10,
     _warmup: int = 2,
 ) -> float:
     N = int(_x_cpu.shape[0])
-    bs, times = max(1, min(int(_bs), N)), []
+    bs = max(1, min(int(_bs), N))
     dev_t = str(getattr(_device, "type", "cpu") or "cpu")
-    pin_ok = bool(is_pin_supported(dev_t))
+    max_probe_bytes = int(
+        env_first_int(
+            (
+                "STNET_H2D_PROBE_MAX_BYTES",
+                "STNET_H2D_PROBE_BYTES",
+                "STNET_H2D_COUNTER_MAX_BYTES",
+            ),
+            default=256 * 1024 * 1024,
+        )
+        or 0
+    )
+    if max_probe_bytes > 0:
+        sample_bytes = int(_get_sample_size(_x_cpu, _y_cpu) or 0)
+        if sample_bytes > 0:
+            bs_cap = max(1, int(max_probe_bytes) // max(1, sample_bytes))
+            bs = max(1, min(bs, bs_cap))
+    pin_supported = bool(is_pin_supported(dev_t))
+    max_pin_bytes = int(
+        env_first_int(
+            (
+                "STNET_H2D_PROBE_MAX_PIN_BYTES",
+                "STNET_H2D_PROBE_PIN_MAX_BYTES",
+            ),
+            default=max_probe_bytes,
+        )
+        or 0
+    )
+    if max_pin_bytes < 0:
+        max_pin_bytes = 0
     ev0 = ev1 = None
     if is_accelerator_timer_supported(dev_t):
         ev0 = new_accelerator_event(_device, enable_timing=True)
         ev1 = new_accelerator_event(_device, enable_timing=True)
-    for s in range(_steps + _warmup):
+    times: list[float] = []
+    for s in range(int(_steps) + int(_warmup)):
         start = random.randint(0, N - bs) if N > bs else 0
         xb = _x_cpu[start : start + bs]
         yb = _y_cpu[start : start + bs] if _y_cpu is not None else None
-        if pin_ok:
+        pin_batch = bool(pin_supported)
+        if pin_batch and max_pin_bytes > 0:
+            bbytes = int(xb.element_size() * xb.numel())
+            if yb is not None:
+                bbytes += int(yb.element_size() * yb.numel())
+            if bbytes > int(max_pin_bytes):
+                pin_batch = False
+        if pin_batch:
             with contextlib.suppress(Exception):
-                xb = (
-                    xb
-                    if (hasattr(xb, "is_pinned") and xb.is_pinned())
-                    else xb.pin_memory()
-                )
+                xb = xb if (hasattr(xb, "is_pinned") and xb.is_pinned()) else xb.pin_memory()
             if yb is not None:
                 with contextlib.suppress(Exception):
-                    yb = (
-                        yb
-                        if (hasattr(yb, "is_pinned") and yb.is_pinned())
-                        else yb.pin_memory()
-                    )
+                    yb = yb if (hasattr(yb, "is_pinned") and yb.is_pinned()) else yb.pin_memory()
         _sync_device(_device)
         if ev0 is not None and ev1 is not None:
             with accelerator(_device):
                 ev0.record()
-                xb.to(_device, non_blocking=pin_ok)
-                yb.to(_device, non_blocking=pin_ok) if yb is not None else None
+                xb.to(_device, non_blocking=bool(pin_batch))
+                yb.to(_device, non_blocking=bool(pin_batch)) if yb is not None else None
                 ev1.record()
             _sync_device(_device)
             ms = float(ev0.elapsed_time(ev1))
         else:
             tns0 = time.perf_counter_ns()
-            xb.to(_device, non_blocking=pin_ok)
-            yb.to(_device, non_blocking=pin_ok) if yb is not None else None
+            xb.to(_device, non_blocking=bool(pin_batch))
+            yb.to(_device, non_blocking=bool(pin_batch)) if yb is not None else None
             _sync_device(_device)
             ms = (time.perf_counter_ns() - tns0) / 1e6
-        if s >= _warmup:
+        if s >= int(_warmup):
             times.append(ms)
     return float(sorted(times)[len(times) // 2]) if times else 0.0
 
@@ -276,6 +304,9 @@ def _set_batch_interval(
     if sbytes <= 0:
         return (max(1, min(256, len(_ds))), 0.0)
     B_cap = 1 << 16
+    max_batch_env = int(
+        env_first_int(("STNET_MAX_BATCH_SIZE", "STNET_MAX_BATCH"), default=0) or 0
+    )
     per_sample = int(getattr(_ds, "_per_sample_mem_bytes", 0) or 0)
     if per_sample <= 0:
         per_sample = int(
@@ -384,6 +415,24 @@ def _set_batch_interval(
                 )
             )
             probe_bs = max(1, min(int(B_cap), 64))
+            if int(max_batch_env) > 0:
+                probe_bs = max(1, min(int(probe_bs), int(max_batch_env)))
+            probe_max_bytes = int(
+                env_first_int(
+                    (
+                        "STNET_H2D_PROBE_MAX_BYTES",
+                        "STNET_H2D_PROBE_BYTES",
+                        "STNET_H2D_COUNTER_MAX_BYTES",
+                    ),
+                    default=256 * 1024 * 1024,
+                )
+                or 0
+            )
+            if probe_max_bytes > 0 and int(sbytes) > 0:
+                probe_bs = max(
+                    1,
+                    min(int(probe_bs), int(probe_max_bytes) // max(1, int(sbytes))),
+                )
             med_probe = 0.0
             with contextlib.suppress(Exception):
                 med_probe = float(
@@ -454,15 +503,8 @@ def _set_batch_interval(
     if cap_from_mem > 0:
         B_cap = min(B_cap, cap_from_mem)
     B_cap = max(1, min(int(B_cap), len(_ds)))
-    if (
-        env_max := int(
-            env_first_int(
-                ("STNET_MAX_BATCH_SIZE", "STNET_MAX_BATCH"), default=0
-            )
-            or 0
-        )
-    ) > 0:
-        B_cap = max(1, min(B_cap, int(env_max)))
+    if int(max_batch_env) > 0:
+        B_cap = max(1, min(B_cap, int(max_batch_env)))
     with contextlib.suppress(Exception):
         setattr(_ds, "_S_B_cap", int(B_cap))
     candidates = _get_random_batch(sbytes, _dev, len(_ds))

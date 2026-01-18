@@ -785,9 +785,10 @@ def stream_memmap(
         chunk_size = int(env_chunk)
     req_chunk = int(chunk_size or 0)
     auto_chunk = req_chunk <= 0
-    chunk_first = max(
-        1, min(count_i, req_chunk if req_chunk > 0 else min(count_i, 256))
-    )
+    if not auto_chunk:
+        chunk_first = max(1, min(count_i, req_chunk))
+    else:
+        chunk_first = 1
     allow_missing = bool(allow_missing_labels) or bool(features_only)
     default_lshape = (
         tuple(default_label_shape) if default_label_shape is not None else (1,)
@@ -803,17 +804,20 @@ def stream_memmap(
     }
     in_dim: Optional[int] = None
     label_shape: Optional[Tuple[int, ...]] = None
-    for s in range(0, count_i, int(chunk_first)):
-        e = min(count_i, s + int(chunk_first))
-        batch = get_batch(int(s), int(e))
+    s_i = 0
+    auto_chunk_adjusted = not bool(auto_chunk)
+    while int(s_i) < int(count_i):
+        e_i = min(int(count_i), int(s_i) + int(chunk_first))
+        batch = get_batch(int(s_i), int(e_i))
         fx, lb, _, _ = ds.preprocess(batch, return_keys=False)
         n = _batch_n(fx)
         if n <= 0:
+            s_i = int(e_i)
             continue
-        expected = int(e) - int(s)
-        if n != expected:
+        expected = int(e_i) - int(s_i)
+        if int(n) != int(expected):
             raise RuntimeError(
-                f"Pass1 batch size mismatch for out_dir={out_dir!r}: expected {expected}, got {n} (s={s}, e={e})."
+                f"Pass1 batch size mismatch for out_dir={out_dir!r}: expected {expected}, got {n} (s={s_i}, e={e_i})."
             )
         fx_flat = _flat2d_cpu_contig(fx, n)
         cur_in_dim = int(fx_flat.shape[1])
@@ -837,6 +841,37 @@ def stream_memmap(
             raise RuntimeError(
                 f"label shape mismatch: expected {label_shape}, got {cur_label_shape}"
             )
+        if not bool(auto_chunk_adjusted):
+            try:
+                target_bytes = int(env_first_int(("STNET_MEMMAP_CHUNK_BYTES",), 0))
+                if target_bytes <= 0:
+                    target_mb = int(env_first_int(("STNET_MEMMAP_CHUNK_MB",), 64))
+                    target_bytes = int(target_mb) * 1024 * 1024
+                avail = int(Memory.available() or 0)
+                if avail > 0:
+                    target_bytes = int(
+                        min(
+                            int(target_bytes),
+                            max(8 * 1024 * 1024, int(avail) // 16),
+                        )
+                    )
+                elem_size = int(fx_flat.element_size())
+                if lb_flat is not None:
+                    elem_size = max(elem_size, int(lb_flat.element_size()))
+                label_numel = (
+                    0 if bool(features_only) else int(numpy.prod(label_shape))
+                )
+                row_bytes = max(1, (int(in_dim) + int(label_numel)) * elem_size)
+                new_chunk = int(
+                    max(1, min(int(count_i), int(target_bytes) // int(row_bytes)))
+                )
+                pass1_max = int(env_first_int(("STNET_MEMMAP_PASS1_CHUNK_MAX",), 256))
+                if pass1_max > 0:
+                    new_chunk = min(new_chunk, pass1_max)
+                chunk_first = int(max(1, new_chunk))
+            except Exception:
+                pass
+            auto_chunk_adjusted = True
         f_stats = Dataset.tensor_scale_stats(fx_flat)
         if bool(features_only):
             stats = Dataset.merge_scale_stats(stats, f_stats)
@@ -856,6 +891,7 @@ def stream_memmap(
             stats = Dataset.merge_scale_stats(
                 stats, Dataset.merge_scale_stats(f_stats, l_stats)
             )
+        s_i = int(e_i)
     if in_dim is None or label_shape is None:
         raise RuntimeError("Failed to infer in_dim/label_shape from data")
     negotiable = Dataset.is_fp32_castable(
@@ -883,7 +919,7 @@ def stream_memmap(
         except Exception:
             pass
         chunk_second = int(
-            max(1, min(count_i, max(32, int(target_bytes) // int(row_bytes))))
+            max(1, min(count_i, int(target_bytes) // int(row_bytes)))
         )
     else:
         chunk_second = int(max(1, min(count_i, req_chunk)))
