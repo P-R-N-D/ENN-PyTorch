@@ -1413,7 +1413,7 @@ class Stream(BufferQueue):
                 hasattr(t, "is_pinned") and t.is_pinned()
             ):
                 return t
-            buf, tok = pool.get_like(obj, return_handle=True, block=False)
+            buf, tok = pool.get_like(t, return_handle=True, block=False)
             buf.copy_(t, non_blocking=False)
             tokens.append(tok)
             return buf
