@@ -1121,13 +1121,37 @@ def _coerce_dcp_keys(state: object) -> object:
     return state
 
 
-def _get_backend_type(device: TorchDeviceLike) -> object:
-    dev_type = str(getattr(device, "type", "cpu"))
-    if dev_type == "cuda":
-        return "nccl"
-    if dev_type == "xpu":
-        return "xccl"
-    return "gloo"
+def _get_backend_type(device: "TorchDeviceLike") -> str:
+    dev_type = str(getattr(device, "type", "cpu")).lower()
+    match dev_type:
+        case "cuda":
+            return "nccl"
+        case "xpu":
+            return "xccl"
+        case "cpu" | "mps":
+            return "gloo"
+        case "dml" | "privateuseone":
+            return "gloo"
+        case "hpu":
+            with contextlib.suppress(Exception):
+                import habana_frameworks.torch.distributed.hccl
+            return "hccl"
+        case "npu":
+            with contextlib.suppress(Exception):
+                import torch_npu
+            return "hccl"
+        case "xla":
+            with contextlib.suppress(Exception):
+                import torch_xla
+            return "xla"
+        case _:
+            get_default = getattr(torch.distributed, "get_default_backend_for_device", None)
+            if callable(get_default):
+                with contextlib.suppress(Exception):
+                    return str(get_default(device)).lower()
+                with contextlib.suppress(Exception):
+                    return str(get_default(dev_type)).lower()
+            return "gloo"
 
 
 def _ensure_default_socket_ifname() -> None:
