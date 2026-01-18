@@ -279,9 +279,7 @@ def _save_model_checkpoint(
             pt_state = dict(m_sd)
             _coerce_dcp_keys(pt_state)
         else:
-            pt_state = {
-                k: v.detach().cpu() for k, v in model.state_dict().items()
-            }
+            pt_state = model.state_dict()
         torch.save(pt_state, os.path.join(out_dir, "model.pt"))
     return m_sd
 
@@ -964,17 +962,12 @@ def train(
                 payload,
                 indent=None,
             )
-        if env_bool("STNET_SAVE_DCP", True) or env_bool(
-            "STNET_SAVE_MODEL_PT", True
-        ):
-            init_dir = new_dir("init_dcp")
-            _save_model_checkpoint(
-                model,
-                init_dir,
-                save_dcp=env_bool("STNET_SAVE_DCP", True),
-                save_pt=env_bool("STNET_SAVE_MODEL_PT", True),
-                overwrite=True,
-            )
+        init_dir = new_dir("init_ckpt")
+        with contextlib.suppress(Exception):
+            model.to("cpu")
+        _save_model_checkpoint(
+            model, init_dir, save_dcp=False, save_pt=True, overwrite=True
+        )
         rdzv = get_available_host(
             rdzv_endpoint
             or get_preferred_ip(allow_loopback=True)
