@@ -641,6 +641,15 @@ def distributed_broadcast(
                 continue
             seen.add(id(t))
             tensors.append(t)
+
+    if tensors:
+        backend = ""
+        with contextlib.suppress(Exception):
+            backend = str(dist.get_backend()).lower()
+        if backend in ("nccl", "xccl") and not env_bool(
+            "STNET_BROADCAST_CPU_TENSORS", False
+        ):
+            tensors = [t for t in tensors if t.device.type != "cpu"]
     if not tensors:
         return
     with torch.no_grad():
