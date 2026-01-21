@@ -24,43 +24,6 @@ from typing import Any, Callable, Optional, Protocol, Tuple
 
 import torch
 
-class Mutex:
-    __slots__ = ("_lock", "_acquire", "_release", "_locked_fn")
-
-    def __init__(self, *args: Any, reentrant: bool = False) -> None:
-        lock = threading.RLock() if bool(reentrant) else threading.Lock()
-        self._lock = lock
-        self._acquire = lock.acquire
-        self._release = lock.release
-        self._locked_fn = getattr(lock, "locked", None)
-
-    @property
-    def raw(self) -> threading.Lock | threading.RLock:
-        return self._lock
-
-    def acquire(
-        self, blocking: bool = True, timeout: float | None = None
-    ) -> bool:
-        if timeout is None:
-            return bool(self._acquire(blocking))
-        return bool(self._acquire(blocking, float(timeout)))
-
-    def release(self) -> None:
-        self._release()
-
-    def locked(self) -> bool:
-        fn = self._locked_fn
-        if callable(fn):
-            return bool(fn())
-        return False
-
-    def __enter__(self) -> "Mutex":
-        self.acquire(True, None)
-        return self
-
-    def __exit__(self, exc_type, exc, tb) -> None:
-        self.release()
-
 from .datatypes import (
     env_first,
     env_first_float,
@@ -94,7 +57,7 @@ _ENV_INNER_THREAD_VARS: tuple[str, ...] = (
 _EXECUTOR_ORDINAL = itertools.count(0)
 _EXECUTOR_ORDINAL_LOCK = threading.Lock()
 _TLB_SINGLETON: Optional["Thread"] = None
-_TLB_SINGLETON_LOCK = Mutex()
+_TLB_SINGLETON_LOCK = None
 
 def _flatten_args(items: Sequence[Any]) -> Iterator[Any]:
     for item in items:
@@ -1110,6 +1073,7 @@ class TensorPage:
         need = _prod_int(shape)
         self.ensure(need)
         return self._buf[:need].view(*shape)
+
 class TensorPagePool:
     Token = _PoolToken
     _Entry = _PoolEntry
@@ -1325,6 +1289,7 @@ class TensorPagePool:
         with self._cv:
             if self._scavenge_lock():
                 self._cv.notify_all()
+
 class TensorSpooler:
     def __init__(self, root: str, max_queue: int = 8) -> None:
         self._root = os.fspath(root)
@@ -1545,6 +1510,7 @@ class TensorSpooler:
 
     def had_error(self) -> bool:
         return bool(self._err_event.is_set())
+
 class BufferQueue:
     def __init__(self, max_batches: int) -> None:
         self.max_batches = max(1, int(max_batches))
@@ -1652,6 +1618,7 @@ class BufferQueue:
 
     def is_stopped(self) -> bool:
         return bool(self._stop.is_set())
+
 class Thread:
     def __init__(
         self,
@@ -1983,6 +1950,7 @@ class Thread:
         tuned = max(1, min(int(io_workers), cpus))
         self._io_workers = tuned
         return tuned
+
 class BoundedExecutor(futures.Executor):
     def __init__(self, inner: futures.Executor, limit: int) -> None:
         self._inner = inner
@@ -2063,3 +2031,43 @@ class BoundedExecutor(futures.Executor):
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self._inner, name)
+
+class Mutex:
+    __slots__ = ("_lock", "_acquire", "_release", "_locked_fn")
+
+    def __init__(self, *args: Any, reentrant: bool = False) -> None:
+        lock = threading.RLock() if bool(reentrant) else threading.Lock()
+        self._lock = lock
+        self._acquire = lock.acquire
+        self._release = lock.release
+        self._locked_fn = getattr(lock, "locked", None)
+
+    @property
+    def raw(self) -> threading.Lock | threading.RLock:
+        return self._lock
+
+    def acquire(
+        self, blocking: bool = True, timeout: float | None = None
+    ) -> bool:
+        if timeout is None:
+            return bool(self._acquire(blocking))
+        return bool(self._acquire(blocking, float(timeout)))
+
+    def release(self) -> None:
+        self._release()
+
+    def locked(self) -> bool:
+        fn = self._locked_fn
+        if callable(fn):
+            return bool(fn())
+        return False
+
+    def __enter__(self) -> "Mutex":
+        self.acquire(True, None)
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self.release()
+        
+        
+_TLB_SINGLETON_LOCK = Mutex()
