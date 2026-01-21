@@ -19,12 +19,12 @@ from ..core.concurrency import Mutex
 from ..core.datatypes import PathLike, coerce_json, save_temp, write_json
 from ..core.distributed import distributed_barrier, is_rank0
 
-_IGNORED_RE = (
-    r".*(?:" + "|".join(re.escape(s) for s in _IGNORED_WARNINGS) + r").*"
-)
 _IGNORED_WARNINGS = (
     "torch.distributed is disabled",
     "TypedStorage is deprecated",
+)
+_IGNORED_RE = (
+    r".*(?:" + "|".join(re.escape(s) for s in _IGNORED_WARNINGS) + r").*"
 )
 _SAVE_LOCK_GUARD = Mutex()
 _SAVE_PATH_LOCKS = weakref.WeakValueDictionary()

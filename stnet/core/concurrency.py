@@ -24,6 +24,43 @@ from typing import Any, Callable, Optional, Protocol, Tuple
 
 import torch
 
+class Mutex:
+    __slots__ = ("_lock", "_acquire", "_release", "_locked_fn")
+
+    def __init__(self, *args: Any, reentrant: bool = False) -> None:
+        lock = threading.RLock() if bool(reentrant) else threading.Lock()
+        self._lock = lock
+        self._acquire = lock.acquire
+        self._release = lock.release
+        self._locked_fn = getattr(lock, "locked", None)
+
+    @property
+    def raw(self) -> threading.Lock | threading.RLock:
+        return self._lock
+
+    def acquire(
+        self, blocking: bool = True, timeout: float | None = None
+    ) -> bool:
+        if timeout is None:
+            return bool(self._acquire(blocking))
+        return bool(self._acquire(blocking, float(timeout)))
+
+    def release(self) -> None:
+        self._release()
+
+    def locked(self) -> bool:
+        fn = self._locked_fn
+        if callable(fn):
+            return bool(fn())
+        return False
+
+    def __enter__(self) -> "Mutex":
+        self.acquire(True, None)
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self.release()
+
 from .datatypes import (
     env_first,
     env_first_float,
@@ -1946,42 +1983,6 @@ class Thread:
         tuned = max(1, min(int(io_workers), cpus))
         self._io_workers = tuned
         return tuned
-class Mutex:
-    __slots__ = ("_lock", "_acquire", "_release", "_locked_fn")
-
-    def __init__(self, *args: Any, reentrant: bool = False) -> None:
-        lock = threading.RLock() if bool(reentrant) else threading.Lock()
-        self._lock = lock
-        self._acquire = lock.acquire
-        self._release = lock.release
-        self._locked_fn = getattr(lock, "locked", None)
-
-    @property
-    def raw(self) -> threading.Lock | threading.RLock:
-        return self._lock
-
-    def acquire(
-        self, blocking: bool = True, timeout: float | None = None
-    ) -> bool:
-        if timeout is None:
-            return bool(self._acquire(blocking))
-        return bool(self._acquire(blocking, float(timeout)))
-
-    def release(self) -> None:
-        self._release()
-
-    def locked(self) -> bool:
-        fn = self._locked_fn
-        if callable(fn):
-            return bool(fn())
-        return False
-
-    def __enter__(self) -> "Mutex":
-        self.acquire(True, None)
-        return self
-
-    def __exit__(self, exc_type, exc, tb) -> None:
-        self.release()
 class BoundedExecutor(futures.Executor):
     def __init__(self, inner: futures.Executor, limit: int) -> None:
         self._inner = inner

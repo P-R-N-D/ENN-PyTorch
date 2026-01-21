@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import math
 import os
-from dataclasses import field, fields
+from dataclasses import dataclass, field, fields
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -588,6 +588,7 @@ def runtime_config(
     actual_mode = data.pop("mode", mode)
     return RuntimeConfig.from_partial(actual_mode, *args, **data)
 
+@dataclass
 class PatchConfig:
     is_square: bool = False
     patch_size_1d: int = 16
@@ -598,6 +599,7 @@ class PatchConfig:
     patch_size_3d: Union[int, Tuple[int, int, int], list[int]] = (2, 2, 2)
     dropout: float = 0.0
     use_padding: bool = True
+@dataclass
 class ModelConfig:
     device: Optional[torch.device | str] = None
     dropout: float = 0.1
@@ -681,6 +683,7 @@ class ModelConfig:
         if isinstance(dev, torch.device):
             data["device"] = str(dev)
         return {k: _to_dict(v) for k, v in data.items()}
+@dataclass
 class RuntimeConfig:
     mode: OpsMode
     in_dim: int

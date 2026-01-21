@@ -15,6 +15,7 @@ import sys
 import sysconfig
 import threading
 import time
+from dataclasses import dataclass
 from datetime import timezone, tzinfo
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
@@ -219,6 +220,7 @@ def _is_main_importable() -> bool:
     if not os.path.isabs(abs_path):
         abs_path = os.path.join(os.getcwd(), abs_path)
     return os.path.isfile(abs_path)
+@contextlib.contextmanager
 def _start_context() -> Any:
     stub = _STNET_MP_MAIN_STUB_PATH
     if not stub or not sys.argv:
@@ -1522,6 +1524,7 @@ def optimal_optimizer_params(
         flags["foreach"] = False
     return flags
 
+@dataclass
 class Device:
     device: torch.device
     device_type: str

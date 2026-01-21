@@ -9,7 +9,7 @@ import math
 import os
 import random
 import time
-from dataclasses import field, replace
+from dataclasses import dataclass, field, replace
 from functools import partial
 from itertools import chain
 from typing import (
@@ -1175,6 +1175,7 @@ class Source(TypedDict):
     path: Required[str]
     format: NotRequired[SourceType]
     kind: NotRequired[SourceType]
+@dataclass
 class Session:
     sources: Any
     device: torch.device | str
@@ -1303,6 +1304,7 @@ class Session:
             with contextlib.suppress(Exception):
                 keep.cleanup()
         self._opened = False
+@dataclass
 class Dataset(Generic[TExtra]):
     device: torch.device
     device_type: str = field(init=False, default="cpu")

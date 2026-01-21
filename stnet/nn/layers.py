@@ -47,6 +47,17 @@ _FLEX_BLOCK_MASK_CACHE_EST_MAX_BYTES = env_int(
     "STNET_FLEX_BLOCK_MASK_CACHE_EST_MAX_BYTES", 128 * 1024 * 1024
 )
 _FLEX_BLOCK_MASK_CACHE_MAX = 16
+try:
+    from torch.nn.attention.flex_attention import create_block_mask
+
+    _HAS_FLEX_ATTENTION = True
+except Exception:
+    create_block_mask = None
+    _HAS_FLEX_ATTENTION = False
+if env_bool("STNET_NO_FLEX_ATTENTION", False) or env_bool(
+    "STNET_DISABLE_FLEX_ATTENTION", False
+):
+    _HAS_FLEX_ATTENTION = False
 _FLEX_KERNEL = FlexAttention(prefer_torch=True)
 _GATE_STATS_CKPT_FWD = env_bool("STNET_GATE_STATS_CKPT_FWD", False)
 _HAS_FLEX_ATTENTION = bool(
@@ -2187,7 +2198,7 @@ class Scaler(nn.Module):
             bias=b.to(dtype=t2.dtype, device=t2.device),
             training=False,
             momentum=0.0,
-            eps=0.0,
+            eps=max(float(self.eps), 1e-6),
         )
 
         if t.dim() == 1:
@@ -2970,15 +2981,3 @@ class Recorder(nn.Module):
                         if buf.dtype != torch.int64:
                             setattr(self, name, buf.to(dtype=torch.int64))
         return self
-
-try:
-    from torch.nn.attention.flex_attention import create_block_mask
-
-    _HAS_FLEX_ATTENTION = True
-except Exception:
-    create_block_mask = None
-    _HAS_FLEX_ATTENTION = False
-if env_bool("STNET_NO_FLEX_ATTENTION", False) or env_bool(
-    "STNET_DISABLE_FLEX_ATTENTION", False
-):
-    _HAS_FLEX_ATTENTION = False

@@ -20,7 +20,6 @@ from .system import CPU, get_device, get_num_accelerators
 
 _DTENSOR_ACTIVE: bool = False
 _GLOOX_GLOO_PG_CACHE: dict[tuple[int, ...], ProcessGroup] = {}
-Join = _TorchJoin
 fully_shard = None
 
 def _set_dtensor_active() -> None:
@@ -750,6 +749,7 @@ def get_world_size(device: Optional[torch.device] = None) -> int:
         case _:
             ncpu = CPU.count()
             return max(1, min(int(ncpu), 4))
+@contextlib.contextmanager
 def no_sync(
     model: torch.nn.Module,
     *args: Any,
@@ -1218,6 +1218,7 @@ try:
     from torch.distributed.algorithms.join import Join as _TorchJoin
 except ImportError:
     _TorchJoin = None
+Join = _TorchJoin
 try:
     from torch.distributed.tensor import DTensor as _DTensor
 except ImportError:
