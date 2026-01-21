@@ -345,6 +345,7 @@ def _draft_export_diagnostics(
         info["error"] = _truncate(repr(exc))
         info["traceback"] = _truncate(traceback.format_exc(), 6000)
     return info
+@contextlib.contextmanager
 def _temp_env(k: str, v: str) -> Iterator[None]:
     old = os.environ.get(k)
     os.environ[k] = v

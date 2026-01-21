@@ -13,6 +13,7 @@ import sys
 import threading
 import warnings
 import weakref
+from dataclasses import dataclass
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Any, Callable, Iterator, Sequence
@@ -35,6 +36,7 @@ _FORWARD_PARAM_CACHE_LOCK = Mutex()
 _ONNX2TF_HELP_CACHE: str | None = None
 _ONNX2TF_HELP_LOCK = Mutex(reentrant=True)
 
+@contextlib.contextmanager
 def _no_empty_tensor(root: nn.Module) -> Iterator[None]:
     patched: list[tuple[nn.Module, str, torch.Tensor]] = []
     try:
@@ -72,6 +74,7 @@ def _suppress_export_warnings() -> None:
                 category=tw,
                 message=r".*Converting a tensor to a Python boolean.*",
             )
+@contextlib.contextmanager
 def _onnx_model(model: object) -> Iterator[object]:
     _suppress_export_warnings()
     was_training = getattr(model, "training", False)
@@ -789,15 +792,19 @@ class _ORTBuilder:
 
         return (ort_path, optimized_onnx_path)
 
+@dataclass
 class BorrowedModule:
     module: nn.Module
     name: str | None = None
+@dataclass
 class OwnedModule:
     module: nn.Module
     name: str | None = None
+@dataclass
 class ModulePath:
     path: str
     name: str | None = None
+@dataclass
 class CallArguments:
     args: tuple[Any, ...]
     kwargs: dict[str, Any]
