@@ -1,0 +1,1478 @@
+# -*- coding: utf-8 -*-
+from __future__ import annotations
+
+import contextlib
+import logging
+from dataclasses import dataclass, replace
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    List,
+    Optional,
+    Protocol,
+    Tuple,
+    Union,
+    TYPE_CHECKING,
+)
+
+import torch
+import torch.nn as nn
+
+from .concurrency import Mutex
+from .datatypes import env_first_int, env_float, env_str
+from .graph import clear_model_cache
+from .precision import Autocast, DeviceMeta, Quantization, is_scale_safe
+from .system import (
+    CPU,
+    _call,
+    _default_thread_limit,
+    _optimal_threads,
+    _log_debug,
+    _log_info,
+    get_device,
+    is_cuda_bf16_supported,
+)
+from .datatypes import default_underflow_action, normalize_underflow_action
+
+if TYPE_CHECKING:
+    from ..data.pipeline import Dataset
+
+
+_TORCH_THREAD_CFG_LOCK = Mutex()
+_TORCH_NUM_THREADS_SET: Optional[int] = None
+_TORCH_INTEROP_THREADS_SET: Optional[int] = None
+_TORCH_INTEROP_LOCKED: bool = False
+
+
+def optimal_procs() -> dict[str, Union[int, str]]:
+    return WorkerPolicy.optimize().get_procs_setting()
+
+
+def optimal_threads() -> dict[str, Union[int, bool]]:
+    return WorkerPolicy.optimize().get_thread_setting()
+
+
+def optimize_threads(
+    intra: Optional[int] = None,
+    inter: Optional[int] = None,
+) -> dict[str, Union[int, bool]]:
+    wp = WorkerPolicy.optimize()
+    if intra is not None:
+        wp = replace(wp, intra_ops=int(intra))
+    if inter is not None:
+        wp = replace(wp, inter_ops=int(inter))
+    wp.set_thread_setting()
+    return wp.get_thread_setting()
+
+
+class LossWeightPolicy(Protocol):
+    def weights(self) -> Tuple[float, float]: ...
+
+    def update(
+        self,
+        top_loss: Optional[torch.Tensor],
+        bottom_loss: Optional[torch.Tensor],
+    ) -> None:
+        raise NotImplementedError
+
+
+@dataclass(slots=True)
+class WorkerPolicy:
+    nproc_per_node: int = 1
+    device: str = "cpu"
+    local_world_size: int = 1
+    intra_ops: int = 1
+    inter_ops: int = 1
+    num_workers: int = 1
+    prebatch: int = 1
+    prefetch_factor: int = 1
+    max_concurrency: int = 1
+    h2d_streams: int = 1
+
+    @staticmethod
+    def _cpu_count() -> int:
+        return CPU.count()
+
+    @staticmethod
+    def _available_accelerator() -> Tuple[str, int]:
+        dev_type = "cpu"
+        n = 0
+        try:
+            accel = getattr(torch, "accelerator", None)
+            if (
+                accel is not None
+                and hasattr(accel, "is_available")
+                and accel.is_available()
+            ):
+                current = getattr(accel, "current_accelerator", None)
+                if callable(current):
+                    dev = current(False)
+                    if isinstance(dev, torch.device):
+                        dev_type = dev.type
+                dc = getattr(accel, "device_count", None)
+                if callable(dc):
+                    n = int(dc())
+        except Exception:
+            dev_type, n = "cpu", 0
+        try:
+            if n <= 0:
+                if torch.cuda.is_available():
+                    dev_type = "cuda"
+                    n = int(torch.cuda.device_count())
+                else:
+                    xpu = getattr(torch, "xpu", None)
+                    if (
+                        xpu is not None
+                        and callable(getattr(xpu, "is_available", None))
+                        and xpu.is_available()
+                    ):
+                        dev_type = "xpu"
+                        n = int(getattr(xpu, "device_count", lambda: 1)())
+                    else:
+                        mps_backend = getattr(torch.backends, "mps", None)
+                        if (
+                            mps_backend is not None
+                            and callable(
+                                getattr(mps_backend, "is_available", None)
+                            )
+                            and mps_backend.is_available()
+                        ):
+                            dev_type = "mps"
+                            n = 1
+        except Exception:
+            pass
+        if n <= 0:
+            dev_type, n = "cpu", 0
+        return dev_type, max(0, n)
+
+    @classmethod
+    def optimize(cls) -> "WorkerPolicy":
+        ncpu_raw = max(1, int(cls._cpu_count() or 1))
+        dev_type, nacc = cls._available_accelerator()
+        is_accel = bool(nacc and int(nacc) > 0)
+        local_world_guess = max(1, int(nacc or 1)) if is_accel else 1
+        local_world_guess = max(
+            1,
+            int(
+                env_first_int(
+                    (
+                        "STNET_LOCAL_WORLD_SIZE",
+                        "LOCAL_WORLD_SIZE",
+                        "SLURM_NTASKS_PER_NODE",
+                    ),
+                    local_world_guess,
+                )
+            ),
+        )
+        if is_accel and int(nacc) > 0:
+            allow_over = int(
+                env_first_int(
+                    (
+                        "STNET_ALLOW_ACCELERATOR_OVERSUBSCRIBE",
+                        "STNET_ALLOW_GPU_OVERSUBSCRIBE",
+                    ),
+                    0,
+                )
+            )
+            if not allow_over and int(local_world_guess) > int(nacc):
+                local_world_guess = int(nacc)
+        _nogil = bool(CPU.is_optimized_for_no_gil())
+        cap_mult = _default_thread_limit(
+            ncpu_raw, is_accel=is_accel, nogil=_nogil
+        )
+        distribute_default = int(local_world_guess) > 1
+        distribute = bool(
+            env_first_int(
+                ("STNET_DISTRIBUTE_THREAD_CAP",), int(distribute_default)
+            )
+        )
+        thread_cap = _optimal_threads(
+            ncpu=ncpu_raw,
+            cap_mult=cap_mult,
+            local_world=int(local_world_guess),
+            distribute=bool(distribute),
+        )
+        eff_cores = max(1, int(thread_cap) // max(1, int(cap_mult)))
+        soft_inflight = 8 if is_accel else 4
+        with contextlib.suppress(Exception):
+            lp = LoaderPolicy()
+            hard = int(lp.hard_inflight_batches(dev_type))
+            soft_inflight = max(
+                1, int(hard * max(1, int(lp.soft_cap_multiplier)))
+            )
+        soft_auto_enabled = bool(
+            env_first_int(("STNET_SOFT_INFLIGHT_AUTO",), 1)
+        )
+        soft_inflight_max_default = (
+            (32 if is_accel else 24) if _nogil else (16 if is_accel else 12)
+        )
+        soft_inflight_max = max(
+            8,
+            env_first_int(
+                ("STNET_SOFT_INFLIGHT_MAX",), soft_inflight_max_default
+            ),
+        )
+        soft_inflight_explicit = env_first_int(("STNET_SOFT_INFLIGHT_CAP",), 0)
+        if soft_inflight_explicit > 0:
+            soft_inflight = max(1, int(soft_inflight_explicit))
+        elif soft_auto_enabled:
+            soft_base = max(0, env_first_int(("STNET_SOFT_INFLIGHT_BASE",), 2))
+            soft_div = max(1, env_first_int(("STNET_SOFT_INFLIGHT_DIV",), 4))
+            auto_soft = int(soft_base) + max(
+                0, int(eff_cores) // int(soft_div)
+            )
+            soft_inflight = max(
+                int(soft_inflight), min(int(auto_soft), int(soft_inflight_max))
+            )
+        soft_inflight = max(1, min(int(soft_inflight), int(thread_cap)))
+        if is_accel:
+            if eff_cores <= 4:
+                model_ratio = 1.00
+            elif eff_cores <= 8:
+                model_ratio = 0.90
+            elif eff_cores <= 16:
+                model_ratio = 0.80
+            elif eff_cores <= 32:
+                model_ratio = 0.70
+            else:
+                model_ratio = 0.60
+        else:
+            if eff_cores <= 4:
+                model_ratio = 1.00
+            elif eff_cores <= 8:
+                model_ratio = 0.95
+            elif eff_cores <= 16:
+                model_ratio = 0.90
+            else:
+                model_ratio = 0.85
+        with contextlib.suppress(Exception):
+            env_key = (
+                "STNET_MODEL_CORE_RATIO_ACCEL"
+                if is_accel
+                else "STNET_MODEL_CORE_RATIO"
+            )
+            model_ratio = float(env_float(env_key, float(model_ratio)))
+        model_ratio = float(max(0.25, min(1.0, model_ratio)))
+        model_budget = max(2, int(round(float(eff_cores) * model_ratio)))
+        if model_budget <= 2:
+            inter_ops = 1
+        elif model_budget <= 8:
+            inter_ops = max(1, model_budget // 4)
+        else:
+            inter_ops = max(2, min(8, model_budget // 6))
+        inter_ops = max(1, min(int(inter_ops), max(1, int(model_budget) - 1)))
+        intra_ops = max(1, int(model_budget) - int(inter_ops))
+        data_budget = max(
+            1, int(thread_cap) - (int(intra_ops) + int(inter_ops))
+        )
+        prebatch = 1
+        prefetch_factor = 1
+        env_pre = env_str("STNET_PREBATCH")
+        if env_pre:
+            with contextlib.suppress(Exception):
+                prebatch = max(1, int(env_pre))
+        elif _nogil:
+            prebatch = 2
+        env_pf = env_str("STNET_PREFETCH_FACTOR")
+        if env_pf:
+            with contextlib.suppress(Exception):
+                prefetch_factor = max(1, int(env_pf))
+        elif _nogil:
+            prefetch_factor = 2
+        prebatch = max(1, int(prebatch))
+        prefetch_factor = max(1, int(prefetch_factor))
+        base_workers = max(1, int(data_budget))
+        base_workers = min(
+            int(base_workers), int(thread_cap), int(soft_inflight)
+        )
+        max_workers = max(
+            1,
+            int(
+                (int(soft_inflight) - int(prebatch))
+                // max(1, int(prefetch_factor))
+            ),
+        )
+        num_workers = max(
+            1, min(int(base_workers), int(max_workers), int(soft_inflight))
+        )
+        max_concurrency = max(1, int(num_workers))
+        total_threads = int(intra_ops) + int(inter_ops) + int(num_workers)
+        if total_threads > int(thread_cap):
+            overflow = int(total_threads) - int(thread_cap)
+            if dev_type == "cpu":
+                num_workers = max(1, int(num_workers) - int(overflow))
+            else:
+                intra_ops = max(1, int(intra_ops) - int(overflow))
+
+            intra_ops = max(
+                1, int(thread_cap) - int(inter_ops) - int(num_workers)
+            )
+            max_concurrency = max(
+                1, min(int(max_concurrency), int(num_workers))
+            )
+        local_world = int(local_world_guess)
+        return cls(
+            nproc_per_node=local_world,
+            device=dev_type,
+            local_world_size=local_world,
+            intra_ops=int(intra_ops),
+            inter_ops=int(inter_ops),
+            num_workers=int(num_workers),
+            prebatch=int(prebatch),
+            prefetch_factor=int(prefetch_factor),
+            max_concurrency=int(max_concurrency),
+            h2d_streams=2 if dev_type in ("cuda", "xpu") else 1,
+        )
+
+    def get_thread_setting(self) -> dict[str, int]:
+        return {
+            "intra_ops": int(self.intra_ops),
+            "inter_ops": int(self.inter_ops),
+            "num_workers": int(self.num_workers),
+            "max_concurrency": int(self.max_concurrency),
+            "prebatch": int(self.prebatch),
+            "prefetch_factor": int(self.prefetch_factor),
+        }
+
+    def get_procs_setting(self) -> dict[str, Union[int, str]]:
+        return {
+            "nproc_per_node": int(self.nproc_per_node),
+            "device": str(self.device),
+        }
+
+    def set_thread_setting(self) -> None:
+        global _TORCH_NUM_THREADS_SET, _TORCH_INTEROP_THREADS_SET, _TORCH_INTEROP_LOCKED
+        intra = max(1, int(self.intra_ops))
+        inter = max(1, int(self.inter_ops))
+        with _TORCH_THREAD_CFG_LOCK:
+            if _TORCH_NUM_THREADS_SET != int(intra):
+                _call(getattr(torch, "set_num_threads", None), int(intra))
+                _TORCH_NUM_THREADS_SET = int(intra)
+            if hasattr(torch, "set_num_interop_threads") and not bool(
+                _TORCH_INTEROP_LOCKED
+            ):
+                if _TORCH_INTEROP_THREADS_SET is None:
+                    try:
+                        torch.set_num_interop_threads(int(inter))
+                        _TORCH_INTEROP_THREADS_SET = int(inter)
+                    except Exception:
+                        _TORCH_INTEROP_LOCKED = True
+                elif int(_TORCH_INTEROP_THREADS_SET) != int(inter):
+                    pass
+
+
+@dataclass(slots=True)
+class LoaderPolicy:
+    max_batches_accel: int = 4
+    max_batches_cpu: int = 2
+    soft_cap_multiplier: int = 2
+
+    def hard_inflight_batches(self, device: torch.device | str) -> int:
+        dev = (
+            torch.device(device)
+            if not isinstance(device, torch.device)
+            else device
+        )
+        if dev.type in ("cuda", "xpu", "mps"):
+            return max(1, int(self.max_batches_accel))
+        return max(1, int(self.max_batches_cpu))
+
+    def apply_soft_limits(
+        self, wp: WorkerPolicy, device: torch.device | str
+    ) -> WorkerPolicy:
+        hard = int(self.hard_inflight_batches(device))
+        soft_cap = max(1, int(hard * max(1, int(self.soft_cap_multiplier))))
+        prefetch_factor = max(1, int(getattr(wp, "prefetch_factor", 1) or 1))
+        prebatch = max(1, int(getattr(wp, "prebatch", 1) or 1))
+        num_workers_req = max(0, int(getattr(wp, "num_workers", 0) or 0))
+        max_workers_inflight = max(
+            0, int((soft_cap - prebatch) // max(1, prefetch_factor))
+        )
+        num_workers = min(num_workers_req, max_workers_inflight, soft_cap)
+        num_workers = max(0, int(num_workers))
+        inflight = int(num_workers) * int(prefetch_factor) + int(prebatch)
+        if inflight > int(soft_cap) and num_workers > 0:
+            prefetch_factor = max(
+                1,
+                int(
+                    (int(soft_cap) - int(prebatch)) // max(1, int(num_workers))
+                ),
+            )
+            max_workers_inflight = max(
+                0, int((soft_cap - prebatch) // max(1, prefetch_factor))
+            )
+            num_workers = min(
+                int(num_workers), int(max_workers_inflight), int(soft_cap)
+            )
+            num_workers = max(0, int(num_workers))
+        wp.num_workers = int(num_workers)
+        wp.prebatch = int(prebatch)
+        wp.prefetch_factor = int(prefetch_factor)
+        with contextlib.suppress(Exception):
+            wp.max_concurrency = max(
+                1,
+                min(
+                    int(getattr(wp, "max_concurrency", 1) or 1),
+                    int(wp.num_workers) if int(wp.num_workers) > 0 else 1,
+                    int(soft_cap),
+                ),
+            )
+        return wp
+
+    def wrap_input(
+        self, loader: Any, device: torch.device | str, *args: Any, name: str
+    ) -> Any:
+        """Wrap a loader with bounded in-flight buffering.
+
+        NOTE: For accelerator training/inference, our stnet.data.nodes.Loader
+        already performs bounded prefetch + device staging via Stream.
+        Double-wrapping with an extra thread-based Prefetcher can interact
+        poorly with some iterables (and can also hide set_epoch hooks).
+
+        For CPU paths (no Stream), we still wrap with Prefetcher to keep
+        in-flight batches hard-limited.
+        """
+        from .concurrency import new_prefetcher
+
+        max_batches = self.hard_inflight_batches(device)
+        # If this is our loader on an accelerator and non_blocking staging is
+        # enabled, prefer the internal Stream (single bounded queue) rather than
+        # stacking another prefetch thread on top.
+        with contextlib.suppress(Exception):
+            dev = torch.device(device) if not isinstance(device, torch.device) else device
+            if dev.type in {"cuda", "xpu", "mps"}:
+                if bool(getattr(loader, "_non_blocking", False)) and hasattr(loader, "_base_iterable"):
+                    # Keep the hard limit by aligning the Stream depth.
+                    with contextlib.suppress(Exception):
+                        setattr(loader, "_depth", int(max(1, int(max_batches))))
+                    return loader
+        return new_prefetcher(loader, max_batches=max_batches, name=name)
+
+
+@dataclass
+class BatchPolicy:
+    sample_bytes: int
+    host_sample_bytes: Optional[int] = None
+    prebatch: int = 1
+    prefetch_factor: int = 1
+    num_workers: int = 0
+    num_streams: int = 1
+    max_concurrency: int = 1
+    local_world_size: int = 1
+    min_batch: int = 1
+    max_batch: Optional[int] = None
+    device_margin: float = 0.8
+    host_margin: float = 0.8
+    device_budget_ratio: float = 0.0
+    device_budget_min_bytes: int = 0
+    device_budget_max_bytes: Optional[int] = None
+    host_budget_ratio: float = 0.0
+    host_budget_min_bytes: int = 0
+    host_budget_max_bytes: Optional[int] = None
+
+    def __post_init__(self) -> None:
+        self.sample_bytes = max(int(self.sample_bytes or 0), 0)
+        if self.host_sample_bytes is None:
+            self.host_sample_bytes = self.sample_bytes
+        self.prebatch = max(int(self.prebatch or 0), 0)
+        self.prefetch_factor = max(int(self.prefetch_factor or 0), 0)
+        self.num_workers = max(int(self.num_workers or 0), 0)
+        self.num_streams = max(int(self.num_streams or 0), 0)
+        self.max_concurrency = max(int(self.max_concurrency or 0), 0)
+        self.min_batch = max(int(self.min_batch or 1), 1)
+        if self.max_batch is not None:
+            self.max_batch = max(int(self.max_batch), 1)
+        self.device_margin = max(0.0, min(1.0, float(self.device_margin)))
+        self.host_margin = max(0.0, min(1.0, float(self.host_margin)))
+        self.device_budget_ratio = max(
+            0.0, min(1.0, float(self.device_budget_ratio or 0.0))
+        )
+        self.host_budget_ratio = max(
+            0.0, min(1.0, float(self.host_budget_ratio or 0.0))
+        )
+        self.device_budget_min_bytes = max(
+            int(self.device_budget_min_bytes or 0), 0
+        )
+        self.host_budget_min_bytes = max(
+            int(self.host_budget_min_bytes or 0), 0
+        )
+        if self.device_budget_max_bytes is not None:
+            self.device_budget_max_bytes = max(
+                int(self.device_budget_max_bytes), 0
+            )
+        if self.host_budget_max_bytes is not None:
+            self.host_budget_max_bytes = max(
+                int(self.host_budget_max_bytes), 0
+            )
+
+    def host_inflight_batches_per_proc(self) -> int:
+        return (
+            max(1, self.max_concurrency) * max(1, self.prebatch)
+            + max(1, self.prefetch_factor)
+            + max(1, self.num_streams)
+            + 1
+        )
+
+    @staticmethod
+    def _budget_bytes(
+        total_bytes: Optional[int],
+        *args: Any,
+        budget_ratio: float,
+        budget_min_bytes: int,
+        budget_max_bytes: Optional[int],
+    ) -> int:
+        total = int(total_bytes) if total_bytes is not None else 0
+        ratio = float(budget_ratio or 0.0)
+        base = int(float(total) * ratio) if total > 0 and ratio > 0.0 else 0
+        budget = max(int(budget_min_bytes or 0), base)
+        if (budget <= 0) and (total <= 0) and (budget_max_bytes is not None):
+            budget = int(budget_max_bytes)
+        elif budget_max_bytes is not None:
+            budget = min(budget, int(budget_max_bytes))
+        return max(0, int(budget))
+
+    def suggest_batch(
+        self,
+        *args: Any,
+        dev_free: Optional[int] = None,
+        host_free: Optional[int] = None,
+        dev_total: Optional[int] = None,
+        host_total: Optional[int] = None,
+        local_world_size: Optional[int] = None,
+    ) -> int:
+        lw = (
+            int(local_world_size)
+            if local_world_size is not None
+            else int(self.local_world_size or 1)
+        )
+        if lw <= 0:
+            lw = 1
+        use_dev_budget = (
+            self.device_budget_ratio > 0.0
+            or self.device_budget_min_bytes > 0
+            or self.device_budget_max_bytes is not None
+        )
+        use_host_budget = (
+            self.host_budget_ratio > 0.0
+            or self.host_budget_min_bytes > 0
+            or self.host_budget_max_bytes is not None
+        )
+        dev_cap: Optional[int] = None
+        if dev_free is not None and dev_free >= 0 and self.sample_bytes > 0:
+            denom = max(1, int(self.sample_bytes))
+            usable = int(float(dev_free) * float(self.device_margin))
+            if use_dev_budget:
+                budget = self._budget_bytes(
+                    dev_total,
+                    budget_ratio=self.device_budget_ratio,
+                    budget_min_bytes=self.device_budget_min_bytes,
+                    budget_max_bytes=self.device_budget_max_bytes,
+                )
+                if budget > 0:
+                    usable = min(int(usable), int(budget))
+            dev_cap = int(max(0, usable) // denom)
+        host_cap: Optional[int] = None
+        if (
+            host_free is not None
+            and host_free >= 0
+            and (self.host_sample_bytes or 0) > 0
+        ):
+            inflight = self.host_inflight_batches_per_proc()
+            denom = (
+                max(1, int(self.host_sample_bytes or 0))
+                * max(1, inflight)
+                * max(1, lw)
+            )
+            usable = int(float(host_free) * float(self.host_margin))
+            if use_host_budget:
+                budget = self._budget_bytes(
+                    host_total,
+                    budget_ratio=self.host_budget_ratio,
+                    budget_min_bytes=self.host_budget_min_bytes,
+                    budget_max_bytes=self.host_budget_max_bytes,
+                )
+                if budget > 0:
+                    usable = min(int(usable), int(budget))
+            host_cap = int(max(0, usable) // denom)
+        candidates = [
+            c for c in (dev_cap, host_cap) if isinstance(c, int) and c >= 0
+        ]
+        if not candidates:
+            b = (
+                self.max_batch
+                if self.max_batch is not None
+                else self.min_batch
+            )
+        else:
+            b = min(candidates)
+            if self.max_batch is not None:
+                b = min(b, int(self.max_batch))
+        b = max(int(b), int(self.min_batch))
+        return max(1, b)
+
+
+@dataclass(slots=True)
+class ModelPolicy:
+    @staticmethod
+    def negotiate(
+        device: Optional[Union[torch.device, str]] = None,
+        *args: Any,
+        metadata: Optional[Dataset[Any]] = None,
+        **kwargs: Any,
+    ) -> torch.dtype:
+        from ..data.pipeline import Dataset
+
+        dev = torch.device(device) if device is not None else get_device()
+        candidates: List[torch.dtype] = []
+        match dev.type:
+            case "cuda":
+                try:
+                    if Dataset.is_cuda_bf16_supported(dev):
+                        candidates.append(torch.bfloat16)
+                except Exception:
+                    pass
+                candidates.extend((torch.float16, torch.float32))
+            case "cpu":
+                if Dataset.is_cpu_bf16_supported():
+                    candidates.append(torch.bfloat16)
+                candidates.extend((torch.float32, torch.float64))
+            case "xpu":
+                candidates.extend((torch.bfloat16, torch.float32))
+            case "mps":
+                candidates.extend((torch.float16, torch.float32))
+            case _:
+                candidates.append(torch.float32)
+        for dtype in candidates:
+            if is_scale_safe(dtype, metadata):
+                return dtype
+        return (
+            torch.float64
+            if is_scale_safe(torch.float64, metadata)
+            else candidates[-1]
+        )
+
+    @staticmethod
+    def _peek_layer(module: nn.Module) -> Optional[torch.Tensor]:
+        with contextlib.suppress(StopIteration):
+            return next(module.parameters())
+        with contextlib.suppress(StopIteration):
+            return next(module.buffers())
+        return None
+
+    @staticmethod
+    def _coerce_metadata(
+        model: nn.Module, metadata: Optional[Dataset[Any]] = None
+    ) -> Dataset[Any]:
+        from ..data.pipeline import Dataset
+
+        Autocast.configure(model, metadata=metadata)
+        meta = Autocast.metadata()
+        if meta is None:
+            ref = ModelPolicy._peek_layer(model)
+            dev = ref.device if isinstance(ref, torch.Tensor) else get_device()
+            meta = Dataset.for_device(dev)
+            Autocast.configure(model, metadata=meta)
+        return meta
+
+    @staticmethod
+    def _align_layers(
+        src: nn.Module,
+        dst: nn.Module,
+        params_dtype: Optional[torch.dtype],
+    ) -> None:
+        ref = ModelPolicy._peek_layer(src)
+        if ref is not None:
+            with contextlib.suppress(Exception):
+                dst.to(device=ref.device)
+        if params_dtype is not None:
+            with contextlib.suppress(Exception):
+                dst.to(dtype=params_dtype)
+
+    @staticmethod
+    def _clone_state(
+        src: nn.Module, dst: nn.Module, params_dtype: Optional[torch.dtype]
+    ) -> None:
+        try:
+            state = src.state_dict()
+        except (RuntimeError, AttributeError):
+            return
+        try:
+            dst.load_state_dict(state, strict=False)
+            return
+        except Exception:
+            pass
+        ref = ModelPolicy._peek_layer(dst)
+        device = ref.device if ref is not None else None
+        converted: Dict[str, Any] = {}
+        for key, value in state.items():
+            if not isinstance(value, torch.Tensor):
+                converted[key] = value
+                continue
+            tensor = value.detach()
+            if (
+                params_dtype is not None
+                and tensor.is_floating_point()
+                and tensor.dtype != params_dtype
+            ):
+                with contextlib.suppress(Exception):
+                    tensor = tensor.to(dtype=params_dtype)
+            if (
+                device is not None
+                and getattr(tensor, "device", None) is not None
+                and tensor.device != device
+            ):
+                with contextlib.suppress(Exception):
+                    tensor = tensor.to(device=device)
+            converted[key] = tensor
+        with contextlib.suppress(Exception):
+            dst.load_state_dict(converted, strict=False)
+
+    @staticmethod
+    def _nvidia_linear(
+        module: nn.Linear,
+        params_dtype: Optional[torch.dtype],
+        te: Any,
+    ) -> Optional[nn.Module]:
+        te_linear = getattr(te, "Linear", None)
+        if te_linear is None:
+            return None
+        kwargs: Dict[str, Any] = {
+            "in_features": module.in_features,
+            "out_features": module.out_features,
+            "bias": module.bias is not None,
+        }
+        if params_dtype is not None:
+            kwargs["params_dtype"] = params_dtype
+        try:
+            replacement = te_linear(**kwargs)
+        except Exception:
+            return None
+        ModelPolicy._align_layers(module, replacement, params_dtype)
+        ModelPolicy._clone_state(module, replacement, params_dtype)
+        return replacement
+
+    @staticmethod
+    def _nvidia_layer_norm(
+        module: nn.LayerNorm,
+        params_dtype: Optional[torch.dtype],
+        te: Any,
+    ) -> Optional[nn.Module]:
+        te_layer_norm = getattr(te, "LayerNorm", None)
+        if te_layer_norm is None:
+            return None
+        kwargs: Dict[str, Any] = {
+            "normalized_shape": module.normalized_shape,
+            "eps": module.eps,
+        }
+        if params_dtype is not None:
+            kwargs["params_dtype"] = params_dtype
+        try:
+            replacement = te_layer_norm(**kwargs)
+        except Exception:
+            return None
+        ModelPolicy._align_layers(module, replacement, params_dtype)
+        if module.elementwise_affine:
+            ModelPolicy._clone_state(module, replacement, params_dtype)
+        return replacement
+
+    @staticmethod
+    def _nvidia_rms_norm(
+        module: nn.Module,
+        params_dtype: Optional[torch.dtype],
+        te: Any,
+    ) -> Optional[nn.Module]:
+        te_rms_norm = getattr(te, "RMSNorm", None)
+        if te_rms_norm is None:
+            return None
+        kwargs: Dict[str, Any] = {
+            "normalized_shape": getattr(module, "normalized_shape", None),
+            "eps": getattr(module, "eps", 1e-5),
+        }
+        if kwargs["normalized_shape"] is None:
+            return None
+        if params_dtype is not None:
+            kwargs["params_dtype"] = params_dtype
+        try:
+            replacement = te_rms_norm(**kwargs)
+        except Exception:
+            return None
+        ModelPolicy._align_layers(module, replacement, params_dtype)
+        ModelPolicy._clone_state(module, replacement, params_dtype)
+        return replacement
+
+    @staticmethod
+    def _to_nvidia_layers(
+        model: nn.Module,
+        *args: Any,
+        apply_te_linear: bool,
+        apply_te_layer_norm: bool,
+        apply_te_rms_norm: bool,
+        filter_linear: Optional[Callable[[nn.Linear, str], bool]],
+        params_dtype: Optional[torch.dtype],
+        **kwargs: Any,
+    ) -> Tuple[nn.Module, int]:
+        try:
+            import transformer_engine.pytorch as te
+        except Exception:
+            return (model, 0)
+
+        def _convert(parent: nn.Module) -> int:
+            converted = 0
+            for name, child in list(parent.named_children()):
+                replacement: Optional[nn.Module] = None
+                if apply_te_linear and isinstance(child, nn.Linear):
+                    if filter_linear is None or filter_linear(child, name):
+                        replacement = ModelPolicy._nvidia_linear(
+                            child, params_dtype, te
+                        )
+                elif apply_te_layer_norm and isinstance(child, nn.LayerNorm):
+                    replacement = ModelPolicy._nvidia_layer_norm(
+                        child, params_dtype, te
+                    )
+                else:
+                    rms_cls = getattr(torch.nn, "RMSNorm", None)
+                    if (
+                        apply_te_rms_norm
+                        and rms_cls is not None
+                        and isinstance(child, rms_cls)
+                    ):
+                        replacement = ModelPolicy._nvidia_rms_norm(
+                            child, params_dtype, te
+                        )
+                if replacement is not None:
+                    setattr(parent, name, replacement)
+                    converted += 1
+                    continue
+                converted += _convert(child)
+            return converted
+
+        count = _convert(model)
+        if count:
+            clear_model_cache(model)
+        return (model, count)
+
+    @staticmethod
+    def _to_nvidia_attention(
+        model: nn.Module,
+        *args: Any,
+        params_dtype: Optional[torch.dtype],
+        **kwargs: Any,
+    ) -> Tuple[nn.Module, int]:
+        swapped = 0
+        from ..nn.architecture import _dot_product_attention_cls
+
+        dot_cls = _dot_product_attention_cls()
+        for module in model.modules():
+            if (
+                dot_cls is not None
+                and isinstance(module, dot_cls)
+                and getattr(module, "_te_ok", False)
+            ):
+                if not getattr(module, "te_first", False):
+                    module.te_first = True
+                swapped += 1
+        if swapped:
+            clear_model_cache(model)
+        return (model, swapped)
+
+    @staticmethod
+    def use_nvidia_layers(
+        model: nn.Module,
+        device: Optional[Union[torch.device, str]] = None,
+        *args: Any,
+        metadata: Optional[Dataset[Any]] = None,
+        logger: Optional[Callable[[str], None]] = None,
+        **kwargs: Any,
+    ) -> Tuple[nn.Module, bool, str]:
+        from ..data.pipeline import Dataset
+
+        dev = torch.device(device) if device is not None else get_device()
+        if dev.type != "cuda":
+            return (model, False, "Non-NVIDIA device; TE not applied")
+        try:
+            import transformer_engine.pytorch as te
+        except Exception:
+            return (model, False, "transformer_engine not installed")
+        te_backend = getattr(te, "__name__", "transformer_engine.pytorch")
+        fp8_ok, why = Dataset.is_float8_supported(dev)
+        if fp8_ok:
+            setattr(model, "__te_fp8_default__", True)
+        params_dtype = kwargs.pop("params_dtype", None)
+        if not isinstance(params_dtype, torch.dtype):
+            params_dtype = ModelPolicy.negotiate(dev, metadata=metadata)
+        if params_dtype is torch.float64:
+            return (model, False, "TE disabled for fp64 params")
+        model, n_layers = ModelPolicy._to_nvidia_layers(
+            model,
+            apply_te_linear=True,
+            apply_te_layer_norm=True,
+            apply_te_rms_norm=True,
+            filter_linear=None,
+            params_dtype=params_dtype,
+        )
+        try:
+            model, attn_swapped = ModelPolicy._to_nvidia_attention(
+                model, params_dtype=params_dtype
+            )
+        except Exception:
+            attn_swapped = 0
+        n_total = (n_layers or 0) + (attn_swapped or 0)
+        _log_info(
+            logger,
+            f"[TE] swapped {n_total} modules (layers:{n_layers}, attn:{attn_swapped}); params_dtype={str(params_dtype).split('.')[-1]}, fp8={('on' if fp8_ok else 'off')} ({(why if fp8_ok else '')}), backend={te_backend}",
+        )
+        return (
+            model,
+            n_total > 0,
+            f"TE applied (swapped {n_total}, layers={n_layers}, attn={attn_swapped}, dtype={params_dtype}, fp8={('on' if fp8_ok else 'off')}, backend={te_backend})",
+        )
+
+    @staticmethod
+    def _enable_nvidia_training(
+        model: nn.Module,
+        params_dtype: torch.dtype,
+        logger: Optional[Callable[[str], None]],
+    ) -> Tuple[nn.Module, bool, str]:
+        try:
+            swapped_model, n = ModelPolicy._to_nvidia_layers(
+                model,
+                apply_te_linear=True,
+                apply_te_layer_norm=True,
+                apply_te_rms_norm=True,
+                filter_linear=lambda lyr, _: lyr.in_features % 16 == 0
+                and lyr.out_features % 16 == 0,
+                params_dtype=params_dtype,
+            )
+            if n > 0:
+                setattr(swapped_model, "__fp8_training_te__", True)
+                if logger:
+                    logger(f"[FP8][TE] swapped {n} modules")
+                return (swapped_model, True, f"TE (swapped {n})")
+            return (model, False, "TE present but no eligible modules")
+        except Exception as exc:
+            return (model, False, f"TE swap failed: {exc}")
+
+    @staticmethod
+    def _enable_torchao_training(
+        model: nn.Module,
+        logger: Optional[Callable[[str], None]],
+    ) -> Tuple[nn.Module, bool, str]:
+        try:
+            from torchao.float8 import convert_to_float8_training
+
+            res = convert_to_float8_training(model)
+            converted = res or model
+            setattr(converted, "__fp8_training_ao__", True)
+            if logger:
+                logger("[FP8][AO] convert_to_float8_training ok")
+            return (converted, True, "torchao.float8")
+        except Exception as exc:
+            return (model, False, f"torchao convert failed: {exc}")
+
+    @staticmethod
+    def _enable_nvidia_inference(
+        model: nn.Module,
+        params_dtype: torch.dtype,
+        logger: Optional[Callable[[str], None]],
+    ) -> Tuple[nn.Module, bool, str]:
+        try:
+            swapped, n = ModelPolicy._to_nvidia_layers(
+                model,
+                apply_te_linear=True,
+                apply_te_layer_norm=True,
+                apply_te_rms_norm=True,
+                filter_linear=lambda lyr, _: lyr.in_features % 16 == 0
+                and lyr.out_features % 16 == 0,
+                params_dtype=params_dtype,
+            )
+            if n > 0:
+                setattr(swapped, "__fp8_inference_te__", True)
+                if logger:
+                    logger(
+                        f"[FP8][TE] swapped {n} modules; using te.fp8_autocast"
+                    )
+                return (swapped, True, f"TE swap ({n})")
+            return (model, False, "no eligible Linear (dims%16)")
+        except Exception as exc:
+            return (model, False, f"TE swap failed: {exc}")
+
+    @staticmethod
+    def _reuse_nvidia_layers(
+        model: nn.Module,
+        logger: Optional[Callable[[str], None]],
+    ) -> Tuple[nn.Module, bool, str]:
+        te_present = any(
+            (
+                getattr(module.__class__, "__module__", "").startswith(
+                    "transformer_engine"
+                )
+                for module in model.modules()
+            )
+        )
+        if te_present:
+            setattr(model, "__fp8_inference_te__", True)
+            clear_model_cache(model)
+            if logger:
+                logger("[FP8][TE] te.* already present; using te.fp8_autocast")
+            return (model, True, "TE present")
+        return (model, False, "TE layers not present")
+
+    @staticmethod
+    def _enable_torchao_inference(
+        model: nn.Module,
+        dynamic_activations: bool,
+        logger: Optional[Callable[[str], None]],
+    ) -> Tuple[nn.Module, bool, str]:
+        try:
+            from torchao.quantization import (
+                Float8DynamicActivationFloat8WeightConfig,
+                Float8WeightOnlyConfig,
+                quantize_,
+            )
+
+            cfg = (
+                Float8DynamicActivationFloat8WeightConfig()
+                if dynamic_activations
+                else Float8WeightOnlyConfig()
+            )
+            quantize_(model, cfg)
+            setattr(model, "__fp8_inference_ao__", True)
+            _log_info(logger, f"[FP8][AO] applied {cfg.__class__.__name__}")
+            return (model, True, "torchao")
+        except Exception as exc:
+            return (model, False, f"AO failed: {exc}")
+
+    @staticmethod
+    def enable_float8_training(
+        model: nn.Module,
+        metadata: Optional[Dataset[Any]] = None,
+        logger: Optional[Callable[[str], None]] = None,
+    ) -> Tuple[nn.Module, bool, str]:
+        from ..data.pipeline import Dataset
+
+        meta = ModelPolicy._coerce_metadata(model, metadata)
+        device = torch.device(meta.device)
+        ok, reason = Dataset.is_float8_supported(device)
+        if not ok:
+            Autocast.configure(model, metadata=meta)
+            return (model, False, reason)
+        if getattr(meta, "has_scale", False):
+            float8_dtypes = Autocast.float8_formats()
+            if not any(
+                is_scale_safe(dtype, meta, safety_margin=2.0)
+                for dtype in float8_dtypes
+            ):
+                _log_info(
+                    logger,
+                    "[FP8] training disabled: data scale exceeds float8 range",
+                )
+                Autocast.configure(model, metadata=meta)
+                return (model, False, "data scale")
+        params_dtype = ModelPolicy.negotiate(device, metadata=meta)
+        for backend in ("te", "torchao"):
+            if backend == "te":
+                m2, ok2, why = ModelPolicy._enable_nvidia_training(
+                    model, params_dtype, logger
+                )
+            else:
+                m2, ok2, why = ModelPolicy._enable_torchao_training(
+                    model, logger
+                )
+            if ok2:
+                _log_info(
+                    logger, f"[FP8] training enabled via {why} ({reason})"
+                )
+                Autocast.configure(m2, metadata=meta)
+                return (m2, True, why)
+            else:
+                _log_debug(logger, f"[FP8] {backend} path skipped: {why}")
+        Autocast.configure(model, metadata=meta)
+        return (model, False, "No usable FP8 backend")
+
+    @staticmethod
+    def enable_float8_prediction(
+        model: nn.Module,
+        metadata: Optional[Dataset[Any]] = None,
+        logger: Optional[Callable[[str], None]] = None,
+    ) -> Tuple[nn.Module, bool, str]:
+        from ..data.pipeline import Dataset
+
+        meta = ModelPolicy._coerce_metadata(model, metadata)
+        device = torch.device(meta.device)
+        ok, reason = Dataset.is_float8_supported(device)
+        if not ok:
+            Autocast.configure(model, metadata=meta)
+            return (model, False, reason)
+        if getattr(meta, "has_scale", False):
+            float8_dtypes = Autocast.float8_formats()
+            if not any(
+                is_scale_safe(dtype, meta, safety_margin=2.0)
+                for dtype in float8_dtypes
+            ):
+                _log_info(
+                    logger,
+                    "[FP8] inference disabled: data scale exceeds float8 range",
+                )
+                Autocast.configure(model, metadata=meta)
+                return (model, False, "data scale")
+        params_dtype = ModelPolicy.negotiate(device, metadata=meta)
+        dynamic_activations = not (
+            getattr(meta, "has_scale", False)
+            and getattr(meta, "scale_is_integral", None) is True
+        )
+        order = ("te_swap", "te_present", "ao")
+        for step in order:
+            if step == "te_swap":
+                m2, ok2, why = ModelPolicy._enable_nvidia_inference(
+                    model, params_dtype, logger
+                )
+            elif step == "te_present":
+                m2, ok2, why = ModelPolicy._reuse_nvidia_layers(model, logger)
+            else:
+                m2, ok2, why = ModelPolicy._enable_torchao_inference(
+                    model, dynamic_activations, logger
+                )
+            if ok2:
+                _log_info(
+                    logger, f"[FP8] inference enabled via {why} ({reason})"
+                )
+                Autocast.configure(m2, metadata=meta)
+                return (m2, True, why)
+            else:
+                _log_debug(logger, f"[FP8] {step} skipped: {why}")
+        Autocast.configure(model, metadata=meta)
+        return (model, False, "No usable FP8 backend")
+
+    @staticmethod
+    def enable_int8_training(
+        model: nn.Module,
+        metadata: Optional[Dataset[Any]] = None,
+        logger: Optional[Callable[[str], None]] = None,
+    ) -> Tuple[nn.Module, bool, str]:
+        meta = ModelPolicy._coerce_metadata(model, metadata)
+        device = torch.device(meta.device)
+        with contextlib.suppress(Exception):
+            model.to(device)
+        dynamic_activations = not (
+            getattr(meta, "has_scale", False)
+            and getattr(meta, "scale_is_integral", None) is True
+        )
+        group_size = 128
+        m2, ok, why = Quantization.enable_qat(
+            model,
+            dynamic_activations=dynamic_activations,
+            group_size=group_size,
+            logger=logger,
+        )
+        Autocast.configure(m2 if ok else model, metadata=meta)
+        return (m2, ok, why)
+
+    @staticmethod
+    def enable_int8_prediction(
+        model: nn.Module,
+        metadata: Optional[Dataset[Any]] = None,
+        logger: Optional[Callable[[str], None]] = None,
+    ) -> Tuple[nn.Module, bool, str]:
+        meta = ModelPolicy._coerce_metadata(model, metadata)
+        device = torch.device(meta.device)
+        with contextlib.suppress(Exception):
+            model.to(device)
+        dynamic_activations = not (
+            getattr(meta, "has_scale", False)
+            and getattr(meta, "scale_is_integral", None) is True
+        )
+        m2, ok, why = Quantization._enable_ptq(
+            model, dynamic_activations=dynamic_activations, logger=logger
+        )
+        Autocast.configure(m2 if ok else model, metadata=meta)
+        return (m2, ok, why)
+
+
+@dataclass(slots=True)
+class PrecisionPolicy:
+    master_float: torch.dtype = torch.float32
+    amp_dtype: Optional[torch.dtype] = None
+    fsdp_param_dtype: torch.dtype = torch.float32
+    fsdp_reduce_dtype: torch.dtype = torch.float32
+    fsdp_output_dtype: torch.dtype = torch.float32
+    bn_buffers_dtype: torch.dtype = torch.float32
+    underflow_action: str = "warn"
+
+    @property
+    def amp_float(self) -> Optional[torch.dtype]:
+        return self.amp_dtype
+
+    @classmethod
+    def from_metadata(
+        cls,
+        device: Union[torch.device, str],
+        metadata: Any | None,
+        *args: Any,
+        logger: Optional[logging.Logger] = None,
+        safety_margin: float = 8.0,
+    ) -> "PrecisionPolicy":
+        dev = torch.device(device)
+        meta = metadata
+        if meta is None:
+            meta = DeviceMeta.for_device(dev)
+        else:
+            with contextlib.suppress(Exception):
+                setattr(meta, "device", dev)
+                if callable(f := getattr(meta, "refresh", None)):
+                    f()
+        action = normalize_underflow_action(
+            getattr(meta, "underflow_action", None),
+            default=default_underflow_action(),
+        )
+        with contextlib.suppress(Exception):
+            setattr(meta, "underflow_action", action)
+        is_negotiable = bool(getattr(meta, "is_negotiable", False))
+        safety = float(safety_margin)
+        amp_dtype: Optional[torch.dtype] = None
+        master_float = (
+            torch.float32
+            if is_negotiable
+            or (
+                dev.type not in ("cpu", "xpu", "mps")
+                and is_scale_safe(torch.float32, meta, safety_margin=safety)
+            )
+            else torch.float64
+        )
+
+        if dev.type == "cuda":
+            if is_negotiable and is_scale_safe(
+                torch.float32, meta, safety_margin=safety
+            ):
+                master_float = torch.float32
+            if is_cuda_bf16_supported(dev) and is_scale_safe(
+                torch.bfloat16, meta, safety_margin=safety
+            ):
+                amp_dtype = torch.bfloat16
+            elif is_scale_safe(torch.float16, meta, safety_margin=safety):
+                amp_dtype = torch.float16
+        elif dev.type == "xpu":
+            amp_dtype = torch.bfloat16
+        elif dev.type == "mps":
+            amp_dtype = torch.float16
+
+        fsdp_dt = (
+            amp_dtype
+            if master_float == torch.float32 and amp_dtype
+            else master_float
+        )
+        return cls(
+            master_float=master_float,
+            amp_dtype=amp_dtype,
+            fsdp_param_dtype=fsdp_dt,
+            fsdp_reduce_dtype=fsdp_dt,
+            fsdp_output_dtype=fsdp_dt,
+            bn_buffers_dtype=master_float,
+            underflow_action=str(action),
+        )
+
+    def to_fsdp_policy(self):
+        from torch.distributed.fsdp import MixedPrecisionPolicy
+
+        return MixedPrecisionPolicy(
+            param_dtype=self.fsdp_param_dtype,
+            reduce_dtype=self.fsdp_reduce_dtype,
+            output_dtype=self.fsdp_output_dtype,
+            cast_forward_inputs=True,
+        )
+
+
+# -----------------------------------------------------------------------------
+# Distributed policy (collectives + sharding/replication selection)
+# -----------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class CollectivePolicy:
+    """How to do collectives for state sync (broadcast / all_reduce).
+
+    This policy intentionally centralizes *collective communication* knobs.
+    Broadcast is just one collective; reduction-style ops (all-reduce) are
+    another. In practice we mostly use this for:
+      - initial state sync (broadcast of parameters/buffers)
+      - periodic state sync / reshard fixes
+      - DDP-style gradient synchronization when HSDP/FSDP is unavailable
+
+    Backends:
+      - **c10d**: Use ``torch.distributed`` collectives directly on the tensor
+        device. This is the fastest path when a native backend exists (e.g.
+        NCCL/XCCL for CUDA/XPU, Gloo for CPU).
+      - **gloox**: Use a *Gloo* process group and stage non-CPU tensors through
+        CPU memory. This is slower, but enables collectives for devices that
+        lack a native backend (e.g. MPS) and can act as a "safe mode" if GPU
+        collectives OOM.
+
+    Environment variables (new names + legacy names are both accepted):
+      - STNET_COLLECTIVE_BACKEND / STNET_BCAST_BACKEND: c10d|gloox (default: c10d)
+      - STNET_COLLECTIVE_INCLUDE_PARAMETERS / STNET_BCAST_INCLUDE_PARAMETERS: 0|1 (default: 1)
+      - STNET_COLLECTIVE_INCLUDE_BUFFERS / STNET_BCAST_INCLUDE_BUFFERS: 0|1 (default: 1)
+      - STNET_COLLECTIVE_MAX_BUFFER_SIZE_MB / STNET_BCAST_MAX_BUFFER_SIZE_MB: int (default: 25)
+
+      - STNET_COLLECTIVE_COALESCE_MB / STNET_BCAST_COALESCE_MB: int (default: 64)
+      - STNET_COLLECTIVE_MAX_TENSOR_MB_FOR_COALESCE / STNET_BCAST_MAX_TENSOR_MB_FOR_COALESCE: int (default: 8)
+
+      - STNET_COLLECTIVE_INTER_STREAM_MB / STNET_BCAST_INTER_STREAM_MB: int (default: 16)
+      - STNET_COLLECTIVE_INTRA_STREAM_MB / STNET_BCAST_INTRA_STREAM_MB: int (default: 64)
+      - STNET_COLLECTIVE_MAX_INFLIGHT_MB / STNET_BCAST_MAX_INFLIGHT_MB: int (default: 64)
+
+      - STNET_COLLECTIVE_DEBUG / STNET_BCAST_DEBUG: 0|1 (default: 0)
+      - STNET_COLLECTIVE_VERBOSE / STNET_BCAST_VERBOSE: 0|1 (default: 0)
+    """
+
+    backend: str = "c10d"
+
+    # What to broadcast when syncing module states.
+    include_parameters: bool = True
+    include_buffers: bool = True
+    max_buffer_size_mb: int = 25
+
+    # Small-tensor coalescing (reduce Python overhead + number of collectives).
+    coalesce_mb: int = 64
+    max_tensor_mb_for_coalesce: int = 8
+
+    # Large-tensor streaming (chunked broadcast).
+    inter_stream_mb: int = 16
+    intra_stream_mb: int = 64
+
+    # Global "in-flight" limiter for async collectives.
+    max_inflight_mb: int = 64
+
+    debug_collectives: bool = False
+    verbose: bool = False
+
+    @classmethod
+    def from_env(cls) -> "CollectivePolicy":
+        import os
+
+        def getenv_bool_any(primary: str, legacy: str, default: bool) -> bool:
+            v = os.getenv(primary)
+            if v is None:
+                v = os.getenv(legacy)
+            if v is None:
+                return default
+            return v.strip().lower() in ("1", "true", "yes", "y", "on")
+
+        def getenv_int_any(primary: str, legacy: str, default: int) -> int:
+            v = os.getenv(primary)
+            if v is None:
+                v = os.getenv(legacy)
+            if v is None:
+                return default
+            try:
+                return int(v)
+            except Exception:
+                return default
+
+        backend = (
+            os.getenv(
+                "STNET_COLLECTIVE_BACKEND",
+                os.getenv("STNET_BCAST_BACKEND", "c10d"),
+            )
+            .strip()
+            .lower()
+        )
+
+        include_parameters = getenv_bool_any(
+            "STNET_COLLECTIVE_INCLUDE_PARAMETERS", "STNET_BCAST_INCLUDE_PARAMETERS", True
+        )
+        include_buffers = getenv_bool_any(
+            "STNET_COLLECTIVE_INCLUDE_BUFFERS", "STNET_BCAST_INCLUDE_BUFFERS", True
+        )
+
+        max_buffer_size_mb = getenv_int_any(
+            "STNET_COLLECTIVE_MAX_BUFFER_SIZE_MB", "STNET_BCAST_MAX_BUFFER_SIZE_MB", 25
+        )
+
+        coalesce_mb = getenv_int_any(
+            "STNET_COLLECTIVE_COALESCE_MB", "STNET_BCAST_COALESCE_MB", 64
+        )
+        max_tensor_mb_for_coalesce = getenv_int_any(
+            "STNET_COLLECTIVE_MAX_TENSOR_MB_FOR_COALESCE",
+            "STNET_BCAST_MAX_TENSOR_MB_FOR_COALESCE",
+            8,
+        )
+
+        inter_stream_mb = getenv_int_any(
+            "STNET_COLLECTIVE_INTER_STREAM_MB", "STNET_BCAST_INTER_STREAM_MB", 16
+        )
+        intra_stream_mb = getenv_int_any(
+            "STNET_COLLECTIVE_INTRA_STREAM_MB", "STNET_BCAST_INTRA_STREAM_MB", 64
+        )
+
+        max_inflight_mb = getenv_int_any(
+            "STNET_COLLECTIVE_MAX_INFLIGHT_MB", "STNET_BCAST_MAX_INFLIGHT_MB", 64
+        )
+
+        debug_collectives = getenv_bool_any(
+            "STNET_COLLECTIVE_DEBUG", "STNET_BCAST_DEBUG", False
+        )
+        verbose = getenv_bool_any(
+            "STNET_COLLECTIVE_VERBOSE", "STNET_BCAST_VERBOSE", False
+        )
+
+        return cls(
+            backend=backend,
+            include_parameters=include_parameters,
+            include_buffers=include_buffers,
+            max_buffer_size_mb=max_buffer_size_mb,
+            coalesce_mb=coalesce_mb,
+            max_tensor_mb_for_coalesce=max_tensor_mb_for_coalesce,
+            inter_stream_mb=inter_stream_mb,
+            intra_stream_mb=intra_stream_mb,
+            max_inflight_mb=max_inflight_mb,
+            debug_collectives=debug_collectives,
+            verbose=verbose,
+        )
+
+
+@dataclass(frozen=True)
+class DistributedPolicy:
+    """Central distribution policy.
+
+    Intentional defaults:
+      - If a device supports HSDP (CUDA/XPU), use it.
+      - Otherwise, fall back to DDP-style data parallel.
+
+    Environment variables:
+      - STNET_DISTRIBUTED_PREFER_HSDP: 0|1 (default: 1)
+      - STNET_DISTRIBUTED_PREFER_DDP: 0|1 (default: 1)
+      - STNET_DISTRIBUTED_SYNC_STATE: 0|1 (default: 1)
+
+    (See ``CollectivePolicy`` for collective-related env vars.)
+    """
+
+    prefer_hsdp: bool = True
+    prefer_ddp: bool = True
+
+    # When starting distributed jobs, whether to run an explicit model state
+    # synchronization step (rank0 -> all ranks). This is separate from DDP/FSDP
+    # internal sync.
+    sync_state: bool = True
+
+    collective: CollectivePolicy = CollectivePolicy()
+
+    @classmethod
+    def from_env(cls) -> "DistributedPolicy":
+        import os
+
+        def getenv_bool(name: str, default: bool) -> bool:
+            v = os.getenv(name)
+            if v is None:
+                return default
+            return v.strip().lower() in ("1", "true", "yes", "y", "on")
+
+        prefer_hsdp = getenv_bool("STNET_DISTRIBUTED_PREFER_HSDP", True)
+        prefer_ddp = getenv_bool("STNET_DISTRIBUTED_PREFER_DDP", True)
+        sync_state = getenv_bool("STNET_DISTRIBUTED_SYNC_STATE", True)
+
+        return cls(
+            prefer_hsdp=prefer_hsdp,
+            prefer_ddp=prefer_ddp,
+            sync_state=sync_state,
+            collective=CollectivePolicy.from_env(),
+        )
