@@ -3864,30 +3864,14 @@ def epochs(
                     sched.step()
                 except Exception:
                     pass
-
-
-
-
-
-
-
-
-
-
             if swa_helper is not None and epoch_idx >= swa_start_epoch and float(train_samples_epoch or 0.0) > 0.0:
                 _LOGGER.info("[swa] epoch %d: update+ckpt (CPU shadow)", epoch_idx + 1)
-
                 swa_target = (
                     model.module
-
-
                     if isinstance(model, torch.nn.parallel.DistributedDataParallel)
                     else model
                 )
                 swa_helper.update(swa_target)
-
-
-
                 ckpt_dir = getattr(ops, "ckpt_dir", None)
                 if ckpt_dir:
                     try:
@@ -3897,37 +3881,24 @@ def epochs(
                 if ckpt_dir:
                     ckpt_path = os.path.join(ckpt_dir, "model.pt")
                     tmp_path = ckpt_path + ".tmp"
-
-
-
-
-
-
-
-
                     model_sd = swa_helper.checkpoint_state_dict(
                         swa_target,
                         include_buffers=True,
                         max_buffer_mb=25,
                     )
-
                     _coerce_dcp_keys(model_sd)
-
-
-
-
+                    _LOGGER.info("Updating checkpoint (%d/%d)", int(epoch_idx + 1), int(ops.epochs))
                     print(
-                        f"[SWA] epoch {int(epoch_idx + 1)}: saving checkpoint -> {ckpt_path}",
+                        f"Updating checkpoint ({int(epoch_idx + 1)}/{int(ops.epochs)})",
                         flush=True,
                     )
                     torch.save(model_sd, tmp_path)
                     os.replace(tmp_path, ckpt_path)
-                    _LOGGER.info("[swa] epoch %d: checkpoint saved -> %s", epoch_idx + 1, ckpt_path)
+                    _LOGGER.info("Checkpoint updated (%d/%d)", int(epoch_idx + 1), int(ops.epochs))
                     print(
-                        f"[SWA] epoch {int(epoch_idx + 1)}: checkpoint saved",
+                        f"Checkpoint updated ({int(epoch_idx + 1)}/{int(ops.epochs)})",
                         flush=True,
                     )
-
                     try:
                         del model_sd
                     except Exception:
@@ -3935,8 +3906,6 @@ def epochs(
                     with contextlib.suppress(Exception):
                         import gc
                         gc.collect()
-
-
             if is_distributed():
                 distributed_barrier(device)
             prev_comp_time += float(comp_time)
@@ -3946,23 +3915,18 @@ def epochs(
             prev_samples += float(train_samples_epoch)
     model_for_scaler = model.module if hasattr(model, "module") else model
     scaler_y_device = model_for_scaler.scaler.y_mean.device
-
-
     with torch.inference_mode():
         sum_x = None
         sum_y = None
         sum_x2 = None
         sum_xy = None
         total_n = 0
-
-
         target_chunk_bytes = 16 * 1024 * 1024
         for batch in train_loader:
             x_b, y_b = collate.get_row(batch, labels_required=True)
             x_raw = x_b.to(device)
             y_raw = y_b.to(scaler_y_device)
             y_flat = y_raw.reshape(y_raw.shape[0], -1) if y_raw.ndim >= 2 else y_raw
-
             out = model(
                 x_raw,
                 labels_flat=None,
@@ -3975,7 +3939,6 @@ def epochs(
                 z_pred_raw, _ = out
             else:
                 z_pred_raw = out
-
             z_pred = z_pred_raw.detach()
             if z_pred.device != scaler_y_device:
                 z_pred = z_pred.to(device=scaler_y_device)
@@ -3984,9 +3947,6 @@ def epochs(
                 if z_pred.ndim >= 2
                 else z_pred.view(-1, 1)
             )
-
-
-
             z_true = model_for_scaler.scaler.normalize_y(y_flat.detach())
             if z_true.device != scaler_y_device:
                 z_true = z_true.to(device=scaler_y_device)
@@ -3995,8 +3955,6 @@ def epochs(
                 if z_true.ndim >= 2
                 else z_true.view(-1, 1)
             )
-
-
             if z_pred.shape[-1] != z_true.shape[-1]:
                 f_pred = z_pred.shape[-1]
                 f_true = z_true.shape[-1]
@@ -4010,29 +3968,23 @@ def epochs(
                     raise RuntimeError(
                         f"Calibration: feature dimension mismatch between prediction and target that cannot be reconciled generically. z_pred.shape={tuple(z_pred.shape)}, z_true.shape={tuple(z_true.shape)}"
                     )
-
             if z_pred.shape[0] != z_true.shape[0]:
                 raise RuntimeError(
                     f"Calibration: batch dimension mismatch between prediction and target. z_pred.shape={tuple(z_pred.shape)}, z_true.shape={tuple(z_true.shape)}"
                 )
             if z_pred.numel() == 0 or z_true.numel() == 0:
                 continue
-
             n_batch = int(z_pred.shape[0])
             total_n += n_batch
-
             feat = int(z_pred.shape[1])
             if sum_x is None:
                 sum_x = torch.zeros((feat,), device=scaler_y_device, dtype=torch.float64)
                 sum_y = torch.zeros((feat,), device=scaler_y_device, dtype=torch.float64)
                 sum_x2 = torch.zeros((feat,), device=scaler_y_device, dtype=torch.float64)
                 sum_xy = torch.zeros((feat,), device=scaler_y_device, dtype=torch.float64)
-
-
             denom = max(1, n_batch * int(z_pred.element_size()))
             chunk_f = max(1, int(target_chunk_bytes // denom))
             chunk_f = min(chunk_f, feat)
-
             if chunk_f >= feat:
                 sum_x += z_pred.sum(dim=0, dtype=torch.float64)
                 sum_y += z_true.sum(dim=0, dtype=torch.float64)
@@ -4047,7 +3999,6 @@ def epochs(
                     sum_y[j:j2] += zt.sum(dim=0, dtype=torch.float64)
                     sum_x2[j:j2] += (zp * zp).sum(dim=0, dtype=torch.float64)
                     sum_xy[j:j2] += (zp * zt).sum(dim=0, dtype=torch.float64)
-
         if is_distributed():
             n_t = torch.tensor(int(total_n), device=scaler_y_device, dtype=torch.int64)
             torch.distributed.all_reduce(n_t, op=torch.distributed.ReduceOp.SUM)
@@ -4060,7 +4011,6 @@ def epochs(
                 torch.distributed.all_reduce(sum_x2, op=torch.distributed.ReduceOp.SUM)
             if sum_xy is not None:
                 torch.distributed.all_reduce(sum_xy, op=torch.distributed.ReduceOp.SUM)
-
         if (
             total_n > 0
             and sum_x is not None
