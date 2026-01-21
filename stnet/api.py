@@ -90,11 +90,6 @@ from .nn.layers import Recorder, resize_scaler_buffer
 from .runtime.io import _filtered_warnings, _torch_load_checkpoint, is_required
 from .runtime.main import _coerce_dcp_keys, process
 
-_IGNORED_WARNING_MESSAGE_RE = re.compile(
-    r".*(?:"
-    + "|".join((f"(?:{p})" for p in _IGNORED_WARNING_PATTERNS))
-    + r").*"
-)
 _IGNORED_WARNING_PATTERNS: tuple[str, ...] = (
     "torch.distributed is disabled, unavailable or uninitialized",
     "TypedStorage is deprecated",
@@ -105,8 +100,20 @@ _IGNORED_WARNING_PATTERNS: tuple[str, ...] = (
     "mixed precision.*may be unavailable",
     "Either mode or options can be specified, but both can't be specified at the same time\\.",
 )
+_IGNORED_WARNING_MESSAGE_RE = re.compile(
+    r".*(?:"
+    + "|".join((f"(?:{p})" for p in _IGNORED_WARNING_PATTERNS))
+    + r").*"
+)
 P = ParamSpec("P")
 PathLike: TypeAlias = str | os.PathLike[str] | Path
+TrainData: TypeAlias = (
+    TensorDictBase
+    | Mapping[str, object]
+    | Sequence[Mapping[str, object]]
+    | Mapping[str, Mapping[str, object]]
+    | object
+)
 PredictData: TypeAlias = TrainData
 PredictionOutput: TypeAlias = (
     TensorDictBase
@@ -117,13 +124,6 @@ PredictionOutput: TypeAlias = (
 R = TypeVar("R")
 TensorLike: TypeAlias = torch.Tensor | MemoryMappedTensor
 TorchDeviceLike: TypeAlias = torch.device | str | int
-TrainData: TypeAlias = (
-    TensorDictBase
-    | Mapping[str, object]
-    | Sequence[Mapping[str, object]]
-    | Mapping[str, Mapping[str, object]]
-    | object
-)
 logger = logging.getLogger(__name__)
 
 def _apply_warning_filters() -> None:

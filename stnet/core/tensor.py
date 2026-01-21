@@ -10,18 +10,6 @@ from typing import Any, Iterator, TypeVar
 import torch
 
 _T = TypeVar("_T")
-_tdx_is_fake = None
-_tdx_is_fake = _optional_attr(
-    "torchdistx.fake", "is_fake", None, predicate=callable
-)
-FakeTensor = ()
-FakeTensor = _optional_attr(
-    "torch._subclasses.fake_tensor", "FakeTensor", (), predicate=inspect.isclass
-)
-TensorDictBase = ()
-TensorDictBase = _optional_attr(
-    "tensordict", "TensorDictBase", (), predicate=inspect.isclass
-)
 
 def _optional_attr(
     module: str,
@@ -46,6 +34,19 @@ def _optional_attr(
     if predicate is not None and not predicate(val):
         return default
     return val
+
+_tdx_is_fake = _optional_attr(
+    "torchdistx.fake", "is_fake", None, predicate=callable
+)
+FakeTensor = _optional_attr(
+    "torch._subclasses.fake_tensor",
+    "FakeTensor",
+    (),
+    predicate=inspect.isclass,
+)
+TensorDictBase = _optional_attr(
+    "tensordict", "TensorDictBase", (), predicate=inspect.isclass
+)
 def _call_from_buffer(
     fn: Any,
     buffer: Any,

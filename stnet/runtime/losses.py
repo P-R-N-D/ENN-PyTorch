@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import contextlib
 import math
+from dataclasses import dataclass
 from typing import Any, List, Optional, Sequence, Tuple, Union
 
 import torch
@@ -1393,6 +1394,7 @@ class TiledLoss(nn.Module):
             if self.reduction == "sum"
             else total_sum / float(max(total_count, 1))
         )
+@dataclass
 class LossWeightController:
     momentum: float = 0.95
     min_weight: float = 1e-6

@@ -131,11 +131,6 @@ from .optimizers import (
 _COMPILE_SAFE_DONE = False
 _COMPILE_SAFE_LOCK = Mutex()
 _DL_STATE_FILE = "dataloader.json"
-_IGNORED_WARNING_MESSAGE_RE = re.compile(
-    r".*(?:"
-    + "|".join((f"(?:{p})" for p in _IGNORED_WARNING_PATTERNS))
-    + r").*"
-)
 _IGNORED_WARNING_PATTERNS: tuple[str, ...] = (
     "torch.distributed is disabled, unavailable or uninitialized",
     "TypedStorage is deprecated",
@@ -145,6 +140,11 @@ _IGNORED_WARNING_PATTERNS: tuple[str, ...] = (
     "found no DeviceMesh from dtensor args",
     "mixed precision.*may be unavailable",
     "Either mode or options can be specified, but both can't be specified at the same time\\.",
+)
+_IGNORED_WARNING_MESSAGE_RE = re.compile(
+    r".*(?:"
+    + "|".join((f"(?:{p})" for p in _IGNORED_WARNING_PATTERNS))
+    + r").*"
 )
 _LOGGER = logging.getLogger(__name__)
 _NVML_BACKOFF_UNTIL = 0.0

@@ -5,7 +5,7 @@ import contextlib
 import contextvars
 import logging
 import os
-from dataclasses import field
+from dataclasses import dataclass, field
 from functools import partial
 from types import TracebackType
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
@@ -13,7 +13,11 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 import torch
 from torch import nn
 
-_ACT_CLASSES: Tuple[type, ...] = tuple(_ACT_COEFF.keys())
+try:
+    from torch.utils._python_dispatch import TorchDispatchMode
+except Exception:
+    TorchDispatchMode = None
+
 _ACT_COEFF: Dict[type, float] = {
     nn.ReLU: 1.0,
     nn.ReLU6: 1.0,
@@ -26,9 +30,9 @@ _ACT_COEFF: Dict[type, float] = {
     nn.Hardswish: 6.0,
     nn.Hardsigmoid: 4.0,
 }
+_ACT_CLASSES: Tuple[type, ...] = tuple(_ACT_COEFF.keys())
 _LOGGER = logging.getLogger(__name__)
 FLOP_PROFILER: "_FlopProfiler" | None = None
-FLOP_PROFILER = _FlopProfiler()
 
 def _float_safe(x: Any, default: float = 0.0) -> float:
     try:
@@ -915,9 +919,11 @@ class _TensorShape:
         for v in self.shape:
             n *= int(v)
         return int(n)
+@dataclass
 class _Acc:
     total: float = 0.0
     by_type: Dict[str, float] = field(default_factory=dict)
+@dataclass
 class _ProfilerConfig:
     include_bias: bool
     effective_bwd: float
@@ -2240,6 +2246,11 @@ class _FlopProfiler:
         if total > 0.0:
             self.add("Attention", total)
         return float(total)
+
+
+FLOP_PROFILER = _FlopProfiler()
+
+
 class _NvtxFlops(contextlib.AbstractContextManager[Any]):
     def __init__(
         self, dev: Optional[torch.device], getter: Callable[[], float]
@@ -2818,10 +2829,6 @@ try:
 except Exception:
     OpOverload = tuple()
     OpOverloadPacket = tuple()
-try:
-    from torch.utils._python_dispatch import TorchDispatchMode
-except Exception:
-    TorchDispatchMode = None
 try:
 
 

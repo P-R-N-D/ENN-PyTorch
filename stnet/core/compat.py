@@ -14,9 +14,6 @@ from .graph import compile_distributed_safe
 _PATCH_LOCK = Mutex(reentrant=True)
 _TORCH_COMPAT: TorchCompat | None = None
 RMSNorm = getattr(nn, "RMSNorm", None)
-StochasticDepth = (
-    getattr(nn, "StochasticDepth", None) or _StochasticDepthFallback
-)
 
 def _fmin_impl(tm, a, b):
     a, b = tm.broadcast_tensors(a, b)
@@ -109,6 +106,10 @@ class _StochasticDepthFallback(nn.Module):
         return x * x.new_empty(shape).bernoulli_(keep).div_(keep)
 class _SDPBackendFallback:
     MATH = FLASH_ATTENTION = EFFICIENT_ATTENTION = CUDNN_ATTENTION = object()
+
+StochasticDepth = (
+    getattr(nn, "StochasticDepth", None) or _StochasticDepthFallback
+)
 
 class TorchCompat:
     def __init__(

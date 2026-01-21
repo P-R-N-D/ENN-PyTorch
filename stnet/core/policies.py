@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import contextlib
 import logging
-from dataclasses import replace
+from dataclasses import dataclass, field, replace
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -73,6 +73,7 @@ class LossWeightPolicy(Protocol):
         bottom_loss: Optional[torch.Tensor],
     ) -> None:
         raise NotImplementedError
+@dataclass
 class WorkerPolicy:
     nproc_per_node: int = 1
     device: str = "cpu"
@@ -355,6 +356,7 @@ class WorkerPolicy:
                         _TORCH_INTEROP_LOCKED = True
                 elif int(_TORCH_INTEROP_THREADS_SET) != int(inter):
                     pass
+@dataclass
 class LoaderPolicy:
     max_batches_accel: int = 4
     max_batches_cpu: int = 2
@@ -440,6 +442,7 @@ class LoaderPolicy:
                         setattr(loader, "_depth", int(max(1, int(max_batches))))
                     return loader
         return new_prefetcher(loader, max_batches=max_batches, name=name)
+@dataclass
 class BatchPolicy:
     sample_bytes: int
     host_sample_bytes: Optional[int] = None
@@ -599,6 +602,7 @@ class BatchPolicy:
                 b = min(b, int(self.max_batch))
         b = max(int(b), int(self.min_batch))
         return max(1, b)
+@dataclass
 class ModelPolicy:
     @staticmethod
     def negotiate(
@@ -1173,6 +1177,7 @@ class ModelPolicy:
         )
         Autocast.configure(m2 if ok else model, metadata=meta)
         return (m2, ok, why)
+@dataclass
 class PrecisionPolicy:
     master_float: torch.dtype = torch.float32
     amp_dtype: Optional[torch.dtype] = None
@@ -1263,6 +1268,7 @@ class PrecisionPolicy:
             output_dtype=self.fsdp_output_dtype,
             cast_forward_inputs=True,
         )
+@dataclass
 class CollectivePolicy:
 \
 \
@@ -1403,6 +1409,7 @@ class CollectivePolicy:
             debug_collectives=debug_collectives,
             verbose=verbose,
         )
+@dataclass
 class DistributedPolicy:
 \
 \
@@ -1426,7 +1433,7 @@ class DistributedPolicy:
 
     sync_state: bool = True
 
-    collective: CollectivePolicy = CollectivePolicy()
+    collective: CollectivePolicy = field(default_factory=CollectivePolicy)
 
     @classmethod
     def from_env(cls) -> "DistributedPolicy":

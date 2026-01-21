@@ -157,6 +157,7 @@ def _canonical_dtype(src: Any) -> str:
     if canonical not in _CANONICAL_DTYPES:
         raise TypeError(f"unsupported dtype: {src!r} (normalized key={key!r})")
     return canonical
+@contextlib.contextmanager
 def _atomic_swap(path: PathLike):
     p = os.fspath(path)
     parent = os.path.dirname(p) or "."
