@@ -19,11 +19,9 @@ from stnet.api import new_model, predict, train
 from stnet.config import ModelConfig, PatchConfig
 from stnet.core.system import get_device
 
+COL_DIR = "방향"
 COL_ROUTE = "노선"
 COL_SECTION = "구간"
-COL_DIR = "방향"
-DIR_UP = "상행"
-DIR_DOWN = "하행"
 DAY_MAP = {
     "월요일": 0,
     "화요일": 1,
@@ -33,8 +31,9 @@ DAY_MAP = {
     "토요일": 5,
     "일요일": 6,
 }
+DIR_DOWN = "하행"
+DIR_UP = "상행"
 HOUR_SUFFIX = "시"
-
 
 def _canonical_section(val: object) -> str:
     parts = [p.strip() for p in str(val).split("-") if str(p).strip()]
@@ -42,7 +41,18 @@ def _canonical_section(val: object) -> str:
         return str(val).strip()
     parts.sort()
     return "-".join(parts)
-
+def _require_tabular_deps():
+    if importlib.util.find_spec("pandas") is None:
+        raise ImportError(
+            "pandas is required for dataset scripts; install with `pip install -e .[pandas]`"
+        )
+    if importlib.util.find_spec("openpyxl") is None:
+        raise ImportError(
+            "openpyxl is required for dataset scripts; install with `pip install -e .[pandas]`"
+        )
+    pd = importlib.import_module("pandas")
+    load_workbook = importlib.import_module("openpyxl").load_workbook
+    return pd, load_workbook
 
 def parse_sheet_name(name: str) -> tuple[int, str]:
     m = re.search(r"(\d+)\uc6d4", name)
@@ -58,22 +68,6 @@ def parse_sheet_name(name: str) -> tuple[int, str]:
     if day_kind is None:
         raise ValueError(f"Could not find weekday in sheet name: {name}")
     return month, day_kind
-
-
-def _require_tabular_deps():
-    if importlib.util.find_spec("pandas") is None:
-        raise ImportError(
-            "pandas is required for dataset scripts; install with `pip install -e .[pandas]`"
-        )
-    if importlib.util.find_spec("openpyxl") is None:
-        raise ImportError(
-            "openpyxl is required for dataset scripts; install with `pip install -e .[pandas]`"
-        )
-    pd = importlib.import_module("pandas")
-    load_workbook = importlib.import_module("openpyxl").load_workbook
-    return pd, load_workbook
-
-
 def build_dataset(xlsx_path: str) -> Dict[str, Any]:
     pd, load_workbook = _require_tabular_deps()
     HOURS = [f"{h:02d}{HOUR_SUFFIX}" for h in range(24)]
@@ -212,8 +206,6 @@ def build_dataset(xlsx_path: str) -> Dict[str, Any]:
         "S_orig": S_orig,
         "T_orig": T_orig,
     }
-
-
 def monitor_run(fn):
     cpu_samples: List[List[float]] = []
     mem_series: List[int] = []
@@ -261,13 +253,11 @@ def monitor_run(fn):
         "cpu_samples": len(cpu_samples),
         "mem_samples": len(mem_series),
     }
-
-
 def main():
     print("PYTHON_GIL env:", os.environ.get("PYTHON_GIL"))
     print("sys._is_gil_enabled available:", hasattr(sys, "_is_gil_enabled"))
     print("GIL enabled?:", getattr(sys, "_is_gil_enabled", lambda: None)())
-    # Keep torchdata batching predictable (avoid Unbatcher splitting into single samples)
+
     os.environ.setdefault("STNET_PREBATCH", "1")
     excel_path = os.path.abspath("raw_data.xlsx")
     if not os.path.isfile(excel_path):
@@ -384,7 +374,6 @@ def main():
     if hasattr(pred_result, "close"):
         pred_result.close()
     print("[done]")
-
 
 if __name__ == "__main__":
     main()

@@ -14,29 +14,21 @@ from typing import Any, Iterator, Protocol, Sequence
 
 import torch
 from torch import nn
+
 from ..core.concurrency import Mutex
-from ..core.distributed import distributed_barrier, is_rank0
 from ..core.datatypes import PathLike, coerce_json, save_temp, write_json
+from ..core.distributed import distributed_barrier, is_rank0
 
-try:
-    from torch.serialization import add_safe_globals
-except ImportError:
-    add_safe_globals = None
-
-
+_IGNORED_RE = (
+    r".*(?:" + "|".join(re.escape(s) for s in _IGNORED_WARNINGS) + r").*"
+)
 _IGNORED_WARNINGS = (
     "torch.distributed is disabled",
     "TypedStorage is deprecated",
 )
-_IGNORED_RE = (
-    r".*(?:" + "|".join(re.escape(s) for s in _IGNORED_WARNINGS) + r").*"
-)
-
-_WARNINGS_FILTER_LOCK = Mutex()
-
 _SAVE_LOCK_GUARD = Mutex()
 _SAVE_PATH_LOCKS = weakref.WeakValueDictionary()
-
+_WARNINGS_FILTER_LOCK = Mutex()
 
 def _register_safe_globals():
     with contextlib.suppress(Exception):
@@ -44,9 +36,6 @@ def _register_safe_globals():
             from torch.torch_version import TorchVersion
 
             add_safe_globals([TorchVersion])
-
-
-@contextlib.contextmanager
 def _filtered_warnings(
     sentences: Sequence[str] | None = None,
 ) -> Iterator[None]:
@@ -69,9 +58,6 @@ def _filtered_warnings(
         with warnings.catch_warnings():
             warnings.filterwarnings("ignore", message=msg_re)
             yield
-
-
-@contextlib.contextmanager
 def _temp_environ(
     updates: dict[str, str | None], *args: Any, only_if_unset: bool = True
 ) -> Iterator[None]:
@@ -92,8 +78,6 @@ def _temp_environ(
                 os.environ.pop(key, None)
             else:
                 os.environ[key] = val
-
-
 def _save_lock(path: PathLike | None = None) -> Mutex:
     try:
         key = str(Path(path).expanduser().resolve()) if path else "__global__"
@@ -101,9 +85,6 @@ def _save_lock(path: PathLike | None = None) -> Mutex:
         key = str(path)
     with _SAVE_LOCK_GUARD:
         return _SAVE_PATH_LOCKS.setdefault(key, Mutex(reentrant=True))
-
-
-@contextlib.contextmanager
 def _save_sync(
     path: PathLike | None = None, *args: Any, barrier: bool = False
 ) -> Iterator[None]:
@@ -115,8 +96,6 @@ def _save_sync(
         finally:
             if barrier:
                 distributed_barrier()
-
-
 def _load_model_config(model: object) -> object:
     try:
         from ..config import _extract_model_config_dict
@@ -124,8 +103,6 @@ def _load_model_config(model: object) -> object:
         return _extract_model_config_dict(model)
     except Exception:
         return {}
-
-
 def _torch_load_checkpoint(
     path: PathLike,
     *args: Any,
@@ -145,7 +122,6 @@ def _torch_load_checkpoint(
             raise RuntimeError("weights_only=True failed") from exc
         raise
 
-
 def is_required(module: str, pip_hint: str | None = None) -> None:
     try:
         __import__(module)
@@ -155,15 +131,12 @@ def is_required(module: str, pip_hint: str | None = None) -> None:
             f"{module} is required for this operation{hint}"
         ) from err
 
-
 class Format(Protocol):
     name: str | None
 
     def save(
         self, model: nn.Module, dst: PathLike, *args: Any, **kwargs: Any
     ) -> object: ...
-
-
 class Builder:
     NATIVE_EXTS = {".pt", ".pth", ".safetensors"}
 
@@ -195,12 +168,12 @@ class Builder:
             }
 
         if not p.suffix and p.exists() and p.is_dir():
+            from torch.distributed.checkpoint import FileSystemWriter
+            from torch.distributed.checkpoint import save as dcp_save
             from torch.distributed.checkpoint.state_dict import (
                 StateDictOptions,
                 get_model_state_dict,
             )
-            from torch.distributed.checkpoint import FileSystemWriter
-            from torch.distributed.checkpoint import save as dcp_save
 
             with _save_sync(p, barrier=True):
                 dcp_save(
@@ -228,6 +201,7 @@ class Builder:
             if p.suffix == ".safetensors":
                 is_required("safetensors", "pip install safetensors")
                 from safetensors.torch import save_file as save_tensors
+
                 from ..core.tensor import coerce_tensor
 
                 fd, tmp_name = tempfile.mkstemp(
@@ -263,8 +237,6 @@ class Builder:
                     payload["optimizer_state_dict"] = optimizer.state_dict()
             save_temp(p, payload, **opts)
             return p
-
-
 class Exporter:
     _by_name: dict[str, Format] = {}
     _ext_map: dict[str, str] = {}
@@ -364,5 +336,8 @@ class Exporter:
             name = cls._ext_map.get(ext.lower())
             return cls._by_name.get(name) if name else None
 
-
+try:
+    from torch.serialization import add_safe_globals
+except ImportError:
+    add_safe_globals = None
 _register_safe_globals()

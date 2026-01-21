@@ -5,8 +5,8 @@ import contextlib
 import importlib
 import threading
 import traceback
-from contextlib import AbstractContextManager, suppress, nullcontext
-from typing import Any, Callable, Dict, List, Optional, Iterator
+from contextlib import AbstractContextManager, nullcontext, suppress
+from typing import Any, Callable, Dict, Iterator, List, Optional
 
 import torch
 from torch import nn
@@ -17,27 +17,7 @@ from .distributed import broadcast_scalar, is_dtensor_active
 from .system import CPU, is_accelerator_available
 from .tensor import is_meta_or_fake_tensor
 
-try:
-    from torch.utils.checkpoint import checkpoint as _torch_checkpoint
-except Exception:
-    _torch_checkpoint = None
-
-
-try:
-    _TORCH_DYNAMO = importlib.import_module("torch._dynamo")
-except Exception:
-    _TORCH_DYNAMO = None
-
-_INDUCTOR_CONFIG_LOCK = Mutex(reentrant=True)
-
-_TORCH_COMPILER = getattr(torch, "compiler", None)
-_TORCH_COMPILE_LOCK = Mutex(reentrant=True)
-
 _CKPT_TL = threading.local()
-
-_SAFE_DIST_LOCK = Mutex()
-_SAFE_DIST_PATCHED: set[str] = set()
-
 _COLLECTIVE_NAMES: tuple[str, ...] = (
     "all_gather",
     "all_gather_into_tensor",
@@ -46,12 +26,14 @@ _COLLECTIVE_NAMES: tuple[str, ...] = (
     "broadcast",
     "barrier",
 )
-
-_NO_COMPILE_SENTINEL = "__stnet_no_compile_wrapped__"
-
 _GRAPH_BREAK_FN: Callable[[], None] | None = None
 _GRAPH_BREAK_LOCK = Mutex()
-
+_INDUCTOR_CONFIG_LOCK = Mutex(reentrant=True)
+_NO_COMPILE_SENTINEL = "__stnet_no_compile_wrapped__"
+_SAFE_DIST_LOCK = Mutex()
+_SAFE_DIST_PATCHED: set[str] = set()
+_TORCH_COMPILER = getattr(torch, "compiler", None)
+_TORCH_COMPILE_LOCK = Mutex(reentrant=True)
 
 def _raised_from_checkpointed_fn(err: BaseException) -> bool:
     tb = err.__traceback__
@@ -64,8 +46,6 @@ def _raised_from_checkpointed_fn(err: BaseException) -> bool:
         ):
             return True
     return False
-
-
 def _is_compiled_for_inference(model: torch.nn.Module) -> bool:
     cached = getattr(model, "__stnet_cached_is_compiled_for_inference__", None)
     if isinstance(cached, bool):
@@ -124,8 +104,6 @@ def _is_compiled_for_inference(model: torch.nn.Module) -> bool:
     except Exception:
         pass
     return False
-
-
 def _is_aot_autograd_enabled(model: torch.nn.Module) -> bool:
     cached = getattr(model, "__stnet_cached_is_aot_autograd_enabled__", None)
     if isinstance(cached, bool):
@@ -162,8 +140,6 @@ def _is_aot_autograd_enabled(model: torch.nn.Module) -> bool:
     except Exception:
         pass
     return False
-
-
 def _is_for_cuda(module: nn.Module) -> bool:
     try:
         p0 = next(module.parameters(), None)
@@ -178,8 +154,6 @@ def _is_for_cuda(module: nn.Module) -> bool:
     except Exception:
         pass
     return bool(is_accelerator_available("cuda"))
-
-
 def _resolve_compiler_disable() -> Any | None:
     if _TORCH_COMPILER is not None:
         fn = getattr(_TORCH_COMPILER, "disable", None)
@@ -190,8 +164,6 @@ def _resolve_compiler_disable() -> Any | None:
         if callable(fn):
             return fn
     return None
-
-
 def _resolve_graph_break() -> Callable[[], None] | None:
     try:
         inductor = importlib.import_module("torch._inductor")
@@ -205,20 +177,14 @@ def _resolve_graph_break() -> Callable[[], None] | None:
         if callable(gb):
             return gb
     return None
-
-
 def _get_inductor_config() -> Any | None:
     try:
         from torch._inductor import config
     except Exception:
         return None
     return config
-
-
 def _identity(fn: Callable[..., Any]) -> Callable[..., Any]:
     return fn
-
-
 def _decorate_compiler_disable(
     *args: Any, reason: str | None = None, recursive: bool = True
 ) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
@@ -243,8 +209,6 @@ def _decorate_compiler_disable(
         except Exception:
             break
     return _identity
-
-
 def _dispatch_mode_stack() -> list[Any]:
     try:
         from torch.utils._python_dispatch import (
@@ -263,7 +227,6 @@ def _dispatch_mode_stack() -> list[Any]:
     except Exception:
         return []
 
-
 def is_compiling() -> bool:
     with suppress(Exception):
         dyn = getattr(torch, "_dynamo", None)
@@ -281,8 +244,6 @@ def is_compiling() -> bool:
         if callable(fn) and bool(fn()):
             return True
     return False
-
-
 def is_fake_tensor_mode_active() -> bool:
     try:
         from torch._subclasses.fake_tensor import FakeTensorMode
@@ -297,8 +258,6 @@ def is_fake_tensor_mode_active() -> bool:
         except Exception:
             continue
     return False
-
-
 def is_tracing_or_exporting() -> bool:
     with suppress(Exception):
         jit = getattr(torch, "jit", None)
@@ -320,20 +279,14 @@ def is_tracing_or_exporting() -> bool:
         if is_fake_tensor_mode_active():
             return True
     return False
-
-
 def is_export_or_trace() -> bool:
     return bool(is_tracing_or_exporting() or is_fake_tensor_mode_active())
-
-
 def is_symbolic() -> bool:
     return bool(
         is_tracing_or_exporting()
         or is_compiling()
         or is_fake_tensor_mode_active()
     )
-
-
 def assert_trace(condition: object, message: str = "") -> None:
     fn = getattr(torch, "_assert_scalar", None)
     if callable(fn):
@@ -354,8 +307,6 @@ def assert_trace(condition: object, message: str = "") -> None:
         ok = False
     if not ok:
         raise RuntimeError(str(message))
-
-
 def canonicalize_compile_mode(mode: object | None) -> str:
     if not isinstance(mode, str):
         return "disabled"
@@ -373,8 +324,6 @@ def canonicalize_compile_mode(mode: object | None) -> str:
         "stable": "reduce-overhead",
     }
     return mode_map.get(compact_mode, "disabled")
-
-
 def clear_model_cache(model: Optional[nn.Module]) -> None:
     if not isinstance(model, nn.Module):
         return
@@ -385,8 +334,6 @@ def clear_model_cache(model: Optional[nn.Module]) -> None:
     ):
         with suppress(Exception):
             delattr(model, attr)
-
-
 def is_nvidia_te_available(model: torch.nn.Module) -> bool:
     cached = getattr(model, "__stnet_cached_is_nvidia_te_available__", None)
     if isinstance(cached, bool):
@@ -417,8 +364,6 @@ def is_nvidia_te_available(model: torch.nn.Module) -> bool:
     except Exception:
         pass
     return False
-
-
 def inference_mode(model: torch.nn.Module) -> AbstractContextManager[None]:
     if (
         is_symbolic()
@@ -428,8 +373,6 @@ def inference_mode(model: torch.nn.Module) -> AbstractContextManager[None]:
     ):
         return torch.no_grad()
     return torch.inference_mode()
-
-
 def compile(
     module: nn.Module,
     *args: Any,
@@ -614,8 +557,6 @@ def compile(
             compile_kwargs.pop("options", None)
     with _TORCH_COMPILE_LOCK:
         return compile_fn(module, **compile_kwargs)
-
-
 def torch_compiler_supported() -> bool:
     if env_bool("STNET_TORCH_COMPILE", default=True) is False:
         return False
@@ -638,22 +579,16 @@ def torch_compiler_supported() -> bool:
     except Exception:
         pass
     return True
-
-
 def cudagraph_mark_step_begin() -> None:
     mark_step = getattr(_TORCH_COMPILER, "cudagraph_mark_step_begin", None)
     if callable(mark_step):
         with suppress(Exception):
             mark_step()
-
-
 def cudagraph_mark_step_end() -> None:
     mark_step = getattr(_TORCH_COMPILER, "cudagraph_mark_step_end", None)
     if callable(mark_step):
         with suppress(Exception):
             mark_step()
-
-
 def graph_break() -> None:
     dyn = _TORCH_DYNAMO
     if dyn is None:
@@ -694,8 +629,6 @@ def graph_break() -> None:
         return
     with suppress(Exception):
         fn()
-
-
 def torch_compiler_disable(
     target: Any | None = None,
     attr: str | None = None,
@@ -728,8 +661,6 @@ def torch_compiler_disable(
     if callable(target):
         return decorator(target)
     return decorator
-
-
 def compile_distributed_safe(
     *args: Any, collectives: tuple[str, ...] = _COLLECTIVE_NAMES
 ) -> bool:
@@ -757,8 +688,6 @@ def compile_distributed_safe(
                 _SAFE_DIST_PATCHED.add(name)
                 updated = True
     return updated
-
-
 def compile_safe(
     *args: Any,
     runtime_module: Any | None = None,
@@ -833,8 +762,6 @@ def compile_safe(
                 reason="Recorder is logging/bookkeeping; keep eager",
                 recursive=False,
             )
-
-
 def to_submodule(model: nn.Module) -> Optional[nn.Module]:
     m = model
     for _ in range(8):
@@ -845,8 +772,6 @@ def to_submodule(model: nn.Module) -> Optional[nn.Module]:
             break
         m = child
     return None
-
-
 def iter_checkpoint(root: nn.Module) -> Iterator[nn.Module]:
     try:
         import torch.nn as nn
@@ -859,8 +784,6 @@ def iter_checkpoint(root: nn.Module) -> Iterator[nn.Module]:
                     yield mod
     except Exception:
         return
-
-
 def to_checkpoint(
     model: object,
     *args: Any,
@@ -929,8 +852,6 @@ def to_checkpoint(
                 int(min(prev_mb, min_bytes)),
             )
     return bool(changed)
-
-
 def from_checkpoint(model: nn.Module, *args: Any, step_total: int) -> None:
     inst = to_submodule(model) or (
         model.module if hasattr(model, "module") else model
@@ -969,12 +890,8 @@ def from_checkpoint(model: nn.Module, *args: Any, step_total: int) -> None:
     with contextlib.suppress(Exception):
         setattr(inst, "_stnet_ckpt_pressure_until", 0)
         setattr(inst, "_stnet_ckpt_pressure_min_bytes", 0)
-
-
 def is_checkpoint() -> bool:
     return bool(getattr(_CKPT_TL, "depth", 0) or 0)
-
-
 def coerce_checkpoint(
     fn: Callable[..., Any],
     *args: Any,
@@ -1058,9 +975,6 @@ def coerce_checkpoint(
             "DTensor/FSDP2 checkpointing requires `use_reentrant=True`, but torch.utils.checkpoint.checkpoint did not accept a compatible signature in this runtime. Upgrade PyTorch or set STNET_CKPT_REQUIRE_REENTRANT=0 to override."
         ) from last_type_error
     return checkpoint(fn, *args, **ckpt_kwargs)
-
-
-@torch_compiler_disable(reason="torch.utils.checkpoint", recursive=False)
 def checkpoint(fn: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
     if _torch_checkpoint is None:
         return fn(*args, **kwargs)
@@ -1075,3 +989,12 @@ def checkpoint(fn: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
             setattr(tl, "depth", depth)
 
     return _torch_checkpoint(_state, *args, **kwargs)
+
+try:
+    from torch.utils.checkpoint import checkpoint as _torch_checkpoint
+except Exception:
+    _torch_checkpoint = None
+try:
+    _TORCH_DYNAMO = importlib.import_module("torch._dynamo")
+except Exception:
+    _TORCH_DYNAMO = None

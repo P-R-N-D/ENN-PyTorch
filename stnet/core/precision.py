@@ -10,7 +10,6 @@ import math
 import threading
 from collections import OrderedDict
 from contextlib import AbstractContextManager
-from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import torch
@@ -29,23 +28,16 @@ from .system import (
     is_int8_supported,
 )
 
-
-_LOGGER = logging.getLogger(__name__)
-
-_NEGO_LOGGED_KEYS: "OrderedDict[object, None]" = OrderedDict()
-_NEGO_LOGGED_MAX: int = 256
-_NEGO_LOGGED_LOCK = Mutex()
-
 _Int8DynamicActivationInt8WeightConfig = None
 _Int8WeightOnlyConfig = None
-
+_LOGGER = logging.getLogger(__name__)
+_NEGO_LOGGED_KEYS: "OrderedDict[object, None]" = OrderedDict()
+_NEGO_LOGGED_LOCK = Mutex()
+_NEGO_LOGGED_MAX: int = 256
 _PTQ_IMPL = None
-
-_qp = None
-
-_TORCHAO_IMPORT_TRIED = False
 _TORCHAO_IMPORT_LOCK = Mutex()
-
+_TORCHAO_IMPORT_TRIED = False
+_qp = None
 
 def __getattr__(name: str) -> Any:
     if name == "PrecisionPolicy":
@@ -54,8 +46,6 @@ def __getattr__(name: str) -> Any:
             "import it from that module instead."
         )
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
-
-
 def _import_torchao_quantization() -> None:
     global _Int8DynamicActivationInt8WeightConfig
     global _Int8WeightOnlyConfig
@@ -76,7 +66,11 @@ def _import_torchao_quantization() -> None:
             ):
                 from torchao.quantization.quant_api import (
                     Int8DynamicActivationInt8WeightConfig as _Int8DynamicActivationInt8WeightConfig,
+                )
+                from torchao.quantization.quant_api import (
                     Int8WeightOnlyConfig as _Int8WeightOnlyConfig,
+                )
+                from torchao.quantization.quant_api import (
                     quantize_ as _quantize_,
                 )
 
@@ -93,15 +87,11 @@ def _import_torchao_quantization() -> None:
             _Int8WeightOnlyConfig = None
             _PTQ_IMPL = None
             _qp = None
-
-
 def _is_ptq_unavailable(
     model: nn.Module, *args: Any, **kwargs: Any
 ) -> tuple[nn.Module, bool, str]:
     _ = args, kwargs
     return (model, False, "PTQ backend unavailable")
-
-
 def _log_negotiation(
     logger: Optional[logging.Logger],
     key: object,
@@ -135,16 +125,12 @@ def _log_negotiation(
     except Exception:
         msg = f"[AMP][NEGOTIATE] {payload}"
     lg.log(lvl, msg)
-
-
 def _parse_dtype(dtype: Any) -> str:
     return (
         str(dtype).split(".")[-1]
         if isinstance(dtype, torch.dtype)
         else str(dtype)
     )
-
-
 def _to_serializable(x: Any) -> Any:
     if x is None or isinstance(x, (bool, int, str, float)):
         return x
@@ -152,8 +138,6 @@ def _to_serializable(x: Any) -> Any:
         return float(x)
     except:
         return str(x)
-
-
 def _coerce_torch_dtype(value: Any, default: torch.dtype) -> torch.dtype:
     return (
         value
@@ -164,8 +148,6 @@ def _coerce_torch_dtype(value: Any, default: torch.dtype) -> torch.dtype:
             else default
         )
     )
-
-
 def _get_meta_stats(meta: Any | None) -> Dict[str, Any]:
     return (
         {
@@ -185,8 +167,6 @@ def _get_meta_stats(meta: Any | None) -> Dict[str, Any]:
         if meta
         else {}
     )
-
-
 def _validate_dtype_safety(
     dtype: torch.dtype,
     meta: Any | None,
@@ -301,7 +281,6 @@ def _validate_dtype_safety(
         ),
     )
 
-
 def is_scale_safe(
     dtype: torch.dtype,
     meta: Any | None,
@@ -318,8 +297,6 @@ def is_scale_safe(
     )
     return ok
 
-
-@dataclass(slots=True)
 class DeviceMeta:
     device: torch.device
     device_type: str = "cpu"
@@ -375,8 +352,6 @@ class DeviceMeta:
             int_quant_bits=int(ds.int_quant_bits),
             underflow_action=default_underflow_action(),
         )
-
-
 class Autocast:
     _preferred_fp8_backend: Optional[str] = None
     _preferred_int_backend: Optional[str] = None
@@ -1019,8 +994,6 @@ class Autocast:
                         ),
                     )
             yield
-
-
 class Quantization:
     @staticmethod
     def is_qat_available() -> bool:

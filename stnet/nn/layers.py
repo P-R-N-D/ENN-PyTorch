@@ -19,61 +19,40 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from ..core.compat import StochasticDepth
 from ..core.concurrency import Mutex
 from ..core.datatypes import env_bool, env_int
-from ..core.compat import StochasticDepth
-from ..core.system import empty_device_cache, is_oom_error
 from ..core.graph import (
     coerce_checkpoint,
-    torch_compiler_disable,
-    is_symbolic,
     is_checkpoint,
-    is_meta_or_fake_tensor,
     is_export_or_trace,
+    is_meta_or_fake_tensor,
+    is_symbolic,
+    torch_compiler_disable,
 )
+from ..core.system import empty_device_cache, is_oom_error
 from .kernels import (
     DotProductAttention,
+    FlexAttention,
     MultiHeadAttention,
     MultiScaleRetention,
-    FlexAttention,
 )
 
-_Norm = nn.LayerNorm
-
-try:
-    from torch.nn.attention.flex_attention import create_block_mask
-
-    _HAS_FLEX_ATTENTION = True
-except Exception:
-    create_block_mask = None
-    _HAS_FLEX_ATTENTION = False
-
-
-# Preferred: STNET_NO_FLEX_ATTENTION=1
-# Backward-compat: STNET_DISABLE_FLEX_ATTENTION=1
-if env_bool("STNET_NO_FLEX_ATTENTION", False) or env_bool(
-    "STNET_DISABLE_FLEX_ATTENTION", False
-):
-    _HAS_FLEX_ATTENTION = False
-
-_FLEX_KERNEL = FlexAttention(prefer_torch=True)
-_HAS_FLEX_ATTENTION = bool(
-    _HAS_FLEX_ATTENTION and _FLEX_KERNEL.has_torch_backend
-)
-
-_GATE_STATS_CKPT_FWD = env_bool("STNET_GATE_STATS_CKPT_FWD", False)
-
-_FLEX_BLOCK_MASK_CACHE_MAX = 16
-_FLEX_BLOCK_MASK_CACHE_EST_MAX_BYTES = env_int(
-    "STNET_FLEX_BLOCK_MASK_CACHE_EST_MAX_BYTES", 128 * 1024 * 1024
-)
-
-_DILATED_MASK_CACHE_MAX = 32
-_DILATED_MASK_CACHE_MAX_L = env_int("STNET_DILATED_MASK_CACHE_MAX_L", 4096)
 _DILATED_MASK_CACHE_ENTRY_MAX_BYTES = env_int(
     "STNET_DILATED_MASK_CACHE_ENTRY_MAX_BYTES", 64 * 1024 * 1024
 )
-
+_DILATED_MASK_CACHE_MAX = 32
+_DILATED_MASK_CACHE_MAX_L = env_int("STNET_DILATED_MASK_CACHE_MAX_L", 4096)
+_FLEX_BLOCK_MASK_CACHE_EST_MAX_BYTES = env_int(
+    "STNET_FLEX_BLOCK_MASK_CACHE_EST_MAX_BYTES", 128 * 1024 * 1024
+)
+_FLEX_BLOCK_MASK_CACHE_MAX = 16
+_FLEX_KERNEL = FlexAttention(prefer_torch=True)
+_GATE_STATS_CKPT_FWD = env_bool("STNET_GATE_STATS_CKPT_FWD", False)
+_HAS_FLEX_ATTENTION = bool(
+    _HAS_FLEX_ATTENTION and _FLEX_KERNEL.has_torch_backend
+)
+_Norm = nn.LayerNorm
 
 def _device_key(device: torch.device) -> Tuple[str, int]:
     idx = -1
@@ -81,8 +60,6 @@ def _device_key(device: torch.device) -> Tuple[str, int]:
         if device.index is not None:
             idx = int(device.index)
     return (str(device.type), idx)
-
-
 def _get_dilated_mask(
     seq_len: int,
     *args: Any,
@@ -120,16 +97,12 @@ def _get_dilated_mask(
     )
     allowed = congruent & within & not_future
     return allowed.contiguous()
-
-
 def _stable_softmax(scores: torch.Tensor) -> torch.Tensor:
     maxv = scores.max(dim=-1, keepdim=True).values
     maxv = torch.where(torch.isfinite(maxv), maxv, torch.zeros_like(maxv))
     exp = torch.exp(scores - maxv)
     denom = exp.sum(dim=-1, keepdim=True).clamp_min(1e-9)
     return exp / denom
-
-
 def _tensor_stats(
     t: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -141,8 +114,6 @@ def _tensor_stats(
     m = t.sum(dtype=torch.float64) / float(t.numel())
     v = torch.zeros((), dtype=torch.float64, device=m.device)
     return v, m, mn, mx
-
-
 def _stream_flex_attention(
     self: Any,
     qh: torch.Tensor,
@@ -219,7 +190,6 @@ def _stream_flex_attention(
         )
     return out_full
 
-
 def resize_scaler_buffer(model: nn.Module, state: Mapping[str, Any]) -> None:
     scaler: Optional[Scaler] = None
     for module in model.modules():
@@ -271,8 +241,6 @@ def resize_scaler_buffer(model: nn.Module, state: Mapping[str, Any]) -> None:
                     scaler._buffers[name] = new_buf
                 except Exception:
                     setattr(scaler, name, new_buf)
-
-
 def norm_layer(norm_type: str, dim: int) -> nn.Module:
     norm = str(norm_type).strip().lower()
     match norm:
@@ -289,7 +257,6 @@ def norm_layer(norm_type: str, dim: int) -> nn.Module:
                 return nn.LayerNorm(dim)
         case _:
             return nn.LayerNorm(dim)
-
 
 class _FlexMaskMod:
     def __init__(
@@ -319,8 +286,6 @@ class _FlexMaskMod:
         if self.dilation > 1:
             keep &= (dq % self.dilation) == 0
         return keep & ~self.kpm[b, kv_idx]
-
-
 class _FlexDilatedMaskMod:
     __slots__ = ("L_q", "L_k", "dilation", "win", "causal")
 
@@ -357,7 +322,6 @@ class _FlexDilatedMaskMod:
         if self.dilation > 1:
             keep &= (dq % int(self.dilation)) == 0
         return keep
-
 
 class Retention(nn.Module):
     def __init__(
@@ -476,8 +440,6 @@ class Retention(nn.Module):
             return out, new_state
         out = self._forward_bidirectional(x, attn_mask=attn_mask)
         return out, None
-
-
 class DilatedAttention(nn.Module):
     def __init__(
         self,
@@ -608,7 +570,7 @@ class DilatedAttention(nn.Module):
             return item
 
         with lock:
-            if key in cache:  # Double check
+            if key in cache:
                 item = cache[key]
                 with contextlib.suppress(Exception):
                     cache.move_to_end(key)
@@ -1321,8 +1283,6 @@ class DilatedAttention(nn.Module):
         if want_weights:
             return x_out, attn_w
         return x_out, None
-
-
 class CrossAttention(nn.Module):
     def __init__(
         self,
@@ -1358,8 +1318,6 @@ class CrossAttention(nn.Module):
         ctx, _ = self.attn(qn, kvn, kvn, need_weights=False)
         ctx = self.out_proj(ctx)
         return q_tokens + self.drop_path(self.dropout(ctx))
-
-
 class SigmoidGate(nn.Module):
     def __init__(
         self,
@@ -2064,8 +2022,6 @@ class SigmoidGate(nn.Module):
             edge_reg_frac,
             edge_reg_power,
         )
-
-
 class Scaler(nn.Module):
     def __init__(self, eps: float = 1e-6) -> None:
         super().__init__()
@@ -2551,8 +2507,6 @@ class Scaler(nn.Module):
             out[:, j] = y0 + t * (y1 - y0)
         out = out.reshape(orig_shape)
         return out
-
-
 class Recorder(nn.Module):
     __stnet_precision_exempt__: bool = True
 
@@ -3016,3 +2970,15 @@ class Recorder(nn.Module):
                         if buf.dtype != torch.int64:
                             setattr(self, name, buf.to(dtype=torch.int64))
         return self
+
+try:
+    from torch.nn.attention.flex_attention import create_block_mask
+
+    _HAS_FLEX_ATTENTION = True
+except Exception:
+    create_block_mask = None
+    _HAS_FLEX_ATTENTION = False
+if env_bool("STNET_NO_FLEX_ATTENTION", False) or env_bool(
+    "STNET_DISABLE_FLEX_ATTENTION", False
+):
+    _HAS_FLEX_ATTENTION = False

@@ -11,19 +11,17 @@ from torch import nn
 from .concurrency import Mutex
 from .graph import compile_distributed_safe
 
-
 _PATCH_LOCK = Mutex(reentrant=True)
 _TORCH_COMPAT: TorchCompat | None = None
-
 RMSNorm = getattr(nn, "RMSNorm", None)
-
+StochasticDepth = (
+    getattr(nn, "StochasticDepth", None) or _StochasticDepthFallback
+)
 
 def _fmin_impl(tm, a, b):
     a, b = tm.broadcast_tensors(a, b)
     an, bn = tm.isnan(a), tm.isnan(b)
     return tm.where(an & ~bn, b, tm.where(bn & ~an, a, tm.minimum(a, b)))
-
-
 def _nan_mm_impl(tm, x, dim, keepdim, op, fill):
     if isinstance(x, torch.Tensor) and not tm.is_floating_point(x):
         return getattr(x, op)(
@@ -39,16 +37,10 @@ def _nan_mm_impl(tm, x, dim, keepdim, op, fill):
     return tm.where(valid, val, tm.full_like(val, float("nan"))), tm.where(
         valid, idx, tm.zeros_like(idx)
     )
-
-
 def _nanmin_impl(tm, x, dim=None, keepdim=False):
     return _nan_mm_impl(tm, x, dim, keepdim, "min", "inf")
-
-
 def _nanmax_impl(tm, x, dim=None, keepdim=False):
     return _nan_mm_impl(tm, x, dim, keepdim, "max", "-inf")
-
-
 def _nansum_impl(tm, x, dim=None, keepdim=False, *args, dtype=None, **kwargs):
     if dtype and not isinstance(dtype, torch.dtype):
         with suppress(Exception):
@@ -75,7 +67,6 @@ def _nansum_impl(tm, x, dim=None, keepdim=False, *args, dtype=None, **kwargs):
         **kwargs,
     )
 
-
 def torch_compat(
     module: Any | None = None, nn_module: Any | None = None
 ) -> TorchCompat:
@@ -90,7 +81,6 @@ def torch_compat(
         _TORCH_COMPAT = compat
         return compat
 
-
 class _RMSNormFallback(nn.Module):
     def __init__(self, d_model: int, eps: float = 1e-06) -> None:
         super().__init__()
@@ -101,8 +91,6 @@ class _RMSNormFallback(nn.Module):
     def forward(self, x: Any) -> Any:
         inv_rms = x.pow(2).mean(dim=-1, keepdim=True).add(self.eps).rsqrt()
         return x * inv_rms * self.weight
-
-
 class _StochasticDepthFallback(nn.Module):
     def __init__(self, p: float = 0.0, mode: str = "row") -> None:
         super().__init__()
@@ -119,11 +107,8 @@ class _StochasticDepthFallback(nn.Module):
             else x.shape
         )
         return x * x.new_empty(shape).bernoulli_(keep).div_(keep)
-
-
 class _SDPBackendFallback:
     MATH = FLASH_ATTENTION = EFFICIENT_ATTENTION = CUDNN_ATTENTION = object()
-
 
 class TorchCompat:
     def __init__(
@@ -154,7 +139,6 @@ class TorchCompat:
                     setattr(self.module, name, partial(impl, self.module))
             compile_distributed_safe()
 
-
 try:
     from torch.nn.attention import SDPBackend, sdpa_kernel
 except Exception:
@@ -164,8 +148,3 @@ except Exception:
     def sdpa_kernel(*backends: Any) -> Iterator[None]:
         _ = backends
         yield
-
-
-StochasticDepth = (
-    getattr(nn, "StochasticDepth", None) or _StochasticDepthFallback
-)

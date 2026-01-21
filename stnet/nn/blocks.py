@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
-import logging
 import contextlib
+import logging
 import os
 from importlib import import_module
 from typing import Any, Callable, List, Optional, Sequence, Tuple
@@ -10,18 +10,12 @@ from typing import Any, Callable, List, Optional, Sequence, Tuple
 import torch
 import torch.nn as nn
 
-from ..core.distributed import _from_hsdp_module
 from ..core.compat import StochasticDepth
+from ..core.distributed import _from_hsdp_module
 from ..core.graph import coerce_checkpoint, is_export_or_trace, is_symbolic
 from .layers import CrossAttention, DilatedAttention, Retention, norm_layer
 
-
-_STNET_HAS_FLEX_ATTENTION = getattr(
-    import_module(".layers", __package__), "_HAS_FLEX_ATTENTION", False
-)
-
 _LOGGER = logging.getLogger(__name__)
-
 _MODELING_TYPE_ALIASES: dict[str, str] = {
     "ss": "ss",
     "spatial": "ss",
@@ -42,7 +36,9 @@ _MODELING_TYPE_ALIASES: dict[str, str] = {
     "spatiotemporal": "st",
     "spatio-temporal": "st",
 }
-
+_STNET_HAS_FLEX_ATTENTION = getattr(
+    import_module(".layers", __package__), "_HAS_FLEX_ATTENTION", False
+)
 
 def _size_of_retnet(
     x: torch.Tensor, blk0: nn.Module, *args: Any, mode: str
@@ -65,8 +61,6 @@ def _size_of_retnet(
     )
     ffn_bytes = int(B) * int(L) * (int(3) * int(hid) + int(D)) * bytes_e
     return int(base_bytes * ret_factor + ffn_bytes + base_bytes * 2)
-
-
 def _infer_module_device(
     module: nn.Module, fallback: torch.device
 ) -> torch.device:
@@ -75,8 +69,6 @@ def _infer_module_device(
         return p.device
     b = next(module.buffers(), None)
     return b.device if b is not None else fallback
-
-
 def _autofit_microbatch(
     device: torch.device, hard_max: int, per_sample_bytes: int
 ) -> int:
@@ -100,8 +92,6 @@ def _autofit_microbatch(
     if not eff or eff <= 0:
         return hard_max
     return max(1, min(hard_max, int((eff * 0.35) // max(per_sample_bytes, 1))))
-
-
 def _coerce_tensor(
     t: torch.Tensor, *args, enabled: bool, inplace: bool
 ) -> torch.Tensor:
@@ -110,8 +100,6 @@ def _coerce_tensor(
         if enabled and (t.is_floating_point() or t.is_complex())
         else t
     )
-
-
 def _prealloc_microbatch(
     inp: torch.Tensor,
     microbatch: int,
@@ -184,15 +172,12 @@ def _prealloc_microbatch(
     if not out_bufs:
         raise RuntimeError(f"{stage}: no outputs")
     return out_bufs[0] if len(out_bufs) == 1 else tuple(out_bufs)
-
-
 def _coerce_modeling_types(value: Any) -> str:
     mode = str(value).strip().lower()
     normalized = _MODELING_TYPE_ALIASES.get(mode)
     if normalized is None:
         raise ValueError(f"Unsupported modeling type '{value}'")
     return normalized
-
 
 def stochastic_depth_schedule(drop_path: float, depth: int) -> List[float]:
     if depth <= 0:
@@ -202,7 +187,6 @@ def stochastic_depth_schedule(drop_path: float, depth: int) -> List[float]:
     return [
         float(i * float(drop_path) / float(depth - 1)) for i in range(depth)
     ]
-
 
 class RetNet(nn.Module):
     def __init__(
@@ -264,8 +248,6 @@ class RetNet(nn.Module):
         x = x + self.drop_path(self.dropout(h))
         x = x + self.drop_path(self.dropout(self.ffn(self.norm2(x))))
         return x, new_state
-
-
 class LongNet(nn.Module):
     def __init__(
         self,
@@ -450,8 +432,6 @@ class LongNet(nn.Module):
         ):
             out = out.transpose(0, 1)
         return out, attn_w
-
-
 class CrossTransformer(nn.Module):
     def __init__(
         self,

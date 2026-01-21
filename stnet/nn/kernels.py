@@ -1,30 +1,31 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
-import inspect
-import warnings
 import contextlib
+import inspect
 import math
 import os
 import threading
-from typing import Any, Optional, Tuple, Mapping
+import warnings
+from typing import Any, Mapping, Optional, Tuple
 
 import torch
 import torch._dynamo
 from torch import nn
 
-from ..core.datatypes import env_str, env_bool
+from ..core.datatypes import env_bool, env_str
 from ..core.graph import (
+    assert_trace,
+    canonicalize_compile_mode,
+    is_compiling,
+    is_symbolic,
+    is_tracing_or_exporting,
     torch_compiler_disable,
     torch_compiler_supported,
-    canonicalize_compile_mode,
-    compile as _stnet_compile,
-    is_compiling,
-    is_tracing_or_exporting,
-    is_symbolic,
-    assert_trace,
 )
-from ..core.tensor import is_meta_or_fake_tensor
+from ..core.graph import (
+    compile as _stnet_compile,
+)
 from ..core.profiler import FLOP_PROFILER, capture
 from ..core.system import (
     get_device,
@@ -32,105 +33,43 @@ from ..core.system import (
     get_runtime_cfg,
     get_runtime_config,
 )
+from ..core.tensor import is_meta_or_fake_tensor
 
-
-try:
-    import triton
-    import triton.language as tl
-
-    _HAS_TRITON_LIB = True
-    _HAS_TRITON_MSR = bool(torch.cuda.is_available())
-except Exception:
-    _HAS_TRITON_LIB = False
-    _HAS_TRITON_MSR = False
-
-    class _TritonStub:
-        def jit(self, fn=None, **kwargs):
-            return fn if fn else lambda f: f
-
-        @staticmethod
-        def cdiv(a, b):
-            return (int(a) + int(b) - 1) // max(1, int(b))
-
-    class _TLStub:
-        constexpr = object()
-
-    triton = _TritonStub()
-    tl = _TLStub()
-
-_torch_flex_attention = None
-_torch_create_mask = None
-_te = None
-
-_HAS_TORCH_FLEX = False
-_HAS_TE = False
-
+_FLEX_ATTN_COMPILED: dict[str, Any] = {}
+_FLEX_ATTN_COMPILE_LOCK = threading.Lock()
 _FLEX_KWARGS: set[str] = set()
-
-try:
-    from torch.nn.attention.flex_attention import (
-        flex_attention as _torch_flex_attention,
-    )
-    from torch.nn.attention.flex_attention import (
-        create_mask as _torch_create_mask,
-    )
-
-    _HAS_TORCH_FLEX = True
-    with contextlib.suppress(Exception):
-        _FLEX_KWARGS = set(
-            inspect.signature(_torch_flex_attention).parameters.keys()
-        )
-except Exception:
-    pass
-
-if (
-    torch.cuda.is_available()
-    and getattr(get_device(), "type", "cpu") == "cuda"
-):
-    try:
-        import transformer_engine.pytorch as te
-
-        _HAS_TE = True
-    except Exception:
-        pass
+_HAS_TE = False
+_HAS_TORCH_FLEX = False
+_te = None
+_torch_create_mask = None
+_torch_flex_attention = None
 
 def _flex_attention_disabled() -> bool:
-    """Whether Flex Attention should be disabled entirely.
+\
+\
+\
+\
 
-    Preferred env var: STNET_NO_FLEX_ATTENTION=1
-    Backward-compat alias: STNET_DISABLE_FLEX_ATTENTION=1
-    """
 
     return bool(
         env_bool("STNET_NO_FLEX_ATTENTION", False)
         or env_bool("STNET_DISABLE_FLEX_ATTENTION", False)
     )
-
-
-if _flex_attention_disabled():
-    _HAS_TORCH_FLEX = False
-
-
-# Cache compiled Flex Attention entrypoints per compile-mode.
-_FLEX_ATTN_COMPILED: dict[str, Any] = {}
-_FLEX_ATTN_COMPILE_LOCK = threading.Lock()
-
-
 def _flex_attention_compile_mode() -> str:
-    """Select a torch.compile mode for Flex Attention.
+\
+\
+\
+\
+\
+\
+\
+\
+\
+\
 
-    We intentionally keep this decoupled from the model-level compile_mode:
 
-    - If the model compile_mode is disabled / aot-eager / reduce-overhead,
-      Flex Attention still compiles in reduce-overhead.
-    - If the model compile_mode is max-autotune, Flex Attention compiles
-      in max-autotune.
-    - If the model compile_mode is max-autotune-no-cudagraphs, Flex
-      Attention compiles in max-autotune-no-cudagraphs.
-    """
 
-    # get_runtime_cfg() returns a SimpleNamespace; it does not accept positional
-    # args. Prefer reading the attribute with a safe default.
+
     cfg = get_runtime_cfg()
     global_mode = getattr(cfg, "compile_mode", "disabled")
     global_mode = canonicalize_compile_mode(global_mode)
@@ -140,15 +79,13 @@ def _flex_attention_compile_mode() -> str:
     if global_mode == "max-autotune-no-cudagraphs":
         return "max-autotune-no-cudagraphs"
     return "reduce-overhead"
-
-
 def _get_compiled_flex_attention() -> Any:
-    """Return Flex Attention callable, compiling it lazily when appropriate."""
+
 
     if not _HAS_TORCH_FLEX or _torch_flex_attention is None:
         raise RuntimeError("Flex Attention is not available")
 
-    # Never compile during graph-capture; it risks nested compilation.
+
     if is_compiling() or is_tracing_or_exporting():
         return _torch_flex_attention
 
@@ -167,20 +104,12 @@ def _get_compiled_flex_attention() -> Any:
         try:
             compiled = _stnet_compile(_torch_flex_attention, mode=mode)
         except Exception:
-            # Fall back to eager (still functional, just slower).
+
             compiled = _torch_flex_attention
         _FLEX_ATTN_COMPILED[mode] = compiled
         return compiled
-
-
-## NOTE: Do NOT keep a backwards-compat alias for a misspelled helper.
-## If a call site refers to a non-existent helper, it must be corrected.
-
-
 def _exporting_boundary() -> bool:
     return bool(is_tracing_or_exporting() or is_symbolic())
-
-
 def _coerce_block_mask_to_dense(
     mask: Any, *args: Any, device: torch.device
 ) -> Optional[torch.Tensor]:
@@ -194,15 +123,11 @@ def _coerce_block_mask_to_dense(
             if torch.is_tensor(dense):
                 return dense.to(device)
     return None
-
-
 def _int_or_none(x: Any) -> Optional[int]:
     try:
         return int(x)
     except Exception:
         return None
-
-
 def _env_int(name: str, default: int) -> int:
     v = os.environ.get(name)
     if v is None:
@@ -211,8 +136,6 @@ def _env_int(name: str, default: int) -> int:
         return int(v)
     except Exception:
         return int(default)
-
-
 def _python_token_mask_from_mask_mod(
     mask_mod: Any,
     *args: Any,
@@ -236,8 +159,6 @@ def _python_token_mask_from_mask_mod(
         return out
     except Exception:
         return None
-
-
 def _blockmask_to_token_mask(
     mask: Any,
     *args: Any,
@@ -312,8 +233,6 @@ def _blockmask_to_token_mask(
         k_block, dim=-1
     )
     return expanded[..., :Lq, :Lk]
-
-
 def _apply_allowed_mask(
     scores: torch.Tensor, allowed: torch.Tensor
 ) -> torch.Tensor:
@@ -322,8 +241,6 @@ def _apply_allowed_mask(
     return scores.masked_fill(
         allowed.logical_not(), torch.finfo(scores.dtype).min
     )
-
-
 def _flatten_attn_mask(
     mask: torch.Tensor,
     *args: Any,
@@ -415,8 +332,6 @@ def _flatten_attn_mask(
                 raise RuntimeError(f"Len mismatch {l0} != {L}")
         return mask, b0, h0, l0
     raise RuntimeError(f"attn_mask rank {dim} not supported")
-
-
 def _compute_flops_msr(
     batch: int,
     seq_len: int,
@@ -431,8 +346,6 @@ def _compute_flops_msr(
     attn = float(batch) * float(seq_len) * float(num_heads) * float(head_dim)
     gate_cost = attn if use_gate else 0.0
     return 4.0 * attn + gate_cost
-
-
 def _compute_flops_mha(
     query: torch.Tensor,
     key: torch.Tensor,
@@ -483,8 +396,6 @@ def _compute_flops_mha(
         FLOP_PROFILER.add(label, float(core + proj))
     except Exception:
         pass
-
-
 def _call_mha_compat(
     mha: Any,
     q: torch.Tensor,
@@ -511,8 +422,6 @@ def _call_mha_compat(
         with contextlib.suppress(TypeError):
             return mha(q, k, v, **kw)
     return mha(q, k, v, **call_kwargs)
-
-
 def _mha_export_safe(
     mha: torch.nn.MultiheadAttention,
     query: torch.Tensor,
@@ -619,8 +528,6 @@ def _mha_export_safe(
     elif not batch_first:
         out = out.transpose(0, 1)
     return out, weights
-
-
 def _call_sdpa_fallback(
     fallback: Any,
     query: torch.Tensor,
@@ -650,8 +557,6 @@ def _call_sdpa_fallback(
         except Exception:
             pass
     return fallback(query, key, value, **call_kwargs)
-
-
 def _attention_math_bshd(
     q_bshd: torch.Tensor,
     k_bshd: torch.Tensor,
@@ -690,8 +595,6 @@ def _attention_math_bshd(
             probs, p=float(dropout_p), training=True
         )
     return torch.matmul(probs, v_bshd)
-
-
 def _is_bshd_contiguous(tensor: torch.Tensor) -> bool:
     if tensor.dim() != 4:
         return False
@@ -704,8 +607,6 @@ def _is_bshd_contiguous(tensor: torch.Tensor) -> bool:
         and stride[-3] == num_heads * head_dim
         and stride[-4] == seq_len * num_heads * head_dim
     )
-
-
 def _is_nvidia_te_supported() -> bool:
     if not torch.cuda.is_available():
         return False
@@ -721,8 +622,6 @@ def _is_nvidia_te_supported() -> bool:
     except Exception:
         pass
     return True
-
-
 def _is_nvidia_mha_preferred() -> bool:
     if not _HAS_TE:
         return False
@@ -735,9 +634,6 @@ def _is_nvidia_mha_preferred() -> bool:
     if device.type != "cuda" or not torch.cuda.is_available():
         return False
     return True
-
-
-@triton.jit
 def _triton_retention(
     V: Any,
     LAMBDA: Any,
@@ -771,7 +667,6 @@ def _triton_retention(
         out_ptr = OUT + b * SOB + t * SOL + h * SOH + dh_off * SOD
         tl.store(out_ptr, state, mask=mask_d)
 
-
 def reshape_for_mha(
     x: torch.Tensor,
     batch: int,
@@ -787,7 +682,6 @@ def reshape_for_mha(
         .transpose(1, 2)
         .contiguous()
     )
-
 
 class _MultiHeadAttentionNvidia(nn.Module):
     def __init__(
@@ -994,8 +888,6 @@ class _MultiHeadAttentionNvidia(nn.Module):
             include_projections=True,
         )
         return y, w
-
-
 class _MultiHeadAttentionCompat(nn.Module):
     def __init__(
         self,
@@ -1066,7 +958,6 @@ class _MultiHeadAttentionCompat(nn.Module):
             include_projections=True,
         )
         return out, w
-
 
 class DotProductAttention(nn.Module):
     def __init__(
@@ -1460,8 +1351,6 @@ class DotProductAttention(nn.Module):
         if device_type == "mps" and tensor.dtype == torch.bfloat16:
             return tensor.to(torch.float16)
         return tensor
-
-
 class FlexAttention(nn.Module):
     def __init__(self, *args: Any, prefer_torch: bool = True) -> None:
         super().__init__()
@@ -1597,20 +1486,20 @@ class FlexAttention(nn.Module):
                     flex_kwargs["dropout"] = float(dropout_p)
             if "kernel_options" in _FLEX_KWARGS and kernel_options is not None:
                 flex_kwargs["kernel_options"] = kernel_options
-            # Compile is lazy: the first call to `flex_fn(...)` may still trigger
-            # inductor compilation. If that fails, fall back to eager flex_attention
-            # for correctness (and cache the fallback to avoid repeated crashes).
+
+
+
             flex_fn = _get_compiled_flex_attention()
             try:
                 return flex_fn(q, k, v, **flex_kwargs)
             except Exception as exc:
                 msg = str(exc)
-                # Inductor can raise if matmul precision APIs were mixed (PyTorch-side).
+
                 if "matmul precision" in msg and "legacy" in msg and "new" in msg:
                     with contextlib.suppress(Exception):
                         mode = _flex_attention_compile_mode()
                         _FLEX_ATTN_COMPILED[mode] = _torch_flex_attention
-                # Generic inductor failure -> fall back as well.
+
                 with contextlib.suppress(Exception):
                     mode = _flex_attention_compile_mode()
                     _FLEX_ATTN_COMPILED[mode] = _torch_flex_attention
@@ -1626,8 +1515,6 @@ class FlexAttention(nn.Module):
             is_causal=bool(is_causal),
             score_mod=score_mod,
         )
-
-
 class MultiScaleRetention(nn.Module):
     def __init__(
         self, d_model: int, nhead: int, use_gate: bool = True
@@ -2032,8 +1919,6 @@ class MultiScaleRetention(nn.Module):
                 last_state = state_tensor.new_zeros((B, self.nhead, head_dim))
             return out, last_state
         return out
-
-
 class MultiHeadAttention(nn.Module):
     def __init__(
         self,
@@ -2104,3 +1989,54 @@ class MultiHeadAttention(nn.Module):
             average_attn_weights=average_attn_weights,
             is_causal=is_causal,
         )
+
+try:
+    import triton
+    import triton.language as tl
+
+    _HAS_TRITON_LIB = True
+    _HAS_TRITON_MSR = bool(torch.cuda.is_available())
+except Exception:
+    _HAS_TRITON_LIB = False
+    _HAS_TRITON_MSR = False
+
+    class _TritonStub:
+        def jit(self, fn=None, **kwargs):
+            return fn if fn else lambda f: f
+
+        @staticmethod
+        def cdiv(a, b):
+            return (int(a) + int(b) - 1) // max(1, int(b))
+
+    class _TLStub:
+        constexpr = object()
+
+    triton = _TritonStub()
+    tl = _TLStub()
+try:
+    from torch.nn.attention.flex_attention import (
+        create_mask as _torch_create_mask,
+    )
+    from torch.nn.attention.flex_attention import (
+        flex_attention as _torch_flex_attention,
+    )
+
+    _HAS_TORCH_FLEX = True
+    with contextlib.suppress(Exception):
+        _FLEX_KWARGS = set(
+            inspect.signature(_torch_flex_attention).parameters.keys()
+        )
+except Exception:
+    pass
+if (
+    torch.cuda.is_available()
+    and getattr(get_device(), "type", "cpu") == "cuda"
+):
+    try:
+        import transformer_engine.pytorch as te
+
+        _HAS_TE = True
+    except Exception:
+        pass
+if _flex_attention_disabled():
+    _HAS_TORCH_FLEX = False

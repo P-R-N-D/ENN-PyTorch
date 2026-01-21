@@ -12,11 +12,6 @@ from typing import Any, TypeAlias
 import numpy
 import torch
 
-
-_TRUE = frozenset({"1", "true", "yes", "y", "on", "enable", "enabled"})
-
-_FALSE = frozenset({"0", "false", "no", "n", "off", "disable", "disabled"})
-
 _CANONICAL_DTYPES: dict[str, dict[str, Any]] = {
     "float64": {
         "torch": torch.float64,
@@ -69,7 +64,7 @@ _CANONICAL_DTYPES: dict[str, dict[str, Any]] = {
         "python": bool,
     },
 }
-
+_DEF_UNDERFLOW_ACTIONS = {"allow", "warn", "forbid"}
 _DTYPE_ALIASES: dict[str, str] = {
     "float": "float32",
     "float_": "float32",
@@ -101,7 +96,7 @@ _DTYPE_ALIASES: dict[str, str] = {
     "i64": "int64",
     "u8": "uint8",
 }
-
+_FALSE = frozenset({"0", "false", "no", "n", "off", "disable", "disabled"})
 _PLATFORM_ALIASES: dict[str, str] = {
     "torch": "torch",
     "pytorch": "torch",
@@ -112,15 +107,12 @@ _PLATFORM_ALIASES: dict[str, str] = {
     "name": "name",
     "canonical": "name",
 }
-
-_DEF_UNDERFLOW_ACTIONS = {"allow", "warn", "forbid"}
-
-PathLike: TypeAlias = str | os.PathLike[str] | Path
+_TRUE = frozenset({"1", "true", "yes", "y", "on", "enable", "enabled"})
 JsonPrimitive: TypeAlias = str | int | float | bool | None
 JsonValue: TypeAlias = (
     JsonPrimitive | list["JsonValue"] | dict[str, "JsonValue"]
 )
-
+PathLike: TypeAlias = str | os.PathLike[str] | Path
 
 def _env_cast(name: str, cast: Callable[[str], Any], default: Any) -> Any:
     s = env_str(name)
@@ -130,8 +122,6 @@ def _env_cast(name: str, cast: Callable[[str], Any], default: Any) -> Any:
         return cast(s)
     except (ValueError, TypeError):
         return default
-
-
 def _env_clean(value: object | None) -> str | None:
     if value is None:
         return None
@@ -139,8 +129,6 @@ def _env_clean(value: object | None) -> str | None:
         value = value.decode(errors="ignore")
     s = str(value).replace("\\r\\n", "\n").replace("\\n", "\n").strip()
     return s or None
-
-
 def _canonical_dtype(src: Any) -> str:
     if src is None:
         raise TypeError("dtype cannot be None")
@@ -169,9 +157,6 @@ def _canonical_dtype(src: Any) -> str:
     if canonical not in _CANONICAL_DTYPES:
         raise TypeError(f"unsupported dtype: {src!r} (normalized key={key!r})")
     return canonical
-
-
-@contextlib.contextmanager
 def _atomic_swap(path: PathLike):
     p = os.fspath(path)
     parent = os.path.dirname(p) or "."
@@ -187,7 +172,6 @@ def _atomic_swap(path: PathLike):
         with contextlib.suppress(Exception):
             os.remove(tmp_name)
 
-
 def parse_bool(value: object) -> bool | None:
     if value is None:
         return None
@@ -201,13 +185,9 @@ def parse_bool(value: object) -> bool | None:
     if s in _FALSE:
         return False
     return None
-
-
 def env_str(name: str, default: str | None = None) -> str | None:
     s = _env_clean(os.getenv(name))
     return s if s is not None else default
-
-
 def env_bool(name: str | Sequence[str], default: bool = False) -> bool:
     raw: object | None
     if isinstance(name, Sequence) and not isinstance(
@@ -220,24 +200,16 @@ def env_bool(name: str | Sequence[str], default: bool = False) -> bool:
     if v is None:
         return bool(default)
     return bool(v)
-
-
 def env_int(name: str, default: int = 0) -> int:
     return int(_env_cast(name, int, int(default)))
-
-
 def env_float(name: str, default: float = 0.0) -> float:
     return float(_env_cast(name, float, float(default)))
-
-
 def env_first(keys: Sequence[str], default: str | None = None) -> str | None:
     for k in keys:
         s = _env_clean(os.getenv(k))
         if s is not None:
             return s
     return default
-
-
 def env_flag(*keys: str, default: bool = False) -> bool:
     if not keys:
         return bool(default)
@@ -248,15 +220,11 @@ def env_flag(*keys: str, default: bool = False) -> bool:
     if raw is None:
         return bool(default)
     return bool(str(raw).strip())
-
-
 def env_first_bool(keys: Sequence[str], default: bool = False) -> bool:
     v = parse_bool(env_first(keys))
     if v is None:
         return bool(default)
     return bool(v)
-
-
 def env_first_int(keys: Sequence[str], default: int = 0) -> int:
     v = env_first(keys)
     if v is None:
@@ -265,8 +233,6 @@ def env_first_int(keys: Sequence[str], default: int = 0) -> int:
         return int(v)
     except (ValueError, TypeError):
         return int(default)
-
-
 def env_first_float(keys: Sequence[str], default: float = 0.0) -> float:
     v = env_first(keys)
     if v is None:
@@ -275,8 +241,6 @@ def env_first_float(keys: Sequence[str], default: float = 0.0) -> float:
         return float(v)
     except (ValueError, TypeError):
         return float(default)
-
-
 def to_platform_dtype(src: Any, platform: str) -> Any:
     platform_key = str(platform).strip().lower()
     normalized = _PLATFORM_ALIASES.get(platform_key)
@@ -296,8 +260,6 @@ def to_platform_dtype(src: Any, platform: str) -> Any:
         raise TypeError(
             f"unsupported dtype conversion: {src!r} -> {platform!r}"
         ) from e
-
-
 def parse_torch_dtype(src: Any) -> torch.dtype | None:
     if src is None:
         return None
@@ -320,22 +282,14 @@ def parse_torch_dtype(src: Any) -> torch.dtype | None:
         if isinstance(dt, torch.dtype):
             return dt
     return None
-
-
 def dtype_from_name(name: Any, default: torch.dtype) -> torch.dtype:
     dt = parse_torch_dtype(name)
     return dt if isinstance(dt, torch.dtype) else default
-
-
 def get_meta_path(mmt_path: str) -> str:
     return str(mmt_path) + ".meta.json"
-
-
 def read_json(path: PathLike) -> JsonValue:
     with open(os.fspath(path), "r", encoding="utf-8-sig") as f:
         return json.load(f)
-
-
 def coerce_json(obj: object) -> JsonValue:
     if obj is None or isinstance(obj, (str, int, float, bool)):
         return obj
@@ -353,20 +307,14 @@ def coerce_json(obj: object) -> JsonValue:
     if isinstance(obj, (list, tuple, set)):
         return [coerce_json(v) for v in obj]
     return str(obj)
-
-
 def write_json(
     path: PathLike, payload: Any, *args: Any, indent: int | None = 2
 ) -> None:
     with _atomic_swap(path) as tmp, open(tmp, "w", encoding="utf-8") as f:
         json.dump(payload, f, indent=indent)
-
-
 def save_temp(path: PathLike, payload: Any, **opts: Any) -> None:
     with _atomic_swap(path) as tmp:
         torch.save(payload, tmp, **opts)
-
-
 def default_underflow_action() -> str:
     raw = (
         str(
@@ -380,8 +328,6 @@ def default_underflow_action() -> str:
         .lower()
     )
     return raw if raw in _DEF_UNDERFLOW_ACTIONS else "warn"
-
-
 def normalize_underflow_action(
     value: object, *args: Any, default: str = "warn"
 ) -> str:

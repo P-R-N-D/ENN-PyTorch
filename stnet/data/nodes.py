@@ -13,7 +13,6 @@ import threading
 import time
 import traceback
 from contextlib import suppress
-from functools import lru_cache
 from typing import (
     Any,
     Callable,
@@ -39,11 +38,10 @@ from torchdata.nodes import (
 from ..core.concurrency import (
     BufferQueue,
     Mutex,
-    TensorPagePool,
     ProducerError,
+    TensorPagePool,
     close,
     new_affinity,
-    new_executor,
     new_thread,
 )
 from ..core.datatypes import (
@@ -70,16 +68,11 @@ from ..core.system import (
 
 _LOGGER = logging.getLogger(__name__)
 
-
 def _node_state_key(node: Any, attr: str, fallback: str) -> str:
     k = getattr(node, attr, None) or getattr(type(node), attr, None)
     return k if isinstance(k, str) else fallback
-
-
 def _is_accelerator_available() -> bool:
     return any(is_accelerator_available(a) for a in ("cuda", "xpu", "mps"))
-
-
 def _device_guard_ok(device: torch.device, guard_bytes: int) -> bool:
     if guard_bytes <= 0:
         return True
@@ -89,16 +82,11 @@ def _device_guard_ok(device: torch.device, guard_bytes: int) -> bool:
         ) is None or free_b >= guard_bytes
     except Exception:
         return True
-
-
 def _host_guard_ok(guard_bytes: int) -> bool:
     return (
         guard_bytes <= 0
         or getattr(Memory, "available", lambda: guard_bytes)() >= guard_bytes
     )
-
-
-@lru_cache(maxsize=1)
 def _accel_event_poll_params() -> tuple[float, float, float]:
     start_us = int(
         env_first_int(
@@ -131,8 +119,6 @@ def _accel_event_poll_params() -> tuple[float, float, float]:
     max_s = max(base_s, float(max_ms) / 1000.0)
     stop_min_s = max(0.0, float(stop_min_ms) / 1000.0)
     return base_s, max_s, stop_min_s
-
-
 def _wait_accel_event_done(
     ev: Any,
     *args: Any,
@@ -163,8 +149,6 @@ def _wait_accel_event_done(
             sleep_s = max(float(sleep_s), stop_min_s)
         time.sleep(sleep_s)
         sleep_s = min(float(sleep_s) * 2.0, max_s)
-
-
 def _normalize_device_spec(
     device: torch.device | str | Sequence[torch.device | str],
 ) -> torch.device | list[torch.device]:
@@ -182,8 +166,6 @@ def _normalize_device_spec(
             )
         return devs if devs else torch.device("cpu")
     return torch.device(device)
-
-
 def _primary_device(
     device_spec: torch.device | list[torch.device],
 ) -> torch.device:
@@ -192,7 +174,6 @@ def _primary_device(
         if isinstance(device_spec, list) and device_spec
         else device_spec
     )
-
 
 class Governor:
     __slots__ = ("_v", "_min_scale", "_max_scale")
@@ -306,8 +287,6 @@ class Governor:
                 )
         except Exception:
             pass
-
-
 class Sampler(torch.utils.data.Sampler):
     _per_sample_mem_bytes: int = 0
 
@@ -825,8 +804,6 @@ class Sampler(torch.utils.data.Sampler):
                     if out.get("Y") is not None:
                         out["Y"] = out["Y"].pin_memory()
             return out
-
-
 class Multiplexer:
     def __init__(
         self,
@@ -855,8 +832,8 @@ class Multiplexer:
         if not callable(reset):
             return
 
-        # Fast path for non-multiplexed pipelines (e.g., single SamplerWrapper):
-        # just reset to the beginning; avoid crafting MultiNodeWeightedSampler state keys.
+
+
         keys = list(getattr(self, "_source_keys", []) or [])
         has_mnws_keys = bool(
             getattr(node, "DATASETS_EXHAUSTED_KEY", None)
@@ -933,8 +910,8 @@ class Multiplexer:
                 "sources must be a BaseNode, Sequence[BaseNode], or Mapping[str, BaseNode]"
             )
         if len(sources_map) <= 1:
-            # Single-source pipelines don't need MultiNodeWeightedSampler.
-            # Bypassing it avoids state-reset edge cases that can surface as 0-batch StopIteration.
+
+
             self._source_keys = list(sources_map.keys())
             only_key = next(iter(sources_map.keys()))
             node = sources_map[only_key]
@@ -1032,8 +1009,6 @@ class Multiplexer:
         )
         self._node = node
         return node
-
-
 class Mapper:
     def __init__(
         self,
@@ -1111,8 +1086,6 @@ class Mapper:
         if (self.prebatch or 0) and int(self.prebatch) > 1:
             node = torchdata.nodes.Unbatcher(node)
         return node
-
-
 class Loader:
     def __init__(
         self,
@@ -1169,11 +1142,11 @@ class Loader:
         self._gpu_guard_bytes = int(max(0, gpu_guard_mb) * (1 << 20))
         self._host_guard_bytes = int(max(0, host_guard_mb) * (1 << 20))
         self._node = node_obj
-        # NOTE: torchdata.nodes.Loader (and some BaseNode graphs) can be stateful.
-        # Keeping a single Loader instance and reusing it across cancelled/failed runs
-        # can lead to "0 batches" symptoms even when the underlying dataset is valid.
-        # We keep a reference for __len__/diagnostics, but we will rebuild/reset it in
-        # __iter__ to guarantee a fresh iterator each run.
+
+
+
+
+
         self._base_iterable = (
             node_obj
             if isinstance(node_obj, torchdata.nodes.Loader)
@@ -1204,8 +1177,8 @@ class Loader:
         dev_t = getattr(dev, "type", "cpu")
         use_accel = dev_t in {"cuda", "xpu", "mps"}
         use_prefetch = bool(use_accel and self._non_blocking)
-        # Always (re)build and reset the torchdata Loader at iterator creation time.
-        # This avoids single-pass exhaustion and makes retries deterministic.
+
+
         node_obj = self._node
         base: Any = (
             node_obj
@@ -1213,14 +1186,14 @@ class Loader:
             else torchdata.nodes.Loader(node_obj)
         )
         with suppress(Exception):
-            # torchdata.nodes supports reset(None) to reset to the beginning.
-            # (No-op for nodes that don't implement reset.)
-            base.reset(None)  # type: ignore[attr-defined]
+
+
+            base.reset(None)
         self._base_iterable = base
-        # "Peek" one batch from the base iterator and feed it back.
-        # This avoids a class of stateful-iterator edge cases where a wrapper
-        # sees an immediate StopIteration even though the underlying base can
-        # produce batches (observed in some Colab + torchdata.nodes.Loader setups).
+
+
+
+
         base_it = iter(base)
         try:
             first = next(base_it)
@@ -1312,8 +1285,6 @@ class Loader:
             length=length,
             pin_memory=pin_memory,
         )
-
-
 class Stream(BufferQueue):
     def __init__(
         self,
@@ -1399,13 +1370,13 @@ class Stream(BufferQueue):
         )
 
     def _apply_structure(self, obj, func):
-        # TensorDict support: treat TensorDict as a tensor-container for pin/to.
-        # We avoid importing tensordict hard-dependency unless available.
+
+
         with suppress(Exception):
-            from tensordict import TensorDictBase  # type: ignore
+            from tensordict import TensorDictBase
 
             if isinstance(obj, TensorDictBase):
-                # Apply to tensor leaves only.
+
                 return obj.apply(
                     lambda t: func(t) if torch.is_tensor(t) else t,
                     inplace=False,
@@ -1426,9 +1397,9 @@ class Stream(BufferQueue):
         return func(obj)
 
     def _to_device(self, x: Any, device: torch.device) -> Any:
-        # Fast-path for TensorDict when available: let TensorDict handle pinned+async copies.
+
         with suppress(Exception):
-            from tensordict import TensorDictBase  # type: ignore
+            from tensordict import TensorDictBase
 
             if isinstance(x, TensorDictBase):
                 return x.to(
@@ -1453,10 +1424,10 @@ class Stream(BufferQueue):
             return x
 
         with suppress(Exception):
-            from tensordict import TensorDictBase  # type: ignore
+            from tensordict import TensorDictBase
 
             if isinstance(x, TensorDictBase):
-                # Prefer TensorDict's own pinning logic when available.
+
                 with suppress(Exception):
                     return x.pin_memory()
 
@@ -1625,10 +1596,10 @@ class Stream(BufferQueue):
                 self.put(sentinel)
 
     def __iter__(self) -> Iterator[Any]:
-        # Session semantics: each iteration gets a fresh Stream instance with its own state.
-        # IMPORTANT: __iter__ is a generator (it contains `yield`). In a generator,
-        # `return <something>` terminates the generator immediately (StopIteration), and
-        # does *not* delegate iteration. We must use `yield from` to delegate.
+
+
+
+
         if not bool(self._session):
             yield from self._spawn_session()
             return
@@ -1641,18 +1612,18 @@ class Stream(BufferQueue):
         gpu_guard_bytes = int(getattr(self, "_gpu_guard_bytes", 0) or 0)
         host_guard_bytes = int(getattr(self, "_host_guard_bytes", 0) or 0)
 
-        # Robustness note:
-        # We observed cases (Colab + forkserver + torchdata.nodes.Loader) where the
-        # base iterable yields batches on the main thread, but yields 0 batches when
-        # consumed from a background thread. To avoid that class of failure, we keep
-        # iteration on the main thread and only use accelerator streams/events for
-        # async staging.
+
+
+
+
+
+
         if use_accel_stream and self._accel_stream is None:
             self._accel_stream = new_accelerator_stream(device)
         if use_accel_stream and self._accel_stream is None:
             use_accel_stream = False
 
-        # Event pool for safe reuse across staged batches.
+
         if use_accel_stream:
             pool: queue.SimpleQueue = queue.SimpleQueue()
             created = 0
@@ -1745,12 +1716,12 @@ class Stream(BufferQueue):
                 return batch_dev, None
 
         buf = collections.deque()
-        # Some iterables (including torchdata.nodes.Loader graphs) are single-pass or
-        # keep internal state across iterations. Always materialize a *fresh* iterator.
+
+
         src_it = iter(iterable)
 
         try:
-            # Prime up to depth items.
+
             for _ in range(max(1, int(getattr(self, "_depth", 2) or 2))):
                 try:
                     raw = next(src_it)
@@ -1758,11 +1729,11 @@ class Stream(BufferQueue):
                     break
                 buf.append(_stage_one(raw))
 
-            # If we got zero items but the source is expected to be non-empty, surface
-            # a clearer error than a silent StopIteration.
+
+
             if not buf:
-                # If we reached here, the source produced *no* items.
-                # Don't suppress this: callers will otherwise see a confusing StopIteration.
+
+
                 raise RuntimeError(
                     "Stream: source yielded 0 items during prefetch priming. "
                     "This usually means the upstream iterable is exhausted/stateful and was reused, "
@@ -1777,7 +1748,7 @@ class Stream(BufferQueue):
                     if cs is not None:
                         with suppress(Exception):
                             cs.wait_event(ev)
-                        # Record on current stream after waiting so the event can be reused safely.
+
                         with suppress(Exception):
                             try:
                                 ev.record(cs)
@@ -1790,7 +1761,7 @@ class Stream(BufferQueue):
 
                 yield batch
 
-                # Refill one to maintain prefetch depth.
+
                 try:
                     raw = next(src_it)
                 except StopIteration:
