@@ -3887,16 +3887,16 @@ def epochs(
                         max_buffer_mb=25,
                     )
                     _coerce_dcp_keys(model_sd)
-                    _LOGGER.info("Updating checkpoint (%d/%d)", int(epoch_idx + 1), int(ops.epochs))
+                    _LOGGER.info("Updating Checkpoint (%d/%d)", int(epoch_idx + 1), int(ops.epochs))
                     print(
-                        f"Updating checkpoint ({int(epoch_idx + 1)}/{int(ops.epochs)})",
+                        f"Updating Checkpoint ({int(epoch_idx + 1)}/{int(ops.epochs)})",
                         flush=True,
                     )
                     torch.save(model_sd, tmp_path)
                     os.replace(tmp_path, ckpt_path)
-                    _LOGGER.info("Checkpoint updated (%d/%d)", int(epoch_idx + 1), int(ops.epochs))
+                    _LOGGER.info("Checkpoint Updated (%d/%d)", int(epoch_idx + 1), int(ops.epochs))
                     print(
-                        f"Checkpoint updated ({int(epoch_idx + 1)}/{int(ops.epochs)})",
+                        f"Checkpoint Updated ({int(epoch_idx + 1)}/{int(ops.epochs)})",
                         flush=True,
                     )
                     try:
