@@ -11,11 +11,11 @@ import shutil
 import subprocess
 import sys
 import threading
-import weakref
 import warnings
+import weakref
+from dataclasses import dataclass
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from dataclasses import dataclass
 from typing import Any, Callable, Iterator, Sequence
 
 import torch
@@ -23,23 +23,18 @@ from tensordict import TensorDict
 from torch import nn
 
 from ..core.concurrency import Mutex
-from ..core.tensor import extract_tensor, from_buffer
 from ..core.datatypes import PathLike, write_json
+from ..core.tensor import extract_tensor, from_buffer
 from ..nn.layers import Recorder
 from .io import Format, _load_model_config, _temp_environ, is_required
 
-
-_FORWARD_PARAM_CACHE: dict[object, object] = {}
-_FORWARD_PARAM_CACHE_LOCK = Mutex()
-
 _EXPORT_SIG_CACHE: object | None = None
 _EXPORT_SIG_LOCK = Mutex()
-
 _EXPORT_WARN_FILTERS_INSTALLED = False
-
+_FORWARD_PARAM_CACHE: dict[object, object] = {}
+_FORWARD_PARAM_CACHE_LOCK = Mutex()
 _ONNX2TF_HELP_CACHE: str | None = None
 _ONNX2TF_HELP_LOCK = Mutex(reentrant=True)
-
 
 @contextlib.contextmanager
 def _no_empty_tensor(root: nn.Module) -> Iterator[None]:
@@ -57,8 +52,6 @@ def _no_empty_tensor(root: nn.Module) -> Iterator[None]:
         for module, name, old in patched:
             with contextlib.suppress(Exception):
                 setattr(module, name, old)
-
-
 def _suppress_export_warnings() -> None:
     global _EXPORT_WARN_FILTERS_INSTALLED
     if _EXPORT_WARN_FILTERS_INSTALLED:
@@ -81,8 +74,6 @@ def _suppress_export_warnings() -> None:
                 category=tw,
                 message=r".*Converting a tensor to a Python boolean.*",
             )
-
-
 @contextlib.contextmanager
 def _onnx_model(model: object) -> Iterator[object]:
     _suppress_export_warnings()
@@ -137,8 +128,6 @@ def _onnx_model(model: object) -> Iterator[object]:
         if was_training:
             with contextlib.suppress(Exception):
                 model.train(True)
-
-
 def _get_forward_parameters(model_cls: object) -> object:
     with _FORWARD_PARAM_CACHE_LOCK:
         cached = _FORWARD_PARAM_CACHE.get(model_cls)
@@ -159,8 +148,6 @@ def _get_forward_parameters(model_cls: object) -> object:
         if len(_FORWARD_PARAM_CACHE) > 512:
             _FORWARD_PARAM_CACHE.clear()
         return _FORWARD_PARAM_CACHE.setdefault(model_cls, info)
-
-
 def _forward(model: object, x: object) -> object:
     fwd_export = getattr(model, "forward_export", None)
     if callable(fwd_export) and isinstance(x, torch.Tensor):
@@ -174,8 +161,6 @@ def _forward(model: object, x: object) -> object:
         if accepts_kwargs or key in names:
             kwargs[key] = None
     return model(x, **kwargs) if kwargs else model(x)
-
-
 def _get_tensor_shape(model: object, sample_input: object) -> object:
     in_dim = (
         int(getattr(model, "in_dim")) if hasattr(model, "in_dim") else None
@@ -212,8 +197,6 @@ def _get_tensor_shape(model: object, sample_input: object) -> object:
     if in_dim is None or out_shape is None:
         raise RuntimeError("Failed to infer shapes.")
     return (int(in_dim), tuple(int(x) for x in out_shape))
-
-
 def _pad_sample(
     model: object, sample_input: object, *args: Any, batch: int = 1
 ) -> object:
@@ -228,8 +211,6 @@ def _pad_sample(
     )
     b = max(1, int(batch))
     return torch.zeros(b, in_dim, dtype=dtype, device=device)
-
-
 def _onnx_options(kwargs: object, *args: Any, target: str = "onnx") -> object:
     target_l = str(target or "onnx").strip().lower()
     defaults = {
@@ -278,8 +259,6 @@ def _onnx_options(kwargs: object, *args: Any, target: str = "onnx") -> object:
             "onnxoptimizer_passes", kwargs.get("onnx_optimizer_passes")
         ),
     }
-
-
 def _coerce_onnx_path(dst: PathLike, kwargs: object) -> object:
     dst_p = Path(dst)
 
@@ -297,13 +276,9 @@ def _coerce_onnx_path(dst: PathLike, kwargs: object) -> object:
         return dst_p
 
     return dst_p.with_name(dst_p.name + ".onnx")
-
-
 def _sidecar_json_path(dst: PathLike) -> Path:
     p = Path(dst)
     return p.with_name(p.name + ".json")
-
-
 def _write_export_meta(
     model: nn.Module,
     dst: PathLike,
@@ -326,8 +301,6 @@ def _write_export_meta(
     if extra:
         payload["extra"] = extra
     write_json(_sidecar_json_path(p), payload, indent=2)
-
-
 def _pad_to_batch(sample: torch.Tensor, min_batch: int) -> torch.Tensor:
     if not isinstance(sample, torch.Tensor):
         return sample
@@ -339,8 +312,6 @@ def _pad_to_batch(sample: torch.Tensor, min_batch: int) -> torch.Tensor:
     pad_shape = (int(min_batch) - b,) + tuple(sample.shape[1:])
     pad = torch.zeros(pad_shape, dtype=sample.dtype, device=sample.device)
     return torch.cat([sample, pad], dim=0)
-
-
 def _onnx2tf_help_text() -> str:
     global _ONNX2TF_HELP_CACHE
     cached = _ONNX2TF_HELP_CACHE
@@ -360,15 +331,11 @@ def _onnx2tf_help_text() -> str:
             out = ""
         _ONNX2TF_HELP_CACHE = out
         return out
-
-
 def _onnx2tf_supports(flag: str) -> bool:
     try:
         return flag in _onnx2tf_help_text()
     except Exception:
         return False
-
-
 def _find_latest_onnx2tf_auto_json(out_dir: Path) -> Path | None:
     try:
         candidates = list(Path(out_dir).rglob("*_auto.json"))
@@ -381,8 +348,6 @@ def _find_latest_onnx2tf_auto_json(out_dir: Path) -> Path | None:
     except Exception:
         pass
     return candidates[0]
-
-
 def _run_onnx2tf(
     onnx_path: Path,
     out_dir: Path,
@@ -447,8 +412,6 @@ def _run_onnx2tf(
                 last_exc = exc
     if last_exc is not None:
         raise last_exc
-
-
 def _torch_export_program(
     torch_export: Callable[..., Any],
     wrapper: nn.Module,
@@ -515,15 +478,11 @@ def _torch_export_program(
             call_kw["strict"] = False
             return _call(**call_kw)
         raise
-
-
 def _in_console(cmd: object, desc: object) -> None:
     try:
         subprocess.run(list(cmd), check=True)
     except (OSError, subprocess.CalledProcessError) as exc:
         raise RuntimeError(f"{desc} failed with error: {exc}") from exc
-
-
 def _export_sig() -> object:
     global _EXPORT_SIG_CACHE
     if _EXPORT_SIG_CACHE is not None:
@@ -537,8 +496,6 @@ def _export_sig() -> object:
             sig = None
         _EXPORT_SIG_CACHE = sig
         return sig
-
-
 def _export_sig_keys() -> set[str]:
     sig = _export_sig()
     if sig is None:
@@ -554,7 +511,6 @@ def _export_sig_keys() -> set[str]:
     except Exception:
         return set()
 
-
 class _TensorDictPack(nn.Module):
     def __init__(self, averaged_module: nn.Module, key: str) -> None:
         super().__init__()
@@ -565,8 +521,6 @@ class _TensorDictPack(nn.Module):
         bs = int(x.shape[0]) if (hasattr(x, "ndim") and x.ndim >= 1) else 1
         td = TensorDict({self._key: x}, batch_size=[bs], device=x.device)
         return self._averaged_module(td)
-
-
 class _TensorOutputModule(nn.Module):
     def __init__(self, net: object) -> None:
         super().__init__()
@@ -574,8 +528,6 @@ class _TensorOutputModule(nn.Module):
 
     def forward(self, x: object) -> object:
         return extract_tensor(_forward(self.net, x))
-
-
 class _ONNXExporter:
     @staticmethod
     def export(
@@ -735,8 +687,6 @@ class _ONNXExporter:
         if not onnx_path.exists():
             return _ONNXExporter.export(model, onnx_path, **kwargs)
         return onnx_path
-
-
 class _ORTBuilder:
     @staticmethod
     def to_ort(
@@ -842,31 +792,22 @@ class _ORTBuilder:
 
         return (ort_path, optimized_onnx_path)
 
-
-@dataclass(frozen=True, slots=True)
+@dataclass
 class BorrowedModule:
     module: nn.Module
     name: str | None = None
-
-
-@dataclass(frozen=True, slots=True)
+@dataclass
 class OwnedModule:
     module: nn.Module
     name: str | None = None
-
-
-@dataclass(frozen=True, slots=True)
+@dataclass
 class ModulePath:
     path: str
     name: str | None = None
-
-
-@dataclass(frozen=True, slots=True)
+@dataclass
 class CallArguments:
     args: tuple[Any, ...]
     kwargs: dict[str, Any]
-
-
 class TorchInductor(Format):
     name = "aoti"
 
@@ -952,8 +893,6 @@ class TorchInductor(Format):
                 _write_export_meta(model, out, format_name=self.name or "aoti")
 
         return (out,)
-
-
 class TorchExport(Format):
     name = "pt2"
 
@@ -1015,8 +954,6 @@ class TorchExport(Format):
             strict=bool(kwargs.get("strict", True)),
             tag="PT2 export",
         )
-
-
 class ExecuTorch(Format):
     name = "executorch"
 
@@ -1157,8 +1094,6 @@ class ExecuTorch(Format):
                     },
                 )
         return (dst,)
-
-
 class ONNX(Format):
     name = "onnx"
 
@@ -1177,8 +1112,6 @@ class ONNX(Format):
         with contextlib.suppress(Exception):
             _write_export_meta(model, out, format_name=self.name or "onnx")
         return (out,)
-
-
 class ORT(Format):
     name = "ort"
 
@@ -1223,8 +1156,6 @@ class ORT(Format):
                 },
             )
         return (ort_path, optimized) if optimized is not None else (ort_path,)
-
-
 class TensorRT(Format):
     name = "tensorrt"
 
@@ -1388,8 +1319,6 @@ class TensorRT(Format):
                         extra={"onnx_path": str(onnx_path)},
                     )
         return (dst,)
-
-
 class CoreML(Format):
     name = "coreml"
 
@@ -1487,8 +1416,6 @@ class CoreML(Format):
                     model, dst, format_name=self.name or "coreml"
                 )
         return (dst,)
-
-
 class LiteRT(Format):
     name = "litert"
 
@@ -1586,8 +1513,6 @@ class LiteRT(Format):
                     extra={"backend": "onnx2tf", "onnx_path": str(onnx_path)},
                 )
             return (dst,)
-
-
 class TensorFlow(Format):
     name = "tensorflow"
 
@@ -1644,8 +1569,6 @@ class TensorFlow(Format):
             )
 
         return (saved_model_dir,)
-
-
 class ReduceMean(nn.Module):
     def __init__(self, dim: int = 1, keepdim: bool = False) -> None:
         super().__init__()
@@ -1654,8 +1577,6 @@ class ReduceMean(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return x.mean(dim=self.dim, keepdim=self.keepdim)
-
-
 class GraphSequential(nn.Module):
     _CONTROL_ATTR = "__stnet_subgraph_control_op__"
 

@@ -10,7 +10,7 @@ import shutil
 import tempfile
 import time
 import warnings
-from functools import lru_cache, partial, update_wrapper
+from functools import partial, update_wrapper
 from pathlib import Path
 from typing import (
     Any,
@@ -34,7 +34,6 @@ from tensordict import (
     TensorDict,
     TensorDictBase,
 )
-from torch.distributed.launcher.api import LaunchConfig, elastic_launch
 from torch.distributed.checkpoint import (
     FileSystemReader,
     FileSystemWriter,
@@ -46,6 +45,7 @@ from torch.distributed.checkpoint.state_dict import (
     get_model_state_dict,
     set_model_state_dict,
 )
+from torch.distributed.launcher.api import LaunchConfig, elastic_launch
 
 from .config import (
     ModelConfig,
@@ -54,7 +54,7 @@ from .config import (
     coerce_model_config,
     runtime_config,
 )
-from .core.datatypes import env_bool
+from .core.datatypes import env_bool, read_json
 from .core.distributed import (
     get_available_host,
     get_preferred_ip,
@@ -69,48 +69,32 @@ from .core.system import (
     new_dir,
     optimal_start_method,
 )
+from .core.tensor import coerce_tensor
 from .data import collate
 from .data.collate import (
     MappingSlicer,
     TensorDictSlicer,
+)
+from .data.collate import (
     postprocess as _postprocess_pipeline,
 )
 from .data.pipeline import (
     Dataset,
-    preload_memmap,
     default_underflow_action,
     iter_dataset,
     normalize_underflow_action,
+    preload_memmap,
 )
-from .core.datatypes import read_json
 from .nn.architecture import Model
 from .nn.layers import Recorder, resize_scaler_buffer
-from .core.tensor import coerce_tensor
 from .runtime.io import _filtered_warnings, _torch_load_checkpoint, is_required
 from .runtime.main import _coerce_dcp_keys, process
 
-
-P = ParamSpec("P")
-R = TypeVar("R")
-PathLike: TypeAlias = str | os.PathLike[str] | Path
-TorchDeviceLike: TypeAlias = torch.device | str | int
-TensorLike: TypeAlias = torch.Tensor | MemoryMappedTensor
-TrainData: TypeAlias = (
-    TensorDictBase
-    | Mapping[str, object]
-    | Sequence[Mapping[str, object]]
-    | Mapping[str, Mapping[str, object]]
-    | object
+_IGNORED_WARNING_MESSAGE_RE = re.compile(
+    r".*(?:"
+    + "|".join((f"(?:{p})" for p in _IGNORED_WARNING_PATTERNS))
+    + r").*"
 )
-PredictData: TypeAlias = TrainData
-PredictionOutput: TypeAlias = (
-    TensorDictBase
-    | PersistentTensorDict
-    | Mapping[str, TensorDictBase]
-    | Mapping[str, torch.Tensor]
-)
-logger = logging.getLogger(__name__)
-
 _IGNORED_WARNING_PATTERNS: tuple[str, ...] = (
     "torch.distributed is disabled, unavailable or uninitialized",
     "TypedStorage is deprecated",
@@ -121,12 +105,26 @@ _IGNORED_WARNING_PATTERNS: tuple[str, ...] = (
     "mixed precision.*may be unavailable",
     "Either mode or options can be specified, but both can't be specified at the same time\\.",
 )
-_IGNORED_WARNING_MESSAGE_RE = re.compile(
-    r".*(?:"
-    + "|".join((f"(?:{p})" for p in _IGNORED_WARNING_PATTERNS))
-    + r").*"
+P = ParamSpec("P")
+PathLike: TypeAlias = str | os.PathLike[str] | Path
+PredictData: TypeAlias = TrainData
+PredictionOutput: TypeAlias = (
+    TensorDictBase
+    | PersistentTensorDict
+    | Mapping[str, TensorDictBase]
+    | Mapping[str, torch.Tensor]
 )
-
+R = TypeVar("R")
+TensorLike: TypeAlias = torch.Tensor | MemoryMappedTensor
+TorchDeviceLike: TypeAlias = torch.device | str | int
+TrainData: TypeAlias = (
+    TensorDictBase
+    | Mapping[str, object]
+    | Sequence[Mapping[str, object]]
+    | Mapping[str, Mapping[str, object]]
+    | object
+)
+logger = logging.getLogger(__name__)
 
 def _apply_warning_filters() -> None:
     with contextlib.suppress(Exception):
@@ -135,38 +133,27 @@ def _apply_warning_filters() -> None:
             message=_IGNORED_WARNING_MESSAGE_RE.pattern,
             category=UserWarning,
         )
-
-
 def _rewrite_state_dict_key(k: str) -> str:
     if k.startswith("m.") and ".module." in k:
         parts = k.split(".")
         if len(parts) >= 4 and parts[1].isdigit() and parts[2] == "module":
             return ".".join(parts[3:])
     return k
-
-
 def _coerce_state_dict(sd: Mapping[str, Any]) -> Mapping[str, Any]:
     if not any(_rewrite_state_dict_key(k) != k for k in sd):
         return sd
     return {_rewrite_state_dict_key(k): v for k, v in sd.items()}
-
-
 def _parse_meta(p: PathLike) -> Mapping[str, Any]:
     meta_path = p / "meta.json"
     try:
         return read_json(meta_path) if meta_path.exists() else {}
     except Exception as exc:
         raise RuntimeError(f"Metadata parse failed: {p}") from exc
-
-
-@lru_cache(maxsize=1)
 def _is_execution_time_logged() -> bool:
     return env_bool(
         ("STNET_LOG_TIMINGS", "STNET_TIMINGS", "STNET_DEBUG_TIMINGS"),
         default=False,
     )
-
-
 def _timed_invoke(
     fn: Callable[P, R],
     log: logging.Logger,
@@ -182,8 +169,6 @@ def _timed_invoke(
     finally:
         dt = time.perf_counter() - t0
         log.info("%s executed in %.3f seconds", fn_name, dt)
-
-
 def _clear_process_group() -> None:
     try:
         import torch.distributed
@@ -198,8 +183,6 @@ def _clear_process_group() -> None:
                 torch.distributed.destroy_process_group()
     except Exception:
         pass
-
-
 def _init_distributed() -> None:
     _apply_warning_filters()
     _clear_process_group()
@@ -207,8 +190,6 @@ def _init_distributed() -> None:
     with contextlib.suppress(Exception):
         torch.multiprocessing.allow_connection_pickling()
     init_start_method()
-
-
 def _clear_device_caches() -> None:
     with contextlib.suppress(Exception):
         import gc
@@ -225,15 +206,11 @@ def _clear_device_caches() -> None:
             device=get_device(), do_gc=False, min_interval_s=0.0
         )
         collect_accelerator_ipc()
-
-
 def _coerce_seed(seed: int) -> Optional[int]:
     try:
         return int(seed) if seed is not None else None
     except (TypeError, ValueError):
         return None
-
-
 def _set_seed(seed_value: int) -> None:
     if seed_value is None:
         return
@@ -247,8 +224,6 @@ def _set_seed(seed_value: int) -> None:
         random.seed(seed_value)
     with contextlib.suppress(Exception):
         numpy.random.seed(seed_value)
-
-
 def _save_model_checkpoint(
     model: Model,
     out_dir: PathLike,
@@ -280,11 +255,11 @@ def _save_model_checkpoint(
             pt_state = dict(m_sd)
             _coerce_dcp_keys(pt_state)
         else:
-            # IMPORTANT: Avoid building an explicit CPU-copied state_dict here; that can
-            # double host RAM and trigger OOM/SIGKILL. torch.save streams tensors (including
-            # device tensors) efficiently, and restores use map_location='cpu'.
+
+
+
             pt_state = model.state_dict()
-            # Meta tensors cannot be serialized (no data).
+
             if any(
                 torch.is_tensor(v)
                 and getattr(v, "device", None) is not None
@@ -293,91 +268,15 @@ def _save_model_checkpoint(
             ):
                 raise NotImplementedError("Cannot save checkpoint with meta tensors (no data).")
 
-            # IMPORTANT: do NOT materialize a full CPU copy of the model here.
-            # torch.save streams tensors and supports device tensors; restores use
-            # map_location='cpu' when loading.
+
+
+
             pt_state = {
                 k: (v.detach() if torch.is_tensor(v) else v)
                 for k, v in pt_state.items()
             }
         torch.save(pt_state, os.path.join(out_dir, "model.pt"))
     return m_sd
-
-
-def _module_has_meta_tensors(model: torch.nn.Module) -> bool:
-    """Return True if any parameter/buffer is on the 'meta' device."""
-
-    try:
-        for t in list(model.parameters(recurse=True)) + list(
-            model.buffers(recurse=True)
-        ):
-            if (
-                torch.is_tensor(t)
-                and getattr(t, "device", None) is not None
-                and t.device.type == "meta"
-            ):
-                return True
-    except Exception:
-        pass
-
-    # Fallback: some wrappers hide params/buffers; state_dict is usually cheap.
-    try:
-        sd = model.state_dict()
-        for v in sd.values():
-            if (
-                torch.is_tensor(v)
-                and getattr(v, "device", None) is not None
-                and v.device.type == "meta"
-            ):
-                return True
-    except Exception:
-        pass
-
-    return False
-
-
-def _materialize_module_to_(
-    model: torch.nn.Module,
-    *,
-    device: str | torch.device = "cpu",
-) -> None:
-    """Materialize a meta module by allocating empty storage on `device`.
-
-    This is critical after moving a model to the 'meta' device to keep the parent
-    process light while elastic workers run. Without materialization, later
-    load_state_dict / checkpoint saves will error with:
-      "Cannot copy out of meta tensor; no data".
-    """
-
-    if not _module_has_meta_tensors(model):
-        return
-    to_empty = getattr(model, "to_empty", None)
-    if not callable(to_empty):
-        raise NotImplementedError(
-            "Model contains meta tensors but torch.nn.Module.to_empty is not available. "
-            "Upgrade PyTorch (2.0+) or avoid moving the parent model to meta."
-        )
-    to_empty(device=device)
-
-
-def _restore_module_from_pt_checkpoint_(
-    model: torch.nn.Module,
-    pt_path: PathLike,
-    *,
-    device: str | torch.device = "cpu",
-) -> None:
-    """Load a raw state_dict checkpoint into `model`, materializing if needed."""
-
-    state = coerce_tensor(
-        _torch_load_checkpoint(pt_path, map_location="cpu", weights_only=True)
-    )
-    if not isinstance(state, Mapping):
-        raise RuntimeError(f"Checkpoint did not contain a state_dict: {pt_path!r}")
-    _materialize_module_to_(model, device=device)
-    resize_scaler_buffer(model, state)
-    model.load_state_dict(state, strict=False)
-
-
 def _get_label_shape(
     first_in_dim: int,
     in_dim: int,
@@ -393,8 +292,6 @@ def _get_label_shape(
             f"Shape mismatch: {first_in_dim}/{first_label_shape} vs {in_dim}/{lshape}"
         )
     return (first_in_dim, first_label_shape)
-
-
 def _adapt_source(
     d: Any, allow_columns: bool = True
 ) -> Tuple[int, Optional[Callable], bool]:
@@ -449,8 +346,6 @@ def _adapt_source(
     if isinstance(d, (list, tuple)):
         return len(d), (lambda s, e: {"features": d[int(s) : int(e)]}), False
     return 0, None, True
-
-
 def _save_dataset(
     d: object,
     out_dir: PathLike,
@@ -539,8 +434,6 @@ def _save_dataset(
     count = int(fx.shape[0])
     in_dim = int(fx.reshape(count, -1).shape[1])
     return (int(in_dim), tuple(lshape), int(count))
-
-
 def _reduce_batch_stats(recs: object) -> Optional[Mapping[str, Any]]:
     if not isinstance(recs, list) or not recs:
         return None
@@ -604,8 +497,6 @@ def _reduce_batch_stats(recs: object) -> Optional[Mapping[str, Any]]:
             }
         )
     return out
-
-
 def _update_batch_stats(
     prev: object, n_prev: object, inc: object, n_inc: object
 ) -> Any:
@@ -655,8 +546,6 @@ def _update_batch_stats(
             }
         )
     return out
-
-
 def _update_history(
     model: object,
     ckpt_dir: str | None,
@@ -678,7 +567,7 @@ def _update_history(
             records = raw if isinstance(raw, list) else []
             meta = {}
         run_stats = _reduce_batch_stats(records)
-        # Normalize a few key run parameters so history entries are self-describing.
+
         epochs_val = (
             int(meta.get("epochs", epochs)) if isinstance(meta, dict) else int(epochs)
         )
@@ -688,10 +577,10 @@ def _update_history(
             else float(val_frac)
         )
         sampled_n = int(meta.get("sampled_n", 0)) if isinstance(meta, dict) else 0
-        # Explain/estimate sample-count basis. In this codebase, "sampled_n" is
-        # intended to represent the *effective* number of training samples seen
-        # across the run (typically train_split_size * epochs). This helps
-        # interpret why sampled_n can be much larger than the raw dataset size.
+
+
+
+
         train_split_n_est = int(round(num_samples_dataset * max(0.0, 1.0 - frac_val)))
         sampled_n_est = int(round(train_split_n_est * max(1, epochs_val)))
         if sampled_n <= 0:
@@ -718,10 +607,10 @@ def _update_history(
         if cum_stats:
             setattr(model, "_history_cum_stats", cum_stats)
         history = getattr(model, "_train_history", []) or []
-        # Best-effort device detection for the *resulting* model in the parent process.
+
         dev_str = None
         with contextlib.suppress(Exception):
-            import torch as _torch  # local import to avoid circular issues
+            import torch as _torch
 
             params = list(getattr(model, "parameters", lambda: [])())
             if params:
@@ -749,7 +638,7 @@ def _update_history(
             **(run_stats or {}),
             **(cum_stats or {}),
         }
-        # Merge dataset meta (if available) with runtime meta.
+
         env_meta: Dict[str, Any] = dict(meta) if isinstance(meta, dict) else {}
         env_meta.setdefault("epochs", int(epochs_val))
         env_meta.setdefault("val_frac", float(frac_val))
@@ -775,8 +664,6 @@ def _update_history(
             logger_obj._records = getattr(model, "_train_history")
     except Exception:
         pass
-
-
 def _to_torch_dtype(dt: object) -> Optional[torch.dtype]:
     try:
         if isinstance(dt, torch.dtype):
@@ -793,8 +680,6 @@ def _to_torch_dtype(dt: object) -> Optional[torch.dtype]:
     except Exception:
         return None
     return None
-
-
 def _get_float_precision(obj: object) -> torch.dtype:
     try:
         if TensorDictBase is not None and isinstance(obj, TensorDictBase):
@@ -833,7 +718,6 @@ def _get_float_precision(obj: object) -> torch.dtype:
         pass
     return torch.float32
 
-
 def get_execution_time(
     log: logging.Logger,
     fn_name: str = "",
@@ -845,8 +729,6 @@ def get_execution_time(
         return cast(Callable[P, R], wrapped)
 
     return _decorator
-
-
 def new_model(
     in_dim: int,
     out_shape: Sequence[int],
@@ -855,8 +737,6 @@ def new_model(
     cfg = coerce_model_config(config)
     core = Model(in_dim, tuple((int(x) for x in out_shape)), config=cfg)
     return core
-
-
 def load_model(
     checkpoint_path: PathLike,
     in_dim: int | None = None,
@@ -991,8 +871,6 @@ def load_model(
         resize_scaler_buffer(model, sd)
     model.load_state_dict(sd, strict=False)
     return model
-
-
 def save_model(
     model: torch.nn.Module,
     path: PathLike,
@@ -1003,7 +881,7 @@ def save_model(
     swa_averager: object | None = None,
     **kwargs: Any,
 ) -> str:
-    from .runtime.io import Exporter, Builder
+    from .runtime.io import Builder, Exporter
 
     p = Path(path)
     if Builder.is_target_native(p):
@@ -1027,9 +905,6 @@ def save_model(
         raise ValueError(f"Unknown export format for path '{path}'.")
     conv.save(model, p, *args, **kwargs)
     return str(p)
-
-
-@get_execution_time(logger, fn_name="train")
 def train(
     model: torch.nn.Module | PathLike,
     data: TrainData,
@@ -1103,13 +978,13 @@ def train(
                 payload,
                 indent=None,
             )
-        # Always write a lightweight init checkpoint for worker bootstrap.
-        # Avoid DCP here: full_state_dict + cpu_offload can be extremely slow and
-        # memory-hungry before the first training step, especially in notebook
-        # environments. Workers will load model.pt if present.
-        # Init checkpoint is only used to bootstrap workers. On single-node (e.g., Colab)
-        # writing it to Google Drive can be painfully slow and may trigger watchdog timeouts.
-        # Use a local temp dir by default for max_nodes<=1; multi-node keeps the shared run dir.
+
+
+
+
+
+
+
         _max_nodes = int(max_nodes) if max_nodes is not None else 1
         use_local_init = env_bool("STNET_INIT_CKPT_LOCAL", default=(_max_nodes <= 1))
         if use_local_init:
@@ -1117,13 +992,13 @@ def train(
         else:
             init_dir = new_dir("init_ckpt")
 
-        # Track the init checkpoint path for safe restoration (especially when
-        # the parent model is moved to the meta device for RAM savings).
+
+
         init_ckpt_path = os.path.join(init_dir, "model.pt")
 
-        # IMPORTANT: write the init checkpoint BEFORE moving the parent model to
-        # the 'meta' device. Meta tensors have no backing storage and cannot be
-        # serialized ("Cannot copy out of meta tensor").
+
+
+
         _save_model_checkpoint(
             model,
             init_dir,
@@ -1132,9 +1007,9 @@ def train(
             overwrite=True,
         )
 
-        # Extract config BEFORE potentially moving the parent model to meta.
-        # (Some config extractors may touch parameters/buffers; meta is safe for
-        # shapes, but not all code paths are.)
+
+
+
         cfg_raw = _extract_model_config_dict(model)
         cfg_dict = (
             coerce_model_config(cfg_raw).to_dict()
@@ -1142,12 +1017,12 @@ def train(
             else ModelConfig().to_dict()
         )
 
-        # Reduce parent-process RAM usage while elastic workers run.
-        # With spawn/forkserver the parent and workers do not share model storage,
-        # so keeping a full copy of parameters here can cause host OOM/SIGKILL.
-        # NOTE: keep this environment toggle lightweight and self-contained.
-        # We intentionally use env_bool() here (instead of a private helper)
-        # to avoid missing imports in forkserver/spawn worker contexts.
+
+
+
+
+
+
         parent_to_meta = False
         if isinstance(model, torch.nn.Module) and env_bool(
             "STNET_PARENT_MODEL_TO_META", default=True
@@ -1231,17 +1106,17 @@ def train(
             return False
 
         def _materialize_to_cpu(m: torch.nn.Module) -> None:
-            # When a module lives on the meta device, it has no backing storage.
-            # `to_empty('cpu')` allocates empty tensors on CPU with the right
-            # shapes/dtypes so we can safely load a real state_dict.
+
+
+
             if hasattr(m, "to_empty"):
                 m.to_empty(device="cpu")
             else:
-                # Best-effort fallback. (Older torch versions may not support to_empty.)
+
                 m.to("cpu")
 
-        # If the parent model was moved to meta, keep it there while workers run.
-        # We'll rematerialize it *only* when we need to load a checkpoint.
+
+
         _clear_device_caches()
         with _start_context():
             elastic_launch(lc, process)(ops)
@@ -1252,15 +1127,15 @@ def train(
                     fallback, map_location="cpu", weights_only=True
                 )
             )
-            # Ensure the parent model is materialized (meta -> real CPU tensors)
-            # before we attempt to load weights.
+
+
             if isinstance(model, torch.nn.Module) and _has_meta_tensors(model):
                 with contextlib.suppress(Exception):
                     _materialize_to_cpu(model)
             resize_scaler_buffer(model, cpu_state)
             model.load_state_dict(cpu_state, strict=False)
         else:
-            # DCP fallback: still requires a materialized model to write into.
+
             if isinstance(model, torch.nn.Module) and _has_meta_tensors(model):
                 with contextlib.suppress(Exception):
                     _materialize_to_cpu(model)
@@ -1283,13 +1158,13 @@ def train(
         _update_history(model, ckpt_dir, epochs, val_frac, num_samples_dataset)
         return model
     finally:
-        # IMPORTANT: If we moved the parent model to `meta`, ALWAYS attempt to
-        # rematerialize it back to CPU tensors before cleaning up init ckpts.
-        # This prevents the common "Cannot write to meta tensor" failure when
-        # users interrupt training (KeyboardInterrupt) and retry with the same
-        # python model object.
+
+
+
+
+
         restore_path: str | None = None
-        # Prefer a last-known-good model checkpoint if workers managed to save it.
+
         with contextlib.suppress(Exception):
             fp = os.path.join(str(ckpt_dir or ""), "model.pt")
             if fp and os.path.isfile(fp):
@@ -1299,7 +1174,7 @@ def train(
 
         if isinstance(model, torch.nn.Module) and restore_path:
             try:
-                # Only do work if the model is meta.
+
                 _meta = False
                 for t in model.parameters(recurse=True):
                     if getattr(t, "is_meta", False) or t.device.type == "meta":
@@ -1328,9 +1203,6 @@ def train(
             shutil.rmtree(ckpt_dir, ignore_errors=True)
         if init_dir is not None:
             shutil.rmtree(init_dir, ignore_errors=True)
-
-
-@get_execution_time(logger, fn_name="predict")
 def predict(
     model: torch.nn.Module | PathLike,
     data: PredictData,
@@ -1587,9 +1459,6 @@ def predict(
                 shutil.rmtree(tmp_dir, ignore_errors=True)
             else:
                 logger.info("predict debug: preserving tmp_dir=%s", tmp_dir)
-
-
-@get_execution_time(logger, fn_name="postprocess")
 def postprocess(
     source: PathLike,
     *args: Any,

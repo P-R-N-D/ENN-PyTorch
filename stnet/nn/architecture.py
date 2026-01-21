@@ -4,7 +4,6 @@ from __future__ import annotations
 import contextlib
 import logging
 import math
-from functools import lru_cache
 from typing import (
     Any,
     Callable,
@@ -25,29 +24,31 @@ from tensordict import TensorDictBase
 from ..config import ModelConfig
 from ..core.concurrency import Mutex, is_gil_enabled
 from ..core.datatypes import env_bool, env_first_int, env_int
-from ..core.tensor import is_meta_or_fake_tensor, symint_safe_expand_as
 from ..core.distributed import _from_hsdp_module
 from ..core.graph import (
-    graph_break,
-    inference_mode,
-    torch_compiler_disable,
-    torch_compiler_supported,
-    compile as compile_module,
     canonicalize_compile_mode,
-    is_export_or_trace,
-    is_symbolic,
     coerce_checkpoint,
     cudagraph_mark_step_begin,
     cudagraph_mark_step_end,
+    graph_break,
+    inference_mode,
+    is_export_or_trace,
+    is_symbolic,
+    torch_compiler_disable,
+    torch_compiler_supported,
 )
-from ..core.precision import Autocast
+from ..core.graph import (
+    compile as compile_module,
+)
 from ..core.policies import LossWeightPolicy
+from ..core.precision import Autocast
 from ..core.system import (
     CPU,
     empty_device_cache,
     get_device,
     set_runtime_cfg,
 )
+from ..core.tensor import is_meta_or_fake_tensor, symint_safe_expand_as
 from ..data.collate import get_feature_key, get_label_key
 from .blocks import (
     CrossTransformer,
@@ -68,14 +69,10 @@ from .layers import (
     SigmoidGate,
 )
 
-
 _LOGGER = logging.getLogger(__name__)
-
 
 def _prod_int(shape: Sequence[int]) -> int:
     return int(math.prod(int(v) for v in shape))
-
-
 def _normalize_tile_shape(
     tile_shape: Sequence[int] | int | None,
     event_shape: Sequence[int],
@@ -96,8 +93,6 @@ def _normalize_tile_shape(
     else:
         ts = ts[-ndim:]
     return tuple(max(1, int(v)) for v in ts)
-
-
 def _tile_counts_grid(
     event_shape: Sequence[int],
     tile_shape: Sequence[int],
@@ -127,8 +122,6 @@ def _tile_counts_grid(
         shape[i] = grid[i]
         out = out * c.view(*shape)
     return out
-
-
 def _reduce_flat_to_grid(
     x: torch.Tensor,
     event_shape: Sequence[int],
@@ -161,8 +154,6 @@ def _reduce_flat_to_grid(
         ev, ts, device=blk.device, dtype=blk.dtype
     ).unsqueeze(0)
     return sum_v / torch.clamp(counts, min=float(eps))
-
-
 def _tv_loss_grid(
     p_grid: torch.Tensor, *args: Any, power: float = 1.0, eps: float = 1e-6
 ) -> torch.Tensor:
@@ -174,9 +165,6 @@ def _tv_loss_grid(
     if total is None:
         return p_grid.new_tensor(0.0, dtype=torch.float32)
     return total.mean()
-
-
-@lru_cache(maxsize=1)
 def _dot_product_attention_cls() -> Any:
     try:
         from .kernels import DotProductAttention
@@ -184,7 +172,6 @@ def _dot_product_attention_cls() -> Any:
         return DotProductAttention
     except Exception:
         return None
-
 
 class SpatialExtractor(nn.Module):
     def __init__(
@@ -275,8 +262,6 @@ class SpatialExtractor(nn.Module):
                     out, causal_mask=attn_mask, state=None, mode="spatial"
                 )
         return self.norm(out)
-
-
 class TemporalExtractor(nn.Module):
     def __init__(
         self,
@@ -567,8 +552,6 @@ class TemporalExtractor(nn.Module):
                 next_state = next_state.detach()
             return x, next_state.contiguous()
         return x
-
-
 class TokenCollector(nn.Module):
     def __init__(
         self,
@@ -701,8 +684,6 @@ class TokenCollector(nn.Module):
                 _prealloc_microbatch(tokens, mb, runner, stage="controller"),
             )
         return refined
-
-
 class TokenizedView(nn.Module):
     def __init__(
         self, in_dim: int, tokens: int, d_model: int, extractor: nn.Module
@@ -734,8 +715,6 @@ class TokenizedView(nn.Module):
             .contiguous()
         )
         return self.extractor(tokens, *args, **kwargs)
-
-
 class TokenFuser(nn.Module):
     def __init__(
         self,
@@ -1116,8 +1095,6 @@ class TokenFuser(nn.Module):
         tokens = self._aggregate_tokens(chosen)
         context = self.decode(tokens, apply_norm=False)
         return tokens, context
-
-
 class Model(nn.Module):
     @staticmethod
     def _get_cfg(cfg, name, default, type_=float):
@@ -1497,8 +1474,8 @@ class Model(nn.Module):
             pass
         raw_mode = getattr(config, "compile_mode", "disabled")
         compile_mode_canonical = canonicalize_compile_mode(raw_mode)
-        # Expose the model's compile mode to lower-level kernels (e.g. FlexAttention).
-        # This is used for safe, deterministic selection of torch.compile modes.
+
+
         set_runtime_cfg("compile_mode", compile_mode_canonical)
         compile_mode_arg = (
             None

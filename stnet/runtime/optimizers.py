@@ -1,15 +1,14 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
-import os
 import contextlib
 import inspect
 import json
 import logging
 import math
+import os
 import tempfile
 from collections import OrderedDict
-from functools import lru_cache
 from typing import (
     Any,
     Callable,
@@ -24,33 +23,25 @@ from typing import (
 )
 
 import torch
-from tensordict import TensorDictBase
 from torch import nn, optim
-from torch.optim.swa_utils import AveragedModel, update_bn
+from torch.optim.swa_utils import update_bn
 
-from .wrappers import _TensorDictPack
-
-from ..core.precision import Autocast, is_scale_safe
 from ..core.concurrency import Mutex
 from ..core.policies import ModelPolicy, PrecisionPolicy
-from ..core.system import get_device, get_module_device, optimal_optimizer_params
+from ..core.precision import Autocast, is_scale_safe
+from ..core.system import get_device, optimal_optimizer_params
 from ..data.pipeline import Dataset
 
-
 _LOGGER = logging.getLogger(__name__)
-
 _OPT_LOGGED_KEYS: "OrderedDict[object, None]" = OrderedDict()
-_OPT_LOGGED_MAX: int = 128
 _OPT_LOGGED_LOCK = Mutex()
-
+_OPT_LOGGED_MAX: int = 128
 
 def _is_hashable(x: object) -> bool:
     with contextlib.suppress(Exception):
         hash(x)
         return True
     return False
-
-
 def _to_immutable(x: Any) -> Any:
     if x is None or isinstance(x, (bool, int, float, str)):
         return x
@@ -61,25 +52,6 @@ def _to_immutable(x: Any) -> Any:
     if isinstance(x, dict):
         return tuple(sorted((str(k), _to_immutable(v)) for k, v in x.items()))
     return str(x)
-
-
-def _iter_batch(items: Iterable[Any], key: str) -> Iterator[torch.Tensor]:
-    for item in items:
-        tensor = None
-        if isinstance(item, (TensorDictBase, dict)):
-            tensor = item.get(key)
-        elif isinstance(item, torch.Tensor):
-            tensor = item
-        elif (
-            isinstance(item, (tuple, list))
-            and item
-            and torch.is_tensor(item[0])
-        ):
-            tensor = item[0]
-        if isinstance(tensor, torch.Tensor):
-            yield tensor
-
-
 def _log_optimizer(
     logger: Optional[Callable[[str], None]],
     key: object,
@@ -117,9 +89,6 @@ def _log_optimizer(
         return
     log_fn = getattr(_LOGGER, str(level).lower(), _LOGGER.info)
     log_fn(msg)
-
-
-@lru_cache(maxsize=256)
 def _get_expected_args(ctor: Any) -> Optional[frozenset[str]]:
     try:
         sig = inspect.signature(ctor)
@@ -133,8 +102,6 @@ def _get_expected_args(ctor: Any) -> Optional[frozenset[str]]:
         )
     except Exception:
         return None
-
-
 def _coerce_kwargs(ctor: Any, kwargs: Dict[str, Any]) -> Dict[str, Any]:
     if not kwargs:
         return {}
@@ -151,8 +118,6 @@ def _coerce_kwargs(ctor: Any, kwargs: Dict[str, Any]) -> Dict[str, Any]:
         except Exception:
             return dict(kwargs)
     return {k: v for k, v in kwargs.items() if k in allowed}
-
-
 def _dataset_for_device(
     model_or_params: Union[
         nn.Module, Iterable[nn.Parameter], Sequence[Dict[str, Any]]
@@ -191,8 +156,6 @@ def _dataset_for_device(
     )
     meta = Autocast.coerce_metadata(dev, metadata=metadata)
     return torch.device(meta.device), meta
-
-
 def _coerce_params(
     model_or_params: Union[
         nn.Module, Iterable[nn.Parameter], Sequence[Dict[str, Any]]
@@ -211,8 +174,6 @@ def _coerce_params(
             if isinstance(g, dict)
         ]
     return list(model_or_params)
-
-
 def _master_cpu_dtypes(
     device: torch.device,
     meta: Optional["Dataset[Any]"] = None,
@@ -230,8 +191,6 @@ def _master_cpu_dtypes(
         except Exception:
             pass
     return master_float, master_int
-
-
 def _cpu_offload(
     t: torch.Tensor,
     dtype: torch.dtype,
@@ -264,59 +223,21 @@ def _cpu_offload(
             out.copy_(src, non_blocking=nb)
             return out
     return src.to(device="cpu", dtype=dtype)
+def _has_batchnorm_modules(model: nn.Module) -> bool:
 
-
-def _safe_copy(dst: torch.Tensor, src: torch.Tensor) -> None:
-    if (
-        torch.is_tensor(dst)
-        and torch.is_tensor(src)
-        and dst.data_ptr() != src.data_ptr()
-    ):
-        with contextlib.suppress(Exception):
-            dst.copy_(src)
-            return
-        with contextlib.suppress(Exception):
-            dst.copy_(src.to(device=dst.device, dtype=dst.dtype))
-
-
-def _sync_optimizer_state(optimizer: optim.Optimizer) -> None:
     try:
-        state = optimizer.state
+        bn_types = (
+            nn.BatchNorm1d,
+            nn.BatchNorm2d,
+            nn.BatchNorm3d,
+            getattr(nn, 'SyncBatchNorm', nn.BatchNorm1d),
+        )
+        for m in model.modules():
+            if isinstance(m, bn_types):
+                return True
     except Exception:
-        return
-    try:
-        for group in optimizer.param_groups:
-            params = group.get("params", [])
-            for p in params:
-                if p is None:
-                    continue
-                p_state = state.get(p)
-                if not isinstance(p_state, dict):
-                    continue
-                for k, v in p_state.items():
-                    if not torch.is_tensor(v):
-                        continue
-                    try:
-                        p_is_float = bool(p.is_floating_point())
-                        v_is_float = bool(v.is_floating_point())
-                        target_dtype = (
-                            p.dtype
-                            if (
-                                p_is_float
-                                and v_is_float
-                                and v.shape == p.shape
-                            )
-                            else v.dtype
-                        )
-                        p_state[k] = v.to(device=p.device, dtype=target_dtype)
-                    except Exception:
-                        try:
-                            p_state[k] = v.to(device=p.device)
-                        except Exception:
-                            pass
-    except Exception:
-        return
-
+        return False
+    return False
 
 def exponential_weight_average(
     model: nn.Module,
@@ -336,8 +257,6 @@ def exponential_weight_average(
         update_every=update_every,
         non_blocking=non_blocking,
     )
-
-
 def stochastic_weight_average(
     model: nn.Module,
     *args: Any,
@@ -354,7 +273,6 @@ def stochastic_weight_average(
         avg_fn=avg_fn,
         **kwargs,
     )
-
 
 class AdamW:
     @staticmethod
@@ -578,8 +496,6 @@ class AdamW:
             payload,
         )
         return selected_opt
-
-
 class ExponentialMovingAverage(nn.Module):
     def __init__(
         self,
@@ -762,41 +678,20 @@ class ExponentialMovingAverage(nn.Module):
             except Exception:
                 with contextlib.suppress(Exception):
                     p.data = ema_v.to(device=p.device, dtype=p.dtype)
-
-
-
-def _has_batchnorm_modules(model: nn.Module) -> bool:
-    """Return True if the module tree contains any BatchNorm layer."""
-    try:
-        bn_types = (
-            nn.BatchNorm1d,
-            nn.BatchNorm2d,
-            nn.BatchNorm3d,
-            getattr(nn, 'SyncBatchNorm', nn.BatchNorm1d),
-        )
-        for m in model.modules():
-            if isinstance(m, bn_types):
-                return True
-    except Exception:
-        return False
-    return False
-
-
-
 class StochasticWeightAverage(nn.Module):
-    """Streaming SWA with bounded staging and memory-mapped CPU shadow.
+\
+\
+\
+\
+\
+\
+\
+\
+\
+\
+\
+\
 
-    Goals:
-    - Keep SWA shadow weights in a *reclaimable* mapping (OS page cache), not
-      anonymous CPU RAM.
-    - Bound peak host RAM by a fixed chunk size during device->host staging.
-    - Follow the configured "master" CPU dtype policy for the shadow (float/int).
-    - Preserve the caller's update cadence (we call once per epoch in training).
-
-    Notes:
-    - The SWA shadow is backed by `torch.from_file(...)` when possible.
-    - If mmap setup fails for any reason, falls back to an in-memory CPU shadow.
-    """
 
     def __init__(
         self,
@@ -833,8 +728,8 @@ class StochasticWeightAverage(nn.Module):
 
         self._avg_dtype = avg_dtype
         self._pin_memory = bool(pin_memory) if pin_memory is not None else False
-        # When staging device->host into CPU scratch, non_blocking only makes sense
-        # with pinned memory; default to that.
+
+
         self._non_blocking = (
             bool(non_blocking)
             if non_blocking is not None
@@ -844,23 +739,23 @@ class StochasticWeightAverage(nn.Module):
         self._step: int = 0
         self._n_averaged: int = 0
 
-        # Shadow storage (CPU). With mmap enabled, values are views into a mapped file.
+
         self._shadow: Dict[str, torch.Tensor] = {}
 
-        # Scratch staging buffers (CPU) keyed by dtype.
+
         self._scratch: Dict[torch.dtype, torch.Tensor] = {}
 
-        # Streaming limits (host RAM bound).
+
         self._stream_chunk_bytes = max(1 << 20, int(stream_chunk_mb) * 1024 * 1024)
         self._stream_max_inflight_bytes = max(
             int(self._stream_chunk_bytes),
             int(stream_max_inflight_mb) * 1024 * 1024,
         )
 
-        # Thread-safety / No-GIL friendliness.
+
         self._lock = Mutex()
 
-        # mmap bookkeeping
+
         self._use_mmap = bool(use_mmap) if use_mmap is not None else True
         self._mmap_dir: str | None = None
         self._mmap_prefix = str(mmap_prefix or "stnet_swa_shadow")
@@ -873,11 +768,11 @@ class StochasticWeightAverage(nn.Module):
         if self._use_mmap:
             try:
                 self._init_mmap_shadow(model, mmap_dir=mmap_dir)
-                # Default cleanup: if we created a temp directory, remove it on close.
+
                 if mmap_cleanup is None and self._mmap_created_temp:
                     self._mmap_cleanup = True
             except Exception:
-                # Fall back silently; SWA still works, just uses CPU RAM.
+
                 self._use_mmap = False
                 self._mmap_dir = None
                 self._mmap_files.clear()
@@ -905,10 +800,10 @@ class StochasticWeightAverage(nn.Module):
             yield name, p
 
     def _target_dtype(self, t: torch.Tensor) -> torch.dtype:
-        # Explicit override.
+
         if self._avg_dtype is not None:
             return self._avg_dtype
-        # Master dtype policy.
+
         if t.is_floating_point():
             return self._master_float
         if t.is_complex():
@@ -922,7 +817,7 @@ class StochasticWeightAverage(nn.Module):
         s = str(dt)
         if s.startswith("torch."):
             s = s.split("torch.", 1)[1]
-        # Make it filesystem-friendly.
+
         return (
             s.replace("bfloat16", "bf16")
             .replace("float16", "f16")
@@ -939,19 +834,19 @@ class StochasticWeightAverage(nn.Module):
         )
 
     def _init_mmap_shadow(self, model: nn.Module, *, mmap_dir: str | None) -> None:
-        # Decide directory.
+
         if mmap_dir:
             d = str(mmap_dir)
             os.makedirs(d, exist_ok=True)
             self._mmap_dir = d
             self._mmap_created_temp = False
         else:
-            # Keep it off the main checkpoint dir by default; this is just a scratch
-            # backing store to keep host RAM stable.
+
+
             self._mmap_dir = tempfile.mkdtemp(prefix=f"{self._mmap_prefix}_")
             self._mmap_created_temp = True
 
-        # Build a deterministic layout (name-sorted) so offsets are stable.
+
         items: list[tuple[str, torch.dtype, tuple[int, ...], int]] = []
         for name, p in self._iter_named_params(model):
             dt = self._target_dtype(p.detach())
@@ -960,7 +855,7 @@ class StochasticWeightAverage(nn.Module):
             items.append((name, dt, shape, numel))
 
         if not items:
-            # Nothing to track.
+
             self._use_mmap = False
             return
 
@@ -970,13 +865,13 @@ class StochasticWeightAverage(nn.Module):
         for _, dt, _, n in items:
             totals[dt] = int(totals.get(dt, 0)) + int(n)
 
-        # Allocate one mapped 1-D tensor per dtype.
+
         for dt, total in totals.items():
             if int(total) <= 0:
                 continue
             tag = self._dtype_tag(dt)
             base_path = os.path.join(str(self._mmap_dir), f"{self._mmap_prefix}.{tag}.bin")
-            # Avoid accidental reuse if the path already exists.
+
             if os.path.exists(base_path):
                 base_path = os.path.join(
                     str(self._mmap_dir),
@@ -1024,7 +919,7 @@ class StochasticWeightAverage(nn.Module):
         return buf[:n]
 
     def _sync_device(self, dev_type: str) -> None:
-        # Best-effort sync when we stage D2H with non_blocking=True.
+
         try:
             if dev_type == "cuda" and hasattr(torch, "cuda"):
                 torch.cuda.synchronize()
@@ -1098,7 +993,7 @@ class StochasticWeightAverage(nn.Module):
             if bool(self._non_blocking) and v.device.type != "cpu":
                 self._sync_device(v.device.type)
             dst_chunk = dst_flat[off : off + n]
-            # In-place: dst = (1 - 1/(n+1)) * dst + 1/(n+1) * src
+
             dst_chunk.mul_(one_m).add_(buf, alpha=inv_n1)
 
     def update(self, model: nn.Module | None = None) -> None:
@@ -1122,8 +1017,8 @@ class StochasticWeightAverage(nn.Module):
                     or tuple(cur.shape) != tuple(v.shape)
                     or cur.dtype != dt
                 ):
-                    # If mmap layout did not include this tensor (rare), fall back to a
-                    # regular CPU tensor. This keeps correctness even if RAM use grows.
+
+
                     cur = torch.empty(
                         v.shape,
                         dtype=dt,
@@ -1132,7 +1027,7 @@ class StochasticWeightAverage(nn.Module):
                     )
                     shadow[name] = cur
 
-                # First update must be a direct copy (avoid NaNs from uninitialized mmap).
+
                 if n == 0:
                     self._stream_copy_(cur, v, dtype=dt)
                     continue
@@ -1146,7 +1041,7 @@ class StochasticWeightAverage(nn.Module):
 
     @contextlib.contextmanager
     def reduction(self, target: nn.Module) -> Any:
-        """Temporarily apply SWA weights to `target` (and restore afterwards)."""
+
         if target is None:
             yield target
             return
@@ -1165,7 +1060,7 @@ class StochasticWeightAverage(nn.Module):
                         p.detach().copy_(backup[k], non_blocking=False)
 
     def apply(self, target: nn.Module | None = None) -> None:
-        """Apply SWA weights to `target` in-place."""
+
         if target is None:
             target = self._model
         if target is None:
@@ -1188,11 +1083,11 @@ class StochasticWeightAverage(nn.Module):
         include_buffers: bool = True,
         max_buffer_mb: int = 25,
     ) -> Dict[str, torch.Tensor]:
-        """Build a CPU checkpoint state_dict using SWA shadow parameters.
+\
+\
+\
+\
 
-        This avoids calling `state_dict()` on sharded wrappers and avoids materializing
-        a full CPU copy at once.
-        """
         out: Dict[str, torch.Tensor] = {}
         shadow = self._shadow
         with torch.no_grad():
@@ -1231,7 +1126,7 @@ class StochasticWeightAverage(nn.Module):
         dataloader: torch.utils.data.DataLoader,
         device: torch.device | None = None,
     ) -> None:
-        """Optional BN-stat recomputation."""
+
         if not self._has_bn:
             return
         if device is None:
@@ -1240,9 +1135,9 @@ class StochasticWeightAverage(nn.Module):
             update_bn(dataloader, self._model, device=device)
 
     def close(self) -> None:
-        """Release mapped storage and (optionally) delete scratch files."""
+
         with self._lock:
-            # Drop tensor views first.
+
             try:
                 self._shadow.clear()
             except Exception:
@@ -1252,7 +1147,7 @@ class StochasticWeightAverage(nn.Module):
             except Exception:
                 pass
 
-            # Drop base mappings.
+
             try:
                 self._mmap_base.clear()
             except Exception:
@@ -1278,8 +1173,8 @@ class StochasticWeightAverage(nn.Module):
             self._mmap_dir = None
 
     def save_state_dict(self) -> Dict[str, Any]:
-        # Keeping this lightweight is important. We avoid serializing the shadow
-        # tensors here by default (it can be huge).
+
+
         return {
             "n_averaged": int(self._n_averaged),
             "update_every": int(self._update_every),
@@ -1294,7 +1189,7 @@ class StochasticWeightAverage(nn.Module):
         }
 
     def load_state_dict(self, state: Dict[str, Any]) -> None:
-        # Best-effort restore of counters only.
+
         try:
             self._n_averaged = int(state.get("n_averaged", 0))
         except Exception:
@@ -1303,4 +1198,3 @@ class StochasticWeightAverage(nn.Module):
             self._update_every = max(1, int(state.get("update_every", self._update_every)))
         except Exception:
             pass
-

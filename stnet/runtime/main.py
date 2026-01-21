@@ -5,24 +5,23 @@ import contextlib
 import datetime
 import glob
 import itertools
-import random
-import re
-import platform
-import socket
 import logging
 import math
 import os
+import platform
+import random
+import re
+import socket
 import sys
 import threading
 import time
 import warnings
 from collections.abc import Mapping
 from dataclasses import replace
-from functools import lru_cache, partial
+from functools import partial
 from pathlib import Path
-from typing import Any, MutableMapping, TypeAlias, overload
+from typing import Any, MutableMapping, TypeAlias
 
-from tqdm.auto import tqdm
 import numpy
 import torch
 import torch.distributed
@@ -30,52 +29,21 @@ import torch.nn as nn
 from tensordict import TensorDictBase
 from torch.distributed.checkpoint import (
     FileSystemReader,
-    FileSystemWriter,
     load,
-    save,
 )
 from torch.distributed.checkpoint.state_dict import (
     StateDictOptions,
     get_model_state_dict,
-    get_optimizer_state_dict,
     set_model_state_dict,
 )
-from torch.distributed.elastic.control_plane import worker_main
+from tqdm.auto import tqdm
 
 from ..config import RuntimeConfig, coerce_model_config
 from ..core.concurrency import (
-    TensorSpooler,
     Mutex,
     TensorPagePool,
+    TensorSpooler,
     new_affinity,
-)
-from ..core.system import (
-    CPU,
-    Memory,
-    empty_device_cache,
-    get_device,
-    init_python_path,
-    is_oom_error,
-    is_cuda_bf16_supported,
-    set_float32_precision,
-)
-from ..core.system import (
-    accelerator_max_allocated_memory,
-    accelerator_stream,
-    accelerator_type,
-    allocated_accelerator_memory,
-    available_device_memory,
-    flush_accelerator_memory_stats,
-    get_accelerator_index,
-    get_num_accelerators,
-    is_accelerator_available,
-    is_accelerator_timer_supported,
-    is_pin_supported,
-    new_accelerator_event,
-    set_accelerator_index,
-    set_accelerator_seed,
-    sync_accelerator,
-    posix_time,
 )
 from ..core.datatypes import (
     env_bool,
@@ -84,36 +52,67 @@ from ..core.datatypes import (
     env_float,
     env_int,
     env_str,
+    read_json,
 )
-from ..core.tensor import is_meta_or_fake_tensor, to_torch_tensor
 from ..core.distributed import (
     broadcast_scalar,
+    distributed_all_reduce_grads,
     distributed_barrier,
     distributed_sync,
-        distributed_all_reduce_grads,
-    joining,
-    no_sync,
+    get_distributed_mesh,
     get_world_size,
     is_distributed,
-    get_distributed_mesh,
+    joining,
+    no_sync,
     to_hsdp_module,
 )
 from ..core.graph import (
-    inference_mode,
     canonicalize_compile_mode,
-    compile_safe,
     compile_distributed_safe,
+    compile_safe,
     cudagraph_mark_step_begin,
     cudagraph_mark_step_end,
     from_checkpoint,
-    to_submodule,
+    inference_mode,
     to_checkpoint,
+    to_submodule,
 )
-from ..core.profiler import FlopCounter
+from ..core.policies import DistributedPolicy, ModelPolicy, PrecisionPolicy
 from ..core.precision import Autocast
-from ..core.policies import ModelPolicy, PrecisionPolicy, DistributedPolicy
+from ..core.profiler import FlopCounter
+from ..core.system import (
+    CPU,
+    Memory,
+    accelerator_max_allocated_memory,
+    accelerator_stream,
+    accelerator_type,
+    allocated_accelerator_memory,
+    available_device_memory,
+    empty_device_cache,
+    flush_accelerator_memory_stats,
+    get_accelerator_index,
+    get_device,
+    get_num_accelerators,
+    init_python_path,
+    is_accelerator_available,
+    is_accelerator_timer_supported,
+    is_cuda_bf16_supported,
+    is_oom_error,
+    is_pin_supported,
+    new_accelerator_event,
+    posix_time,
+    set_accelerator_index,
+    set_accelerator_seed,
+    set_float32_precision,
+    sync_accelerator,
+)
+from ..core.tensor import is_meta_or_fake_tensor, to_torch_tensor
+from ..data import collate
+from ..data.collate import ShardCollector
+from ..data.pipeline import Dataset
 from ..nn.architecture import Model
 from ..nn.layers import Recorder, resize_scaler_buffer
+from .io import _filtered_warnings, _torch_load_checkpoint
 from .losses import (
     CRPSLoss,
     DataFidelityLoss,
@@ -128,64 +127,15 @@ from .optimizers import (
     ExponentialMovingAverage,
     StochasticWeightAverage,
 )
-from ..data import collate
-from ..data.collate import ShardCollector
-from ..data.pipeline import Dataset
-from ..core.datatypes import read_json
-from .io import _filtered_warnings, _torch_load_checkpoint
-
-try:
-    import psutil
-except Exception:
-    psutil = None
-
-try:
-    from torch.distributed._composable.fsdp import MixedPrecisionPolicy
-except Exception:
-    try:
-        from torch.distributed.fsdp import MixedPrecisionPolicy
-    except Exception:
-        MixedPrecisionPolicy = None
-
-try:
-    from tensordict.nn import CudaGraphModule as TD_CudaGraphModule
-except Exception:
-    TD_CudaGraphModule = None
-
-
-MB_DIV = 1024.0 * 1024.0
-PathLike: TypeAlias = str | os.PathLike[str] | Path
-JsonPrimitive: TypeAlias = str | int | float | bool | None
-JsonValue: TypeAlias = (
-    JsonPrimitive | list["JsonValue"] | dict[str, "JsonValue"]
-)
-TorchDeviceLike: TypeAlias = torch.device | str | int
-ReturnSink: TypeAlias = MutableMapping[str, object]
-
-_LOGGER = logging.getLogger(__name__)
-
-_nvml = None
-_NVML_READY = False
-_NVML_TRIED = False
-_NVML_LOCK = Mutex()
-_NVML_QUERY_LOCK = Mutex()
-_NVML_HANDLE_CACHE = {}
-_NVML_UTIL_CACHE = {}
-_NVML_FAIL_COUNT = 0
-_NVML_BACKOFF_UNTIL = 0.0
 
 _COMPILE_SAFE_DONE = False
 _COMPILE_SAFE_LOCK = Mutex()
-
-_SAMPLER_SCALE_LOG_LOCK = Mutex()
-_SAMPLER_SCALE_LOG_LAST_S = {}
-
-_OOM_RETRY_LOCK = Mutex()
-_OOM_RETRY_COUNT = {}
-
-_TIMING_EVENT_TLS = threading.local()
-_TIMING_EVENTS_UNSUPPORTED = object()
-
+_DL_STATE_FILE = "dataloader.json"
+_IGNORED_WARNING_MESSAGE_RE = re.compile(
+    r".*(?:"
+    + "|".join((f"(?:{p})" for p in _IGNORED_WARNING_PATTERNS))
+    + r").*"
+)
 _IGNORED_WARNING_PATTERNS: tuple[str, ...] = (
     "torch.distributed is disabled, unavailable or uninitialized",
     "TypedStorage is deprecated",
@@ -196,37 +146,46 @@ _IGNORED_WARNING_PATTERNS: tuple[str, ...] = (
     "mixed precision.*may be unavailable",
     "Either mode or options can be specified, but both can't be specified at the same time\\.",
 )
-_IGNORED_WARNING_MESSAGE_RE = re.compile(
-    r".*(?:"
-    + "|".join((f"(?:{p})" for p in _IGNORED_WARNING_PATTERNS))
-    + r").*"
+_LOGGER = logging.getLogger(__name__)
+_NVML_BACKOFF_UNTIL = 0.0
+_NVML_FAIL_COUNT = 0
+_NVML_HANDLE_CACHE = {}
+_NVML_LOCK = Mutex()
+_NVML_QUERY_LOCK = Mutex()
+_NVML_READY = False
+_NVML_TRIED = False
+_NVML_UTIL_CACHE = {}
+_OOM_RETRY_COUNT = {}
+_OOM_RETRY_LOCK = Mutex()
+_SAMPLER_SCALE_LOG_LAST_S = {}
+_SAMPLER_SCALE_LOG_LOCK = Mutex()
+_TIMING_EVENTS_UNSUPPORTED = object()
+_TIMING_EVENT_TLS = threading.local()
+_nvml = None
+JsonPrimitive: TypeAlias = str | int | float | bool | None
+JsonValue: TypeAlias = (
+    JsonPrimitive | list["JsonValue"] | dict[str, "JsonValue"]
 )
+MB_DIV = 1024.0 * 1024.0
+PathLike: TypeAlias = str | os.PathLike[str] | Path
+ReturnSink: TypeAlias = MutableMapping[str, object]
+TorchDeviceLike: TypeAlias = torch.device | str | int
 
-_DL_STATE_FILE = "dataloader.json"
-
-
-@lru_cache(maxsize=4)
 def _is_nvml_disabled() -> bool:
     return env_bool("STNET_NVML_DISABLE", False) or not env_bool(
         "STNET_NVML", True
     )
-
-
 def _nvml_cfg(key: str, default: object, cast_fn: type = int) -> object:
     return cast_fn(
         env_first(
             (f"STNET_NVML_{key}", f"STNET_NVML_{key}_S"), default=default
         )
     )
-
-
 def _is_nvml_blocked(now: object | None = None) -> object:
     now = float(now or time.perf_counter())
     with _NVML_LOCK:
         until = float(_NVML_BACKOFF_UNTIL or 0.0)
     return bool(until > 0.0 and float(now) < until)
-
-
 def _is_nvml_available() -> object:
     global _nvml, _NVML_READY, _NVML_TRIED
     nogil = bool(CPU.is_optimized_for_no_gil())
@@ -269,8 +228,6 @@ def _is_nvml_available() -> object:
             if env_bool("STNET_DEBUG", False):
                 _LOGGER.debug("NVML init failed: %s", exc, exc_info=True)
     return bool(_NVML_READY)
-
-
 def _validate_compile_safe() -> None:
     global _COMPILE_SAFE_DONE
     if _COMPILE_SAFE_DONE:
@@ -281,9 +238,6 @@ def _validate_compile_safe() -> None:
         _COMPILE_SAFE_DONE = True
     with contextlib.suppress(Exception):
         compile_safe(runtime_module=sys.modules[__name__])
-
-
-@lru_cache(maxsize=8)
 def _is_clock_synchronized(dev_type: str) -> bool:
     if _env_flag("STNET_TIMER_SYNC", False) or _env_flag(
         "STNET_WALLCLOCK_TIMER_SYNC", False
@@ -291,8 +245,6 @@ def _is_clock_synchronized(dev_type: str) -> bool:
         return True
     dt = str(dev_type or "cpu")
     return _env_flag(f"STNET_{dt.upper()}_TIMER_SYNC", False)
-
-
 def _is_event_timer_available(device: torch.device) -> bool:
     try:
         return bool(
@@ -300,8 +252,6 @@ def _is_event_timer_available(device: torch.device) -> bool:
         )
     except Exception:
         return False
-
-
 def _new_event_timer(device: torch.device) -> object:
     try:
         dev_type = str(getattr(device, "type", "cpu"))
@@ -310,8 +260,6 @@ def _new_event_timer(device: torch.device) -> object:
     if not is_accelerator_timer_supported(dev_type):
         return None
     return new_accelerator_event(device, enable_timing=True)
-
-
 def _get_thread_events(device: torch.device, slot: str) -> object:
     try:
         dev_type = str(getattr(device, "type", "cpu"))
@@ -339,23 +287,12 @@ def _get_thread_events(device: torch.device, slot: str) -> object:
         cached = (ev_s, ev_e)
         d[key] = cached
     return cached
-
-
-@lru_cache(maxsize=256)
 def _env_flag(name: object, default: object) -> object:
     return env_bool(str(name), bool(default))
-
-
-@lru_cache(maxsize=256)
 def _env_int(name: object, default: object) -> object:
     return env_int(str(name), int(default))
-
-
-@lru_cache(maxsize=256)
 def _env_float(name: object, default: object) -> object:
     return env_float(str(name), float(default))
-
-
 def _get_torch_profiler(
     *args: Any,
     enabled: object,
@@ -434,8 +371,6 @@ def _get_torch_profiler(
         return prof
     except Exception:
         return None
-
-
 def _get_profiler_summary(
     prof: object,
     *args: Any,
@@ -474,22 +409,16 @@ def _get_profiler_summary(
             str(tag),
             str(table),
         )
-
-
 def _oom_retries(loader: object, phase: object, step: int) -> object:
     key = (int(id(loader)), str(phase), int(step))
     with _OOM_RETRY_LOCK:
         cur = int(_OOM_RETRY_COUNT.get(key, 0)) + 1
         _OOM_RETRY_COUNT[key] = int(cur)
         return int(cur)
-
-
 def _clear_oom_retries(loader: object, phase: object, step: int) -> None:
     key = (int(id(loader)), str(phase), int(step))
     with _OOM_RETRY_LOCK:
         _OOM_RETRY_COUNT.pop(key, None)
-
-
 def _oom_max_retries(phase: object) -> object:
     phase = str(phase).strip().lower()
     if phase == "train":
@@ -505,8 +434,6 @@ def _oom_max_retries(phase: object) -> object:
     else:
         v = _env_int("STNET_OOM_MAX_RETRIES_PER_BATCH", 3)
     return max(0, int(v))
-
-
 def _is_batch_skippable(phase: object) -> bool:
     phase = str(phase).strip().lower()
     if phase == "train":
@@ -518,14 +445,10 @@ def _is_batch_skippable(phase: object) -> bool:
             "STNET_OOM_SKIP_VAL", _env_flag("STNET_OOM_SKIP_BATCH", True)
         )
     return _env_flag("STNET_OOM_SKIP_BATCH", True)
-
-
 def _get_scale_rate_down(attempt: object) -> object:
     seq = (0.8, 0.7, 0.6, 0.5)
     idx = min(3, max(0, int(attempt) - 1))
     return float(seq[idx])
-
-
 def _is_scale_rate_logged(
     *args: Any,
     logger: logging.Logger,
@@ -559,8 +482,6 @@ def _is_scale_rate_logged(
             logger.info(msg)
     except Exception:
         pass
-
-
 def _get_sampler_scaler(
     loader: object, *args: Any, max_depth: int = 4
 ) -> object:
@@ -577,8 +498,6 @@ def _get_sampler_scaler(
             return ctl
         obj = getattr(obj, "_src", None) or getattr(obj, "src", None)
     return None
-
-
 def _get_oom_blocking_time(oom_try: int, phase: str | None = None) -> float:
     try:
         base_ms = float(_env_float("STNET_OOM_BACKOFF_BASE_MS", 0.0))
@@ -593,8 +512,6 @@ def _get_oom_blocking_time(oom_try: int, phase: str | None = None) -> float:
     p = max(0, int(oom_try) - 2)
     sleep_ms = min(float(max_ms), float(base_ms) * (2.0 ** float(p)))
     return max(0.0, float(sleep_ms) / 1000.0)
-
-
 def _recover_oom(
     *args: Any,
     phase: str,
@@ -743,8 +660,6 @@ def _recover_oom(
         with contextlib.suppress(Exception):
             time.sleep(float(sleep_s))
     return ("retry", grad_accum_steps)
-
-
 def _get_batch_length(loader: object) -> object:
     if loader is None:
         return 0
@@ -768,8 +683,6 @@ def _get_batch_length(loader: object) -> object:
                     loader.load_state_dict(state)
             return count
     return 0
-
-
 def _float8_log(
     msg: str, *args: Any, only_main_rank: bool = True, **kwargs: Any
 ) -> None:
@@ -784,8 +697,6 @@ def _float8_log(
     except Exception:
         pass
     _LOGGER.info(msg, *args)
-
-
 def _validate_no_meta_tensors(module: object) -> None:
     hits = []
     for name, param in module.named_parameters(recurse=True):
@@ -796,8 +707,6 @@ def _validate_no_meta_tensors(module: object) -> None:
             hits.append(f"buffer {name} shape={tuple(buffer.shape)}")
     if hits:
         raise RuntimeError("Found meta tensors in model:\n" + "\n".join(hits))
-
-
 def _hook_meta_monitor(
     module: object, inputs: object, warn_only: object
 ) -> None:
@@ -808,8 +717,6 @@ def _hook_meta_monitor(
                 warnings.warn(message, stacklevel=3)
                 return
             raise RuntimeError(message)
-
-
 def _enable_meta_monitor(model: object) -> None:
     hook_mode = (
         str(
@@ -826,8 +733,6 @@ def _enable_meta_monitor(model: object) -> None:
         submodule.register_forward_pre_hook(
             partial(_hook_meta_monitor, warn_only=warn_only), with_kwargs=False
         )
-
-
 def _validate_no_fake_dtensor(
     root: nn.Module, *args: Any, **kwargs: Any
 ) -> None:
@@ -848,8 +753,6 @@ def _validate_no_fake_dtensor(
             "LayerNorm parameters must be materialized as a real Tensor: "
             + ", ".join(bad)
         )
-
-
 def _set_requires_grad(
     module: nn.Module,
     name: str,
@@ -858,12 +761,8 @@ def _set_requires_grad(
     requires_grad: bool,
 ) -> None:
     setattr(module, name, nn.Parameter(data, requires_grad=requires_grad))
-
-
 def _is_precision_exempted(module: object) -> bool:
     return bool(getattr(module, "__stnet_precision_exempt__", False))
-
-
 def _cast_float_dtype(model: object, dtype: torch.dtype) -> object:
     if not isinstance(dtype, torch.dtype):
         return
@@ -894,15 +793,13 @@ def _cast_float_dtype(model: object, dtype: torch.dtype) -> object:
                         continue
                     if not b.is_floating_point() or b.dtype == dtype:
                         continue
-                    # Some buffers are intentionally kept in float64 for
-                    # numerical stability/accuracy (e.g., data scaling stats).
-                    # Do NOT downcast them just because the model master dtype
-                    # is lower-precision.
+
+
+
+
                     if b.dtype is torch.float64 and dtype is not torch.float64:
                         continue
                     bufs[name] = b.detach().to(dtype)
-
-
 def _to_device_recursive(obj: object, dev: object) -> object:
     if isinstance(obj, torch.Tensor):
         dev_type = getattr(dev, "type", None)
@@ -919,8 +816,6 @@ def _to_device_recursive(obj: object, dev: object) -> object:
         seq = [_to_device_recursive(v, dev) for v in obj]
         return type(obj)(seq)
     return obj
-
-
 def _touch_tensors(obj: object) -> None:
     if isinstance(obj, torch.Tensor):
         _ = obj.sum()
@@ -937,8 +832,6 @@ def _touch_tensors(obj: object) -> None:
         for v in obj:
             _touch_tensors(v)
         return
-
-
 def _cast_batchnorm_buffers_dtype(
     module: object, dtype: torch.dtype | None
 ) -> None:
@@ -966,8 +859,6 @@ def _cast_batchnorm_buffers_dtype(
                         continue
                     with contextlib.suppress(Exception):
                         mod._buffers[name] = buf.to(dtype=dtype)
-
-
 def _get_layernorm_dtype(device: TorchDeviceLike) -> object:
     try:
         meta = Autocast.coerce_metadata(device)
@@ -988,8 +879,6 @@ def _get_layernorm_dtype(device: TorchDeviceLike) -> object:
         return torch.float64 if chosen == torch.float64 else torch.float32
     except Exception:
         return torch.float32
-
-
 def _preload_layers(model: object, device: TorchDeviceLike) -> None:
     for module in model.modules():
         if not isinstance(module, nn.LayerNorm):
@@ -1061,8 +950,6 @@ def _preload_layers(model: object, device: TorchDeviceLike) -> None:
                 module, "bias", data, requires_grad=requires_grad_b
             )
             bias = module.bias
-
-
 def _validate_model_dtype_unity(
     model: object, device: TorchDeviceLike
 ) -> None:
@@ -1109,8 +996,6 @@ def _validate_model_dtype_unity(
             "LayerNorm parameter dtype mismatch detected:\n"
             + "\n".join(mismatches)
         )
-
-
 def _coerce_dcp_keys(state: object) -> object:
     if isinstance(state, dict):
         keys = []
@@ -1127,8 +1012,6 @@ def _coerce_dcp_keys(state: object) -> object:
         for key in keys:
             state.pop(key, None)
     return state
-
-
 def _get_backend_type(device: "TorchDeviceLike") -> str:
     dev_type = str(getattr(device, "type", "cpu")).lower()
     match dev_type:
@@ -1142,15 +1025,15 @@ def _get_backend_type(device: "TorchDeviceLike") -> str:
             return "gloo"
         case "hpu":
             with contextlib.suppress(Exception):
-                import habana_frameworks.torch.distributed.hccl
+                pass
             return "hccl"
         case "npu":
             with contextlib.suppress(Exception):
-                import torch_npu
+                pass
             return "hccl"
         case "xla":
             with contextlib.suppress(Exception):
-                import torch_xla
+                pass
             return "xla"
         case _:
             get_default = getattr(torch.distributed, "get_default_backend_for_device", None)
@@ -1160,8 +1043,6 @@ def _get_backend_type(device: "TorchDeviceLike") -> str:
                 with contextlib.suppress(Exception):
                     return str(get_default(dev_type)).lower()
             return "gloo"
-
-
 def _ensure_default_socket_ifname() -> None:
     iface = None
     gloo_if = os.environ.get("GLOO_SOCKET_IFNAME")
@@ -1206,8 +1087,6 @@ def _ensure_default_socket_ifname() -> None:
     if iface:
         os.environ.setdefault("GLOO_SOCKET_IFNAME", iface)
         os.environ.setdefault("TP_SOCKET_IFNAME", iface)
-
-
 def _configure_torch_nccl_env(device: TorchDeviceLike) -> None:
     try:
         if str(getattr(device, "type", "cpu")) != "cuda":
@@ -1242,16 +1121,10 @@ def _configure_torch_nccl_env(device: TorchDeviceLike) -> None:
         default_bw = 1 if int(world) <= 1 else 0
         bw = int(env_int("STNET_TORCH_NCCL_BLOCKING_WAIT", default_bw))
         os.environ["TORCH_NCCL_BLOCKING_WAIT"] = str(int(bw))
-
-
 def _configure_torch_gloo_env(device: TorchDeviceLike) -> None:
     _ensure_default_socket_ifname()
-
-
 def _configure_torch_xccl_env(device: TorchDeviceLike) -> None:
     return
-
-
 def _configure_backend_env(backend: object, device: TorchDeviceLike) -> None:
     b = str(backend).lower() if backend is not None else ""
     if b == "nccl":
@@ -1260,8 +1133,6 @@ def _configure_backend_env(backend: object, device: TorchDeviceLike) -> None:
         _configure_torch_xccl_env(device)
     elif b == "gloo":
         _configure_torch_gloo_env(device)
-
-
 def _init_backend(device: TorchDeviceLike) -> None:
     with contextlib.suppress(Exception):
         if device.type == "cuda" and hasattr(torch.backends, "cudnn"):
@@ -1272,8 +1143,6 @@ def _init_backend(device: TorchDeviceLike) -> None:
         set_accelerator_index(device.type, int(rank) % int(n))
     else:
         _ensure_default_socket_ifname()
-
-
 def _unify_model_dtype(model: object, prefer: object | None = None) -> object:
     dtypes = set((p.dtype for p in model.parameters() if p is not None))
     if len(dtypes) <= 1:
@@ -1298,8 +1167,6 @@ def _unify_model_dtype(model: object, prefer: object | None = None) -> object:
             )
             setattr(mod, name, new_p)
     return tgt
-
-
 def _get_source_path(obj: object) -> object:
     if isinstance(obj, dict):
         if "path" in obj and "kind" in obj:
@@ -1310,8 +1177,6 @@ def _get_source_path(obj: object) -> object:
     if isinstance(obj, (list, tuple)) and obj:
         return _get_source_path(obj[0])
     raise RuntimeError("sources is empty or invalid")
-
-
 def _get_sample_size(
     model: object,
     device: TorchDeviceLike,
@@ -1503,8 +1368,6 @@ def _get_sample_size(
             os.environ["STNET_PER_SAMPLE_MEM_BYTES"] = str(int(per_sample))
     except Exception:
         return
-
-
 def _init_tensor(
     value: object,
     *args: Any,
@@ -1533,8 +1396,6 @@ def _init_tensor(
             base, dtype=desired_dtype, device=desired_device
         )
     return step_tensor
-
-
 def _init_optimizer(optim: object) -> None:
     for group in optim.param_groups:
         amsgrad = group.get("amsgrad", False)
@@ -1556,8 +1417,6 @@ def _init_optimizer(optim: object) -> None:
             if amsgrad and "max_exp_avg_sq" not in state:
                 state["max_exp_avg_sq"] = torch.zeros_like(param)
             optim.state[param] = state
-
-
 def _schedule(
     step: int,
     *args: Any,
@@ -1577,8 +1436,6 @@ def _schedule(
     return frac_min + (1.0 - frac_min) * 0.5 * (
         1.0 + math.cos(math.pi * t / max(1, main_steps))
     )
-
-
 def _init_distributed_group(
     backend: object, device: TorchDeviceLike, local_rank: int
 ) -> None:
@@ -1620,8 +1477,6 @@ def _init_distributed_group(
         except TypeError:
             kwargs.pop("timeout", None)
             torch.distributed.init_process_group(**kwargs)
-
-
 def _gpu_nvml_utils(device: TorchDeviceLike) -> object:
     if getattr(device, "type", "") != "cuda":
         return (None, None)
@@ -1713,24 +1568,18 @@ def _gpu_nvml_utils(device: TorchDeviceLike) -> object:
         with contextlib.suppress(Exception):
             mem_util = available_device_memory(torch.device("cuda", idx_i))
     return (gpu_util, mem_util)
-
-
 def _xpu_mem_util(device: TorchDeviceLike) -> object:
     if getattr(device, "type", "") != "xpu":
         return None
     with contextlib.suppress(Exception):
         return available_device_memory(device)
     return None
-
-
 def _mps_mem_util(device: TorchDeviceLike) -> object:
     if getattr(device, "type", "") != "mps":
         return None
     with contextlib.suppress(Exception):
         return available_device_memory(device)
     return None
-
-
 def _get_cpu_load() -> object:
     if psutil is None:
         return None
@@ -1738,8 +1587,6 @@ def _get_cpu_load() -> object:
         return float(psutil.cpu_percent(interval=0.0))
     except Exception:
         return None
-
-
 def _pool_tensor(
     tensor: torch.Tensor,
     *args: Any,
@@ -1786,8 +1633,6 @@ def _pool_tensor(
         if callable(is_pinned):
             pinned = bool(is_pinned())
     return out, None, pinned
-
-
 def _stream_tensor(
     tensor: object,
     *args: Any,
@@ -1906,8 +1751,6 @@ def _stream_tensor(
             with contextlib.suppress(Exception):
                 cpu_pool.release(handle)
         return out
-
-
 def _move_staged_pair_to_device(
     X_st: object,
     x_tok: TensorPagePool.Token | None,
@@ -1929,8 +1772,6 @@ def _move_staged_pair_to_device(
         Y_dev = to_device(Y_st, handle=y_tok, pinned=y_pinned)
         y_tok = None
     return X_dev, Y_dev, x_tok, y_tok
-
-
 def _pin(
     meta: object,
     raw: object,
@@ -2034,27 +1875,23 @@ def _pin(
         if y_tok is not None and cpu_pool is not None:
             with contextlib.suppress(Exception):
                 cpu_pool.release(y_tok)
-
-
 def _is_process_group(obj: object) -> bool:
-    """Best-effort check for a real ProcessGroup.
+\
+\
+\
+\
+\
 
-    Some internal STNet objects may expose a `process_group` attribute for
-    unrelated reasons (or even accidentally store a `torch.device`). Passing
-    those through to `torch.distributed.*(group=...)` can deadlock or crash.
-    """
 
     if obj is None:
         return False
     with contextlib.suppress(Exception):
-        from torch.distributed.distributed_c10d import ProcessGroup  # type: ignore
+        from torch.distributed.distributed_c10d import ProcessGroup
 
         return isinstance(obj, ProcessGroup)
     return False
-
-
 def _validate_distributed_group(meta: object, model: object) -> object:
-    """Return a ProcessGroup if we can safely infer one, else None."""
+
 
     candidates = [
         (meta, "process_group"),
@@ -2075,8 +1912,6 @@ def _validate_distributed_group(meta: object, model: object) -> object:
         if _is_process_group(pg):
             return pg
     return None
-
-
 def _get_world_size(pg: object) -> object:
     try:
         if pg is None:
@@ -2086,8 +1921,6 @@ def _get_world_size(pg: object) -> object:
         return int(torch.distributed.get_world_size(group=pg))
     except Exception:
         return max(1, int(get_world_size()))
-
-
 def _reduce_sum(t: object, pg: object) -> None:
     if pg is None or (not _is_process_group(pg)):
         torch.distributed.all_reduce(t, op=torch.distributed.ReduceOp.SUM)
@@ -2095,9 +1928,6 @@ def _reduce_sum(t: object, pg: object) -> None:
         torch.distributed.all_reduce(
             t, op=torch.distributed.ReduceOp.SUM, group=pg
         )
-
-
-@torch.no_grad()
 def _set_gate_factor(
     target_module: object,
     *args: Any,
@@ -2357,8 +2187,6 @@ def _set_gate_factor(
             float(k_high_prev),
             float(k_high_new),
         )
-
-
 def _compute_batch_bytes_per_sample(obj: object) -> tuple[int | None, int]:
     batch_dim: int | None = None
     bytes_per_sample = 0
@@ -2385,80 +2213,6 @@ def _compute_batch_bytes_per_sample(obj: object) -> tuple[int | None, int]:
     if bytes_per_sample <= 0:
         return (None, 0)
     return (batch_dim, bytes_per_sample)
-
-
-def get_loader_state(directory: PathLike) -> object:
-    return os.path.join(directory, _DL_STATE_FILE)
-
-
-def get_progress_bar(
-    *args: Any,
-    title: str,
-    total: int,
-    device: torch.device,
-    **kwargs: Any,
-) -> object:
-    try:
-        if (
-            torch.distributed.is_initialized()
-            and torch.distributed.get_rank() != 0
-        ):
-            return None
-    except Exception:
-        pass
-    if int(total) <= 0:
-        return None
-    bar = tqdm(
-        total=int(total),
-        desc=f"{title} ({device.type.upper()}) ",
-        unit="I/O < 0.01 MB/s, COM < 0.01 TFLOPS",
-        bar_format="{desc}"
-        + "{bar} {percentage:3.0f}% "
-        + "({unit}) Elapsed: {elapsed}, Remaining: {remaining}",
-        colour="green",
-        ascii=True,
-        position=0,
-        leave=False,
-        file=sys.stdout,
-    )
-    return bar
-
-
-def update_progress_bar(
-    bar: object,
-    finish: bool,
-    *args: Any,
-    mbps: float | None = None,
-    tflops: float | None = None,
-    **kwargs: Any,
-) -> None:
-    if bar is None:
-        return
-    try:
-        mbps_val = float(mbps) if mbps is not None else 0.0
-    except Exception:
-        mbps_val = 0.0
-    try:
-        tflops_val = float(tflops) if tflops is not None else 0.0
-    except Exception:
-        tflops_val = 0.0
-    io_expr = (
-        f"I/O = {mbps_val:.2f} MB/s" if mbps_val >= 0.01 else "I/O < 0.01 MB/s"
-    )
-    com_expr = (
-        f"COM = {tflops_val:.2f} TFLOPS"
-        if tflops_val >= 0.01
-        else "COM < 0.01 TFLOPS"
-    )
-    bar.unit = io_expr + ", " + com_expr
-    try:
-        inc = int(finish)
-    except Exception:
-        inc = 1
-    if inc > 0:
-        bar.update(inc)
-
-
 def _warmup_scaler_stats(
     model: object, train_loader: object, ops: object
 ) -> None:
@@ -2565,7 +2319,72 @@ def _warmup_scaler_stats(
     if y_max is not None:
         model_for_scaler.scaler.y_max.resize_(y_max.shape).copy_(y_max)
 
-
+def get_loader_state(directory: PathLike) -> object:
+    return os.path.join(directory, _DL_STATE_FILE)
+def get_progress_bar(
+    *args: Any,
+    title: str,
+    total: int,
+    device: torch.device,
+    **kwargs: Any,
+) -> object:
+    try:
+        if (
+            torch.distributed.is_initialized()
+            and torch.distributed.get_rank() != 0
+        ):
+            return None
+    except Exception:
+        pass
+    if int(total) <= 0:
+        return None
+    bar = tqdm(
+        total=int(total),
+        desc=f"{title} ({device.type.upper()}) ",
+        unit="I/O < 0.01 MB/s, COM < 0.01 TFLOPS",
+        bar_format="{desc}"
+        + "{bar} {percentage:3.0f}% "
+        + "({unit}) Elapsed: {elapsed}, Remaining: {remaining}",
+        colour="green",
+        ascii=True,
+        position=0,
+        leave=False,
+        file=sys.stdout,
+    )
+    return bar
+def update_progress_bar(
+    bar: object,
+    finish: bool,
+    *args: Any,
+    mbps: float | None = None,
+    tflops: float | None = None,
+    **kwargs: Any,
+) -> None:
+    if bar is None:
+        return
+    try:
+        mbps_val = float(mbps) if mbps is not None else 0.0
+    except Exception:
+        mbps_val = 0.0
+    try:
+        tflops_val = float(tflops) if tflops is not None else 0.0
+    except Exception:
+        tflops_val = 0.0
+    io_expr = (
+        f"I/O = {mbps_val:.2f} MB/s" if mbps_val >= 0.01 else "I/O < 0.01 MB/s"
+    )
+    com_expr = (
+        f"COM = {tflops_val:.2f} TFLOPS"
+        if tflops_val >= 0.01
+        else "COM < 0.01 TFLOPS"
+    )
+    bar.unit = io_expr + ", " + com_expr
+    try:
+        inc = int(finish)
+    except Exception:
+        inc = 1
+    if inc > 0:
+        bar.update(inc)
 def epochs(
     model: nn.Module,
     device: torch.device,
@@ -2592,9 +2411,9 @@ def epochs(
 ) -> object:
     from ..data.nodes import Sampler
 
-    # Computed in `process()` once we know whether the model was wrapped with
-    # HSDP/FSDP. When True, we did not wrap with HSDP/FSDP but we're in a
-    # multi-rank run, so we need DDP-like gradient sync semantics.
+
+
+
     ddp_fallback: bool = bool(kwargs.pop("ddp_fallback", False))
 
     if train_loader is None:
@@ -3059,14 +2878,14 @@ def epochs(
                     fn = getattr(train_loader, "set_epoch", None)
                     if callable(fn):
                         fn(int(epoch_idx))
-            # IMPORTANT:
-            # Avoid synchronizing the full module state on every epoch.
-            # This was originally a safety-net but it can devolve into a
-            # "broadcast storm" (especially with large models / HSDP-style
-            # wrapping) and can trigger host/GPU OOMs that surface as SIGKILL.
-            #
-            # If you *really* need per-epoch state sync for debugging, enable:
-            #   STNET_DIST_SYNC_EPOCH=1
+
+
+
+
+
+
+
+
             if is_distributed() and _env_flag("STNET_DIST_SYNC_EPOCH", False):
                 target_module = model.module if hasattr(model, "module") else model
                 distributed_sync(target_module, device=device)
@@ -3091,7 +2910,7 @@ def epochs(
                 lw_top_sum = None
                 lw_bottom_sum = None
                 lw_count = 0
-                # --- DIAG: ensure loader produces at least one batch (avoid silent 0-step epochs) ---
+
                 train_iter = iter(train_loader)
                 try:
                     _first_raw = next(train_iter)
@@ -3313,8 +3132,8 @@ def epochs(
                                             )
                                             ema_helper.update(ema_target)
 
-                                        # NOTE: SWA update moved to epoch-end (once per epoch) to avoid per-step
-                                        # CPU<->GPU traffic and potential broadcast / memory storms.
+
+
 
                                         target_for_step = (
                                             model.module
@@ -4046,29 +3865,29 @@ def epochs(
                 except Exception:
                     pass
 
-            # ------------------------------------------------------------
-            # Epoch-boundary SWA update + checkpoint (SWA shadow on CPU)
-            #
-            # IMPORTANT:
-            # - SWA updates/saving are intentionally **not** tied to grad-accum
-            #   or per-step sync points. Doing so can create tensor storms
-            #   (GPU->CPU copies + collectives) and can trigger SIGKILL/OOM.
-            # - Keep the boundary clear: GPU model = fwd/bwd, CPU SWA = sync/save.
-            # ------------------------------------------------------------
+
+
+
+
+
+
+
+
+
             if swa_helper is not None and epoch_idx >= swa_start_epoch and float(train_samples_epoch or 0.0) > 0.0:
                 _LOGGER.info("[swa] epoch %d: update+ckpt (CPU shadow)", epoch_idx + 1)
-                # Track the underlying module (not the DDP wrapper).
+
                 swa_target = (
                     model.module
-                    # Avoid importing DistributedDataParallel into module scope;
-                    # use fully-qualified name so this check never crashes.
+
+
                     if isinstance(model, torch.nn.parallel.DistributedDataParallel)
                     else model
                 )
                 swa_helper.update(swa_target)
 
-                # Save SWA-only checkpoint once per epoch.
-                # (Rank0-only by construction: swa_helper is created only on local_rank==0.)
+
+
                 ckpt_dir = getattr(ops, "ckpt_dir", None)
                 if ckpt_dir:
                     try:
@@ -4079,13 +3898,13 @@ def epochs(
                     ckpt_path = os.path.join(ckpt_dir, "model.pt")
                     tmp_path = ckpt_path + ".tmp"
 
-                    # IMPORTANT:
-                    # Avoid calling `state_dict()` here. On some distributed wrappers
-                    # (e.g. sharded/FSDP-like modules) that can trigger gather/unshard
-                    # behavior and blow up host RAM.
-                    #
-                    # Instead, build a checkpoint mapping directly from the SWA shadow
-                    # (CPU, averaged) + small buffers.
+
+
+
+
+
+
+
                     model_sd = swa_helper.checkpoint_state_dict(
                         swa_target,
                         include_buffers=True,
@@ -4094,9 +3913,9 @@ def epochs(
 
                     _coerce_dcp_keys(model_sd)
 
-                    # IMPORTANT: stnet.api.train() expects `model.pt` to contain a raw
-                    # state_dict (mapping param_name -> Tensor). Keep any extra metadata
-                    # in a separate json file so load_state_dict stays safe.
+
+
+
                     print(
                         f"[SWA] epoch {int(epoch_idx + 1)}: saving checkpoint -> {ckpt_path}",
                         flush=True,
@@ -4108,7 +3927,7 @@ def epochs(
                         f"[SWA] epoch {int(epoch_idx + 1)}: checkpoint saved",
                         flush=True,
                     )
-                    # Drop the large python dict ASAP to stabilize host RAM for post-train work.
+
                     try:
                         del model_sd
                     except Exception:
@@ -4116,8 +3935,8 @@ def epochs(
                     with contextlib.suppress(Exception):
                         import gc
                         gc.collect()
-            # Ensure all ranks finish epoch-boundary SWA work before starting the next epoch.
-            # barrier() blocks the CPU thread until completion when using NCCL.  (See PyTorch docs.)
+
+
             if is_distributed():
                 distributed_barrier(device)
             prev_comp_time += float(comp_time)
@@ -4127,17 +3946,17 @@ def epochs(
             prev_samples += float(train_samples_epoch)
     model_for_scaler = model.module if hasattr(model, "module") else model
     scaler_y_device = model_for_scaler.scaler.y_mean.device
-    # Accumulate in float64 for numerical stability, but avoid materializing
-    # full-batch float64 tensors (important for large outputs / tight host RAM).
+
+
     with torch.inference_mode():
         sum_x = None
         sum_y = None
         sum_x2 = None
         sum_xy = None
         total_n = 0
-        # Bound temporary buffers during affine calibration.
-        # (Guardrail against end-of-train SIGKILL/OOM when SWA shadow is large.)
-        target_chunk_bytes = 16 * 1024 * 1024  # 16 MiB
+
+
+        target_chunk_bytes = 16 * 1024 * 1024
         for batch in train_loader:
             x_b, y_b = collate.get_row(batch, labels_required=True)
             x_raw = x_b.to(device)
@@ -4166,8 +3985,8 @@ def epochs(
                 else z_pred.view(-1, 1)
             )
 
-            # Keep targets in the model's 'z' space (normalized y) on the same device,
-            # but do NOT upcast the full batch to float64.
+
+
             z_true = model_for_scaler.scaler.normalize_y(y_flat.detach())
             if z_true.device != scaler_y_device:
                 z_true = z_true.to(device=scaler_y_device)
@@ -4177,7 +3996,7 @@ def epochs(
                 else z_true.view(-1, 1)
             )
 
-            # Reconcile feature dims (generic fallback).
+
             if z_pred.shape[-1] != z_true.shape[-1]:
                 f_pred = z_pred.shape[-1]
                 f_true = z_true.shape[-1]
@@ -4209,7 +4028,7 @@ def epochs(
                 sum_x2 = torch.zeros((feat,), device=scaler_y_device, dtype=torch.float64)
                 sum_xy = torch.zeros((feat,), device=scaler_y_device, dtype=torch.float64)
 
-            # Choose a feature-chunk size so that (batch*chunk) temporary buffers stay bounded.
+
             denom = max(1, n_batch * int(z_pred.element_size()))
             chunk_f = max(1, int(target_chunk_bytes // denom))
             chunk_f = min(chunk_f, feat)
@@ -4370,7 +4189,7 @@ def epochs(
                     max(1, get_world_size(device)) if is_distributed() else 1
                 )
                 hist.end_session(end_sec, peers=world)
-                # Persist history for the parent process (api.py reads ckpt_dir/history.json)
+
                 try:
                     if ops.ckpt_dir and (not is_distributed() or int(torch.distributed.get_rank()) == 0):
                         hist_path = os.path.join(str(ops.ckpt_dir), 'history.json')
@@ -4381,8 +4200,6 @@ def epochs(
                 pass
     except Exception:
         pass
-
-
 def infer(
     model: object,
     device: TorchDeviceLike,
@@ -4680,7 +4497,7 @@ def infer(
 
             row_ids_buf = None
             pad_buf = None
-            # --- DIAG: infer loader sanity + counters (helps pinpoint 0-row / no-part failures) ---
+
             dl_type = type(data_loader).__name__
             dl_len = None
             with contextlib.suppress(Exception):
@@ -5027,21 +4844,12 @@ def infer(
             with contextlib.suppress(Exception):
                 distributed_barrier(device)
     return None
-
-
-@overload
 def process(
     ops: RuntimeConfig, ret_sink: ReturnSink | None = None
 ) -> object: ...
-
-
-@overload
 def process(
     local_rank: int, ops: RuntimeConfig, ret_sink: ReturnSink | None = None
 ) -> object: ...
-
-
-@worker_main()
 def process(*args: Any, **kwargs: Any) -> object:
     from ..data.pipeline import Session
 
@@ -5250,7 +5058,7 @@ def process(*args: Any, **kwargs: Any) -> object:
         _validate_no_meta_tensors(_m_pre)
         _validate_no_fake_dtensor(_m_pre)
 
-        # Central distribution policy (HSDP/DDP selection + collectives)
+
         dist_policy = DistributedPolicy.from_env()
         hsdp_wrapped = False
 
@@ -5495,9 +5303,9 @@ def process(*args: Any, **kwargs: Any) -> object:
             swa_helper = None
             swa_start_epoch = int(total_epochs)
 
-            # SWA vs EMA policy
-            # - If the model has BatchNorm, prefer EMA (SWA would typically require BN-stat recomputation).
-            # - Otherwise, prefer SWA (the final checkpoint is SWA-only).
+
+
+
             try:
                 has_bn = any(
                     isinstance(m, nn.modules.batchnorm._BatchNorm)
@@ -5508,13 +5316,13 @@ def process(*args: Any, **kwargs: Any) -> object:
 
             use_swa = not has_bn
 
-            # IMPORTANT: Only node-local rank0 maintains the averaged (SWA/EMA) shadow model.
-            # Other local ranks would otherwise keep N identical CPU copies and easily OOM.
+
+
             if local_rank == 0:
                 if use_swa:
-                    # NOTE: SWA acts as the *shadow/sync/save* model (typically on CPU).
-                    # Default to starting immediately (epoch 0) to keep epoch-level checkpoints simple.
-                    # Users can override via STNET_SWA_START_EPOCH.
+
+
+
                     swa_start_epoch = 0
                     _swa_env = os.environ.get('STNET_SWA_START_EPOCH')
                     if _swa_env is not None and str(_swa_env).strip() != "":
@@ -5570,11 +5378,11 @@ def process(*args: Any, **kwargs: Any) -> object:
             if session is not None:
                 session.close()
         if local_rank == 0:
-            # NOTE: We intentionally checkpoint ONLY the averaged model (SWA preferred, else EMA, else raw).
-            # Rationale: saving both the train-time model + averaged model + optimizer can explode memory/IO
-            # and has been a frequent source of SIGKILL / kernel resets in notebook + network FS setups.
 
-            # 2) Pick the checkpoint source: SWA > EMA > raw model.
+
+
+
+
             avg_tag = None
             avg_helper = None
             if swa_helper is not None and getattr(swa_helper, "n_averaged", 0) > 0:
@@ -5584,17 +5392,17 @@ def process(*args: Any, **kwargs: Any) -> object:
                 avg_tag = "ema"
                 avg_helper = ema_helper
 
-            # 3) Always save as model.pt for API compatibility.
-            #    (The parent process expects model.pt and loads it after elastic launch.)
-            #    If an epoch-level SWA checkpoint already wrote model.pt, skip the final
-            #    re-materialization/copy to avoid host-memory spikes at teardown.
+
+
+
+
             if ops.ckpt_dir:
                 ckpt_path = os.path.join(ops.ckpt_dir, "model.pt")
-                # If SWA saved per-epoch (including the last epoch), model.pt already exists.
-                # Only build+save a CPU state_dict here if nothing wrote it yet (e.g. EMA-only).
+
+
                 if not os.path.isfile(ckpt_path):
-                    # Build a CPU state_dict without calling `state_dict()` on the (possibly sharded)
-                    # wrapper. Prefer averaged CPU shadow weights when available.
+
+
                     src_mod = tracked_module if tracked_module is not None else model
                     shadow = getattr(avg_helper, "shadow", None) if avg_helper is not None else None
 
@@ -5619,7 +5427,7 @@ def process(*args: Any, **kwargs: Any) -> object:
                                     tv = tv.to("cpu")
                                 model_sd[k] = tv
 
-                        # Buffers are typically small; keep a conservative cap.
+
                         max_bytes = 25 * 1024 * 1024
                         if src_mod is not None:
                             for k, b in src_mod.named_buffers(recurse=True):
@@ -5639,13 +5447,13 @@ def process(*args: Any, **kwargs: Any) -> object:
 
                     _coerce_dcp_keys(model_sd)
                     torch.save(model_sd, ckpt_path)
-                    # Drop the large python dict ASAP to keep host RAM stable.
+
                     try:
                         del model_sd
                     except Exception:
                         pass
-            
-        # Release SWA mmap-backed shadow as early as possible to keep host RAM stable.
+
+
         with contextlib.suppress(Exception):
             if swa_helper is not None and hasattr(swa_helper, 'close'):
                 swa_helper.close()
@@ -5844,5 +5652,19 @@ def process(*args: Any, **kwargs: Any) -> object:
         return None
     raise ValueError(f"unsupported ops mode: {ops.mode}")
 
-
+try:
+    import psutil
+except Exception:
+    psutil = None
+try:
+    from torch.distributed._composable.fsdp import MixedPrecisionPolicy
+except Exception:
+    try:
+        from torch.distributed.fsdp import MixedPrecisionPolicy
+    except Exception:
+        MixedPrecisionPolicy = None
+try:
+    from tensordict.nn import CudaGraphModule as TD_CudaGraphModule
+except Exception:
+    TD_CudaGraphModule = None
 compile_distributed_safe()

@@ -1,28 +1,26 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
+import collections
+import concurrent.futures as futures
 import contextlib
 import ctypes
-import importlib
 import hashlib
+import importlib
 import itertools
-import sys
-import concurrent.futures as futures
-import traceback
+import logging
 import math
 import os
-import re
-import collections
-import logging
 import queue
+import re
+import sys
 import tempfile
 import threading
 import time
+import traceback
 from collections.abc import Iterator, Sequence
-from dataclasses import dataclass
-from functools import lru_cache
 from types import ModuleType
-from typing import Any, Callable, Optional, Protocol, Tuple, runtime_checkable
+from typing import Any, Callable, Optional, Protocol, Tuple
 
 import torch
 
@@ -42,9 +40,12 @@ from .system import (
     _optimal_threads,
 )
 
-
-_EXECUTOR_ORDINAL = itertools.count(0)
-_EXECUTOR_ORDINAL_LOCK = threading.Lock()
+_ENV_INNER_BOOL_VARS: dict[str, str] = {
+    "OMP_DYNAMIC": "FALSE",
+    "MKL_DYNAMIC": "FALSE",
+    "KMP_BLOCKTIME": "0",
+    "OMP_PROC_BIND": "TRUE",
+}
 _ENV_INNER_THREAD_VARS: tuple[str, ...] = (
     "OMP_NUM_THREADS",
     "MKL_NUM_THREADS",
@@ -53,13 +54,10 @@ _ENV_INNER_THREAD_VARS: tuple[str, ...] = (
     "VECLIB_MAXIMUM_THREADS",
     "NUMEXPR_NUM_THREADS",
 )
-_ENV_INNER_BOOL_VARS: dict[str, str] = {
-    "OMP_DYNAMIC": "FALSE",
-    "MKL_DYNAMIC": "FALSE",
-    "KMP_BLOCKTIME": "0",
-    "OMP_PROC_BIND": "TRUE",
-}
-
+_EXECUTOR_ORDINAL = itertools.count(0)
+_EXECUTOR_ORDINAL_LOCK = threading.Lock()
+_TLB_SINGLETON: Optional["Thread"] = None
+_TLB_SINGLETON_LOCK = Mutex()
 
 def _flatten_args(items: Sequence[Any]) -> Iterator[Any]:
     for item in items:
@@ -69,8 +67,6 @@ def _flatten_args(items: Sequence[Any]) -> Iterator[Any]:
             yield from _flatten_args(list(item))
         else:
             yield item
-
-
 def _get_throttle_state() -> str:
     s = (
         str(
@@ -92,9 +88,6 @@ def _get_throttle_state() -> str:
         if s in {"sync", "synchronous"}
         else ("raise" if s in {"raise", "error"} else "block")
     )
-
-
-@lru_cache(maxsize=1)
 def _get_throttle_timeout() -> float:
     return max(
         0.0,
@@ -109,9 +102,6 @@ def _get_throttle_timeout() -> float:
             or 0.05
         ),
     )
-
-
-@lru_cache(maxsize=1)
 def _is_early_release_enabled() -> bool:
     return bool(
         env_flag(
@@ -120,27 +110,16 @@ def _is_early_release_enabled() -> bool:
             default=True,
         )
     )
-
-
-@lru_cache(maxsize=1)
 def _is_force_unpin_enabled() -> bool:
     return bool(
         env_flag("STNET_CACHE_FORCE_UNPIN", "STNET_CACHE_UNPIN", default=False)
     )
-
-
 def _prod_int(shape: Sequence[int]) -> int:
     return int(max(1, math.prod(int(s) for s in shape)))
-
-
-@lru_cache(maxsize=1)
 def _is_affinity_enabled() -> bool:
     return bool(
         env_flag("STNET_EXECUTOR_AFFINITY", "STNET_AFFINITY", default=True)
     )
-
-
-@lru_cache(maxsize=1)
 def _is_affinity_strict() -> bool:
     return bool(
         env_flag(
@@ -149,15 +128,11 @@ def _is_affinity_strict() -> bool:
             default=False,
         )
     )
-
-
 def _next_ordinal() -> int:
     with _EXECUTOR_ORDINAL_LOCK:
         with contextlib.suppress(Exception):
             return int(next(_EXECUTOR_ORDINAL))
     return 0
-
-
 def _is_inner_thread_limited(wl: str) -> bool:
     wl = str(wl or "").strip().lower()
     if wl not in {"cpu", "compute"}:
@@ -169,8 +144,6 @@ def _is_inner_thread_limited(wl: str) -> bool:
     ):
         return False
     return True
-
-
 def _set_concurrency_env(
     key: str, value: str, *args: Any, force: bool, cap_down: bool = True
 ) -> None:
@@ -195,8 +168,6 @@ def _set_concurrency_env(
             os.environ[k] = str(max(1, tgt_i))
     except Exception:
         return
-
-
 def _init_env(key: str, value: str, *args: Any, force: bool) -> None:
     try:
         if (
@@ -207,8 +178,6 @@ def _init_env(key: str, value: str, *args: Any, force: bool) -> None:
             os.environ[str(key)] = str(value)
     except Exception:
         return
-
-
 def _limit_inner_threads(threads: int, *args: Any, force: bool = False) -> int:
     t = max(1, int(threads))
     ov = env_first_int(("STNET_EXECUTOR_INNER_THREADS",), default=0) or 0
@@ -229,16 +198,10 @@ def _limit_inner_threads(threads: int, *args: Any, force: bool = False) -> int:
     with contextlib.suppress(Exception):
         torch.set_num_interop_threads(1)
     return int(t)
-
-
-@lru_cache(maxsize=1)
 def _is_outer_concurrency_limited() -> bool:
     return bool(
         env_flag("STNET_EXECUTOR_LIMIT_OUTER_CONCURRENCY", default=True)
     )
-
-
-@lru_cache(maxsize=1)
 def _max_outer_concurrency() -> int:
     return int(
         env_first_int(
@@ -247,9 +210,6 @@ def _max_outer_concurrency() -> int:
         )
         or 0
     )
-
-
-@lru_cache(maxsize=1)
 def _outer_concurrency_mode() -> str:
     s = (
         str(
@@ -262,21 +222,13 @@ def _outer_concurrency_mode() -> str:
         .lower()
     )
     return s if s in {"auto", "logical", "physical"} else "auto"
-
-
-@lru_cache(maxsize=1)
 def _are_processes_limited() -> bool:
     return bool(env_flag("STNET_EXECUTOR_CAP_PROCESS_WORKERS", default=True))
-
-
-@lru_cache(maxsize=1)
 def _target_process_workers() -> int:
     return int(
         env_first_int(("STNET_EXECUTOR_PROCESS_TARGET_WORKERS",), default=0)
         or 0
     )
-
-
 def _outer_concurrency_limit(
     wl: str, executor_kind: str, nlogical: int, nphysical: int, mw: int
 ) -> int:
@@ -302,8 +254,6 @@ def _outer_concurrency_limit(
     else:
         base = nphy if wl == "compute" else nlog
     return max(1, min(int(mw), int(base)))
-
-
 def _parse_cpu_list(spec: str) -> list[int]:
     out: list[int] = []
     s = str(spec or "").strip()
@@ -323,9 +273,6 @@ def _parse_cpu_list(spec: str) -> list[int]:
             with contextlib.suppress(Exception):
                 out.append(int(part))
     return out
-
-
-@lru_cache(maxsize=8)
 def _linux_thread_sibling_groups(
     cpus_key: tuple[int, ...],
 ) -> list[tuple[int, ...]]:
@@ -344,8 +291,6 @@ def _linux_thread_sibling_groups(
             continue
         groups[tuple(sibs)] = None
     return sorted(groups.keys(), key=lambda g: (g[0], len(g), g))
-
-
 def _executor_scatter_cpus(cpus: Sequence[int]) -> list[int]:
     base = sorted({int(x) for x in (cpus or [])})
     if not base:
@@ -364,8 +309,6 @@ def _executor_scatter_cpus(cpus: Sequence[int]) -> list[int]:
         c for c in secondary if c in allowed
     ]
     return out if out else base
-
-
 def _executor_prefer_smt_lane(
     cpus: Sequence[int], *args: Any, prefer_primary: bool
 ) -> list[int]:
@@ -386,23 +329,17 @@ def _executor_prefer_smt_lane(
     sec = [c for c in secondary if c in allowed]
     out = (prim + sec) if prefer_primary else (sec + prim)
     return out if out else base
-
-
 def _executor_allowed_cpus() -> list[int]:
     with contextlib.suppress(Exception):
         return sorted({int(x) for x in CPU.allowed()})
     with contextlib.suppress(Exception):
         return sorted({int(x) for x in os.sched_getaffinity(0)})
     return []
-
-
 def _hash32(s: str) -> int:
     with contextlib.suppress(Exception):
         b = hashlib.md5(s.encode("utf-8", errors="ignore")).digest()
         return int.from_bytes(b[:4], byteorder="little", signed=False)
     return 0
-
-
 def _pick_coprime_stride(n: int, hint: int, salt: int) -> int:
     n = max(1, int(n))
     if n == 1:
@@ -414,8 +351,6 @@ def _pick_coprime_stride(n: int, hint: int, salt: int) -> int:
         if math.gcd(int(k), int(n)) == 1:
             return int(k)
     return 1
-
-
 def _executor_scope_start(
     role: str, wl: str, prefix: str, mw: int, cpw: int, ordinal: int, ncpu: int
 ) -> int:
@@ -425,8 +360,6 @@ def _executor_scope_start(
     key = f"{seed}|pid={os.getpid()}|role={role}|wl={wl}|pfx={prefix}|mw={mw}|cpw={cpw}|ord={ordinal}"
     h = _hash32(key)
     return int(h % max(1, int(ncpu)))
-
-
 def _pick_cores_balanced(
     cpus: Sequence[int],
     start: int,
@@ -456,8 +389,6 @@ def _pick_cores_balanced(
             out.append(c)
             seen.add(c)
     return out or [int(base[base_pos])]
-
-
 def _thread_worker_index(max_workers: int) -> int:
     try:
         nm = str(threading.current_thread().name or "")
@@ -471,8 +402,6 @@ def _thread_worker_index(max_workers: int) -> int:
         nid = int(threading.get_native_id())
         return int(nid) % max(1, int(max_workers))
     return 0
-
-
 def _process_worker_index(max_workers: int) -> int:
     with contextlib.suppress(Exception):
         import multiprocessing as _mp
@@ -483,8 +412,6 @@ def _process_worker_index(max_workers: int) -> int:
     with contextlib.suppress(Exception):
         return int(os.getpid()) % max(1, int(max_workers))
     return 0
-
-
 def _set_current_thread_affinity(cores: Sequence[int]) -> None:
     if not cores:
         return
@@ -494,8 +421,6 @@ def _set_current_thread_affinity(cores: Sequence[int]) -> None:
             if tid > 0:
                 os.sched_setaffinity(tid, {int(c) for c in cores})
     return
-
-
 def _set_current_process_affinity(cores: Sequence[int]) -> None:
     if not cores:
         return
@@ -503,8 +428,6 @@ def _set_current_process_affinity(cores: Sequence[int]) -> None:
         with contextlib.suppress(Exception):
             os.sched_setaffinity(0, {int(c) for c in cores})
     return
-
-
 def _executor_thread_initializer(
     role: str,
     wl: str,
@@ -528,8 +451,6 @@ def _executor_thread_initializer(
     with contextlib.suppress(Exception):
         tlb = new_affinity()
         tlb._tls.pinned = True
-
-
 def _executor_process_initializer(
     wl: str,
     cpus: Sequence[int],
@@ -555,14 +476,11 @@ def _executor_process_initializer(
         tlb = new_affinity()
         tlb._tls.pinned = True
 
-
 def is_free_threading_build() -> bool:
     with contextlib.suppress(Exception):
         return bool(CPU.is_free_threaded_build())
     tag = getattr(getattr(sys, "implementation", None), "cache_tag", "") or ""
     return bool(isinstance(tag, str) and tag.endswith("t"))
-
-
 def is_gil_enabled() -> bool:
     with contextlib.suppress(Exception):
         return bool(CPU.is_gil_enabled())
@@ -571,17 +489,11 @@ def is_gil_enabled() -> bool:
         with contextlib.suppress(Exception):
             return bool(fn())
     return True
-
-
 def python_build_tag() -> str:
     major, minor = sys.version_info[:2]
     return f"{major}.{minor}{'t' if is_free_threading_build() else ''}"
-
-
 def is_interpreter_pool_supported() -> bool:
     return getattr(futures, "InterpreterPoolExecutor", None) is not None
-
-
 def new_prefetcher(
     iterable: Any,
     *args: Any,
@@ -592,8 +504,6 @@ def new_prefetcher(
     return Prefetcher(
         iterable, max_batches=max_batches, name=name, daemon=daemon
     )
-
-
 def new_executor(
     max_workers: int,
     *args: Any,
@@ -839,8 +749,6 @@ def new_executor(
         )
     except TypeError:
         return futures.ProcessPoolExecutor(max_workers=int(mw_eff))
-
-
 def new_affinity(io_workers: Optional[int] = None) -> "Thread":
     global _TLB_SINGLETON
     if _TLB_SINGLETON is None:
@@ -855,14 +763,10 @@ def new_affinity(io_workers: Optional[int] = None) -> "Thread":
     elif io_workers is not None:
         _TLB_SINGLETON.tune(io_workers=int(io_workers))
     return _TLB_SINGLETON
-
-
 def new_thread(
     fn: Callable[[Any], Any], *args: Any, io_workers: Optional[int] = None
 ) -> Callable[[Any], Any]:
     return new_affinity(io_workers=io_workers).new_thread(fn)
-
-
 def close(obj: Any, *args: Any, join_timeout: float | None = 1.0) -> None:
     for name in (
         "cleanup",
@@ -885,28 +789,15 @@ def close(obj: Any, *args: Any, join_timeout: float | None = 1.0) -> None:
     with contextlib.suppress(Exception):
         obj() if callable(obj) else None
 
-
 class _QueryEvent(Protocol):
     def query(self) -> bool: ...
-
-
-@runtime_checkable
 class _SyncEvent(Protocol):
     def synchronize(self) -> Any: ...
-
-
-@runtime_checkable
 class _WaitEvent(Protocol):
     def wait(self, timeout: float | None = None) -> Any: ...
-
-
-@dataclass(slots=True)
 class _PoolToken:
     i: int
     g: int
-
-
-@dataclass(slots=True)
 class _PoolEntry:
     page: TensorPage
     busy: bool = False
@@ -914,13 +805,9 @@ class _PoolEntry:
     fence_evt: object | None = None
     gen: int = 0
 
-
-@dataclass(slots=True)
 class ProducerError:
     exc: BaseException
     tb: str
-
-
 class Affinity:
     __slots__ = (
         "_parent",
@@ -992,8 +879,6 @@ class Affinity:
             except Exception:
                 pass
         return out
-
-
 class Disposable:
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         self._keep: list[Any] = list(_flatten_args(list(args)))
@@ -1014,8 +899,6 @@ class Disposable:
 
     def __iter__(self) -> Iterator[Any]:
         return iter(self._keep)
-
-
 class Prefetcher:
     __slots__ = (
         "_src",
@@ -1072,19 +955,19 @@ class Prefetcher:
         return self._iter_session()
 
     def __getattr__(self, name: str) -> Any:
-        """Proxy unknown attributes to the underlying iterable.
+\
+\
+\
+\
 
-        This avoids wrappers hiding hooks like sampler/set_epoch that the training
-        loop may probe for.
-        """
         return getattr(self._src, name)
 
     def _producer_loop(self, src: Any, buf: "BufferQueue", sentinel: object) -> None:
         it: Iterator[Any] | None = None
         try:
-            # Create the iterator in the producer thread. Some iterables (especially
-            # those that manage worker pools) can behave poorly if iter() happens in
-            # a different thread than next().
+
+
+
             it = iter(src)
             while not buf.is_stopped():
                 if not buf.block(timeout=None):
@@ -1111,7 +994,7 @@ class Prefetcher:
         buf = BufferQueue(max_batches=int(self._max_batches))
         sentinel = object()
         ex = new_executor(1, workload="io", name=f"{self._name}-producer")
-        # IMPORTANT: pass the iterable itself so iter() happens in the producer.
+
         fut = ex.submit(self._producer_loop, self._src, buf, sentinel)
         try:
             while True:
@@ -1142,9 +1025,6 @@ class Prefetcher:
                     ex.shutdown(wait=False, cancel_futures=True)
                 except TypeError:
                     ex.shutdown(wait=False)
-
-
-
 class TensorPage:
     __slots__ = ("_buf", "_numel", "_dtype", "_pinned")
 
@@ -1193,8 +1073,6 @@ class TensorPage:
         need = _prod_int(shape)
         self.ensure(need)
         return self._buf[:need].view(*shape)
-
-
 class TensorPagePool:
     Token = _PoolToken
     _Entry = _PoolEntry
@@ -1410,8 +1288,6 @@ class TensorPagePool:
         with self._cv:
             if self._scavenge_lock():
                 self._cv.notify_all()
-
-
 class TensorSpooler:
     def __init__(self, root: str, max_queue: int = 8) -> None:
         self._root = os.fspath(root)
@@ -1632,8 +1508,6 @@ class TensorSpooler:
 
     def had_error(self) -> bool:
         return bool(self._err_event.is_set())
-
-
 class BufferQueue:
     def __init__(self, max_batches: int) -> None:
         self.max_batches = max(1, int(max_batches))
@@ -1741,8 +1615,6 @@ class BufferQueue:
 
     def is_stopped(self) -> bool:
         return bool(self._stop.is_set())
-
-
 class Thread:
     def __init__(
         self,
@@ -2074,8 +1946,6 @@ class Thread:
         tuned = max(1, min(int(io_workers), cpus))
         self._io_workers = tuned
         return tuned
-
-
 class Mutex:
     __slots__ = ("_lock", "_acquire", "_release", "_locked_fn")
 
@@ -2112,8 +1982,6 @@ class Mutex:
 
     def __exit__(self, exc_type, exc, tb) -> None:
         self.release()
-
-
 class BoundedExecutor(futures.Executor):
     def __init__(self, inner: futures.Executor, limit: int) -> None:
         self._inner = inner
@@ -2194,7 +2062,3 @@ class BoundedExecutor(futures.Executor):
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self._inner, name)
-
-
-_TLB_SINGLETON: Optional["Thread"] = None
-_TLB_SINGLETON_LOCK = Mutex()

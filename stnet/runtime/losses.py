@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import contextlib
 import math
-from dataclasses import dataclass
 from typing import Any, List, Optional, Sequence, Tuple, Union
 
 import torch
@@ -14,10 +13,8 @@ from torch.nn import functional as F
 from ..core.graph import is_compiling
 from ..core.tensor import to_tensor_like
 
-
 Number = Union[float, int]
 TensorLike = Union[Number, torch.Tensor]
-
 
 def _canonize_dims(
     x: torch.Tensor, dims: Any, keep_batch: bool = False
@@ -31,14 +28,10 @@ def _canonize_dims(
         sorted(d for d in pos if 0 <= d < nd and (keep_batch or d != 0))
     )
     return out or ((1,) if nd > 1 else (0,))
-
-
 def _median_over_dims(x: torch.Tensor, dims: Tuple[int, ...]) -> torch.Tensor:
     for d in _canonize_dims(x, dims):
         x = x.median(dim=d, keepdim=True).values
     return x
-
-
 def _mad_std(
     x: torch.Tensor, dims: Tuple[int, ...], eps: float
 ) -> torch.Tensor:
@@ -47,12 +40,8 @@ def _mad_std(
         * 1.482602218505602,
         min=float(eps),
     )
-
-
 def _master_float_dtype(x: torch.Tensor) -> torch.dtype:
     return torch.float64 if x.dtype == torch.float64 else torch.float32
-
-
 def _coerce_std(
     x: torch.Tensor, dim: Tuple[int, ...] | int | None, ddof: int, eps: float
 ) -> torch.Tensor:
@@ -90,20 +79,12 @@ def _coerce_std(
             else 1.0
         )
     return torch.sqrt(var.clamp(min=float(eps) ** 2)).clamp(min=float(eps))
-
-
 def _to_tuple(x: Any) -> Tuple[int, ...]:
     return tuple(int(v) for v in x)
-
-
 def _normal_cdf(x: torch.Tensor) -> torch.Tensor:
     return 0.5 * (1.0 + torch.erf(x / math.sqrt(2.0)))
-
-
 def _normal_pdf(x: torch.Tensor) -> torch.Tensor:
     return torch.exp(-0.5 * x * x) / math.sqrt(2.0 * math.pi)
-
-
 def _students_t_cdf(
     x: torch.Tensor, df: torch.Tensor, loc: torch.Tensor, scale: torch.Tensor
 ) -> torch.Tensor:
@@ -119,8 +100,6 @@ def _students_t_cdf(
     v_clamped = torch.clamp(v, min=3.0)
     z = t * torch.sqrt((v_clamped - 2.0) / v_clamped)
     return _normal_cdf(z)
-
-
 def _fft_nd(
     x: torch.Tensor,
     shape: Sequence[int],
@@ -143,8 +122,6 @@ def _fft_nd(
         if real_input
         else torch.fft.ifftn(x, s=s, dim=d, norm=norm)
     )
-
-
 def _nufft_nd(
     x_cplx: torch.Tensor,
     omega: torch.Tensor,
@@ -206,7 +183,6 @@ def _nufft_nd(
         ]
     )
 
-
 def expand_to_pred(
     mask: torch.Tensor, prediction: torch.Tensor
 ) -> torch.Tensor:
@@ -218,7 +194,6 @@ def expand_to_pred(
         raise ValueError(
             f"Mask shape {mask.shape} cannot be broadcast to prediction shape {prediction.shape}"
         ) from e
-
 
 class MultipleQuantileLoss(nn.Module):
     def __init__(
@@ -282,8 +257,6 @@ class MultipleQuantileLoss(nn.Module):
             else losses.sum(dim=tuple(range(1, losses.ndim)))
         )
         return (per_q * self.w).sum()
-
-
 class CRPSLoss(nn.Module):
     def __init__(
         self,
@@ -575,8 +548,6 @@ class CRPSLoss(nn.Module):
             if self.mode == "normal"
             else self._crps_energy(pred, target)
         )
-
-
 class DistributionLoss(nn.Module):
     def __init__(
         self,
@@ -780,8 +751,6 @@ class DistributionLoss(nn.Module):
                 self._compute_margin(stat_abs, pred, target, mu, std)
             )
         )
-
-
 class StandardNormalLoss(DistributionLoss):
     def __init__(
         self,
@@ -893,8 +862,6 @@ class StandardNormalLoss(DistributionLoss):
             alpha = max(1.0 - self.confidence, self.eps)
             return -torch.log(torch.clamp(p, min=self.eps)) + math.log(alpha)
         raise ValueError("Invalid metric")
-
-
 class StudentsTLoss(DistributionLoss):
     def __init__(
         self,
@@ -1058,8 +1025,6 @@ class StudentsTLoss(DistributionLoss):
             alpha = max(1.0 - self.confidence, self.eps)
             return -torch.log(torch.clamp(p, min=self.eps)) + math.log(alpha)
         raise ValueError("Invalid metric")
-
-
 class DataFidelityLoss(nn.Module):
     def __init__(
         self,
@@ -1162,8 +1127,6 @@ class DataFidelityLoss(nn.Module):
         else:
             raise ValueError(f"Invalid mode {self.mode}")
         return self._mse(Xk, Yk)
-
-
 class LinearCombinationLoss(nn.Module):
     def __init__(
         self,
@@ -1256,8 +1219,6 @@ class LinearCombinationLoss(nn.Module):
             total = total + w * v_eff
         self._update_coefficients(per_loss_vals)
         return total
-
-
 class TiledLoss(nn.Module):
     def __init__(
         self,
@@ -1432,9 +1393,6 @@ class TiledLoss(nn.Module):
             if self.reduction == "sum"
             else total_sum / float(max(total_count, 1))
         )
-
-
-@dataclass
 class LossWeightController:
     momentum: float = 0.95
     min_weight: float = 1e-6

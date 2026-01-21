@@ -3,18 +3,18 @@ from __future__ import annotations
 
 import math
 import os
-from dataclasses import dataclass, field, fields
+from dataclasses import field, fields
 from typing import (
     TYPE_CHECKING,
     Any,
     ClassVar,
     Dict,
     List,
-    Mapping,
-    Set,
     Literal,
+    Mapping,
     Optional,
     Sequence,
+    Set,
     Tuple,
     Union,
 )
@@ -23,14 +23,7 @@ import torch
 
 from .core.graph import canonicalize_compile_mode
 
-if TYPE_CHECKING:
-    from .data.pipeline import Source
-else:
-    Source = Dict[str, Any]
-
-
 OpsMode = Literal["train", "predict", "infer"]
-
 
 def _to_dict(value: Any) -> Optional[Dict[Any, Any] | List[Any] | Set[Any]]:
     if isinstance(value, dict):
@@ -38,16 +31,8 @@ def _to_dict(value: Any) -> Optional[Dict[Any, Any] | List[Any] | Set[Any]]:
     if isinstance(value, (list, set)):
         return type(value)(value)
     return value
-
-
 def _to_dict_strict(obj: Any) -> Dict[Any, Any]:
     return {f.name: getattr(obj, f.name) for f in fields(obj.__class__)}
-
-
-def _to_frozenset(cls: type) -> frozenset[str]:
-    return frozenset(f.name for f in fields(cls))
-
-
 def _coerce_str(
     value: Any,
     name: str,
@@ -61,8 +46,6 @@ def _coerce_str(
         else str(value) if value is not None else ""
     )
     return (s.lower() if lower else s) or default
-
-
 def _coerce_bool(value: Any, *args: Any, name: str, **kwargs: Any) -> bool:
     if isinstance(value, bool):
         return value
@@ -74,8 +57,6 @@ def _coerce_bool(value: Any, *args: Any, name: str, **kwargs: Any) -> bool:
     if s in ("false", "0", "no", "n", "off", "f"):
         return False
     raise TypeError(f"{name} invalid bool")
-
-
 def _coerce_num(
     val: Any,
     type_: type,
@@ -97,8 +78,6 @@ def _coerce_num(
     if max is not None and v > max:
         raise ValueError(f"{name} > {max}")
     return v
-
-
 def _coerce_int(
     value: Any,
     *args: Any,
@@ -108,8 +87,6 @@ def _coerce_int(
     **kwargs: Any,
 ) -> int:
     return _coerce_num(value, int, name, minimum, maximum)
-
-
 def _coerce_float(
     value: Any,
     *args: Any,
@@ -120,8 +97,6 @@ def _coerce_float(
     **kwargs: Any,
 ) -> float:
     return _coerce_num(value, float, name, minimum, maximum, finite)
-
-
 def _coerce_int_tuple(
     value: Any,
     *args: Any,
@@ -145,8 +120,6 @@ def _coerce_int_tuple(
             )
         return tuple(_coerce_num(v, int, name, min=1) for v in value)
     raise TypeError(f"{name} must be an int or sequence of {dims} integers")
-
-
 def _coerce_int_sequence(
     xs: Sequence[Any],
     *args: Any,
@@ -157,8 +130,6 @@ def _coerce_int_sequence(
         return tuple(_coerce_num(x, int, name, min=minimum) for x in xs)
     except TypeError as exc:
         raise TypeError(f"{name} sequence invalid: {xs}") from exc
-
-
 def _coerce_weights_spec(
     value: Any,
     *args: Any,
@@ -195,16 +166,12 @@ def _coerce_weights_spec(
             raise ValueError(f"{name} needs >0 weight")
         return out_seq
     raise TypeError(f"{name} must be a Mapping[str, float] or Sequence[float]")
-
-
 def _is_source_spec(obj: Any) -> bool:
     return (
         isinstance(obj, Mapping)
         and isinstance(obj.get("format"), str)
         and isinstance(obj.get("path"), (str, os.PathLike))
     )
-
-
 def _effective_source_count(sources: Any) -> int:
     if not sources:
         return 0
@@ -213,14 +180,10 @@ def _effective_source_count(sources: Any) -> int:
     ):
         return len(sources)
     return 1
-
-
 def _validate_out_shape_dims(out_shape: Tuple[int, ...]) -> Tuple[int, ...]:
     if not out_shape or any(d <= 0 for d in out_shape):
         raise ValueError(f"Invalid shape {out_shape}")
     return out_shape
-
-
 def _coerce_device(
     value: Any, *args: Any, name: str = "device"
 ) -> Optional[torch.device]:
@@ -234,8 +197,6 @@ def _coerce_device(
         raise ValueError(
             f"{name} has invalid device specification: {value!r}"
         ) from exc
-
-
 def _to_tuple(
     value: Union[int, Tuple[int, ...]], *args: Any, dims: int, name: str
 ) -> Tuple[int, ...]:
@@ -248,8 +209,6 @@ def _to_tuple(
             )
         return value
     raise TypeError(f"{name} must be int or tuple of length {dims}")
-
-
 def _validate_equal_dims(
     value: Union[int, Tuple[int, ...]], *args: Any, dims: int, name: str
 ) -> None:
@@ -259,8 +218,6 @@ def _validate_equal_dims(
         raise ValueError(
             f"{name} must have equal dimensions (dims={dims}), got {t}"
         )
-
-
 def _extract_model_config_dict(model: Any) -> Dict[str, Any]:
     cfg_obj = getattr(model, "config", None) or getattr(
         model, "__stnet_instance_config__", None
@@ -277,7 +234,6 @@ def _extract_model_config_dict(model: Any) -> Dict[str, Any]:
     if isinstance(cfg_obj, dict):
         return coerce_model_config(cfg_obj).to_dict()
     return {}
-
 
 def coerce_patch_config(
     config: PatchConfig | Dict[str, Any] | None,
@@ -352,8 +308,6 @@ def coerce_patch_config(
         dropout,
         use_padding,
     )
-
-
 def coerce_model_config(
     config: ModelConfig | Dict[str, Any] | None,
 ) -> ModelConfig:
@@ -556,22 +510,16 @@ def coerce_model_config(
         }
     )
     return ModelConfig(**params)
-
-
 def coerce_build_config(
     config: ModelConfig | Dict[str, Any] | None,
 ) -> ModelConfig:
     return coerce_model_config(config)
-
-
 def patch_config_to_dict(
     config: PatchConfig | Dict[str, Any] | None,
 ) -> Dict[str, Any]:
     cfg = coerce_patch_config(config)
     data = _to_dict_strict(cfg)
     return {k: _to_dict(v) for k, v in data.items()}
-
-
 def model_config_to_dict(
     config: ModelConfig | Dict[str, Any] | None,
 ) -> Dict[str, Any]:
@@ -583,8 +531,6 @@ def model_config_to_dict(
         else coerce_model_config(config)
     )
     return cfg.to_dict()
-
-
 def patch_config(
     base: PatchConfig | Dict[str, Any] | None = None, /, **overrides: Any
 ) -> PatchConfig:
@@ -599,8 +545,6 @@ def patch_config(
     if overrides:
         data.update(overrides)
     return coerce_patch_config(data)
-
-
 def model_config(
     base: ModelConfig | Dict[str, Any] | None = None, /, **overrides: Any
 ) -> ModelConfig:
@@ -615,14 +559,10 @@ def model_config(
     if overrides:
         data.update(overrides)
     return coerce_model_config(data)
-
-
 def build_config(
     base: ModelConfig | Dict[str, Any] | None = None, /, **overrides: Any
 ) -> ModelConfig:
     return model_config(base, **overrides)
-
-
 def coerce_runtime_config(
     config: RuntimeConfig | Dict[str, Any],
 ) -> RuntimeConfig:
@@ -639,8 +579,6 @@ def coerce_runtime_config(
     if mode not in ("train", "predict", "infer"):
         raise ValueError(f"invalid runtime mode: {mode_value}")
     return RuntimeConfig.from_partial(mode=mode, **data)
-
-
 def runtime_config(
     mode: OpsMode, base: Dict[str, Any] | None, /, *args: Any, **kwargs: Any
 ) -> RuntimeConfig:
@@ -650,8 +588,6 @@ def runtime_config(
     actual_mode = data.pop("mode", mode)
     return RuntimeConfig.from_partial(actual_mode, *args, **data)
 
-
-@dataclass(frozen=True)
 class PatchConfig:
     is_square: bool = False
     patch_size_1d: int = 16
@@ -662,9 +598,6 @@ class PatchConfig:
     patch_size_3d: Union[int, Tuple[int, int, int], list[int]] = (2, 2, 2)
     dropout: float = 0.0
     use_padding: bool = True
-
-
-@dataclass
 class ModelConfig:
     device: Optional[torch.device | str] = None
     dropout: float = 0.1
@@ -748,9 +681,6 @@ class ModelConfig:
         if isinstance(dev, torch.device):
             data["device"] = str(dev)
         return {k: _to_dict(v) for k, v in data.items()}
-
-
-@dataclass(frozen=True)
 class RuntimeConfig:
     mode: OpsMode
     in_dim: int
@@ -1006,3 +936,8 @@ class RuntimeConfig:
                 else None
             ),
         )
+
+if TYPE_CHECKING:
+    from .data.pipeline import Source
+else:
+    Source = Dict[str, Any]

@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
-from typing import Optional, Any
+from typing import Any, Optional
 
 import torch
 from torch import nn
@@ -57,8 +57,6 @@ class GLU(nn.Module):
             raise ValueError(f"Expected dim {self.in_dim}, got {x.size(-1)}")
         a, b = self.in_proj(x).chunk(2, dim=-1)
         return self.out_proj(self.dropout(self.activation(a) * b))
-
-
 class GeGLU(GLU):
     def __init__(
         self,
@@ -79,8 +77,6 @@ class GeGLU(GLU):
             activation=nn.GELU(),
             check_input=check_input,
         )
-
-
 class SwiGLU(GLU):
     def __init__(
         self,

@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 from __future__ import annotations
 
 import collections.abc
@@ -8,7 +9,7 @@ import shutil
 import tempfile
 import time
 from contextlib import suppress
-from functools import lru_cache, partial
+from functools import partial
 from pathlib import Path
 from typing import (
     Any,
@@ -40,8 +41,8 @@ from ..core.datatypes import (
     dtype_from_name,
     env_first_int,
     env_str,
-    parse_torch_dtype,
     get_meta_path,
+    parse_torch_dtype,
     read_json,
     save_temp,
     write_json,
@@ -51,18 +52,13 @@ from ..core.system import (
     is_accelerator_available,
 )
 
-
-_LOGGER = logging.getLogger(__name__)
-
-
 _FEATURE_KEY_ALIASES = frozenset(
     {"x", "feature", "features", "input", "inputs", "in"}
 )
-
 _LABEL_KEY_ALIASES = frozenset(
     {"y", "label", "labels", "output", "outputs", "out"}
 )
-
+_LOGGER = logging.getLogger(__name__)
 
 def _strictest_underflow_action(
     v1: Optional[str], v2: Optional[str]
@@ -71,8 +67,6 @@ def _strictest_underflow_action(
         return v1 or v2
     order = {"allow": 0, "warn": 1, "forbid": 2}
     return v1 if order.get(str(v1), 0) >= order.get(str(v2), 0) else v2
-
-
 def _meta_has_scale(meta: Any) -> bool:
     if not isinstance(meta, Mapping):
         return False
@@ -87,20 +81,14 @@ def _meta_has_scale(meta: Any) -> bool:
     return isinstance((ss := meta.get("scale_stats")), Mapping) and (
         ss.get("has_scale") or any(ss.get(k) is not None for k in keys)
     )
-
-
 def _td_set(td: TensorDictBase, key: str, value: Any) -> None:
     try:
         td.set(key, value)
     except Exception:
         td[key] = value
-
-
 def _td_del(td: TensorDictBase, key: str) -> None:
     with suppress(Exception):
         td.del_(key) if hasattr(td, "del_") else td.__delitem__(key)
-
-
 def _resolve_key(
     data: Any, aliases: frozenset, name: str, required: bool
 ) -> Optional[str]:
@@ -122,8 +110,6 @@ def _resolve_key(
             f"Expected exactly one {name} key among {sorted(aliases)}; found {matches or 'none'}"
         )
     return None
-
-
 def _to_safe_tensor(
     obj: Any, dtype: Optional[torch.dtype] = None
 ) -> Optional[torch.Tensor]:
@@ -137,16 +123,12 @@ def _to_safe_tensor(
         if isinstance(t, torch.Tensor) and t.dtype != dtype
         else t
     )
-
-
 def _td_batch_size_from_X(x: Any) -> list[int]:
     return (
         [int(x.shape[0])]
         if isinstance(x, torch.Tensor) and x.ndim >= 1
         else []
     )
-
-
 def _coerce_path(path: PathLike) -> Optional[str]:
     if path is None:
         return None
@@ -154,8 +136,6 @@ def _coerce_path(path: PathLike) -> Optional[str]:
     if not p or p.lower() in ("none", "null", "nil"):
         return None
     return os.path.abspath(os.path.expanduser(p))
-
-
 def _coerce_prediction_output(output: object) -> str:
     if isinstance(output, str) and output.strip().lower() in {
         "file",
@@ -166,8 +146,6 @@ def _coerce_prediction_output(output: object) -> str:
     }:
         return "file"
     return "memory"
-
-
 def _coerce_prediction_overwrite(overwrite: object) -> str:
     if isinstance(overwrite, str):
         ow = overwrite.strip().lower()
@@ -178,8 +156,6 @@ def _coerce_prediction_overwrite(overwrite: object) -> str:
         if ow in {"ignore", "skip"}:
             return "ignore"
     return "error"
-
-
 def _coerce_prediction_path(
     path: PathLike, *args: Any, run_id: str
 ) -> Optional[str]:
@@ -190,8 +166,6 @@ def _coerce_prediction_path(
     if p.is_dir():
         return os.fspath(p / f"{run_id}.h5")
     return None
-
-
 def _is_path_writable(path: PathLike) -> bool:
     try:
         p = Path(path)
@@ -207,8 +181,6 @@ def _is_path_writable(path: PathLike) -> bool:
         return True
     except Exception:
         return False
-
-
 def _get_prediction_dtype(
     chunks_dir: PathLike,
     *args: Any,
@@ -259,18 +231,12 @@ def _get_prediction_dtype(
             except Exception:
                 continue
     return default
-
-
 def _remove_safe(path: str) -> None:
     with suppress(FileNotFoundError):
         os.remove(path)
-
-
 def _node_state_key(node: Any, attr: str, fallback: str) -> str:
     k = getattr(node, attr, None) or getattr(type(node), attr, None)
     return k if isinstance(k, str) else fallback
-
-
 def _expand_multinode_sources(spec: Any) -> tuple[Any, bool]:
     if not (isinstance(spec, dict) and "path" in spec and "kind" in spec):
         return spec, False
@@ -290,12 +256,8 @@ def _expand_multinode_sources(spec: Any) -> tuple[Any, bool]:
             for v in payload
         ], True
     return spec, False
-
-
 def _is_accelerator_available() -> bool:
     return any(is_accelerator_available(a) for a in ("cuda", "xpu", "mps"))
-
-
 def _device_guard_ok(device: torch.device, guard_bytes: int) -> bool:
     if guard_bytes <= 0:
         return True
@@ -305,16 +267,11 @@ def _device_guard_ok(device: torch.device, guard_bytes: int) -> bool:
         ) is None or free_b >= guard_bytes
     except Exception:
         return True
-
-
 def _host_guard_ok(guard_bytes: int) -> bool:
     return (
         guard_bytes <= 0
         or getattr(Memory, "available", lambda: guard_bytes)() >= guard_bytes
     )
-
-
-@lru_cache(maxsize=1)
 def _accel_event_poll_params() -> tuple[float, float, float]:
     start_us = int(
         env_first_int(
@@ -347,8 +304,6 @@ def _accel_event_poll_params() -> tuple[float, float, float]:
     max_s = max(base_s, float(max_ms) / 1000.0)
     stop_min_s = max(0.0, float(stop_min_ms) / 1000.0)
     return base_s, max_s, stop_min_s
-
-
 def _wait_accel_event_done(
     ev: Any,
     *args: Any,
@@ -379,16 +334,6 @@ def _wait_accel_event_done(
             sleep_s = max(float(sleep_s), stop_min_s)
         time.sleep(sleep_s)
         sleep_s = min(float(sleep_s) * 2.0, max_s)
-
-
-def _preload_len0(obj: Any) -> int:
-    return (
-        (obj.shape[0] if getattr(obj, "ndim", 0) > 0 else 1)
-        if isinstance(obj, torch.Tensor)
-        else len(obj)
-    )
-
-
 def _preload_slice_any(obj: Any, s: int, e: int, *args, name: str) -> Any:
     if obj is None:
         return None
@@ -396,8 +341,6 @@ def _preload_slice_any(obj: Any, s: int, e: int, *args, name: str) -> Any:
         return obj[s:e]
     except Exception:
         return [obj[i] for i in range(s, e)]
-
-
 def _preload_gather_any_preconverted(
     obj: Any,
     idx_cpu: torch.Tensor,
@@ -415,8 +358,6 @@ def _preload_gather_any_preconverted(
         return obj[idx_np if idx_np is not None else idx_cpu.numpy()]
     except Exception:
         return [obj[int(i)] for i in idx_cpu.tolist()]
-
-
 def _normalize_device_spec(
     device: torch.device | str | Sequence[torch.device | str],
 ) -> torch.device | list[torch.device]:
@@ -434,8 +375,6 @@ def _normalize_device_spec(
             )
         return devs if devs else torch.device("cpu")
     return torch.device(device)
-
-
 def _primary_device(
     device_spec: torch.device | list[torch.device],
 ) -> torch.device:
@@ -444,8 +383,6 @@ def _primary_device(
         if isinstance(device_spec, list) and device_spec
         else device_spec
     )
-
-
 def _resolve_memmap_store_float(*args: Any, negotiable: bool) -> torch.dtype:
     req = str(env_str("STNET_MEMMAP_FLOAT_DTYPE") or "").strip()
     if req.startswith("torch."):
@@ -463,8 +400,6 @@ def _resolve_memmap_store_float(*args: Any, negotiable: bool) -> torch.dtype:
         if (bool(negotiable) and req_dtype != torch.float64)
         else torch.float64
     )
-
-
 def _to_cpu_contig(t: torch.Tensor) -> torch.Tensor:
     t = t.detach()
     if t.device.type != "cpu":
@@ -472,20 +407,14 @@ def _to_cpu_contig(t: torch.Tensor) -> torch.Tensor:
     if not t.is_contiguous():
         t = t.contiguous()
     return t
-
-
 def _flat2d_cpu_contig(t: torch.Tensor, n: int) -> torch.Tensor:
     t_cpu = _to_cpu_contig(t)
     if t_cpu.ndim == 0:
         t_cpu = t_cpu.reshape(1)
     return t_cpu.reshape(int(n), -1)
-
-
 def _batch_n(x: torch.Tensor) -> int:
     xd = int(getattr(x, "ndim", 0) or 0)
     return int(x.shape[0]) if xd > 0 else 1
-
-
 def _idx_to_cpu_int64(idx: Any) -> torch.Tensor:
     if not isinstance(idx, torch.Tensor):
         idx = torch.as_tensor(idx)
@@ -495,8 +424,6 @@ def _idx_to_cpu_int64(idx: Any) -> torch.Tensor:
         idx = idx.to(dtype=torch.int64, copy=False)
     idx = idx.reshape(-1)
     return idx.to(dtype=torch.int64, copy=False)
-
-
 def _validate_row_contiguity(rows: torch.Tensor) -> tuple[bool, int, int]:
     rows = rows.reshape(-1)
     n = int(rows.numel())
@@ -511,8 +438,6 @@ def _validate_row_contiguity(rows: torch.Tensor) -> tuple[bool, int, int]:
     if not bool(torch.all(rows[1:] == rows[:-1] + 1)):
         return (False, 0, 0)
     return (True, start, start + n)
-
-
 def _index_copy_rows(
     dst: object,
     rows_t: torch.Tensor,
@@ -540,8 +465,6 @@ def _index_copy_rows(
                 f"Row indices out of bounds: min={rmin}, max={rmax}, count={int(count)}"
             )
     dst.index_copy_(0, rows_t, preds_t)
-
-
 def _h5_write_rows(
     dset_Y: object,
     rows_t: torch.Tensor,
@@ -566,12 +489,8 @@ def _h5_write_rows(
                 f"Row indices out of bounds: min={rmin}, max={rmax}, count={int(count)}"
             )
     dset_Y[rows_np] = preds_np
-
-
 def _torch_load_cpu(path: str) -> object:
     return torch.load(path, map_location="cpu", weights_only=True)
-
-
 def _load_row(rows_file: str) -> torch.Tensor:
     rows_t = _torch_load_cpu(os.fspath(rows_file))
     if not isinstance(rows_t, torch.Tensor):
@@ -580,8 +499,6 @@ def _load_row(rows_file: str) -> torch.Tensor:
     if not bool(rows_t.is_contiguous()):
         rows_t = rows_t.contiguous()
     return rows_t
-
-
 def _load_prediction(
     pred_file: str, *args: Any, dtype: torch.dtype
 ) -> torch.Tensor:
@@ -600,8 +517,6 @@ def _load_prediction(
     if preds_t.device.type != "cpu":
         preds_t = preds_t.to(device="cpu")
     return preds_t.to(dtype=dtype, copy=False)
-
-
 def _to_numpy_dtype(dtype: torch.dtype):
     np_bfloat16 = getattr(numpy, "bfloat16", numpy.float32)
     mapping = {
@@ -617,8 +532,6 @@ def _to_numpy_dtype(dtype: torch.dtype):
         torch.bool: numpy.bool_,
     }
     return mapping.get(dtype, numpy.float32)
-
-
 def _atomic_h5_op(out_path, overwrite, op_fn):
     out_path = os.fspath(out_path)
     ow = str(overwrite or "replace").strip().lower()
@@ -649,17 +562,12 @@ def _atomic_h5_op(out_path, overwrite, op_fn):
             os.remove(tmp)
     return PersistentTensorDict(filename=out_path, mode="r")
 
-
 def get_feature_key(data: Any) -> str:
     return _resolve_key(data, _FEATURE_KEY_ALIASES, "feature", True)
-
-
 def get_label_key(
     data: Any, *args: Any, required: bool = True
 ) -> Optional[str]:
     return _resolve_key(data, _LABEL_KEY_ALIASES, "label", required)
-
-
 def canonicalize_keys_(
     td: TensorDictBase,
     *args: Any,
@@ -678,8 +586,6 @@ def canonicalize_keys_(
         _td_set(td, y_key, td[lkey])
         _td_del(td, lkey)
     return td
-
-
 def get_row(
     data: Any,
     *args: Any,
@@ -690,8 +596,6 @@ def get_row(
         if (l := get_label_key(data, required=labels_required))
         else None
     )
-
-
 def preprocess(
     batch: Any,
     *args: Any,
@@ -730,8 +634,6 @@ def preprocess(
             if "row_ids" in batch:
                 out["row_ids"] = batch.get("row_ids")
     return out
-
-
 def column_cursor(
     data: Mapping[Any, Any],
     *args: Any,
@@ -741,8 +643,6 @@ def column_cursor(
     if count <= 0:
         raise ValueError("Empty mapping: no keys")
     return count, _KeyCursor(data, keys)
-
-
 def is_feature_label_batch_mapping(obj: Any) -> bool:
     if not isinstance(obj, Mapping) or not obj:
         return False
@@ -753,8 +653,6 @@ def is_feature_label_batch_mapping(obj: Any) -> bool:
         if ck in _FEATURE_KEY_ALIASES or ck in _LABEL_KEY_ALIASES:
             return True
     return False
-
-
 def stream_memmap(
     *args: Any,
     ds: Any,
@@ -1309,8 +1207,6 @@ def stream_memmap(
     }
     write_json(os.path.join(out_dir, "meta.json"), meta_json, indent=2)
     return int(in_dim), tuple(label_shape)
-
-
 def iter_source_path(obj: Any):
     if obj is None:
         return
@@ -1325,14 +1221,10 @@ def iter_source_path(obj: Any):
     elif isinstance(obj, (list, tuple)):
         for v in obj:
             yield from iter_source_path(v)
-
-
 def from_meta(memmap_dir: str) -> Dict[str, Any]:
     meta_path = os.path.join(os.fspath(memmap_dir), "meta.json")
     raw = read_json(meta_path)
     return raw if isinstance(raw, dict) else {}
-
-
 def merge_meta_info(metas: Any) -> Dict[str, Any]:
     def _merge_dicts(items: list[dict]) -> Dict[str, Any]:
         if not items:
@@ -1392,8 +1284,6 @@ def merge_meta_info(metas: Any) -> Dict[str, Any]:
         if isinstance(meta, dict):
             collected.append(meta)
     return _merge_dicts(collected)
-
-
 def load_scaler_stats(sources: Any) -> Optional[Dict[str, Any]]:
     expanded = expand_source(sources)
     total = 0
@@ -1607,8 +1497,6 @@ def load_scaler_stats(sources: Any) -> Optional[Dict[str, Any]]:
             }
         )
     return out
-
-
 def expand_source(sources: Any) -> Any:
     expanded, ok = _expand_multinode_sources(sources)
     if ok:
@@ -1618,8 +1506,6 @@ def expand_source(sources: Any) -> Any:
         if ok:
             return expanded
     return sources
-
-
 def load_memmap_meta(memmap_dir: str) -> Mapping[str, Any]:
     meta_path = os.path.join(os.fspath(memmap_dir), "meta.json")
     if not os.path.isfile(meta_path):
@@ -1628,8 +1514,6 @@ def load_memmap_meta(memmap_dir: str) -> Mapping[str, Any]:
     if not isinstance(meta, dict):
         raise ValueError(f"memmap meta.json malformed: {meta_path}")
     return meta
-
-
 def open_memory_mapped_tensor(mmt_path: str) -> Optional[MemoryMappedTensor]:
     meta_path = get_meta_path(mmt_path)
     if not (os.path.isfile(mmt_path) and os.path.isfile(meta_path)):
@@ -1647,8 +1531,6 @@ def open_memory_mapped_tensor(mmt_path: str) -> Optional[MemoryMappedTensor]:
         )
     except Exception:
         return None
-
-
 def load_memmap_features(memmap_dir: str) -> MemoryMappedTensor:
     meta = load_memmap_meta(memmap_dir)
     n = int(meta.get("N", 0) or 0)
@@ -1669,8 +1551,6 @@ def load_memmap_features(memmap_dir: str) -> MemoryMappedTensor:
     return MemoryMappedTensor.from_filename(
         feat_path, dtype=f_dtype, shape=torch.Size([n, fdim])
     )
-
-
 def copy_mmt_to_cpu_tensor(
     mmt: object,
     *args: Any,
@@ -1706,8 +1586,6 @@ def copy_mmt_to_cpu_tensor(
         chunk_cpu = chunk.detach().to(device="cpu", dtype=out.dtype)
         out[s:e].copy_(chunk_cpu)
     return out
-
-
 def load_predictions_h5(path: str) -> TensorDict:
     p = os.fspath(path)
     if not p or not os.path.isfile(p):
@@ -1720,8 +1598,6 @@ def load_predictions_h5(path: str) -> TensorDict:
     x_t = torch.as_tensor(x_np).clone()
     y_t = torch.as_tensor(y_np).clone()
     return TensorDict({"X": x_t, "Y": y_t}, batch_size=[int(x_t.shape[0])])
-
-
 def validate_predictions_h5(
     path: str,
     *args: Any,
@@ -1786,8 +1662,6 @@ def validate_predictions_h5(
                     f"predictions file has unexpected Y shape: got {tuple(int(d) for d in y_shape[1:])}, expected {out_shape_t} ({p!r})"
                 )
     return int(n)
-
-
 def concat_memory_mapped_tensor(
     chunks_dir: str,
     out_path: str,
@@ -1831,8 +1705,6 @@ def concat_memory_mapped_tensor(
         indent=None,
     )
     return y_out
-
-
 def concat_tensor(
     chunks_dir: str,
     *args: Any,
@@ -1859,8 +1731,6 @@ def concat_tensor(
         preds_t = _load_prediction(pred_file, dtype=dtype)
         _index_copy_rows(y_out, rows_t, preds_t, count=int(count))
     return y_out
-
-
 def concat_segment_h5(
     out_path: str,
     *args: Any,
@@ -1916,8 +1786,6 @@ def concat_segment_h5(
     return PersistentTensorDict(
         filename=out_path, batch_size=[int(count)], mode="r"
     )
-
-
 def write_predictions_h5_from_memmap(
     out_path: str,
     *args: Any,
@@ -1969,8 +1837,6 @@ def write_predictions_h5_from_memmap(
     return PersistentTensorDict(
         filename=out_path, batch_size=[int(n)], mode="r"
     )
-
-
 def write_predictions_h5_atomic(
     out_path: str,
     *args: Any,
@@ -1989,8 +1855,6 @@ def write_predictions_h5_atomic(
             chunk_size=chunk_size,
         ),
     )
-
-
 def copy_predictions_h5_atomic(
     src_path: str,
     dst_path: str,
@@ -2004,8 +1868,6 @@ def copy_predictions_h5_atomic(
     )
     validate_predictions_h5(dst_path, out_shape=out_shape)
     return res
-
-
 def remove_prediction_artifacts(
     *args: Any, memmap_dir: str, pred_path: str
 ) -> None:
@@ -2027,8 +1889,6 @@ def remove_prediction_artifacts(
     _remove_safe(os.path.join(os.fspath(memmap_dir), "meta.json"))
     with suppress(OSError):
         os.rmdir(os.fspath(memmap_dir))
-
-
 def postprocess(
     source: PathLike,
     *args: Any,
@@ -2212,7 +2072,6 @@ def postprocess(
         )
         return td_out
 
-
 class _BatchSliceGetter:
     def __init__(
         self, raw_X: Any, raw_Y: Any, *args: Any, features_only: bool
@@ -2230,8 +2089,6 @@ class _BatchSliceGetter:
         if self.raw_Y is not None and not self.features_only:
             out["labels"] = _preload_slice_any(self.raw_Y, s, e, name="labels")
         return out
-
-
 class _BatchIndexGetter:
     def __init__(
         self, raw_X: Any, raw_Y: Any, *args: Any, features_only: bool
@@ -2256,8 +2113,6 @@ class _BatchIndexGetter:
                 self.raw_Y, idx_cpu, idx_np, name="labels"
             )
         return out
-
-
 class _KeyView(collections.abc.Mapping):
     __slots__ = ("_data", "_keys")
 
@@ -2273,8 +2128,6 @@ class _KeyView(collections.abc.Mapping):
 
     def __getitem__(self, k: Any) -> Any:
         return self._data[k]
-
-
 class _KeyCursor:
     __slots__ = ("_data", "_keys_source", "_it", "_pos")
 
@@ -2316,7 +2169,6 @@ class _KeyCursor:
         self._pos += int(len(batch_keys))
         return _KeyView(self._data, batch_keys)
 
-
 class MappingSlicer:
     __slots__ = ("const_items", "slice_items")
 
@@ -2334,8 +2186,6 @@ class MappingSlicer:
             except Exception:
                 batch[k] = v
         return batch
-
-
 class TensorDictSlicer:
     __slots__ = ("td",)
 
@@ -2344,8 +2194,6 @@ class TensorDictSlicer:
 
     def __call__(self, s: object, e: object) -> TensorDictBase:
         return self.td[s:e]
-
-
 class ShardCollector:
     __slots__ = (
         "chunk_dir",
@@ -2610,8 +2458,6 @@ class ShardCollector:
             start += n
             if self.buf_fill >= int(self.target_rows):
                 self.flush()
-
-
 class Collator:
     labels_dtype: Optional[torch.dtype] = None
     sanitize: bool = False

@@ -3,32 +3,32 @@ from __future__ import annotations
 
 import collections.abc
 import contextlib
-import logging
 import importlib
+import logging
 import math
 import os
 import random
 import time
-from itertools import chain
-from dataclasses import dataclass, field, replace
+from dataclasses import field, replace
 from functools import partial
+from itertools import chain
 from typing import (
     Any,
     Callable,
     Dict,
     Generic,
+    Literal,
     Mapping,
     MutableMapping,
+    NotRequired,
     Optional,
+    Required,
     Sequence,
     Tuple,
+    TypedDict,
     TypeVar,
     Union,
     cast,
-    Literal,
-    NotRequired,
-    Required,
-    TypedDict,
 )
 
 import torch
@@ -38,9 +38,11 @@ from torchdata.nodes import BaseNode
 from ..core.concurrency import Disposable, Mutex, new_affinity
 from ..core.datatypes import (
     PathLike,
+    default_underflow_action,
     env_first,
     env_first_float,
     env_first_int,
+    normalize_underflow_action,
 )
 from ..core.policies import BatchPolicy, LoaderPolicy, WorkerPolicy
 from ..core.system import (
@@ -60,24 +62,14 @@ from ..core.system import (
     new_accelerator_event,
     sync_accelerator,
 )
-from ..core.datatypes import (
-    default_underflow_action,
-    normalize_underflow_action,
-)
 from . import collate
 
-
-_NODES_LOCK = Mutex()
 _NODES_IMPORTED = False
-
+_NODES_LOCK = Mutex()
 _device_mem_get_info = Memory.mem_get_info
-
-logger = logging.getLogger(__name__)
-
-TExtra = TypeVar("TExtra")
-
 SourceType = Literal["memmap"]
-
+TExtra = TypeVar("TExtra")
+logger = logging.getLogger(__name__)
 
 def _require_nodes() -> None:
     global _NODES_IMPORTED
@@ -105,24 +97,16 @@ def _require_nodes() -> None:
             }
         )
         _NODES_IMPORTED = True
-
-
 def _sync_device(device: torch.device) -> None:
     sync_accelerator(device)
-
-
 def _is_lazy_tensor(x: Any) -> bool:
     return isinstance(x, MemoryMappedTensor)
-
-
 def _feature_size_hint(obj: Any) -> Optional[int]:
     if isinstance(obj, torch.Tensor):
         return int(obj.numel()) if obj.ndim > 0 else 1
     if isinstance(obj, (tuple, list)):
         return len(obj)
     return None
-
-
 def _stack_sequence(
     seq: Sequence[Any],
     *args: Any,
@@ -150,8 +134,6 @@ def _stack_sequence(
             )
         out[i].copy_(ti)
     return out
-
-
 def _get_sample_size(
     _x_cpu: torch.Tensor, _y_cpu: Optional[torch.Tensor]
 ) -> int:
@@ -162,8 +144,6 @@ def _get_sample_size(
         y_one = _y_cpu[0]
         by = int(y_one.numel()) * int(y_one.element_size())
     return int(bx + by)
-
-
 def _get_random_batch(
     _sample_bytes: int, _device: torch.device, _N: int
 ) -> Sequence[int]:
@@ -190,9 +170,6 @@ def _get_random_batch(
         {max(1, int(capB * f)) for f in (0.125, 0.25, 0.375, 0.5, 0.75, 1.0)}
     )
     return [c for c in cands if c <= _N]
-
-
-@torch.no_grad()
 def _h2d_counter(
     _x_cpu: torch.Tensor,
     _y_cpu: Optional[torch.Tensor],
@@ -273,8 +250,6 @@ def _h2d_counter(
         if s >= int(_warmup):
             times.append(ms)
     return float(sorted(times)[len(times) // 2]) if times else 0.0
-
-
 def _set_batch_interval(
     _ds: "Sampler",
     _dev: torch.device,
@@ -556,8 +531,6 @@ def _set_batch_interval(
             break
         B, med = B_next, med_next
     return (max(1, int(B)), float(med))
-
-
 def _is_source(obj: Any) -> bool:
     if not isinstance(obj, Mapping):
         return False
@@ -570,16 +543,12 @@ def _is_source(obj: Any) -> bool:
         return bool(os.fspath(p))
     except Exception:
         return False
-
-
 def _merge_opt(v1, v2, op):
     if v1 is None:
         return v2
     if v2 is None:
         return v1
     return op(v1, v2)
-
-
 def _fetch_stream_batch(
     ds: "Sampler",
     device: torch.device,
@@ -600,8 +569,6 @@ def _fetch_stream_batch(
         )
     except Exception:
         return (0, 0.0)
-
-
 def _fetch_auto_batch_size(
     datasets: Mapping[str, "Sampler"],
     device: torch.device,
@@ -629,8 +596,6 @@ def _fetch_auto_batch_size(
     cand_mean = int(sum(candidates) // max(1, len(candidates)))
     cand_max = int(max(candidates))
     return int(max(1, min(cand_max, cand_mean)))
-
-
 def _fetch_cap_pf_depth(
     datasets: Mapping[str, "Sampler"],
     device: torch.device,
@@ -693,8 +658,6 @@ def _fetch_cap_pf_depth(
         return int(max(1, min(int(pf), int(pf_cap), 8)))
     except Exception:
         return int(pf)
-
-
 def _fetch_iterate_sample(
     sample: Any,
     *args: Any,
@@ -730,8 +693,6 @@ def _fetch_iterate_sample(
         batch = ds.get(s, e)
         return collate(batch) if batch is not None else None
     return collate(sample)
-
-
 def _fetch_merge_batches(batches: Sequence[Any]) -> Any:
     if TensorDictBase is not None and all(
         isinstance(b, TensorDictBase) for b in batches
@@ -786,8 +747,6 @@ def _fetch_merge_batches(batches: Sequence[Any]) -> Any:
             b if isinstance(b, (list, tuple)) else [b] for b in batches
         )
     )
-
-
 def _fetch_normalize_sources(sources: Any) -> Dict[str, Source]:
     if isinstance(sources, Mapping) and (not _is_source(sources)):
         out: Dict[str, Source] = {}
@@ -800,8 +759,6 @@ def _fetch_normalize_sources(sources: Any) -> Dict[str, Source]:
     if isinstance(sources, (list, tuple)):
         return {str(i): v for i, v in enumerate(sources)}
     return {"0": sources}
-
-
 def _fetch_build_datasets(
     specs: Mapping[str, Source],
     *args: Any,
@@ -822,8 +779,6 @@ def _fetch_build_datasets(
         if collect_epochables and epochables is not None:
             epochables.append(ds)
     return out
-
-
 def _fetch_build_sampler_nodes(
     datasets: Mapping[str, "Sampler"],
     *args: Any,
@@ -844,7 +799,6 @@ def _fetch_build_sampler_nodes(
             nodes[str(k)] = sn
             lengths[str(k)] = int(len(ds))
     return nodes, lengths
-
 
 def iter_dataset(
     data: object,
@@ -887,8 +841,6 @@ def iter_dataset(
             manifest_list.append(key)
         return (items2, manifest_list)
     return ([("0", data)], None)
-
-
 def new_dataset(
     source: Source,
     *args: Any,
@@ -922,8 +874,6 @@ def new_dataset(
     if not (0.0 <= vf <= 1.0):
         raise ValueError(f"val_frac must be in [0,1], got: {vf}")
     return Sampler(path, split=sp, val_frac=vf, sampler_scale=sampler_scale)
-
-
 def compose(
     node_or_nodes: Union[BaseNode, Sequence[BaseNode], Mapping[str, BaseNode]],
     *args: Any,
@@ -963,8 +913,6 @@ def compose(
     )
     mapped = mapper.compose(source)
     return source, mapped, mapped
-
-
 def fetch(
     sources: Union[Source, Sequence[Source], Mapping[str, Source]],
     device: Union[str, torch.device],
@@ -1131,8 +1079,6 @@ def fetch(
         "disposable": allocated,
         "sampler_scale": scale_ctl,
     }
-
-
 def preload_memmap(
     data: Mapping[str, Any],
     *args: Any,
@@ -1225,14 +1171,10 @@ def preload_memmap(
     )
     return None
 
-
 class Source(TypedDict):
     path: Required[str]
     format: NotRequired[SourceType]
     kind: NotRequired[SourceType]
-
-
-@dataclass
 class Session:
     sources: Any
     device: torch.device | str
@@ -1361,9 +1303,6 @@ class Session:
             with contextlib.suppress(Exception):
                 keep.cleanup()
         self._opened = False
-
-
-@dataclass
 class Dataset(Generic[TExtra]):
     device: torch.device
     device_type: str = field(init=False, default="cpu")

@@ -3,8 +3,9 @@ from __future__ import annotations
 
 import contextlib
 import logging
-from dataclasses import dataclass, replace
+from dataclasses import replace
 from typing import (
+    TYPE_CHECKING,
     Any,
     Callable,
     Dict,
@@ -13,46 +14,44 @@ from typing import (
     Protocol,
     Tuple,
     Union,
-    TYPE_CHECKING,
 )
 
 import torch
 import torch.nn as nn
 
 from .concurrency import Mutex
-from .datatypes import env_first_int, env_float, env_str
+from .datatypes import (
+    default_underflow_action,
+    env_first_int,
+    env_float,
+    env_str,
+    normalize_underflow_action,
+)
 from .graph import clear_model_cache
 from .precision import Autocast, DeviceMeta, Quantization, is_scale_safe
 from .system import (
     CPU,
     _call,
     _default_thread_limit,
-    _optimal_threads,
     _log_debug,
     _log_info,
+    _optimal_threads,
     get_device,
     is_cuda_bf16_supported,
 )
-from .datatypes import default_underflow_action, normalize_underflow_action
 
 if TYPE_CHECKING:
     from ..data.pipeline import Dataset
 
-
-_TORCH_THREAD_CFG_LOCK = Mutex()
-_TORCH_NUM_THREADS_SET: Optional[int] = None
-_TORCH_INTEROP_THREADS_SET: Optional[int] = None
 _TORCH_INTEROP_LOCKED: bool = False
-
+_TORCH_INTEROP_THREADS_SET: Optional[int] = None
+_TORCH_NUM_THREADS_SET: Optional[int] = None
+_TORCH_THREAD_CFG_LOCK = Mutex()
 
 def optimal_procs() -> dict[str, Union[int, str]]:
     return WorkerPolicy.optimize().get_procs_setting()
-
-
 def optimal_threads() -> dict[str, Union[int, bool]]:
     return WorkerPolicy.optimize().get_thread_setting()
-
-
 def optimize_threads(
     intra: Optional[int] = None,
     inter: Optional[int] = None,
@@ -65,7 +64,6 @@ def optimize_threads(
     wp.set_thread_setting()
     return wp.get_thread_setting()
 
-
 class LossWeightPolicy(Protocol):
     def weights(self) -> Tuple[float, float]: ...
 
@@ -75,9 +73,6 @@ class LossWeightPolicy(Protocol):
         bottom_loss: Optional[torch.Tensor],
     ) -> None:
         raise NotImplementedError
-
-
-@dataclass(slots=True)
 class WorkerPolicy:
     nproc_per_node: int = 1
     device: str = "cpu"
@@ -360,9 +355,6 @@ class WorkerPolicy:
                         _TORCH_INTEROP_LOCKED = True
                 elif int(_TORCH_INTEROP_THREADS_SET) != int(inter):
                     pass
-
-
-@dataclass(slots=True)
 class LoaderPolicy:
     max_batches_accel: int = 4
     max_batches_cpu: int = 2
@@ -423,34 +415,31 @@ class LoaderPolicy:
     def wrap_input(
         self, loader: Any, device: torch.device | str, *args: Any, name: str
     ) -> Any:
-        """Wrap a loader with bounded in-flight buffering.
+\
+\
+\
+\
+\
+\
+\
+\
+\
 
-        NOTE: For accelerator training/inference, our stnet.data.nodes.Loader
-        already performs bounded prefetch + device staging via Stream.
-        Double-wrapping with an extra thread-based Prefetcher can interact
-        poorly with some iterables (and can also hide set_epoch hooks).
-
-        For CPU paths (no Stream), we still wrap with Prefetcher to keep
-        in-flight batches hard-limited.
-        """
         from .concurrency import new_prefetcher
 
         max_batches = self.hard_inflight_batches(device)
-        # If this is our loader on an accelerator and non_blocking staging is
-        # enabled, prefer the internal Stream (single bounded queue) rather than
-        # stacking another prefetch thread on top.
+
+
+
         with contextlib.suppress(Exception):
             dev = torch.device(device) if not isinstance(device, torch.device) else device
             if dev.type in {"cuda", "xpu", "mps"}:
                 if bool(getattr(loader, "_non_blocking", False)) and hasattr(loader, "_base_iterable"):
-                    # Keep the hard limit by aligning the Stream depth.
+
                     with contextlib.suppress(Exception):
                         setattr(loader, "_depth", int(max(1, int(max_batches))))
                     return loader
         return new_prefetcher(loader, max_batches=max_batches, name=name)
-
-
-@dataclass
 class BatchPolicy:
     sample_bytes: int
     host_sample_bytes: Optional[int] = None
@@ -610,9 +599,6 @@ class BatchPolicy:
                 b = min(b, int(self.max_batch))
         b = max(int(b), int(self.min_batch))
         return max(1, b)
-
-
-@dataclass(slots=True)
 class ModelPolicy:
     @staticmethod
     def negotiate(
@@ -1187,9 +1173,6 @@ class ModelPolicy:
         )
         Autocast.configure(m2 if ok else model, metadata=meta)
         return (m2, ok, why)
-
-
-@dataclass(slots=True)
 class PrecisionPolicy:
     master_float: torch.dtype = torch.float32
     amp_dtype: Optional[torch.dtype] = None
@@ -1280,66 +1263,58 @@ class PrecisionPolicy:
             output_dtype=self.fsdp_output_dtype,
             cast_forward_inputs=True,
         )
-
-
-# -----------------------------------------------------------------------------
-# Distributed policy (collectives + sharding/replication selection)
-# -----------------------------------------------------------------------------
-
-
-@dataclass(frozen=True)
 class CollectivePolicy:
-    """How to do collectives for state sync (broadcast / all_reduce).
+\
+\
+\
+\
+\
+\
+\
+\
+\
+\
+\
+\
+\
+\
+\
+\
+\
+\
+\
+\
+\
+\
+\
+\
+\
+\
+\
+\
+\
+\
+\
+\
+\
 
-    This policy intentionally centralizes *collective communication* knobs.
-    Broadcast is just one collective; reduction-style ops (all-reduce) are
-    another. In practice we mostly use this for:
-      - initial state sync (broadcast of parameters/buffers)
-      - periodic state sync / reshard fixes
-      - DDP-style gradient synchronization when HSDP/FSDP is unavailable
-
-    Backends:
-      - **c10d**: Use ``torch.distributed`` collectives directly on the tensor
-        device. This is the fastest path when a native backend exists (e.g.
-        NCCL/XCCL for CUDA/XPU, Gloo for CPU).
-      - **gloox**: Use a *Gloo* process group and stage non-CPU tensors through
-        CPU memory. This is slower, but enables collectives for devices that
-        lack a native backend (e.g. MPS) and can act as a "safe mode" if GPU
-        collectives OOM.
-
-    Environment variables (new names + legacy names are both accepted):
-      - STNET_COLLECTIVE_BACKEND / STNET_BCAST_BACKEND: c10d|gloox (default: c10d)
-      - STNET_COLLECTIVE_INCLUDE_PARAMETERS / STNET_BCAST_INCLUDE_PARAMETERS: 0|1 (default: 1)
-      - STNET_COLLECTIVE_INCLUDE_BUFFERS / STNET_BCAST_INCLUDE_BUFFERS: 0|1 (default: 1)
-      - STNET_COLLECTIVE_MAX_BUFFER_SIZE_MB / STNET_BCAST_MAX_BUFFER_SIZE_MB: int (default: 25)
-
-      - STNET_COLLECTIVE_COALESCE_MB / STNET_BCAST_COALESCE_MB: int (default: 64)
-      - STNET_COLLECTIVE_MAX_TENSOR_MB_FOR_COALESCE / STNET_BCAST_MAX_TENSOR_MB_FOR_COALESCE: int (default: 8)
-
-      - STNET_COLLECTIVE_INTER_STREAM_MB / STNET_BCAST_INTER_STREAM_MB: int (default: 16)
-      - STNET_COLLECTIVE_INTRA_STREAM_MB / STNET_BCAST_INTRA_STREAM_MB: int (default: 64)
-      - STNET_COLLECTIVE_MAX_INFLIGHT_MB / STNET_BCAST_MAX_INFLIGHT_MB: int (default: 64)
-
-      - STNET_COLLECTIVE_DEBUG / STNET_BCAST_DEBUG: 0|1 (default: 0)
-      - STNET_COLLECTIVE_VERBOSE / STNET_BCAST_VERBOSE: 0|1 (default: 0)
-    """
 
     backend: str = "c10d"
 
-    # What to broadcast when syncing module states.
+
     include_parameters: bool = True
     include_buffers: bool = True
     max_buffer_size_mb: int = 25
 
-    # Small-tensor coalescing (reduce Python overhead + number of collectives).
+
     coalesce_mb: int = 64
     max_tensor_mb_for_coalesce: int = 8
 
-    # Large-tensor streaming (chunked broadcast).
+
     inter_stream_mb: int = 16
     intra_stream_mb: int = 64
 
-    # Global "in-flight" limiter for async collectives.
+
     max_inflight_mb: int = 64
 
     debug_collectives: bool = False
@@ -1428,30 +1403,27 @@ class CollectivePolicy:
             debug_collectives=debug_collectives,
             verbose=verbose,
         )
-
-
-@dataclass(frozen=True)
 class DistributedPolicy:
-    """Central distribution policy.
+\
+\
+\
+\
+\
+\
+\
+\
+\
+\
+\
+\
 
-    Intentional defaults:
-      - If a device supports HSDP (CUDA/XPU), use it.
-      - Otherwise, fall back to DDP-style data parallel.
-
-    Environment variables:
-      - STNET_DISTRIBUTED_PREFER_HSDP: 0|1 (default: 1)
-      - STNET_DISTRIBUTED_PREFER_DDP: 0|1 (default: 1)
-      - STNET_DISTRIBUTED_SYNC_STATE: 0|1 (default: 1)
-
-    (See ``CollectivePolicy`` for collective-related env vars.)
-    """
 
     prefer_hsdp: bool = True
     prefer_ddp: bool = True
 
-    # When starting distributed jobs, whether to run an explicit model state
-    # synchronization step (rank0 -> all ranks). This is separate from DDP/FSDP
-    # internal sync.
+
+
+
     sync_state: bool = True
 
     collective: CollectivePolicy = CollectivePolicy()

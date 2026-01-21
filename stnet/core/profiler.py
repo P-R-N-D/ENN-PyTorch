@@ -5,7 +5,7 @@ import contextlib
 import contextvars
 import logging
 import os
-from dataclasses import dataclass, field
+from dataclasses import field
 from functools import partial
 from types import TracebackType
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
@@ -13,30 +13,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 import torch
 from torch import nn
 
-try:
-    from torch._ops import OpOverload, OpOverloadPacket
-except Exception:
-    OpOverload = tuple()
-    OpOverloadPacket = tuple()
-
-try:
-    from torch.utils._python_dispatch import TorchDispatchMode
-except Exception:
-    TorchDispatchMode = None
-
-try:
-    # Higher-order operators (HOO) such as flex_attention are implemented as
-    # HigherOrderOperator callables. TorchDispatchMode must explicitly opt-in
-    # to allow HOO to run under the mode.
-    from torch._higher_order_ops.higher_order_operator import HigherOrderOperator
-except Exception:
-    HigherOrderOperator = tuple()
-
-
-FLOP_PROFILER: "_FlopProfiler" | None = None
-
-_LOGGER = logging.getLogger(__name__)
-
+_ACT_CLASSES: Tuple[type, ...] = tuple(_ACT_COEFF.keys())
 _ACT_COEFF: Dict[type, float] = {
     nn.ReLU: 1.0,
     nn.ReLU6: 1.0,
@@ -49,27 +26,22 @@ _ACT_COEFF: Dict[type, float] = {
     nn.Hardswish: 6.0,
     nn.Hardsigmoid: 4.0,
 }
-_ACT_CLASSES: Tuple[type, ...] = tuple(_ACT_COEFF.keys())
-
+_LOGGER = logging.getLogger(__name__)
+FLOP_PROFILER: "_FlopProfiler" | None = None
+FLOP_PROFILER = _FlopProfiler()
 
 def _float_safe(x: Any, default: float = 0.0) -> float:
     try:
         return v if (v := float(x)) == v else default
     except:
         return default
-
-
 def _int_safe(x: Any, default: int = 0) -> int:
     try:
         return int(x)
     except:
         return default
-
-
 def _prod_int(xs: Sequence[int]) -> int:
     return int(math.prod(int(v) for v in xs)) if xs else 1
-
-
 def _coerce(obj: Any) -> Any:
     if obj is None:
         return None
@@ -78,8 +50,6 @@ def _coerce(obj: Any) -> Any:
             return obj
         return getattr(obj, "default", obj)
     return obj
-
-
 def _get_forward(out: Any) -> Optional[torch.Tensor]:
     return (
         out
@@ -90,8 +60,6 @@ def _get_forward(out: Any) -> Optional[torch.Tensor]:
             else None
         )
     )
-
-
 def _coerce_tensor_sequence(
     args: Tuple[Any, ...], max_n: int = 4
 ) -> List[torch.Tensor]:
@@ -104,16 +72,12 @@ def _coerce_tensor_sequence(
         if len(out) >= max_n:
             return out[:max_n]
     return out
-
-
 def _bhsd_shape(x: torch.Tensor) -> Tuple[int, int, int, int]:
     return (
         _infer_bhsd_shape(x.shape)
         if isinstance(x, torch.Tensor) and x.ndim == 4
         else (0, 0, 0, 0)
     )
-
-
 def _infer_bhsd_shape(shape: Tuple[int, ...]) -> Tuple[int, int, int, int]:
     if not shape or len(shape) != 4:
         return (0, 0, 0, 0)
@@ -122,8 +86,6 @@ def _infer_bhsd_shape(shape: Tuple[int, ...]) -> Tuple[int, int, int, int]:
         if shape[1] <= shape[2]
         else (int(shape[0]), int(shape[2]), int(shape[1]), int(shape[-1]))
     )
-
-
 def _te_layernormmlp_name_score(name: str, for_w2: bool) -> int:
     s = name.lower()
     if for_w2:
@@ -137,15 +99,11 @@ def _te_layernormmlp_name_score(name: str, for_w2: bool) -> int:
         if "in" in s or "qkv" in s:
             return 2
     return 1
-
-
 def _register_op_handler(
     handlers: Dict[Any, Any], op: Any, handler: Any
 ) -> None:
     if op is not None:
         handlers[op] = handler
-
-
 def _aten_ops_from(aten: Any, base: str) -> List[Any]:
     ops: List[Any] = []
     obj = getattr(aten, base, None)
@@ -168,8 +126,6 @@ def _aten_ops_from(aten: Any, base: str) -> List[Any]:
             if f is not None:
                 ops.append(f)
     return ops
-
-
 def _fx_resolve(obj: Any, gm: "torch.fx.GraphModule") -> Any:
     if isinstance(obj, torch.fx.Node):
         return _fx_resolve_node(obj, gm)
@@ -178,8 +134,6 @@ def _fx_resolve(obj: Any, gm: "torch.fx.GraphModule") -> Any:
     if isinstance(obj, dict):
         return {k: _fx_resolve(v, gm) for k, v in obj.items()}
     return obj
-
-
 def _fx_resolve_node(n: "torch.fx.Node", gm: "torch.fx.GraphModule") -> Any:
     v = n.meta.get("val", None)
     if v is not None:
@@ -190,8 +144,6 @@ def _fx_resolve_node(n: "torch.fx.Node", gm: "torch.fx.GraphModule") -> Any:
     if n.op == "get_attr":
         return getattr(gm, str(n.target), None)
     return None
-
-
 def _flop_sig_key_of(x: Any) -> Any:
     if isinstance(x, torch.Tensor):
         return (
@@ -207,8 +159,6 @@ def _flop_sig_key_of(x: Any) -> Any:
             sorted((kk, _flop_sig_key_of(vv)) for kk, vv in x.items())
         )
     return ("O", type(x).__name__, repr(x)[:64])
-
-
 def _linear_mkn_shape(
     inp: torch.Tensor, out: Any, weight: Optional[torch.Tensor]
 ) -> Tuple[int, int, int]:
@@ -230,8 +180,6 @@ def _linear_mkn_shape(
     if isinstance(out, torch.Tensor) and out.numel() > 0:
         m_dim = max(m_dim, _int_safe(out.numel() // max(n_dim, 1), 0))
     return (m_dim, k_dim, n_dim)
-
-
 def _flops_linear(
     inp: torch.Tensor,
     out: Any,
@@ -248,8 +196,6 @@ def _flops_linear(
         float(m_dim * n_dim) if (include_bias and has_bias) else 0.0
     )
     return float(fwd * (1.0 + max(0.0, _float_safe(effective_bwd, 0.0))))
-
-
 def _flops_conv(
     inp: torch.Tensor,
     out: Any,
@@ -283,8 +229,6 @@ def _flops_conv(
         return float(fwd * (1.0 + max(0.0, _float_safe(effective_bwd, 0.0))))
     except Exception:
         return 0.0
-
-
 def _flops_elementwise(
     out: Any, *args: Any, coeff: float, effective_bwd: float
 ) -> float:
@@ -293,8 +237,6 @@ def _flops_elementwise(
         return 0.0
     fwd = float(out_t.numel()) * float(coeff)
     return float(fwd * (1.0 + max(0.0, _float_safe(effective_bwd, 0.0))))
-
-
 def _flops_softmax(
     inp: torch.Tensor, out: Any, *args: Any, dim: int, effective_bwd: float
 ) -> float:
@@ -321,8 +263,6 @@ def _flops_softmax(
         else 0.0
     )
     return float(fwd * (1.0 + max(0.0, _float_safe(effective_bwd, 0.0))))
-
-
 def _flops_layernorm(
     inp: torch.Tensor,
     out: Any,
@@ -353,8 +293,6 @@ def _flops_layernorm(
         affine += 1.0 + (1.0 if has_bias else 0.0)
     fwd = float(groups) * float(n_norm) * (6.0 + affine)
     return float(fwd * (1.0 + max(0.0, _float_safe(effective_bwd, 0.0))))
-
-
 def _flops_attention_generics(
     *args: Any,
     batch: int,
@@ -378,8 +316,6 @@ def _flops_attention_generics(
     )
     fwd = matmul + misc
     return float(fwd * (1.0 + max(0.0, _float_safe(effective_bwd, 0.0))))
-
-
 def _flops_attention_qkv(
     q: torch.Tensor,
     k: Optional[torch.Tensor],
@@ -407,8 +343,6 @@ def _flops_attention_qkv(
         training=training,
         include_softmax_scale_dropout=include_softmax_scale_dropout,
     )
-
-
 def _activation_coefficients(t: type) -> Optional[float]:
     coeff = _ACT_COEFF.get(t)
     if coeff is not None:
@@ -420,12 +354,8 @@ def _activation_coefficients(t: type) -> Optional[float]:
         except Exception:
             continue
     return None
-
-
 def _is_te_module(mod: nn.Module) -> bool:
     return "transformer_engine" in getattr(type(mod), "__module__", "")
-
-
 def _register_linear(
     mod: nn.Module,
     inp: Tuple[Any, ...],
@@ -457,8 +387,6 @@ def _register_linear(
         if _is_te_module(mod):
             typ = f"TE.{typ}"
         profiler.add(typ, val)
-
-
 def _register_conv(
     mod: nn.Module,
     inp: Tuple[Any, ...],
@@ -486,8 +414,6 @@ def _register_conv(
     )
     if val > 0.0:
         profiler.add(type(mod).__name__, val)
-
-
 def _register_activation(
     mod: nn.Module,
     inp: Tuple[Any, ...],
@@ -506,8 +432,6 @@ def _register_activation(
     )
     if val > 0.0:
         profiler.add(type(mod).__name__, val)
-
-
 def _register_dropout(
     mod: nn.Module,
     inp: Tuple[Any, ...],
@@ -524,8 +448,6 @@ def _register_dropout(
     val = _flops_elementwise(out, coeff=2.0, effective_bwd=cfg.effective_bwd)
     if val > 0.0:
         profiler.add(type(mod).__name__, val)
-
-
 def _register_softmax(
     mod: nn.Module,
     inp: Tuple[Any, ...],
@@ -543,8 +465,6 @@ def _register_softmax(
     val = _flops_softmax(x, out, dim=int(dim), effective_bwd=cfg.effective_bwd)
     if val > 0.0:
         profiler.add(type(mod).__name__, val)
-
-
 def _register_layernorm(
     mod: nn.Module,
     inp: Tuple[Any, ...],
@@ -573,8 +493,6 @@ def _register_layernorm(
     )
     if val > 0.0:
         profiler.add(type(mod).__name__, val)
-
-
 def _register_embedding(
     mod: nn.Module,
     inp: Tuple[Any, ...],
@@ -584,8 +502,6 @@ def _register_embedding(
     cfg: _ProfilerConfig,
 ) -> None:
     return
-
-
 def _register_mha(
     mod: nn.MultiheadAttention,
     inp: Tuple[Any, ...],
@@ -641,16 +557,12 @@ def _register_mha(
     total = float(inproj + attn + outproj)
     if total > 0.0:
         profiler.add(type(mod).__name__, total)
-
-
 def _get_tensor_attr(mod: nn.Module, name: str) -> Optional[torch.Tensor]:
     try:
         v = getattr(mod, name)
         return v if isinstance(v, torch.Tensor) else None
     except Exception:
         return None
-
-
 def _get_2d_weights(mod: nn.Module) -> List[Tuple[str, torch.Tensor, bool]]:
     entries: List[Tuple[str, torch.Tensor, bool]] = []
     seen: set[int] = set()
@@ -742,8 +654,6 @@ def _get_2d_weights(mod: nn.Module) -> List[Tuple[str, torch.Tensor, bool]]:
     except Exception:
         pass
     return entries
-
-
 def _get_te_weights(mod: nn.Module) -> List[Tuple[str, torch.Tensor, bool]]:
     try:
         cache = getattr(mod, "_stnet_te_weight_cache", None)
@@ -761,8 +671,6 @@ def _get_te_weights(mod: nn.Module) -> List[Tuple[str, torch.Tensor, bool]]:
     except Exception:
         pass
     return entries
-
-
 def _get_te_norm(mod: nn.Module) -> Tuple[bool, bool]:
     has_weight = False
     has_bias = False
@@ -775,8 +683,6 @@ def _get_te_norm(mod: nn.Module) -> Tuple[bool, bool]:
             has_bias = True
             break
     return (has_weight or has_bias), has_bias
-
-
 def _register_te_module(
     mod: nn.Module,
     inp: Tuple[Any, ...],
@@ -941,19 +847,13 @@ def _register_te_module(
         )
         if val > 0.0:
             profiler.add(f"TE.{type(mod).__name__}", val)
-
-
 def _op_name(func: Any) -> str:
     try:
         return str(func).replace("torch.ops.aten.", "aten.")
     except Exception:
         return "op"
-
-
 def _is_tensorlike(x: Any) -> bool:
     return isinstance(x, (torch.Tensor, _TensorShape))
-
-
 def _meta_shape(meta: Any) -> Optional[Tuple[int, ...]]:
     try:
         return (
@@ -963,14 +863,10 @@ def _meta_shape(meta: Any) -> Optional[Tuple[int, ...]]:
         )
     except:
         return None
-
-
 def _to_tensor(x: Any) -> torch.Tensor:
     return (
         x if isinstance(x, torch.Tensor) else torch.empty((1, 1), device="cpu")
     )
-
-
 def _export_graph(
     model: nn.Module, args: Tuple[Any, ...], kwargs: Dict[str, Any]
 ) -> Optional[torch.fx.GraphModule]:
@@ -983,8 +879,6 @@ def _export_graph(
     except Exception as exc:
         _LOGGER.debug("dynamo.export failed: %s", exc)
         return None
-
-
 def _forward_shape(
     gm: torch.fx.GraphModule, args: Tuple[Any, ...], kwargs: Dict[str, Any]
 ) -> None:
@@ -994,7 +888,6 @@ def _forward_shape(
         ShapeProp(gm).propagate(*args, **kwargs)
     except Exception as exc:
         _LOGGER.debug("ShapeProp failed: %s", exc)
-
 
 def capture(
     q: torch.Tensor,
@@ -1012,7 +905,6 @@ def capture(
         include_softmax_scale_dropout=include_softmax_scale_dropout,
     )
 
-
 class _TensorShape:
     def __init__(self, shape: Tuple[int, ...]) -> None:
         self.shape = tuple(int(x) for x in shape)
@@ -1023,15 +915,9 @@ class _TensorShape:
         for v in self.shape:
             n *= int(v)
         return int(n)
-
-
-@dataclass
 class _Acc:
     total: float = 0.0
     by_type: Dict[str, float] = field(default_factory=dict)
-
-
-@dataclass
 class _ProfilerConfig:
     include_bias: bool
     effective_bwd: float
@@ -1040,13 +926,11 @@ class _ProfilerConfig:
     count_softmax: bool
     count_dropout: bool
     count_embedding: bool
-
-
 class _OpFlopDispatchMode(TorchDispatchMode):
-    # Opt-in to run HigherOrderOperator-based ops (e.g., flex_attention) under
-    # this TorchDispatchMode.
+
+
     supports_higher_order_operators = True
-    # PyTorch requires opt-in for HigherOrderOperator dispatch under TorchDispatchMode.
+
     supports_higher_order_operators = True
 
     def __init__(
@@ -1258,9 +1142,9 @@ class _OpFlopDispatchMode(TorchDispatchMode):
         if kwargs is None:
             kwargs = {}
 
-        # If a higher-order operator is invoked under this mode, we don't attempt
-        # to profile it here. Returning NotImplemented allows PyTorch to run the
-        # operator via its default path without raising.
+
+
+
         if HigherOrderOperator and isinstance(func, HigherOrderOperator):
             return NotImplemented
 
@@ -1592,8 +1476,6 @@ class _OpFlopDispatchMode(TorchDispatchMode):
         return _flops_elementwise(
             out, coeff=1.0, effective_bwd=self._effective_bwd
         )
-
-
 class _GraphProfiler:
     def __init__(
         self,
@@ -2136,8 +2018,6 @@ class _GraphProfiler:
             total += float(flops)
             by[typ] = by.get(typ, 0.0) + float(flops)
         return float(total), by
-
-
 class _FlopProfiler:
     _stack_var: contextvars.ContextVar[Tuple[_Acc, ...]] = (
         contextvars.ContextVar("stnet_flops_stack", default=())
@@ -2360,8 +2240,6 @@ class _FlopProfiler:
         if total > 0.0:
             self.add("Attention", total)
         return float(total)
-
-
 class _NvtxFlops(contextlib.AbstractContextManager[Any]):
     def __init__(
         self, dev: Optional[torch.device], getter: Callable[[], float]
@@ -2401,8 +2279,6 @@ class _NvtxFlops(contextlib.AbstractContextManager[Any]):
             return max(0.0, cur - float(self._base))
         except Exception:
             return 0.0
-
-
 class _TorchFlops(contextlib.AbstractContextManager[Any]):
     def __init__(self, profile_fn: Callable[..., Any], show: bool) -> None:
         self._profile_fn = profile_fn
@@ -2438,8 +2314,6 @@ class _TorchFlops(contextlib.AbstractContextManager[Any]):
             return float(sum(getattr(e, "flops", 0.0) for e in events))
         except Exception:
             return 0.0
-
-
 class _TorchFlopsCompat(contextlib.AbstractContextManager[Any]):
     def __init__(self, show: bool) -> None:
         try:
@@ -2471,8 +2345,6 @@ class _TorchFlopsCompat(contextlib.AbstractContextManager[Any]):
             return float(self._impl.get_total_flops())
         except Exception:
             return 0.0
-
-
 class _Flops(contextlib.AbstractContextManager[Any]):
     def __init__(
         self,
@@ -2591,8 +2463,6 @@ class _Flops(contextlib.AbstractContextManager[Any]):
             for name, value in items[:top_k]:
                 lines.append(f"  - {name}: {value:.3e}")
         return "\n".join(lines)
-
-
 class _StaticFlops(contextlib.AbstractContextManager[Any]):
     def __init__(self, total: float, breakdown: Dict[str, float]) -> None:
         self.manual_total = float(total)
@@ -2634,8 +2504,6 @@ class _StaticFlops(contextlib.AbstractContextManager[Any]):
             for name, value in items[:top_k]:
                 lines.append(f"  - {name}: {value:.3e}")
         return "\n".join(lines)
-
-
 class _DynamicFlops(contextlib.AbstractContextManager[Any]):
     def __init__(
         self,
@@ -2712,7 +2580,6 @@ class _DynamicFlops(contextlib.AbstractContextManager[Any]):
             return _StaticFlops(self.total, self.manual_breakdown).verbose(
                 top_k=top_k
             )
-
 
 class FlopCounter:
     def __init__(
@@ -2946,5 +2813,19 @@ class FlopCounter:
             dispatch_mode=None,
         )
 
+try:
+    from torch._ops import OpOverload, OpOverloadPacket
+except Exception:
+    OpOverload = tuple()
+    OpOverloadPacket = tuple()
+try:
+    from torch.utils._python_dispatch import TorchDispatchMode
+except Exception:
+    TorchDispatchMode = None
+try:
 
-FLOP_PROFILER = _FlopProfiler()
+
+
+    from torch._higher_order_ops.higher_order_operator import HigherOrderOperator
+except Exception:
+    HigherOrderOperator = tuple()
