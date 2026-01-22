@@ -3,9 +3,9 @@ requires = ["setuptools>=69", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "stnet-pytorch"
+name = "enn-torch"
 version = "1.0.0"
-description = "Spatio-temporal modular neural network (MNN) model implemented with PyTorch"
+description = "Elastic neural network (ENN) framework for spatio-temporal modeling"
 readme = { file = "README.md", content-type = "text/markdown" }
 requires-python = ">=3.12"
 license = { file = "LICENSE" }
@@ -54,8 +54,8 @@ dependencies = [
 ]
 
 [project.urls]
-Repository = "https://github.com/P-R-N-D/STNet-PyTorch"
-Issues = "https://github.com/P-R-N-D/STNet-PyTorch/issues"
+Repository = "https://github.com/P-R-N-D/ENN-PyTorch"
+Issues = "https://github.com/P-R-N-D/ENN-PyTorch/issues"
 
 [project.optional-dependencies]
 safetensors = ["safetensors>=0.4.0"]
