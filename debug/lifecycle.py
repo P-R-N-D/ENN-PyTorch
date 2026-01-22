@@ -16,9 +16,9 @@ import psutil
 import torch
 from tensordict import TensorDict
 
-from stnet.api import new_model, predict, train
-from stnet.config import ModelConfig, PatchConfig
-from stnet.core.system import get_device
+from enn_torch.api import new_model, predict, train
+from enn_torch.config import ModelConfig, PatchConfig
+from enn_torch.core.system import get_device
 
 COL_DIR = "방향"
 COL_ROUTE = "노선"
@@ -270,7 +270,7 @@ def main() -> None:
     print("sys._is_gil_enabled available:", hasattr(sys, "_is_gil_enabled"))
     print("GIL enabled?:", getattr(sys, "_is_gil_enabled", lambda: None)())
 
-    os.environ.setdefault("STNET_PREBATCH", "1")
+    os.environ.setdefault("ENN_PREBATCH", "1")
     excel_path = os.path.abspath("raw_data.xlsx")
     if not os.path.isfile(excel_path):
         raise FileNotFoundError(excel_path)
@@ -315,7 +315,7 @@ def main() -> None:
         in_dim=td_train["X"].shape[1], out_shape=(S, T), config=config
     ).to(device)
     train_epochs = 6
-    print("[train] starting... (elastic_launch inside stnet.api.train)")
+    print("[train] starting... (elastic_launch inside enn_torch.api.train)")
     trained_model, train_metrics = monitor_run(
         lambda: train(
             model,

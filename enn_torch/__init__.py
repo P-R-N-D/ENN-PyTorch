@@ -27,8 +27,8 @@ __all__ = [
 
 def __getattr__(name: str) -> ModuleType:
     if name in {"core", "data", "nn", "runtime", "api", "config"}:
-        return importlib.import_module(f"stnet.{name}")
-    raise AttributeError(f"module 'stnet' has no attribute {name!r}")
+        return importlib.import_module(f"enn_torch.{name}")
+    raise AttributeError(f"module 'enn_torch' has no attribute {name!r}")
 
 
 def new_model(*args: Any, **kwargs: Any) -> Model:

@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "enn-torch"
 version = "1.0.0"
-description = "Modular neural network runtime for elastic, efficient, robust, and fault-tolerent spatio-temporal modeling"
+description = "Modular neural networks for high-performance computing (HPC) — robust and efficient by design, elastic and fault-tolerant in execution"
 readme = { file = "README.md", content-type = "text/markdown" }
 requires-python = ">=3.12"
 license = { file = "LICENSE" }

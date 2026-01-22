@@ -364,7 +364,7 @@ def default_underflow_action() -> str:
     raw = (
         str(
             env_first(
-                ("STNET_DATA_UNDERFLOW_ACTION", "STNET_UNDERFLOW_ACTION"),
+                ("ENN_DATA_UNDERFLOW_ACTION", "ENN_UNDERFLOW_ACTION"),
                 default="warn",
             )
             or "warn"

@@ -75,9 +75,9 @@ def _get_throttle_state() -> str:
         str(
             env_first(
                 (
-                    "STNET_CACHE_BACKPRESSURE_MODE",
-                    "STNET_CACHE_BACKPRESSURE",
-                    "STNET_CACHE_MODE",
+                    "ENN_CACHE_BACKPRESSURE_MODE",
+                    "ENN_CACHE_BACKPRESSURE",
+                    "ENN_CACHE_MODE",
                 ),
                 default="block",
             )
@@ -99,8 +99,8 @@ def _get_throttle_timeout() -> float:
         float(
             env_first_float(
                 (
-                    "STNET_CACHE_BACKPRESSURE_TIMEOUT_S",
-                    "STNET_CACHE_SUBMIT_TIMEOUT_S",
+                    "ENN_CACHE_BACKPRESSURE_TIMEOUT_S",
+                    "ENN_CACHE_SUBMIT_TIMEOUT_S",
                 ),
                 default=0.05,
             )
@@ -112,8 +112,8 @@ def _get_throttle_timeout() -> float:
 def _is_early_release_enabled() -> bool:
     return bool(
         env_flag(
-            "STNET_CACHE_EARLY_RELEASE",
-            "STNET_CACHE_RELEASE_EARLY",
+            "ENN_CACHE_EARLY_RELEASE",
+            "ENN_CACHE_RELEASE_EARLY",
             default=True,
         )
     )
@@ -121,7 +121,7 @@ def _is_early_release_enabled() -> bool:
 
 def _is_force_unpin_enabled() -> bool:
     return bool(
-        env_flag("STNET_CACHE_FORCE_UNPIN", "STNET_CACHE_UNPIN", default=False)
+        env_flag("ENN_CACHE_FORCE_UNPIN", "ENN_CACHE_UNPIN", default=False)
     )
 
 
@@ -131,15 +131,15 @@ def _prod_int(shape: Sequence[int]) -> int:
 
 def _is_affinity_enabled() -> bool:
     return bool(
-        env_flag("STNET_EXECUTOR_AFFINITY", "STNET_AFFINITY", default=True)
+        env_flag("ENN_EXECUTOR_AFFINITY", "ENN_AFFINITY", default=True)
     )
 
 
 def _is_affinity_strict() -> bool:
     return bool(
         env_flag(
-            "STNET_EXECUTOR_AFFINITY_STRICT",
-            "STNET_AFFINITY_STRICT",
+            "ENN_EXECUTOR_AFFINITY_STRICT",
+            "ENN_AFFINITY_STRICT",
             default=False,
         )
     )
@@ -156,10 +156,10 @@ def _is_inner_thread_limited(wl: str) -> bool:
     wl = str(wl or "").strip().lower()
     if wl not in {"cpu", "compute"}:
         return False
-    if not bool(env_flag("STNET_EXECUTOR_LIMIT_INNER_THREADS", default=True)):
+    if not bool(env_flag("ENN_EXECUTOR_LIMIT_INNER_THREADS", default=True)):
         return False
     if not bool(
-        env_flag("STNET_EXECUTOR_TORCH_OUTER_PARALLELISM", default=True)
+        env_flag("ENN_EXECUTOR_TORCH_OUTER_PARALLELISM", default=True)
     ):
         return False
     return True
@@ -205,14 +205,14 @@ def _init_env(key: str, value: str, *args: Any, force: bool) -> None:
 
 def _limit_inner_threads(threads: int, *args: Any, force: bool = False) -> int:
     t = max(1, int(threads))
-    ov = env_first_int(("STNET_EXECUTOR_INNER_THREADS",), default=0) or 0
+    ov = env_first_int(("ENN_EXECUTOR_INNER_THREADS",), default=0) or 0
     if int(ov) > 0:
         t = max(1, int(ov))
     force = bool(force) or bool(
-        env_flag("STNET_EXECUTOR_FORCE_INNER_THREADS", default=False)
+        env_flag("ENN_EXECUTOR_FORCE_INNER_THREADS", default=False)
     )
     cap_down = bool(
-        env_flag("STNET_EXECUTOR_CAP_DOWN_INNER_THREADS", default=True)
+        env_flag("ENN_EXECUTOR_CAP_DOWN_INNER_THREADS", default=True)
     )
     for k in _ENV_INNER_THREAD_VARS:
         _set_concurrency_env(k, str(t), force=force, cap_down=cap_down)
@@ -227,14 +227,14 @@ def _limit_inner_threads(threads: int, *args: Any, force: bool = False) -> int:
 
 def _is_outer_concurrency_limited() -> bool:
     return bool(
-        env_flag("STNET_EXECUTOR_LIMIT_OUTER_CONCURRENCY", default=True)
+        env_flag("ENN_EXECUTOR_LIMIT_OUTER_CONCURRENCY", default=True)
     )
 
 
 def _max_outer_concurrency() -> int:
     return int(
         env_first_int(
-            ("STNET_EXECUTOR_OUTER_CONCURRENCY", "STNET_EXECUTOR_OUTER_LIMIT"),
+            ("ENN_EXECUTOR_OUTER_CONCURRENCY", "ENN_EXECUTOR_OUTER_LIMIT"),
             default=0,
         )
         or 0
@@ -245,7 +245,7 @@ def _outer_concurrency_mode() -> str:
     s = (
         str(
             env_first(
-                ("STNET_EXECUTOR_OUTER_CONCURRENCY_MODE",), default="auto"
+                ("ENN_EXECUTOR_OUTER_CONCURRENCY_MODE",), default="auto"
             )
             or "auto"
         )
@@ -256,12 +256,12 @@ def _outer_concurrency_mode() -> str:
 
 
 def _are_processes_limited() -> bool:
-    return bool(env_flag("STNET_EXECUTOR_CAP_PROCESS_WORKERS", default=True))
+    return bool(env_flag("ENN_EXECUTOR_CAP_PROCESS_WORKERS", default=True))
 
 
 def _target_process_workers() -> int:
     return int(
-        env_first_int(("STNET_EXECUTOR_PROCESS_TARGET_WORKERS",), default=0)
+        env_first_int(("ENN_EXECUTOR_PROCESS_TARGET_WORKERS",), default=0)
         or 0
     )
 
@@ -408,7 +408,7 @@ def _executor_scope_start(
     role: str, wl: str, prefix: str, mw: int, cpw: int, ordinal: int, ncpu: int
 ) -> int:
     seed = env_first(
-        ("STNET_EXECUTOR_AFFINITY_SEED", "STNET_AFFINITY_SEED"), default="0"
+        ("ENN_EXECUTOR_AFFINITY_SEED", "ENN_AFFINITY_SEED"), default="0"
     )
     key = f"{seed}|pid={os.getpid()}|role={role}|wl={wl}|pfx={prefix}|mw={mw}|cpw={cpw}|ord={ordinal}"
     h = _hash32(key)
@@ -586,12 +586,12 @@ def new_executor(
     max_workers: int,
     *args: Any,
     workload: str = "io",
-    name: str = "stnet",
+    name: str = "enn_torch",
     prefer_interpreters: bool | None = None,
 ) -> futures.Executor:
     mw = max(1, int(max_workers))
     wl = str(workload or "io").strip().lower()
-    prefix = str(name or "stnet").strip() or "stnet"
+    prefix = str(name or "enn_torch").strip() or "enn_torch"
 
     executor_kind = "thread"
     if wl in {"cpu", "compute"}:
@@ -600,7 +600,7 @@ def new_executor(
         else:
             if prefer_interpreters is None:
                 prefer_interpreters = bool(
-                    env_flag("STNET_PREFER_INTERPRETER_POOL", default=True)
+                    env_flag("ENN_PREFER_INTERPRETER_POOL", default=True)
                 )
             if bool(prefer_interpreters) and is_interpreter_pool_supported():
                 executor_kind = "interpreter"
@@ -657,8 +657,8 @@ def new_executor(
                     cpw = int(
                         env_first_int(
                             (
-                                "STNET_EXECUTOR_CORES_PER_WORKER_CPU",
-                                "STNET_AFFINITY_CORES_PER_WORKER_CPU",
+                                "ENN_EXECUTOR_CORES_PER_WORKER_CPU",
+                                "ENN_AFFINITY_CORES_PER_WORKER_CPU",
                             ),
                             default=default_cpw,
                         )
@@ -1026,7 +1026,7 @@ class Prefetcher:
         self._join_timeout_s = 0.5
         with contextlib.suppress(Exception):
             jt_ms = int(
-                env_first_int(("STNET_THREAD_JOIN_TIMEOUT_MS",), default=500)
+                env_first_int(("ENN_THREAD_JOIN_TIMEOUT_MS",), default=500)
                 or 500
             )
             self._join_timeout_s = max(0.0, float(jt_ms) / 1000.0)
@@ -1626,7 +1626,7 @@ class BufferQueue:
         self._stop = threading.Event()
         self._cv = threading.Condition()
         self._warn_blocking = env_flag(
-            "STNET_BUFFER_WARN_BLOCKING", "STNET_DEBUG", default=False
+            "ENN_BUFFER_WARN_BLOCKING", "ENN_DEBUG", default=False
         )
 
     def put(
@@ -1755,10 +1755,10 @@ class Thread:
         self._omp_ok = bool(allow_omp_bind) and bool(self.spread_threads())
 
         self._flush_every = max(
-            1, int(env_first_int(("STNET_TLB_FLUSH_EVERY",), 256))
+            1, int(env_first_int(("ENN_TLB_FLUSH_EVERY",), 256))
         )
         self._sample_every = max(
-            1, int(env_first_int(("STNET_TLB_SAMPLE_EVERY",), 8))
+            1, int(env_first_int(("ENN_TLB_SAMPLE_EVERY",), 8))
         )
 
     @staticmethod
@@ -1825,7 +1825,7 @@ class Thread:
             distribute_default = local_world > 1
             distribute = bool(
                 env_first_int(
-                    ("STNET_DISTRIBUTE_THREAD_CAP",), int(distribute_default)
+                    ("ENN_DISTRIBUTE_THREAD_CAP",), int(distribute_default)
                 )
             )
             thread_cap = _optimal_threads(
@@ -2002,7 +2002,7 @@ class Thread:
             distribute_default = local_world > 1
             distribute = bool(
                 env_first_int(
-                    ("STNET_DISTRIBUTE_THREAD_CAP",), int(distribute_default)
+                    ("ENN_DISTRIBUTE_THREAD_CAP",), int(distribute_default)
                 )
             )
             thread_cap = _optimal_threads(

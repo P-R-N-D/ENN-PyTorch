@@ -18,10 +18,10 @@ import numpy as np
 import torch
 from tensordict import TensorDict
 
-from stnet.api import new_model, train
-from stnet.config import ModelConfig, PatchConfig
-from stnet.core.tensor import extract_tensor, from_buffer
-from stnet.runtime.io import Exporter
+from enn_torch.api import new_model, train
+from enn_torch.config import ModelConfig, PatchConfig
+from enn_torch.core.tensor import extract_tensor, from_buffer
+from enn_torch.runtime.io import Exporter
 
 from .lifecycle import build_dataset
 
@@ -278,7 +278,7 @@ def _draft_export_diagnostics(
         return info
 
     try:
-        from stnet.runtime.wrappers import _onnx_model, _TensorOutputModule
+        from enn_torch.runtime.wrappers import _onnx_model, _TensorOutputModule
     except Exception as exc:
         info["error"] = f"could not import ONNX wrapper helpers: {exc!r}"
         return info
@@ -441,7 +441,7 @@ def export_and_validate(
     except Exception as exc:
         state_path = None
         results["_state_save_error"] = repr(exc)
-    with _temp_env("STNET_DISABLE_PIECEWISE_CALIB", "1"):
+    with _temp_env("ENN_DISABLE_PIECEWISE_CALIB", "1"):
         for name, path in targets.items():
             if state_path is not None and name in ("onnx", "ort", "tensorrt"):
                 results[name] = _run_isolated_export(
@@ -492,7 +492,7 @@ def export_and_validate(
         validation["label_stats_error"] = repr(exc)
     pt2_path = targets["pt2"]
     if pt2_path.exists():
-        with _temp_env("STNET_DISABLE_PIECEWISE_CALIB", "1"):
+        with _temp_env("ENN_DISABLE_PIECEWISE_CALIB", "1"):
             try:
                 with from_buffer():
                     ep = torch.export.load(str(pt2_path))
@@ -545,7 +545,7 @@ def export_and_validate(
         def _truthy(v: str) -> bool:
             return v.strip().lower() in ("1", "true", "yes", "y", "on")
 
-        do_alt = _truthy(os.environ.get("STNET_VALIDATE_ALT_BATCH", "0"))
+        do_alt = _truthy(os.environ.get("ENN_VALIDATE_ALT_BATCH", "0"))
         if (
             "pt2_error" not in validation
             and do_alt
@@ -578,7 +578,7 @@ def export_and_validate(
     if isinstance(onnx_res, dict) and onnx_res.get("status") == "error":
         err = str(onnx_res.get("error", ""))
         if _should_run_draft(err):
-            if os.environ.get("STNET_ONNX_DRAFT_EXPORT", "1") != "0":
+            if os.environ.get("ENN_ONNX_DRAFT_EXPORT", "1") != "0":
                 validation["onnx_draft_export"] = _draft_export_diagnostics(
                     model, sample
                 )
@@ -586,7 +586,7 @@ def export_and_validate(
     for name in ("onnx", "ort"):
         path = targets[name]
         if path.exists():
-            with _temp_env("STNET_DISABLE_PIECEWISE_CALIB", "1"):
+            with _temp_env("ENN_DISABLE_PIECEWISE_CALIB", "1"):
                 try:
                     import onnxruntime as ort
 
@@ -620,8 +620,8 @@ def main() -> None:
             _export_only_main(args.export_only, args.out, args.state)
         )
 
-    os.environ.setdefault("STNET_PREBATCH", "1")
-    os.environ.setdefault("STNET_PREFETCH_FACTOR", "1")
+    os.environ.setdefault("ENN_PREBATCH", "1")
+    os.environ.setdefault("ENN_PREFETCH_FACTOR", "1")
     data, td_train, model, sample = _build_model_and_sample(
         torch.device("cpu")
     )

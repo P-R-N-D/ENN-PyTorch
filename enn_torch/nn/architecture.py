@@ -331,7 +331,7 @@ class TemporalExtractor(nn.Module):
         if state is None:
             return None
         strict = env_bool(
-            ("STNET_STRICT_TEMPORAL_STATE", "STNET_STRICT_STATE"),
+            ("ENN_STRICT_TEMPORAL_STATE", "ENN_STRICT_STATE"),
             default=False,
         )
 
@@ -2207,13 +2207,13 @@ class Model(nn.Module):
         if not isinstance(X, torch.Tensor):
             return 64
         b = int(X.shape[0] if X.ndim > 0 else 1)
-        hard_max = int(env_int("STNET_MICROBATCH_MAX", 64))
+        hard_max = int(env_int("ENN_MICROBATCH_MAX", 64))
         hard_max = max(1, min(hard_max, b))
         per_sample = int(
             env_first_int(
                 (
-                    "STNET_PER_SAMPLE_MEM_BYTES",
-                    "STNET_DEVICE_BYTES_PER_SAMPLE",
+                    "ENN_PER_SAMPLE_MEM_BYTES",
+                    "ENN_DEVICE_BYTES_PER_SAMPLE",
                 ),
                 default=0,
             )
@@ -2223,7 +2223,7 @@ class Model(nn.Module):
             one = X[:1]
             bytes_per_sample = int(one.nelement()) * int(one.element_size())
             per_sample = int(bytes_per_sample * 8)
-        stage_div = max(1, int(env_int("STNET_MICROBATCH_STAGE_DIV", 4)))
+        stage_div = max(1, int(env_int("ENN_MICROBATCH_STAGE_DIV", 4)))
         per_sample = max(1, int(per_sample // stage_div))
         mb_size = _autofit_microbatch(
             device=device, hard_max=hard_max, per_sample_bytes=per_sample

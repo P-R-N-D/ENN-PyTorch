@@ -160,7 +160,7 @@ def _parse_meta(p: PathLike) -> Mapping[str, Any]:
 
 def _is_execution_time_logged() -> bool:
     return env_bool(
-        ("STNET_LOG_TIMINGS", "STNET_TIMINGS", "STNET_DEBUG_TIMINGS"),
+        ("ENN_LOG_TIMINGS", "ENN_TIMINGS", "ENN_DEBUG_TIMINGS"),
         default=False,
     )
 
@@ -1032,7 +1032,7 @@ def train(
 
         _max_nodes = int(max_nodes) if max_nodes is not None else 1
         use_local_init = env_bool(
-            "STNET_INIT_CKPT_LOCAL", default=(_max_nodes <= 1)
+            "ENN_INIT_CKPT_LOCAL", default=(_max_nodes <= 1)
         )
         if use_local_init:
             init_dir = tempfile.mkdtemp(prefix=f"stnet_init_ckpt_{run_id}_")
@@ -1058,7 +1058,7 @@ def train(
 
         parent_to_meta = False
         if isinstance(model, torch.nn.Module) and env_bool(
-            "STNET_PARENT_MODEL_TO_META", default=True
+            "ENN_PARENT_MODEL_TO_META", default=True
         ):
             with contextlib.suppress(Exception):
                 model.to("meta")

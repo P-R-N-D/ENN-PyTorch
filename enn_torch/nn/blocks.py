@@ -36,7 +36,7 @@ _MODELING_TYPE_ALIASES: dict[str, str] = {
     "spatiotemporal": "st",
     "spatio-temporal": "st",
 }
-_STNET_HAS_FLEX_ATTENTION = getattr(
+_ENN_HAS_FLEX_ATTENTION = getattr(
     import_module(".layers", __package__), "_HAS_FLEX_ATTENTION", False
 )
 
@@ -239,7 +239,7 @@ class RetNet(nn.Module):
     ) -> Tuple[torch.Tensor, Optional[dict]]:
         if getattr(x, "is_meta", False) and (not is_symbolic()):
             strict = str(
-                os.environ.get("STNET_STRICT_META_FAKE", "0")
+                os.environ.get("ENN_STRICT_META_FAKE", "0")
             ).strip().lower() in {"1", "true", "yes", "y"}
             if strict:
                 raise RuntimeError("meta tensor reached RetNet.forward")
@@ -353,7 +353,7 @@ class LongNet(nn.Module):
             )
             peak = 0
             flex = (
-                _STNET_HAS_FLEX_ATTENTION and out.is_cuda and not need_weights
+                _ENN_HAS_FLEX_ATTENTION and out.is_cuda and not need_weights
             )
             for lyr in self.layers:
                 dense = not (

@@ -454,8 +454,8 @@ def compile(
                 ):
                     override = env_first(
                         (
-                            "STNET_INDUCTOR_COMPILE_THREADS",
-                            "STNET_COMPILE_THREADS",
+                            "ENN_INDUCTOR_COMPILE_THREADS",
+                            "ENN_COMPILE_THREADS",
                         ),
                         None,
                     )
@@ -470,7 +470,7 @@ def compile(
                     else:
                         local_world = env_first_int(
                             (
-                                "STNET_LOCAL_WORLD_SIZE",
+                                "ENN_LOCAL_WORLD_SIZE",
                                 "LOCAL_WORLD_SIZE",
                                 "SLURM_NTASKS_PER_NODE",
                             ),
@@ -529,8 +529,8 @@ def compile(
                     ):
                         override_raw = env_first(
                             (
-                                "STNET_INDUCTOR_COMPILE_THREADS",
-                                "STNET_COMPILE_THREADS",
+                                "ENN_INDUCTOR_COMPILE_THREADS",
+                                "ENN_COMPILE_THREADS",
                                 "TORCHINDUCTOR_COMPILE_THREADS",
                             )
                         )
@@ -600,7 +600,7 @@ def compile(
 
 
 def torch_compiler_supported() -> bool:
-    if env_bool("STNET_TORCH_COMPILE", default=True) is False:
+    if env_bool("ENN_TORCH_COMPILE", default=True) is False:
         return False
     compile_fn = getattr(torch, "compile", None)
     if not callable(compile_fn):
@@ -753,9 +753,9 @@ def compile_safe(
         compile_distributed_safe()
     if layers_module is None:
         for mod_name in (
-            "stnet.nn.layers",
-            "stnet.nn.blocks",
-            "stnet.nn.architecture",
+            "enn_torch.nn.layers",
+            "enn_torch.nn.blocks",
+            "enn_torch.nn.architecture",
         ):
             with suppress(Exception):
                 layers_module = importlib.import_module(mod_name)
@@ -766,7 +766,7 @@ def compile_safe(
         else None
     )
     if scaler_cls is None:
-        for mod_name in ("stnet.nn.layers", "stnet.nn.blocks"):
+        for mod_name in ("enn_torch.nn.layers", "enn_torch.nn.blocks"):
             with suppress(Exception):
                 mod = importlib.import_module(mod_name)
                 scaler_cls = getattr(mod, "Scaler", None)
@@ -793,7 +793,7 @@ def compile_safe(
         else None
     )
     if history_cls is None:
-        for mod_name in ("stnet.nn.layers", "stnet.nn.blocks"):
+        for mod_name in ("enn_torch.nn.layers", "enn_torch.nn.blocks"):
             with suppress(Exception):
                 mod = importlib.import_module(mod_name)
                 history_cls = getattr(mod, "Recorder", None)
@@ -970,10 +970,10 @@ def coerce_checkpoint(
     ):
         return fn(*args)
     force_reentrant = env_first(
-        ("STNET_CKPT_REQUIRE_REENTRANT",), default=None
+        ("ENN_CKPT_REQUIRE_REENTRANT",), default=None
     )
     require_reentrant = (
-        env_bool("STNET_CKPT_REQUIRE_REENTRANT", default=False)
+        env_bool("ENN_CKPT_REQUIRE_REENTRANT", default=False)
         if force_reentrant is not None
         else bool(is_dtensor_active())
     )
@@ -1038,7 +1038,7 @@ def coerce_checkpoint(
 
     if require_reentrant:
         raise TypeError(
-            "DTensor/FSDP2 checkpointing requires `use_reentrant=True`, but torch.utils.checkpoint.checkpoint did not accept a compatible signature in this runtime. Upgrade PyTorch or set STNET_CKPT_REQUIRE_REENTRANT=0 to override."
+            "DTensor/FSDP2 checkpointing requires `use_reentrant=True`, but torch.utils.checkpoint.checkpoint did not accept a compatible signature in this runtime. Upgrade PyTorch or set ENN_CKPT_REQUIRE_REENTRANT=0 to override."
         ) from last_type_error
     return checkpoint(fn, *args, **ckpt_kwargs)
 
