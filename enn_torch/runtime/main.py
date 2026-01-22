@@ -4045,25 +4045,27 @@ def epochs(
                     )
                     _coerce_dcp_keys(model_sd)
                     _LOGGER.info(
-                        "Training (%s) Updating Checkpoint (Total = %d, Finished = %d)",
+                        "Training (%s) Updating Checkpoint %d%% (Total = %d, Finished = %d)",
                         str(device.type).upper(),
+                        round(float(int(epoch_idx)/int(ops.epochs))),
                         int(ops.epochs),
                         int(epoch_idx),
                     )
                     print(
-                        f"Training ({str(device.type).upper()}) Updating Checkpoint (Total = {int(ops.epochs)}, Finished = {int(epoch_idx)})",
+                        f"Training ({str(device.type).upper()}) Updating Checkpoint {round(float(int(epoch_idx)/int(ops.epochs)))}% (Total = {int(ops.epochs)}, Finished = {int(epoch_idx)})",
                         flush=True,
                     )
                     torch.save(model_sd, tmp_path)
                     os.replace(tmp_path, ckpt_path)
                     _LOGGER.info(
-                        "Training (%s) Updated Checkpoint (Total = %d, Finished = %d)",
+                        "Training (%s) Updated Checkpoint %d%% (Total = %d, Finished = %d)",
                         str(device.type).upper(),
+                        round(float(int(epoch_idx + 1)/int(ops.epochs))),
                         int(ops.epochs),
                         int(epoch_idx + 1),
                     )
                     print(
-                        f"Training ({str(device.type).upper()}) Updated Checkpoint (Total = {int(ops.epochs)}, Finished = {int(epoch_idx + 1)})",
+                        f"Training ({str(device.type).upper()}) Updated Checkpoint {round(float(int(epoch_idx + 1)/int(ops.epochs)))}% (Total = {int(ops.epochs)}, Finished = {int(epoch_idx + 1)})",
                         flush=True,
                     )
                     try:
