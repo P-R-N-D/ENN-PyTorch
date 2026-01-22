@@ -1,6 +1,6 @@
 # ENN-PyTorch
 
-Spatio‑temporal modular neural network (MNN) model for PyTorch with pragmatic utilities for data pipelines, training, export, and system tuning. The package is structured to keep the *model code* small while providing a clean façade over configuration, I/O, distributed runtime, and export helpers.
+Modular neural networks for high-performance computing (HPC), implemented by using PyTorch. This features pragmatic utilities for data pipelines, training, export, and system tuning. The package is structured to keep the *model code* small while providing a clean façade over configuration, I/O, distributed runtime, and export helpers.
 
 This repository also includes a worked example notebook (`notebook.ipynb`) and a sample data (`raw_data.xlsx`) demonstrating a tabular‑to‑grid regression workflow.
 
