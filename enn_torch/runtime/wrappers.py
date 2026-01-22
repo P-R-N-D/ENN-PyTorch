@@ -16,7 +16,7 @@ import weakref
 from dataclasses import dataclass
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from typing import Any, Callable, Iterator, Sequence, Self
+from typing import Any, Callable, Iterator, Protocol, Sequence, Self
 
 import torch
 from tensordict import TensorDict
@@ -26,7 +26,7 @@ from ..core.concurrency import Mutex
 from ..core.datatypes import PathLike, write_json
 from ..core.tensor import extract_tensor, from_buffer
 from ..nn.layers import Recorder
-from .io import Format, _load_model_config, _temp_environ, is_required
+from .io import _load_model_config, _temp_environ, is_required
 
 _EXPORT_SIG_CACHE: object | None = None
 _EXPORT_SIG_LOCK = Mutex()
@@ -861,6 +861,14 @@ class ModulePath:
 class CallArguments:
     args: tuple[Any, ...]
     kwargs: dict[str, Any]
+
+
+class Format(Protocol):
+    name: str | None
+
+    def save(
+        self: Self, model: nn.Module, dst: PathLike, *args: Any, **kwargs: Any
+    ) -> object: ...
 
 
 class TorchInductor(Format):

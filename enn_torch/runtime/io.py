@@ -10,7 +10,7 @@ import tempfile
 import warnings
 import weakref
 from pathlib import Path
-from typing import Any, Iterator, Protocol, Sequence, Self
+from typing import TYPE_CHECKING, Any, Iterator, Sequence, Self
 
 import torch
 from torch import nn
@@ -19,6 +19,8 @@ from ..core.concurrency import Mutex
 from ..core.datatypes import PathLike, coerce_json, save_temp, write_json
 from ..core.distributed import distributed_barrier, is_rank0
 
+if TYPE_CHECKING:
+    from .wrappers import Format
 _IGNORED_WARNINGS = (
     "torch.distributed is disabled",
     "TypedStorage is deprecated",
@@ -147,14 +149,6 @@ def is_required(module: str, pip_hint: str | None = None) -> None:
         raise ImportError(
             f"{module} is required for this operation{hint}"
         ) from err
-
-
-class Format(Protocol):
-    name: str | None
-
-    def save(
-        self: Self, model: nn.Module, dst: PathLike, *args: Any, **kwargs: Any
-    ) -> object: ...
 
 
 class Builder:
