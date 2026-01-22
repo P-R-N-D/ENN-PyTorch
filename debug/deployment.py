@@ -92,7 +92,8 @@ def _run_isolated_export(
 ) -> dict[str, Any]:
     cmd = [
         sys.executable,
-        __file__,
+        "-m",
+        "debug.deployment",
         "--export-only",
         fmt_name,
         "--out",
