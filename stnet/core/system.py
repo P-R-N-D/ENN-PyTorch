@@ -1090,7 +1090,7 @@ def set_float32_precision(
     minor = _parse_int_prefix(parts[1]) if len(parts) > 1 else 0
 
     use_new_api = (
-        (major, minor) >= (2, 9)
+        (major, minor) >= (2, 8)
         and hasattr(torch, "backends")
         and hasattr(torch.backends, "cuda")
         and hasattr(torch.backends.cuda, "matmul")
