@@ -317,8 +317,8 @@ def _accel_event_poll_params() -> tuple[float, float, float]:
     start_us = int(
         env_first_int(
             (
-                "STNET_ACCEL_EVENT_POLL_START_US",
-                "STNET_CUDA_EVENT_POLL_START_US",
+                "ENN_ACCEL_EVENT_POLL_START_US",
+                "ENN_CUDA_EVENT_POLL_START_US",
             ),
             default=500,
         )
@@ -326,7 +326,7 @@ def _accel_event_poll_params() -> tuple[float, float, float]:
     )
     max_ms = int(
         env_first_int(
-            ("STNET_ACCEL_EVENT_POLL_MAX_MS", "STNET_CUDA_EVENT_POLL_MAX_MS"),
+            ("ENN_ACCEL_EVENT_POLL_MAX_MS", "ENN_CUDA_EVENT_POLL_MAX_MS"),
             default=50,
         )
         or 50
@@ -334,8 +334,8 @@ def _accel_event_poll_params() -> tuple[float, float, float]:
     stop_min_ms = int(
         env_first_int(
             (
-                "STNET_ACCEL_EVENT_POLL_STOP_MIN_MS",
-                "STNET_CUDA_EVENT_POLL_STOP_MIN_MS",
+                "ENN_ACCEL_EVENT_POLL_STOP_MIN_MS",
+                "ENN_CUDA_EVENT_POLL_STOP_MIN_MS",
             ),
             default=5,
         )
@@ -439,7 +439,7 @@ def _primary_device(
 
 
 def _resolve_memmap_store_float(*args: Any, negotiable: bool) -> torch.dtype:
-    req = str(env_str("STNET_MEMMAP_FLOAT_DTYPE") or "").strip()
+    req = str(env_str("ENN_MEMMAP_FLOAT_DTYPE") or "").strip()
     if req.startswith("torch."):
         req = req.split(".", 1)[1]
     req_dtype = getattr(torch, req, None) if req else None
@@ -775,7 +775,7 @@ def stream_memmap(
     if count_i <= 0:
         raise ValueError("count must be > 0")
     env_chunk = env_first_int(
-        ("STNET_MEMMAP_CHUNK_SIZE", "STNET_MEMMAP_CHUNK"), 0
+        ("ENN_MEMMAP_CHUNK_SIZE", "ENN_MEMMAP_CHUNK"), 0
     )
     if int(env_chunk) > 0:
         chunk_size = int(env_chunk)
@@ -840,11 +840,11 @@ def stream_memmap(
         if not bool(auto_chunk_adjusted):
             try:
                 target_bytes = int(
-                    env_first_int(("STNET_MEMMAP_CHUNK_BYTES",), 0)
+                    env_first_int(("ENN_MEMMAP_CHUNK_BYTES",), 0)
                 )
                 if target_bytes <= 0:
                     target_mb = int(
-                        env_first_int(("STNET_MEMMAP_CHUNK_MB",), 64)
+                        env_first_int(("ENN_MEMMAP_CHUNK_MB",), 64)
                     )
                     target_bytes = int(target_mb) * 1024 * 1024
                 avail = int(Memory.available() or 0)
@@ -871,7 +871,7 @@ def stream_memmap(
                     )
                 )
                 pass1_max = int(
-                    env_first_int(("STNET_MEMMAP_PASS1_CHUNK_MAX",), 256)
+                    env_first_int(("ENN_MEMMAP_PASS1_CHUNK_MAX",), 256)
                 )
                 if pass1_max > 0:
                     new_chunk = min(new_chunk, pass1_max)
@@ -913,9 +913,9 @@ def stream_memmap(
             0 if bool(features_only) else int(numpy.prod(label_shape))
         )
         row_bytes = max(1, (int(in_dim) + int(label_numel)) * int(elem_size))
-        target_bytes = env_first_int(("STNET_MEMMAP_CHUNK_BYTES",), 0)
+        target_bytes = env_first_int(("ENN_MEMMAP_CHUNK_BYTES",), 0)
         if int(target_bytes) <= 0:
-            target_mb = env_first_int(("STNET_MEMMAP_CHUNK_MB",), 64)
+            target_mb = env_first_int(("ENN_MEMMAP_CHUNK_MB",), 64)
             target_bytes = int(target_mb) * 1024 * 1024
         try:
             avail = int(Memory.available() or 0)
@@ -960,8 +960,8 @@ def stream_memmap(
             raise ValueError("shuffle=True requires get_by_indices")
         max_elems = env_first_int(
             (
-                "STNET_MEMMAP_RANDPERM_MAX_ELEMS",
-                "STNET_MEMMAP_SHUFFLE_MAX_ELEMS",
+                "ENN_MEMMAP_RANDPERM_MAX_ELEMS",
+                "ENN_MEMMAP_SHUFFLE_MAX_ELEMS",
             ),
             5_000_000,
         )

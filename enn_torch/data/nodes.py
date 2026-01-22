@@ -101,8 +101,8 @@ def _accel_event_poll_params() -> tuple[float, float, float]:
     start_us = int(
         env_first_int(
             (
-                "STNET_ACCEL_EVENT_POLL_START_US",
-                "STNET_CUDA_EVENT_POLL_START_US",
+                "ENN_ACCEL_EVENT_POLL_START_US",
+                "ENN_CUDA_EVENT_POLL_START_US",
             ),
             default=500,
         )
@@ -110,7 +110,7 @@ def _accel_event_poll_params() -> tuple[float, float, float]:
     )
     max_ms = int(
         env_first_int(
-            ("STNET_ACCEL_EVENT_POLL_MAX_MS", "STNET_CUDA_EVENT_POLL_MAX_MS"),
+            ("ENN_ACCEL_EVENT_POLL_MAX_MS", "ENN_CUDA_EVENT_POLL_MAX_MS"),
             default=50,
         )
         or 50
@@ -118,8 +118,8 @@ def _accel_event_poll_params() -> tuple[float, float, float]:
     stop_min_ms = int(
         env_first_int(
             (
-                "STNET_ACCEL_EVENT_POLL_STOP_MIN_MS",
-                "STNET_CUDA_EVENT_POLL_STOP_MIN_MS",
+                "ENN_ACCEL_EVENT_POLL_STOP_MIN_MS",
+                "ENN_CUDA_EVENT_POLL_STOP_MIN_MS",
             ),
             default=5,
         )
@@ -359,7 +359,7 @@ class Sampler(torch.utils.data.Sampler):
         l_dtype = dtype_from_name(
             self._meta.get("labels_dtype", "int64"), torch.int64
         )
-        self._include_row_ids = env_bool("STNET_INCLUDE_ROW_IDS", default=True)
+        self._include_row_ids = env_bool("ENN_INCLUDE_ROW_IDS", default=True)
         self._feat_path = feat_path
         self._lab_path = lab_path if lab_path else None
         self._feat_dtype = f_dtype
@@ -368,7 +368,7 @@ class Sampler(torch.utils.data.Sampler):
         if MemoryMappedTensor is None:
             raise ImportError(
                 "tensordict is required for MemoryMappedTensor-backed pipelines. "
-                "Please install 'tensordict' (or install stnet-pytorch with its default dependencies)."
+                "Please install 'tensordict' (or install enn_torch-pytorch with its default dependencies)."
             )
         self._features = MemoryMappedTensor.from_filename(
             filename=feat_path,
@@ -396,9 +396,9 @@ class Sampler(torch.utils.data.Sampler):
             default_tl = bool(CPU.is_optimized_for_no_gil())
         self._mmap_thread_local = env_bool(
             (
-                "STNET_MEMMAP_THREAD_LOCAL_HANDLES",
-                "STNET_MEMMAP_THREAD_LOCAL",
-                "STNET_NOGIL",
+                "ENN_MEMMAP_THREAD_LOCAL_HANDLES",
+                "ENN_MEMMAP_THREAD_LOCAL",
+                "ENN_NOGIL",
             ),
             default=default_tl,
         )
@@ -406,7 +406,7 @@ class Sampler(torch.utils.data.Sampler):
             cpu = int(CPU.count() or 8)
             default_max = max(8, min(64, cpu))
             self._mmap_thread_local_max = env_first_int(
-                ("STNET_MEMMAP_THREAD_LOCAL_MAX", "STNET_MEMMAP_TL_MAX"),
+                ("ENN_MEMMAP_THREAD_LOCAL_MAX", "ENN_MEMMAP_TL_MAX"),
                 default=default_max,
             )
             self._mmap_thread_local_max = int(self._mmap_thread_local_max)
@@ -519,7 +519,7 @@ class Sampler(torch.utils.data.Sampler):
         if MemoryMappedTensor is None:
             raise ImportError(
                 "tensordict is required for MemoryMappedTensor-backed pipelines. "
-                "Please install 'tensordict' (or install stnet-pytorch with its default dependencies)."
+                "Please install 'tensordict' (or install enn_torch-pytorch with its default dependencies)."
             )
         self._features = MemoryMappedTensor.from_filename(
             filename=str(self._feat_path),
@@ -818,7 +818,7 @@ class Sampler(torch.utils.data.Sampler):
                 if self._label_shape:
                     Y = Y.reshape(n, *self._label_shape)
                 out["Y"] = Y
-            pin_in_dataset = env_bool("STNET_PIN_IN_DATASET", default=False)
+            pin_in_dataset = env_bool("ENN_PIN_IN_DATASET", default=False)
             if pin_in_dataset and _is_accelerator_available():
                 with suppress(Exception):
                     out["X"] = out["X"].pin_memory()
@@ -1134,7 +1134,7 @@ class Loader:
         depth = max(1, int(prefetch_factor))
         with suppress(Exception):
             depth_env = int(
-                env_first_int(("STNET_PREFETCH_DEPTH",), default=0) or 0
+                env_first_int(("ENN_PREFETCH_DEPTH",), default=0) or 0
             )
             if depth_env > 0:
                 depth = int(depth_env)
@@ -1154,12 +1154,12 @@ class Loader:
         host_guard_mb = 1024 if self._non_blocking else 0
         with suppress(Exception):
             gpu_guard_mb = int(
-                env_first_int(("STNET_GPU_GUARD_MB",), default=gpu_guard_mb)
+                env_first_int(("ENN_GPU_GUARD_MB",), default=gpu_guard_mb)
                 or gpu_guard_mb
             )
         with suppress(Exception):
             host_guard_mb = int(
-                env_first_int(("STNET_HOST_GUARD_MB",), default=host_guard_mb)
+                env_first_int(("ENN_HOST_GUARD_MB",), default=host_guard_mb)
                 or host_guard_mb
             )
         self._gpu_guard_bytes = int(max(0, gpu_guard_mb) * (1 << 20))
@@ -1346,10 +1346,10 @@ class Stream(BufferQueue):
             and self._non_blocking
             and is_stream_supported(self._device.type)
         ):
-            use_pool = env_bool("STNET_PREFETCH_PIN_POOL", default=True)
+            use_pool = env_bool("ENN_PREFETCH_PIN_POOL", default=True)
             cap_default = max(8, max(2, int(self._depth) * 2))
             cap = env_first_int(
-                ("STNET_PREFETCH_PIN_POOL_CAPACITY",), default=cap_default
+                ("ENN_PREFETCH_PIN_POOL_CAPACITY",), default=cap_default
             )
             if use_pool and int(cap) > 0:
                 self._host_pool = TensorPagePool(
@@ -1360,13 +1360,13 @@ class Stream(BufferQueue):
         self._accel_event_pool: Optional[queue.SimpleQueue] = None
         self._session = bool(_session)
         ttl_ms = int(
-            env_first_int(("STNET_PREFETCH_GUARD_TTL_MS",), default=10) or 10
+            env_first_int(("ENN_PREFETCH_GUARD_TTL_MS",), default=10) or 10
         )
         self._guard_ttl_s = max(0.0, float(ttl_ms) / 1000.0)
         self._join_timeout_s = 0.5
         with suppress(Exception):
             jt_ms = int(
-                env_first_int(("STNET_THREAD_JOIN_TIMEOUT_MS",), default=500)
+                env_first_int(("ENN_THREAD_JOIN_TIMEOUT_MS",), default=500)
                 or 500
             )
             self._join_timeout_s = max(0.0, float(jt_ms) / 1000.0)

@@ -41,12 +41,12 @@ from .kernels import (
 )
 
 _DILATED_MASK_CACHE_ENTRY_MAX_BYTES = env_int(
-    "STNET_DILATED_MASK_CACHE_ENTRY_MAX_BYTES", 64 * 1024 * 1024
+    "ENN_DILATED_MASK_CACHE_ENTRY_MAX_BYTES", 64 * 1024 * 1024
 )
 _DILATED_MASK_CACHE_MAX = 32
-_DILATED_MASK_CACHE_MAX_L = env_int("STNET_DILATED_MASK_CACHE_MAX_L", 4096)
+_DILATED_MASK_CACHE_MAX_L = env_int("ENN_DILATED_MASK_CACHE_MAX_L", 4096)
 _FLEX_BLOCK_MASK_CACHE_EST_MAX_BYTES = env_int(
-    "STNET_FLEX_BLOCK_MASK_CACHE_EST_MAX_BYTES", 128 * 1024 * 1024
+    "ENN_FLEX_BLOCK_MASK_CACHE_EST_MAX_BYTES", 128 * 1024 * 1024
 )
 _FLEX_BLOCK_MASK_CACHE_MAX = 16
 TCache = TypeVar("TCache")
@@ -57,12 +57,12 @@ try:
 except Exception:
     create_block_mask = None
     _HAS_FLEX_ATTENTION = False
-if env_bool("STNET_NO_FLEX_ATTENTION", False) or env_bool(
-    "STNET_DISABLE_FLEX_ATTENTION", False
+if env_bool("ENN_NO_FLEX_ATTENTION", False) or env_bool(
+    "ENN_DISABLE_FLEX_ATTENTION", False
 ):
     _HAS_FLEX_ATTENTION = False
 _FLEX_KERNEL = FlexAttention(prefer_torch=True)
-_GATE_STATS_CKPT_FWD = env_bool("STNET_GATE_STATS_CKPT_FWD", False)
+_GATE_STATS_CKPT_FWD = env_bool("ENN_GATE_STATS_CKPT_FWD", False)
 _HAS_FLEX_ATTENTION = bool(
     _HAS_FLEX_ATTENTION and _FLEX_KERNEL.has_torch_backend
 )
@@ -1015,7 +1015,7 @@ class DilatedAttention(nn.Module):
                 if q_pad is not None:
                     attn_out = attn_out.masked_fill(q_pad.unsqueeze(-1), 0.0)
             else:
-                env_mb = int(env_int("STNET_ATTN_WEIGHTS_BATCH_MICROBATCH", 0))
+                env_mb = int(env_int("ENN_ATTN_WEIGHTS_BATCH_MICROBATCH", 0))
                 est = int(B) * int(H) * int(L_q) * int(L_k)
                 if env_mb > 0:
                     group = max(1, min(int(B), int(env_mb)))
@@ -1232,7 +1232,7 @@ class DilatedAttention(nn.Module):
                             )
                         else:
                             env_mb = int(
-                                env_int("STNET_SDPA_BATCH_MICROBATCH", 0)
+                                env_int("ENN_SDPA_BATCH_MICROBATCH", 0)
                             )
                             group = int(env_mb)
                             if group <= 0:
@@ -2370,8 +2370,8 @@ class Scaler(nn.Module):
     def calibrate(self: Self, z_raw: torch.Tensor) -> torch.Tensor:
         disable_pw = env_bool(
             (
-                "STNET_DISABLE_PIECEWISE_CALIB",
-                "STNET_EXPORT_DISABLE_PIECEWISE_CALIB",
+                "ENN_DISABLE_PIECEWISE_CALIB",
+                "ENN_EXPORT_DISABLE_PIECEWISE_CALIB",
             ),
             default=False,
         )
@@ -2531,8 +2531,8 @@ class Scaler(nn.Module):
         if (
             env_bool(
                 (
-                    "STNET_DISABLE_PIECEWISE_CALIB",
-                    "STNET_EXPORT_DISABLE_PIECEWISE_CALIB",
+                    "ENN_DISABLE_PIECEWISE_CALIB",
+                    "ENN_EXPORT_DISABLE_PIECEWISE_CALIB",
                 ),
                 default=False,
             )

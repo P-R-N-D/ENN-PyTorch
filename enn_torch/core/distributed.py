@@ -509,7 +509,7 @@ def resolve_ip_expr(
     link_local = (
         allow_link_local
         if allow_link_local is not None
-        else env_bool("STNET_ALLOW_LINK_LOCAL", False)
+        else env_bool("ENN_ALLOW_LINK_LOCAL", False)
     )
     if lit := _canonize_ip(
         host_text, loopback=allow_loopback, link_local=link_local
@@ -557,7 +557,7 @@ def validate_ip_expr(
     link_local = (
         allow_link_local
         if allow_link_local is not None
-        else env_bool("STNET_ALLOW_LINK_LOCAL", False)
+        else env_bool("ENN_ALLOW_LINK_LOCAL", False)
     )
     for h in [host, fallback]:
         txt = str(h).strip() if h else ""
@@ -580,7 +580,7 @@ def is_port_available(
     link_local = (
         allow_link_local
         if allow_link_local is not None
-        else env_bool("STNET_ALLOW_LINK_LOCAL", False)
+        else env_bool("ENN_ALLOW_LINK_LOCAL", False)
     )
     host_ip = _canonize_ip(
         host, loopback=True, link_local=link_local
@@ -619,7 +619,7 @@ def get_available_host(
     link_local = (
         allow_link_local
         if allow_link_local is not None
-        else env_bool("STNET_ALLOW_LINK_LOCAL", False)
+        else env_bool("ENN_ALLOW_LINK_LOCAL", False)
     )
     if endpoint:
         h, p = _canonize_host(endpoint, default_host, link_local)
@@ -706,7 +706,7 @@ def get_preferred_ip(
     **kwargs: Any,
 ) -> str:
     if allow_link_local is None:
-        allow_link_local = env_bool("STNET_ALLOW_LINK_LOCAL", False)
+        allow_link_local = env_bool("ENN_ALLOW_LINK_LOCAL", False)
     hn = None if hostname is None else str(hostname)
     return _get_preferred_ip_cached(
         hn, bool(prefer_ipv6), bool(allow_loopback), bool(allow_link_local)
@@ -724,7 +724,7 @@ def init_master_addr(
     link_local = (
         allow_link_local
         if allow_link_local is not None
-        else env_bool("STNET_ALLOW_LINK_LOCAL", False)
+        else env_bool("ENN_ALLOW_LINK_LOCAL", False)
     )
     default_host = get_preferred_ip(
         allow_loopback=allow_loopback,
@@ -1122,9 +1122,9 @@ def to_hsdp_module(
         if pg_obj is None and mesh_obj is None:
             mesh_obj = mesh
     defaults: dict[str, Any] = {
-        "forward_prefetch": env_bool("STNET_FSDP_FWD_PREFETCH", True),
-        "limit_all_gathers": env_bool("STNET_FSDP_LIMIT_AG", True),
-        "use_orig_params": env_bool("STNET_FSDP_USE_ORIG_PARAMS", True),
+        "forward_prefetch": env_bool("ENN_FSDP_FWD_PREFETCH", True),
+        "limit_all_gathers": env_bool("ENN_FSDP_LIMIT_AG", True),
+        "use_orig_params": env_bool("ENN_FSDP_USE_ORIG_PARAMS", True),
         "mp_policy": mp_policy,
         "reshard_after_forward": reshard_after_forward,
         "sync_module_states": sync_module_states,

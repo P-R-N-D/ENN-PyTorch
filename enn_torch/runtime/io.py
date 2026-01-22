@@ -327,7 +327,7 @@ class Exporter:
                 from . import wrappers as _w
             except Exception as exc:
                 raise RuntimeError(
-                    "Exporter backends live in stnet.runtime.wrappers, but it could not be imported. "
+                    "Exporter backends live in enn_torch.runtime.wrappers, but it could not be imported. "
                     "Install the optional export dependencies (e.g. tensordict) or avoid calling Exporter.for_export()."
                 ) from exc
 

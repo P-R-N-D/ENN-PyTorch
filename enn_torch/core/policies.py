@@ -162,7 +162,7 @@ class WorkerPolicy:
             int(
                 env_first_int(
                     (
-                        "STNET_LOCAL_WORLD_SIZE",
+                        "ENN_LOCAL_WORLD_SIZE",
                         "LOCAL_WORLD_SIZE",
                         "SLURM_NTASKS_PER_NODE",
                     ),
@@ -174,8 +174,8 @@ class WorkerPolicy:
             allow_over = int(
                 env_first_int(
                     (
-                        "STNET_ALLOW_ACCELERATOR_OVERSUBSCRIBE",
-                        "STNET_ALLOW_GPU_OVERSUBSCRIBE",
+                        "ENN_ALLOW_ACCELERATOR_OVERSUBSCRIBE",
+                        "ENN_ALLOW_GPU_OVERSUBSCRIBE",
                     ),
                     0,
                 )
@@ -189,7 +189,7 @@ class WorkerPolicy:
         distribute_default = int(local_world_guess) > 1
         distribute = bool(
             env_first_int(
-                ("STNET_DISTRIBUTE_THREAD_CAP",), int(distribute_default)
+                ("ENN_DISTRIBUTE_THREAD_CAP",), int(distribute_default)
             )
         )
         thread_cap = _optimal_threads(
@@ -207,7 +207,7 @@ class WorkerPolicy:
                 1, int(hard * max(1, int(lp.soft_cap_multiplier)))
             )
         soft_auto_enabled = bool(
-            env_first_int(("STNET_SOFT_INFLIGHT_AUTO",), 1)
+            env_first_int(("ENN_SOFT_INFLIGHT_AUTO",), 1)
         )
         soft_inflight_max_default = (
             (32 if is_accel else 24) if _nogil else (16 if is_accel else 12)
@@ -215,15 +215,15 @@ class WorkerPolicy:
         soft_inflight_max = max(
             8,
             env_first_int(
-                ("STNET_SOFT_INFLIGHT_MAX",), soft_inflight_max_default
+                ("ENN_SOFT_INFLIGHT_MAX",), soft_inflight_max_default
             ),
         )
-        soft_inflight_explicit = env_first_int(("STNET_SOFT_INFLIGHT_CAP",), 0)
+        soft_inflight_explicit = env_first_int(("ENN_SOFT_INFLIGHT_CAP",), 0)
         if soft_inflight_explicit > 0:
             soft_inflight = max(1, int(soft_inflight_explicit))
         elif soft_auto_enabled:
-            soft_base = max(0, env_first_int(("STNET_SOFT_INFLIGHT_BASE",), 2))
-            soft_div = max(1, env_first_int(("STNET_SOFT_INFLIGHT_DIV",), 4))
+            soft_base = max(0, env_first_int(("ENN_SOFT_INFLIGHT_BASE",), 2))
+            soft_div = max(1, env_first_int(("ENN_SOFT_INFLIGHT_DIV",), 4))
             auto_soft = int(soft_base) + max(
                 0, int(eff_cores) // int(soft_div)
             )
@@ -253,9 +253,9 @@ class WorkerPolicy:
                 model_ratio = 0.85
         with contextlib.suppress(Exception):
             env_key = (
-                "STNET_MODEL_CORE_RATIO_ACCEL"
+                "ENN_MODEL_CORE_RATIO_ACCEL"
                 if is_accel
-                else "STNET_MODEL_CORE_RATIO"
+                else "ENN_MODEL_CORE_RATIO"
             )
             model_ratio = float(env_float(env_key, float(model_ratio)))
         model_ratio = float(max(0.25, min(1.0, model_ratio)))
@@ -273,13 +273,13 @@ class WorkerPolicy:
         )
         prebatch = 1
         prefetch_factor = 1
-        env_pre = env_str("STNET_PREBATCH")
+        env_pre = env_str("ENN_PREBATCH")
         if env_pre:
             with contextlib.suppress(Exception):
                 prebatch = max(1, int(env_pre))
         elif _nogil:
             prebatch = 2
-        env_pf = env_str("STNET_PREFETCH_FACTOR")
+        env_pf = env_str("ENN_PREFETCH_FACTOR")
         if env_pf:
             with contextlib.suppress(Exception):
                 prefetch_factor = max(1, int(env_pf))
@@ -1333,61 +1333,61 @@ class CollectivePolicy:
 
         backend = (
             os.getenv(
-                "STNET_COLLECTIVE_BACKEND",
-                os.getenv("STNET_BCAST_BACKEND", "c10d"),
+                "ENN_COLLECTIVE_BACKEND",
+                os.getenv("ENN_BCAST_BACKEND", "c10d"),
             )
             .strip()
             .lower()
         )
 
         include_parameters = getenv_bool_any(
-            "STNET_COLLECTIVE_INCLUDE_PARAMETERS",
-            "STNET_BCAST_INCLUDE_PARAMETERS",
+            "ENN_COLLECTIVE_INCLUDE_PARAMETERS",
+            "ENN_BCAST_INCLUDE_PARAMETERS",
             True,
         )
         include_buffers = getenv_bool_any(
-            "STNET_COLLECTIVE_INCLUDE_BUFFERS",
-            "STNET_BCAST_INCLUDE_BUFFERS",
+            "ENN_COLLECTIVE_INCLUDE_BUFFERS",
+            "ENN_BCAST_INCLUDE_BUFFERS",
             True,
         )
 
         max_buffer_size_mb = getenv_int_any(
-            "STNET_COLLECTIVE_MAX_BUFFER_SIZE_MB",
-            "STNET_BCAST_MAX_BUFFER_SIZE_MB",
+            "ENN_COLLECTIVE_MAX_BUFFER_SIZE_MB",
+            "ENN_BCAST_MAX_BUFFER_SIZE_MB",
             25,
         )
 
         coalesce_mb = getenv_int_any(
-            "STNET_COLLECTIVE_COALESCE_MB", "STNET_BCAST_COALESCE_MB", 64
+            "ENN_COLLECTIVE_COALESCE_MB", "ENN_BCAST_COALESCE_MB", 64
         )
         max_tensor_mb_for_coalesce = getenv_int_any(
-            "STNET_COLLECTIVE_MAX_TENSOR_MB_FOR_COALESCE",
-            "STNET_BCAST_MAX_TENSOR_MB_FOR_COALESCE",
+            "ENN_COLLECTIVE_MAX_TENSOR_MB_FOR_COALESCE",
+            "ENN_BCAST_MAX_TENSOR_MB_FOR_COALESCE",
             8,
         )
 
         inter_stream_mb = getenv_int_any(
-            "STNET_COLLECTIVE_INTER_STREAM_MB",
-            "STNET_BCAST_INTER_STREAM_MB",
+            "ENN_COLLECTIVE_INTER_STREAM_MB",
+            "ENN_BCAST_INTER_STREAM_MB",
             16,
         )
         intra_stream_mb = getenv_int_any(
-            "STNET_COLLECTIVE_INTRA_STREAM_MB",
-            "STNET_BCAST_INTRA_STREAM_MB",
+            "ENN_COLLECTIVE_INTRA_STREAM_MB",
+            "ENN_BCAST_INTRA_STREAM_MB",
             64,
         )
 
         max_inflight_mb = getenv_int_any(
-            "STNET_COLLECTIVE_MAX_INFLIGHT_MB",
-            "STNET_BCAST_MAX_INFLIGHT_MB",
+            "ENN_COLLECTIVE_MAX_INFLIGHT_MB",
+            "ENN_BCAST_MAX_INFLIGHT_MB",
             64,
         )
 
         debug_collectives = getenv_bool_any(
-            "STNET_COLLECTIVE_DEBUG", "STNET_BCAST_DEBUG", False
+            "ENN_COLLECTIVE_DEBUG", "ENN_BCAST_DEBUG", False
         )
         verbose = getenv_bool_any(
-            "STNET_COLLECTIVE_VERBOSE", "STNET_BCAST_VERBOSE", False
+            "ENN_COLLECTIVE_VERBOSE", "ENN_BCAST_VERBOSE", False
         )
 
         return cls(
@@ -1424,9 +1424,9 @@ class DistributedPolicy:
                 return default
             return v.strip().lower() in ("1", "true", "yes", "y", "on")
 
-        prefer_hsdp = getenv_bool("STNET_DISTRIBUTED_PREFER_HSDP", True)
-        prefer_ddp = getenv_bool("STNET_DISTRIBUTED_PREFER_DDP", True)
-        sync_state = getenv_bool("STNET_DISTRIBUTED_SYNC_STATE", True)
+        prefer_hsdp = getenv_bool("ENN_DISTRIBUTED_PREFER_HSDP", True)
+        prefer_ddp = getenv_bool("ENN_DISTRIBUTED_PREFER_DDP", True)
+        sync_state = getenv_bool("ENN_DISTRIBUTED_SYNC_STATE", True)
 
         return cls(
             prefer_hsdp=prefer_hsdp,

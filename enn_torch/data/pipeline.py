@@ -83,7 +83,7 @@ def _require_nodes() -> None:
             return
         try:
             mod = importlib.import_module(
-                f"{__package__ or 'stnet.data'}.nodes"
+                f"{__package__ or 'enn_torch.data'}.nodes"
             )
         except Exception as e:
             raise RuntimeError("Requires 'torchdata'/'tensordict'") from e
@@ -201,9 +201,9 @@ def _h2d_counter(
     max_probe_bytes = int(
         env_first_int(
             (
-                "STNET_H2D_PROBE_MAX_BYTES",
-                "STNET_H2D_PROBE_BYTES",
-                "STNET_H2D_COUNTER_MAX_BYTES",
+                "ENN_H2D_PROBE_MAX_BYTES",
+                "ENN_H2D_PROBE_BYTES",
+                "ENN_H2D_COUNTER_MAX_BYTES",
             ),
             default=256 * 1024 * 1024,
         )
@@ -218,8 +218,8 @@ def _h2d_counter(
     max_pin_bytes = int(
         env_first_int(
             (
-                "STNET_H2D_PROBE_MAX_PIN_BYTES",
-                "STNET_H2D_PROBE_PIN_MAX_BYTES",
+                "ENN_H2D_PROBE_MAX_PIN_BYTES",
+                "ENN_H2D_PROBE_PIN_MAX_BYTES",
             ),
             default=max_probe_bytes,
         )
@@ -311,7 +311,7 @@ def _set_batch_interval(
         return (max(1, min(256, len(_ds))), 0.0)
     B_cap = 1 << 16
     max_batch_env = int(
-        env_first_int(("STNET_MAX_BATCH_SIZE", "STNET_MAX_BATCH"), default=0)
+        env_first_int(("ENN_MAX_BATCH_SIZE", "ENN_MAX_BATCH"), default=0)
         or 0
     )
     per_sample = int(getattr(_ds, "_per_sample_mem_bytes", 0) or 0)
@@ -319,8 +319,8 @@ def _set_batch_interval(
         per_sample = int(
             env_first_int(
                 (
-                    "STNET_PER_SAMPLE_MEM_BYTES",
-                    "STNET_DEVICE_BYTES_PER_SAMPLE",
+                    "ENN_PER_SAMPLE_MEM_BYTES",
+                    "ENN_DEVICE_BYTES_PER_SAMPLE",
                 ),
                 default=0,
             )
@@ -347,7 +347,7 @@ def _set_batch_interval(
         min(
             4.0,
             float(
-                env_first_float(("STNET_BUDGET_SLACK",), default=1.25) or 1.25
+                env_first_float(("ENN_BUDGET_SLACK",), default=1.25) or 1.25
             ),
         ),
     )
@@ -370,23 +370,23 @@ def _set_batch_interval(
         min_batch=1,
         max_batch=B_cap,
         device_margin=float(
-            env_first_float(("STNET_DEVICE_MARGIN",), default=0.90) or 0.90
+            env_first_float(("ENN_DEVICE_MARGIN",), default=0.90) or 0.90
         ),
         host_margin=float(
-            env_first_float(("STNET_HOST_MARGIN",), default=0.10) or 0.10
+            env_first_float(("ENN_HOST_MARGIN",), default=0.10) or 0.10
         ),
         device_budget_ratio=float(
-            env_first_float(("STNET_DEVICE_BUDGET_RATIO",), default=1.0) or 1.0
+            env_first_float(("ENN_DEVICE_BUDGET_RATIO",), default=1.0) or 1.0
         ),
-        device_budget_min_bytes=_get_bytes("STNET_DEVICE_BUDGET_MIN_BYTES"),
+        device_budget_min_bytes=_get_bytes("ENN_DEVICE_BUDGET_MIN_BYTES"),
         device_budget_max_bytes=_get_opt_bytes(
-            "STNET_DEVICE_BUDGET_MAX_BYTES"
+            "ENN_DEVICE_BUDGET_MAX_BYTES"
         ),
         host_budget_ratio=float(
-            env_first_float(("STNET_HOST_BUDGET_RATIO",), default=1.0) or 1.0
+            env_first_float(("ENN_HOST_BUDGET_RATIO",), default=1.0) or 1.0
         ),
-        host_budget_min_bytes=_get_bytes("STNET_HOST_BUDGET_MIN_BYTES"),
-        host_budget_max_bytes=_get_opt_bytes("STNET_HOST_BUDGET_MAX_BYTES"),
+        host_budget_min_bytes=_get_bytes("ENN_HOST_BUDGET_MIN_BYTES"),
+        host_budget_max_bytes=_get_opt_bytes("ENN_HOST_BUDGET_MAX_BYTES"),
     )
     dev_free, dev_total = _device_mem_get_info(_dev)
     host_free: Optional[int] = None
@@ -427,9 +427,9 @@ def _set_batch_interval(
             probe_max_bytes = int(
                 env_first_int(
                     (
-                        "STNET_H2D_PROBE_MAX_BYTES",
-                        "STNET_H2D_PROBE_BYTES",
-                        "STNET_H2D_COUNTER_MAX_BYTES",
+                        "ENN_H2D_PROBE_MAX_BYTES",
+                        "ENN_H2D_PROBE_BYTES",
+                        "ENN_H2D_COUNTER_MAX_BYTES",
                     ),
                     default=256 * 1024 * 1024,
                 )
@@ -1441,13 +1441,13 @@ class Dataset(Generic[TExtra]):
 
     def _refresh_dtypes_from_env(self: Self) -> None:
         float_env = env_first(
-            ("STNET_DATA_FLOAT_DTYPES", "STNET_FLOAT_DTYPES")
+            ("ENN_DATA_FLOAT_DTYPES", "ENN_FLOAT_DTYPES")
         )
         if float_env:
             parsed = self._parse_dtypes_env(float_env)
             if parsed:
                 self.float_dtypes = parsed
-        int_env = env_first(("STNET_DATA_INT_DTYPES", "STNET_INT_DTYPES"))
+        int_env = env_first(("ENN_DATA_INT_DTYPES", "ENN_INT_DTYPES"))
         if int_env:
             parsed = self._parse_dtypes_env(int_env)
             if parsed:
@@ -1455,7 +1455,7 @@ class Dataset(Generic[TExtra]):
 
     def _refresh_quant_from_env(self: Self) -> None:
         bits = env_first_int(
-            ("STNET_DATA_INT_QUANT_BITS", "STNET_INT_QUANT_BITS"), default=0
+            ("ENN_DATA_INT_QUANT_BITS", "ENN_INT_QUANT_BITS"), default=0
         )
         if bits > 0:
             self.int_quant_bits = int(bits)

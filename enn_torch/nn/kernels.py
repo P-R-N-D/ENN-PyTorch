@@ -47,8 +47,8 @@ _torch_flex_attention = None
 
 def _flex_attention_disabled() -> bool:
     return bool(
-        env_bool("STNET_NO_FLEX_ATTENTION", False)
-        or env_bool("STNET_DISABLE_FLEX_ATTENTION", False)
+        env_bool("ENN_NO_FLEX_ATTENTION", False)
+        or env_bool("ENN_DISABLE_FLEX_ATTENTION", False)
     )
 
 
@@ -188,7 +188,7 @@ def _blockmask_to_token_mask(
             and (lq_i is not None)
             and (lk_i is not None)
         ):
-            max_elems = _env_int("STNET_FLEX_PY_MASK_MAX_ELEMS", 2_000_000)
+            max_elems = _env_int("ENN_FLEX_PY_MASK_MAX_ELEMS", 2_000_000)
             py_mask = _python_token_mask_from_mask_mod(
                 mask_mod,
                 B=b_i,
@@ -1280,8 +1280,8 @@ class DotProductAttention(nn.Module):
             sdpa_is_causal = False
 
         exporting = _exporting_boundary()
-        disable_sdpa = env_bool(("STNET_DISABLE_SDPA",), default=False)
-        force_sdpa = env_bool(("STNET_FORCE_SDPA",), default=False)
+        disable_sdpa = env_bool(("ENN_DISABLE_SDPA",), default=False)
+        force_sdpa = env_bool(("ENN_FORCE_SDPA",), default=False)
         if (
             (exporting and not force_sdpa)
             or disable_sdpa
@@ -1762,7 +1762,7 @@ class MultiScaleRetention(nn.Module):
         out = torch.empty_like(v, dtype=v.dtype)
         SVB, SVL, SVH, SVD = v.stride()
         SOB, SOL, SOH, SOD = out.stride()
-        env_block = env_str("STNET_MSR_TRITON_BLOCK_DH") or ""
+        env_block = env_str("ENN_MSR_TRITON_BLOCK_DH") or ""
         if env_block:
             try:
                 BLOCK_DH = int(env_block)
@@ -1772,7 +1772,7 @@ class MultiScaleRetention(nn.Module):
                 BLOCK_DH = 64 if Dh >= 64 else 32
         else:
             BLOCK_DH = 64 if Dh >= 64 else 32
-        env_warps = env_str("STNET_MSR_TRITON_NUM_WARPS") or ""
+        env_warps = env_str("ENN_MSR_TRITON_NUM_WARPS") or ""
         if env_warps:
             try:
                 num_warps = int(env_warps)
@@ -1809,9 +1809,9 @@ class MultiScaleRetention(nn.Module):
     ) -> torch.Tensor:
         disable_triton = env_bool(
             (
-                "STNET_MSR_FORCE_TORCH",
-                "STNET_MSR_DISABLE_TRITON",
-                "STNET_DISABLE_TRITON_MSR",
+                "ENN_MSR_FORCE_TORCH",
+                "ENN_MSR_DISABLE_TRITON",
+                "ENN_DISABLE_TRITON_MSR",
             ),
             default=False,
         )

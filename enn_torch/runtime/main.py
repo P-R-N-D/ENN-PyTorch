@@ -173,15 +173,15 @@ TorchDeviceLike: TypeAlias = torch.device | str | int
 
 
 def _is_nvml_disabled() -> bool:
-    return env_bool("STNET_NVML_DISABLE", False) or not env_bool(
-        "STNET_NVML", True
+    return env_bool("ENN_NVML_DISABLE", False) or not env_bool(
+        "ENN_NVML", True
     )
 
 
 def _nvml_cfg(key: str, default: object, cast_fn: type = int) -> object:
     return cast_fn(
         env_first(
-            (f"STNET_NVML_{key}", f"STNET_NVML_{key}_S"), default=default
+            (f"ENN_NVML_{key}", f"ENN_NVML_{key}_S"), default=default
         )
     )
 
@@ -232,7 +232,7 @@ def _is_nvml_available() -> object:
         except Exception as exc:
             _nvml = None
             _NVML_READY = False
-            if env_bool("STNET_DEBUG", False):
+            if env_bool("ENN_DEBUG", False):
                 _LOGGER.debug("NVML init failed: %s", exc, exc_info=True)
     return bool(_NVML_READY)
 
@@ -250,12 +250,12 @@ def _validate_compile_safe() -> None:
 
 
 def _is_clock_synchronized(dev_type: str) -> bool:
-    if _env_flag("STNET_TIMER_SYNC", False) or _env_flag(
-        "STNET_WALLCLOCK_TIMER_SYNC", False
+    if _env_flag("ENN_TIMER_SYNC", False) or _env_flag(
+        "ENN_WALLCLOCK_TIMER_SYNC", False
     ):
         return True
     dt = str(dev_type or "cpu")
-    return _env_flag(f"STNET_{dt.upper()}_TIMER_SYNC", False)
+    return _env_flag(f"ENN_{dt.upper()}_TIMER_SYNC", False)
 
 
 def _is_event_timer_available(device: torch.device) -> bool:
@@ -345,28 +345,28 @@ def _get_torch_profiler(
             mps_act = getattr(tp.ProfilerActivity, "MPS", None)
             if mps_act is not None:
                 activities.append(mps_act)
-    wait = max(0, int(_env_int("STNET_TORCH_PROFILE_WAIT", 0)))
-    warmup = max(0, int(_env_int("STNET_TORCH_PROFILE_WARMUP", 2)))
+    wait = max(0, int(_env_int("ENN_TORCH_PROFILE_WAIT", 0)))
+    warmup = max(0, int(_env_int("ENN_TORCH_PROFILE_WARMUP", 2)))
     active = max(
         1,
         int(
             _env_int(
-                "STNET_TORCH_PROFILE_ACTIVE",
-                _env_int("STNET_TORCH_PROFILE_STEPS", 8),
+                "ENN_TORCH_PROFILE_ACTIVE",
+                _env_int("ENN_TORCH_PROFILE_STEPS", 8),
             )
         ),
     )
-    repeat = max(1, int(_env_int("STNET_TORCH_PROFILE_REPEAT", 1)))
-    record_shapes = bool(_env_flag("STNET_TORCH_PROFILE_RECORD_SHAPES", False))
+    repeat = max(1, int(_env_int("ENN_TORCH_PROFILE_REPEAT", 1)))
+    record_shapes = bool(_env_flag("ENN_TORCH_PROFILE_RECORD_SHAPES", False))
     profile_memory = bool(
-        _env_flag("STNET_TORCH_PROFILE_PROFILE_MEMORY", True)
+        _env_flag("ENN_TORCH_PROFILE_PROFILE_MEMORY", True)
     )
-    with_stack = bool(_env_flag("STNET_TORCH_PROFILE_WITH_STACK", False))
-    with_flops = bool(_env_flag("STNET_TORCH_PROFILE_WITH_FLOPS", False))
+    with_stack = bool(_env_flag("ENN_TORCH_PROFILE_WITH_STACK", False))
+    with_flops = bool(_env_flag("ENN_TORCH_PROFILE_WITH_FLOPS", False))
     group_by_shape = bool(
-        _env_flag("STNET_TORCH_PROFILE_GROUP_BY_SHAPE", False)
+        _env_flag("ENN_TORCH_PROFILE_GROUP_BY_SHAPE", False)
     )
-    row_limit = max(5, int(_env_int("STNET_TORCH_PROFILE_TOPK", 40)))
+    row_limit = max(5, int(_env_int("ENN_TORCH_PROFILE_TOPK", 40)))
     if not out_dir:
         out_dir = os.path.join(os.getcwd(), "torch_profiler")
     out_dir = os.path.abspath(str(out_dir))
@@ -456,16 +456,16 @@ def _oom_max_retries(phase: object) -> object:
     phase = str(phase).strip().lower()
     if phase == "train":
         v = _env_int(
-            "STNET_OOM_MAX_RETRIES_TRAIN",
-            _env_int("STNET_OOM_MAX_RETRIES_PER_BATCH", 4),
+            "ENN_OOM_MAX_RETRIES_TRAIN",
+            _env_int("ENN_OOM_MAX_RETRIES_PER_BATCH", 4),
         )
     elif phase in {"val", "valid", "validation"}:
         v = _env_int(
-            "STNET_OOM_MAX_RETRIES_VAL",
-            _env_int("STNET_OOM_MAX_RETRIES_PER_BATCH", 2),
+            "ENN_OOM_MAX_RETRIES_VAL",
+            _env_int("ENN_OOM_MAX_RETRIES_PER_BATCH", 2),
         )
     else:
-        v = _env_int("STNET_OOM_MAX_RETRIES_PER_BATCH", 3)
+        v = _env_int("ENN_OOM_MAX_RETRIES_PER_BATCH", 3)
     return max(0, int(v))
 
 
@@ -473,13 +473,13 @@ def _is_batch_skippable(phase: object) -> bool:
     phase = str(phase).strip().lower()
     if phase == "train":
         return _env_flag(
-            "STNET_OOM_SKIP_TRAIN", _env_flag("STNET_OOM_SKIP_BATCH", True)
+            "ENN_OOM_SKIP_TRAIN", _env_flag("ENN_OOM_SKIP_BATCH", True)
         )
     elif phase in {"val", "valid", "validation"}:
         return _env_flag(
-            "STNET_OOM_SKIP_VAL", _env_flag("STNET_OOM_SKIP_BATCH", True)
+            "ENN_OOM_SKIP_VAL", _env_flag("ENN_OOM_SKIP_BATCH", True)
         )
-    return _env_flag("STNET_OOM_SKIP_BATCH", True)
+    return _env_flag("ENN_OOM_SKIP_BATCH", True)
 
 
 def _get_scale_rate_down(attempt: object) -> object:
@@ -499,7 +499,7 @@ def _is_scale_rate_logged(
 ) -> None:
     if min_interval_s is None:
         min_interval_s = _env_float(
-            "STNET_SAMPLER_SCALE_LOG_MIN_INTERVAL_S", 5.0
+            "ENN_SAMPLER_SCALE_LOG_MIN_INTERVAL_S", 5.0
         )
     try:
         min_interval_s = float(min_interval_s)
@@ -543,13 +543,13 @@ def _get_sampler_scaler(
 
 def _get_oom_blocking_time(oom_try: int, phase: str | None = None) -> float:
     try:
-        base_ms = float(_env_float("STNET_OOM_BACKOFF_BASE_MS", 0.0))
+        base_ms = float(_env_float("ENN_OOM_BACKOFF_BASE_MS", 0.0))
     except Exception:
         base_ms = 0.0
     if base_ms <= 0.0:
         return 0.0
     try:
-        max_ms = max(0.0, float(_env_float("STNET_OOM_BACKOFF_MAX_MS", 50.0)))
+        max_ms = max(0.0, float(_env_float("ENN_OOM_BACKOFF_MAX_MS", 50.0)))
     except Exception:
         max_ms = 50.0
     p = max(0, int(oom_try) - 2)
@@ -775,7 +775,7 @@ def _hook_meta_monitor(
 def _enable_meta_monitor(model: object) -> None:
     hook_mode = (
         str(
-            env_first(("STNET_META_MONITOR", "STNET_META_HOOK"), default="off")
+            env_first(("ENN_META_MONITOR", "ENN_META_HOOK"), default="off")
             or "off"
         )
         .strip()
@@ -1181,27 +1181,27 @@ def _configure_torch_nccl_env(device: TorchDeviceLike) -> None:
 
     if "TORCH_NCCL_ENABLE_MONITORING" not in os.environ:
         default_mon = 0 if int(world) <= 1 else 1
-        mon = int(env_int("STNET_TORCH_NCCL_ENABLE_MONITORING", default_mon))
+        mon = int(env_int("ENN_TORCH_NCCL_ENABLE_MONITORING", default_mon))
         os.environ["TORCH_NCCL_ENABLE_MONITORING"] = str(int(mon))
 
     if "TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC" not in os.environ:
         default_hb = 3600 if int(world) <= 1 else 600
-        hb = int(env_int("STNET_TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC", default_hb))
+        hb = int(env_int("ENN_TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC", default_hb))
         os.environ["TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC"] = str(int(hb))
 
     if "TORCH_NCCL_DUMP_ON_TIMEOUT" not in os.environ:
         default_dump = 0 if int(world) <= 1 else 1
-        dump = int(env_int("STNET_TORCH_NCCL_DUMP_ON_TIMEOUT", default_dump))
+        dump = int(env_int("ENN_TORCH_NCCL_DUMP_ON_TIMEOUT", default_dump))
         os.environ["TORCH_NCCL_DUMP_ON_TIMEOUT"] = str(int(dump))
 
     if "TORCH_NCCL_ASYNC_ERROR_HANDLING" not in os.environ:
         default_ae = 0 if int(world) <= 1 else 3
-        ae = int(env_int("STNET_TORCH_NCCL_ASYNC_ERROR_HANDLING", default_ae))
+        ae = int(env_int("ENN_TORCH_NCCL_ASYNC_ERROR_HANDLING", default_ae))
         os.environ["TORCH_NCCL_ASYNC_ERROR_HANDLING"] = str(int(ae))
 
     if "TORCH_NCCL_BLOCKING_WAIT" not in os.environ:
         default_bw = 1 if int(world) <= 1 else 0
-        bw = int(env_int("STNET_TORCH_NCCL_BLOCKING_WAIT", default_bw))
+        bw = int(env_int("ENN_TORCH_NCCL_BLOCKING_WAIT", default_bw))
         os.environ["TORCH_NCCL_BLOCKING_WAIT"] = str(int(bw))
 
 
@@ -1379,13 +1379,13 @@ def _get_sample_size(
                 else:
                     with inference_mode(model), Autocast.float(device):
                         warmup_iters = int(
-                            _env_int("STNET_SERVE_WARMUP_ITERS", 0) or 0
+                            _env_int("ENN_SERVE_WARMUP_ITERS", 0) or 0
                         )
                         if (
                             warmup_iters <= 0
                             and str(getattr(ops, "mode", "") or "")
                             in ("predict", "infer")
-                            and _env_flag("STNET_MAX_PERF", True)
+                            and _env_flag("ENN_MAX_PERF", True)
                         ):
                             m_eval = (
                                 model.module
@@ -1461,7 +1461,7 @@ def _get_sample_size(
         except Exception:
             pass
         with contextlib.suppress(Exception):
-            os.environ["STNET_PER_SAMPLE_MEM_BYTES"] = str(int(per_sample))
+            os.environ["ENN_PER_SAMPLE_MEM_BYTES"] = str(int(per_sample))
     except Exception:
         return
 
@@ -1558,7 +1558,7 @@ def _init_distributed_group(
             dev_id = index
     timeout = None
     try:
-        to_s = int(env_int("STNET_PROCESS_GROUP_TIMEOUT_SEC", 0) or 0)
+        to_s = int(env_int("ENN_PROCESS_GROUP_TIMEOUT_SEC", 0) or 0)
         if to_s <= 0 and backend_name in ("nccl", "xccl"):
             ws = int(env_int("WORLD_SIZE", 1) or 1)
             if ws <= 1:
@@ -2575,7 +2575,7 @@ def epochs(
             Memory.prefer_local_numa()
         try:
             cpu_pool_cap = max(
-                2, int(_env_int("STNET_RUNTIME_PIN_POOL_CAPACITY", 8))
+                2, int(_env_int("ENN_RUNTIME_PIN_POOL_CAPACITY", 8))
             )
             cpu_pool = TensorPagePool(capacity=cpu_pool_cap)
             pool_capacity = int(getattr(cpu_pool, "capacity", 8))
@@ -2618,19 +2618,19 @@ def epochs(
     fixed_accum = 2 if getattr(device, "type", "cpu") == "cpu" else 4
     min_grad_accum = fixed_accum
     max_grad_accum = fixed_accum
-    dev_margin = env_float("STNET_DEVICE_MARGIN", 0.8)
-    host_margin = env_float("STNET_HOST_MARGIN", 0.8)
-    budget_slack = env_float("STNET_BUDGET_SLACK", 1.25)
+    dev_margin = env_float("ENN_DEVICE_MARGIN", 0.8)
+    host_margin = env_float("ENN_HOST_MARGIN", 0.8)
+    budget_slack = env_float("ENN_BUDGET_SLACK", 1.25)
     budget_slack = max(1.0, min(4.0, float(budget_slack)))
-    dev_budget_ratio = env_float("STNET_DEVICE_BUDGET_RATIO", 1.0)
-    dev_budget_min_bytes = env_int("STNET_DEVICE_BUDGET_MIN_BYTES", 0)
-    _dev_budget_max_raw = env_int("STNET_DEVICE_BUDGET_MAX_BYTES", 0)
+    dev_budget_ratio = env_float("ENN_DEVICE_BUDGET_RATIO", 1.0)
+    dev_budget_min_bytes = env_int("ENN_DEVICE_BUDGET_MIN_BYTES", 0)
+    _dev_budget_max_raw = env_int("ENN_DEVICE_BUDGET_MAX_BYTES", 0)
     dev_budget_max_bytes = (
         None if int(_dev_budget_max_raw) <= 0 else int(_dev_budget_max_raw)
     )
-    host_budget_ratio = env_float("STNET_HOST_BUDGET_RATIO", 1.0)
-    host_budget_min_bytes = env_int("STNET_HOST_BUDGET_MIN_BYTES", 0)
-    _host_budget_max_raw = env_int("STNET_HOST_BUDGET_MAX_BYTES", 0)
+    host_budget_ratio = env_float("ENN_HOST_BUDGET_RATIO", 1.0)
+    host_budget_min_bytes = env_int("ENN_HOST_BUDGET_MIN_BYTES", 0)
+    _host_budget_max_raw = env_int("ENN_HOST_BUDGET_MAX_BYTES", 0)
     host_budget_max_bytes = (
         None if int(_host_budget_max_raw) <= 0 else int(_host_budget_max_raw)
     )
@@ -2666,7 +2666,7 @@ def epochs(
                 sample_bytes=int(est_bytes_per_sample),
                 host_sample_bytes=int(est_bytes_per_sample),
                 prebatch=1,
-                prefetch_factor=int(env_int("STNET_HOST_PREFETCH_FACTOR", 4)),
+                prefetch_factor=int(env_int("ENN_HOST_PREFETCH_FACTOR", 4)),
                 num_workers=getattr(train_loader, "num_workers", 0),
                 num_streams=int(effective_streams),
                 max_concurrency=1,
@@ -2959,15 +2959,15 @@ def epochs(
                 comp_ev_s, comp_ev_e = pair
         torch_prof = None
         prof_enabled = _env_flag(
-            "STNET_TORCH_PROFILE_TRAIN",
-            _env_flag("STNET_TORCH_PROFILE", False),
+            "ENN_TORCH_PROFILE_TRAIN",
+            _env_flag("ENN_TORCH_PROFILE", False),
         )
-        prof_all_ranks = _env_flag("STNET_TORCH_PROFILE_ALL_RANKS", False)
+        prof_all_ranks = _env_flag("ENN_TORCH_PROFILE_ALL_RANKS", False)
         prof_rank = (
             int(torch.distributed.get_rank()) if is_distributed() else 0
         )
         if prof_enabled and (prof_all_ranks or prof_rank == 0):
-            prof_dir = env_str("STNET_TORCH_PROFILE_DIR")
+            prof_dir = env_str("ENN_TORCH_PROFILE_DIR")
             if not prof_dir:
                 prof_dir = os.path.join(
                     str(ops.ckpt_dir or "."), "torch_profiler"
@@ -3008,7 +3008,7 @@ def epochs(
                     if callable(fn):
                         fn(int(epoch_idx))
 
-            if is_distributed() and _env_flag("STNET_DIST_SYNC_EPOCH", False):
+            if is_distributed() and _env_flag("ENN_DIST_SYNC_EPOCH", False):
                 target_module = (
                     model.module if hasattr(model, "module") else model
                 )
@@ -4378,11 +4378,11 @@ def infer(
     world_size = get_world_size(device) if is_distributed() else 1
     torch_prof = None
     prof_enabled = _env_flag(
-        "STNET_TORCH_PROFILE_INFER", _env_flag("STNET_TORCH_PROFILE", False)
+        "ENN_TORCH_PROFILE_INFER", _env_flag("ENN_TORCH_PROFILE", False)
     )
-    prof_all_ranks = _env_flag("STNET_TORCH_PROFILE_ALL_RANKS", False)
+    prof_all_ranks = _env_flag("ENN_TORCH_PROFILE_ALL_RANKS", False)
     if prof_enabled and (prof_all_ranks or int(rank) == 0):
-        prof_dir = env_str("STNET_TORCH_PROFILE_DIR")
+        prof_dir = env_str("ENN_TORCH_PROFILE_DIR")
         if not prof_dir:
             prof_dir = os.path.join(str(ops.ckpt_dir or "."), "torch_profiler")
         torch_prof = _get_torch_profiler(
@@ -4405,18 +4405,18 @@ def infer(
         int(
             env_first_int(
                 (
-                    "STNET_PRED_CACHE_MAX_QUEUE",
-                    "STNET_PRED_WRITE_QUEUE",
-                    "STNET_CACHE_MAX_QUEUE",
+                    "ENN_PRED_CACHE_MAX_QUEUE",
+                    "ENN_PRED_WRITE_QUEUE",
+                    "ENN_CACHE_MAX_QUEUE",
                 ),
                 default=_cache_default,
             )
         ),
     )
     dev_type = str(getattr(device, "type", "cpu"))
-    use_async_write = bool(_env_flag("STNET_PRED_ASYNC_WRITE", True))
+    use_async_write = bool(_env_flag("ENN_PRED_ASYNC_WRITE", True))
     use_mmt_pred_parts = bool(
-        _env_flag("STNET_PRED_MMT_PARTS", dev_type != "cpu")
+        _env_flag("ENN_PRED_MMT_PARTS", dev_type != "cpu")
     )
     if not use_async_write:
         use_mmt_pred_parts = False
@@ -4425,7 +4425,7 @@ def infer(
         if use_async_write
         else None
     )
-    target_rows = int(_env_int("STNET_PRED_CHUNK_ROWS", 0))
+    target_rows = int(_env_int("ENN_PRED_CHUNK_ROWS", 0))
     if target_rows <= 0:
         out_shape = tuple((int(x) for x in ops.out_shape or ()))
         out_numel = 1
@@ -4433,7 +4433,7 @@ def infer(
             out_numel *= max(1, int(d))
         est_row_bytes = max(1, out_numel * 4)
         target_bytes = int(
-            _env_int("STNET_PRED_CHUNK_BYTES", 64 * 1024 * 1024)
+            _env_int("ENN_PRED_CHUNK_BYTES", 64 * 1024 * 1024)
         )
         target_rows = max(256, min(65536, target_bytes // est_row_bytes))
     dev_obj = (
@@ -4505,20 +4505,20 @@ def infer(
                     _cpu_default = 16
             cpu_pool_cap = max(
                 2,
-                int(_env_int("STNET_RUNTIME_PIN_POOL_CAPACITY", _cpu_default)),
+                int(_env_int("ENN_RUNTIME_PIN_POOL_CAPACITY", _cpu_default)),
             )
             cpu_pool = TensorPagePool(capacity=cpu_pool_cap)
     pred_pool = None
     if (
         non_blocking_ok
         and TensorPagePool is not None
-        and _env_flag("STNET_PRED_PINNED", True)
+        and _env_flag("ENN_PRED_PINNED", True)
     ):
         with contextlib.suppress(Exception):
             _nogil = bool(CPU.is_optimized_for_no_gil())
             _pred_default = 2 if not _nogil else 4
             pred_pool_cap = max(
-                2, int(_env_int("STNET_PRED_PIN_POOL_CAPACITY", _pred_default))
+                2, int(_env_int("ENN_PRED_PIN_POOL_CAPACITY", _pred_default))
             )
             pred_pool = TensorPagePool(capacity=pred_pool_cap, pin_memory=True)
     stage_tensor = partial(
@@ -5022,7 +5022,7 @@ def infer(
                     f"infer: no prediction parts produced in {chunk_dir}. diag={diag}"
                 )
             manifest = {
-                "format": "stnet.pred.v2",
+                "format": "enn_torch.pred.v2",
                 "rank_count": int(world_size),
                 "out_shape": list((int(x) for x in ops.out_shape or ())),
                 "variable_shape": bool(writer.variable_shape),
@@ -5445,8 +5445,8 @@ def process(*args: Any, **kwargs: Any) -> object:
                     local_loss=bottom_loss,
                     loss_weights=loss_controller.weights(),
                 )
-            os.environ.setdefault("STNET_MICROBATCH_MAX", "64")
-            os.environ.setdefault("STNET_MICROBATCH_STAGE_DIV", "4")
+            os.environ.setdefault("ENN_MICROBATCH_MAX", "64")
+            os.environ.setdefault("ENN_MICROBATCH_STAGE_DIV", "4")
             session = Session(
                 sources=ops.sources,
                 device=device,
@@ -5513,7 +5513,7 @@ def process(*args: Any, **kwargs: Any) -> object:
             if local_rank == 0:
                 if use_swa:
                     swa_start_epoch = 0
-                    _swa_env = os.environ.get("STNET_SWA_START_EPOCH")
+                    _swa_env = os.environ.get("ENN_SWA_START_EPOCH")
                     if _swa_env is not None and str(_swa_env).strip() != "":
                         try:
                             swa_start_epoch = max(
@@ -5685,10 +5685,10 @@ def process(*args: Any, **kwargs: Any) -> object:
             ops.cfg_dict if isinstance(ops.cfg_dict, dict) else ops.cfg_dict
         )
         cfg = replace(cfg, device=device)
-        if _env_flag("STNET_MAX_PERF", True):
+        if _env_flag("ENN_MAX_PERF", True):
             cm = canonicalize_compile_mode(getattr(cfg, "compile_mode", None))
             if cm == "disabled":
-                default_cm = env_str("STNET_SERVE_COMPILE_MODE")
+                default_cm = env_str("ENN_SERVE_COMPILE_MODE")
                 if not default_cm:
                     default_cm = (
                         "max-autotune"
@@ -5700,19 +5700,19 @@ def process(*args: Any, **kwargs: Any) -> object:
                     setattr(
                         cfg,
                         "compile_heavy_submodules",
-                        bool(_env_flag("STNET_COMPILE_HEAVY", True)),
+                        bool(_env_flag("ENN_COMPILE_HEAVY", True)),
                     )
                 with contextlib.suppress(Exception):
                     setattr(
                         cfg,
                         "compile_dynamic",
-                        bool(_env_flag("STNET_COMPILE_DYNAMIC", False)),
+                        bool(_env_flag("ENN_COMPILE_DYNAMIC", False)),
                     )
                 with contextlib.suppress(Exception):
                     setattr(
                         cfg,
                         "compile_cudagraphs",
-                        bool(_env_flag("STNET_COMPILE_CUDAGRAPHS", True)),
+                        bool(_env_flag("ENN_COMPILE_CUDAGRAPHS", True)),
                     )
         model = Model(ops.in_dim, ops.out_shape, config=cfg)
         if not ops.model_ckpt_dir:

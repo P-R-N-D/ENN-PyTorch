@@ -2205,7 +2205,7 @@ class _FlopProfiler:
     def coerce_flops_nvtx(self: Self) -> None:
         if self._nvtx_getter is not None:
             return
-        hook = os.getenv("STNET_NVTX_GETTER", "")
+        hook = os.getenv("ENN_NVTX_GETTER", "")
         if not hook:
             self._nvtx_getter = None
             return

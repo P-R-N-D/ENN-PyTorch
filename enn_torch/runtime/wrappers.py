@@ -111,8 +111,8 @@ def _onnx_model(model: object) -> Iterator[object]:
     try:
         with _temp_environ(
             {
-                "STNET_MSR_FORCE_TORCH": "1",
-                "STNET_DISABLE_PIECEWISE_CALIB": "1",
+                "ENN_MSR_FORCE_TORCH": "1",
+                "ENN_DISABLE_PIECEWISE_CALIB": "1",
             },
             only_if_unset=True,
         ):
@@ -598,7 +598,7 @@ class _ONNXExporter:
             dyn_axes = {"features": {0: "batch"}, "preds_flat": {0: "batch"}}
             if hasattr(torch, "export") and hasattr(torch.export, "Dim"):
                 mode = (
-                    os.environ.get("STNET_EXPORT_BATCH_DIM", "auto")
+                    os.environ.get("ENN_EXPORT_BATCH_DIM", "auto")
                     .strip()
                     .lower()
                 )
@@ -1051,7 +1051,7 @@ class ExecuTorch(Format):
             strict = bool(kwargs.get("strict", True))
             silent_fallback = bool(
                 kwargs.get("silent_fallback", False)
-            ) or self._truthy_env("STNET_EXPORT_SILENT_FALLBACK")
+            ) or self._truthy_env("ENN_EXPORT_SILENT_FALLBACK")
 
             def _do_export(db: bool, ds: bool) -> object:
                 return _torch_export_program(
@@ -1070,7 +1070,7 @@ class ExecuTorch(Format):
             except Exception:
                 if dyn_batch or dyn_seq:
                     if os.environ.get(
-                        "STNET_EXPORT_WARNINGS", ""
+                        "ENN_EXPORT_WARNINGS", ""
                     ).strip().lower() in (
                         "1",
                         "true",
@@ -1118,7 +1118,7 @@ class ExecuTorch(Format):
                                 "falling back to a static program (dynamic_batch=False, dynamic_seq=False). "
                                 "This static artifact may not accept variable-length inputs. "
                                 "To silence this warning, pass silent_fallback=True or set "
-                                "STNET_EXPORT_SILENT_FALLBACK=1.",
+                                "ENN_EXPORT_SILENT_FALLBACK=1.",
                                 RuntimeWarning,
                             )
                         exported_static = _torch_export_program(
