@@ -3894,9 +3894,9 @@ def epochs(
                     )
                     torch.save(model_sd, tmp_path)
                     os.replace(tmp_path, ckpt_path)
-                    _LOGGER.info("Checkpoint Updated (%d/%d)", int(epoch_idx + 1), int(ops.epochs))
+                    _LOGGER.info("Updated Checkpoint (%d/%d)", int(epoch_idx + 1), int(ops.epochs))
                     print(
-                        f"Checkpoint Updated ({int(epoch_idx + 1)}/{int(ops.epochs)})",
+                        f"Updated Checkpoint ({int(epoch_idx + 1)}/{int(ops.epochs)})",
                         flush=True,
                     )
                     try:
