@@ -20,6 +20,7 @@ from typing import (
     Sequence,
     Tuple,
     Union,
+    Self,
 )
 
 import torch
@@ -37,11 +38,14 @@ _OPT_LOGGED_KEYS: "OrderedDict[object, None]" = OrderedDict()
 _OPT_LOGGED_LOCK = Mutex()
 _OPT_LOGGED_MAX: int = 128
 
+
 def _is_hashable(x: object) -> bool:
     with contextlib.suppress(Exception):
         hash(x)
         return True
     return False
+
+
 def _to_immutable(x: Any) -> Any:
     if x is None or isinstance(x, (bool, int, float, str)):
         return x
@@ -52,6 +56,8 @@ def _to_immutable(x: Any) -> Any:
     if isinstance(x, dict):
         return tuple(sorted((str(k), _to_immutable(v)) for k, v in x.items()))
     return str(x)
+
+
 def _log_optimizer(
     logger: Optional[Callable[[str], None]],
     key: object,
@@ -89,6 +95,8 @@ def _log_optimizer(
         return
     log_fn = getattr(_LOGGER, str(level).lower(), _LOGGER.info)
     log_fn(msg)
+
+
 def _get_expected_args(ctor: Any) -> Optional[frozenset[str]]:
     try:
         sig = inspect.signature(ctor)
@@ -102,6 +110,8 @@ def _get_expected_args(ctor: Any) -> Optional[frozenset[str]]:
         )
     except Exception:
         return None
+
+
 def _coerce_kwargs(ctor: Any, kwargs: Dict[str, Any]) -> Dict[str, Any]:
     if not kwargs:
         return {}
@@ -118,6 +128,8 @@ def _coerce_kwargs(ctor: Any, kwargs: Dict[str, Any]) -> Dict[str, Any]:
         except Exception:
             return dict(kwargs)
     return {k: v for k, v in kwargs.items() if k in allowed}
+
+
 def _dataset_for_device(
     model_or_params: Union[
         nn.Module, Iterable[nn.Parameter], Sequence[Dict[str, Any]]
@@ -152,10 +164,14 @@ def _dataset_for_device(
     dev = (
         torch.device(metadata.device)
         if metadata
-        else ref_tensor.device if ref_tensor is not None else get_device()
+        else ref_tensor.device
+        if ref_tensor is not None
+        else get_device()
     )
     meta = Autocast.coerce_metadata(dev, metadata=metadata)
     return torch.device(meta.device), meta
+
+
 def _coerce_params(
     model_or_params: Union[
         nn.Module, Iterable[nn.Parameter], Sequence[Dict[str, Any]]
@@ -174,6 +190,8 @@ def _coerce_params(
             if isinstance(g, dict)
         ]
     return list(model_or_params)
+
+
 def _master_cpu_dtypes(
     device: torch.device,
     meta: Optional["Dataset[Any]"] = None,
@@ -191,6 +209,8 @@ def _master_cpu_dtypes(
         except Exception:
             pass
     return master_float, master_int
+
+
 def _cpu_offload(
     t: torch.Tensor,
     dtype: torch.dtype,
@@ -223,14 +243,15 @@ def _cpu_offload(
             out.copy_(src, non_blocking=nb)
             return out
     return src.to(device="cpu", dtype=dtype)
-def _has_batchnorm_modules(model: nn.Module) -> bool:
 
+
+def _has_batchnorm_modules(model: nn.Module) -> bool:
     try:
         bn_types = (
             nn.BatchNorm1d,
             nn.BatchNorm2d,
             nn.BatchNorm3d,
-            getattr(nn, 'SyncBatchNorm', nn.BatchNorm1d),
+            getattr(nn, "SyncBatchNorm", nn.BatchNorm1d),
         )
         for m in model.modules():
             if isinstance(m, bn_types):
@@ -238,6 +259,7 @@ def _has_batchnorm_modules(model: nn.Module) -> bool:
     except Exception:
         return False
     return False
+
 
 def exponential_weight_average(
     model: nn.Module,
@@ -257,6 +279,8 @@ def exponential_weight_average(
         update_every=update_every,
         non_blocking=non_blocking,
     )
+
+
 def stochastic_weight_average(
     model: nn.Module,
     *args: Any,
@@ -273,6 +297,7 @@ def stochastic_weight_average(
         avg_fn=avg_fn,
         **kwargs,
     )
+
 
 class AdamW:
     @staticmethod
@@ -496,9 +521,11 @@ class AdamW:
             payload,
         )
         return selected_opt
+
+
 class ExponentialMovingAverage(nn.Module):
     def __init__(
-        self,
+        self: Self,
         model: nn.Module,
         *args: Any,
         decay: float = 0.9999,
@@ -528,7 +555,7 @@ class ExponentialMovingAverage(nn.Module):
             self._init_shadow(model)
 
     def _iter_named_params(
-        self, model: nn.Module
+        self: Self, model: nn.Module
     ) -> Iterator[tuple[str, torch.Tensor]]:
         for name, p in model.named_parameters(recurse=True):
             if not isinstance(p, torch.Tensor):
@@ -541,7 +568,7 @@ class ExponentialMovingAverage(nn.Module):
                 continue
             yield name, p
 
-    def _target_dtype(self, t: torch.Tensor) -> torch.dtype:
+    def _target_dtype(self: Self, t: torch.Tensor) -> torch.dtype:
         if t.is_floating_point():
             return self.master_float
         if t.is_complex():
@@ -553,7 +580,7 @@ class ExponentialMovingAverage(nn.Module):
         return self.master_int
 
     def _scratch_view(
-        self, numel: int, shape: torch.Size, dtype: torch.dtype
+        self: Self, numel: int, shape: torch.Size, dtype: torch.dtype
     ) -> torch.Tensor:
         buf = self._scratch.get(dtype, None)
         if buf is None or buf.numel() < numel:
@@ -566,7 +593,7 @@ class ExponentialMovingAverage(nn.Module):
             buf = self._scratch[dtype]
         return buf[: int(numel)].view(shape)
 
-    def _init_shadow(self, model: nn.Module) -> None:
+    def _init_shadow(self: Self, model: nn.Module) -> None:
         shadow: Dict[str, torch.Tensor] = {}
         for name, p in self._iter_named_params(model):
             dt = self._target_dtype(p)
@@ -580,7 +607,7 @@ class ExponentialMovingAverage(nn.Module):
 
     @torch.no_grad()
     def update(
-        self, model: nn.Module, optimizer: object | None = None
+        self: Self, model: nn.Module, optimizer: object | None = None
     ) -> None:
         _ = optimizer
         self._step += 1
@@ -629,7 +656,9 @@ class ExponentialMovingAverage(nn.Module):
                 cur.copy_(tmp)
 
     @torch.no_grad()
-    def store(self, model: nn.Module, optimizer: object | None = None) -> None:
+    def store(
+        self: Self, model: nn.Module, optimizer: object | None = None
+    ) -> None:
         _ = optimizer
         self.collected = {}
         collected = self.collected
@@ -643,7 +672,7 @@ class ExponentialMovingAverage(nn.Module):
 
     @torch.no_grad()
     def restore(
-        self, model: nn.Module, optimizer: object | None = None
+        self: Self, model: nn.Module, optimizer: object | None = None
     ) -> None:
         _ = optimizer
         if not self.collected:
@@ -661,7 +690,9 @@ class ExponentialMovingAverage(nn.Module):
                     p.data = prev.to(device=p.device, dtype=p.dtype)
 
     @torch.no_grad()
-    def apply(self, model: nn.Module, optimizer: object | None = None) -> None:
+    def apply(
+        self: Self, model: nn.Module, optimizer: object | None = None
+    ) -> None:
         _ = optimizer
         shadow = self.shadow
         if not shadow:
@@ -678,23 +709,11 @@ class ExponentialMovingAverage(nn.Module):
             except Exception:
                 with contextlib.suppress(Exception):
                     p.data = ema_v.to(device=p.device, dtype=p.dtype)
+
+
 class StochasticWeightAverage(nn.Module):
-\
-\
-\
-\
-\
-\
-\
-\
-\
-\
-\
-\
-
-
     def __init__(
-        self,
+        self: Self,
         model: nn.Module,
         *args: Any,
         metadata: Optional["Dataset[Any]"] = None,
@@ -727,8 +746,9 @@ class StochasticWeightAverage(nn.Module):
         )
 
         self._avg_dtype = avg_dtype
-        self._pin_memory = bool(pin_memory) if pin_memory is not None else False
-
+        self._pin_memory = (
+            bool(pin_memory) if pin_memory is not None else False
+        )
 
         self._non_blocking = (
             bool(non_blocking)
@@ -739,31 +759,32 @@ class StochasticWeightAverage(nn.Module):
         self._step: int = 0
         self._n_averaged: int = 0
 
-
         self._shadow: Dict[str, torch.Tensor] = {}
-
 
         self._scratch: Dict[torch.dtype, torch.Tensor] = {}
 
-
-        self._stream_chunk_bytes = max(1 << 20, int(stream_chunk_mb) * 1024 * 1024)
+        self._stream_chunk_bytes = max(
+            1 << 20, int(stream_chunk_mb) * 1024 * 1024
+        )
         self._stream_max_inflight_bytes = max(
             int(self._stream_chunk_bytes),
             int(stream_max_inflight_mb) * 1024 * 1024,
         )
 
-
         self._lock = Mutex()
-
 
         self._use_mmap = bool(use_mmap) if use_mmap is not None else True
         self._mmap_dir: str | None = None
         self._mmap_prefix = str(mmap_prefix or "stnet_swa_shadow")
-        self._mmap_cleanup = bool(mmap_cleanup) if mmap_cleanup is not None else False
+        self._mmap_cleanup = (
+            bool(mmap_cleanup) if mmap_cleanup is not None else False
+        )
         self._mmap_created_temp = False
         self._mmap_files: Dict[torch.dtype, str] = {}
         self._mmap_base: Dict[torch.dtype, torch.Tensor] = {}
-        self._mmap_layout: Dict[str, tuple[torch.dtype, int, int, tuple[int, ...]]] = {}
+        self._mmap_layout: Dict[
+            str, tuple[torch.dtype, int, int, tuple[int, ...]]
+        ] = {}
 
         if self._use_mmap:
             try:
@@ -772,7 +793,6 @@ class StochasticWeightAverage(nn.Module):
                 if mmap_cleanup is None and self._mmap_created_temp:
                     self._mmap_cleanup = True
             except Exception:
-
                 self._use_mmap = False
                 self._mmap_dir = None
                 self._mmap_files.clear()
@@ -780,15 +800,15 @@ class StochasticWeightAverage(nn.Module):
                 self._mmap_layout.clear()
 
     @property
-    def n_averaged(self) -> int:
+    def n_averaged(self: Self) -> int:
         return int(self._n_averaged)
 
     @property
-    def shadow(self) -> Dict[str, torch.Tensor]:
+    def shadow(self: Self) -> Dict[str, torch.Tensor]:
         return self._shadow
 
     def _iter_named_params(
-        self, model: nn.Module
+        self: Self, model: nn.Module
     ) -> Iterator[tuple[str, torch.Tensor]]:
         for name, p in model.named_parameters(recurse=True):
             if not isinstance(p, torch.Tensor):
@@ -799,8 +819,7 @@ class StochasticWeightAverage(nn.Module):
                 continue
             yield name, p
 
-    def _target_dtype(self, t: torch.Tensor) -> torch.dtype:
-
+    def _target_dtype(self: Self, t: torch.Tensor) -> torch.dtype:
         if self._avg_dtype is not None:
             return self._avg_dtype
 
@@ -833,19 +852,17 @@ class StochasticWeightAverage(nn.Module):
             .replace("bool", "b1")
         )
 
-    def _init_mmap_shadow(self, model: nn.Module, *, mmap_dir: str | None) -> None:
-
+    def _init_mmap_shadow(
+        self: Self, model: nn.Module, *, mmap_dir: str | None
+    ) -> None:
         if mmap_dir:
             d = str(mmap_dir)
             os.makedirs(d, exist_ok=True)
             self._mmap_dir = d
             self._mmap_created_temp = False
         else:
-
-
             self._mmap_dir = tempfile.mkdtemp(prefix=f"{self._mmap_prefix}_")
             self._mmap_created_temp = True
-
 
         items: list[tuple[str, torch.dtype, tuple[int, ...], int]] = []
         for name, p in self._iter_named_params(model):
@@ -855,7 +872,6 @@ class StochasticWeightAverage(nn.Module):
             items.append((name, dt, shape, numel))
 
         if not items:
-
             self._use_mmap = False
             return
 
@@ -865,12 +881,13 @@ class StochasticWeightAverage(nn.Module):
         for _, dt, _, n in items:
             totals[dt] = int(totals.get(dt, 0)) + int(n)
 
-
         for dt, total in totals.items():
             if int(total) <= 0:
                 continue
             tag = self._dtype_tag(dt)
-            base_path = os.path.join(str(self._mmap_dir), f"{self._mmap_prefix}.{tag}.bin")
+            base_path = os.path.join(
+                str(self._mmap_dir), f"{self._mmap_prefix}.{tag}.bin"
+            )
 
             if os.path.exists(base_path):
                 base_path = os.path.join(
@@ -903,7 +920,9 @@ class StochasticWeightAverage(nn.Module):
         self._shadow = shadow
         self._mmap_layout = layout
 
-    def _scratch_view(self, numel: int, dtype: torch.dtype) -> torch.Tensor:
+    def _scratch_view(
+        self: Self, numel: int, dtype: torch.dtype
+    ) -> torch.Tensor:
         n = int(numel)
         if n <= 0:
             return torch.empty((0,), device="cpu", dtype=dtype)
@@ -918,8 +937,7 @@ class StochasticWeightAverage(nn.Module):
             buf = self._scratch[dtype]
         return buf[:n]
 
-    def _sync_device(self, dev_type: str) -> None:
-
+    def _sync_device(self: Self, dev_type: str) -> None:
         try:
             if dev_type == "cuda" and hasattr(torch, "cuda"):
                 torch.cuda.synchronize()
@@ -931,7 +949,7 @@ class StochasticWeightAverage(nn.Module):
             pass
 
     def _stream_copy_(
-        self, dst: torch.Tensor, src: torch.Tensor, *, dtype: torch.dtype
+        self: Self, dst: torch.Tensor, src: torch.Tensor, *, dtype: torch.dtype
     ) -> None:
         v = src.detach()
         if getattr(v, "is_meta", False) or v.device.type == "meta":
@@ -947,19 +965,23 @@ class StochasticWeightAverage(nn.Module):
         if total <= 0:
             return
 
-        dt_size = int(torch.empty((), dtype=dtype, device="cpu").element_size())
+        dt_size = int(
+            torch.empty((), dtype=dtype, device="cpu").element_size()
+        )
         chunk_elems = max(1, int(self._stream_chunk_bytes // max(1, dt_size)))
 
         for off in range(0, total, chunk_elems):
             n = min(chunk_elems, total - off)
             buf = self._scratch_view(n, dtype)
-            buf.copy_(v_flat[off : off + n], non_blocking=bool(self._non_blocking))
+            buf.copy_(
+                v_flat[off : off + n], non_blocking=bool(self._non_blocking)
+            )
             if bool(self._non_blocking) and v.device.type != "cpu":
                 self._sync_device(v.device.type)
             dst_flat[off : off + n].copy_(buf, non_blocking=False)
 
     def _stream_avg_(
-        self,
+        self: Self,
         dst: torch.Tensor,
         src: torch.Tensor,
         *,
@@ -983,20 +1005,24 @@ class StochasticWeightAverage(nn.Module):
         inv_n1 = 1.0 / float(int(n_averaged) + 1)
         one_m = 1.0 - inv_n1
 
-        dt_size = int(torch.empty((), dtype=dtype, device="cpu").element_size())
+        dt_size = int(
+            torch.empty((), dtype=dtype, device="cpu").element_size()
+        )
         chunk_elems = max(1, int(self._stream_chunk_bytes // max(1, dt_size)))
 
         for off in range(0, total, chunk_elems):
             n = min(chunk_elems, total - off)
             buf = self._scratch_view(n, dtype)
-            buf.copy_(v_flat[off : off + n], non_blocking=bool(self._non_blocking))
+            buf.copy_(
+                v_flat[off : off + n], non_blocking=bool(self._non_blocking)
+            )
             if bool(self._non_blocking) and v.device.type != "cpu":
                 self._sync_device(v.device.type)
             dst_chunk = dst_flat[off : off + n]
 
             dst_chunk.mul_(one_m).add_(buf, alpha=inv_n1)
 
-    def update(self, model: nn.Module | None = None) -> None:
+    def update(self: Self, model: nn.Module | None = None) -> None:
         if model is None:
             model = self._model
         with self._lock:
@@ -1017,8 +1043,6 @@ class StochasticWeightAverage(nn.Module):
                     or tuple(cur.shape) != tuple(v.shape)
                     or cur.dtype != dt
                 ):
-
-
                     cur = torch.empty(
                         v.shape,
                         dtype=dt,
@@ -1026,7 +1050,6 @@ class StochasticWeightAverage(nn.Module):
                         pin_memory=False,
                     )
                     shadow[name] = cur
-
 
                 if n == 0:
                     self._stream_copy_(cur, v, dtype=dt)
@@ -1040,8 +1063,7 @@ class StochasticWeightAverage(nn.Module):
             self._n_averaged = int(n + 1)
 
     @contextlib.contextmanager
-    def reduction(self, target: nn.Module) -> Any:
-
+    def reduction(self: Self, target: nn.Module) -> Any:
         if target is None:
             yield target
             return
@@ -1059,8 +1081,7 @@ class StochasticWeightAverage(nn.Module):
                     if k in backup:
                         p.detach().copy_(backup[k], non_blocking=False)
 
-    def apply(self, target: nn.Module | None = None) -> None:
-
+    def apply(self: Self, target: nn.Module | None = None) -> None:
         if target is None:
             target = self._model
         if target is None:
@@ -1077,17 +1098,12 @@ class StochasticWeightAverage(nn.Module):
                 p.detach().copy_(src, non_blocking=False)
 
     def checkpoint_state_dict(
-        self,
+        self: Self,
         model: nn.Module,
         *,
         include_buffers: bool = True,
         max_buffer_mb: int = 25,
     ) -> Dict[str, torch.Tensor]:
-\
-\
-\
-\
-
         out: Dict[str, torch.Tensor] = {}
         shadow = self._shadow
         with torch.no_grad():
@@ -1111,7 +1127,10 @@ class StochasticWeightAverage(nn.Module):
                     if getattr(b, "is_meta", False) or b.device.type == "meta":
                         continue
                     try:
-                        if max_bytes and (b.numel() * b.element_size()) > max_bytes:
+                        if (
+                            max_bytes
+                            and (b.numel() * b.element_size()) > max_bytes
+                        ):
                             continue
                     except Exception:
                         pass
@@ -1122,11 +1141,10 @@ class StochasticWeightAverage(nn.Module):
         return out
 
     def update_batch_norm(
-        self,
+        self: Self,
         dataloader: torch.utils.data.DataLoader,
         device: torch.device | None = None,
     ) -> None:
-
         if not self._has_bn:
             return
         if device is None:
@@ -1134,10 +1152,8 @@ class StochasticWeightAverage(nn.Module):
         with self.reduction(self._model):
             update_bn(dataloader, self._model, device=device)
 
-    def close(self) -> None:
-
+    def close(self: Self) -> None:
         with self._lock:
-
             try:
                 self._shadow.clear()
             except Exception:
@@ -1146,7 +1162,6 @@ class StochasticWeightAverage(nn.Module):
                 self._scratch.clear()
             except Exception:
                 pass
-
 
             try:
                 self._mmap_base.clear()
@@ -1172,29 +1187,35 @@ class StochasticWeightAverage(nn.Module):
                     pass
             self._mmap_dir = None
 
-    def save_state_dict(self) -> Dict[str, Any]:
-
-
+    def save_state_dict(self: Self) -> Dict[str, Any]:
         return {
             "n_averaged": int(self._n_averaged),
             "update_every": int(self._update_every),
-            "avg_dtype": str(self._avg_dtype) if self._avg_dtype is not None else None,
+            "avg_dtype": str(self._avg_dtype)
+            if self._avg_dtype is not None
+            else None,
             "use_mmap": bool(self._use_mmap),
             "mmap_dir": str(self._mmap_dir) if self._mmap_dir else None,
             "mmap_files": dict(self._mmap_files),
             "mmap_layout": {
-                k: (str(v[0]), int(v[1]), int(v[2]), tuple(int(x) for x in v[3]))
+                k: (
+                    str(v[0]),
+                    int(v[1]),
+                    int(v[2]),
+                    tuple(int(x) for x in v[3]),
+                )
                 for k, v in self._mmap_layout.items()
             },
         }
 
-    def load_state_dict(self, state: Dict[str, Any]) -> None:
-
+    def load_state_dict(self: Self, state: Dict[str, Any]) -> None:
         try:
             self._n_averaged = int(state.get("n_averaged", 0))
         except Exception:
             self._n_averaged = 0
         try:
-            self._update_every = max(1, int(state.get("update_every", self._update_every)))
+            self._update_every = max(
+                1, int(state.get("update_every", self._update_every))
+            )
         except Exception:
             pass

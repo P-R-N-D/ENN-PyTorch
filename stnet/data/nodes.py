@@ -22,6 +22,7 @@ from typing import (
     Optional,
     Sequence,
     Tuple,
+    Self,
 )
 
 import torch
@@ -68,11 +69,16 @@ from ..core.system import (
 
 _LOGGER = logging.getLogger(__name__)
 
+
 def _node_state_key(node: Any, attr: str, fallback: str) -> str:
     k = getattr(node, attr, None) or getattr(type(node), attr, None)
     return k if isinstance(k, str) else fallback
+
+
 def _is_accelerator_available() -> bool:
     return any(is_accelerator_available(a) for a in ("cuda", "xpu", "mps"))
+
+
 def _device_guard_ok(device: torch.device, guard_bytes: int) -> bool:
     if guard_bytes <= 0:
         return True
@@ -82,11 +88,15 @@ def _device_guard_ok(device: torch.device, guard_bytes: int) -> bool:
         ) is None or free_b >= guard_bytes
     except Exception:
         return True
+
+
 def _host_guard_ok(guard_bytes: int) -> bool:
     return (
         guard_bytes <= 0
         or getattr(Memory, "available", lambda: guard_bytes)() >= guard_bytes
     )
+
+
 def _accel_event_poll_params() -> tuple[float, float, float]:
     start_us = int(
         env_first_int(
@@ -119,6 +129,8 @@ def _accel_event_poll_params() -> tuple[float, float, float]:
     max_s = max(base_s, float(max_ms) / 1000.0)
     stop_min_s = max(0.0, float(stop_min_ms) / 1000.0)
     return base_s, max_s, stop_min_s
+
+
 def _wait_accel_event_done(
     ev: Any,
     *args: Any,
@@ -149,6 +161,8 @@ def _wait_accel_event_done(
             sleep_s = max(float(sleep_s), stop_min_s)
         time.sleep(sleep_s)
         sleep_s = min(float(sleep_s) * 2.0, max_s)
+
+
 def _normalize_device_spec(
     device: torch.device | str | Sequence[torch.device | str],
 ) -> torch.device | list[torch.device]:
@@ -166,6 +180,8 @@ def _normalize_device_spec(
             )
         return devs if devs else torch.device("cpu")
     return torch.device(device)
+
+
 def _primary_device(
     device_spec: torch.device | list[torch.device],
 ) -> torch.device:
@@ -175,11 +191,12 @@ def _primary_device(
         else device_spec
     )
 
+
 class Governor:
     __slots__ = ("_v", "_min_scale", "_max_scale")
 
     def __init__(
-        self,
+        self: Self,
         scale: float = 1.0,
         *args: Any,
         min_scale: float = 0.5,
@@ -190,10 +207,10 @@ class Governor:
         self._v = multiprocessing.Value("d", 1.0, lock=True)
         self.reset(scale)
 
-    def __getstate__(self):
+    def __getstate__(self: Self) -> tuple[object, float, float]:
         return (self._v, float(self._min_scale), float(self._max_scale))
 
-    def __setstate__(self, state):
+    def __setstate__(self: Self, state: tuple[object, float, float]) -> None:
         try:
             v, mn, mx = state
         except Exception:
@@ -216,7 +233,7 @@ class Governor:
         except Exception:
             self._v = multiprocessing.Value("d", 1.0, lock=True)
 
-    def get(self) -> float:
+    def get(self: Self) -> float:
         mn = float(self._min_scale)
         mx = float(self._max_scale)
         try:
@@ -241,7 +258,7 @@ class Governor:
             v = mx
         return float(v)
 
-    def reset(self, value: float = 1.0) -> None:
+    def reset(self: Self, value: float = 1.0) -> None:
         try:
             v = float(value)
         except Exception:
@@ -256,7 +273,7 @@ class Governor:
             with suppress(Exception):
                 self._v.value = float(v)
 
-    def request_scale_up(self, factor: float) -> None:
+    def request_scale_up(self: Self, factor: float) -> None:
         try:
             f = float(factor)
         except Exception:
@@ -272,7 +289,7 @@ class Governor:
         except Exception:
             pass
 
-    def request_scale_down(self, factor: float) -> None:
+    def request_scale_down(self: Self, factor: float) -> None:
         try:
             f = float(factor)
         except Exception:
@@ -287,11 +304,13 @@ class Governor:
                 )
         except Exception:
             pass
+
+
 class Sampler(torch.utils.data.Sampler):
     _per_sample_mem_bytes: int = 0
 
     def __init__(
-        self,
+        self: Self,
         memmap_dir: str,
         *args: Any,
         split: str = "train",
@@ -436,7 +455,7 @@ class Sampler(torch.utils.data.Sampler):
             )
         return meta
 
-    def _effective_batch_size(self) -> int:
+    def _effective_batch_size(self: Self) -> int:
         base = self.base_batch_size
         scale = 1.0
         with suppress(Exception):
@@ -452,7 +471,7 @@ class Sampler(torch.utils.data.Sampler):
             eff = min(int(eff), int(cap))
         return max(1, int(eff))
 
-    def _len_batch_size(self) -> int:
+    def _len_batch_size(self: Self) -> int:
         epoch = int(getattr(self, "_S_epoch", 0) or 0)
         snap_epoch = int(getattr(self, "_len_epoch", -1) or -1)
         snap = getattr(self, "_len_B_snapshot", None)
@@ -463,11 +482,11 @@ class Sampler(torch.utils.data.Sampler):
         return max(1, int(snap))
 
     @property
-    def _S_B(self) -> int:
+    def _S_B(self: Self) -> int:
         return self._effective_batch_size()
 
     @_S_B.setter
-    def _S_B(self, value: int) -> None:
+    def _S_B(self: Self, value: int) -> None:
         try:
             v = int(value)
         except Exception:
@@ -476,7 +495,7 @@ class Sampler(torch.utils.data.Sampler):
             v = 1
         setattr(self, "_S_B_base", int(v))
 
-    def __getstate__(self):
+    def __getstate__(self: Self) -> dict[str, object]:
         state = dict(self.__dict__)
         for key in (
             "_features",
@@ -493,7 +512,7 @@ class Sampler(torch.utils.data.Sampler):
         state["_mmap_limit_lock"] = None
         return state
 
-    def __setstate__(self, state):
+    def __setstate__(self: Self, state: dict[str, object]) -> None:
         self.__dict__.update(state)
         self._mmap_tls = None
         self._mmap_limit_lock = Mutex()
@@ -519,7 +538,9 @@ class Sampler(torch.utils.data.Sampler):
         self._X = self._memmap_features
         self._Y = self._memmap_labels
 
-    def _get_mmaps(self):
+    def _get_mmaps(
+        self: Self,
+    ) -> tuple[MemoryMappedTensor, MemoryMappedTensor | None]:
         if not getattr(self, "_mmap_thread_local", False):
             return self._features, self._labels
         has_labels = bool(self._labels is not None and self._lab_path)
@@ -561,7 +582,7 @@ class Sampler(torch.utils.data.Sampler):
                     )
             return self._features, self._labels
 
-    def _slice(self, start: int, end: int) -> Mapping[str, torch.Tensor]:
+    def _slice(self: Self, start: int, end: int) -> Mapping[str, torch.Tensor]:
         start = int(start)
         end = int(end)
         features, labels = self._get_mmaps()
@@ -579,7 +600,7 @@ class Sampler(torch.utils.data.Sampler):
         return out
 
     def _gather(
-        self, idx_tensor: torch.Tensor, features: Any, labels: Any
+        self: Self, idx_tensor: torch.Tensor, features: Any, labels: Any
     ) -> Mapping[str, torch.Tensor]:
         idx_tensor = idx_tensor.to(dtype=torch.long, copy=False)
         try:
@@ -608,7 +629,7 @@ class Sampler(torch.utils.data.Sampler):
         return out
 
     def __getitem__(
-        self, idx: int | Tuple[int, int] | Sequence[int] | torch.Tensor
+        self: Self, idx: int | Tuple[int, int] | Sequence[int] | torch.Tensor
     ) -> Mapping[str, torch.Tensor]:
         features, labels = self._get_mmaps()
         base = int(self._start)
@@ -651,7 +672,7 @@ class Sampler(torch.utils.data.Sampler):
                         out["row_ids"] = r.squeeze(0)
                 return out
 
-    def _shard(self) -> None:
+    def _shard(self: Self) -> None:
         try:
             dist = getattr(torch, "distributed", None)
             if (
@@ -673,7 +694,7 @@ class Sampler(torch.utils.data.Sampler):
             self._num_shards = 1
             self._shard_id = 0
 
-    def __iter__(self) -> Iterator[tuple[str, tuple[int, int]]]:
+    def __iter__(self: Self) -> Iterator[tuple[str, tuple[int, int]]]:
         start = int(getattr(self, "start", 0))
         end = int(getattr(self, "end", 0))
         if end <= start:
@@ -717,7 +738,7 @@ class Sampler(torch.utils.data.Sampler):
                 yield (self._key, (int(cur), int(nxt)))
                 cur = int(nxt)
 
-    def __len__(self) -> int:
+    def __len__(self: Self) -> int:
         start = int(getattr(self, "start", 0))
         end = int(getattr(self, "end", 0))
         B = max(1, int(self._len_batch_size()))
@@ -729,11 +750,11 @@ class Sampler(torch.utils.data.Sampler):
         return max(0, (int(total) - si + ns - 1) // ns)
 
     @property
-    def sampler_scale(self) -> "Governor":
+    def sampler_scale(self: Self) -> "Governor":
         return self._sampler_scale
 
     @property
-    def base_batch_size(self) -> int:
+    def base_batch_size(self: Self) -> int:
         try:
             b = int(getattr(self, "_S_B_base", 1) or 1)
         except Exception:
@@ -741,19 +762,19 @@ class Sampler(torch.utils.data.Sampler):
         return max(1, int(b))
 
     @property
-    def start(self) -> int:
+    def start(self: Self) -> int:
         return int(self._start)
 
     @property
-    def end(self) -> int:
+    def end(self: Self) -> int:
         return int(self._end)
 
     @property
-    def meta(self) -> Mapping[str, Any]:
+    def meta(self: Self) -> Mapping[str, Any]:
         return dict(self._meta or {})
 
     def compose(
-        self,
+        self: Self,
         *args: Any,
         batch_size: int,
         shuffle: bool = True,
@@ -773,12 +794,12 @@ class Sampler(torch.utils.data.Sampler):
             raise RuntimeError("torchdata.nodes.SamplerWrapper is required")
         return SamplerWrapper(self)
 
-    def set_epoch(self, epoch: int) -> None:
+    def set_epoch(self: Self, epoch: int) -> None:
         self._S_epoch = int(epoch)
         self._len_epoch = int(self._S_epoch)
         self._len_B_snapshot = max(1, int(self._effective_batch_size()))
 
-    def get(self, start: int, end: int) -> Mapping[str, Any]:
+    def get(self: Self, start: int, end: int) -> Mapping[str, Any]:
         s = int(start)
         e = int(end)
         n = max(0, e - s)
@@ -804,9 +825,11 @@ class Sampler(torch.utils.data.Sampler):
                     if out.get("Y") is not None:
                         out["Y"] = out["Y"].pin_memory()
             return out
+
+
 class Multiplexer:
     def __init__(
-        self,
+        self: Self,
         *args: Any,
         stop_criteria: str = "ALL_DATASETS_EXHAUSTED",
         weights: Optional[
@@ -823,7 +846,7 @@ class Multiplexer:
         self._node: Optional[Any] = None
         self._source_keys: list[str] = []
 
-    def set_epoch(self, epoch: int) -> None:
+    def set_epoch(self: Self, epoch: int) -> None:
         self._epoch = int(epoch)
         node = getattr(self, "_node", None)
         if node is None:
@@ -831,8 +854,6 @@ class Multiplexer:
         reset = getattr(node, "reset", None)
         if not callable(reset):
             return
-
-
 
         keys = list(getattr(self, "_source_keys", []) or [])
         has_mnws_keys = bool(
@@ -877,7 +898,7 @@ class Multiplexer:
             reset(None)
 
     def compose(
-        self,
+        self: Self,
         sources: Mapping[str, "BaseNode"] | Sequence["BaseNode"] | "BaseNode",
     ) -> "BaseNode":
         sources_kind: str
@@ -910,8 +931,6 @@ class Multiplexer:
                 "sources must be a BaseNode, Sequence[BaseNode], or Mapping[str, BaseNode]"
             )
         if len(sources_map) <= 1:
-
-
             self._source_keys = list(sources_map.keys())
             only_key = next(iter(sources_map.keys()))
             node = sources_map[only_key]
@@ -1009,9 +1028,11 @@ class Multiplexer:
         )
         self._node = node
         return node
+
+
 class Mapper:
     def __init__(
-        self,
+        self: Self,
         *args: Any,
         map_fn: Callable[[Any], Any],
         io_workers: Optional[int] = None,
@@ -1066,7 +1087,7 @@ class Mapper:
         except Exception:
             pass
 
-    def compose(self, source: "BaseNode") -> "BaseNode":
+    def compose(self: Self, source: "BaseNode") -> "BaseNode":
         node: BaseNode = source
         mapper = self.map_fn
         if (self.prebatch or 0) and int(self.prebatch) > 1:
@@ -1086,9 +1107,11 @@ class Mapper:
         if (self.prebatch or 0) and int(self.prebatch) > 1:
             node = torchdata.nodes.Unbatcher(node)
         return node
+
+
 class Loader:
     def __init__(
-        self,
+        self: Self,
         device: torch.device | str | Sequence[torch.device | str],
         *args: Any,
         node: BaseNode | None = None,
@@ -1143,10 +1166,6 @@ class Loader:
         self._host_guard_bytes = int(max(0, host_guard_mb) * (1 << 20))
         self._node = node_obj
 
-
-
-
-
         self._base_iterable = (
             node_obj
             if isinstance(node_obj, torchdata.nodes.Loader)
@@ -1172,12 +1191,11 @@ class Loader:
         except Exception:
             pass
 
-    def __iter__(self) -> Iterator[Any]:
+    def __iter__(self: Self) -> Iterator[Any]:
         dev = self._device_for_current_thread()
         dev_t = getattr(dev, "type", "cpu")
         use_accel = dev_t in {"cuda", "xpu", "mps"}
         use_prefetch = bool(use_accel and self._non_blocking)
-
 
         node_obj = self._node
         base: Any = (
@@ -1186,13 +1204,8 @@ class Loader:
             else torchdata.nodes.Loader(node_obj)
         )
         with suppress(Exception):
-
-
             base.reset(None)
         self._base_iterable = base
-
-
-
 
         base_it = iter(base)
         try:
@@ -1213,7 +1226,7 @@ class Loader:
             )
         return iter(iterable)
 
-    def __len__(self) -> int:
+    def __len__(self: Self) -> int:
         if self._length is not None:
             return int(self._length)
         try:
@@ -1221,7 +1234,7 @@ class Loader:
         except Exception:
             return 1
 
-    def _device_for_current_thread(self) -> torch.device:
+    def _device_for_current_thread(self: Self) -> torch.device:
         if isinstance(self._device, list):
             tid = threading.get_ident()
             guard = (
@@ -1238,7 +1251,7 @@ class Loader:
                 return dev
         return self._device
 
-    def _infer_mapper_threads(self, node: Any) -> int:
+    def _infer_mapper_threads(self: Self, node: Any) -> int:
         if node is None:
             return 1
         if hasattr(node, "num_workers"):
@@ -1252,7 +1265,7 @@ class Loader:
                     return count
         return 1
 
-    def _local_device_index(self) -> int:
+    def _local_device_index(self: Self) -> int:
         try:
             if is_accelerator_available("cuda"):
                 return int(get_accelerator_index("cuda"))
@@ -1285,9 +1298,11 @@ class Loader:
             length=length,
             pin_memory=pin_memory,
         )
+
+
 class Stream(BufferQueue):
     def __init__(
-        self,
+        self: Self,
         iterable: Any,
         *args: Any,
         device: torch.device | str,
@@ -1356,7 +1371,7 @@ class Stream(BufferQueue):
             )
             self._join_timeout_s = max(0.0, float(jt_ms) / 1000.0)
 
-    def _spawn_session(self) -> "Stream":
+    def _spawn_session(self: Self) -> "Stream":
         return Stream(
             self._src,
             device=self._device,
@@ -1369,14 +1384,13 @@ class Stream(BufferQueue):
             _session=True,
         )
 
-    def _apply_structure(self, obj, func):
-
-
+    def _apply_structure(
+        self: Self, obj: object, func: Callable[[object], object]
+    ) -> object:
         with suppress(Exception):
             from tensordict import TensorDictBase
 
             if isinstance(obj, TensorDictBase):
-
                 return obj.apply(
                     lambda t: func(t) if torch.is_tensor(t) else t,
                     inplace=False,
@@ -1396,8 +1410,7 @@ class Stream(BufferQueue):
             }
         return func(obj)
 
-    def _to_device(self, x: Any, device: torch.device) -> Any:
-
+    def _to_device(self: Self, x: Any, device: torch.device) -> Any:
         with suppress(Exception):
             from tensordict import TensorDictBase
 
@@ -1408,7 +1421,7 @@ class Stream(BufferQueue):
                     non_blocking_pin=bool(self._pin and self._non_blocking),
                 )
 
-        def _f(t):
+        def _f(t: object) -> object:
             if not torch.is_tensor(t) or t.device == device:
                 return t
             nb = self._non_blocking and (
@@ -1419,7 +1432,7 @@ class Stream(BufferQueue):
 
         return self._apply_structure(x, _f)
 
-    def _pin_memory(self, x: Any) -> Any:
+    def _pin_memory(self: Self, x: Any) -> Any:
         if not self._pin:
             return x
 
@@ -1427,11 +1440,10 @@ class Stream(BufferQueue):
             from tensordict import TensorDictBase
 
             if isinstance(x, TensorDictBase):
-
                 with suppress(Exception):
                     return x.pin_memory()
 
-        def _f(t):
+        def _f(t: object) -> object:
             if (
                 torch.is_tensor(t)
                 and t.device.type == "cpu"
@@ -1443,12 +1455,12 @@ class Stream(BufferQueue):
         return self._apply_structure(x, _f)
 
     def _stage_with_pool(
-        self,
+        self: Self,
         obj: Any,
         pool: TensorPagePool,
         tokens: list[Optional[TensorPagePool.Token]],
     ) -> Any:
-        def _f(t):
+        def _f(t: object) -> object:
             if not (torch.is_tensor(t) and t.device.type == "cpu") or (
                 hasattr(t, "is_pinned") and t.is_pinned()
             ):
@@ -1461,7 +1473,7 @@ class Stream(BufferQueue):
         return self._apply_structure(obj, _f)
 
     def _pin_batch(
-        self, x: Any
+        self: Self, x: Any
     ) -> tuple[Any, list[Optional[TensorPagePool.Token]]]:
         if not self._pin:
             return x, []
@@ -1472,7 +1484,7 @@ class Stream(BufferQueue):
         return self._stage_with_pool(x, pool, tokens), tokens
 
     def _producer_loop(
-        self,
+        self: Self,
         iterable: Any,
         sentinel: object,
         *args: Any,
@@ -1595,34 +1607,25 @@ class Stream(BufferQueue):
             with suppress(Exception):
                 self.put(sentinel)
 
-    def __iter__(self) -> Iterator[Any]:
-
-
-
-
+    def __iter__(self: Self) -> Iterator[Any]:
         if not bool(self._session):
             yield from self._spawn_session()
             return
 
         device = getattr(self, "_device", torch.device("cpu"))
         use_device = device.type in {"cuda", "mps", "xpu"}
-        use_accel_stream = bool(self._non_blocking and is_stream_supported(device.type))
+        use_accel_stream = bool(
+            self._non_blocking and is_stream_supported(device.type)
+        )
 
         iterable = getattr(self, "_iterable", self._src)
         gpu_guard_bytes = int(getattr(self, "_gpu_guard_bytes", 0) or 0)
         host_guard_bytes = int(getattr(self, "_host_guard_bytes", 0) or 0)
 
-
-
-
-
-
-
         if use_accel_stream and self._accel_stream is None:
             self._accel_stream = new_accelerator_stream(device)
         if use_accel_stream and self._accel_stream is None:
             use_accel_stream = False
-
 
         if use_accel_stream:
             pool: queue.SimpleQueue = queue.SimpleQueue()
@@ -1717,11 +1720,9 @@ class Stream(BufferQueue):
 
         buf = collections.deque()
 
-
         src_it = iter(iterable)
 
         try:
-
             for _ in range(max(1, int(getattr(self, "_depth", 2) or 2))):
                 try:
                     raw = next(src_it)
@@ -1729,11 +1730,7 @@ class Stream(BufferQueue):
                     break
                 buf.append(_stage_one(raw))
 
-
-
             if not buf:
-
-
                 raise RuntimeError(
                     "Stream: source yielded 0 items during prefetch priming. "
                     "This usually means the upstream iterable is exhausted/stateful and was reused, "
@@ -1760,7 +1757,6 @@ class Stream(BufferQueue):
                             pool.put(ev)
 
                 yield batch
-
 
                 try:
                     raw = next(src_it)

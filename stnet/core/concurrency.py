@@ -19,8 +19,8 @@ import threading
 import time
 import traceback
 from collections.abc import Iterator, Sequence
-from types import ModuleType
-from typing import Any, Callable, Optional, Protocol, Tuple
+from types import ModuleType, TracebackType
+from typing import Any, Callable, Optional, Protocol, Tuple, Self
 
 import torch
 
@@ -59,6 +59,7 @@ _EXECUTOR_ORDINAL_LOCK = threading.Lock()
 _TLB_SINGLETON: Optional["Thread"] = None
 _TLB_SINGLETON_LOCK = None
 
+
 def _flatten_args(items: Sequence[Any]) -> Iterator[Any]:
     for item in items:
         if isinstance(item, dict):
@@ -67,6 +68,8 @@ def _flatten_args(items: Sequence[Any]) -> Iterator[Any]:
             yield from _flatten_args(list(item))
         else:
             yield item
+
+
 def _get_throttle_state() -> str:
     s = (
         str(
@@ -88,6 +91,8 @@ def _get_throttle_state() -> str:
         if s in {"sync", "synchronous"}
         else ("raise" if s in {"raise", "error"} else "block")
     )
+
+
 def _get_throttle_timeout() -> float:
     return max(
         0.0,
@@ -102,6 +107,8 @@ def _get_throttle_timeout() -> float:
             or 0.05
         ),
     )
+
+
 def _is_early_release_enabled() -> bool:
     return bool(
         env_flag(
@@ -110,16 +117,24 @@ def _is_early_release_enabled() -> bool:
             default=True,
         )
     )
+
+
 def _is_force_unpin_enabled() -> bool:
     return bool(
         env_flag("STNET_CACHE_FORCE_UNPIN", "STNET_CACHE_UNPIN", default=False)
     )
+
+
 def _prod_int(shape: Sequence[int]) -> int:
     return int(max(1, math.prod(int(s) for s in shape)))
+
+
 def _is_affinity_enabled() -> bool:
     return bool(
         env_flag("STNET_EXECUTOR_AFFINITY", "STNET_AFFINITY", default=True)
     )
+
+
 def _is_affinity_strict() -> bool:
     return bool(
         env_flag(
@@ -128,11 +143,15 @@ def _is_affinity_strict() -> bool:
             default=False,
         )
     )
+
+
 def _next_ordinal() -> int:
     with _EXECUTOR_ORDINAL_LOCK:
         with contextlib.suppress(Exception):
             return int(next(_EXECUTOR_ORDINAL))
     return 0
+
+
 def _is_inner_thread_limited(wl: str) -> bool:
     wl = str(wl or "").strip().lower()
     if wl not in {"cpu", "compute"}:
@@ -144,6 +163,8 @@ def _is_inner_thread_limited(wl: str) -> bool:
     ):
         return False
     return True
+
+
 def _set_concurrency_env(
     key: str, value: str, *args: Any, force: bool, cap_down: bool = True
 ) -> None:
@@ -168,6 +189,8 @@ def _set_concurrency_env(
             os.environ[k] = str(max(1, tgt_i))
     except Exception:
         return
+
+
 def _init_env(key: str, value: str, *args: Any, force: bool) -> None:
     try:
         if (
@@ -178,6 +201,8 @@ def _init_env(key: str, value: str, *args: Any, force: bool) -> None:
             os.environ[str(key)] = str(value)
     except Exception:
         return
+
+
 def _limit_inner_threads(threads: int, *args: Any, force: bool = False) -> int:
     t = max(1, int(threads))
     ov = env_first_int(("STNET_EXECUTOR_INNER_THREADS",), default=0) or 0
@@ -198,10 +223,14 @@ def _limit_inner_threads(threads: int, *args: Any, force: bool = False) -> int:
     with contextlib.suppress(Exception):
         torch.set_num_interop_threads(1)
     return int(t)
+
+
 def _is_outer_concurrency_limited() -> bool:
     return bool(
         env_flag("STNET_EXECUTOR_LIMIT_OUTER_CONCURRENCY", default=True)
     )
+
+
 def _max_outer_concurrency() -> int:
     return int(
         env_first_int(
@@ -210,6 +239,8 @@ def _max_outer_concurrency() -> int:
         )
         or 0
     )
+
+
 def _outer_concurrency_mode() -> str:
     s = (
         str(
@@ -222,13 +253,19 @@ def _outer_concurrency_mode() -> str:
         .lower()
     )
     return s if s in {"auto", "logical", "physical"} else "auto"
+
+
 def _are_processes_limited() -> bool:
     return bool(env_flag("STNET_EXECUTOR_CAP_PROCESS_WORKERS", default=True))
+
+
 def _target_process_workers() -> int:
     return int(
         env_first_int(("STNET_EXECUTOR_PROCESS_TARGET_WORKERS",), default=0)
         or 0
     )
+
+
 def _outer_concurrency_limit(
     wl: str, executor_kind: str, nlogical: int, nphysical: int, mw: int
 ) -> int:
@@ -254,6 +291,8 @@ def _outer_concurrency_limit(
     else:
         base = nphy if wl == "compute" else nlog
     return max(1, min(int(mw), int(base)))
+
+
 def _parse_cpu_list(spec: str) -> list[int]:
     out: list[int] = []
     s = str(spec or "").strip()
@@ -273,6 +312,8 @@ def _parse_cpu_list(spec: str) -> list[int]:
             with contextlib.suppress(Exception):
                 out.append(int(part))
     return out
+
+
 def _linux_thread_sibling_groups(
     cpus_key: tuple[int, ...],
 ) -> list[tuple[int, ...]]:
@@ -291,6 +332,8 @@ def _linux_thread_sibling_groups(
             continue
         groups[tuple(sibs)] = None
     return sorted(groups.keys(), key=lambda g: (g[0], len(g), g))
+
+
 def _executor_scatter_cpus(cpus: Sequence[int]) -> list[int]:
     base = sorted({int(x) for x in (cpus or [])})
     if not base:
@@ -309,6 +352,8 @@ def _executor_scatter_cpus(cpus: Sequence[int]) -> list[int]:
         c for c in secondary if c in allowed
     ]
     return out if out else base
+
+
 def _executor_prefer_smt_lane(
     cpus: Sequence[int], *args: Any, prefer_primary: bool
 ) -> list[int]:
@@ -329,17 +374,23 @@ def _executor_prefer_smt_lane(
     sec = [c for c in secondary if c in allowed]
     out = (prim + sec) if prefer_primary else (sec + prim)
     return out if out else base
+
+
 def _executor_allowed_cpus() -> list[int]:
     with contextlib.suppress(Exception):
         return sorted({int(x) for x in CPU.allowed()})
     with contextlib.suppress(Exception):
         return sorted({int(x) for x in os.sched_getaffinity(0)})
     return []
+
+
 def _hash32(s: str) -> int:
     with contextlib.suppress(Exception):
         b = hashlib.md5(s.encode("utf-8", errors="ignore")).digest()
         return int.from_bytes(b[:4], byteorder="little", signed=False)
     return 0
+
+
 def _pick_coprime_stride(n: int, hint: int, salt: int) -> int:
     n = max(1, int(n))
     if n == 1:
@@ -351,6 +402,8 @@ def _pick_coprime_stride(n: int, hint: int, salt: int) -> int:
         if math.gcd(int(k), int(n)) == 1:
             return int(k)
     return 1
+
+
 def _executor_scope_start(
     role: str, wl: str, prefix: str, mw: int, cpw: int, ordinal: int, ncpu: int
 ) -> int:
@@ -360,6 +413,8 @@ def _executor_scope_start(
     key = f"{seed}|pid={os.getpid()}|role={role}|wl={wl}|pfx={prefix}|mw={mw}|cpw={cpw}|ord={ordinal}"
     h = _hash32(key)
     return int(h % max(1, int(ncpu)))
+
+
 def _pick_cores_balanced(
     cpus: Sequence[int],
     start: int,
@@ -389,6 +444,8 @@ def _pick_cores_balanced(
             out.append(c)
             seen.add(c)
     return out or [int(base[base_pos])]
+
+
 def _thread_worker_index(max_workers: int) -> int:
     try:
         nm = str(threading.current_thread().name or "")
@@ -402,6 +459,8 @@ def _thread_worker_index(max_workers: int) -> int:
         nid = int(threading.get_native_id())
         return int(nid) % max(1, int(max_workers))
     return 0
+
+
 def _process_worker_index(max_workers: int) -> int:
     with contextlib.suppress(Exception):
         import multiprocessing as _mp
@@ -412,6 +471,8 @@ def _process_worker_index(max_workers: int) -> int:
     with contextlib.suppress(Exception):
         return int(os.getpid()) % max(1, int(max_workers))
     return 0
+
+
 def _set_current_thread_affinity(cores: Sequence[int]) -> None:
     if not cores:
         return
@@ -421,6 +482,8 @@ def _set_current_thread_affinity(cores: Sequence[int]) -> None:
             if tid > 0:
                 os.sched_setaffinity(tid, {int(c) for c in cores})
     return
+
+
 def _set_current_process_affinity(cores: Sequence[int]) -> None:
     if not cores:
         return
@@ -428,6 +491,8 @@ def _set_current_process_affinity(cores: Sequence[int]) -> None:
         with contextlib.suppress(Exception):
             os.sched_setaffinity(0, {int(c) for c in cores})
     return
+
+
 def _executor_thread_initializer(
     role: str,
     wl: str,
@@ -451,6 +516,8 @@ def _executor_thread_initializer(
     with contextlib.suppress(Exception):
         tlb = new_affinity()
         tlb._tls.pinned = True
+
+
 def _executor_process_initializer(
     wl: str,
     cpus: Sequence[int],
@@ -476,11 +543,14 @@ def _executor_process_initializer(
         tlb = new_affinity()
         tlb._tls.pinned = True
 
+
 def is_free_threading_build() -> bool:
     with contextlib.suppress(Exception):
         return bool(CPU.is_free_threaded_build())
     tag = getattr(getattr(sys, "implementation", None), "cache_tag", "") or ""
     return bool(isinstance(tag, str) and tag.endswith("t"))
+
+
 def is_gil_enabled() -> bool:
     with contextlib.suppress(Exception):
         return bool(CPU.is_gil_enabled())
@@ -489,11 +559,17 @@ def is_gil_enabled() -> bool:
         with contextlib.suppress(Exception):
             return bool(fn())
     return True
+
+
 def python_build_tag() -> str:
     major, minor = sys.version_info[:2]
     return f"{major}.{minor}{'t' if is_free_threading_build() else ''}"
+
+
 def is_interpreter_pool_supported() -> bool:
     return getattr(futures, "InterpreterPoolExecutor", None) is not None
+
+
 def new_prefetcher(
     iterable: Any,
     *args: Any,
@@ -504,6 +580,8 @@ def new_prefetcher(
     return Prefetcher(
         iterable, max_batches=max_batches, name=name, daemon=daemon
     )
+
+
 def new_executor(
     max_workers: int,
     *args: Any,
@@ -749,6 +827,8 @@ def new_executor(
         )
     except TypeError:
         return futures.ProcessPoolExecutor(max_workers=int(mw_eff))
+
+
 def new_affinity(io_workers: Optional[int] = None) -> "Thread":
     global _TLB_SINGLETON
     if _TLB_SINGLETON is None:
@@ -763,10 +843,14 @@ def new_affinity(io_workers: Optional[int] = None) -> "Thread":
     elif io_workers is not None:
         _TLB_SINGLETON.tune(io_workers=int(io_workers))
     return _TLB_SINGLETON
+
+
 def new_thread(
     fn: Callable[[Any], Any], *args: Any, io_workers: Optional[int] = None
 ) -> Callable[[Any], Any]:
     return new_affinity(io_workers=io_workers).new_thread(fn)
+
+
 def close(obj: Any, *args: Any, join_timeout: float | None = 1.0) -> None:
     for name in (
         "cleanup",
@@ -789,15 +873,24 @@ def close(obj: Any, *args: Any, join_timeout: float | None = 1.0) -> None:
     with contextlib.suppress(Exception):
         obj() if callable(obj) else None
 
+
 class _QueryEvent(Protocol):
-    def query(self) -> bool: ...
+    def query(self: Self) -> bool: ...
+
+
 class _SyncEvent(Protocol):
-    def synchronize(self) -> Any: ...
+    def synchronize(self: Self) -> Any: ...
+
+
 class _WaitEvent(Protocol):
-    def wait(self, timeout: float | None = None) -> Any: ...
+    def wait(self: Self, timeout: float | None = None) -> Any: ...
+
+
 class _PoolToken:
     i: int
     g: int
+
+
 class _PoolEntry:
     page: TensorPage
     busy: bool = False
@@ -805,9 +898,12 @@ class _PoolEntry:
     fence_evt: object | None = None
     gen: int = 0
 
+
 class ProducerError:
     exc: BaseException
     tb: str
+
+
 class Affinity:
     __slots__ = (
         "_parent",
@@ -823,7 +919,7 @@ class Affinity:
     )
 
     def __init__(
-        self,
+        self: Self,
         parent: "Thread",
         fn: Callable[[Any], Any],
         pin_thread: Callable[[], None],
@@ -846,7 +942,7 @@ class Affinity:
         self._perf_counter_ns = perf_counter_ns
         self._thread_time_ns = thread_time_ns
 
-    def __call__(self, *args: Any, **kwargs: Any) -> Any:
+    def __call__(self: Self, *args: Any, **kwargs: Any) -> Any:
         if not getattr(self._tls, "pinned", False):
             self._pin_thread()
         count = getattr(self._tls, "count", 0) + 1
@@ -879,26 +975,30 @@ class Affinity:
             except Exception:
                 pass
         return out
+
+
 class Disposable:
-    def __init__(self, *args: Any, **kwargs: Any) -> None:
+    def __init__(self: Self, *args: Any, **kwargs: Any) -> None:
         self._keep: list[Any] = list(_flatten_args(list(args)))
         if kwargs:
             self._keep.extend(list(_flatten_args(list(kwargs.values()))))
 
-    def add(self, *args: Any, **kwargs: Any) -> None:
+    def add(self: Self, *args: Any, **kwargs: Any) -> None:
         self._keep.extend(list(_flatten_args(list(args))))
         if kwargs:
             self._keep.extend(list(_flatten_args(list(kwargs.values()))))
 
-    def cleanup(self) -> None:
+    def cleanup(self: Self) -> None:
         for obj in self._keep:
             close(obj)
 
-    def close(self) -> None:
+    def close(self: Self) -> None:
         self.cleanup()
 
-    def __iter__(self) -> Iterator[Any]:
+    def __iter__(self: Self) -> Iterator[Any]:
         return iter(self._keep)
+
+
 class Prefetcher:
     __slots__ = (
         "_src",
@@ -910,7 +1010,7 @@ class Prefetcher:
     )
 
     def __init__(
-        self,
+        self: Self,
         iterable: Any,
         *args: Any,
         max_batches: int = 4,
@@ -932,16 +1032,16 @@ class Prefetcher:
             self._join_timeout_s = max(0.0, float(jt_ms) / 1000.0)
 
     @property
-    def max_batches(self) -> int:
+    def max_batches(self: Self) -> int:
         return int(self._max_batches)
 
-    def __len__(self) -> int:
+    def __len__(self: Self) -> int:
         try:
             return int(len(self._src))
         except Exception:
             return 1
 
-    def __iter__(self) -> Iterator[Any]:
+    def __iter__(self: Self) -> Iterator[Any]:
         if not bool(self._session):
             return iter(
                 Prefetcher(
@@ -954,20 +1054,14 @@ class Prefetcher:
             )
         return self._iter_session()
 
-    def __getattr__(self, name: str) -> Any:
-\
-\
-\
-\
-
+    def __getattr__(self: Self, name: str) -> Any:
         return getattr(self._src, name)
 
-    def _producer_loop(self, src: Any, buf: "BufferQueue", sentinel: object) -> None:
+    def _producer_loop(
+        self: Self, src: Any, buf: "BufferQueue", sentinel: object
+    ) -> None:
         it: Iterator[Any] | None = None
         try:
-
-
-
             it = iter(src)
             while not buf.is_stopped():
                 if not buf.block(timeout=None):
@@ -990,7 +1084,7 @@ class Prefetcher:
             with contextlib.suppress(Exception):
                 buf.put(sentinel)
 
-    def _iter_session(self) -> Iterator[Any]:
+    def _iter_session(self: Self) -> Iterator[Any]:
         buf = BufferQueue(max_batches=int(self._max_batches))
         sentinel = object()
         ex = new_executor(1, workload="io", name=f"{self._name}-producer")
@@ -1025,11 +1119,13 @@ class Prefetcher:
                     ex.shutdown(wait=False, cancel_futures=True)
                 except TypeError:
                     ex.shutdown(wait=False)
+
+
 class TensorPage:
     __slots__ = ("_buf", "_numel", "_dtype", "_pinned")
 
     def __init__(
-        self,
+        self: Self,
         numel: int,
         dtype: torch.dtype,
         *args: Any,
@@ -1046,18 +1142,18 @@ class TensorPage:
         )
 
     @property
-    def numel(self) -> int:
+    def numel(self: Self) -> int:
         return int(self._numel)
 
     @property
-    def dtype(self) -> torch.dtype:
+    def dtype(self: Self) -> torch.dtype:
         return self._dtype
 
     @property
-    def pinned(self) -> bool:
+    def pinned(self: Self) -> bool:
         return bool(self._pinned)
 
-    def ensure(self, numel: int) -> None:
+    def ensure(self: Self, numel: int) -> None:
         need = int(max(1, int(numel)))
         if need <= int(self._numel):
             return
@@ -1069,17 +1165,18 @@ class TensorPage:
             pin_memory=bool(self._pinned),
         )
 
-    def view(self, *shape: int) -> torch.Tensor:
+    def view(self: Self, *shape: int) -> torch.Tensor:
         need = _prod_int(shape)
         self.ensure(need)
         return self._buf[:need].view(*shape)
+
 
 class TensorPagePool:
     Token = _PoolToken
     _Entry = _PoolEntry
 
     def __init__(
-        self, capacity: int = 4, *args: Any, pin_memory: bool = True
+        self: Self, capacity: int = 4, *args: Any, pin_memory: bool = True
     ) -> None:
         self._cap = max(1, int(capacity))
         self._pin = bool(pin_memory)
@@ -1087,7 +1184,7 @@ class TensorPagePool:
         self._rr = 0
         self._cv = threading.Condition()
 
-    def _event_finished(self, evt: object | None) -> bool:
+    def _event_finished(self: Self, evt: object | None) -> bool:
         if evt is None:
             return True
         with contextlib.suppress(Exception):
@@ -1097,7 +1194,7 @@ class TensorPagePool:
                 return bool(is_set())
         return False
 
-    def _scavenge_lock(self) -> int:
+    def _scavenge_lock(self: Self) -> int:
         freed = 0
         for e in self._pages:
             if (
@@ -1111,11 +1208,11 @@ class TensorPagePool:
         return freed
 
     @property
-    def capacity(self) -> int:
+    def capacity(self: Self) -> int:
         return int(self._cap)
 
     def get(
-        self,
+        self: Self,
         shape: Tuple[int, ...],
         dtype: torch.dtype,
         *args: Any,
@@ -1184,8 +1281,9 @@ class TensorPagePool:
                     e = self._pages[idx]
                     if new_page:
                         e.page, e.gen = new_page, e.gen + 1
-                    view, token = e.page.view(*shape_t), TensorPagePool.Token(
-                        int(idx), int(e.gen)
+                    view, token = (
+                        e.page.view(*shape_t),
+                        TensorPagePool.Token(int(idx), int(e.gen)),
                     )
                 return (view, token) if return_handle else view
 
@@ -1202,9 +1300,10 @@ class TensorPagePool:
                     if len(self._pages) < self._cap:
                         self._pages.append(entry)
                         self._rr = len(self._pages) % self._cap
-                        view, token = entry.page.view(
-                            *shape_t
-                        ), TensorPagePool.Token(len(self._pages) - 1, 0)
+                        view, token = (
+                            entry.page.view(*shape_t),
+                            TensorPagePool.Token(len(self._pages) - 1, 0),
+                        )
                         return (view, token) if return_handle else view
                 continue
             break
@@ -1215,7 +1314,7 @@ class TensorPagePool:
         return (view, None) if return_handle else view
 
     def get_like(
-        self,
+        self: Self,
         t: torch.Tensor,
         *args: Any,
         return_handle: bool = False,
@@ -1231,7 +1330,7 @@ class TensorPagePool:
         )
 
     def fence_event(
-        self,
+        self: Self,
         token: TensorPagePool.Token | None,
         factory: Callable[[], object] | None,
     ) -> object | None:
@@ -1264,7 +1363,9 @@ class TensorPagePool:
         return ev_new
 
     def release_after(
-        self, token: TensorPagePool.Token | None, wait_event: object | None
+        self: Self,
+        token: TensorPagePool.Token | None,
+        wait_event: object | None,
     ) -> None:
         if token is None:
             return
@@ -1275,7 +1376,7 @@ class TensorPagePool:
                 self._pages[i].busy, self._pages[i].fence = True, wait_event
                 self._cv.notify()
 
-    def release(self, token: TensorPagePool.Token | None) -> None:
+    def release(self: Self, token: TensorPagePool.Token | None) -> None:
         if token is None:
             return
         with self._cv:
@@ -1285,13 +1386,14 @@ class TensorPagePool:
                 self._pages[i].busy, self._pages[i].fence = False, None
                 self._cv.notify()
 
-    def collect(self) -> None:
+    def collect(self: Self) -> None:
         with self._cv:
             if self._scavenge_lock():
                 self._cv.notify_all()
 
+
 class TensorSpooler:
-    def __init__(self, root: str, max_queue: int = 8) -> None:
+    def __init__(self: Self, root: str, max_queue: int = 8) -> None:
         self._root = os.fspath(root)
         os.makedirs(self._root, exist_ok=True)
         max_q = max(1, int(max_queue))
@@ -1309,7 +1411,7 @@ class TensorSpooler:
         self._executor = new_executor(1, workload="io", name="CacheWriter")
         self._future = self._executor.submit(self._run)
 
-    def _wait(self, evt: object | None) -> None:
+    def _wait(self: Self, evt: object | None) -> None:
         if evt is None:
             return
         with contextlib.suppress(Exception):
@@ -1331,7 +1433,7 @@ class TensorSpooler:
         return False
 
     def _init_tensor(
-        self,
+        self: Self,
         tensor: torch.Tensor,
         *args: Any,
         release_cb: Callable[[], Any] | None = None,
@@ -1370,7 +1472,7 @@ class TensorSpooler:
             buf = buf.contiguous()
         return buf, released
 
-    def _save_tensor(self, tensor: torch.Tensor, path: str) -> None:
+    def _save_tensor(self: Self, tensor: torch.Tensor, path: str) -> None:
         if not torch.is_tensor(tensor):
             tensor = torch.as_tensor(tensor)
         buf = tensor.detach()
@@ -1414,14 +1516,19 @@ class TensorSpooler:
         else:
             torch.save(buf, path)
 
-    def __enter__(self):
+    def __enter__(self: Self) -> Self:
         return self
 
-    def __exit__(self, exc_type, exc, tb):
+    def __exit__(
+        self: Self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: TracebackType | None,
+    ) -> bool:
         self.close()
         return False
 
-    def _run(self) -> None:
+    def _run(self: Self) -> None:
         while True:
             item = self._q.get()
             if item[0] is None:
@@ -1446,7 +1553,7 @@ class TensorSpooler:
                     self._sem.release() if self._sem else None
 
     def submit(
-        self,
+        self: Self,
         tensor: torch.Tensor,
         path: Optional[str] = None,
         idx: Optional[int] = None,
@@ -1498,7 +1605,7 @@ class TensorSpooler:
                     self._sem.release()
             raise
 
-    def close(self) -> None:
+    def close(self: Self) -> None:
         if self._closed.is_set():
             return
         self._closed.set()
@@ -1508,11 +1615,12 @@ class TensorSpooler:
         with contextlib.suppress(Exception):
             self._executor.shutdown(wait=True)
 
-    def had_error(self) -> bool:
+    def had_error(self: Self) -> bool:
         return bool(self._err_event.is_set())
 
+
 class BufferQueue:
-    def __init__(self, max_batches: int) -> None:
+    def __init__(self: Self, max_batches: int) -> None:
         self.max_batches = max(1, int(max_batches))
         self._buf: "collections.deque[Any]" = collections.deque()
         self._stop = threading.Event()
@@ -1521,7 +1629,9 @@ class BufferQueue:
             "STNET_BUFFER_WARN_BLOCKING", "STNET_DEBUG", default=False
         )
 
-    def put(self, item: Any, *args: Any, timeout: float | None = None) -> bool:
+    def put(
+        self: Self, item: Any, *args: Any, timeout: float | None = None
+    ) -> bool:
         if self._stop.is_set():
             return False
         t0 = time.monotonic()
@@ -1552,10 +1662,12 @@ class BufferQueue:
             )
         return True
 
-    def __len__(self) -> int:
+    def __len__(self: Self) -> int:
         return self.size()
 
-    def get(self, block: bool = True, timeout: float | None = None) -> Any:
+    def get(
+        self: Self, block: bool = True, timeout: float | None = None
+    ) -> Any:
         if not bool(block):
             with self._cv:
                 if not self._buf:
@@ -1580,15 +1692,15 @@ class BufferQueue:
             self._cv.notify()
             return item
 
-    def empty(self) -> bool:
+    def empty(self: Self) -> bool:
         with self._cv:
             return not bool(self._buf)
 
-    def size(self) -> int:
+    def size(self: Self) -> int:
         with self._cv:
             return int(len(self._buf))
 
-    def block(self, *args: Any, timeout: float | None = None) -> bool:
+    def block(self: Self, *args: Any, timeout: float | None = None) -> bool:
         if self._stop.is_set():
             return False
         t0 = time.monotonic()
@@ -1606,22 +1718,23 @@ class BufferQueue:
                     self._cv.wait(timeout=remaining)
             return not bool(self._stop.is_set())
 
-    def clear(self) -> None:
+    def clear(self: Self) -> None:
         with self._cv:
             self._buf.clear()
             self._cv.notify_all()
 
-    def stop(self) -> None:
+    def stop(self: Self) -> None:
         self._stop.set()
         with self._cv:
             self._cv.notify_all()
 
-    def is_stopped(self) -> bool:
+    def is_stopped(self: Self) -> bool:
         return bool(self._stop.is_set())
+
 
 class Thread:
     def __init__(
-        self,
+        self: Self,
         io_workers: int,
         enabled: bool = True,
         allow_omp_bind: bool = True,
@@ -1655,7 +1768,7 @@ class Thread:
             return None
         return importlib.import_module("psutil")
 
-    def _next_core(self) -> int:
+    def _next_core(self: Self) -> int:
         return int(next(self._proc_cycle))
 
     @staticmethod
@@ -1686,14 +1799,14 @@ class Thread:
         except Exception:
             return False
 
-    def tune(self, io_workers: Optional[int] = None) -> None:
+    def tune(self: Self, io_workers: Optional[int] = None) -> None:
         if io_workers is not None:
             self._io_workers = max(
                 1, min(int(io_workers), max(1, len(self._allowed_cpus)))
             )
         self.tune_threads(io_workers=self._io_workers, initial=True)
 
-    def _retune_threads(self) -> None:
+    def _retune_threads(self: Self) -> None:
         if not self._enabled:
             return
         if getattr(self._tls, "in_retune", False):
@@ -1744,7 +1857,7 @@ class Thread:
         finally:
             self._tls.in_retune = False
 
-    def total_procs(self) -> list[int]:
+    def total_procs(self: Self) -> list[int]:
         return list(self._allowed_cpus)
 
     @staticmethod
@@ -1785,7 +1898,7 @@ class Thread:
                 pass
         return False
 
-    def pin_thread(self) -> None:
+    def pin_thread(self: Self) -> None:
         if not self._enabled:
             return
         attempts = getattr(self._tls, "attempts", 0)
@@ -1856,7 +1969,7 @@ class Thread:
                 self._enabled = False
 
     def tune_threads(
-        self,
+        self: Self,
         io_workers: Optional[int] = None,
         *_unused_args: Any,
         initial: bool = False,
@@ -1921,7 +2034,9 @@ class Thread:
             return
         self._retune_threads()
 
-    def new_thread(self, fn: Callable[[Any], Any]) -> Callable[[Any], Any]:
+    def new_thread(
+        self: Self, fn: Callable[[Any], Any]
+    ) -> Callable[[Any], Any]:
         if not self._enabled:
             return fn
         sample_every = (
@@ -1943,7 +2058,7 @@ class Thread:
             thread_time_ns=getattr(time, "thread_time_ns", None),
         )
 
-    def optimize_procs(self, io_workers: int) -> int:
+    def optimize_procs(self: Self, io_workers: int) -> int:
         if not self._enabled:
             return int(io_workers)
         cpus = max(1, len(self._allowed_cpus))
@@ -1951,14 +2066,15 @@ class Thread:
         self._io_workers = tuned
         return tuned
 
+
 class BoundedExecutor(futures.Executor):
-    def __init__(self, inner: futures.Executor, limit: int) -> None:
+    def __init__(self: Self, inner: futures.Executor, limit: int) -> None:
         self._inner = inner
         self._limit = max(1, int(limit))
         self._sem = threading.BoundedSemaphore(value=self._limit)
 
     def submit(
-        self, fn: Callable[..., Any], /, *args: Any, **kwargs: Any
+        self: Self, fn: Callable[..., Any], /, *args: Any, **kwargs: Any
     ) -> futures.Future:
         sem = self._sem
         sem.acquire()
@@ -1975,7 +2091,7 @@ class BoundedExecutor(futures.Executor):
         return fut
 
     def map(
-        self,
+        self: Self,
         fn: Callable[..., Any],
         *iterables: Any,
         timeout: float | None = None,
@@ -2015,27 +2131,28 @@ class BoundedExecutor(futures.Executor):
         return _result_iter()
 
     def shutdown(
-        self, wait: bool = True, *args: Any, cancel_futures: bool = False
+        self: Self, wait: bool = True, *args: Any, cancel_futures: bool = False
     ) -> None:
         try:
             self._inner.shutdown(wait=wait, cancel_futures=cancel_futures)
         except TypeError:
             self._inner.shutdown(wait=wait)
 
-    def __enter__(self) -> "BoundedExecutor":
+    def __enter__(self: Self) -> "BoundedExecutor":
         self._inner.__enter__()
         return self
 
-    def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> Any:
+    def __exit__(self: Self, exc_type: Any, exc: Any, tb: Any) -> Any:
         return self._inner.__exit__(exc_type, exc, tb)
 
-    def __getattr__(self, name: str) -> Any:
+    def __getattr__(self: Self, name: str) -> Any:
         return getattr(self._inner, name)
+
 
 class Mutex:
     __slots__ = ("_lock", "_acquire", "_release", "_locked_fn")
 
-    def __init__(self, *args: Any, reentrant: bool = False) -> None:
+    def __init__(self: Self, *args: Any, reentrant: bool = False) -> None:
         lock = threading.RLock() if bool(reentrant) else threading.Lock()
         self._lock = lock
         self._acquire = lock.acquire
@@ -2043,31 +2160,36 @@ class Mutex:
         self._locked_fn = getattr(lock, "locked", None)
 
     @property
-    def raw(self) -> threading.Lock | threading.RLock:
+    def raw(self: Self) -> threading.Lock | threading.RLock:
         return self._lock
 
     def acquire(
-        self, blocking: bool = True, timeout: float | None = None
+        self: Self, blocking: bool = True, timeout: float | None = None
     ) -> bool:
         if timeout is None:
             return bool(self._acquire(blocking))
         return bool(self._acquire(blocking, float(timeout)))
 
-    def release(self) -> None:
+    def release(self: Self) -> None:
         self._release()
 
-    def locked(self) -> bool:
+    def locked(self: Self) -> bool:
         fn = self._locked_fn
         if callable(fn):
             return bool(fn())
         return False
 
-    def __enter__(self) -> "Mutex":
+    def __enter__(self: Self) -> "Mutex":
         self.acquire(True, None)
         return self
 
-    def __exit__(self, exc_type, exc, tb) -> None:
+    def __exit__(
+        self: Self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: TracebackType | None,
+    ) -> None:
         self.release()
-        
-        
+
+
 _TLB_SINGLETON_LOCK = Mutex()

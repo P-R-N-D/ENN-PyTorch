@@ -29,6 +29,7 @@ from typing import (
     TypeVar,
     Union,
     cast,
+    Self,
 )
 
 import torch
@@ -69,7 +70,9 @@ _NODES_LOCK = Mutex()
 _device_mem_get_info = Memory.mem_get_info
 SourceType = Literal["memmap"]
 TExtra = TypeVar("TExtra")
+TMerge = TypeVar("TMerge")
 logger = logging.getLogger(__name__)
+
 
 def _require_nodes() -> None:
     global _NODES_IMPORTED
@@ -97,16 +100,24 @@ def _require_nodes() -> None:
             }
         )
         _NODES_IMPORTED = True
+
+
 def _sync_device(device: torch.device) -> None:
     sync_accelerator(device)
+
+
 def _is_lazy_tensor(x: Any) -> bool:
     return isinstance(x, MemoryMappedTensor)
+
+
 def _feature_size_hint(obj: Any) -> Optional[int]:
     if isinstance(obj, torch.Tensor):
         return int(obj.numel()) if obj.ndim > 0 else 1
     if isinstance(obj, (tuple, list)):
         return len(obj)
     return None
+
+
 def _stack_sequence(
     seq: Sequence[Any],
     *args: Any,
@@ -134,6 +145,8 @@ def _stack_sequence(
             )
         out[i].copy_(ti)
     return out
+
+
 def _get_sample_size(
     _x_cpu: torch.Tensor, _y_cpu: Optional[torch.Tensor]
 ) -> int:
@@ -144,6 +157,8 @@ def _get_sample_size(
         y_one = _y_cpu[0]
         by = int(y_one.numel()) * int(y_one.element_size())
     return int(bx + by)
+
+
 def _get_random_batch(
     _sample_bytes: int, _device: torch.device, _N: int
 ) -> Sequence[int]:
@@ -170,6 +185,8 @@ def _get_random_batch(
         {max(1, int(capB * f)) for f in (0.125, 0.25, 0.375, 0.5, 0.75, 1.0)}
     )
     return [c for c in cands if c <= _N]
+
+
 def _h2d_counter(
     _x_cpu: torch.Tensor,
     _y_cpu: Optional[torch.Tensor],
@@ -228,28 +245,42 @@ def _h2d_counter(
                 pin_batch = False
         if pin_batch:
             with contextlib.suppress(Exception):
-                xb = xb if (hasattr(xb, "is_pinned") and xb.is_pinned()) else xb.pin_memory()
+                xb = (
+                    xb
+                    if (hasattr(xb, "is_pinned") and xb.is_pinned())
+                    else xb.pin_memory()
+                )
             if yb is not None:
                 with contextlib.suppress(Exception):
-                    yb = yb if (hasattr(yb, "is_pinned") and yb.is_pinned()) else yb.pin_memory()
+                    yb = (
+                        yb
+                        if (hasattr(yb, "is_pinned") and yb.is_pinned())
+                        else yb.pin_memory()
+                    )
         _sync_device(_device)
         if ev0 is not None and ev1 is not None:
             with accelerator(_device):
                 ev0.record()
                 xb.to(_device, non_blocking=bool(pin_batch))
-                yb.to(_device, non_blocking=bool(pin_batch)) if yb is not None else None
+                yb.to(
+                    _device, non_blocking=bool(pin_batch)
+                ) if yb is not None else None
                 ev1.record()
             _sync_device(_device)
             ms = float(ev0.elapsed_time(ev1))
         else:
             tns0 = time.perf_counter_ns()
             xb.to(_device, non_blocking=bool(pin_batch))
-            yb.to(_device, non_blocking=bool(pin_batch)) if yb is not None else None
+            yb.to(
+                _device, non_blocking=bool(pin_batch)
+            ) if yb is not None else None
             _sync_device(_device)
             ms = (time.perf_counter_ns() - tns0) / 1e6
         if s >= int(_warmup):
             times.append(ms)
     return float(sorted(times)[len(times) // 2]) if times else 0.0
+
+
 def _set_batch_interval(
     _ds: "Sampler",
     _dev: torch.device,
@@ -280,7 +311,8 @@ def _set_batch_interval(
         return (max(1, min(256, len(_ds))), 0.0)
     B_cap = 1 << 16
     max_batch_env = int(
-        env_first_int(("STNET_MAX_BATCH_SIZE", "STNET_MAX_BATCH"), default=0) or 0
+        env_first_int(("STNET_MAX_BATCH_SIZE", "STNET_MAX_BATCH"), default=0)
+        or 0
     )
     per_sample = int(getattr(_ds, "_per_sample_mem_bytes", 0) or 0)
     if per_sample <= 0:
@@ -320,10 +352,10 @@ def _set_batch_interval(
         ),
     )
 
-    def _get_bytes(name):
+    def _get_bytes(name: str) -> int:
         return int(env_first_int((name,), default=0) or 0)
 
-    def _get_opt_bytes(name):
+    def _get_opt_bytes(name: str) -> int | None:
         return val if (val := _get_bytes(name)) > 0 else None
 
     tpl = BatchPolicy(
@@ -406,7 +438,10 @@ def _set_batch_interval(
             if probe_max_bytes > 0 and int(sbytes) > 0:
                 probe_bs = max(
                     1,
-                    min(int(probe_bs), int(probe_max_bytes) // max(1, int(sbytes))),
+                    min(
+                        int(probe_bs),
+                        int(probe_max_bytes) // max(1, int(sbytes)),
+                    ),
                 )
             med_probe = 0.0
             with contextlib.suppress(Exception):
@@ -531,6 +566,8 @@ def _set_batch_interval(
             break
         B, med = B_next, med_next
     return (max(1, int(B)), float(med))
+
+
 def _is_source(obj: Any) -> bool:
     if not isinstance(obj, Mapping):
         return False
@@ -543,12 +580,20 @@ def _is_source(obj: Any) -> bool:
         return bool(os.fspath(p))
     except Exception:
         return False
-def _merge_opt(v1, v2, op):
+
+
+def _merge_opt(
+    v1: TMerge | None,
+    v2: TMerge | None,
+    op: Callable[[TMerge, TMerge], TMerge],
+) -> TMerge | None:
     if v1 is None:
         return v2
     if v2 is None:
         return v1
     return op(v1, v2)
+
+
 def _fetch_stream_batch(
     ds: "Sampler",
     device: torch.device,
@@ -569,6 +614,8 @@ def _fetch_stream_batch(
         )
     except Exception:
         return (0, 0.0)
+
+
 def _fetch_auto_batch_size(
     datasets: Mapping[str, "Sampler"],
     device: torch.device,
@@ -596,6 +643,8 @@ def _fetch_auto_batch_size(
     cand_mean = int(sum(candidates) // max(1, len(candidates)))
     cand_max = int(max(candidates))
     return int(max(1, min(cand_max, cand_mean)))
+
+
 def _fetch_cap_pf_depth(
     datasets: Mapping[str, "Sampler"],
     device: torch.device,
@@ -658,6 +707,8 @@ def _fetch_cap_pf_depth(
         return int(max(1, min(int(pf), int(pf_cap), 8)))
     except Exception:
         return int(pf)
+
+
 def _fetch_iterate_sample(
     sample: Any,
     *args: Any,
@@ -693,6 +744,8 @@ def _fetch_iterate_sample(
         batch = ds.get(s, e)
         return collate(batch) if batch is not None else None
     return collate(sample)
+
+
 def _fetch_merge_batches(batches: Sequence[Any]) -> Any:
     if TensorDictBase is not None and all(
         isinstance(b, TensorDictBase) for b in batches
@@ -747,6 +800,8 @@ def _fetch_merge_batches(batches: Sequence[Any]) -> Any:
             b if isinstance(b, (list, tuple)) else [b] for b in batches
         )
     )
+
+
 def _fetch_normalize_sources(sources: Any) -> Dict[str, Source]:
     if isinstance(sources, Mapping) and (not _is_source(sources)):
         out: Dict[str, Source] = {}
@@ -759,6 +814,8 @@ def _fetch_normalize_sources(sources: Any) -> Dict[str, Source]:
     if isinstance(sources, (list, tuple)):
         return {str(i): v for i, v in enumerate(sources)}
     return {"0": sources}
+
+
 def _fetch_build_datasets(
     specs: Mapping[str, Source],
     *args: Any,
@@ -779,6 +836,8 @@ def _fetch_build_datasets(
         if collect_epochables and epochables is not None:
             epochables.append(ds)
     return out
+
+
 def _fetch_build_sampler_nodes(
     datasets: Mapping[str, "Sampler"],
     *args: Any,
@@ -799,6 +858,7 @@ def _fetch_build_sampler_nodes(
             nodes[str(k)] = sn
             lengths[str(k)] = int(len(ds))
     return nodes, lengths
+
 
 def iter_dataset(
     data: object,
@@ -841,6 +901,8 @@ def iter_dataset(
             manifest_list.append(key)
         return (items2, manifest_list)
     return ([("0", data)], None)
+
+
 def new_dataset(
     source: Source,
     *args: Any,
@@ -874,6 +936,8 @@ def new_dataset(
     if not (0.0 <= vf <= 1.0):
         raise ValueError(f"val_frac must be in [0,1], got: {vf}")
     return Sampler(path, split=sp, val_frac=vf, sampler_scale=sampler_scale)
+
+
 def compose(
     node_or_nodes: Union[BaseNode, Sequence[BaseNode], Mapping[str, BaseNode]],
     *args: Any,
@@ -913,6 +977,8 @@ def compose(
     )
     mapped = mapper.compose(source)
     return source, mapped, mapped
+
+
 def fetch(
     sources: Union[Source, Sequence[Source], Mapping[str, Source]],
     device: Union[str, torch.device],
@@ -965,8 +1031,12 @@ def fetch(
     spec_keys = list(specs.keys())
 
     def _create_loader_stage(
-        split, shuffle, weights, collect_epochables=False, epochables=None
-    ):
+        split: str,
+        shuffle: bool,
+        weights: Mapping[str, float] | None,
+        collect_epochables: bool = False,
+        epochables: list[object] | None = None,
+    ) -> "Loader | None":
         datasets = _fetch_build_datasets(
             specs,
             split=split,
@@ -1079,6 +1149,8 @@ def fetch(
         "disposable": allocated,
         "sampler_scale": scale_ctl,
     }
+
+
 def preload_memmap(
     data: Mapping[str, Any],
     *args: Any,
@@ -1171,10 +1243,13 @@ def preload_memmap(
     )
     return None
 
+
 class Source(TypedDict):
     path: Required[str]
     format: NotRequired[SourceType]
     kind: NotRequired[SourceType]
+
+
 @dataclass
 class Session:
     sources: Any
@@ -1198,14 +1273,14 @@ class Session:
     sampler_scale: Optional["Governor"] = None
     _opened: bool = False
 
-    def __enter__(self) -> "Session":
+    def __enter__(self: Self) -> "Session":
         return self.open()
 
-    def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+    def __exit__(self: Self, exc_type: Any, exc: Any, tb: Any) -> None:
         self.close()
 
     def open(
-        self,
+        self: Self,
         *args: Any,
         train_state: Optional[Dict[str, Any]] = None,
         val_state: Optional[Dict[str, Any]] = None,
@@ -1296,7 +1371,7 @@ class Session:
         self._opened = True
         return self
 
-    def close(self) -> None:
+    def close(self: Self) -> None:
         if not self._opened:
             return
         keep = getattr(self, "disposable", None)
@@ -1304,6 +1379,8 @@ class Session:
             with contextlib.suppress(Exception):
                 keep.cleanup()
         self._opened = False
+
+
 @dataclass
 class Dataset(Generic[TExtra]):
     device: torch.device
@@ -1329,12 +1406,12 @@ class Dataset(Generic[TExtra]):
     stats: MutableMapping[str, torch.Tensor] = field(default_factory=dict)
     extra: Dict[str, TExtra] = field(default_factory=dict)
 
-    def __post_init__(self) -> None:
+    def __post_init__(self: Self) -> None:
         self._refresh_device_info()
         self._refresh_dtypes_from_env()
         self._refresh_quant_from_env()
 
-    def _refresh_device_info(self) -> None:
+    def _refresh_device_info(self: Self) -> None:
         stats = get_device_stats(self.device)
         self.device = stats.device
         self.device_type = stats.device_type
@@ -1362,7 +1439,7 @@ class Dataset(Generic[TExtra]):
                 entries.append(dtype)
         return tuple(entries)
 
-    def _refresh_dtypes_from_env(self) -> None:
+    def _refresh_dtypes_from_env(self: Self) -> None:
         float_env = env_first(
             ("STNET_DATA_FLOAT_DTYPES", "STNET_FLOAT_DTYPES")
         )
@@ -1376,7 +1453,7 @@ class Dataset(Generic[TExtra]):
             if parsed:
                 self.int_dtypes = parsed
 
-    def _refresh_quant_from_env(self) -> None:
+    def _refresh_quant_from_env(self: Self) -> None:
         bits = env_first_int(
             ("STNET_DATA_INT_QUANT_BITS", "STNET_INT_QUANT_BITS"), default=0
         )
@@ -1384,14 +1461,14 @@ class Dataset(Generic[TExtra]):
             self.int_quant_bits = int(bits)
 
     @property
-    def device_stats(self):
+    def device_stats(self: Self) -> "Device":
         return get_device_stats(self.device)
 
-    def ensure_device_info(self) -> "Dataset[TExtra]":
+    def ensure_device_info(self: Self) -> "Dataset[TExtra]":
         self._refresh_device_info()
         return self
 
-    def refresh(self) -> "Dataset[TExtra]":
+    def refresh(self: Self) -> "Dataset[TExtra]":
         self._refresh_device_info()
         self._refresh_dtypes_from_env()
         self._refresh_quant_from_env()
@@ -1425,7 +1502,7 @@ class Dataset(Generic[TExtra]):
         return self
 
     def preprocess(
-        self,
+        self: Self,
         data: Any,
         *args: Any,
         return_keys: bool = True,
@@ -1622,7 +1699,7 @@ class Dataset(Generic[TExtra]):
         return features, labels, keys, label_shape
 
     @property
-    def scale_min_abs(self) -> Optional[float]:
+    def scale_min_abs(self: Self) -> Optional[float]:
         return self.scale_min_positive
 
     @staticmethod
@@ -1796,7 +1873,7 @@ class Dataset(Generic[TExtra]):
 
     @classmethod
     def is_fp32_castable(
-        cls,
+        cls: type[Self],
         stats: Mapping[str, Any],
         *args: Any,
         underflow_action: Optional[str] = None,
@@ -1835,7 +1912,7 @@ class Dataset(Generic[TExtra]):
                         return False
         return True
 
-    def update_scale_stats(self, stats: Mapping[str, Any]) -> None:
+    def update_scale_stats(self: Self, stats: Mapping[str, Any]) -> None:
         self.has_scale = bool(stats.get("has_scale") or False)
         self.has_nonfinite = bool(stats.get("has_nonfinite") or False)
         self.scale_max_abs = (
@@ -1866,7 +1943,7 @@ class Dataset(Generic[TExtra]):
         )
 
     def batch_to_device(
-        self,
+        self: Self,
         batch: Any,
         device: Union[str, torch.device],
         non_blocking: bool = True,
@@ -1896,25 +1973,25 @@ class Dataset(Generic[TExtra]):
 
     @classmethod
     def is_float8_supported(
-        cls, device: Optional[Union[torch.device, str]] = None
+        cls: type[Self], device: Optional[Union[torch.device, str]] = None
     ) -> Tuple[bool, str]:
         return is_float8_supported(device)
 
     @classmethod
     def is_int8_supported(
-        cls, device: Optional[Union[torch.device, str]] = None
+        cls: type[Self], device: Optional[Union[torch.device, str]] = None
     ) -> Tuple[bool, str]:
         return is_int8_supported(device)
 
     @classmethod
     def is_int4_supported(
-        cls, device: Optional[Union[torch.device, str]] = None
+        cls: type[Self], device: Optional[Union[torch.device, str]] = None
     ) -> Tuple[bool, str]:
         return is_int4_supported(device)
 
     @classmethod
     def for_device(
-        cls,
+        cls: type[Self],
         device: Union[torch.device, str],
         *args: Any,
         feature_dtype: torch.dtype = torch.float32,

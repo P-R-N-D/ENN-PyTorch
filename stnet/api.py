@@ -126,6 +126,7 @@ TensorLike: TypeAlias = torch.Tensor | MemoryMappedTensor
 TorchDeviceLike: TypeAlias = torch.device | str | int
 logger = logging.getLogger(__name__)
 
+
 def _apply_warning_filters() -> None:
     with contextlib.suppress(Exception):
         warnings.filterwarnings(
@@ -133,27 +134,37 @@ def _apply_warning_filters() -> None:
             message=_IGNORED_WARNING_MESSAGE_RE.pattern,
             category=UserWarning,
         )
+
+
 def _rewrite_state_dict_key(k: str) -> str:
     if k.startswith("m.") and ".module." in k:
         parts = k.split(".")
         if len(parts) >= 4 and parts[1].isdigit() and parts[2] == "module":
             return ".".join(parts[3:])
     return k
+
+
 def _coerce_state_dict(sd: Mapping[str, Any]) -> Mapping[str, Any]:
     if not any(_rewrite_state_dict_key(k) != k for k in sd):
         return sd
     return {_rewrite_state_dict_key(k): v for k, v in sd.items()}
+
+
 def _parse_meta(p: PathLike) -> Mapping[str, Any]:
     meta_path = p / "meta.json"
     try:
         return read_json(meta_path) if meta_path.exists() else {}
     except Exception as exc:
         raise RuntimeError(f"Metadata parse failed: {p}") from exc
+
+
 def _is_execution_time_logged() -> bool:
     return env_bool(
         ("STNET_LOG_TIMINGS", "STNET_TIMINGS", "STNET_DEBUG_TIMINGS"),
         default=False,
     )
+
+
 def _timed_invoke(
     fn: Callable[P, R],
     log: logging.Logger,
@@ -169,6 +180,8 @@ def _timed_invoke(
     finally:
         dt = time.perf_counter() - t0
         log.info("%s executed in %.3f seconds", fn_name, dt)
+
+
 def _clear_process_group() -> None:
     try:
         import torch.distributed
@@ -183,6 +196,8 @@ def _clear_process_group() -> None:
                 torch.distributed.destroy_process_group()
     except Exception:
         pass
+
+
 def _init_distributed() -> None:
     _apply_warning_filters()
     _clear_process_group()
@@ -190,6 +205,8 @@ def _init_distributed() -> None:
     with contextlib.suppress(Exception):
         torch.multiprocessing.allow_connection_pickling()
     init_start_method()
+
+
 def _clear_device_caches() -> None:
     with contextlib.suppress(Exception):
         import gc
@@ -206,11 +223,15 @@ def _clear_device_caches() -> None:
             device=get_device(), do_gc=False, min_interval_s=0.0
         )
         collect_accelerator_ipc()
+
+
 def _coerce_seed(seed: int) -> Optional[int]:
     try:
         return int(seed) if seed is not None else None
     except (TypeError, ValueError):
         return None
+
+
 def _set_seed(seed_value: int) -> None:
     if seed_value is None:
         return
@@ -224,6 +245,8 @@ def _set_seed(seed_value: int) -> None:
         random.seed(seed_value)
     with contextlib.suppress(Exception):
         numpy.random.seed(seed_value)
+
+
 def _save_model_checkpoint(
     model: Model,
     out_dir: PathLike,
@@ -255,9 +278,6 @@ def _save_model_checkpoint(
             pt_state = dict(m_sd)
             _coerce_dcp_keys(pt_state)
         else:
-
-
-
             pt_state = model.state_dict()
 
             if any(
@@ -266,10 +286,9 @@ def _save_model_checkpoint(
                 and v.device.type == "meta"
                 for v in pt_state.values()
             ):
-                raise NotImplementedError("Cannot save checkpoint with meta tensors (no data).")
-
-
-
+                raise NotImplementedError(
+                    "Cannot save checkpoint with meta tensors (no data)."
+                )
 
             pt_state = {
                 k: (v.detach() if torch.is_tensor(v) else v)
@@ -277,6 +296,8 @@ def _save_model_checkpoint(
             }
         torch.save(pt_state, os.path.join(out_dir, "model.pt"))
     return m_sd
+
+
 def _get_label_shape(
     first_in_dim: int,
     in_dim: int,
@@ -292,6 +313,8 @@ def _get_label_shape(
             f"Shape mismatch: {first_in_dim}/{first_label_shape} vs {in_dim}/{lshape}"
         )
     return (first_in_dim, first_label_shape)
+
+
 def _adapt_source(
     d: Any, allow_columns: bool = True
 ) -> Tuple[int, Optional[Callable], bool]:
@@ -346,6 +369,8 @@ def _adapt_source(
     if isinstance(d, (list, tuple)):
         return len(d), (lambda s, e: {"features": d[int(s) : int(e)]}), False
     return 0, None, True
+
+
 def _save_dataset(
     d: object,
     out_dir: PathLike,
@@ -434,6 +459,8 @@ def _save_dataset(
     count = int(fx.shape[0])
     in_dim = int(fx.reshape(count, -1).shape[1])
     return (int(in_dim), tuple(lshape), int(count))
+
+
 def _reduce_batch_stats(recs: object) -> Optional[Mapping[str, Any]]:
     if not isinstance(recs, list) or not recs:
         return None
@@ -448,7 +475,9 @@ def _reduce_batch_stats(recs: object) -> Optional[Mapping[str, Any]]:
                         (
                             0.0
                             if s in ("mean", "var")
-                            else float("inf") if s == "min" else float("-inf")
+                            else float("inf")
+                            if s == "min"
+                            else float("-inf")
                         ),
                     )
                 )
@@ -497,6 +526,8 @@ def _reduce_batch_stats(recs: object) -> Optional[Mapping[str, Any]]:
             }
         )
     return out
+
+
 def _update_batch_stats(
     prev: object, n_prev: object, inc: object, n_inc: object
 ) -> Any:
@@ -546,6 +577,8 @@ def _update_batch_stats(
             }
         )
     return out
+
+
 def _update_history(
     model: object,
     ckpt_dir: str | None,
@@ -569,19 +602,22 @@ def _update_history(
         run_stats = _reduce_batch_stats(records)
 
         epochs_val = (
-            int(meta.get("epochs", epochs)) if isinstance(meta, dict) else int(epochs)
+            int(meta.get("epochs", epochs))
+            if isinstance(meta, dict)
+            else int(epochs)
         )
         frac_val = (
             float(meta.get("val_frac", val_frac))
             if isinstance(meta, dict)
             else float(val_frac)
         )
-        sampled_n = int(meta.get("sampled_n", 0)) if isinstance(meta, dict) else 0
+        sampled_n = (
+            int(meta.get("sampled_n", 0)) if isinstance(meta, dict) else 0
+        )
 
-
-
-
-        train_split_n_est = int(round(num_samples_dataset * max(0.0, 1.0 - frac_val)))
+        train_split_n_est = int(
+            round(num_samples_dataset * max(0.0, 1.0 - frac_val))
+        )
         sampled_n_est = int(round(train_split_n_est * max(1, epochs_val)))
         if sampled_n <= 0:
             frac_val = max(0.0, min(1.0, frac_val))
@@ -655,7 +691,9 @@ def _update_history(
             import torch as _torch
 
             env_meta.setdefault("torch", getattr(_torch, "__version__", None))
-            env_meta.setdefault("cuda", getattr(getattr(_torch, "version", None), "cuda", None))
+            env_meta.setdefault(
+                "cuda", getattr(getattr(_torch, "version", None), "cuda", None)
+            )
         if env_meta:
             record["env"] = env_meta
         setattr(model, "_train_history", history + [record])
@@ -664,6 +702,8 @@ def _update_history(
             logger_obj._records = getattr(model, "_train_history")
     except Exception:
         pass
+
+
 def _to_torch_dtype(dt: object) -> Optional[torch.dtype]:
     try:
         if isinstance(dt, torch.dtype):
@@ -680,6 +720,8 @@ def _to_torch_dtype(dt: object) -> Optional[torch.dtype]:
     except Exception:
         return None
     return None
+
+
 def _get_float_precision(obj: object) -> torch.dtype:
     try:
         if TensorDictBase is not None and isinstance(obj, TensorDictBase):
@@ -718,6 +760,7 @@ def _get_float_precision(obj: object) -> torch.dtype:
         pass
     return torch.float32
 
+
 def get_execution_time(
     log: logging.Logger,
     fn_name: str = "",
@@ -729,6 +772,8 @@ def get_execution_time(
         return cast(Callable[P, R], wrapped)
 
     return _decorator
+
+
 def new_model(
     in_dim: int,
     out_shape: Sequence[int],
@@ -737,6 +782,8 @@ def new_model(
     cfg = coerce_model_config(config)
     core = Model(in_dim, tuple((int(x) for x in out_shape)), config=cfg)
     return core
+
+
 def load_model(
     checkpoint_path: PathLike,
     in_dim: int | None = None,
@@ -871,6 +918,8 @@ def load_model(
         resize_scaler_buffer(model, sd)
     model.load_state_dict(sd, strict=False)
     return model
+
+
 def save_model(
     model: torch.nn.Module,
     path: PathLike,
@@ -905,6 +954,8 @@ def save_model(
         raise ValueError(f"Unknown export format for path '{path}'.")
     conv.save(model, p, *args, **kwargs)
     return str(p)
+
+
 def train(
     model: torch.nn.Module | PathLike,
     data: TrainData,
@@ -979,25 +1030,16 @@ def train(
                 indent=None,
             )
 
-
-
-
-
-
-
         _max_nodes = int(max_nodes) if max_nodes is not None else 1
-        use_local_init = env_bool("STNET_INIT_CKPT_LOCAL", default=(_max_nodes <= 1))
+        use_local_init = env_bool(
+            "STNET_INIT_CKPT_LOCAL", default=(_max_nodes <= 1)
+        )
         if use_local_init:
             init_dir = tempfile.mkdtemp(prefix=f"stnet_init_ckpt_{run_id}_")
         else:
             init_dir = new_dir("init_ckpt")
 
-
-
         init_ckpt_path = os.path.join(init_dir, "model.pt")
-
-
-
 
         _save_model_checkpoint(
             model,
@@ -1007,21 +1049,12 @@ def train(
             overwrite=True,
         )
 
-
-
-
         cfg_raw = _extract_model_config_dict(model)
         cfg_dict = (
             coerce_model_config(cfg_raw).to_dict()
             if cfg_raw
             else ModelConfig().to_dict()
         )
-
-
-
-
-
-
 
         parent_to_meta = False
         if isinstance(model, torch.nn.Module) and env_bool(
@@ -1106,16 +1139,10 @@ def train(
             return False
 
         def _materialize_to_cpu(m: torch.nn.Module) -> None:
-
-
-
             if hasattr(m, "to_empty"):
                 m.to_empty(device="cpu")
             else:
-
                 m.to("cpu")
-
-
 
         _clear_device_caches()
         with _start_context():
@@ -1128,14 +1155,12 @@ def train(
                 )
             )
 
-
             if isinstance(model, torch.nn.Module) and _has_meta_tensors(model):
                 with contextlib.suppress(Exception):
                     _materialize_to_cpu(model)
             resize_scaler_buffer(model, cpu_state)
             model.load_state_dict(cpu_state, strict=False)
         else:
-
             if isinstance(model, torch.nn.Module) and _has_meta_tensors(model):
                 with contextlib.suppress(Exception):
                     _materialize_to_cpu(model)
@@ -1158,23 +1183,21 @@ def train(
         _update_history(model, ckpt_dir, epochs, val_frac, num_samples_dataset)
         return model
     finally:
-
-
-
-
-
         restore_path: str | None = None
 
         with contextlib.suppress(Exception):
             fp = os.path.join(str(ckpt_dir or ""), "model.pt")
             if fp and os.path.isfile(fp):
                 restore_path = fp
-        if restore_path is None and init_ckpt_path and os.path.isfile(init_ckpt_path):
+        if (
+            restore_path is None
+            and init_ckpt_path
+            and os.path.isfile(init_ckpt_path)
+        ):
             restore_path = init_ckpt_path
 
         if isinstance(model, torch.nn.Module) and restore_path:
             try:
-
                 _meta = False
                 for t in model.parameters(recurse=True):
                     if getattr(t, "is_meta", False) or t.device.type == "meta":
@@ -1182,7 +1205,10 @@ def train(
                         break
                 if not _meta:
                     for t in model.buffers(recurse=True):
-                        if getattr(t, "is_meta", False) or t.device.type == "meta":
+                        if (
+                            getattr(t, "is_meta", False)
+                            or t.device.type == "meta"
+                        ):
                             _meta = True
                             break
                 if _meta:
@@ -1203,6 +1229,8 @@ def train(
             shutil.rmtree(ckpt_dir, ignore_errors=True)
         if init_dir is not None:
             shutil.rmtree(init_dir, ignore_errors=True)
+
+
 def predict(
     model: torch.nn.Module | PathLike,
     data: PredictData,
@@ -1459,6 +1487,8 @@ def predict(
                 shutil.rmtree(tmp_dir, ignore_errors=True)
             else:
                 logger.info("predict debug: preserving tmp_dir=%s", tmp_dir)
+
+
 def postprocess(
     source: PathLike,
     *args: Any,

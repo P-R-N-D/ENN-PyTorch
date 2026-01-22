@@ -10,7 +10,7 @@ import tempfile
 import warnings
 import weakref
 from pathlib import Path
-from typing import Any, Iterator, Protocol, Sequence
+from typing import Any, Iterator, Protocol, Sequence, Self
 
 import torch
 from torch import nn
@@ -30,12 +30,15 @@ _SAVE_LOCK_GUARD = Mutex()
 _SAVE_PATH_LOCKS = weakref.WeakValueDictionary()
 _WARNINGS_FILTER_LOCK = Mutex()
 
-def _register_safe_globals():
+
+def _register_safe_globals() -> None:
     with contextlib.suppress(Exception):
         if add_safe_globals:
             from torch.torch_version import TorchVersion
 
             add_safe_globals([TorchVersion])
+
+
 @contextlib.contextmanager
 def _filtered_warnings(
     sentences: Sequence[str] | None = None,
@@ -59,6 +62,8 @@ def _filtered_warnings(
         with warnings.catch_warnings():
             warnings.filterwarnings("ignore", message=msg_re)
             yield
+
+
 @contextlib.contextmanager
 def _temp_environ(
     updates: dict[str, str | None], *args: Any, only_if_unset: bool = True
@@ -80,6 +85,8 @@ def _temp_environ(
                 os.environ.pop(key, None)
             else:
                 os.environ[key] = val
+
+
 def _save_lock(path: PathLike | None = None) -> Mutex:
     try:
         key = str(Path(path).expanduser().resolve()) if path else "__global__"
@@ -87,6 +94,8 @@ def _save_lock(path: PathLike | None = None) -> Mutex:
         key = str(path)
     with _SAVE_LOCK_GUARD:
         return _SAVE_PATH_LOCKS.setdefault(key, Mutex(reentrant=True))
+
+
 @contextlib.contextmanager
 def _save_sync(
     path: PathLike | None = None, *args: Any, barrier: bool = False
@@ -99,6 +108,8 @@ def _save_sync(
         finally:
             if barrier:
                 distributed_barrier()
+
+
 def _load_model_config(model: object) -> object:
     try:
         from ..config import _extract_model_config_dict
@@ -106,6 +117,8 @@ def _load_model_config(model: object) -> object:
         return _extract_model_config_dict(model)
     except Exception:
         return {}
+
+
 def _torch_load_checkpoint(
     path: PathLike,
     *args: Any,
@@ -125,6 +138,7 @@ def _torch_load_checkpoint(
             raise RuntimeError("weights_only=True failed") from exc
         raise
 
+
 def is_required(module: str, pip_hint: str | None = None) -> None:
     try:
         __import__(module)
@@ -134,12 +148,15 @@ def is_required(module: str, pip_hint: str | None = None) -> None:
             f"{module} is required for this operation{hint}"
         ) from err
 
+
 class Format(Protocol):
     name: str | None
 
     def save(
-        self, model: nn.Module, dst: PathLike, *args: Any, **kwargs: Any
+        self: Self, model: nn.Module, dst: PathLike, *args: Any, **kwargs: Any
     ) -> object: ...
+
+
 class Builder:
     NATIVE_EXTS = {".pt", ".pth", ".safetensors"}
 
@@ -240,6 +257,8 @@ class Builder:
                     payload["optimizer_state_dict"] = optimizer.state_dict()
             save_temp(p, payload, **opts)
             return p
+
+
 class Exporter:
     _by_name: dict[str, Format] = {}
     _ext_map: dict[str, str] = {}
@@ -251,7 +270,7 @@ class Exporter:
     _export_sig_lock = Mutex()
 
     @classmethod
-    def _export_sig(cls) -> object:
+    def _export_sig(cls: type[Self]) -> object:
         cached = getattr(cls, "_export_sig_cache", None)
         if cached is not None:
             return cached
@@ -267,7 +286,7 @@ class Exporter:
             return sig
 
     @classmethod
-    def _export_sig_keys(cls) -> set[str]:
+    def _export_sig_keys(cls: type[Self]) -> set[str]:
         sig = cls._export_sig()
         if sig is None:
             return set()
@@ -283,20 +302,22 @@ class Exporter:
             return set()
 
     @classmethod
-    def register(cls, name: str, exts: tuple[str, ...], impl: Format) -> None:
+    def register(
+        cls: type[Self], name: str, exts: tuple[str, ...], impl: Format
+    ) -> None:
         with cls._defaults_lock:
             cls._register_unlocked(name, exts, impl)
 
     @classmethod
     def _register_unlocked(
-        cls, name: str, exts: tuple[str, ...], impl: Format
+        cls: type[Self], name: str, exts: tuple[str, ...], impl: Format
     ) -> None:
         cls._by_name[name] = impl
         for ext in exts:
             cls._ext_map[ext.lower()] = name
 
     @classmethod
-    def _ensure_defaults_registered(cls) -> None:
+    def _ensure_defaults_registered(cls: type[Self]) -> None:
         if cls._defaults_registered:
             return
         with cls._defaults_lock:
@@ -333,11 +354,12 @@ class Exporter:
             cls._defaults_registered = True
 
     @classmethod
-    def for_export(cls, ext: str) -> Format | None:
+    def for_export(cls: type[Self], ext: str) -> Format | None:
         cls._ensure_defaults_registered()
         with cls._defaults_lock:
             name = cls._ext_map.get(ext.lower())
             return cls._by_name.get(name) if name else None
+
 
 try:
     from torch.serialization import add_safe_globals

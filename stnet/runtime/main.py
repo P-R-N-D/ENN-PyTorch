@@ -171,21 +171,28 @@ PathLike: TypeAlias = str | os.PathLike[str] | Path
 ReturnSink: TypeAlias = MutableMapping[str, object]
 TorchDeviceLike: TypeAlias = torch.device | str | int
 
+
 def _is_nvml_disabled() -> bool:
     return env_bool("STNET_NVML_DISABLE", False) or not env_bool(
         "STNET_NVML", True
     )
+
+
 def _nvml_cfg(key: str, default: object, cast_fn: type = int) -> object:
     return cast_fn(
         env_first(
             (f"STNET_NVML_{key}", f"STNET_NVML_{key}_S"), default=default
         )
     )
+
+
 def _is_nvml_blocked(now: object | None = None) -> object:
     now = float(now or time.perf_counter())
     with _NVML_LOCK:
         until = float(_NVML_BACKOFF_UNTIL or 0.0)
     return bool(until > 0.0 and float(now) < until)
+
+
 def _is_nvml_available() -> object:
     global _nvml, _NVML_READY, _NVML_TRIED
     nogil = bool(CPU.is_optimized_for_no_gil())
@@ -228,6 +235,8 @@ def _is_nvml_available() -> object:
             if env_bool("STNET_DEBUG", False):
                 _LOGGER.debug("NVML init failed: %s", exc, exc_info=True)
     return bool(_NVML_READY)
+
+
 def _validate_compile_safe() -> None:
     global _COMPILE_SAFE_DONE
     if _COMPILE_SAFE_DONE:
@@ -238,6 +247,8 @@ def _validate_compile_safe() -> None:
         _COMPILE_SAFE_DONE = True
     with contextlib.suppress(Exception):
         compile_safe(runtime_module=sys.modules[__name__])
+
+
 def _is_clock_synchronized(dev_type: str) -> bool:
     if _env_flag("STNET_TIMER_SYNC", False) or _env_flag(
         "STNET_WALLCLOCK_TIMER_SYNC", False
@@ -245,6 +256,8 @@ def _is_clock_synchronized(dev_type: str) -> bool:
         return True
     dt = str(dev_type or "cpu")
     return _env_flag(f"STNET_{dt.upper()}_TIMER_SYNC", False)
+
+
 def _is_event_timer_available(device: torch.device) -> bool:
     try:
         return bool(
@@ -252,6 +265,8 @@ def _is_event_timer_available(device: torch.device) -> bool:
         )
     except Exception:
         return False
+
+
 def _new_event_timer(device: torch.device) -> object:
     try:
         dev_type = str(getattr(device, "type", "cpu"))
@@ -260,6 +275,8 @@ def _new_event_timer(device: torch.device) -> object:
     if not is_accelerator_timer_supported(dev_type):
         return None
     return new_accelerator_event(device, enable_timing=True)
+
+
 def _get_thread_events(device: torch.device, slot: str) -> object:
     try:
         dev_type = str(getattr(device, "type", "cpu"))
@@ -287,12 +304,20 @@ def _get_thread_events(device: torch.device, slot: str) -> object:
         cached = (ev_s, ev_e)
         d[key] = cached
     return cached
+
+
 def _env_flag(name: object, default: object) -> object:
     return env_bool(str(name), bool(default))
+
+
 def _env_int(name: object, default: object) -> object:
     return env_int(str(name), int(default))
+
+
 def _env_float(name: object, default: object) -> object:
     return env_float(str(name), float(default))
+
+
 def _get_torch_profiler(
     *args: Any,
     enabled: object,
@@ -371,6 +396,8 @@ def _get_torch_profiler(
         return prof
     except Exception:
         return None
+
+
 def _get_profiler_summary(
     prof: object,
     *args: Any,
@@ -409,16 +436,22 @@ def _get_profiler_summary(
             str(tag),
             str(table),
         )
+
+
 def _oom_retries(loader: object, phase: object, step: int) -> object:
     key = (int(id(loader)), str(phase), int(step))
     with _OOM_RETRY_LOCK:
         cur = int(_OOM_RETRY_COUNT.get(key, 0)) + 1
         _OOM_RETRY_COUNT[key] = int(cur)
         return int(cur)
+
+
 def _clear_oom_retries(loader: object, phase: object, step: int) -> None:
     key = (int(id(loader)), str(phase), int(step))
     with _OOM_RETRY_LOCK:
         _OOM_RETRY_COUNT.pop(key, None)
+
+
 def _oom_max_retries(phase: object) -> object:
     phase = str(phase).strip().lower()
     if phase == "train":
@@ -434,6 +467,8 @@ def _oom_max_retries(phase: object) -> object:
     else:
         v = _env_int("STNET_OOM_MAX_RETRIES_PER_BATCH", 3)
     return max(0, int(v))
+
+
 def _is_batch_skippable(phase: object) -> bool:
     phase = str(phase).strip().lower()
     if phase == "train":
@@ -445,10 +480,14 @@ def _is_batch_skippable(phase: object) -> bool:
             "STNET_OOM_SKIP_VAL", _env_flag("STNET_OOM_SKIP_BATCH", True)
         )
     return _env_flag("STNET_OOM_SKIP_BATCH", True)
+
+
 def _get_scale_rate_down(attempt: object) -> object:
     seq = (0.8, 0.7, 0.6, 0.5)
     idx = min(3, max(0, int(attempt) - 1))
     return float(seq[idx])
+
+
 def _is_scale_rate_logged(
     *args: Any,
     logger: logging.Logger,
@@ -482,6 +521,8 @@ def _is_scale_rate_logged(
             logger.info(msg)
     except Exception:
         pass
+
+
 def _get_sampler_scaler(
     loader: object, *args: Any, max_depth: int = 4
 ) -> object:
@@ -498,6 +539,8 @@ def _get_sampler_scaler(
             return ctl
         obj = getattr(obj, "_src", None) or getattr(obj, "src", None)
     return None
+
+
 def _get_oom_blocking_time(oom_try: int, phase: str | None = None) -> float:
     try:
         base_ms = float(_env_float("STNET_OOM_BACKOFF_BASE_MS", 0.0))
@@ -512,6 +555,8 @@ def _get_oom_blocking_time(oom_try: int, phase: str | None = None) -> float:
     p = max(0, int(oom_try) - 2)
     sleep_ms = min(float(max_ms), float(base_ms) * (2.0 ** float(p)))
     return max(0.0, float(sleep_ms) / 1000.0)
+
+
 def _recover_oom(
     *args: Any,
     phase: str,
@@ -660,6 +705,8 @@ def _recover_oom(
         with contextlib.suppress(Exception):
             time.sleep(float(sleep_s))
     return ("retry", grad_accum_steps)
+
+
 def _get_batch_length(loader: object) -> object:
     if loader is None:
         return 0
@@ -683,6 +730,8 @@ def _get_batch_length(loader: object) -> object:
                     loader.load_state_dict(state)
             return count
     return 0
+
+
 def _float8_log(
     msg: str, *args: Any, only_main_rank: bool = True, **kwargs: Any
 ) -> None:
@@ -697,6 +746,8 @@ def _float8_log(
     except Exception:
         pass
     _LOGGER.info(msg, *args)
+
+
 def _validate_no_meta_tensors(module: object) -> None:
     hits = []
     for name, param in module.named_parameters(recurse=True):
@@ -707,6 +758,8 @@ def _validate_no_meta_tensors(module: object) -> None:
             hits.append(f"buffer {name} shape={tuple(buffer.shape)}")
     if hits:
         raise RuntimeError("Found meta tensors in model:\n" + "\n".join(hits))
+
+
 def _hook_meta_monitor(
     module: object, inputs: object, warn_only: object
 ) -> None:
@@ -717,6 +770,8 @@ def _hook_meta_monitor(
                 warnings.warn(message, stacklevel=3)
                 return
             raise RuntimeError(message)
+
+
 def _enable_meta_monitor(model: object) -> None:
     hook_mode = (
         str(
@@ -733,6 +788,8 @@ def _enable_meta_monitor(model: object) -> None:
         submodule.register_forward_pre_hook(
             partial(_hook_meta_monitor, warn_only=warn_only), with_kwargs=False
         )
+
+
 def _validate_no_fake_dtensor(
     root: nn.Module, *args: Any, **kwargs: Any
 ) -> None:
@@ -753,6 +810,8 @@ def _validate_no_fake_dtensor(
             "LayerNorm parameters must be materialized as a real Tensor: "
             + ", ".join(bad)
         )
+
+
 def _set_requires_grad(
     module: nn.Module,
     name: str,
@@ -761,8 +820,12 @@ def _set_requires_grad(
     requires_grad: bool,
 ) -> None:
     setattr(module, name, nn.Parameter(data, requires_grad=requires_grad))
+
+
 def _is_precision_exempted(module: object) -> bool:
     return bool(getattr(module, "__stnet_precision_exempt__", False))
+
+
 def _cast_float_dtype(model: object, dtype: torch.dtype) -> object:
     if not isinstance(dtype, torch.dtype):
         return
@@ -794,12 +857,11 @@ def _cast_float_dtype(model: object, dtype: torch.dtype) -> object:
                     if not b.is_floating_point() or b.dtype == dtype:
                         continue
 
-
-
-
                     if b.dtype is torch.float64 and dtype is not torch.float64:
                         continue
                     bufs[name] = b.detach().to(dtype)
+
+
 def _to_device_recursive(obj: object, dev: object) -> object:
     if isinstance(obj, torch.Tensor):
         dev_type = getattr(dev, "type", None)
@@ -816,6 +878,8 @@ def _to_device_recursive(obj: object, dev: object) -> object:
         seq = [_to_device_recursive(v, dev) for v in obj]
         return type(obj)(seq)
     return obj
+
+
 def _touch_tensors(obj: object) -> None:
     if isinstance(obj, torch.Tensor):
         _ = obj.sum()
@@ -832,6 +896,8 @@ def _touch_tensors(obj: object) -> None:
         for v in obj:
             _touch_tensors(v)
         return
+
+
 def _cast_batchnorm_buffers_dtype(
     module: object, dtype: torch.dtype | None
 ) -> None:
@@ -859,6 +925,8 @@ def _cast_batchnorm_buffers_dtype(
                         continue
                     with contextlib.suppress(Exception):
                         mod._buffers[name] = buf.to(dtype=dtype)
+
+
 def _get_layernorm_dtype(device: TorchDeviceLike) -> object:
     try:
         meta = Autocast.coerce_metadata(device)
@@ -879,6 +947,8 @@ def _get_layernorm_dtype(device: TorchDeviceLike) -> object:
         return torch.float64 if chosen == torch.float64 else torch.float32
     except Exception:
         return torch.float32
+
+
 def _preload_layers(model: object, device: TorchDeviceLike) -> None:
     for module in model.modules():
         if not isinstance(module, nn.LayerNorm):
@@ -950,6 +1020,8 @@ def _preload_layers(model: object, device: TorchDeviceLike) -> None:
                 module, "bias", data, requires_grad=requires_grad_b
             )
             bias = module.bias
+
+
 def _validate_model_dtype_unity(
     model: object, device: TorchDeviceLike
 ) -> None:
@@ -996,6 +1068,8 @@ def _validate_model_dtype_unity(
             "LayerNorm parameter dtype mismatch detected:\n"
             + "\n".join(mismatches)
         )
+
+
 def _coerce_dcp_keys(state: object) -> object:
     if isinstance(state, dict):
         keys = []
@@ -1012,6 +1086,8 @@ def _coerce_dcp_keys(state: object) -> object:
         for key in keys:
             state.pop(key, None)
     return state
+
+
 def _get_backend_type(device: "TorchDeviceLike") -> str:
     dev_type = str(getattr(device, "type", "cpu")).lower()
     match dev_type:
@@ -1036,13 +1112,17 @@ def _get_backend_type(device: "TorchDeviceLike") -> str:
                 pass
             return "xla"
         case _:
-            get_default = getattr(torch.distributed, "get_default_backend_for_device", None)
+            get_default = getattr(
+                torch.distributed, "get_default_backend_for_device", None
+            )
             if callable(get_default):
                 with contextlib.suppress(Exception):
                     return str(get_default(device)).lower()
                 with contextlib.suppress(Exception):
                     return str(get_default(dev_type)).lower()
             return "gloo"
+
+
 def _ensure_default_socket_ifname() -> None:
     iface = None
     gloo_if = os.environ.get("GLOO_SOCKET_IFNAME")
@@ -1087,6 +1167,8 @@ def _ensure_default_socket_ifname() -> None:
     if iface:
         os.environ.setdefault("GLOO_SOCKET_IFNAME", iface)
         os.environ.setdefault("TP_SOCKET_IFNAME", iface)
+
+
 def _configure_torch_nccl_env(device: TorchDeviceLike) -> None:
     try:
         if str(getattr(device, "type", "cpu")) != "cuda":
@@ -1121,10 +1203,16 @@ def _configure_torch_nccl_env(device: TorchDeviceLike) -> None:
         default_bw = 1 if int(world) <= 1 else 0
         bw = int(env_int("STNET_TORCH_NCCL_BLOCKING_WAIT", default_bw))
         os.environ["TORCH_NCCL_BLOCKING_WAIT"] = str(int(bw))
+
+
 def _configure_torch_gloo_env(device: TorchDeviceLike) -> None:
     _ensure_default_socket_ifname()
+
+
 def _configure_torch_xccl_env(device: TorchDeviceLike) -> None:
     return
+
+
 def _configure_backend_env(backend: object, device: TorchDeviceLike) -> None:
     b = str(backend).lower() if backend is not None else ""
     if b == "nccl":
@@ -1133,6 +1221,8 @@ def _configure_backend_env(backend: object, device: TorchDeviceLike) -> None:
         _configure_torch_xccl_env(device)
     elif b == "gloo":
         _configure_torch_gloo_env(device)
+
+
 def _init_backend(device: TorchDeviceLike) -> None:
     with contextlib.suppress(Exception):
         if device.type == "cuda" and hasattr(torch.backends, "cudnn"):
@@ -1143,6 +1233,8 @@ def _init_backend(device: TorchDeviceLike) -> None:
         set_accelerator_index(device.type, int(rank) % int(n))
     else:
         _ensure_default_socket_ifname()
+
+
 def _unify_model_dtype(model: object, prefer: object | None = None) -> object:
     dtypes = set((p.dtype for p in model.parameters() if p is not None))
     if len(dtypes) <= 1:
@@ -1167,6 +1259,8 @@ def _unify_model_dtype(model: object, prefer: object | None = None) -> object:
             )
             setattr(mod, name, new_p)
     return tgt
+
+
 def _get_source_path(obj: object) -> object:
     if isinstance(obj, dict):
         if "path" in obj and "kind" in obj:
@@ -1177,6 +1271,8 @@ def _get_source_path(obj: object) -> object:
     if isinstance(obj, (list, tuple)) and obj:
         return _get_source_path(obj[0])
     raise RuntimeError("sources is empty or invalid")
+
+
 def _get_sample_size(
     model: object,
     device: TorchDeviceLike,
@@ -1368,6 +1464,8 @@ def _get_sample_size(
             os.environ["STNET_PER_SAMPLE_MEM_BYTES"] = str(int(per_sample))
     except Exception:
         return
+
+
 def _init_tensor(
     value: object,
     *args: Any,
@@ -1396,6 +1494,8 @@ def _init_tensor(
             base, dtype=desired_dtype, device=desired_device
         )
     return step_tensor
+
+
 def _init_optimizer(optim: object) -> None:
     for group in optim.param_groups:
         amsgrad = group.get("amsgrad", False)
@@ -1417,6 +1517,8 @@ def _init_optimizer(optim: object) -> None:
             if amsgrad and "max_exp_avg_sq" not in state:
                 state["max_exp_avg_sq"] = torch.zeros_like(param)
             optim.state[param] = state
+
+
 def _schedule(
     step: int,
     *args: Any,
@@ -1436,6 +1538,8 @@ def _schedule(
     return frac_min + (1.0 - frac_min) * 0.5 * (
         1.0 + math.cos(math.pi * t / max(1, main_steps))
     )
+
+
 def _init_distributed_group(
     backend: object, device: TorchDeviceLike, local_rank: int
 ) -> None:
@@ -1477,6 +1581,8 @@ def _init_distributed_group(
         except TypeError:
             kwargs.pop("timeout", None)
             torch.distributed.init_process_group(**kwargs)
+
+
 def _gpu_nvml_utils(device: TorchDeviceLike) -> object:
     if getattr(device, "type", "") != "cuda":
         return (None, None)
@@ -1568,18 +1674,24 @@ def _gpu_nvml_utils(device: TorchDeviceLike) -> object:
         with contextlib.suppress(Exception):
             mem_util = available_device_memory(torch.device("cuda", idx_i))
     return (gpu_util, mem_util)
+
+
 def _xpu_mem_util(device: TorchDeviceLike) -> object:
     if getattr(device, "type", "") != "xpu":
         return None
     with contextlib.suppress(Exception):
         return available_device_memory(device)
     return None
+
+
 def _mps_mem_util(device: TorchDeviceLike) -> object:
     if getattr(device, "type", "") != "mps":
         return None
     with contextlib.suppress(Exception):
         return available_device_memory(device)
     return None
+
+
 def _get_cpu_load() -> object:
     if psutil is None:
         return None
@@ -1587,6 +1699,8 @@ def _get_cpu_load() -> object:
         return float(psutil.cpu_percent(interval=0.0))
     except Exception:
         return None
+
+
 def _pool_tensor(
     tensor: torch.Tensor,
     *args: Any,
@@ -1633,6 +1747,8 @@ def _pool_tensor(
         if callable(is_pinned):
             pinned = bool(is_pinned())
     return out, None, pinned
+
+
 def _stream_tensor(
     tensor: object,
     *args: Any,
@@ -1751,6 +1867,8 @@ def _stream_tensor(
             with contextlib.suppress(Exception):
                 cpu_pool.release(handle)
         return out
+
+
 def _move_staged_pair_to_device(
     X_st: object,
     x_tok: TensorPagePool.Token | None,
@@ -1772,6 +1890,8 @@ def _move_staged_pair_to_device(
         Y_dev = to_device(Y_st, handle=y_tok, pinned=y_pinned)
         y_tok = None
     return X_dev, Y_dev, x_tok, y_tok
+
+
 def _pin(
     meta: object,
     raw: object,
@@ -1875,14 +1995,9 @@ def _pin(
         if y_tok is not None and cpu_pool is not None:
             with contextlib.suppress(Exception):
                 cpu_pool.release(y_tok)
+
+
 def _is_process_group(obj: object) -> bool:
-\
-\
-\
-\
-\
-
-
     if obj is None:
         return False
     with contextlib.suppress(Exception):
@@ -1890,9 +2005,9 @@ def _is_process_group(obj: object) -> bool:
 
         return isinstance(obj, ProcessGroup)
     return False
+
+
 def _validate_distributed_group(meta: object, model: object) -> object:
-
-
     candidates = [
         (meta, "process_group"),
         (meta, "distributed_process_group"),
@@ -1912,6 +2027,8 @@ def _validate_distributed_group(meta: object, model: object) -> object:
         if _is_process_group(pg):
             return pg
     return None
+
+
 def _get_world_size(pg: object) -> object:
     try:
         if pg is None:
@@ -1921,6 +2038,8 @@ def _get_world_size(pg: object) -> object:
         return int(torch.distributed.get_world_size(group=pg))
     except Exception:
         return max(1, int(get_world_size()))
+
+
 def _reduce_sum(t: object, pg: object) -> None:
     if pg is None or (not _is_process_group(pg)):
         torch.distributed.all_reduce(t, op=torch.distributed.ReduceOp.SUM)
@@ -1928,6 +2047,8 @@ def _reduce_sum(t: object, pg: object) -> None:
         torch.distributed.all_reduce(
             t, op=torch.distributed.ReduceOp.SUM, group=pg
         )
+
+
 def _set_gate_factor(
     target_module: object,
     *args: Any,
@@ -2187,6 +2308,8 @@ def _set_gate_factor(
             float(k_high_prev),
             float(k_high_new),
         )
+
+
 def _compute_batch_bytes_per_sample(obj: object) -> tuple[int | None, int]:
     batch_dim: int | None = None
     bytes_per_sample = 0
@@ -2213,6 +2336,8 @@ def _compute_batch_bytes_per_sample(obj: object) -> tuple[int | None, int]:
     if bytes_per_sample <= 0:
         return (None, 0)
     return (batch_dim, bytes_per_sample)
+
+
 def _warmup_scaler_stats(
     model: object, train_loader: object, ops: object
 ) -> None:
@@ -2319,8 +2444,11 @@ def _warmup_scaler_stats(
     if y_max is not None:
         model_for_scaler.scaler.y_max.resize_(y_max.shape).copy_(y_max)
 
+
 def get_loader_state(directory: PathLike) -> object:
     return os.path.join(directory, _DL_STATE_FILE)
+
+
 def get_progress_bar(
     *args: Any,
     title: str,
@@ -2352,6 +2480,8 @@ def get_progress_bar(
         file=sys.stdout,
     )
     return bar
+
+
 def update_progress_bar(
     bar: object,
     finish: bool,
@@ -2385,6 +2515,8 @@ def update_progress_bar(
         inc = 1
     if inc > 0:
         bar.update(inc)
+
+
 def epochs(
     model: nn.Module,
     device: torch.device,
@@ -2410,9 +2542,6 @@ def epochs(
     **kwargs: Any,
 ) -> object:
     from ..data.nodes import Sampler
-
-
-
 
     ddp_fallback: bool = bool(kwargs.pop("ddp_fallback", False))
 
@@ -2879,15 +3008,10 @@ def epochs(
                     if callable(fn):
                         fn(int(epoch_idx))
 
-
-
-
-
-
-
-
             if is_distributed() and _env_flag("STNET_DIST_SYNC_EPOCH", False):
-                target_module = model.module if hasattr(model, "module") else model
+                target_module = (
+                    model.module if hasattr(model, "module") else model
+                )
                 distributed_sync(target_module, device=device)
             flop_breakdown_epoch = {}
             io_time = 0.0
@@ -2919,7 +3043,11 @@ def epochs(
                     dl_len = None
                     with contextlib.suppress(Exception):
                         dl_len = len(train_loader)
-                    r = int(torch.distributed.get_rank()) if is_distributed() else 0
+                    r = (
+                        int(torch.distributed.get_rank())
+                        if is_distributed()
+                        else 0
+                    )
                     w = int(get_world_size(device)) if is_distributed() else 1
                     with contextlib.suppress(Exception):
                         chain = []
@@ -2931,41 +3059,62 @@ def epochs(
                                 clen = len(cur)
                             except Exception:
                                 clen = None
-                            chain.append(f"{type(cur).__module__}.{type(cur).__name__}(len={clen})")
+                            chain.append(
+                                f"{type(cur).__module__}.{type(cur).__name__}(len={clen})"
+                            )
                             nxt = getattr(cur, "_src", None)
                             if nxt is None and hasattr(cur, "_base_iterable"):
                                 nxt = getattr(cur, "_base_iterable", None)
                             if nxt is None or nxt is cur:
                                 break
                             cur = nxt
-                        _LOGGER.error("[DIAG] train: loader chain: %s", " -> ".join(chain))
+                        _LOGGER.error(
+                            "[DIAG] train: loader chain: %s",
+                            " -> ".join(chain),
+                        )
 
                         base = getattr(train_loader, "_base_iterable", None)
                         if base is not None:
                             try:
                                 next(iter(base))
-                                _LOGGER.error("[DIAG] train: _base_iterable yields batches; Stream layer likely blocking/dropping.")
+                                _LOGGER.error(
+                                    "[DIAG] train: _base_iterable yields batches; Stream layer likely blocking/dropping."
+                                )
                             except StopIteration:
-                                _LOGGER.error("[DIAG] train: _base_iterable also produced 0 batches (source pipeline empty).")
+                                _LOGGER.error(
+                                    "[DIAG] train: _base_iterable also produced 0 batches (source pipeline empty)."
+                                )
                             except Exception as e:
-                                _LOGGER.exception("[DIAG] train: probing _base_iterable failed: %s", e)
+                                _LOGGER.exception(
+                                    "[DIAG] train: probing _base_iterable failed: %s",
+                                    e,
+                                )
 
                         src = getattr(train_loader, "_src", None)
                         if src is not None:
                             try:
                                 next(iter(src))
-                                _LOGGER.error("[DIAG] train: underlying _src yields batches; wrapper/preload layer likely blocking.")
+                                _LOGGER.error(
+                                    "[DIAG] train: underlying _src yields batches; wrapper/preload layer likely blocking."
+                                )
                             except StopIteration:
-                                _LOGGER.error("[DIAG] train: underlying _src also produced 0 batches.")
+                                _LOGGER.error(
+                                    "[DIAG] train: underlying _src also produced 0 batches."
+                                )
                             except Exception as e:
-                                _LOGGER.exception("[DIAG] train: probing underlying _src failed: %s", e)
+                                _LOGGER.exception(
+                                    "[DIAG] train: probing underlying _src failed: %s",
+                                    e,
+                                )
                     raise RuntimeError(
                         "train: data_loader produced 0 batches. "
                         f"(rank={r}/{w}, device={device}, loader={dl_type}, len={dl_len}) "
                         "If you cancelled a prior run or reused the same iterator, recreate the Loader/Dataset. "
                         "On accelerators, also check Stream/prefetch backpressure and dataset filtering."
                     )
-                for step_idx, _raw in enumerate(itertools.chain([_first_raw], train_iter)):
+                for step_idx, _raw in enumerate(
+                    itertools.chain([_first_raw], train_iter)
+                ):
                     train_accum_since_last += 1
                     while True:
                         mark_cudagraph = False
@@ -3118,7 +3267,11 @@ def epochs(
                                             )
                                     if should_sync:
                                         if ddp_fallback:
-                                            distributed_all_reduce_grads(_m_post, average=True, policy=dist_policy.collective)
+                                            distributed_all_reduce_grads(
+                                                _m_post,
+                                                average=True,
+                                                policy=dist_policy.collective,
+                                            )
                                         scaler.unscale_(optimizer)
                                         scaler.step(optimizer)
                                         scaler.update()
@@ -3131,9 +3284,6 @@ def epochs(
                                                 else model
                                             )
                                             ema_helper.update(ema_target)
-
-
-
 
                                         target_for_step = (
                                             model.module
@@ -3327,9 +3477,8 @@ def epochs(
                                         mem_util_ema = mem_now
                                     else:
                                         mem_util_ema = (
-                                            (1.0 - util_alpha) * mem_util_ema
-                                            + util_alpha * mem_now
-                                        )
+                                            1.0 - util_alpha
+                                        ) * mem_util_ema + util_alpha * mem_now
                                 if (
                                     util_adjust_interval > 0
                                     and global_step >= util_warmup_steps
@@ -3864,11 +4013,19 @@ def epochs(
                     sched.step()
                 except Exception:
                     pass
-            if swa_helper is not None and epoch_idx >= swa_start_epoch and float(train_samples_epoch or 0.0) > 0.0:
-                _LOGGER.info("[swa] epoch %d: update+ckpt (CPU shadow)", epoch_idx + 1)
+            if (
+                swa_helper is not None
+                and epoch_idx >= swa_start_epoch
+                and float(train_samples_epoch or 0.0) > 0.0
+            ):
+                _LOGGER.info(
+                    "[swa] epoch %d: update+ckpt (CPU shadow)", epoch_idx + 1
+                )
                 swa_target = (
                     model.module
-                    if isinstance(model, torch.nn.parallel.DistributedDataParallel)
+                    if isinstance(
+                        model, torch.nn.parallel.DistributedDataParallel
+                    )
                     else model
                 )
                 swa_helper.update(swa_target)
@@ -3887,14 +4044,22 @@ def epochs(
                         max_buffer_mb=25,
                     )
                     _coerce_dcp_keys(model_sd)
-                    _LOGGER.info("Updating Checkpoint (%d/%d)", int(epoch_idx + 1), int(ops.epochs))
+                    _LOGGER.info(
+                        "Updating Checkpoint (%d/%d)",
+                        int(epoch_idx + 1),
+                        int(ops.epochs),
+                    )
                     print(
                         f"Updating Checkpoint ({int(epoch_idx + 1)}/{int(ops.epochs)})",
                         flush=True,
                     )
                     torch.save(model_sd, tmp_path)
                     os.replace(tmp_path, ckpt_path)
-                    _LOGGER.info("Updated Checkpoint (%d/%d)", int(epoch_idx + 1), int(ops.epochs))
+                    _LOGGER.info(
+                        "Updated Checkpoint (%d/%d)",
+                        int(epoch_idx + 1),
+                        int(ops.epochs),
+                    )
                     print(
                         f"Updated Checkpoint ({int(epoch_idx + 1)}/{int(ops.epochs)})",
                         flush=True,
@@ -3905,6 +4070,7 @@ def epochs(
                         pass
                     with contextlib.suppress(Exception):
                         import gc
+
                         gc.collect()
             if is_distributed():
                 distributed_barrier(device)
@@ -3926,7 +4092,9 @@ def epochs(
             x_b, y_b = collate.get_row(batch, labels_required=True)
             x_raw = x_b.to(device)
             y_raw = y_b.to(scaler_y_device)
-            y_flat = y_raw.reshape(y_raw.shape[0], -1) if y_raw.ndim >= 2 else y_raw
+            y_flat = (
+                y_raw.reshape(y_raw.shape[0], -1) if y_raw.ndim >= 2 else y_raw
+            )
             out = model(
                 x_raw,
                 labels_flat=None,
@@ -3960,7 +4128,9 @@ def epochs(
                 f_true = z_true.shape[-1]
                 if f_true % f_pred == 0:
                     group = f_true // f_pred
-                    z_true = z_true.view(z_true.shape[0], group, f_pred).mean(dim=1)
+                    z_true = z_true.view(z_true.shape[0], group, f_pred).mean(
+                        dim=1
+                    )
                 elif f_pred % f_true == 0:
                     group = f_pred // f_true
                     z_true = z_true.repeat_interleave(group, dim=1)
@@ -3978,10 +4148,18 @@ def epochs(
             total_n += n_batch
             feat = int(z_pred.shape[1])
             if sum_x is None:
-                sum_x = torch.zeros((feat,), device=scaler_y_device, dtype=torch.float64)
-                sum_y = torch.zeros((feat,), device=scaler_y_device, dtype=torch.float64)
-                sum_x2 = torch.zeros((feat,), device=scaler_y_device, dtype=torch.float64)
-                sum_xy = torch.zeros((feat,), device=scaler_y_device, dtype=torch.float64)
+                sum_x = torch.zeros(
+                    (feat,), device=scaler_y_device, dtype=torch.float64
+                )
+                sum_y = torch.zeros(
+                    (feat,), device=scaler_y_device, dtype=torch.float64
+                )
+                sum_x2 = torch.zeros(
+                    (feat,), device=scaler_y_device, dtype=torch.float64
+                )
+                sum_xy = torch.zeros(
+                    (feat,), device=scaler_y_device, dtype=torch.float64
+                )
             denom = max(1, n_batch * int(z_pred.element_size()))
             chunk_f = max(1, int(target_chunk_bytes // denom))
             chunk_f = min(chunk_f, feat)
@@ -4000,17 +4178,29 @@ def epochs(
                     sum_x2[j:j2] += (zp * zp).sum(dim=0, dtype=torch.float64)
                     sum_xy[j:j2] += (zp * zt).sum(dim=0, dtype=torch.float64)
         if is_distributed():
-            n_t = torch.tensor(int(total_n), device=scaler_y_device, dtype=torch.int64)
-            torch.distributed.all_reduce(n_t, op=torch.distributed.ReduceOp.SUM)
+            n_t = torch.tensor(
+                int(total_n), device=scaler_y_device, dtype=torch.int64
+            )
+            torch.distributed.all_reduce(
+                n_t, op=torch.distributed.ReduceOp.SUM
+            )
             total_n = int(n_t.item())
             if sum_x is not None:
-                torch.distributed.all_reduce(sum_x, op=torch.distributed.ReduceOp.SUM)
+                torch.distributed.all_reduce(
+                    sum_x, op=torch.distributed.ReduceOp.SUM
+                )
             if sum_y is not None:
-                torch.distributed.all_reduce(sum_y, op=torch.distributed.ReduceOp.SUM)
+                torch.distributed.all_reduce(
+                    sum_y, op=torch.distributed.ReduceOp.SUM
+                )
             if sum_x2 is not None:
-                torch.distributed.all_reduce(sum_x2, op=torch.distributed.ReduceOp.SUM)
+                torch.distributed.all_reduce(
+                    sum_x2, op=torch.distributed.ReduceOp.SUM
+                )
             if sum_xy is not None:
-                torch.distributed.all_reduce(sum_xy, op=torch.distributed.ReduceOp.SUM)
+                torch.distributed.all_reduce(
+                    sum_xy, op=torch.distributed.ReduceOp.SUM
+                )
         if (
             total_n > 0
             and sum_x is not None
@@ -4031,7 +4221,9 @@ def epochs(
             denom[tiny_mask] = 1.0
             affine_dtype = model_for_scaler.scaler.affine_a.dtype
             a = (cov_xy / denom).to(dtype=affine_dtype)
-            b = (mean_y - a.to(dtype=affine_dtype) * mean_x).to(dtype=affine_dtype)
+            b = (mean_y - a.to(dtype=affine_dtype) * mean_x).to(
+                dtype=affine_dtype
+            )
             a[tiny_mask] = 1.0
             b[tiny_mask] = 0.0
             model_for_scaler.scaler.set_affine(a, b)
@@ -4062,7 +4254,9 @@ def epochs(
         util_fallback = (
             util_from_sps
             if util_from_sps > 0.0
-            else prev_comp_time / total_t if total_t > 0.0 else 0.0
+            else prev_comp_time / total_t
+            if total_t > 0.0
+            else 0.0
         )
         gpu_util_frac = None
         mem_util_frac = None
@@ -4141,8 +4335,13 @@ def epochs(
                 hist.end_session(end_sec, peers=world)
 
                 try:
-                    if ops.ckpt_dir and (not is_distributed() or int(torch.distributed.get_rank()) == 0):
-                        hist_path = os.path.join(str(ops.ckpt_dir), 'history.json')
+                    if ops.ckpt_dir and (
+                        not is_distributed()
+                        or int(torch.distributed.get_rank()) == 0
+                    ):
+                        hist_path = os.path.join(
+                            str(ops.ckpt_dir), "history.json"
+                        )
                         collate.write_json(hist_path, hist.save(), indent=2)
                 except Exception:
                     pass
@@ -4150,6 +4349,8 @@ def epochs(
                 pass
     except Exception:
         pass
+
+
 def infer(
     model: object,
     device: TorchDeviceLike,
@@ -4393,7 +4594,12 @@ def infer(
 
             def _td_cudagraph(bs_now: int, X_now: torch.Tensor) -> None:
                 nonlocal td_cg_active, td_cg_disabled, td_cg_mb, td_cg_mod
-                nonlocal td_cg_pad_buf, td_cg_seen, td_cg_max_bs, td_cg_target, td_cg_x_inner_shape
+                nonlocal \
+                    td_cg_pad_buf, \
+                    td_cg_seen, \
+                    td_cg_max_bs, \
+                    td_cg_target, \
+                    td_cg_x_inner_shape
                 if (
                     td_cg_disabled
                     or td_cg_active
@@ -4461,7 +4667,11 @@ def infer(
             try:
                 _first_batch = next(data_iter)
             except StopIteration:
-                r = int(torch.distributed.get_rank()) if is_distributed() else 0
+                r = (
+                    int(torch.distributed.get_rank())
+                    if is_distributed()
+                    else 0
+                )
                 w = int(get_world_size(device)) if is_distributed() else 1
                 with contextlib.suppress(Exception):
                     chain = []
@@ -4473,34 +4683,52 @@ def infer(
                             clen = len(cur)
                         except Exception:
                             clen = None
-                        chain.append(f"{type(cur).__module__}.{type(cur).__name__}(len={clen})")
+                        chain.append(
+                            f"{type(cur).__module__}.{type(cur).__name__}(len={clen})"
+                        )
                         nxt = getattr(cur, "_src", None)
                         if nxt is None and hasattr(cur, "_base_iterable"):
                             nxt = getattr(cur, "_base_iterable", None)
                         if nxt is None or nxt is cur:
                             break
                         cur = nxt
-                    _LOGGER.error("[DIAG] infer: loader chain: %s", " -> ".join(chain))
+                    _LOGGER.error(
+                        "[DIAG] infer: loader chain: %s", " -> ".join(chain)
+                    )
 
                     base = getattr(data_loader, "_base_iterable", None)
                     if base is not None:
                         try:
                             next(iter(base))
-                            _LOGGER.error("[DIAG] infer: _base_iterable yields batches; Stream layer likely blocking/dropping.")
+                            _LOGGER.error(
+                                "[DIAG] infer: _base_iterable yields batches; Stream layer likely blocking/dropping."
+                            )
                         except StopIteration:
-                            _LOGGER.error("[DIAG] infer: _base_iterable also produced 0 batches (source pipeline empty).")
+                            _LOGGER.error(
+                                "[DIAG] infer: _base_iterable also produced 0 batches (source pipeline empty)."
+                            )
                         except Exception as e:
-                            _LOGGER.exception("[DIAG] infer: probing _base_iterable failed: %s", e)
+                            _LOGGER.exception(
+                                "[DIAG] infer: probing _base_iterable failed: %s",
+                                e,
+                            )
 
                     src = getattr(data_loader, "_src", None)
                     if src is not None:
                         try:
                             next(iter(src))
-                            _LOGGER.error("[DIAG] infer: underlying _src yields batches; wrapper/preload layer likely blocking.")
+                            _LOGGER.error(
+                                "[DIAG] infer: underlying _src yields batches; wrapper/preload layer likely blocking."
+                            )
                         except StopIteration:
-                            _LOGGER.error("[DIAG] infer: underlying _src also produced 0 batches.")
+                            _LOGGER.error(
+                                "[DIAG] infer: underlying _src also produced 0 batches."
+                            )
                         except Exception as e:
-                            _LOGGER.exception("[DIAG] infer: probing underlying _src failed: %s", e)
+                            _LOGGER.exception(
+                                "[DIAG] infer: probing underlying _src failed: %s",
+                                e,
+                            )
                 raise RuntimeError(
                     "infer: data_loader produced 0 batches. "
                     f"(rank={r}/{w}, device={device}, loader={dl_type}, len={dl_len}, chunk_dir={chunk_dir})"
@@ -4541,13 +4769,23 @@ def infer(
                 )
                 if (not first_batch_info) and seen_batches == 1:
                     with contextlib.suppress(Exception):
-                        first_batch_info['batch_type'] = type(batch).__name__
-                        first_batch_info['X_shape'] = [int(x) for x in getattr(X, 'shape', ())]
-                        first_batch_info['X_dtype'] = str(getattr(X, 'dtype', None))
-                        first_batch_info['X_device'] = str(getattr(X, 'device', None))
-                        if row_ids is not None and hasattr(row_ids, 'shape'):
-                            first_batch_info['row_ids_shape'] = [int(x) for x in getattr(row_ids, 'shape', ())]
-                            first_batch_info['row_ids_device'] = str(getattr(row_ids, 'device', None))
+                        first_batch_info["batch_type"] = type(batch).__name__
+                        first_batch_info["X_shape"] = [
+                            int(x) for x in getattr(X, "shape", ())
+                        ]
+                        first_batch_info["X_dtype"] = str(
+                            getattr(X, "dtype", None)
+                        )
+                        first_batch_info["X_device"] = str(
+                            getattr(X, "device", None)
+                        )
+                        if row_ids is not None and hasattr(row_ids, "shape"):
+                            first_batch_info["row_ids_shape"] = [
+                                int(x) for x in getattr(row_ids, "shape", ())
+                            ]
+                            first_batch_info["row_ids_device"] = str(
+                                getattr(row_ids, "device", None)
+                            )
                 if bs <= 0:
                     empty_x_batches += 1
                     if status_bar is not None:
@@ -4701,7 +4939,9 @@ def infer(
                         else rows_i.to(device="cpu")
                     )
                     writer.append(rows_cpu, preds)
-                    appended_rows_total += int(getattr(preds, 'shape', (0,))[0])
+                    appended_rows_total += int(
+                        getattr(preds, "shape", (0,))[0]
+                    )
                     del Xi, Xi_pad, rows_i, out, preds, rows_cpu
                     start = end
                 if torch_prof is not None:
@@ -4768,15 +5008,15 @@ def infer(
                 )
             if not parts:
                 diag = {
-                    'rank': int(rank),
-                    'world_size': int(world_size),
-                    'seen_batches': int(seen_batches),
-                    'none_batches': int(none_batches),
-                    'empty_x_batches': int(empty_x_batches),
-                    'appended_rows_total': int(appended_rows_total),
-                    'loader_type': dl_type,
-                    'loader_len': dl_len,
-                    'first_batch': first_batch_info,
+                    "rank": int(rank),
+                    "world_size": int(world_size),
+                    "seen_batches": int(seen_batches),
+                    "none_batches": int(none_batches),
+                    "empty_x_batches": int(empty_x_batches),
+                    "appended_rows_total": int(appended_rows_total),
+                    "loader_type": dl_type,
+                    "loader_len": dl_len,
+                    "first_batch": first_batch_info,
                 }
                 raise RuntimeError(
                     f"infer: no prediction parts produced in {chunk_dir}. diag={diag}"
@@ -4794,12 +5034,18 @@ def infer(
             with contextlib.suppress(Exception):
                 distributed_barrier(device)
     return None
+
+
 def process(
     ops: RuntimeConfig, ret_sink: ReturnSink | None = None
 ) -> object: ...
+
+
 def process(
     local_rank: int, ops: RuntimeConfig, ret_sink: ReturnSink | None = None
 ) -> object: ...
+
+
 def process(*args: Any, **kwargs: Any) -> object:
     from ..data.pipeline import Session
 
@@ -5008,7 +5254,6 @@ def process(*args: Any, **kwargs: Any) -> object:
         _validate_no_meta_tensors(_m_pre)
         _validate_no_fake_dtensor(_m_pre)
 
-
         dist_policy = DistributedPolicy.from_env()
         hsdp_wrapped = False
 
@@ -5087,7 +5332,9 @@ def process(*args: Any, **kwargs: Any) -> object:
         )
 
         if dist_policy.sync_state:
-            distributed_sync(_m_post, device=device, policy=dist_policy.collective)
+            distributed_sync(
+                _m_post, device=device, policy=dist_policy.collective
+            )
         net_params = [p for p in model.parameters()]
         optimizer = AdamW.float(
             net_params,
@@ -5253,9 +5500,6 @@ def process(*args: Any, **kwargs: Any) -> object:
             swa_helper = None
             swa_start_epoch = int(total_epochs)
 
-
-
-
             try:
                 has_bn = any(
                     isinstance(m, nn.modules.batchnorm._BatchNorm)
@@ -5266,18 +5510,15 @@ def process(*args: Any, **kwargs: Any) -> object:
 
             use_swa = not has_bn
 
-
-
             if local_rank == 0:
                 if use_swa:
-
-
-
                     swa_start_epoch = 0
-                    _swa_env = os.environ.get('STNET_SWA_START_EPOCH')
+                    _swa_env = os.environ.get("STNET_SWA_START_EPOCH")
                     if _swa_env is not None and str(_swa_env).strip() != "":
                         try:
-                            swa_start_epoch = max(0, int(str(_swa_env).strip()))
+                            swa_start_epoch = max(
+                                0, int(str(_swa_env).strip())
+                            )
                         except Exception:
                             swa_start_epoch = 0
                     swa_helper = StochasticWeightAverage(
@@ -5328,35 +5569,36 @@ def process(*args: Any, **kwargs: Any) -> object:
             if session is not None:
                 session.close()
         if local_rank == 0:
-
-
-
-
-
             avg_tag = None
             avg_helper = None
-            if swa_helper is not None and getattr(swa_helper, "n_averaged", 0) > 0:
+            if (
+                swa_helper is not None
+                and getattr(swa_helper, "n_averaged", 0) > 0
+            ):
                 avg_tag = "swa"
                 avg_helper = swa_helper
-            elif ema_helper is not None and getattr(ema_helper, "shadow", None):
+            elif ema_helper is not None and getattr(
+                ema_helper, "shadow", None
+            ):
                 avg_tag = "ema"
                 avg_helper = ema_helper
-
-
-
-
 
             if ops.ckpt_dir:
                 ckpt_path = os.path.join(ops.ckpt_dir, "model.pt")
 
-
                 if not os.path.isfile(ckpt_path):
+                    src_mod = (
+                        tracked_module if tracked_module is not None else model
+                    )
+                    shadow = (
+                        getattr(avg_helper, "shadow", None)
+                        if avg_helper is not None
+                        else None
+                    )
 
-
-                    src_mod = tracked_module if tracked_module is not None else model
-                    shadow = getattr(avg_helper, "shadow", None) if avg_helper is not None else None
-
-                    if avg_helper is not None and hasattr(avg_helper, "checkpoint_state_dict"):
+                    if avg_helper is not None and hasattr(
+                        avg_helper, "checkpoint_state_dict"
+                    ):
                         model_sd = avg_helper.checkpoint_state_dict(
                             src_mod,
                             include_buffers=True,
@@ -5366,27 +5608,40 @@ def process(*args: Any, **kwargs: Any) -> object:
                         model_sd = {}
                         if src_mod is not None:
                             for k, p in src_mod.named_parameters(recurse=True):
-                                sv = shadow.get(k, None) if isinstance(shadow, dict) else None
+                                sv = (
+                                    shadow.get(k, None)
+                                    if isinstance(shadow, dict)
+                                    else None
+                                )
                                 tv = sv if torch.is_tensor(sv) else p
                                 if not torch.is_tensor(tv):
                                     continue
-                                if getattr(tv, "is_meta", False) or tv.device.type == "meta":
+                                if (
+                                    getattr(tv, "is_meta", False)
+                                    or tv.device.type == "meta"
+                                ):
                                     continue
                                 tv = tv.detach()
                                 if tv.device.type != "cpu":
                                     tv = tv.to("cpu")
                                 model_sd[k] = tv
 
-
                         max_bytes = 25 * 1024 * 1024
                         if src_mod is not None:
                             for k, b in src_mod.named_buffers(recurse=True):
                                 if not torch.is_tensor(b) or b.numel() <= 0:
                                     continue
-                                if getattr(b, "is_meta", False) or b.device.type == "meta":
+                                if (
+                                    getattr(b, "is_meta", False)
+                                    or b.device.type == "meta"
+                                ):
                                     continue
                                 try:
-                                    if max_bytes and (b.numel() * b.element_size()) > max_bytes:
+                                    if (
+                                        max_bytes
+                                        and (b.numel() * b.element_size())
+                                        > max_bytes
+                                    ):
                                         continue
                                 except Exception:
                                     pass
@@ -5403,9 +5658,8 @@ def process(*args: Any, **kwargs: Any) -> object:
                     except Exception:
                         pass
 
-
         with contextlib.suppress(Exception):
-            if swa_helper is not None and hasattr(swa_helper, 'close'):
+            if swa_helper is not None and hasattr(swa_helper, "close"):
                 swa_helper.close()
 
         torch.distributed.barrier(
@@ -5601,6 +5855,7 @@ def process(*args: Any, **kwargs: Any) -> object:
         torch.distributed.destroy_process_group()
         return None
     raise ValueError(f"unsupported ops mode: {ops.mode}")
+
 
 try:
     import psutil

@@ -22,9 +22,12 @@ _DTENSOR_ACTIVE: bool = False
 _GLOOX_GLOO_PG_CACHE: dict[tuple[int, ...], ProcessGroup] = {}
 fully_shard = None
 
+
 def _set_dtensor_active() -> None:
     global _DTENSOR_ACTIVE
     _DTENSOR_ACTIVE = True
+
+
 def _from_hsdp_module(module: torch.nn.Module) -> None:
     if not (
         is_distributed()
@@ -52,6 +55,8 @@ def _from_hsdp_module(module: torch.nn.Module) -> None:
             wait()
     except:
         pass
+
+
 def _coerce_ip_addr(v: Any, strip_zone: bool = True) -> str:
     s = str(v).strip() if v is not None else ""
     if s.startswith("[") and s.endswith("]"):
@@ -59,12 +64,16 @@ def _coerce_ip_addr(v: Any, strip_zone: bool = True) -> str:
     if strip_zone and "%" in s:
         s = s.partition("%")[0].strip()
     return s
+
+
 def _is_ip_addr(value: str) -> bool:
     try:
         ipaddress.ip_address(_coerce_ip_addr(value))
         return True
     except:
         return False
+
+
 def _canonize_ip(
     value: Any, loopback: bool = False, link_local: bool = False
 ) -> str | None:
@@ -80,6 +89,8 @@ def _canonize_ip(
         return f"{ip.compressed}{'%' + value.partition('%')[2] if '%' in str(value) and ip.version == 6 else ''}"
     except:
         return None
+
+
 def _format_endpoint(host: str, port: int) -> str:
     host_text = str(host).strip() if host is not None else ""
     if host_text.startswith("[") and host_text.endswith("]"):
@@ -95,6 +106,8 @@ def _format_endpoint(host: str, port: int) -> str:
     except:
         pass
     return f"{h}:{p}"
+
+
 def _parse_endpoint(text: str) -> tuple[str, int]:
     text = text.strip()
     if not text:
@@ -110,6 +123,8 @@ def _parse_endpoint(text: str) -> tuple[str, int]:
     if sep and port.isdigit():
         return host.strip(), int(port)
     return text, 0
+
+
 def _canonize_host(ep: str, default: str, link_local: bool) -> tuple[str, int]:
     if not ep:
         return default, 0
@@ -118,8 +133,12 @@ def _canonize_host(ep: str, default: str, link_local: bool) -> tuple[str, int]:
         host or default, loopback=True, link_local=link_local
     ) or (default if _is_ip_addr(host) else host)
     return host, port if 0 < port <= 65535 else 0
+
+
 def _has_join_hook(obj: Any | None) -> bool:
     return obj is not None and getattr(obj, "join_hook", None) is not None
+
+
 def _get_device_id(device: Optional[torch.device]) -> Optional[Iterable[int]]:
     return (
         [int(device.index)]
@@ -128,12 +147,16 @@ def _get_device_id(device: Optional[torch.device]) -> Optional[Iterable[int]]:
         and device.index is not None
         else None
     )
+
+
 def _safe_getaddrinfo(host: str) -> list[tuple[Any, ...]]:
     with contextlib.suppress(Exception):
         return socket.getaddrinfo(
             host, None, family=socket.AF_UNSPEC, type=socket.SOCK_STREAM
         )
     return []
+
+
 def _get_preferred_ip_cached(
     hostname: str | None,
     prefer_ipv6: bool,
@@ -174,6 +197,8 @@ def _get_preferred_ip_cached(
     if found:
         return found[0][2]
     return "::" if prefer_ipv6 else "0.0.0.0"
+
+
 def _get_default_process_group() -> Any:
     try:
         return dist.group.WORLD
@@ -183,6 +208,8 @@ def _get_default_process_group() -> Any:
         return dist.distributed_c10d._get_default_group()
     except Exception:
         return None
+
+
 def _hsdp_supported_params() -> set[str]:
     if fully_shard is None:
         return set()
@@ -191,15 +218,9 @@ def _hsdp_supported_params() -> set[str]:
         return set(sig.parameters.keys())
     except Exception:
         return set()
+
+
 def _get_gloox_gloo_process_group(pg: ProcessGroup | None) -> ProcessGroup:
-\
-\
-\
-\
-\
-\
-
-
     if not is_distributed():
         return pg or dist.group.WORLD
 
@@ -209,13 +230,11 @@ def _get_gloox_gloo_process_group(pg: ProcessGroup | None) -> ProcessGroup:
         if dist.get_backend(base_pg) == "gloo":
             return base_pg
     except Exception:
-
         pass
 
     try:
         ranks = tuple(dist.get_process_group_ranks(base_pg))
     except Exception:
-
         ranks = tuple(range(dist.get_world_size(base_pg)))
 
     cached = _GLOOX_GLOO_PG_CACHE.get(ranks)
@@ -229,7 +248,11 @@ def _get_gloox_gloo_process_group(pg: ProcessGroup | None) -> ProcessGroup:
 
     _GLOOX_GLOO_PG_CACHE[ranks] = gloo_pg
     return gloo_pg
-def _iter_buckets_by_bytes(tensors: list[Tensor], max_bucket_bytes: int) -> Iterable[list[Tensor]]:
+
+
+def _iter_buckets_by_bytes(
+    tensors: list[Tensor], max_bucket_bytes: int
+) -> Iterable[list[Tensor]]:
     bucket: list[Tensor] = []
     bucket_bytes = 0
 
@@ -245,9 +268,11 @@ def _iter_buckets_by_bytes(tensors: list[Tensor], max_bucket_bytes: int) -> Iter
 
     if bucket:
         yield bucket
-def _broadcast_bucket_gloox(tensors: list[Tensor], *, src_rank: int, group: ProcessGroup) -> None:
 
 
+def _broadcast_bucket_gloox(
+    tensors: list[Tensor], *, src_rank: int, group: ProcessGroup
+) -> None:
     if not tensors:
         return
 
@@ -266,11 +291,12 @@ def _broadcast_bucket_gloox(tensors: list[Tensor], *, src_rank: int, group: Proc
 
     out_parts = torch._utils._unflatten_dense_tensors(flat, cpu_parts)
     for orig, cpu in zip(tensors, out_parts):
-
         if orig.device.type == "cpu":
             orig.copy_(cpu)
         else:
             orig.copy_(cpu, non_blocking=True)
+
+
 def _broadcast_large_tensor_gloox(
     tensor: Tensor,
     *,
@@ -279,17 +305,10 @@ def _broadcast_large_tensor_gloox(
     chunk_mb: int,
     max_inflight_mb: int,
 ) -> None:
-\
-\
-\
-
-
     flat = tensor.reshape(-1)
     elem_size = flat.element_size()
 
     max_inflight_bytes = max(0, int(max_inflight_mb) * 1024 * 1024)
-
-
 
     chunk_bytes = max(1, int(chunk_mb) * 1024 * 1024)
     if max_inflight_bytes > 0 and chunk_bytes > max_inflight_bytes:
@@ -314,7 +333,9 @@ def _broadcast_large_tensor_gloox(
         else:
             cpu_chunk = torch.empty((n,), dtype=flat.dtype, device="cpu")
 
-        work = dist.broadcast(cpu_chunk, src=src_rank, group=group, async_op=use_async)
+        work = dist.broadcast(
+            cpu_chunk, src=src_rank, group=group, async_op=use_async
+        )
 
         if use_async:
             pending.append((work, cpu_chunk, offset, n))
@@ -338,6 +359,8 @@ def _broadcast_large_tensor_gloox(
         w.wait()
         if rank != src_rank:
             flat[o : o + nn].copy_(c, non_blocking=True)
+
+
 def _broadcast_large_tensor(
     tensor: Tensor,
     *,
@@ -346,14 +369,6 @@ def _broadcast_large_tensor(
     chunk_mb: int,
     max_inflight_mb: int,
 ) -> None:
-\
-\
-\
-\
-\
-\
-
-
     if not is_distributed():
         return
 
@@ -378,7 +393,9 @@ def _broadcast_large_tensor(
         n = min(chunk_elems, total - offset)
         view = flat[offset : offset + n]
 
-        work = dist.broadcast(view, src=src_rank, group=group, async_op=use_async)
+        work = dist.broadcast(
+            view, src=src_rank, group=group, async_op=use_async
+        )
 
         if use_async:
             pending.append(work)
@@ -389,13 +406,14 @@ def _broadcast_large_tensor(
                 pending.clear()
                 inflight_bytes = 0
         else:
-
             pass
 
         offset += n
 
     for w in pending:
         w.wait()
+
+
 def _all_reduce_tensor_gloox(
     tensor: Tensor,
     *,
@@ -405,22 +423,14 @@ def _all_reduce_tensor_gloox(
     average: bool,
     world_size: int,
 ) -> None:
-\
-\
-\
-\
-
-
     if tensor.numel() == 0:
         return
-
 
     if tensor.device.type == "cpu":
         dist.all_reduce(tensor, op=dist.ReduceOp.SUM, group=group)
         if average:
             tensor.div_(world_size)
         return
-
 
     if not tensor.is_contiguous():
         tmp = tensor.contiguous()
@@ -484,6 +494,7 @@ def _all_reduce_tensor_gloox(
             c.div_(world_size)
         flat[o : o + nn].copy_(c, non_blocking=True)
 
+
 def resolve_ip_expr(
     host: Any,
     *args: Any,
@@ -531,6 +542,8 @@ def resolve_ip_expr(
                 ):
                     return f"{ip}%{host_text.partition('%')[2]}"
     return None
+
+
 def validate_ip_expr(
     host: Any,
     *args: Any,
@@ -557,6 +570,8 @@ def validate_ip_expr(
             elif allow_hostname:
                 return txt
     return _canonize_ip(default, loopback=True, link_local=True) or default
+
+
 def is_port_available(
     host: str, port: int, *args: Any, allow_link_local: bool | None = None
 ) -> bool:
@@ -592,6 +607,8 @@ def is_port_available(
             return True
     except OSError:
         return False
+
+
 def get_available_host(
     endpoint: Optional[str],
     *args: Any,
@@ -642,6 +659,8 @@ def get_available_host(
             return _format_endpoint(host, int(sock.getsockname()[1]))
     except OSError:
         return _format_endpoint(host, 0)
+
+
 def supported_ip_ver(
     *args: Any, allow_loopback: bool = True, **kwargs: Any
 ) -> tuple[bool, bool]:
@@ -676,6 +695,8 @@ def supported_ip_ver(
         except OSError:
             pass
     return ipv4_ok, ipv6_ok
+
+
 def get_preferred_ip(
     hostname: Optional[str] = None,
     *args: Any,
@@ -690,6 +711,8 @@ def get_preferred_ip(
     return _get_preferred_ip_cached(
         hn, bool(prefer_ipv6), bool(allow_loopback), bool(allow_link_local)
     )
+
+
 def init_master_addr(
     endpoint: Optional[str],
     *args: Any,
@@ -723,6 +746,8 @@ def init_master_addr(
     if port > 0:
         os.environ.setdefault("MASTER_PORT", str(int(port)))
     return master_addr, int(port)
+
+
 def get_world_size(device: Optional[torch.device] = None) -> int:
     try:
         if dist.is_available() and dist.is_initialized():
@@ -749,6 +774,8 @@ def get_world_size(device: Optional[torch.device] = None) -> int:
         case _:
             ncpu = CPU.count()
             return max(1, min(int(ncpu), 4))
+
+
 @contextlib.contextmanager
 def no_sync(
     model: torch.nn.Module,
@@ -762,6 +789,8 @@ def no_sync(
     ctx = getattr(model, "no_sync", lambda: contextlib.nullcontext())()
     with ctx:
         yield
+
+
 def joining(
     model: Any,
     optimizer: Optimizer | None = None,
@@ -772,6 +801,8 @@ def joining(
     if not joinables:
         return contextlib.nullcontext()
     return Join(joinables, throw_on_early_termination=True)
+
+
 def broadcast_scalar(
     value: int | float, device: torch.device, src: int = 0
 ) -> int:
@@ -783,38 +814,40 @@ def broadcast_scalar(
         return int(tensor.item())
     except Exception:
         return int(value)
+
+
 def is_distributed() -> bool:
     try:
         return dist.is_available() and dist.is_initialized()
     except Exception:
         return False
-def get_rank(default: int | None = None) -> int | None:
 
+
+def get_rank(default: int | None = None) -> int | None:
     if not is_distributed():
         return default
     try:
         return int(dist.get_rank())
     except Exception:
         return default
-def is_rank0() -> bool:
 
+
+def is_rank0() -> bool:
     r = get_rank(default=0)
     return int(r or 0) == 0
-def distributed_barrier(device: Optional[torch.device] = None, group: ProcessGroup | None = None) -> None:
-\
-\
-\
-\
-\
-\
-\
-\
 
+
+def distributed_barrier(
+    device: Optional[torch.device] = None, group: ProcessGroup | None = None
+) -> None:
     if not is_distributed():
         return
 
-
-    if group is None and device is not None and not isinstance(device, torch.device):
+    if (
+        group is None
+        and device is not None
+        and not isinstance(device, torch.device)
+    ):
         with contextlib.suppress(Exception):
             from torch.distributed.distributed_c10d import ProcessGroup as _PG
 
@@ -826,9 +859,9 @@ def distributed_barrier(device: Optional[torch.device] = None, group: ProcessGro
     try:
         dist.barrier(group=pg, device_ids=_get_device_id(device))
     except TypeError:
-
-
         dist.barrier(group=pg)
+
+
 def distributed_broadcast(
     target_module: torch.nn.Module,
     *,
@@ -838,16 +871,6 @@ def distributed_broadcast(
     max_buffer_size_mb: int = 25,
     policy: "CollectivePolicy | None" = None,
 ) -> None:
-\
-\
-\
-\
-\
-\
-\
-\
-
-
     from .policies import CollectivePolicy
 
     if not is_distributed():
@@ -859,7 +882,6 @@ def distributed_broadcast(
         return
 
     policy = policy or CollectivePolicy.from_env()
-
 
     if include_buffers:
         include_buffers = bool(policy.include_buffers)
@@ -884,9 +906,10 @@ def distributed_broadcast(
     if not tensors:
         return
 
-
     coalesce_bytes = max(1, int(policy.coalesce_mb)) * 1024 * 1024
-    max_tensor_bytes = max(1, int(policy.max_tensor_mb_for_coalesce)) * 1024 * 1024
+    max_tensor_bytes = (
+        max(1, int(policy.max_tensor_mb_for_coalesce)) * 1024 * 1024
+    )
 
     def _is_small(t: Tensor) -> bool:
         return (t.numel() * t.element_size()) <= max_tensor_bytes
@@ -895,10 +918,14 @@ def distributed_broadcast(
     large_tensors = [t for t in tensors if not _is_small(t)]
 
     world_size = dist.get_world_size(group)
-    local_world_size = env_first_int(["LOCAL_WORLD_SIZE", "SLURM_STEP_NUM_TASKS"], default=world_size)
+    local_world_size = env_first_int(
+        ["LOCAL_WORLD_SIZE", "SLURM_STEP_NUM_TASKS"], default=world_size
+    )
     multi_node = bool(world_size > local_world_size)
 
-    chunk_mb = int(policy.inter_stream_mb if multi_node else policy.intra_stream_mb)
+    chunk_mb = int(
+        policy.inter_stream_mb if multi_node else policy.intra_stream_mb
+    )
     max_inflight_mb = int(policy.max_inflight_mb)
 
     backend = (policy.backend or "c10d").strip().lower()
@@ -909,16 +936,20 @@ def distributed_broadcast(
         large_bytes = total_bytes - small_bytes
         print(
             f"[collectives/broadcast] backend={backend} tensors={len(tensors)} "
-            f"small={len(small_tensors)} ({small_bytes/1024/1024:.1f} MiB) "
-            f"large={len(large_tensors)} ({large_bytes/1024/1024:.1f} MiB) "
+            f"small={len(small_tensors)} ({small_bytes / 1024 / 1024:.1f} MiB) "
+            f"large={len(large_tensors)} ({large_bytes / 1024 / 1024:.1f} MiB) "
             f"chunk={chunk_mb}MiB inflight={max_inflight_mb}MiB multi_node={multi_node}"
         )
 
     if backend == "gloox":
         gloo_group = _get_gloox_gloo_process_group(group)
 
-        for bucket in _iter_buckets_by_bytes(small_tensors, max_bucket_bytes=coalesce_bytes):
-            _broadcast_bucket_gloox(bucket, src_rank=src_rank, group=gloo_group)
+        for bucket in _iter_buckets_by_bytes(
+            small_tensors, max_bucket_bytes=coalesce_bytes
+        ):
+            _broadcast_bucket_gloox(
+                bucket, src_rank=src_rank, group=gloo_group
+            )
 
         for t in large_tensors:
             _broadcast_large_tensor_gloox(
@@ -931,14 +962,23 @@ def distributed_broadcast(
 
         return
 
-
     if small_tensors:
         element_size = small_tensors[0].element_size()
         coalesce_numel = max(1, coalesce_bytes // element_size)
-        dist._broadcast_coalesced(group, small_tensors, buffer_size=coalesce_numel, src=src_rank)
+        dist._broadcast_coalesced(
+            group, small_tensors, buffer_size=coalesce_numel, src=src_rank
+        )
 
     for t in large_tensors:
-        _broadcast_large_tensor(t, group=group, src_rank=src_rank, chunk_mb=chunk_mb, max_inflight_mb=max_inflight_mb)
+        _broadcast_large_tensor(
+            t,
+            group=group,
+            src_rank=src_rank,
+            chunk_mb=chunk_mb,
+            max_inflight_mb=max_inflight_mb,
+        )
+
+
 def distributed_sync(
     target_module: nn.Module,
     device: torch.device | None = None,
@@ -948,8 +988,6 @@ def distributed_sync(
     *,
     policy: "CollectivePolicy | None" = None,
 ) -> None:
-
-
     if not is_distributed():
         return
 
@@ -972,6 +1010,8 @@ def distributed_sync(
     )
 
     distributed_barrier(group=pg, device=device)
+
+
 def distributed_all_reduce_grads(
     module: nn.Module,
     *,
@@ -979,14 +1019,6 @@ def distributed_all_reduce_grads(
     average: bool = True,
     policy: "CollectivePolicy | None" = None,
 ) -> None:
-\
-\
-\
-\
-\
-\
-
-
     if not is_distributed():
         return
 
@@ -1016,8 +1048,6 @@ def distributed_all_reduce_grads(
     if not grads:
         return
 
-
-
     local_world_size = env_first_int(
         [
             "LOCAL_WORLD_SIZE",
@@ -1046,7 +1076,6 @@ def distributed_all_reduce_grads(
             )
         return
 
-
     for g in grads:
         if g.numel() == 0:
             continue
@@ -1060,8 +1089,12 @@ def distributed_all_reduce_grads(
             dist.all_reduce(g, op=dist.ReduceOp.SUM, group=pg)
             if average:
                 g.div_(world_size)
+
+
 def is_dtensor_active() -> bool:
     return bool(_DTENSOR_ACTIVE)
+
+
 def to_hsdp_module(
     module: torch.nn.Module,
     *args: Any,
@@ -1128,6 +1161,8 @@ def to_hsdp_module(
             if hasattr(sharded, _name):
                 register_fsdp_forward_method(sharded, _name)
     return sharded
+
+
 def get_distributed_mesh(
     device: torch.device | None = None,
 ) -> tuple[Any | None, str]:
@@ -1208,6 +1243,7 @@ def get_distributed_mesh(
         return (mesh, "fsdp2")
     except Exception:
         return (None, "none")
+
 
 try:
     from torch.distributed._composable.fsdp import fully_shard
