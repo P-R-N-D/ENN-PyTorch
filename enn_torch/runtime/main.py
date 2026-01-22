@@ -4044,15 +4044,17 @@ def epochs(
                         max_buffer_mb=25,
                     )
                     _coerce_dcp_keys(model_sd)
+                    ckpt_percentage_before = 100 * float(int(epoch_idx) / int(ops.epochs))
+                    ckpt_percentate_after = 100 * float(int(epoch_idx + 1) / int(ops.epochs))
                     _LOGGER.info(
                         "Training (%s) Updating Checkpoint %d%% (Total = %d, Finished = %d)",
                         str(device.type).upper(),
-                        round(float(int(epoch_idx)/int(ops.epochs))),
+                        round(ckpt_percentage_before),
                         int(ops.epochs),
                         int(epoch_idx),
                     )
                     print(
-                        f"Training ({str(device.type).upper()}) Updating Checkpoint {round(float(int(epoch_idx)/int(ops.epochs)))}% (Total = {int(ops.epochs)}, Finished = {int(epoch_idx)})",
+                        f"Training ({str(device.type).upper()}) Updating Checkpoint {round(ckpt_percentage_before)}% (Total = {int(ops.epochs)}, Finished = {int(epoch_idx)})",
                         flush=True,
                     )
                     torch.save(model_sd, tmp_path)
@@ -4060,12 +4062,12 @@ def epochs(
                     _LOGGER.info(
                         "Training (%s) Updated Checkpoint %d%% (Total = %d, Finished = %d)",
                         str(device.type).upper(),
-                        round(float(int(epoch_idx + 1)/int(ops.epochs))),
+                        round(ckpt_percentate_after),
                         int(ops.epochs),
                         int(epoch_idx + 1),
                     )
                     print(
-                        f"Training ({str(device.type).upper()}) Updated Checkpoint {round(float(int(epoch_idx + 1)/int(ops.epochs)))}% (Total = {int(ops.epochs)}, Finished = {int(epoch_idx + 1)})",
+                        f"Training ({str(device.type).upper()}) Updated Checkpoint {round(ckpt_percentate_after)}% (Total = {int(ops.epochs)}, Finished = {int(epoch_idx + 1)})",
                         flush=True,
                     )
                     try:
