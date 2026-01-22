@@ -4045,25 +4045,25 @@ def epochs(
                     )
                     _coerce_dcp_keys(model_sd)
                     _LOGGER.info(
-                        "Training (%s) Updating Checkpoint (%d/%d)",
+                        "Training (%s) Updating Checkpoint (Total = %d, Finished = %d)",
                         str(device.type).upper(),
-                        int(epoch_idx + 1),
                         int(ops.epochs),
+                        int(epoch_idx),
                     )
                     print(
-                        f"Training ({str(device.type).upper()}) Updating Checkpoint ({int(epoch_idx + 1)}/{int(ops.epochs)})",
+                        f"Training ({str(device.type).upper()}) Updating Checkpoint (Total = {int(ops.epochs)}, Finished = {int(epoch_idx)})",
                         flush=True,
                     )
                     torch.save(model_sd, tmp_path)
                     os.replace(tmp_path, ckpt_path)
                     _LOGGER.info(
-                        "Training (%s) Updated Checkpoint (%d/%d)",
+                        "Training (%s) Updated Checkpoint (Total = %d, Finished = %d)",
                         str(device.type).upper(),
-                        int(epoch_idx + 1),
                         int(ops.epochs),
+                        int(epoch_idx + 1),
                     )
                     print(
-                        f"Training ({str(device.type).upper()}) Updated Checkpoint ({int(epoch_idx + 1)}/{int(ops.epochs)})",
+                        f"Training ({str(device.type).upper()}) Updated Checkpoint (Total = {int(ops.epochs)}, Finished = {int(epoch_idx + 1)})",
                         flush=True,
                     )
                     try:
@@ -4072,7 +4072,6 @@ def epochs(
                         pass
                     with contextlib.suppress(Exception):
                         import gc
-
                         gc.collect()
             if is_distributed():
                 distributed_barrier(device)
