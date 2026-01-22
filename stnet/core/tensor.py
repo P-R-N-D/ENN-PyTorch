@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
+import contextlib
 import importlib
 import inspect
 import warnings
@@ -186,6 +187,7 @@ def to_tensor_like(x: Any, ref: torch.Tensor) -> torch.Tensor:
         if torch.is_tensor(x)
         else torch.tensor(x, device=ref.device, dtype=ref.dtype)
     )
+@contextlib.contextmanager
 def from_buffer(
     *args: Any, coerce_requires_grad: bool = True
 ) -> Iterator[None]:

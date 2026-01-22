@@ -36,6 +36,7 @@ def _register_safe_globals():
             from torch.torch_version import TorchVersion
 
             add_safe_globals([TorchVersion])
+@contextlib.contextmanager
 def _filtered_warnings(
     sentences: Sequence[str] | None = None,
 ) -> Iterator[None]:
@@ -58,6 +59,7 @@ def _filtered_warnings(
         with warnings.catch_warnings():
             warnings.filterwarnings("ignore", message=msg_re)
             yield
+@contextlib.contextmanager
 def _temp_environ(
     updates: dict[str, str | None], *args: Any, only_if_unset: bool = True
 ) -> Iterator[None]:
@@ -85,6 +87,7 @@ def _save_lock(path: PathLike | None = None) -> Mutex:
         key = str(path)
     with _SAVE_LOCK_GUARD:
         return _SAVE_PATH_LOCKS.setdefault(key, Mutex(reentrant=True))
+@contextlib.contextmanager
 def _save_sync(
     path: PathLike | None = None, *args: Any, barrier: bool = False
 ) -> Iterator[None]:
