@@ -5,7 +5,7 @@ import contextlib
 import logging
 import os
 from importlib import import_module
-from typing import Any, Callable, List, Optional, Sequence, Tuple
+from typing import Any, Callable, List, Optional, Sequence, Tuple, Self
 
 import torch
 import torch.nn as nn
@@ -40,6 +40,7 @@ _STNET_HAS_FLEX_ATTENTION = getattr(
     import_module(".layers", __package__), "_HAS_FLEX_ATTENTION", False
 )
 
+
 def _size_of_retnet(
     x: torch.Tensor, blk0: nn.Module, *args: Any, mode: str
 ) -> int:
@@ -61,6 +62,8 @@ def _size_of_retnet(
     )
     ffn_bytes = int(B) * int(L) * (int(3) * int(hid) + int(D)) * bytes_e
     return int(base_bytes * ret_factor + ffn_bytes + base_bytes * 2)
+
+
 def _infer_module_device(
     module: nn.Module, fallback: torch.device
 ) -> torch.device:
@@ -69,6 +72,8 @@ def _infer_module_device(
         return p.device
     b = next(module.buffers(), None)
     return b.device if b is not None else fallback
+
+
 def _autofit_microbatch(
     device: torch.device, hard_max: int, per_sample_bytes: int
 ) -> int:
@@ -92,24 +97,28 @@ def _autofit_microbatch(
     if not eff or eff <= 0:
         return hard_max
     return max(1, min(hard_max, int((eff * 0.35) // max(per_sample_bytes, 1))))
+
+
 def _coerce_tensor(
-    t: torch.Tensor, *args, enabled: bool, inplace: bool
+    t: torch.Tensor, *args: object, enabled: bool, inplace: bool
 ) -> torch.Tensor:
     return (
         torch.nan_to_num(t, nan=0.0, posinf=0.0, neginf=0.0)
         if enabled and (t.is_floating_point() or t.is_complex())
         else t
     )
+
+
 def _prealloc_microbatch(
     inp: torch.Tensor,
     microbatch: int,
-    run_fn: Callable,
-    *args,
+    run_fn: Callable[[torch.Tensor], torch.Tensor | Sequence[torch.Tensor]],
+    *args: object,
     pad_to: Optional[int] = None,
     out_dtype: Optional[torch.dtype] = None,
-    cast_slice: Optional[Callable] = None,
+    cast_slice: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
     stage: str = "microbatch",
-):
+) -> torch.Tensor | tuple[torch.Tensor, ...]:
     if inp.ndim < 1:
         raise ValueError(f"{stage}: expected batched input, got {inp.shape}")
     total_b = int(inp.shape[0])
@@ -172,12 +181,15 @@ def _prealloc_microbatch(
     if not out_bufs:
         raise RuntimeError(f"{stage}: no outputs")
     return out_bufs[0] if len(out_bufs) == 1 else tuple(out_bufs)
+
+
 def _coerce_modeling_types(value: Any) -> str:
     mode = str(value).strip().lower()
     normalized = _MODELING_TYPE_ALIASES.get(mode)
     if normalized is None:
         raise ValueError(f"Unsupported modeling type '{value}'")
     return normalized
+
 
 def stochastic_depth_schedule(drop_path: float, depth: int) -> List[float]:
     if depth <= 0:
@@ -188,9 +200,10 @@ def stochastic_depth_schedule(drop_path: float, depth: int) -> List[float]:
         float(i * float(drop_path) / float(depth - 1)) for i in range(depth)
     ]
 
+
 class RetNet(nn.Module):
     def __init__(
-        self,
+        self: Self,
         d_model: int,
         nhead: int,
         *args: Any,
@@ -218,7 +231,7 @@ class RetNet(nn.Module):
         )
 
     def forward(
-        self,
+        self: Self,
         x: torch.Tensor,
         causal_mask: Optional[torch.Tensor] = None,
         state: Optional[dict] = None,
@@ -248,9 +261,11 @@ class RetNet(nn.Module):
         x = x + self.drop_path(self.dropout(h))
         x = x + self.drop_path(self.dropout(self.ffn(self.norm2(x))))
         return x, new_state
+
+
 class LongNet(nn.Module):
     def __init__(
-        self,
+        self: Self,
         embed_dim: int,
         num_heads: int,
         depth: int,
@@ -307,12 +322,16 @@ class LongNet(nn.Module):
         self._ckpt_min_bytes = int(64 * 1024 * 1024)
 
     @property
-    def using(self) -> str:
+    def using(self: Self) -> str:
         return self._using
 
     def _should_enable_checkpoint(
-        self, out, layout_batch_first, need_weights, key_padding_mask
-    ):
+        self: Self,
+        out: torch.Tensor,
+        layout_batch_first: bool,
+        need_weights: bool,
+        key_padding_mask: Optional[torch.Tensor],
+    ) -> bool:
         if not (
             self.training
             and torch.is_grad_enabled()
@@ -370,7 +389,12 @@ class LongNet(nn.Module):
         except:
             return False
 
-    def _ckpt_fn(self, t, layer, key_padding_mask):
+    def _ckpt_fn(
+        self: Self,
+        t: torch.Tensor,
+        layer: nn.Module,
+        key_padding_mask: Optional[torch.Tensor],
+    ) -> torch.Tensor:
         if torch.is_grad_enabled():
             _from_hsdp_module(self)
             _from_hsdp_module(layer)
@@ -383,7 +407,7 @@ class LongNet(nn.Module):
         )[0]
 
     def forward(
-        self,
+        self: Self,
         x: torch.Tensor,
         key_padding_mask: Optional[torch.Tensor] = None,
         need_weights: bool = False,
@@ -432,9 +456,11 @@ class LongNet(nn.Module):
         ):
             out = out.transpose(0, 1)
         return out, attn_w
+
+
 class CrossTransformer(nn.Module):
     def __init__(
-        self,
+        self: Self,
         d_model: int,
         nhead: int,
         *args: Any,
@@ -474,7 +500,7 @@ class CrossTransformer(nn.Module):
         self._fixed_mode: Optional[str] = getattr(self, "modeling_type", None)
 
     def forward(
-        self,
+        self: Self,
         tokens_a: torch.Tensor,
         tokens_b: torch.Tensor,
         mode: Optional[str] = None,

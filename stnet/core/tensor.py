@@ -12,6 +12,7 @@ import torch
 
 _T = TypeVar("_T")
 
+
 def _optional_attr(
     module: str,
     attr: str,
@@ -36,6 +37,7 @@ def _optional_attr(
         return default
     return val
 
+
 _tdx_is_fake = _optional_attr(
     "torchdistx.fake", "is_fake", None, predicate=callable
 )
@@ -48,6 +50,8 @@ FakeTensor = _optional_attr(
 TensorDictBase = _optional_attr(
     "tensordict", "TensorDictBase", (), predicate=inspect.isclass
 )
+
+
 def _call_from_buffer(
     fn: Any,
     buffer: Any,
@@ -63,6 +67,7 @@ def _call_from_buffer(
         return fn(**kw, requires_grad=requires_grad)
     except TypeError:
         return fn(**kw)
+
 
 def to_torch_tensor(obj: Any) -> torch.Tensor:
     if isinstance(obj, torch.Tensor):
@@ -86,16 +91,24 @@ def to_torch_tensor(obj: Any) -> torch.Tensor:
             except Exception:
                 continue
     return torch.as_tensor(obj)
+
+
 def is_fake_tensor(value: Any) -> bool:
     if not isinstance(value, torch.Tensor):
         return False
     if _tdx_is_fake and (res := _tdx_is_fake(value)):
         return bool(res)
     return isinstance(value, FakeTensor)
+
+
 def is_meta_tensor(value: Any) -> bool:
     return isinstance(value, torch.Tensor) and getattr(value, "is_meta", False)
+
+
 def is_meta_or_fake_tensor(value: Any) -> bool:
     return is_meta_tensor(value) or is_fake_tensor(value)
+
+
 def coerce_tensor(
     value: object,
     *args: Any,
@@ -139,6 +152,8 @@ def coerce_tensor(
             for k, v in value.items()
         )
     return value
+
+
 def extract_tensor(out: object) -> torch.Tensor:
     def _to_plain(t: torch.Tensor) -> torch.Tensor:
         try:
@@ -181,12 +196,16 @@ def extract_tensor(out: object) -> torch.Tensor:
             return _to_plain(y)
         raise RuntimeError("Sequence output missing tensors")
     raise RuntimeError(f"Unsupported output type: {type(out)}")
+
+
 def to_tensor_like(x: Any, ref: torch.Tensor) -> torch.Tensor:
     return (
         x.to(device=ref.device, dtype=ref.dtype)
         if torch.is_tensor(x)
         else torch.tensor(x, device=ref.device, dtype=ref.dtype)
     )
+
+
 @contextlib.contextmanager
 def from_buffer(
     *args: Any, coerce_requires_grad: bool = True
@@ -202,7 +221,7 @@ def from_buffer(
         count: int = -1,
         offset: int = 0,
         requires_grad: bool = False,
-    ):
+    ) -> torch.Tensor:
         if coerce_requires_grad:
             requires_grad = False
         try:
@@ -248,6 +267,8 @@ def from_buffer(
         yield
     finally:
         setattr(torch, "frombuffer", _original)
+
+
 def symint_safe_expand(
     t: torch.Tensor,
     target_shape: tuple[object, ...] | list[object] | torch.Size,
@@ -267,5 +288,7 @@ def symint_safe_expand(
         sizes.append(-1 if s_dim == t_dim else t_dim)
 
     return t.expand(tuple(sizes))
+
+
 def symint_safe_expand_as(t: torch.Tensor, ref: torch.Tensor) -> torch.Tensor:
     return symint_safe_expand(t, ref.shape)

@@ -12,8 +12,10 @@ from typing import (
     Optional,
     Sequence,
     Tuple,
+    TypeVar,
     Union,
     cast,
+    Self,
 )
 
 import torch
@@ -70,9 +72,13 @@ from .layers import (
 )
 
 _LOGGER = logging.getLogger(__name__)
+TConfig = TypeVar("TConfig")
+
 
 def _prod_int(shape: Sequence[int]) -> int:
     return int(math.prod(int(v) for v in shape))
+
+
 def _normalize_tile_shape(
     tile_shape: Sequence[int] | int | None,
     event_shape: Sequence[int],
@@ -93,6 +99,8 @@ def _normalize_tile_shape(
     else:
         ts = ts[-ndim:]
     return tuple(max(1, int(v)) for v in ts)
+
+
 def _tile_counts_grid(
     event_shape: Sequence[int],
     tile_shape: Sequence[int],
@@ -122,6 +130,8 @@ def _tile_counts_grid(
         shape[i] = grid[i]
         out = out * c.view(*shape)
     return out
+
+
 def _reduce_flat_to_grid(
     x: torch.Tensor,
     event_shape: Sequence[int],
@@ -154,6 +164,8 @@ def _reduce_flat_to_grid(
         ev, ts, device=blk.device, dtype=blk.dtype
     ).unsqueeze(0)
     return sum_v / torch.clamp(counts, min=float(eps))
+
+
 def _tv_loss_grid(
     p_grid: torch.Tensor, *args: Any, power: float = 1.0, eps: float = 1e-6
 ) -> torch.Tensor:
@@ -165,6 +177,8 @@ def _tv_loss_grid(
     if total is None:
         return p_grid.new_tensor(0.0, dtype=torch.float32)
     return total.mean()
+
+
 def _dot_product_attention_cls() -> Any:
     try:
         from .kernels import DotProductAttention
@@ -173,9 +187,10 @@ def _dot_product_attention_cls() -> Any:
     except Exception:
         return None
 
+
 class SpatialExtractor(nn.Module):
     def __init__(
-        self,
+        self: Self,
         d_model: int,
         nhead: int,
         depth: int,
@@ -208,7 +223,7 @@ class SpatialExtractor(nn.Module):
         self._ckpt_min_bytes = int(64 * 1024 * 1024)
 
     def forward(
-        self,
+        self: Self,
         x: torch.Tensor,
         coords: Optional[torch.Tensor] = None,
         attn_mask: Optional[torch.Tensor] = None,
@@ -262,9 +277,11 @@ class SpatialExtractor(nn.Module):
                     out, causal_mask=attn_mask, state=None, mode="spatial"
                 )
         return self.norm(out)
+
+
 class TemporalExtractor(nn.Module):
     def __init__(
-        self,
+        self: Self,
         d_model: int,
         nhead: int,
         depth: int,
@@ -430,7 +447,7 @@ class TemporalExtractor(nn.Module):
         return _bad(f"unrecognized state type {type(cand).__name__}")
 
     def forward(
-        self,
+        self: Self,
         x: torch.Tensor,
         causal_mask: Optional[torch.Tensor] = None,
         state: Any = None,
@@ -552,9 +569,11 @@ class TemporalExtractor(nn.Module):
                 next_state = next_state.detach()
             return x, next_state.contiguous()
         return x
+
+
 class TokenCollector(nn.Module):
     def __init__(
-        self,
+        self: Self,
         embed_dim: int,
         num_heads: int,
         depth: int,
@@ -587,21 +606,21 @@ class TokenCollector(nn.Module):
         self._auto_microbatch_pending: bool = True
         self._runtime_lock = Mutex()
 
-    def __getstate__(self):
+    def __getstate__(self: Self) -> dict[str, object]:
         state = super().__getstate__()
         state.pop("_runtime_lock", None)
         return state
 
-    def __setstate__(self, state):
+    def __setstate__(self: Self, state: dict[str, object]) -> None:
         super().__setstate__(state)
         self._runtime_lock = Mutex()
 
     @property
-    def using(self) -> str:
+    def using(self: Self) -> str:
         return self.backbone.using
 
     def forward(
-        self,
+        self: Self,
         x: torch.Tensor,
         key_padding_mask: Optional[torch.Tensor] = None,
         need_weights: bool = False,
@@ -616,7 +635,7 @@ class TokenCollector(nn.Module):
         )
 
     def forward_export(
-        self,
+        self: Self,
         x: torch.Tensor,
         key_padding_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
@@ -629,7 +648,7 @@ class TokenCollector(nn.Module):
         return out
 
     def run(
-        self,
+        self: Self,
         tokens: torch.Tensor,
         *args: Any,
         device: torch.device,
@@ -684,9 +703,15 @@ class TokenCollector(nn.Module):
                 _prealloc_microbatch(tokens, mb, runner, stage="controller"),
             )
         return refined
+
+
 class TokenizedView(nn.Module):
     def __init__(
-        self, in_dim: int, tokens: int, d_model: int, extractor: nn.Module
+        self: Self,
+        in_dim: int,
+        tokens: int,
+        d_model: int,
+        extractor: nn.Module,
     ) -> None:
         super().__init__()
         self.in_dim = int(in_dim)
@@ -696,18 +721,18 @@ class TokenizedView(nn.Module):
         self.extractor = extractor
 
     @property
-    def depth(self) -> int:
+    def depth(self: Self) -> int:
         return int(getattr(self.extractor, "depth", 0) or 0)
 
     @property
-    def nhead(self) -> int:
+    def nhead(self: Self) -> int:
         return int(getattr(self.extractor, "nhead", 0) or 0)
 
     @property
-    def head_dim(self) -> int:
+    def head_dim(self: Self) -> int:
         return int(getattr(self.extractor, "head_dim", 0) or 0)
 
-    def forward(self, x: torch.Tensor, *args: Any, **kwargs: Any) -> Any:
+    def forward(self: Self, x: torch.Tensor, *args: Any, **kwargs: Any) -> Any:
         B = x.size(0)
         tokens = (
             self.tokenizer(x)
@@ -715,9 +740,11 @@ class TokenizedView(nn.Module):
             .contiguous()
         )
         return self.extractor(tokens, *args, **kwargs)
+
+
 class TokenFuser(nn.Module):
     def __init__(
-        self,
+        self: Self,
         in_dim: int,
         out_shape: Sequence[int],
         config: ModelConfig,
@@ -885,7 +912,7 @@ class TokenFuser(nn.Module):
         return f"{x}|{y}", (x, y)
 
     def _canon_pair_key(
-        self, raw: str | Tuple[str, str]
+        self: Self, raw: str | Tuple[str, str]
     ) -> tuple[str, tuple[str, str]]:
         return self._canon_pair_key_static(raw)
 
@@ -900,7 +927,7 @@ class TokenFuser(nn.Module):
         return t
 
     def _aggregate_tokens(
-        self, token_sets: Sequence[torch.Tensor]
+        self: Self, token_sets: Sequence[torch.Tensor]
     ) -> torch.Tensor:
         if len(token_sets) < 1:
             raise ValueError("no token sets to aggregate")
@@ -937,7 +964,7 @@ class TokenFuser(nn.Module):
         raise KeyError(f"missing views: {preferred}")
 
     def _run_views(
-        self,
+        self: Self,
         x: torch.Tensor,
         *args: Any,
         temporal_state: Any = None,
@@ -973,7 +1000,7 @@ class TokenFuser(nn.Module):
         return out, next_state
 
     def _run_fusions(
-        self, views: Mapping[str, torch.Tensor]
+        self: Self, views: Mapping[str, torch.Tensor]
     ) -> list[torch.Tensor]:
         out: list[torch.Tensor] = []
         for key, fuser in self.pair_fusers.items():
@@ -990,7 +1017,7 @@ class TokenFuser(nn.Module):
         recursive=False,
     )
     def forward(
-        self,
+        self: Self,
         x: torch.Tensor,
         *args: Any,
         temporal_state: Any = None,
@@ -1021,7 +1048,7 @@ class TokenFuser(nn.Module):
         return tokens, context
 
     def forward_state(
-        self,
+        self: Self,
         x: torch.Tensor,
         *args: Any,
         temporal_state: Any = None,
@@ -1053,7 +1080,7 @@ class TokenFuser(nn.Module):
         return tokens, context, filler
 
     def forward_stream(
-        self,
+        self: Self,
         x: torch.Tensor,
         *args: Any,
         temporal_state: Optional[torch.Tensor] = None,
@@ -1067,7 +1094,7 @@ class TokenFuser(nn.Module):
         return tokens, context, next_state
 
     def decode(
-        self, tokens: torch.Tensor, *args: Any, apply_norm: bool = False
+        self: Self, tokens: torch.Tensor, *args: Any, apply_norm: bool = False
     ) -> torch.Tensor:
         if apply_norm:
             tokens = self.norm(tokens)
@@ -1076,7 +1103,7 @@ class TokenFuser(nn.Module):
         return flat.reshape(tokens.shape[0], *self.out_shape)
 
     def forward_export(
-        self, x: torch.Tensor
+        self: Self, x: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         if not isinstance(x, torch.Tensor):
             raise TypeError("forward_export expects a Tensor")
@@ -1095,13 +1122,20 @@ class TokenFuser(nn.Module):
         tokens = self._aggregate_tokens(chosen)
         context = self.decode(tokens, apply_norm=False)
         return tokens, context
+
+
 class Model(nn.Module):
     @staticmethod
-    def _get_cfg(cfg, name, default, type_=float):
+    def _get_cfg(
+        cfg: object,
+        name: str,
+        default: TConfig,
+        type_: type[TConfig] = float,
+    ) -> TConfig:
         return type_(getattr(cfg, name, default))
 
     def __init__(
-        self, in_dim: int, out_shape: Sequence[int], config: ModelConfig
+        self: Self, in_dim: int, out_shape: Sequence[int], config: ModelConfig
     ) -> None:
         super().__init__()
         self.in_dim = int(in_dim)
@@ -1475,7 +1509,6 @@ class Model(nn.Module):
         raw_mode = getattr(config, "compile_mode", "disabled")
         compile_mode_canonical = canonicalize_compile_mode(raw_mode)
 
-
         set_runtime_cfg("compile_mode", compile_mode_canonical)
         compile_mode_arg = (
             None
@@ -1688,17 +1721,17 @@ class Model(nn.Module):
         self.__stnet_instance_config__ = config
 
     @property
-    def config(self) -> ModelConfig:
+    def config(self: Self) -> ModelConfig:
         return self.__config
 
-    def to(self, *args: Any, **kwargs: Any) -> "Model":
+    def to(self: Self, *args: Any, **kwargs: Any) -> "Model":
         out = super().to(*args, **kwargs)
         with contextlib.suppress(Exception):
             if isinstance(getattr(self, "logger", None), Recorder):
                 self.logger.cpu()
         return cast(Model, out)
 
-    def __getstate__(self):
+    def __getstate__(self: Self) -> dict[str, object]:
         ctx = contextlib.nullcontext()
         with contextlib.suppress(Exception):
             ctx = self.eager_for_export()
@@ -1711,7 +1744,7 @@ class Model(nn.Module):
         state.pop("_amp_dtype_cache_last_dtype", None)
         return state
 
-    def __setstate__(self, state):
+    def __setstate__(self: Self, state: dict[str, object]) -> None:
         super().__setstate__(state)
         self._runtime_lock = Mutex()
         self._amp_dtype_cache_lock = Mutex()
@@ -1734,7 +1767,7 @@ class Model(nn.Module):
         return x
 
     @contextlib.contextmanager
-    def eager_for_export(self):
+    def eager_for_export(self: Self) -> None:
         proc = getattr(self, "processor", None)
         if proc is None:
             proc = getattr(self, "fuser", None)
@@ -1796,7 +1829,7 @@ class Model(nn.Module):
                     _sync_after_swap(name)
 
     def _run_forward_core(
-        self,
+        self: Self,
         features: torch.Tensor,
         *args: Any,
         export: bool = False,
@@ -1806,7 +1839,16 @@ class Model(nn.Module):
         calibrate_output: bool = True,
         device: Optional[torch.device] = None,
         base_dtype: Optional[torch.dtype] = None,
-    ):
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor | None,
+        torch.Tensor | None,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ]:
         x = self._cast_graph_safe(
             features, device or self._device, base_dtype or features.dtype
         )
@@ -1896,7 +1938,7 @@ class Model(nn.Module):
             pred = _coerce_tensor(pred, enabled=True, inplace=not export)
         return pred, next_state, p, assembled, enhanced, delta, tokens, refined
 
-    def forward_export(self, features: torch.Tensor) -> torch.Tensor:
+    def forward_export(self: Self, features: torch.Tensor) -> torch.Tensor:
         if not isinstance(features, torch.Tensor):
             raise TypeError("forward_export expects Tensor")
         base_dtype = None
@@ -1912,7 +1954,7 @@ class Model(nn.Module):
         )[0]
 
     def forward_stream(
-        self,
+        self: Self,
         features: torch.Tensor,
         *args: Any,
         temporal_state: Optional[torch.Tensor] = None,
@@ -1933,19 +1975,19 @@ class Model(nn.Module):
         return pred, next_state
 
     def _compute_aux_losses(
-        self,
-        loss_val,
-        y_hat,
-        assembled,
-        enhanced,
-        tokens,
-        p,
-        z_true,
-        features_t,
-        is_cls_loss,
-        edge_reg_low,
-        edge_reg_high,
-    ):
+        self: Self,
+        loss_val: torch.Tensor,
+        y_hat: torch.Tensor,
+        assembled: torch.Tensor,
+        enhanced: torch.Tensor,
+        tokens: torch.Tensor,
+        p: torch.Tensor | None,
+        z_true: torch.Tensor,
+        features_t: torch.Tensor,
+        is_cls_loss: bool,
+        edge_reg_low: float,
+        edge_reg_high: float,
+    ) -> torch.Tensor:
         if not (self.training and torch.is_grad_enabled()):
             return loss_val
         aux_total = y_hat.new_tensor(0.0, dtype=y_hat.dtype)
@@ -2149,7 +2191,9 @@ class Model(nn.Module):
         return loss_val
 
     def _auto_microbatch(
-        self, features: torch.Tensor | TensorDictBase, device: torch.device
+        self: Self,
+        features: torch.Tensor | TensorDictBase,
+        device: torch.device,
     ) -> int:
         if isinstance(features, TensorDictBase):
             X = None
@@ -2187,7 +2231,7 @@ class Model(nn.Module):
         return int(mb_size)
 
     def forward(
-        self,
+        self: Self,
         features: torch.Tensor | TensorDictBase,
         *args: Any,
         labels_flat: Optional[torch.Tensor] = None,
@@ -2982,7 +3026,7 @@ class Model(nn.Module):
                     _reshard()
 
     def predict(
-        self,
+        self: Self,
         features: torch.Tensor | TensorDictBase,
         *args: Any,
         **kwargs: Any,
@@ -2990,7 +3034,7 @@ class Model(nn.Module):
         kwargs.setdefault("return_loss", False)
         return self.forward(features, *args, **kwargs)
 
-    def history(self) -> Sequence[Mapping[str, Any]]:
+    def history(self: Self) -> Sequence[Mapping[str, Any]]:
         run_hist = getattr(self, "_train_history", None)
         if isinstance(run_hist, list):
             return run_hist

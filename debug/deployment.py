@@ -28,6 +28,7 @@ from .lifecycle import build_dataset
 _ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 _TL_LOG_RE = re.compile(r"(dedicated_log_torch_trace_[A-Za-z0-9_]+\.log)")
 
+
 def _as_path_list(out: Any, fallback: Path) -> list[str]:
     if out is None:
         return [str(fallback)]
@@ -44,6 +45,8 @@ def _as_path_list(out: Any, fallback: Path) -> list[str]:
                 flat.append(str(item))
         return flat if flat else [str(fallback)]
     return [str(out)]
+
+
 def _stats_np(arr: np.ndarray) -> dict[str, float | list[int]]:
     arr = np.asarray(arr)
     return {
@@ -53,6 +56,8 @@ def _stats_np(arr: np.ndarray) -> dict[str, float | list[int]]:
         "mean": float(arr.mean()),
         "std": float(arr.std()),
     }
+
+
 def _build_model_and_sample(
     device: torch.device,
 ) -> tuple[dict[str, Any], TensorDict, torch.nn.Module, torch.Tensor]:
@@ -87,6 +92,8 @@ def _build_model_and_sample(
     ).to(device)
     sample = td_train["X"][:4].to(device)
     return data, td_train, model, sample
+
+
 def _run_isolated_export(
     fmt_name: str, out_path: str, state_path: str
 ) -> dict[str, Any]:
@@ -149,6 +156,8 @@ def _run_isolated_export(
         "stdout_tail": (p.stdout or "")[-2000:],
         "stderr_tail": (p.stderr or "")[-2000:],
     }
+
+
 def _ensure_state_shapes_for_scaler(
     model: torch.nn.Module, sd: dict[str, object]
 ) -> None:
@@ -202,8 +211,12 @@ def _ensure_state_shapes_for_scaler(
                 )
                 setattr(mod, name, mod._parameters[name])
             continue
+
+
 def _strip_ansi(s: str) -> str:
     return _ANSI_RE.sub("", s)
+
+
 def _truncate(s: str, n: int = 4000) -> str:
     if s is None:
         return ""
@@ -211,9 +224,13 @@ def _truncate(s: str, n: int = 4000) -> str:
     if len(s) <= n:
         return s
     return s[: n - 3] + "..."
+
+
 def _should_run_draft(err: str) -> bool:
     e = _strip_ansi(err or "")
     return ("Constraints violated" in e) or ("torch.export.export" in e)
+
+
 def _extract_tlparse_log_from_text(txt: str) -> str | None:
     if not txt:
         return None
@@ -221,6 +238,8 @@ def _extract_tlparse_log_from_text(txt: str) -> str | None:
     if not m:
         return None
     return f"/tmp/export_root/{m.group(1)}"
+
+
 def _read_log_excerpt(
     path: str, *, max_lines: int = 220, tail: bool = True
 ) -> str | None:
@@ -235,6 +254,8 @@ def _read_log_excerpt(
         return "\n".join(chunk)
     except Exception:
         return None
+
+
 def _report_to_text(ep: object) -> str:
     for attr in ("_report", "report"):
         if hasattr(ep, attr):
@@ -243,6 +264,8 @@ def _report_to_text(ep: object) -> str:
             except Exception:
                 pass
     return ""
+
+
 def _draft_export_diagnostics(
     model: torch.nn.Module, sample: torch.Tensor
 ) -> dict[str, Any]:
@@ -346,6 +369,8 @@ def _draft_export_diagnostics(
         info["error"] = _truncate(repr(exc))
         info["traceback"] = _truncate(traceback.format_exc(), 6000)
     return info
+
+
 @contextlib.contextmanager
 def _temp_env(k: str, v: str) -> Iterator[None]:
     old = os.environ.get(k)
@@ -357,6 +382,8 @@ def _temp_env(k: str, v: str) -> Iterator[None]:
             os.environ.pop(k, None)
         else:
             os.environ[k] = old
+
+
 def _export_only_main(fmt_name: str, out_path: str, state_path: str) -> int:
     device = torch.device("cpu")
     data, td_train, model, sample = _build_model_and_sample(device)
@@ -383,6 +410,7 @@ def _export_only_main(fmt_name: str, out_path: str, state_path: str) -> int:
     except Exception as exc:
         print(json.dumps({"status": "error", "error": repr(exc)}))
         return 1
+
 
 def export_and_validate(
     model: torch.nn.Module,
@@ -579,6 +607,8 @@ def export_and_validate(
                 except Exception as exc:
                     validation[f"{name}_error"] = repr(exc)
     return {"exports": results, "validation": validation}
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--export-only", default=None)
@@ -613,6 +643,7 @@ def main() -> None:
         model, sample, td_train, Path("export_artifacts")
     )
     print(json.dumps(stats, indent=2))
+
 
 if __name__ == "__main__":
     main()

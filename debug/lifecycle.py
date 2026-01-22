@@ -8,7 +8,8 @@ import re
 import sys
 import threading
 import time
-from typing import Any, Dict, List, Sequence, Tuple
+from types import ModuleType
+from typing import Any, Callable, Dict, List, Sequence, Tuple, TypeVar
 
 import numpy as np
 import psutil
@@ -34,6 +35,8 @@ DAY_MAP = {
 DIR_DOWN = "하행"
 DIR_UP = "상행"
 HOUR_SUFFIX = "시"
+T = TypeVar("T")
+
 
 def _canonical_section(val: object) -> str:
     parts = [p.strip() for p in str(val).split("-") if str(p).strip()]
@@ -41,7 +44,9 @@ def _canonical_section(val: object) -> str:
         return str(val).strip()
     parts.sort()
     return "-".join(parts)
-def _require_tabular_deps():
+
+
+def _require_tabular_deps() -> tuple[ModuleType, Callable[..., object]]:
     if importlib.util.find_spec("pandas") is None:
         raise ImportError(
             "pandas is required for dataset scripts; install with `pip install -e .[pandas]`"
@@ -53,6 +58,7 @@ def _require_tabular_deps():
     pd = importlib.import_module("pandas")
     load_workbook = importlib.import_module("openpyxl").load_workbook
     return pd, load_workbook
+
 
 def parse_sheet_name(name: str) -> tuple[int, str]:
     m = re.search(r"(\d+)\uc6d4", name)
@@ -68,6 +74,8 @@ def parse_sheet_name(name: str) -> tuple[int, str]:
     if day_kind is None:
         raise ValueError(f"Could not find weekday in sheet name: {name}")
     return month, day_kind
+
+
 def build_dataset(xlsx_path: str) -> Dict[str, Any]:
     pd, load_workbook = _require_tabular_deps()
     HOURS = [f"{h:02d}{HOUR_SUFFIX}" for h in range(24)]
@@ -206,7 +214,9 @@ def build_dataset(xlsx_path: str) -> Dict[str, Any]:
         "S_orig": S_orig,
         "T_orig": T_orig,
     }
-def monitor_run(fn):
+
+
+def monitor_run(fn: Callable[[], T]) -> tuple[T, dict[str, object]]:
     cpu_samples: List[List[float]] = []
     mem_series: List[int] = []
     mem_peak = 0
@@ -214,7 +224,7 @@ def monitor_run(fn):
     proc = psutil.Process()
     psutil.cpu_percent(interval=None, percpu=True)
 
-    def sampler():
+    def sampler() -> None:
         nonlocal mem_peak
         while not stop.is_set():
             cpu_vals = psutil.cpu_percent(interval=1.0, percpu=True)
@@ -253,7 +263,9 @@ def monitor_run(fn):
         "cpu_samples": len(cpu_samples),
         "mem_samples": len(mem_series),
     }
-def main():
+
+
+def main() -> None:
     print("PYTHON_GIL env:", os.environ.get("PYTHON_GIL"))
     print("sys._is_gil_enabled available:", hasattr(sys, "_is_gil_enabled"))
     print("GIL enabled?:", getattr(sys, "_is_gil_enabled", lambda: None)())
@@ -374,6 +386,7 @@ def main():
     if hasattr(pred_result, "close"):
         pred_result.close()
     print("[done]")
+
 
 if __name__ == "__main__":
     main()

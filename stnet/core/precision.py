@@ -10,7 +10,7 @@ import math
 import threading
 from collections import OrderedDict
 from contextlib import AbstractContextManager
-from typing import Any, Callable, Dict, List, Optional, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union, Self
 
 import torch
 from torch import nn
@@ -39,6 +39,7 @@ _TORCHAO_IMPORT_LOCK = Mutex()
 _TORCHAO_IMPORT_TRIED = False
 _qp = None
 
+
 def __getattr__(name: str) -> Any:
     if name == "PrecisionPolicy":
         raise AttributeError(
@@ -46,6 +47,8 @@ def __getattr__(name: str) -> Any:
             "import it from that module instead."
         )
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
 def _import_torchao_quantization() -> None:
     global _Int8DynamicActivationInt8WeightConfig
     global _Int8WeightOnlyConfig
@@ -87,11 +90,15 @@ def _import_torchao_quantization() -> None:
             _Int8WeightOnlyConfig = None
             _PTQ_IMPL = None
             _qp = None
+
+
 def _is_ptq_unavailable(
     model: nn.Module, *args: Any, **kwargs: Any
 ) -> tuple[nn.Module, bool, str]:
     _ = args, kwargs
     return (model, False, "PTQ backend unavailable")
+
+
 def _log_negotiation(
     logger: Optional[logging.Logger],
     key: object,
@@ -99,8 +106,9 @@ def _log_negotiation(
     *args: Any,
     level: str = "debug",
 ) -> None:
-    lg, lvl = (logger or _LOGGER), (
-        logging.INFO if str(level).lower() == "info" else logging.DEBUG
+    lg, lvl = (
+        (logger or _LOGGER),
+        (logging.INFO if str(level).lower() == "info" else logging.DEBUG),
     )
     if not lg.isEnabledFor(lvl):
         return
@@ -125,12 +133,16 @@ def _log_negotiation(
     except Exception:
         msg = f"[AMP][NEGOTIATE] {payload}"
     lg.log(lvl, msg)
+
+
 def _parse_dtype(dtype: Any) -> str:
     return (
         str(dtype).split(".")[-1]
         if isinstance(dtype, torch.dtype)
         else str(dtype)
     )
+
+
 def _to_serializable(x: Any) -> Any:
     if x is None or isinstance(x, (bool, int, str, float)):
         return x
@@ -138,6 +150,8 @@ def _to_serializable(x: Any) -> Any:
         return float(x)
     except:
         return str(x)
+
+
 def _coerce_torch_dtype(value: Any, default: torch.dtype) -> torch.dtype:
     return (
         value
@@ -148,6 +162,8 @@ def _coerce_torch_dtype(value: Any, default: torch.dtype) -> torch.dtype:
             else default
         )
     )
+
+
 def _get_meta_stats(meta: Any | None) -> Dict[str, Any]:
     return (
         {
@@ -167,6 +183,8 @@ def _get_meta_stats(meta: Any | None) -> Dict[str, Any]:
         if meta
         else {}
     )
+
+
 def _validate_dtype_safety(
     dtype: torch.dtype,
     meta: Any | None,
@@ -281,6 +299,7 @@ def _validate_dtype_safety(
         ),
     )
 
+
 def is_scale_safe(
     dtype: torch.dtype,
     meta: Any | None,
@@ -296,6 +315,7 @@ def is_scale_safe(
         underflow_action=underflow_action,
     )
     return ok
+
 
 class DeviceMeta:
     device: torch.device
@@ -315,17 +335,17 @@ class DeviceMeta:
     is_negotiable: Optional[bool] = None
     underflow_action: str = "warn"
 
-    def _refresh_device_info(self) -> None:
+    def _refresh_device_info(self: Self) -> None:
         ds = get_device_stats(self.device)
         self.device = ds.device
         self.device_type = ds.device_type
         self.cuda_cc = ds.cuda_cc
 
-    def coerce_device_info(self) -> "DeviceMeta":
+    def coerce_device_info(self: Self) -> "DeviceMeta":
         self._refresh_device_info()
         return self
 
-    def refresh(self) -> "DeviceMeta":
+    def refresh(self: Self) -> "DeviceMeta":
         self._refresh_device_info()
         ds = get_device_stats(self.device)
         if not self.float_dtypes:
@@ -336,11 +356,13 @@ class DeviceMeta:
             self.int_quant_bits = int(ds.int_quant_bits)
         return self
 
-    def is_disabled(self) -> bool:
+    def is_disabled(self: Self) -> bool:
         return False
 
     @classmethod
-    def for_device(cls, device: Union[torch.device, str]) -> "DeviceMeta":
+    def for_device(
+        cls: type[Self], device: Union[torch.device, str]
+    ) -> "DeviceMeta":
         ds = get_device_stats(device)
         return cls(
             device=ds.device,
@@ -352,6 +374,8 @@ class DeviceMeta:
             int_quant_bits=int(ds.int_quant_bits),
             underflow_action=default_underflow_action(),
         )
+
+
 class Autocast:
     _preferred_fp8_backend: Optional[str] = None
     _preferred_int_backend: Optional[str] = None
@@ -361,11 +385,11 @@ class Autocast:
     _metadata_tls = threading.local()
 
     @classmethod
-    def _get_tls_metadata(cls) -> Any | None:
+    def _get_tls_metadata(cls: type[Self]) -> Any | None:
         return getattr(cls._metadata_tls, "meta", None)
 
     @classmethod
-    def _set_tls_metadata(cls, meta: Any | None) -> None:
+    def _set_tls_metadata(cls: type[Self], meta: Any | None) -> None:
         setattr(cls._metadata_tls, "meta", meta)
         cls._metadata = meta
 
@@ -381,7 +405,7 @@ class Autocast:
 
     @classmethod
     def _try_load_backend(
-        cls,
+        cls: type[Self],
         mod_name: str,
         attr_name: str,
         test_supported: bool = True,
@@ -401,7 +425,10 @@ class Autocast:
 
     @classmethod
     def _resolve_backend(
-        cls, preferred: Optional[str], device: torch.device, kind: str
+        cls: type[Self],
+        preferred: Optional[str],
+        device: torch.device,
+        kind: str,
     ) -> Optional[str]:
         order = ("ao", "te") if preferred == "ao" else ("te", "ao")
         is_supported = (
@@ -439,15 +466,29 @@ class Autocast:
         return None
 
     @classmethod
-    def _fp8_backend(cls, pref, *args, device=None, **kwargs):
+    def _fp8_backend(
+        cls: type[Self],
+        pref: Optional[str],
+        *args: object,
+        device: Optional[torch.device] = None,
+        **kwargs: object,
+    ) -> Optional[str]:
         return cls._resolve_backend(pref, device or cls._device(None), "fp8")
 
     @classmethod
-    def _int_backend(cls, pref, *args, device=None, **kwargs):
+    def _int_backend(
+        cls: type[Self],
+        pref: Optional[str],
+        *args: object,
+        device: Optional[torch.device] = None,
+        **kwargs: object,
+    ) -> Optional[str]:
         return cls._resolve_backend(pref, device or cls._device(None), "int")
 
     @classmethod
-    def _get_backend_context(cls, mod_name, attr_name, enabled):
+    def _get_backend_context(
+        cls: type[Self], mod_name: str, attr_name: str, enabled: bool
+    ) -> List[AbstractContextManager[None]]:
         if not enabled:
             return []
         if mod := cls._try_load_backend(mod_name, attr_name):
@@ -455,19 +496,25 @@ class Autocast:
         return []
 
     @classmethod
-    def _nvidia_float8(cls, device: torch.device, enabled: bool):
+    def _nvidia_float8(
+        cls: type[Self], device: torch.device, enabled: bool
+    ) -> List[AbstractContextManager[None]]:
         return cls._get_backend_context(
             "transformer_engine.pytorch", "fp8_autocast", enabled
         )
 
     @classmethod
-    def _torchao_float8(cls, enabled: bool):
+    def _torchao_float8(
+        cls: type[Self], enabled: bool
+    ) -> List[AbstractContextManager[None]]:
         return cls._get_backend_context(
             "torchao.float8", "fp8_autocast", enabled
         )
 
     @classmethod
-    def _torchao_int8_backend(cls, device: torch.device, enabled: bool):
+    def _torchao_int8_backend(
+        cls: type[Self], device: torch.device, enabled: bool
+    ) -> List[AbstractContextManager[None]]:
         backend = cls._preferred_int_backend
         if backend == "te":
             return cls._get_backend_context(
@@ -480,27 +527,29 @@ class Autocast:
         return []
 
     @classmethod
-    def _torchao_int4(cls, device: torch.device, enabled: bool):
+    def _torchao_int4(
+        cls: type[Self], device: torch.device, enabled: bool
+    ) -> List[AbstractContextManager[None]]:
         return cls._get_backend_context(
             "torchao.quantization", "int4_autocast", enabled
         )
 
     @classmethod
     def _torchao_int8(
-        cls, device: torch.device, enabled: bool
+        cls: type[Self], device: torch.device, enabled: bool
     ) -> List[AbstractContextManager[None]]:
         return cls._torchao_int8_autocast(device, enabled)
 
     @classmethod
     def _torchao_int8_autocast(
-        cls, device: torch.device, enabled: bool
+        cls: type[Self], device: torch.device, enabled: bool
     ) -> List[AbstractContextManager[None]]:
         if cls._preferred_int_backend is None:
             cls._preferred_int_backend = "ao"
         return cls._torchao_int8_backend(device, enabled)
 
     @classmethod
-    def metadata(cls) -> Any | None:
+    def metadata(cls: type[Self]) -> Any | None:
         return cls._get_tls_metadata()
 
     @staticmethod
@@ -519,7 +568,7 @@ class Autocast:
 
     @classmethod
     def coerce_metadata(
-        cls,
+        cls: type[Self],
         device: Optional[Union[torch.device, str]] = None,
         *args: Any,
         metadata: Any | None = None,
@@ -569,7 +618,7 @@ class Autocast:
 
     @classmethod
     def float_amp_priority(
-        cls, device: torch.device
+        cls: type[Self], device: torch.device
     ) -> Tuple[torch.dtype, ...]:
         meta = cls.coerce_metadata(device)
         candidates = getattr(meta, "float_dtypes", ())
@@ -579,7 +628,7 @@ class Autocast:
 
     @classmethod
     def integer_amp_priority(
-        cls, device: torch.device
+        cls: type[Self], device: torch.device
     ) -> Tuple[torch.dtype, ...]:
         meta = cls.coerce_metadata(device)
         candidates = getattr(meta, "int_dtypes", ())
@@ -589,7 +638,7 @@ class Autocast:
 
     @classmethod
     def configure(
-        cls,
+        cls: type[Self],
         model: Any | None = None,
         *args: Any,
         fp8_backend: Optional[str] = None,
@@ -647,7 +696,7 @@ class Autocast:
 
     @classmethod
     def negotiate(
-        cls,
+        cls: type[Self],
         candidates: Tuple[torch.dtype, ...],
         *args: Any,
         fallback: torch.dtype,
@@ -658,7 +707,7 @@ class Autocast:
         decision_key: object = None,
         **kwargs: Any,
     ) -> torch.dtype:
-        def _parse_margin():
+        def _parse_margin() -> tuple[float, int]:
             p2 = kwargs.pop("safety_margin_pow2", None)
             if p2 is not None:
                 return float(2 ** max(0, min(30, int(p2 or 3)))), int(p2 or 3)
@@ -764,7 +813,7 @@ class Autocast:
 
     @classmethod
     def resolve_float_dtype(
-        cls,
+        cls: type[Self],
         device: Optional[Union[torch.device, str]] = None,
         dtype: Optional[Union[torch.dtype, str]] = None,
         metadata: Any | None = None,
@@ -804,7 +853,7 @@ class Autocast:
     @classmethod
     @contextlib.contextmanager
     def float(
-        cls,
+        cls: type[Self],
         device: Optional[Union[torch.device, str]] = None,
         *args: Any,
         metadata: Any | None = None,
@@ -916,7 +965,7 @@ class Autocast:
     @classmethod
     @contextlib.contextmanager
     def suspend(
-        cls, device: Optional[Union[torch.device, str]] = None
+        cls: type[Self], device: Optional[Union[torch.device, str]] = None
     ) -> contextlib.AbstractContextManager[None]:
         dev = cls._device(device)
         with contextlib.ExitStack() as stack:
@@ -929,7 +978,7 @@ class Autocast:
     @classmethod
     @contextlib.contextmanager
     def integer(
-        cls,
+        cls: type[Self],
         device: Optional[Union[torch.device, str]] = None,
         *args: Any,
         metadata: Any | None = None,
@@ -994,6 +1043,8 @@ class Autocast:
                         ),
                     )
             yield
+
+
 class Quantization:
     @staticmethod
     def is_qat_available() -> bool:
@@ -1090,7 +1141,7 @@ class Quantization:
 
     @classmethod
     def enable_qat(
-        cls,
+        cls: type[Self],
         model: nn.Module,
         *args: Any,
         dynamic_activations: bool = True,
@@ -1115,7 +1166,7 @@ class Quantization:
 
     @classmethod
     def _enable_ptq(
-        cls,
+        cls: type[Self],
         model: nn.Module,
         *args: Any,
         dynamic_activations: bool = True,
@@ -1133,7 +1184,7 @@ class Quantization:
 
     @classmethod
     def enable_int8_training(
-        cls,
+        cls: type[Self],
         model: nn.Module,
         *args: Any,
         dynamic_activations: bool = True,

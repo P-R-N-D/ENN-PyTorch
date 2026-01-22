@@ -7,7 +7,7 @@ import math
 import os
 import threading
 import warnings
-from typing import Any, Mapping, Optional, Tuple
+from typing import Any, Callable, Mapping, Optional, Tuple, Self
 
 import torch
 import torch._dynamo
@@ -44,32 +44,15 @@ _te = None
 _torch_create_mask = None
 _torch_flex_attention = None
 
+
 def _flex_attention_disabled() -> bool:
-\
-\
-\
-\
-
-
     return bool(
         env_bool("STNET_NO_FLEX_ATTENTION", False)
         or env_bool("STNET_DISABLE_FLEX_ATTENTION", False)
     )
+
+
 def _flex_attention_compile_mode() -> str:
-\
-\
-\
-\
-\
-\
-\
-\
-\
-\
-
-
-
-
     cfg = get_runtime_cfg()
     global_mode = getattr(cfg, "compile_mode", "disabled")
     global_mode = canonicalize_compile_mode(global_mode)
@@ -79,12 +62,11 @@ def _flex_attention_compile_mode() -> str:
     if global_mode == "max-autotune-no-cudagraphs":
         return "max-autotune-no-cudagraphs"
     return "reduce-overhead"
+
+
 def _get_compiled_flex_attention() -> Any:
-
-
     if not _HAS_TORCH_FLEX or _torch_flex_attention is None:
         raise RuntimeError("Flex Attention is not available")
-
 
     if is_compiling() or is_tracing_or_exporting():
         return _torch_flex_attention
@@ -104,12 +86,15 @@ def _get_compiled_flex_attention() -> Any:
         try:
             compiled = _stnet_compile(_torch_flex_attention, mode=mode)
         except Exception:
-
             compiled = _torch_flex_attention
         _FLEX_ATTN_COMPILED[mode] = compiled
         return compiled
+
+
 def _exporting_boundary() -> bool:
     return bool(is_tracing_or_exporting() or is_symbolic())
+
+
 def _coerce_block_mask_to_dense(
     mask: Any, *args: Any, device: torch.device
 ) -> Optional[torch.Tensor]:
@@ -123,11 +108,15 @@ def _coerce_block_mask_to_dense(
             if torch.is_tensor(dense):
                 return dense.to(device)
     return None
+
+
 def _int_or_none(x: Any) -> Optional[int]:
     try:
         return int(x)
     except Exception:
         return None
+
+
 def _env_int(name: str, default: int) -> int:
     v = os.environ.get(name)
     if v is None:
@@ -136,6 +125,8 @@ def _env_int(name: str, default: int) -> int:
         return int(v)
     except Exception:
         return int(default)
+
+
 def _python_token_mask_from_mask_mod(
     mask_mod: Any,
     *args: Any,
@@ -159,6 +150,8 @@ def _python_token_mask_from_mask_mod(
         return out
     except Exception:
         return None
+
+
 def _blockmask_to_token_mask(
     mask: Any,
     *args: Any,
@@ -233,6 +226,8 @@ def _blockmask_to_token_mask(
         k_block, dim=-1
     )
     return expanded[..., :Lq, :Lk]
+
+
 def _apply_allowed_mask(
     scores: torch.Tensor, allowed: torch.Tensor
 ) -> torch.Tensor:
@@ -241,6 +236,8 @@ def _apply_allowed_mask(
     return scores.masked_fill(
         allowed.logical_not(), torch.finfo(scores.dtype).min
     )
+
+
 def _flatten_attn_mask(
     mask: torch.Tensor,
     *args: Any,
@@ -332,6 +329,8 @@ def _flatten_attn_mask(
                 raise RuntimeError(f"Len mismatch {l0} != {L}")
         return mask, b0, h0, l0
     raise RuntimeError(f"attn_mask rank {dim} not supported")
+
+
 def _compute_flops_msr(
     batch: int,
     seq_len: int,
@@ -346,6 +345,8 @@ def _compute_flops_msr(
     attn = float(batch) * float(seq_len) * float(num_heads) * float(head_dim)
     gate_cost = attn if use_gate else 0.0
     return 4.0 * attn + gate_cost
+
+
 def _compute_flops_mha(
     query: torch.Tensor,
     key: torch.Tensor,
@@ -396,6 +397,8 @@ def _compute_flops_mha(
         FLOP_PROFILER.add(label, float(core + proj))
     except Exception:
         pass
+
+
 def _call_mha_compat(
     mha: Any,
     q: torch.Tensor,
@@ -422,6 +425,8 @@ def _call_mha_compat(
         with contextlib.suppress(TypeError):
             return mha(q, k, v, **kw)
     return mha(q, k, v, **call_kwargs)
+
+
 def _mha_export_safe(
     mha: torch.nn.MultiheadAttention,
     query: torch.Tensor,
@@ -528,6 +533,8 @@ def _mha_export_safe(
     elif not batch_first:
         out = out.transpose(0, 1)
     return out, weights
+
+
 def _call_sdpa_fallback(
     fallback: Any,
     query: torch.Tensor,
@@ -557,6 +564,8 @@ def _call_sdpa_fallback(
         except Exception:
             pass
     return fallback(query, key, value, **call_kwargs)
+
+
 def _attention_math_bshd(
     q_bshd: torch.Tensor,
     k_bshd: torch.Tensor,
@@ -595,6 +604,8 @@ def _attention_math_bshd(
             probs, p=float(dropout_p), training=True
         )
     return torch.matmul(probs, v_bshd)
+
+
 def _is_bshd_contiguous(tensor: torch.Tensor) -> bool:
     if tensor.dim() != 4:
         return False
@@ -607,6 +618,8 @@ def _is_bshd_contiguous(tensor: torch.Tensor) -> bool:
         and stride[-3] == num_heads * head_dim
         and stride[-4] == seq_len * num_heads * head_dim
     )
+
+
 def _is_nvidia_te_supported() -> bool:
     if not torch.cuda.is_available():
         return False
@@ -622,6 +635,8 @@ def _is_nvidia_te_supported() -> bool:
     except Exception:
         pass
     return True
+
+
 def _is_nvidia_mha_preferred() -> bool:
     if not _HAS_TE:
         return False
@@ -634,6 +649,8 @@ def _is_nvidia_mha_preferred() -> bool:
     if device.type != "cuda" or not torch.cuda.is_available():
         return False
     return True
+
+
 def _triton_retention(
     V: Any,
     LAMBDA: Any,
@@ -667,6 +684,7 @@ def _triton_retention(
         out_ptr = OUT + b * SOB + t * SOL + h * SOH + dh_off * SOD
         tl.store(out_ptr, state, mask=mask_d)
 
+
 def reshape_for_mha(
     x: torch.Tensor,
     batch: int,
@@ -683,9 +701,10 @@ def reshape_for_mha(
         .contiguous()
     )
 
+
 class _MultiHeadAttentionNvidia(nn.Module):
     def __init__(
-        self,
+        self: Self,
         embed_dim: int,
         num_heads: int,
         *args: Any,
@@ -742,7 +761,12 @@ class _MultiHeadAttentionNvidia(nn.Module):
             self._te_supports_training = "training" in params
 
     @staticmethod
-    def _nvidia_mha(embed_dim, num_heads, dropout, kwargs):
+    def _nvidia_mha(
+        embed_dim: int,
+        num_heads: int,
+        dropout: float,
+        kwargs: dict[str, object],
+    ) -> nn.Module | None:
         if not (_HAS_TE and _is_nvidia_te_supported()):
             return None
         candidates = [
@@ -772,7 +796,7 @@ class _MultiHeadAttentionNvidia(nn.Module):
         return None
 
     def forward(
-        self,
+        self: Self,
         query: torch.Tensor,
         key: torch.Tensor,
         value: torch.Tensor,
@@ -795,7 +819,7 @@ class _MultiHeadAttentionNvidia(nn.Module):
                 is_causal=is_causal,
             )
 
-        def _fallback_call():
+        def _fallback_call() -> tuple[torch.Tensor, torch.Tensor | None]:
             return _call_sdpa_fallback(
                 self._fallback,
                 query,
@@ -875,8 +899,9 @@ class _MultiHeadAttentionNvidia(nn.Module):
             self._force_pt = True
             return _fallback_call()
         y, w = (
-            out[0] if isinstance(out, tuple) and len(out) >= 1 else out
-        ), None
+            (out[0] if isinstance(out, tuple) and len(out) >= 1 else out),
+            None,
+        )
         if not bf and isinstance(y, torch.Tensor) and y.dim() >= 2:
             y = y.transpose(0, 1)
         _compute_flops_mha(
@@ -888,9 +913,11 @@ class _MultiHeadAttentionNvidia(nn.Module):
             include_projections=True,
         )
         return y, w
+
+
 class _MultiHeadAttentionCompat(nn.Module):
     def __init__(
-        self,
+        self: Self,
         embed_dim: int,
         num_heads: int,
         *args: Any,
@@ -910,7 +937,7 @@ class _MultiHeadAttentionCompat(nn.Module):
         )
 
     def forward(
-        self,
+        self: Self,
         query: torch.Tensor,
         key: torch.Tensor,
         value: torch.Tensor,
@@ -959,9 +986,10 @@ class _MultiHeadAttentionCompat(nn.Module):
         )
         return out, w
 
+
 class DotProductAttention(nn.Module):
     def __init__(
-        self,
+        self: Self,
         num_heads: Optional[int] = None,
         head_dim: Optional[int] = None,
         te_first: Optional[bool] = None,
@@ -1033,7 +1061,7 @@ class DotProductAttention(nn.Module):
                 self._te_supports_training = "training" in params
 
     def forward(
-        self,
+        self: Self,
         q: torch.Tensor,
         k: torch.Tensor,
         v: torch.Tensor,
@@ -1351,17 +1379,19 @@ class DotProductAttention(nn.Module):
         if device_type == "mps" and tensor.dtype == torch.bfloat16:
             return tensor.to(torch.float16)
         return tensor
+
+
 class FlexAttention(nn.Module):
-    def __init__(self, *args: Any, prefer_torch: bool = True) -> None:
+    def __init__(self: Self, *args: Any, prefer_torch: bool = True) -> None:
         super().__init__()
         self.prefer_torch = bool(prefer_torch)
 
     @property
-    def has_torch_backend(self) -> bool:
+    def has_torch_backend(self: Self) -> bool:
         return bool(_HAS_TORCH_FLEX and _torch_flex_attention is not None)
 
     def _reference(
-        self,
+        self: Self,
         q: torch.Tensor,
         k: torch.Tensor,
         v: torch.Tensor,
@@ -1421,7 +1451,7 @@ class FlexAttention(nn.Module):
         return torch.matmul(attn, v_bshd)
 
     def forward(
-        self,
+        self: Self,
         q: torch.Tensor,
         k: torch.Tensor,
         v: torch.Tensor,
@@ -1487,15 +1517,17 @@ class FlexAttention(nn.Module):
             if "kernel_options" in _FLEX_KWARGS and kernel_options is not None:
                 flex_kwargs["kernel_options"] = kernel_options
 
-
-
             flex_fn = _get_compiled_flex_attention()
             try:
                 return flex_fn(q, k, v, **flex_kwargs)
             except Exception as exc:
                 msg = str(exc)
 
-                if "matmul precision" in msg and "legacy" in msg and "new" in msg:
+                if (
+                    "matmul precision" in msg
+                    and "legacy" in msg
+                    and "new" in msg
+                ):
                     with contextlib.suppress(Exception):
                         mode = _flex_attention_compile_mode()
                         _FLEX_ATTN_COMPILED[mode] = _torch_flex_attention
@@ -1515,9 +1547,11 @@ class FlexAttention(nn.Module):
             is_causal=bool(is_causal),
             score_mod=score_mod,
         )
+
+
 class MultiScaleRetention(nn.Module):
     def __init__(
-        self, d_model: int, nhead: int, use_gate: bool = True
+        self: Self, d_model: int, nhead: int, use_gate: bool = True
     ) -> None:
         super().__init__()
         self.d_model = int(d_model)
@@ -1547,7 +1581,7 @@ class MultiScaleRetention(nn.Module):
         self._beta = nn.Parameter(beta_init)
 
     def _decay_lambda(
-        self, device: torch.device, dtype: torch.dtype
+        self: Self, device: torch.device, dtype: torch.dtype
     ) -> torch.Tensor:
         H = int(self.nhead)
         calc_dtype = (
@@ -1716,7 +1750,7 @@ class MultiScaleRetention(nn.Module):
 
     @torch_compiler_disable(recursive=False, reason="Triton retention scan")
     def _scan_causal_triton(
-        self, v: torch.Tensor, lam_h: torch.Tensor
+        self: Self, v: torch.Tensor, lam_h: torch.Tensor
     ) -> torch.Tensor:
         if v.dim() != 4:
             raise ValueError(
@@ -1771,7 +1805,7 @@ class MultiScaleRetention(nn.Module):
         return out
 
     def _scan_causal(
-        self, v: torch.Tensor, lam_h: torch.Tensor
+        self: Self, v: torch.Tensor, lam_h: torch.Tensor
     ) -> torch.Tensor:
         disable_triton = env_bool(
             (
@@ -1797,7 +1831,7 @@ class MultiScaleRetention(nn.Module):
         return self._scan_causal_torch(v, lam_h)
 
     def forward(
-        self,
+        self: Self,
         x: torch.Tensor,
         *args: Any,
         decay: Any = None,
@@ -1919,9 +1953,11 @@ class MultiScaleRetention(nn.Module):
                 last_state = state_tensor.new_zeros((B, self.nhead, head_dim))
             return out, last_state
         return out
+
+
 class MultiHeadAttention(nn.Module):
     def __init__(
-        self,
+        self: Self,
         embed_dim: int,
         num_heads: int,
         *args: Any,
@@ -1965,11 +2001,11 @@ class MultiHeadAttention(nn.Module):
             )
 
     @property
-    def backend(self) -> str:
+    def backend(self: Self) -> str:
         return self._backend
 
     def forward(
-        self,
+        self: Self,
         query: torch.Tensor,
         key: torch.Tensor,
         value: torch.Tensor,
@@ -1990,6 +2026,7 @@ class MultiHeadAttention(nn.Module):
             is_causal=is_causal,
         )
 
+
 try:
     import triton
     import triton.language as tl
@@ -2001,11 +2038,15 @@ except Exception:
     _HAS_TRITON_MSR = False
 
     class _TritonStub:
-        def jit(self, fn=None, **kwargs):
+        def jit(
+            self: Self,
+            fn: Callable[..., object] | None = None,
+            **kwargs: object,
+        ) -> Callable[..., object]:
             return fn if fn else lambda f: f
 
         @staticmethod
-        def cdiv(a, b):
+        def cdiv(a: int, b: int) -> int:
             return (int(a) + int(b) - 1) // max(1, int(b))
 
     class _TLStub:

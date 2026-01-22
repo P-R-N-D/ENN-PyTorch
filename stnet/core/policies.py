@@ -14,6 +14,7 @@ from typing import (
     Protocol,
     Tuple,
     Union,
+    Self,
 )
 
 import torch
@@ -48,10 +49,15 @@ _TORCH_INTEROP_THREADS_SET: Optional[int] = None
 _TORCH_NUM_THREADS_SET: Optional[int] = None
 _TORCH_THREAD_CFG_LOCK = Mutex()
 
+
 def optimal_procs() -> dict[str, Union[int, str]]:
     return WorkerPolicy.optimize().get_procs_setting()
+
+
 def optimal_threads() -> dict[str, Union[int, bool]]:
     return WorkerPolicy.optimize().get_thread_setting()
+
+
 def optimize_threads(
     intra: Optional[int] = None,
     inter: Optional[int] = None,
@@ -64,15 +70,18 @@ def optimize_threads(
     wp.set_thread_setting()
     return wp.get_thread_setting()
 
+
 class LossWeightPolicy(Protocol):
-    def weights(self) -> Tuple[float, float]: ...
+    def weights(self: Self) -> Tuple[float, float]: ...
 
     def update(
-        self,
+        self: Self,
         top_loss: Optional[torch.Tensor],
         bottom_loss: Optional[torch.Tensor],
     ) -> None:
         raise NotImplementedError
+
+
 @dataclass
 class WorkerPolicy:
     nproc_per_node: int = 1
@@ -143,7 +152,7 @@ class WorkerPolicy:
         return dev_type, max(0, n)
 
     @classmethod
-    def optimize(cls) -> "WorkerPolicy":
+    def optimize(cls: type[Self]) -> "WorkerPolicy":
         ncpu_raw = max(1, int(cls._cpu_count() or 1))
         dev_type, nacc = cls._available_accelerator()
         is_accel = bool(nacc and int(nacc) > 0)
@@ -321,7 +330,7 @@ class WorkerPolicy:
             h2d_streams=2 if dev_type in ("cuda", "xpu") else 1,
         )
 
-    def get_thread_setting(self) -> dict[str, int]:
+    def get_thread_setting(self: Self) -> dict[str, int]:
         return {
             "intra_ops": int(self.intra_ops),
             "inter_ops": int(self.inter_ops),
@@ -331,14 +340,17 @@ class WorkerPolicy:
             "prefetch_factor": int(self.prefetch_factor),
         }
 
-    def get_procs_setting(self) -> dict[str, Union[int, str]]:
+    def get_procs_setting(self: Self) -> dict[str, Union[int, str]]:
         return {
             "nproc_per_node": int(self.nproc_per_node),
             "device": str(self.device),
         }
 
-    def set_thread_setting(self) -> None:
-        global _TORCH_NUM_THREADS_SET, _TORCH_INTEROP_THREADS_SET, _TORCH_INTEROP_LOCKED
+    def set_thread_setting(self: Self) -> None:
+        global \
+            _TORCH_NUM_THREADS_SET, \
+            _TORCH_INTEROP_THREADS_SET, \
+            _TORCH_INTEROP_LOCKED
         intra = max(1, int(self.intra_ops))
         inter = max(1, int(self.inter_ops))
         with _TORCH_THREAD_CFG_LOCK:
@@ -356,13 +368,15 @@ class WorkerPolicy:
                         _TORCH_INTEROP_LOCKED = True
                 elif int(_TORCH_INTEROP_THREADS_SET) != int(inter):
                     pass
+
+
 @dataclass
 class LoaderPolicy:
     max_batches_accel: int = 4
     max_batches_cpu: int = 2
     soft_cap_multiplier: int = 2
 
-    def hard_inflight_batches(self, device: torch.device | str) -> int:
+    def hard_inflight_batches(self: Self, device: torch.device | str) -> int:
         dev = (
             torch.device(device)
             if not isinstance(device, torch.device)
@@ -373,7 +387,7 @@ class LoaderPolicy:
         return max(1, int(self.max_batches_cpu))
 
     def apply_soft_limits(
-        self, wp: WorkerPolicy, device: torch.device | str
+        self: Self, wp: WorkerPolicy, device: torch.device | str
     ) -> WorkerPolicy:
         hard = int(self.hard_inflight_batches(device))
         soft_cap = max(1, int(hard * max(1, int(self.soft_cap_multiplier))))
@@ -415,33 +429,34 @@ class LoaderPolicy:
         return wp
 
     def wrap_input(
-        self, loader: Any, device: torch.device | str, *args: Any, name: str
+        self: Self,
+        loader: Any,
+        device: torch.device | str,
+        *args: Any,
+        name: str,
     ) -> Any:
-\
-\
-\
-\
-\
-\
-\
-\
-\
-
         from .concurrency import new_prefetcher
 
         max_batches = self.hard_inflight_batches(device)
 
-
-
         with contextlib.suppress(Exception):
-            dev = torch.device(device) if not isinstance(device, torch.device) else device
+            dev = (
+                torch.device(device)
+                if not isinstance(device, torch.device)
+                else device
+            )
             if dev.type in {"cuda", "xpu", "mps"}:
-                if bool(getattr(loader, "_non_blocking", False)) and hasattr(loader, "_base_iterable"):
-
+                if bool(getattr(loader, "_non_blocking", False)) and hasattr(
+                    loader, "_base_iterable"
+                ):
                     with contextlib.suppress(Exception):
-                        setattr(loader, "_depth", int(max(1, int(max_batches))))
+                        setattr(
+                            loader, "_depth", int(max(1, int(max_batches)))
+                        )
                     return loader
         return new_prefetcher(loader, max_batches=max_batches, name=name)
+
+
 @dataclass
 class BatchPolicy:
     sample_bytes: int
@@ -463,7 +478,7 @@ class BatchPolicy:
     host_budget_min_bytes: int = 0
     host_budget_max_bytes: Optional[int] = None
 
-    def __post_init__(self) -> None:
+    def __post_init__(self: Self) -> None:
         self.sample_bytes = max(int(self.sample_bytes or 0), 0)
         if self.host_sample_bytes is None:
             self.host_sample_bytes = self.sample_bytes
@@ -498,7 +513,7 @@ class BatchPolicy:
                 int(self.host_budget_max_bytes), 0
             )
 
-    def host_inflight_batches_per_proc(self) -> int:
+    def host_inflight_batches_per_proc(self: Self) -> int:
         return (
             max(1, self.max_concurrency) * max(1, self.prebatch)
             + max(1, self.prefetch_factor)
@@ -525,7 +540,7 @@ class BatchPolicy:
         return max(0, int(budget))
 
     def suggest_batch(
-        self,
+        self: Self,
         *args: Any,
         dev_free: Optional[int] = None,
         host_free: Optional[int] = None,
@@ -602,6 +617,8 @@ class BatchPolicy:
                 b = min(b, int(self.max_batch))
         b = max(int(b), int(self.min_batch))
         return max(1, b)
+
+
 @dataclass
 class ModelPolicy:
     @staticmethod
@@ -1177,6 +1194,8 @@ class ModelPolicy:
         )
         Autocast.configure(m2 if ok else model, metadata=meta)
         return (m2, ok, why)
+
+
 @dataclass
 class PrecisionPolicy:
     master_float: torch.dtype = torch.float32
@@ -1188,12 +1207,12 @@ class PrecisionPolicy:
     underflow_action: str = "warn"
 
     @property
-    def amp_float(self) -> Optional[torch.dtype]:
+    def amp_float(self: Self) -> Optional[torch.dtype]:
         return self.amp_dtype
 
     @classmethod
     def from_metadata(
-        cls,
+        cls: type[Self],
         device: Union[torch.device, str],
         metadata: Any | None,
         *args: Any,
@@ -1259,7 +1278,7 @@ class PrecisionPolicy:
             underflow_action=str(action),
         )
 
-    def to_fsdp_policy(self):
+    def to_fsdp_policy(self: Self) -> "MixedPrecisionPolicy":
         from torch.distributed.fsdp import MixedPrecisionPolicy
 
         return MixedPrecisionPolicy(
@@ -1268,58 +1287,21 @@ class PrecisionPolicy:
             output_dtype=self.fsdp_output_dtype,
             cast_forward_inputs=True,
         )
+
+
 @dataclass
 class CollectivePolicy:
-\
-\
-\
-\
-\
-\
-\
-\
-\
-\
-\
-\
-\
-\
-\
-\
-\
-\
-\
-\
-\
-\
-\
-\
-\
-\
-\
-\
-\
-\
-\
-\
-\
-
-
     backend: str = "c10d"
-
 
     include_parameters: bool = True
     include_buffers: bool = True
     max_buffer_size_mb: int = 25
 
-
     coalesce_mb: int = 64
     max_tensor_mb_for_coalesce: int = 8
 
-
     inter_stream_mb: int = 16
     intra_stream_mb: int = 64
-
 
     max_inflight_mb: int = 64
 
@@ -1327,7 +1309,7 @@ class CollectivePolicy:
     verbose: bool = False
 
     @classmethod
-    def from_env(cls) -> "CollectivePolicy":
+    def from_env(cls: type[Self]) -> "CollectivePolicy":
         import os
 
         def getenv_bool_any(primary: str, legacy: str, default: bool) -> bool:
@@ -1359,14 +1341,20 @@ class CollectivePolicy:
         )
 
         include_parameters = getenv_bool_any(
-            "STNET_COLLECTIVE_INCLUDE_PARAMETERS", "STNET_BCAST_INCLUDE_PARAMETERS", True
+            "STNET_COLLECTIVE_INCLUDE_PARAMETERS",
+            "STNET_BCAST_INCLUDE_PARAMETERS",
+            True,
         )
         include_buffers = getenv_bool_any(
-            "STNET_COLLECTIVE_INCLUDE_BUFFERS", "STNET_BCAST_INCLUDE_BUFFERS", True
+            "STNET_COLLECTIVE_INCLUDE_BUFFERS",
+            "STNET_BCAST_INCLUDE_BUFFERS",
+            True,
         )
 
         max_buffer_size_mb = getenv_int_any(
-            "STNET_COLLECTIVE_MAX_BUFFER_SIZE_MB", "STNET_BCAST_MAX_BUFFER_SIZE_MB", 25
+            "STNET_COLLECTIVE_MAX_BUFFER_SIZE_MB",
+            "STNET_BCAST_MAX_BUFFER_SIZE_MB",
+            25,
         )
 
         coalesce_mb = getenv_int_any(
@@ -1379,14 +1367,20 @@ class CollectivePolicy:
         )
 
         inter_stream_mb = getenv_int_any(
-            "STNET_COLLECTIVE_INTER_STREAM_MB", "STNET_BCAST_INTER_STREAM_MB", 16
+            "STNET_COLLECTIVE_INTER_STREAM_MB",
+            "STNET_BCAST_INTER_STREAM_MB",
+            16,
         )
         intra_stream_mb = getenv_int_any(
-            "STNET_COLLECTIVE_INTRA_STREAM_MB", "STNET_BCAST_INTRA_STREAM_MB", 64
+            "STNET_COLLECTIVE_INTRA_STREAM_MB",
+            "STNET_BCAST_INTRA_STREAM_MB",
+            64,
         )
 
         max_inflight_mb = getenv_int_any(
-            "STNET_COLLECTIVE_MAX_INFLIGHT_MB", "STNET_BCAST_MAX_INFLIGHT_MB", 64
+            "STNET_COLLECTIVE_MAX_INFLIGHT_MB",
+            "STNET_BCAST_MAX_INFLIGHT_MB",
+            64,
         )
 
         debug_collectives = getenv_bool_any(
@@ -1409,34 +1403,19 @@ class CollectivePolicy:
             debug_collectives=debug_collectives,
             verbose=verbose,
         )
+
+
 @dataclass
 class DistributedPolicy:
-\
-\
-\
-\
-\
-\
-\
-\
-\
-\
-\
-\
-
-
     prefer_hsdp: bool = True
     prefer_ddp: bool = True
-
-
-
 
     sync_state: bool = True
 
     collective: CollectivePolicy = field(default_factory=CollectivePolicy)
 
     @classmethod
-    def from_env(cls) -> "DistributedPolicy":
+    def from_env(cls: type[Self]) -> "DistributedPolicy":
         import os
 
         def getenv_bool(name: str, default: bool) -> bool:

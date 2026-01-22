@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
-from typing import Any, Optional
+from typing import Any, Optional, Self
 
 import torch
 from torch import nn
@@ -9,7 +9,7 @@ from torch import nn
 
 class GLU(nn.Module):
     def __init__(
-        self,
+        self: Self,
         in_dim: int,
         hidden_dim: int,
         out_dim: Optional[int] = None,
@@ -37,10 +37,10 @@ class GLU(nn.Module):
         self.out_proj = nn.Linear(self.hid, self.out_dim, bias=bias)
 
     @property
-    def hidden_dim(self) -> int:
+    def hidden_dim(self: Self) -> int:
         return self.hid
 
-    def extra_repr(self) -> str:
+    def extra_repr(self: Self) -> str:
         return (
             f"in_dim={self.in_dim}, hidden_dim={self.hid}, out_dim={self.out_dim}, "
             f"activation={type(self.activation).__name__}, "
@@ -48,7 +48,7 @@ class GLU(nn.Module):
             f"check_input={self.check_input}"
         )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self: Self, x: torch.Tensor) -> torch.Tensor:
         if (
             self.check_input
             and (not torch.jit.is_tracing())
@@ -57,9 +57,11 @@ class GLU(nn.Module):
             raise ValueError(f"Expected dim {self.in_dim}, got {x.size(-1)}")
         a, b = self.in_proj(x).chunk(2, dim=-1)
         return self.out_proj(self.dropout(self.activation(a) * b))
+
+
 class GeGLU(GLU):
     def __init__(
-        self,
+        self: Self,
         in_dim: int,
         hidden_dim: int,
         out_dim: Optional[int] = None,
@@ -77,9 +79,11 @@ class GeGLU(GLU):
             activation=nn.GELU(),
             check_input=check_input,
         )
+
+
 class SwiGLU(GLU):
     def __init__(
-        self,
+        self: Self,
         in_dim: int,
         hidden_dim: int,
         out_dim: Optional[int] = None,
