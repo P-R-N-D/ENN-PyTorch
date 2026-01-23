@@ -483,6 +483,7 @@ def compile(
     options_merged: Dict[str, Any] | None = opt or None
     _inductor_config = _get_inductor_config()
     _restore_inductor: Dict[str, Any] | None = None
+    _scoped_inductor_overrides: Dict[str, Any] | None = None
     if _inductor_config is not None:
         with _INDUCTOR_CONFIG_LOCK:
             try:
@@ -529,6 +530,7 @@ def compile(
                 "max-autotune-no-cudagraphs",
             }:
                 _restore_inductor = {}
+                _scoped_inductor_overrides = {}
 
                 def _snapshot(attr: str) -> None:
                     if hasattr(_inductor_config, attr):
@@ -548,12 +550,19 @@ def compile(
                 ):
                     _snapshot(_attr)
 
+                def _want(attr: str, value: Any) -> None:
+                    if hasattr(_inductor_config, attr):
+                        _scoped_inductor_overrides[attr] = value
+
                 with suppress(Exception):
                     _inductor_config.autotune_in_subproc = True
+                _want("autotune_in_subproc", True)
                 with suppress(Exception):
                     _inductor_config.autotune_local_cache = True
+                _want("autotune_local_cache", True)
                 with suppress(Exception):
                     _inductor_config.autotune_remote_cache = None
+                _want("autotune_remote_cache", None)
                 with suppress(Exception):
                     if (
                         getattr(
@@ -566,6 +575,7 @@ def compile(
                         _inductor_config.max_autotune_gemm_search_space = (
                             "DEFAULT"
                         )
+                        _want("max_autotune_gemm_search_space", "DEFAULT")
                 with suppress(Exception):
                     if (
                         getattr(
@@ -574,12 +584,14 @@ def compile(
                         is not None
                     ):
                         _inductor_config.max_autotune_pointwise = False
+                        _want("max_autotune_pointwise", False)
                 with suppress(Exception):
                     if (
                         getattr(_inductor_config, "max_autotune_gemm", None)
                         is not None
                     ):
                         _inductor_config.max_autotune_gemm = True
+                        _want("max_autotune_gemm", True)
                 with suppress(Exception):
                     if (
                         getattr(_inductor_config, "compile_threads", None)
@@ -599,6 +611,7 @@ def compile(
                                 override_valid = True
                         if not override_valid:
                             _inductor_config.compile_threads = 1
+                            _want("compile_threads", 1)
     try:
         backend_value = backend
         mode_value: Optional[str] = None
@@ -623,39 +636,116 @@ def compile(
             if isinstance(existing, dict):
                 options_merged = {**options_merged, **existing}
             compile_kwargs["options"] = options_merged
-        if isinstance(compile_kwargs.get("options", None), dict):
-            inductor_cfg = _get_inductor_config()
-            patch = (
-                getattr(inductor_cfg, "patch", None)
-                if inductor_cfg is not None
-                else None
-            )
+        inductor_cfg = _get_inductor_config()
+        patch = (
+            getattr(inductor_cfg, "patch", None)
+            if inductor_cfg is not None
+            else None
+        )
+        patchable: Dict[str, Any] = {}
 
-            def _has_cfg_key(cfg: Any, key: str) -> bool:
-                obj = cfg
-                for part in key.split("."):
-                    if not hasattr(obj, part):
-                        return False
-                    obj = getattr(obj, part)
-                return True
+        def _has_cfg_key(cfg: Any, key: str) -> bool:
+            obj = cfg
+            for part in key.split("."):
+                if not hasattr(obj, part):
+                    return False
+                obj = getattr(obj, part)
+            return True
 
+        if isinstance(compile_kwargs.get("options", None), dict) and callable(
+            patch
+        ):
             options_dict = dict(compile_kwargs.get("options") or {})
-            if callable(patch) and options_dict:
+            if options_dict:
                 patchable = {
                     k: v
                     for k, v in options_dict.items()
                     if isinstance(k, str) and _has_cfg_key(inductor_cfg, k)
                 }
-                strip_options = mode_value is not None
-                with _TORCH_COMPILE_LOCK, _INDUCTOR_CONFIG_LOCK:
-                    with patch(patchable) if patchable else nullcontext():
-                        if strip_options or patchable:
-                            compile_kwargs.pop("options", None)
-                        return compile_fn(module, **compile_kwargs)
-            if mode_value is not None:
-                compile_kwargs.pop("options", None)
+        strip_options = bool(mode_value is not None)
+
+        if patchable and (strip_options or patchable):
+            compile_kwargs.pop("options", None)
+        elif strip_options:
+            compile_kwargs.pop("options", None)
+
         with _TORCH_COMPILE_LOCK:
-            return compile_fn(module, **compile_kwargs)
+            compiled = compile_fn(module, **compile_kwargs)
+
+        need_scope = bool(_scoped_inductor_overrides) or bool(patchable)
+        if not need_scope:
+            return compiled
+
+        class _ScopedInductorCompiled(nn.Module):
+            def __init__(
+                self,
+                inner: nn.Module,
+                cfg: Any,
+                overrides: Dict[str, Any] | None,
+                restore: Dict[str, Any] | None,
+                patch_fn: Any,
+                patch_dict: Dict[str, Any],
+            ) -> None:
+                super().__init__()
+                self._enn_inner = inner
+                self._enn_cfg = cfg
+                self._enn_overrides = dict(overrides or {})
+                self._enn_restore = dict(restore or {})
+                self._enn_patch_fn = patch_fn
+                self._enn_patch_dict = dict(patch_dict or {})
+
+            def forward(  # type: ignore[override]
+                self, *f_args: Any, **f_kwargs: Any
+            ) -> Any:
+                cfg = self._enn_cfg
+                if cfg is None or (
+                    not self._enn_overrides and not self._enn_patch_dict
+                ):
+                    return self._enn_inner(*f_args, **f_kwargs)
+
+                with _INDUCTOR_CONFIG_LOCK:
+                    for k, v in self._enn_overrides.items():
+                        with suppress(Exception):
+                            setattr(cfg, k, v)
+
+                    cm = (
+                        self._enn_patch_fn(self._enn_patch_dict)
+                        if callable(self._enn_patch_fn)
+                        and self._enn_patch_dict
+                        else nullcontext()
+                    )
+                    try:
+                        with cm:
+                            return self._enn_inner(*f_args, **f_kwargs)
+                    finally:
+                        for k, v in self._enn_restore.items():
+                            with suppress(Exception):
+                                setattr(cfg, k, v)
+
+            def __getattr__(self, name: str) -> Any:
+                try:
+                    return super().__getattr__(name)
+                except AttributeError:
+                    return getattr(self._enn_inner, name)
+
+            def state_dict(  # type: ignore[override]
+                self, *sd_args: Any, **sd_kwargs: Any
+            ) -> Any:
+                return self._enn_inner.state_dict(*sd_args, **sd_kwargs)
+
+            def load_state_dict(  # type: ignore[override]
+                self, *ls_args: Any, **ls_kwargs: Any
+            ) -> Any:
+                return self._enn_inner.load_state_dict(*ls_args, **ls_kwargs)
+
+        return _ScopedInductorCompiled(
+            compiled,
+            inductor_cfg,
+            _scoped_inductor_overrides,
+            _restore_inductor,
+            patch,
+            patchable,
+        )
     finally:
         if _restore_inductor and _inductor_config is not None:
             with _INDUCTOR_CONFIG_LOCK:
