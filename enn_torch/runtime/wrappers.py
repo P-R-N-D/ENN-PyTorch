@@ -396,6 +396,8 @@ def _run_onnx2tf(
 
     def _cmd(*more: str) -> list[str]:
         cmd: list[str] = [
+            sys.executable,
+            "-m",
             "onnx2tf",
             "-i",
             str(onnx_path),

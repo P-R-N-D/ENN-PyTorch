@@ -411,6 +411,7 @@ def coerce_model_config(
     _i("delta_gate_hidden_dim", 1)
     _b("delta_gate_detach_inputs")
     _i("delta_gate_bounds_q_max_samples")
+    _b("delta_gate_bounds_use_quantile")
     _b("delta_gate_bounds_clip_to_minmax")
     _f("delta_gate_bounds_q_low", max=1.0)
     _f("delta_gate_bounds_q_high", max=1.0)
