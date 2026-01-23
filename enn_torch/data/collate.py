@@ -1868,6 +1868,21 @@ def concat_tensor(
     return y_out
 
 
+def _h5_filter_kwargs(
+    h5_compression: str | None,
+    h5_compression_opts: int | None,
+    h5_shuffle: bool,
+) -> dict[str, Any]:
+    kwargs: dict[str, Any] = {}
+    if h5_compression:
+        kwargs["compression"] = str(h5_compression)
+        if h5_compression_opts is not None:
+            kwargs["compression_opts"] = int(h5_compression_opts)
+    if h5_shuffle:
+        kwargs["shuffle"] = True
+    return kwargs
+
+
 def concat_segment_h5(
     out_path: str,
     *args: Any,
@@ -1877,6 +1892,9 @@ def concat_segment_h5(
     out_shape: object,
     store_float: object,
     chunk_size: int = 8192,
+    h5_compression: str | None = None,
+    h5_compression_opts: int | None = None,
+    h5_shuffle: bool = False,
 ) -> PersistentTensorDict:
     _ = args
     x_mmt = load_memmap_features(memmap_dir)
@@ -1886,16 +1904,35 @@ def concat_segment_h5(
     cast_dtype = store_float
     if store_float == torch.bfloat16 and np_float == numpy.float32:
         cast_dtype = torch.float32
+    step = int(chunk_size)
+    h5_kwargs = _h5_filter_kwargs(
+        h5_compression, h5_compression_opts, h5_shuffle
+    )
+    use_filters = bool(h5_kwargs)
     with h5py.File(out_path, "w") as f:
+        dset_x_kwargs = dict(h5_kwargs)
+        dset_y_kwargs = dict(h5_kwargs)
+        if use_filters:
+            dset_x_kwargs["chunks"] = (
+                min(int(count), step),
+                *[int(x) for x in x_mmt.shape[1:]],
+            )
+            dset_y_kwargs["chunks"] = (
+                min(int(count), step),
+                *out_shape_t,
+            )
         dset_X = f.create_dataset(
             "X",
             shape=tuple(x_mmt.shape),
             dtype=_to_numpy_dtype(x_mmt.dtype),
+            **dset_x_kwargs,
         )
         dset_Y = f.create_dataset(
-            "Y", shape=(int(count), *out_shape_t), dtype=np_float
+            "Y",
+            shape=(int(count), *out_shape_t),
+            dtype=np_float,
+            **dset_y_kwargs,
         )
-        step = int(chunk_size)
         for s in range(0, int(count), step):
             e = min(int(count), s + step)
             dset_X[s:e] = x_mmt[s:e].detach().to(device="cpu").numpy()
@@ -1932,6 +1969,9 @@ def write_predictions_h5_from_memmap(
     pred_path: str,
     count: object | None = None,
     chunk_size: int = 8192,
+    h5_compression: str | None = None,
+    h5_compression_opts: int | None = None,
+    h5_shuffle: bool = False,
 ) -> PersistentTensorDict:
     _ = args
     x_mmt = load_memmap_features(memmap_dir)
@@ -1949,18 +1989,23 @@ def write_predictions_h5_from_memmap(
     out_parent = os.path.dirname(out_path) or "."
     os.makedirs(out_parent, exist_ok=True)
     step = int(chunk_size)
+    h5_kwargs = _h5_filter_kwargs(
+        h5_compression, h5_compression_opts, h5_shuffle
+    )
     with h5py.File(out_path, "w") as f:
         dset_X = f.create_dataset(
             "X",
             shape=(n, int(x_mmt.shape[1])),
             dtype=x_np_dtype,
             chunks=(min(n, step), int(x_mmt.shape[1])),
+            **h5_kwargs,
         )
         dset_Y = f.create_dataset(
             "Y",
             shape=(n, *[int(x) for x in y_mmt.shape[1:]]),
             dtype=y_np_dtype,
             chunks=(min(n, step), *[int(x) for x in y_mmt.shape[1:]]),
+            **h5_kwargs,
         )
         for s in range(0, n, step):
             e = min(n, s + step)
@@ -1984,6 +2029,9 @@ def write_predictions_h5_atomic(
     memmap_dir: str,
     pred_path: str,
     chunk_size: int = 8192,
+    h5_compression: str | None = None,
+    h5_compression_opts: int | None = None,
+    h5_shuffle: bool = False,
     overwrite: str = "replace",
 ) -> PersistentTensorDict:
     return _atomic_h5_op(
@@ -1994,6 +2042,9 @@ def write_predictions_h5_atomic(
             memmap_dir=memmap_dir,
             pred_path=pred_path,
             chunk_size=chunk_size,
+            h5_compression=h5_compression,
+            h5_compression_opts=h5_compression_opts,
+            h5_shuffle=h5_shuffle,
         ),
     )
 

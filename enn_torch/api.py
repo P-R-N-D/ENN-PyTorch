@@ -1244,6 +1244,9 @@ def predict(
     output: str | None = "memory",
     path: PathLike | None = None,
     overwrite: str = "error",
+    h5_compression: str | None = None,
+    h5_compression_opts: int | None = None,
+    h5_shuffle: bool = False,
     **kwargs: Any,
 ) -> PredictionOutput:
     if model is None:
@@ -1305,6 +1308,9 @@ def predict(
                     output=output,
                     path=per_path,
                     overwrite=overwrite,
+                    h5_compression=h5_compression,
+                    h5_compression_opts=h5_compression_opts,
+                    h5_shuffle=h5_shuffle,
                     **{
                         **base_kwargs,
                         "run_id": per_run_id,
@@ -1465,6 +1471,9 @@ def predict(
                     pred_path=os.fspath(pred_mmt_path),
                     chunk_size=int(chunk_size or 8192),
                     overwrite=str(overwrite_mode or "replace"),
+                    h5_compression=h5_compression,
+                    h5_compression_opts=h5_compression_opts,
+                    h5_shuffle=h5_shuffle,
                 )
                 collate.validate_predictions_h5(
                     os.fspath(out_path),
