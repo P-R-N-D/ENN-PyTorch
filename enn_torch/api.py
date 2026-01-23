@@ -585,6 +585,7 @@ def _update_history(
     epochs: int,
     val_frac: float,
     num_samples_dataset: int,
+    train_device: str | None = None,
 ) -> None:
     if not ckpt_dir:
         return
@@ -644,17 +645,29 @@ def _update_history(
             setattr(model, "_history_cum_stats", cum_stats)
         history = getattr(model, "_train_history", []) or []
 
-        dev_str = None
+        model_dev_str: str | None = None
         with contextlib.suppress(Exception):
             import torch as _torch
 
             params = list(getattr(model, "parameters", lambda: [])())
             if params:
-                dev_str = str(params[0].device)
+                model_dev_str = str(params[0].device)
             else:
                 bufs = list(getattr(model, "buffers", lambda: [])())
                 if bufs:
-                    dev_str = str(bufs[0].device)
+                    model_dev_str = str(bufs[0].device)
+
+        train_dev_str: str | None = None
+        if train_device is not None:
+            with contextlib.suppress(Exception):
+                train_dev_str = str(train_device)
+        if not train_dev_str:
+            with contextlib.suppress(Exception):
+                from .core.system import get_device as _get_device
+
+                train_dev_str = str(_get_device())
+        if not train_dev_str:
+            train_dev_str = model_dev_str
 
         posix_time = None
         with contextlib.suppress(Exception):
@@ -664,7 +677,7 @@ def _update_history(
             "run_index": len(history),
             "posix_time": posix_time,
             "epochs": int(epochs_val),
-            "device": dev_str,
+            "device": train_dev_str,
             "dataset_n": int(num_samples_dataset),
             "val_frac": float(frac_val),
             "train_split_n_est": int(train_split_n_est),
@@ -675,14 +688,24 @@ def _update_history(
             **(cum_stats or {}),
         }
 
+        if (
+            model_dev_str
+            and train_dev_str
+            and str(model_dev_str) != str(train_dev_str)
+        ):
+            record["model_device"] = model_dev_str
+
         env_meta: Dict[str, Any] = dict(meta) if isinstance(meta, dict) else {}
-        env_meta.setdefault("epochs", int(epochs_val))
-        env_meta.setdefault("val_frac", float(frac_val))
-        env_meta.setdefault("dataset_n", int(num_samples_dataset))
-        env_meta.setdefault("train_split_n_est", int(train_split_n_est))
-        env_meta.setdefault("sampled_n_est", int(sampled_n_est))
-        env_meta.setdefault("device", dev_str)
-        env_meta.setdefault("posix_time", posix_time)
+        for k in (
+            "epochs",
+            "val_frac",
+            "dataset_n",
+            "train_split_n_est",
+            "sampled_n_est",
+            "device",
+            "posix_time",
+        ):
+            env_meta.pop(k, None)
         with contextlib.suppress(Exception):
             import sys as _sys
 

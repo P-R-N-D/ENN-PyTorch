@@ -256,12 +256,12 @@ def _validate_equal_dims(
 
 def _extract_model_config_dict(model: Any) -> Dict[str, Any]:
     cfg_obj = getattr(model, "config", None) or getattr(
-        model, "__stnet_instance_config__", None
+        model, "__enn_instance_config__", None
     )
     if not cfg_obj:
         for submodule in model.modules():
             cfg_obj = getattr(submodule, "config", None) or getattr(
-                submodule, "__stnet_instance_config__", None
+                submodule, "__enn_instance_config__", None
             )
             if cfg_obj:
                 break

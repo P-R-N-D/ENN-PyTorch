@@ -1774,7 +1774,7 @@ class Model(nn.Module):
         self._amp_dtype_cache_lock = Mutex()
         self._amp_dtype_cache_use_lock = not bool(is_gil_enabled())
         self.__config = config
-        self.__stnet_instance_config__ = config
+        self.__enn_instance_config__ = config
 
     @property
     def config(self: Self) -> ModelConfig:

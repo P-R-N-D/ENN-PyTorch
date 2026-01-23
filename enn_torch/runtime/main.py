@@ -823,7 +823,7 @@ def _set_requires_grad(
 
 
 def _is_precision_exempted(module: object) -> bool:
-    return bool(getattr(module, "__stnet_precision_exempt__", False))
+    return bool(getattr(module, "__enn_precision_exempt__", False))
 
 
 def _cast_float_dtype(model: object, dtype: torch.dtype) -> object:

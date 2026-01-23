@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import contextlib
 import importlib
+import logging
 import threading
 import traceback
 from contextlib import AbstractContextManager, nullcontext, suppress
@@ -29,11 +30,46 @@ _COLLECTIVE_NAMES: tuple[str, ...] = (
 _GRAPH_BREAK_FN: Callable[[], None] | None = None
 _GRAPH_BREAK_LOCK = Mutex()
 _INDUCTOR_CONFIG_LOCK = Mutex(reentrant=True)
-_NO_COMPILE_SENTINEL = "__stnet_no_compile_wrapped__"
+_NO_COMPILE_SENTINEL = "__enn_no_compile_wrapped__"
 _SAFE_DIST_LOCK = Mutex()
 _SAFE_DIST_PATCHED: set[str] = set()
 _TORCH_COMPILER = getattr(torch, "compiler", None)
 _TORCH_COMPILE_LOCK = Mutex(reentrant=True)
+
+_INDUCTOR_WARN_FILTER_LOCK = Mutex(reentrant=True)
+_INDUCTOR_MAX_AUTOTUNE_SMS_FILTERED = False
+
+
+def _suppress_inductor_max_autotune_sms_warning() -> None:
+    global _INDUCTOR_MAX_AUTOTUNE_SMS_FILTERED
+    if _INDUCTOR_MAX_AUTOTUNE_SMS_FILTERED:
+        return
+    with _INDUCTOR_WARN_FILTER_LOCK:
+        if _INDUCTOR_MAX_AUTOTUNE_SMS_FILTERED:
+            return
+
+        needle = "Not enough SMs to use max_autotune_gemm mode"
+
+        class _DropInductorSMWarning(logging.Filter):
+            def filter(self, record: logging.LogRecord) -> bool:
+                try:
+                    return needle not in record.getMessage()
+                except Exception:
+                    return True
+
+        flt = _DropInductorSMWarning()
+        for logger_name in (
+            "torch._inductor.utils",
+            "torch._inductor",
+            "torch",
+            "",
+        ):
+            try:
+                logging.getLogger(logger_name).addFilter(flt)
+            except Exception:
+                pass
+
+        _INDUCTOR_MAX_AUTOTUNE_SMS_FILTERED = True
 
 
 def _raised_from_checkpointed_fn(err: BaseException) -> bool:
@@ -50,7 +86,7 @@ def _raised_from_checkpointed_fn(err: BaseException) -> bool:
 
 
 def _is_compiled_for_inference(model: torch.nn.Module) -> bool:
-    cached = getattr(model, "__stnet_cached_is_compiled_for_inference__", None)
+    cached = getattr(model, "__enn_cached_is_compiled_for_inference__", None)
     if isinstance(cached, bool):
         return cached
     compile_attrs = (
@@ -62,7 +98,7 @@ def _is_compiled_for_inference(model: torch.nn.Module) -> bool:
     )
     if any(bool(getattr(model, attr, False)) for attr in compile_attrs):
         try:
-            setattr(model, "__stnet_cached_is_compiled_for_inference__", True)
+            setattr(model, "__enn_cached_is_compiled_for_inference__", True)
         except Exception:
             pass
         return True
@@ -87,7 +123,7 @@ def _is_compiled_for_inference(model: torch.nn.Module) -> bool:
                     script_like_types.append(typ)
     if any(isinstance(model, typ) for typ in script_like_types):
         try:
-            setattr(model, "__stnet_cached_is_compiled_for_inference__", True)
+            setattr(model, "__enn_cached_is_compiled_for_inference__", True)
         except Exception:
             pass
         return True
@@ -103,14 +139,14 @@ def _is_compiled_for_inference(model: torch.nn.Module) -> bool:
         if any(isinstance(module, typ) for typ in script_like_types):
             return True
     try:
-        setattr(model, "__stnet_cached_is_compiled_for_inference__", False)
+        setattr(model, "__enn_cached_is_compiled_for_inference__", False)
     except Exception:
         pass
     return False
 
 
 def _is_aot_autograd_enabled(model: torch.nn.Module) -> bool:
-    cached = getattr(model, "__stnet_cached_is_aot_autograd_enabled__", None)
+    cached = getattr(model, "__enn_cached_is_aot_autograd_enabled__", None)
     if isinstance(cached, bool):
         return cached
     indicator_attrs = (
@@ -123,7 +159,7 @@ def _is_aot_autograd_enabled(model: torch.nn.Module) -> bool:
     )
     if any(getattr(model, attr, None) for attr in indicator_attrs):
         try:
-            setattr(model, "__stnet_cached_is_aot_autograd_enabled__", True)
+            setattr(model, "__enn_cached_is_aot_autograd_enabled__", True)
         except Exception:
             pass
         return True
@@ -141,7 +177,7 @@ def _is_aot_autograd_enabled(model: torch.nn.Module) -> bool:
         if "AOTAutograd" in class_name or "aot_autograd" in module_name:
             return True
     try:
-        setattr(model, "__stnet_cached_is_aot_autograd_enabled__", False)
+        setattr(model, "__enn_cached_is_aot_autograd_enabled__", False)
     except Exception:
         pass
     return False
@@ -362,16 +398,16 @@ def clear_model_cache(model: Optional[nn.Module]) -> None:
     if not isinstance(model, nn.Module):
         return
     for attr in (
-        "__stnet_cached_is_compiled_for_inference__",
-        "__stnet_cached_is_aot_autograd_enabled__",
-        "__stnet_cached_is_nvidia_te_available__",
+        "__enn_cached_is_compiled_for_inference__",
+        "__enn_cached_is_aot_autograd_enabled__",
+        "__enn_cached_is_nvidia_te_available__",
     ):
         with suppress(Exception):
             delattr(model, attr)
 
 
 def is_nvidia_te_available(model: torch.nn.Module) -> bool:
-    cached = getattr(model, "__stnet_cached_is_nvidia_te_available__", None)
+    cached = getattr(model, "__enn_cached_is_nvidia_te_available__", None)
     if isinstance(cached, bool):
         return cached
     te_flags = (
@@ -381,7 +417,7 @@ def is_nvidia_te_available(model: torch.nn.Module) -> bool:
     )
     if any(te_flags):
         try:
-            setattr(model, "__stnet_cached_is_nvidia_te_available__", True)
+            setattr(model, "__enn_cached_is_nvidia_te_available__", True)
         except Exception:
             pass
         return True
@@ -391,12 +427,12 @@ def is_nvidia_te_available(model: torch.nn.Module) -> bool:
             "transformer_engine"
         ):
             try:
-                setattr(model, "__stnet_cached_is_nvidia_te_available__", True)
+                setattr(model, "__enn_cached_is_nvidia_te_available__", True)
             except Exception:
                 pass
             return True
     try:
-        setattr(model, "__stnet_cached_is_nvidia_te_available__", False)
+        setattr(model, "__enn_cached_is_nvidia_te_available__", False)
     except Exception:
         pass
     return False
@@ -435,6 +471,7 @@ def compile(
     compile_fn = getattr(torch, "compile", None)
     if not callable(compile_fn):
         return module
+    _suppress_inductor_max_autotune_sms_warning()
     if canonical_mode == "max-autotune" and not _is_for_cuda(module):
         canonical_mode = "max-autotune-no-cudagraphs"
     opt: Dict[str, Any] = dict(options or {})
@@ -445,6 +482,7 @@ def compile(
         opt.setdefault("triton.cudagraphs", False)
     options_merged: Dict[str, Any] | None = opt or None
     _inductor_config = _get_inductor_config()
+    _restore_inductor: Dict[str, Any] | None = None
     if _inductor_config is not None:
         with _INDUCTOR_CONFIG_LOCK:
             try:
@@ -490,6 +528,26 @@ def compile(
                 "max-autotune",
                 "max-autotune-no-cudagraphs",
             }:
+                _restore_inductor = {}
+
+                def _snapshot(attr: str) -> None:
+                    if hasattr(_inductor_config, attr):
+                        with suppress(Exception):
+                            _restore_inductor[attr] = getattr(
+                                _inductor_config, attr
+                            )
+
+                for _attr in (
+                    "autotune_in_subproc",
+                    "autotune_local_cache",
+                    "autotune_remote_cache",
+                    "max_autotune_gemm_search_space",
+                    "max_autotune_pointwise",
+                    "max_autotune_gemm",
+                    "compile_threads",
+                ):
+                    _snapshot(_attr)
+
                 with suppress(Exception):
                     _inductor_config.autotune_in_subproc = True
                 with suppress(Exception):
@@ -541,62 +599,69 @@ def compile(
                                 override_valid = True
                         if not override_valid:
                             _inductor_config.compile_threads = 1
-    backend_value = backend
-    mode_value: Optional[str] = None
-    match canonical_mode:
-        case "aot-eager":
-            backend_value = "aot_eager"
-        case "reduce-overhead" | "max-autotune" | "max-autotune-no-cudagraphs":
-            mode_value = canonical_mode
-        case _:
-            mode_value = str(mode) if mode is not None else None
-    compile_kwargs: Dict[str, Any] = dict(kwargs)
-    if backend_value is not None:
-        compile_kwargs["backend"] = backend_value
-    if mode_value is not None:
-        compile_kwargs["mode"] = mode_value
-    if fullgraph is not None:
-        compile_kwargs["fullgraph"] = bool(fullgraph)
-    if dynamic is not None:
-        compile_kwargs["dynamic"] = bool(dynamic)
-    if options_merged is not None:
-        existing = compile_kwargs.get("options", {})
-        if isinstance(existing, dict):
-            options_merged = {**options_merged, **existing}
-        compile_kwargs["options"] = options_merged
-    if isinstance(compile_kwargs.get("options", None), dict):
-        inductor_cfg = _get_inductor_config()
-        patch = (
-            getattr(inductor_cfg, "patch", None)
-            if inductor_cfg is not None
-            else None
-        )
-
-        def _has_cfg_key(cfg: Any, key: str) -> bool:
-            obj = cfg
-            for part in key.split("."):
-                if not hasattr(obj, part):
-                    return False
-                obj = getattr(obj, part)
-            return True
-
-        options_dict = dict(compile_kwargs.get("options") or {})
-        if callable(patch) and options_dict:
-            patchable = {
-                k: v
-                for k, v in options_dict.items()
-                if isinstance(k, str) and _has_cfg_key(inductor_cfg, k)
-            }
-            strip_options = mode_value is not None
-            with _TORCH_COMPILE_LOCK, _INDUCTOR_CONFIG_LOCK:
-                with patch(patchable) if patchable else nullcontext():
-                    if strip_options or patchable:
-                        compile_kwargs.pop("options", None)
-                    return compile_fn(module, **compile_kwargs)
+    try:
+        backend_value = backend
+        mode_value: Optional[str] = None
+        match canonical_mode:
+            case "aot-eager":
+                backend_value = "aot_eager"
+            case "reduce-overhead" | "max-autotune" | "max-autotune-no-cudagraphs":
+                mode_value = canonical_mode
+            case _:
+                mode_value = str(mode) if mode is not None else None
+        compile_kwargs: Dict[str, Any] = dict(kwargs)
+        if backend_value is not None:
+            compile_kwargs["backend"] = backend_value
         if mode_value is not None:
-            compile_kwargs.pop("options", None)
-    with _TORCH_COMPILE_LOCK:
-        return compile_fn(module, **compile_kwargs)
+            compile_kwargs["mode"] = mode_value
+        if fullgraph is not None:
+            compile_kwargs["fullgraph"] = bool(fullgraph)
+        if dynamic is not None:
+            compile_kwargs["dynamic"] = bool(dynamic)
+        if options_merged is not None:
+            existing = compile_kwargs.get("options", {})
+            if isinstance(existing, dict):
+                options_merged = {**options_merged, **existing}
+            compile_kwargs["options"] = options_merged
+        if isinstance(compile_kwargs.get("options", None), dict):
+            inductor_cfg = _get_inductor_config()
+            patch = (
+                getattr(inductor_cfg, "patch", None)
+                if inductor_cfg is not None
+                else None
+            )
+
+            def _has_cfg_key(cfg: Any, key: str) -> bool:
+                obj = cfg
+                for part in key.split("."):
+                    if not hasattr(obj, part):
+                        return False
+                    obj = getattr(obj, part)
+                return True
+
+            options_dict = dict(compile_kwargs.get("options") or {})
+            if callable(patch) and options_dict:
+                patchable = {
+                    k: v
+                    for k, v in options_dict.items()
+                    if isinstance(k, str) and _has_cfg_key(inductor_cfg, k)
+                }
+                strip_options = mode_value is not None
+                with _TORCH_COMPILE_LOCK, _INDUCTOR_CONFIG_LOCK:
+                    with patch(patchable) if patchable else nullcontext():
+                        if strip_options or patchable:
+                            compile_kwargs.pop("options", None)
+                        return compile_fn(module, **compile_kwargs)
+            if mode_value is not None:
+                compile_kwargs.pop("options", None)
+        with _TORCH_COMPILE_LOCK:
+            return compile_fn(module, **compile_kwargs)
+    finally:
+        if _restore_inductor and _inductor_config is not None:
+            with _INDUCTOR_CONFIG_LOCK:
+                for k, v in _restore_inductor.items():
+                    with suppress(Exception):
+                        setattr(_inductor_config, k, v)
 
 
 def torch_compiler_supported() -> bool:
