@@ -2084,7 +2084,7 @@ class SigmoidGate(nn.Module):
 class Scaler(nn.Module):
     def __init__(self: Self, eps: float = 1e-6) -> None:
         super().__init__()
-        self.__stnet_precision_exempt__ = True
+        self.__enn_precision_exempt__ = True
         self.eps = float(eps)
         self.calib_mode: str = "none"
         self.register_buffer("x_mean", torch.zeros(1, dtype=torch.float64))
@@ -2593,11 +2593,11 @@ class Scaler(nn.Module):
 
 
 class Recorder(nn.Module):
-    __stnet_precision_exempt__: bool = True
+    __enn_precision_exempt__: bool = True
 
     def __init__(self: Self) -> None:
         super().__init__()
-        self.__stnet_precision_exempt__ = True
+        self.__enn_precision_exempt__ = True
         self.register_buffer(
             "start", torch.zeros(1, dtype=torch.float64), persistent=True
         )

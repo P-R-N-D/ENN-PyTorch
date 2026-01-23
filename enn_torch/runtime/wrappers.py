@@ -1684,7 +1684,7 @@ class ReduceMean(nn.Module):
 
 
 class GraphSequential(nn.Module):
-    _CONTROL_ATTR = "__stnet_subgraph_control_op__"
+    _CONTROL_ATTR = "__enn_subgraph_control_op__"
 
     def __init__(
         self: Self,

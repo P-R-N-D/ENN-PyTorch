@@ -5,6 +5,7 @@ import collections
 import concurrent.futures as futures
 import contextlib
 import ctypes
+from dataclasses import dataclass
 import hashlib
 import importlib
 import itertools
@@ -886,11 +887,13 @@ class _WaitEvent(Protocol):
     def wait(self: Self, timeout: float | None = None) -> Any: ...
 
 
+@dataclass(slots=True)
 class _PoolToken:
     i: int
     g: int
 
 
+@dataclass(slots=True)
 class _PoolEntry:
     page: TensorPage
     busy: bool = False
