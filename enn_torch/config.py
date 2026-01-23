@@ -408,18 +408,19 @@ def coerce_model_config(
     _i("temporal_latents", 1)
     _b("use_linear_branch")
     _i("safety_margin_pow2", 0)
-    _i("p_gate_hidden_dim", 1)
-    _b("p_gate_detach_inputs")
-    _i("p_gate_bounds_q_max_samples")
-    _b("p_gate_bounds_clip_to_minmax")
-    _f("p_gate_bounds_q_low", max=1.0)
-    _f("p_gate_bounds_q_high", max=1.0)
-    if params["p_gate_bounds_q_high"] < params["p_gate_bounds_q_low"]:
-        params["p_gate_bounds_q_high"] = params["p_gate_bounds_q_low"]
-    _f("p_gate_p_floor", max=100.0)
-    _f("p_gate_p_ceil", max=100.0)
-    if params["p_gate_p_ceil"] < params["p_gate_p_floor"]:
-        params["p_gate_p_ceil"] = params["p_gate_p_floor"]
+    _i("delta_gate_hidden_dim", 1)
+    _b("delta_gate_detach_inputs")
+    _i("delta_gate_bounds_q_max_samples")
+    _b("delta_gate_bounds_use_quantile")
+    _b("delta_gate_bounds_clip_to_minmax")
+    _f("delta_gate_bounds_q_low", max=1.0)
+    _f("delta_gate_bounds_q_high", max=1.0)
+    if params["delta_gate_bounds_q_high"] < params["delta_gate_bounds_q_low"]:
+        params["delta_gate_bounds_q_high"] = params["delta_gate_bounds_q_low"]
+    _f("delta_gate_p_floor", max=100.0)
+    _f("delta_gate_p_ceil", max=100.0)
+    if params["delta_gate_p_ceil"] < params["delta_gate_p_floor"]:
+        params["delta_gate_p_ceil"] = params["delta_gate_p_floor"]
 
     normalization_method = _coerce_str(
         get("normalization_method", _MODEL_DEFAULTS.normalization_method),
@@ -460,15 +461,15 @@ def coerce_model_config(
         )
     )
 
-    raw_tile_shape = get("p_gate_tile_shape", None)
-    p_gate_tile_shape = None
+    raw_tile_shape = get("delta_gate_tile_shape", None)
+    delta_gate_tile_shape = None
     if isinstance(raw_tile_shape, int) and not isinstance(
         raw_tile_shape, bool
     ):
-        p_gate_tile_shape = (raw_tile_shape,)
+        delta_gate_tile_shape = (raw_tile_shape,)
     elif isinstance(raw_tile_shape, (list, tuple)):
-        p_gate_tile_shape = tuple(
-            _coerce_int(v, name="p_gate_tile_shape", minimum=1)
+        delta_gate_tile_shape = tuple(
+            _coerce_int(v, name="delta_gate_tile_shape", minimum=1)
             for v in raw_tile_shape
         )
     elif isinstance(raw_tile_shape, str):
@@ -482,53 +483,53 @@ def coerce_model_config(
             if p.strip()
         ]
         if parts:
-            p_gate_tile_shape = tuple(
-                _coerce_int(p, name="p_gate_tile_shape", minimum=1)
+            delta_gate_tile_shape = tuple(
+                _coerce_int(p, name="delta_gate_tile_shape", minimum=1)
                 for p in parts
             )
 
-    _f("p_gate_fallback_k")
-    _f("p_gate_fallback_k_low", allow_none=True)
-    _f("p_gate_fallback_k_high", allow_none=True)
-    _i("p_gate_auto_k_interval")
-    _i("p_gate_auto_k_warmup")
-    _f("p_gate_auto_k_ema_alpha", max=1.0)
-    _f("p_gate_auto_k_target_tight", max=1.0)
-    _f("p_gate_auto_k_tolerance", max=10.0)
-    _f("p_gate_auto_k_step_up", max=10.0)
-    _f("p_gate_auto_k_step_down", max=1.0)
+    _f("delta_gate_fallback_k")
+    _f("delta_gate_fallback_k_low", allow_none=True)
+    _f("delta_gate_fallback_k_high", allow_none=True)
+    _i("delta_gate_auto_k_interval")
+    _i("delta_gate_auto_k_warmup")
+    _f("delta_gate_auto_k_ema_alpha", max=1.0)
+    _f("delta_gate_auto_k_target_tight", max=1.0)
+    _f("delta_gate_auto_k_tolerance", max=10.0)
+    _f("delta_gate_auto_k_step_up", max=10.0)
+    _f("delta_gate_auto_k_step_down", max=1.0)
     for suffix in ("low", "high"):
-        _f(f"p_gate_auto_k_step_up_{suffix}", max=10.0)
-        _f(f"p_gate_auto_k_step_down_{suffix}", max=1.0)
-        _f(f"p_gate_auto_k_edge_step_down_{suffix}", max=1.0)
-    _f("p_gate_auto_k_target_edge", max=1.0)
-    _f("p_gate_auto_k_edge_tolerance", max=10.0)
-    _f("p_gate_auto_k_edge_ema_alpha", max=1.0)
-    _f("p_gate_auto_k_min")
-    _f("p_gate_auto_k_max")
-    if params["p_gate_auto_k_max"] < params["p_gate_auto_k_min"]:
-        params["p_gate_auto_k_max"] = params["p_gate_auto_k_min"]
+        _f(f"delta_gate_auto_k_step_up_{suffix}", max=10.0)
+        _f(f"delta_gate_auto_k_step_down_{suffix}", max=1.0)
+        _f(f"delta_gate_auto_k_edge_step_down_{suffix}", max=1.0)
+    _f("delta_gate_auto_k_target_edge", max=1.0)
+    _f("delta_gate_auto_k_edge_tolerance", max=10.0)
+    _f("delta_gate_auto_k_edge_ema_alpha", max=1.0)
+    _f("delta_gate_auto_k_min")
+    _f("delta_gate_auto_k_max")
+    if params["delta_gate_auto_k_max"] < params["delta_gate_auto_k_min"]:
+        params["delta_gate_auto_k_max"] = params["delta_gate_auto_k_min"]
 
-    _f("p_gate_auto_k_width_frac", max=1.0)
-    _f("p_gate_auto_k_edge_frac", max=1.0)
-    _i("p_gate_auto_k_log_interval")
-    _f("p_gate_clip_eps", max=0.49)
-    _f("p_gate_eps", max=1.0)
-    _f("p_gate_edge_reg_weight")
-    _f("p_gate_edge_reg_weight_low", allow_none=True)
-    _f("p_gate_edge_reg_weight_high", allow_none=True)
-    _b("p_gate_edge_reg_fallback_only")
-    _f("p_gate_edge_reg_frac", max=0.49)
-    _f("p_gate_edge_reg_min_width_frac", max=1.0)
-    _f("p_gate_edge_reg_power", min=1.0, max=8.0)
-    _f("p_gate_budget_weight")
-    _f("p_gate_budget_target")
-    _f("p_gate_tv_weight")
-    _f("p_gate_tv_power", min=1.0, max=8.0)
-    _f("p_gate_teacher_weight")
-    _f("p_gate_teacher_temp", min=1e-8, max=100.0)
-    _f("p_gate_teacher_tau")
-    _b("p_gate_teacher_relu")
+    _f("delta_gate_auto_k_width_frac", max=1.0)
+    _f("delta_gate_auto_k_edge_frac", max=1.0)
+    _i("delta_gate_auto_k_log_interval")
+    _f("delta_gate_clip_eps", max=0.49)
+    _f("delta_gate_eps", max=1.0)
+    _f("delta_gate_edge_reg_weight")
+    _f("delta_gate_edge_reg_weight_low", allow_none=True)
+    _f("delta_gate_edge_reg_weight_high", allow_none=True)
+    _b("delta_gate_edge_reg_fallback_only")
+    _f("delta_gate_edge_reg_frac", max=0.49)
+    _f("delta_gate_edge_reg_min_width_frac", max=1.0)
+    _f("delta_gate_edge_reg_power", min=1.0, max=8.0)
+    _f("delta_gate_budget_weight")
+    _f("delta_gate_budget_target")
+    _f("delta_gate_tv_weight")
+    _f("delta_gate_tv_power", min=1.0, max=8.0)
+    _f("delta_gate_teacher_weight")
+    _f("delta_gate_teacher_temp", min=1e-8, max=100.0)
+    _f("delta_gate_teacher_tau")
+    _b("delta_gate_teacher_relu")
     _f("unsup_xx_weight")
     _f("unsup_yy_weight")
     _f("p_prior_weight")
@@ -542,12 +543,12 @@ def coerce_model_config(
             "modeling_type": modeling_type,
             "patch": patch_cfg,
             "compile_mode": compile_mode,
-            "p_gate_tile_shape": p_gate_tile_shape,
-            "p_gate_tile_size": (
+            "delta_gate_tile_shape": delta_gate_tile_shape,
+            "delta_gate_tile_size": (
                 _coerce_int(
-                    get("p_gate_tile_size"), name="p_gate_tile_size", minimum=1
+                    get("delta_gate_tile_size"), name="delta_gate_tile_size", minimum=1
                 )
-                if get("p_gate_tile_size")
+                if get("delta_gate_tile_size")
                 else None
             ),
         }
@@ -680,58 +681,58 @@ class ModelConfig:
     use_linear_branch: bool = False
     compile_mode: str = "disabled"
     safety_margin_pow2: int = 3
-    p_gate_hidden_dim: int = 64
-    p_gate_detach_inputs: bool = True
-    p_gate_tile_size: Optional[int] = None
-    p_gate_tile_shape: Optional[Tuple[int, ...]] = None
-    p_gate_bounds_use_quantile: bool = False
-    p_gate_bounds_q_low: float = 0.005
-    p_gate_bounds_q_high: float = 0.995
-    p_gate_bounds_q_max_samples: int = 8192
-    p_gate_bounds_clip_to_minmax: bool = True
-    p_gate_p_floor: float = 0.0
-    p_gate_p_ceil: float = 1.0
-    p_gate_fallback_k: float = 6.0
-    p_gate_fallback_k_low: Optional[float] = None
-    p_gate_fallback_k_high: Optional[float] = None
-    p_gate_auto_k_interval: int = 100
-    p_gate_auto_k_warmup: int = 100
-    p_gate_auto_k_ema_alpha: float = 0.1
-    p_gate_auto_k_target_tight: float = 0.02
-    p_gate_auto_k_tolerance: float = 0.5
-    p_gate_auto_k_step_up: float = 0.1
-    p_gate_auto_k_step_down: float = 0.02
-    p_gate_auto_k_step_up_low: float = 0.1
-    p_gate_auto_k_step_down_low: float = 0.02
-    p_gate_auto_k_step_up_high: float = 0.1
-    p_gate_auto_k_step_down_high: float = 0.02
-    p_gate_auto_k_target_edge: float = 0.05
-    p_gate_auto_k_edge_tolerance: float = 0.5
-    p_gate_auto_k_edge_ema_alpha: float = 0.1
-    p_gate_auto_k_edge_step_down_low: float = 0.01
-    p_gate_auto_k_edge_step_down_high: float = 0.01
-    p_gate_auto_k_min: float = 1.0
-    p_gate_auto_k_max: float = 16.0
-    p_gate_auto_k_width_frac: float = 0.05
-    p_gate_auto_k_edge_frac: float = 0.02
-    p_gate_auto_k_log_interval: int = 200
-    p_gate_clip_eps: float = 1e-6
-    p_gate_eps: float = 1e-6
-    p_gate_edge_reg_weight: float = 0.0
-    p_gate_edge_reg_weight_low: Optional[float] = None
-    p_gate_edge_reg_weight_high: Optional[float] = None
-    p_gate_edge_reg_fallback_only: bool = False
-    p_gate_edge_reg_frac: float = 0.02
-    p_gate_edge_reg_min_width_frac: float = 0.05
-    p_gate_edge_reg_power: float = 2.0
-    p_gate_budget_weight: float = 0.0
-    p_gate_budget_target: float = 0.5
-    p_gate_tv_weight: float = 0.0
-    p_gate_tv_power: float = 1.0
-    p_gate_teacher_weight: float = 0.0
-    p_gate_teacher_temp: float = 0.25
-    p_gate_teacher_tau: float = 0.0
-    p_gate_teacher_relu: bool = False
+    delta_gate_hidden_dim: int = 64
+    delta_gate_detach_inputs: bool = True
+    delta_gate_tile_size: Optional[int] = None
+    delta_gate_tile_shape: Optional[Tuple[int, ...]] = None
+    delta_gate_bounds_use_quantile: bool = False
+    delta_gate_bounds_q_low: float = 0.005
+    delta_gate_bounds_q_high: float = 0.995
+    delta_gate_bounds_q_max_samples: int = 8192
+    delta_gate_bounds_clip_to_minmax: bool = True
+    delta_gate_p_floor: float = 0.0
+    delta_gate_p_ceil: float = 1.0
+    delta_gate_fallback_k: float = 6.0
+    delta_gate_fallback_k_low: Optional[float] = None
+    delta_gate_fallback_k_high: Optional[float] = None
+    delta_gate_auto_k_interval: int = 100
+    delta_gate_auto_k_warmup: int = 100
+    delta_gate_auto_k_ema_alpha: float = 0.1
+    delta_gate_auto_k_target_tight: float = 0.02
+    delta_gate_auto_k_tolerance: float = 0.5
+    delta_gate_auto_k_step_up: float = 0.1
+    delta_gate_auto_k_step_down: float = 0.02
+    delta_gate_auto_k_step_up_low: float = 0.1
+    delta_gate_auto_k_step_down_low: float = 0.02
+    delta_gate_auto_k_step_up_high: float = 0.1
+    delta_gate_auto_k_step_down_high: float = 0.02
+    delta_gate_auto_k_target_edge: float = 0.05
+    delta_gate_auto_k_edge_tolerance: float = 0.5
+    delta_gate_auto_k_edge_ema_alpha: float = 0.1
+    delta_gate_auto_k_edge_step_down_low: float = 0.01
+    delta_gate_auto_k_edge_step_down_high: float = 0.01
+    delta_gate_auto_k_min: float = 1.0
+    delta_gate_auto_k_max: float = 16.0
+    delta_gate_auto_k_width_frac: float = 0.05
+    delta_gate_auto_k_edge_frac: float = 0.02
+    delta_gate_auto_k_log_interval: int = 200
+    delta_gate_clip_eps: float = 1e-6
+    delta_gate_eps: float = 1e-6
+    delta_gate_edge_reg_weight: float = 0.0
+    delta_gate_edge_reg_weight_low: Optional[float] = None
+    delta_gate_edge_reg_weight_high: Optional[float] = None
+    delta_gate_edge_reg_fallback_only: bool = False
+    delta_gate_edge_reg_frac: float = 0.02
+    delta_gate_edge_reg_min_width_frac: float = 0.05
+    delta_gate_edge_reg_power: float = 2.0
+    delta_gate_budget_weight: float = 0.0
+    delta_gate_budget_target: float = 0.5
+    delta_gate_tv_weight: float = 0.0
+    delta_gate_tv_power: float = 1.0
+    delta_gate_teacher_weight: float = 0.0
+    delta_gate_teacher_temp: float = 0.25
+    delta_gate_teacher_tau: float = 0.0
+    delta_gate_teacher_relu: bool = False
     unsup_xx_weight: float = 0.0
     unsup_yy_weight: float = 0.0
     p_prior_weight: float = 0.0
