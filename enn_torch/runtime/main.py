@@ -2058,15 +2058,15 @@ def _set_gate_factor(
 ) -> None:
     if target_module is None:
         return
-    if not bool(getattr(target_module, "p_gate_auto_k_enabled", False)):
+    if not bool(getattr(target_module, "delta_gate_auto_k_enabled", False)):
         return
-    gate = getattr(target_module, "p_gate", None)
+    gate = getattr(target_module, "delta_gate", None)
     if gate is None or not hasattr(gate, "consume_fallback_stats"):
         return
-    interval = int(getattr(target_module, "p_gate_auto_k_interval", 0) or 0)
+    interval = int(getattr(target_module, "delta_gate_auto_k_interval", 0) or 0)
     if interval <= 0:
         return
-    warmup = int(getattr(target_module, "p_gate_auto_k_warmup", 0) or 0)
+    warmup = int(getattr(target_module, "delta_gate_auto_k_warmup", 0) or 0)
     if int(step) < int(warmup):
         if int(step) % max(1, int(interval)) == 0:
             with contextlib.suppress(Exception):
@@ -2074,7 +2074,7 @@ def _set_gate_factor(
         return
     if int(step) % int(interval) != 0:
         return
-    step_buf = getattr(target_module, "p_gate_auto_k_step_buf", None)
+    step_buf = getattr(target_module, "delta_gate_auto_k_step_buf", None)
     if isinstance(step_buf, torch.Tensor):
         with contextlib.suppress(Exception):
             step_buf.fill_(int(step))
@@ -2092,10 +2092,10 @@ def _set_gate_factor(
     width_mean = float((stats[3] / stats[0]).item())
     edge_low_rate = float((stats[4] / stats[0]).item())
     edge_high_rate = float((stats[5] / stats[0]).item())
-    alpha = float(getattr(target_module, "p_gate_auto_k_ema_alpha", 0.1))
+    alpha = float(getattr(target_module, "delta_gate_auto_k_ema_alpha", 0.1))
     alpha = max(0.0, min(1.0, alpha))
-    ema_low_buf = getattr(target_module, "p_gate_auto_k_ema_low_buf", None)
-    ema_high_buf = getattr(target_module, "p_gate_auto_k_ema_high_buf", None)
+    ema_low_buf = getattr(target_module, "delta_gate_auto_k_ema_low_buf", None)
+    ema_high_buf = getattr(target_module, "delta_gate_auto_k_ema_high_buf", None)
     ema_low_prev = (
         float(ema_low_buf.item())
         if isinstance(ema_low_buf, torch.Tensor)
@@ -2115,24 +2115,24 @@ def _set_gate_factor(
         with contextlib.suppress(Exception):
             ema_high_buf.fill_(float(ema_high_new))
     ema_overall = 0.5 * (float(ema_low_new) + float(ema_high_new))
-    ema_buf = getattr(target_module, "p_gate_auto_k_ema_buf", None)
+    ema_buf = getattr(target_module, "delta_gate_auto_k_ema_buf", None)
     if isinstance(ema_buf, torch.Tensor):
         with contextlib.suppress(Exception):
             ema_buf.fill_(float(ema_overall))
     edge_enabled = bool(
-        getattr(target_module, "p_gate_auto_k_edge_enabled", False)
+        getattr(target_module, "delta_gate_auto_k_edge_enabled", False)
     )
     edge_alpha = float(
-        getattr(target_module, "p_gate_auto_k_edge_ema_alpha", alpha)
+        getattr(target_module, "delta_gate_auto_k_edge_ema_alpha", alpha)
     )
     edge_alpha = max(0.0, min(1.0, edge_alpha))
     edge_ema_low_buf = getattr(
-        target_module, "p_gate_auto_k_edge_ema_low_buf", None
+        target_module, "delta_gate_auto_k_edge_ema_low_buf", None
     )
     edge_ema_high_buf = getattr(
-        target_module, "p_gate_auto_k_edge_ema_high_buf", None
+        target_module, "delta_gate_auto_k_edge_ema_high_buf", None
     )
-    edge_ema_buf = getattr(target_module, "p_gate_auto_k_edge_ema_buf", None)
+    edge_ema_buf = getattr(target_module, "delta_gate_auto_k_edge_ema_buf", None)
     edge_ema_low_prev = (
         float(edge_ema_low_buf.item())
         if isinstance(edge_ema_low_buf, torch.Tensor)
@@ -2160,9 +2160,9 @@ def _set_gate_factor(
             edge_ema_buf.fill_(
                 float(0.5 * (edge_ema_low_new + edge_ema_high_new))
             )
-    k_low_buf = getattr(target_module, "p_gate_fallback_k_low_buf", None)
-    k_high_buf = getattr(target_module, "p_gate_fallback_k_high_buf", None)
-    k_legacy_buf = getattr(target_module, "p_gate_fallback_k_buf", None)
+    k_low_buf = getattr(target_module, "delta_gate_fallback_k_low_buf", None)
+    k_high_buf = getattr(target_module, "delta_gate_fallback_k_high_buf", None)
+    k_legacy_buf = getattr(target_module, "delta_gate_fallback_k_buf", None)
     use_legacy = not (
         isinstance(k_low_buf, torch.Tensor)
         and isinstance(k_high_buf, torch.Tensor)
@@ -2182,39 +2182,39 @@ def _set_gate_factor(
     )
     k_low_new = k_low_prev
     k_high_new = k_high_prev
-    target = float(getattr(target_module, "p_gate_auto_k_target_tight", 0.02))
-    tol = float(getattr(target_module, "p_gate_auto_k_tolerance", 0.5))
+    target = float(getattr(target_module, "delta_gate_auto_k_target_tight", 0.02))
+    tol = float(getattr(target_module, "delta_gate_auto_k_tolerance", 0.5))
     hi = target * (1.0 + tol)
     lo = max(0.0, target * (1.0 - tol))
-    step_up = float(getattr(target_module, "p_gate_auto_k_step_up", 0.1))
-    step_down = float(getattr(target_module, "p_gate_auto_k_step_down", 0.02))
+    step_up = float(getattr(target_module, "delta_gate_auto_k_step_up", 0.1))
+    step_down = float(getattr(target_module, "delta_gate_auto_k_step_down", 0.02))
     step_up_low = float(
-        getattr(target_module, "p_gate_auto_k_step_up_low", step_up)
+        getattr(target_module, "delta_gate_auto_k_step_up_low", step_up)
     )
     step_down_low = float(
-        getattr(target_module, "p_gate_auto_k_step_down_low", step_down)
+        getattr(target_module, "delta_gate_auto_k_step_down_low", step_down)
     )
     step_up_high = float(
-        getattr(target_module, "p_gate_auto_k_step_up_high", step_up)
+        getattr(target_module, "delta_gate_auto_k_step_up_high", step_up)
     )
     step_down_high = float(
-        getattr(target_module, "p_gate_auto_k_step_down_high", step_down)
+        getattr(target_module, "delta_gate_auto_k_step_down_high", step_down)
     )
     edge_target = float(
-        getattr(target_module, "p_gate_auto_k_target_edge", 0.05)
+        getattr(target_module, "delta_gate_auto_k_target_edge", 0.05)
     )
     edge_tol = float(
-        getattr(target_module, "p_gate_auto_k_edge_tolerance", 0.5)
+        getattr(target_module, "delta_gate_auto_k_edge_tolerance", 0.5)
     )
     edge_hi = edge_target * (1.0 + edge_tol)
     edge_step_down_low = float(
-        getattr(target_module, "p_gate_auto_k_edge_step_down_low", 0.01)
+        getattr(target_module, "delta_gate_auto_k_edge_step_down_low", 0.01)
     )
     edge_step_down_high = float(
-        getattr(target_module, "p_gate_auto_k_edge_step_down_high", 0.01)
+        getattr(target_module, "delta_gate_auto_k_edge_step_down_high", 0.01)
     )
-    k_min = float(getattr(target_module, "p_gate_auto_k_min", 1.0))
-    k_max = float(getattr(target_module, "p_gate_auto_k_max", 16.0))
+    k_min = float(getattr(target_module, "delta_gate_auto_k_min", 1.0))
+    k_max = float(getattr(target_module, "delta_gate_auto_k_max", 16.0))
     if k_max < k_min:
         k_max = k_min
     edge_low_eff = (
@@ -2274,15 +2274,15 @@ def _set_gate_factor(
         with contextlib.suppress(Exception):
             setattr(
                 target_module,
-                "p_gate_fallback_enabled",
+                "delta_gate_fallback_enabled",
                 bool(k_low_new > 0.0 and k_high_new > 0.0),
             )
-        upd_buf = getattr(target_module, "p_gate_auto_k_updates_buf", None)
+        upd_buf = getattr(target_module, "delta_gate_auto_k_updates_buf", None)
         if isinstance(upd_buf, torch.Tensor):
             with contextlib.suppress(Exception):
                 upd_buf.add_(1)
     log_interval = int(
-        getattr(target_module, "p_gate_auto_k_log_interval", 0) or 0
+        getattr(target_module, "delta_gate_auto_k_log_interval", 0) or 0
     )
     log_due = (
         bool(k_changed)
@@ -2291,7 +2291,7 @@ def _set_gate_factor(
     )
     if int(local_rank) == 0 and log_due:
         _LOGGER.info(
-            "[p_gate] auto_k step=%d seen=%d activeL_sma=%.4f activeH_sma=%.4f width_mean=%.4f edgeL_sma=%.4f edgeH_sma=%.4f activeL_ema=%.4f activeH_ema=%.4f edgeL_ema=%.4f edgeH_ema=%.4f kL=%.4f -> %.4f kH=%.4f -> %.4f",
+            "[delta_gate] auto_k step=%d seen=%d activeL_sma=%.4f activeH_sma=%.4f width_mean=%.4f edgeL_sma=%.4f edgeH_sma=%.4f activeL_ema=%.4f activeH_ema=%.4f edgeL_ema=%.4f edgeH_ema=%.4f kL=%.4f -> %.4f kH=%.4f -> %.4f",
             int(step),
             int(count),
             float(active_low_rate),
@@ -2793,12 +2793,12 @@ def epochs(
     mem_util_ema = None
     util_alpha = 0.2
     global_step = 0
-    p_gate_auto_step_total = 0
+    delta_gate_auto_step_total = 0
     with contextlib.suppress(Exception):
         target_for_autok = model.module if hasattr(model, "module") else model
-        step_buf = getattr(target_for_autok, "p_gate_auto_k_step_buf", None)
+        step_buf = getattr(target_for_autok, "delta_gate_auto_k_step_buf", None)
         if isinstance(step_buf, torch.Tensor):
-            p_gate_auto_step_total = int(step_buf.item())
+            delta_gate_auto_step_total = int(step_buf.item())
     util_adjust_interval = 0
     util_warmup_steps = 0
     if buffers_dtype is not None:
@@ -3298,7 +3298,7 @@ def epochs(
                                             setattr(
                                                 inst_step,
                                                 "_stnet_step_total",
-                                                int(p_gate_auto_step_total),
+                                                int(delta_gate_auto_step_total),
                                             )
                                         peak = None
                                         free = None
@@ -3354,7 +3354,7 @@ def epochs(
                                                     model,
                                                     device=device,
                                                     step_total=int(
-                                                        p_gate_auto_step_total
+                                                        delta_gate_auto_step_total
                                                     ),
                                                     ttl_steps=128,
                                                     min_bytes=16 * 1024 * 1024,
@@ -3362,7 +3362,7 @@ def epochs(
                                         from_checkpoint(
                                             model,
                                             step_total=int(
-                                                p_gate_auto_step_total
+                                                delta_gate_auto_step_total
                                             ),
                                         )
                                         if scheduler_step_per_batch:
@@ -3432,7 +3432,7 @@ def epochs(
                                                 )
                             if should_sync:
                                 global_step += 1
-                                p_gate_auto_step_total += 1
+                                delta_gate_auto_step_total += 1
                                 with contextlib.suppress(Exception):
                                     target_for_autok = (
                                         model.module
@@ -3441,7 +3441,7 @@ def epochs(
                                     )
                                     _set_gate_factor(
                                         target_for_autok,
-                                        step=p_gate_auto_step_total,
+                                        step=delta_gate_auto_step_total,
                                         pg=train_pg,
                                         local_rank=local_rank,
                                     )
@@ -5701,12 +5701,6 @@ def process(*args: Any, **kwargs: Any) -> object:
                         else "max-autotune-no-cudagraphs"
                     )
                 cfg = replace(cfg, compile_mode=str(default_cm))
-                with contextlib.suppress(Exception):
-                    setattr(
-                        cfg,
-                        "compile_heavy_submodules",
-                        bool(_env_flag("ENN_COMPILE_HEAVY", True)),
-                    )
                 with contextlib.suppress(Exception):
                     setattr(
                         cfg,

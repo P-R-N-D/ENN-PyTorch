@@ -18,6 +18,7 @@ from ..core.graph import (
     assert_trace,
     canonicalize_compile_mode,
     is_compiling,
+    is_export_or_trace,
     is_symbolic,
     is_tracing_or_exporting,
     torch_compiler_disable,
@@ -46,10 +47,7 @@ _torch_flex_attention = None
 
 
 def _flex_attention_disabled() -> bool:
-    return bool(
-        env_bool("ENN_NO_FLEX_ATTENTION", False)
-        or env_bool("ENN_DISABLE_FLEX_ATTENTION", False)
-    )
+    return bool(env_bool("ENN_DISABLE_FLEX_ATTENTION", False))
 
 
 def _flex_attention_compile_mode() -> str:
@@ -57,10 +55,12 @@ def _flex_attention_compile_mode() -> str:
     global_mode = getattr(cfg, "compile_mode", "disabled")
     global_mode = canonicalize_compile_mode(global_mode)
 
-    if global_mode == "max-autotune":
-        return "max-autotune"
-    if global_mode == "max-autotune-no-cudagraphs":
-        return "max-autotune-no-cudagraphs"
+    if global_mode in {"disabled", "aot-eager"}:
+        return "aot-eager"
+    if global_mode == "reduce-overhead":
+        return "reduce-overhead"
+    if global_mode in {"max-autotune", "max-autotune-no-cudagraphs"}:
+        return global_mode
     return "reduce-overhead"
 
 
@@ -92,7 +92,7 @@ def _get_compiled_flex_attention() -> Any:
 
 
 def _exporting_boundary() -> bool:
-    return bool(is_tracing_or_exporting() or is_symbolic())
+    return bool(is_export_or_trace())
 
 
 def _coerce_block_mask_to_dense(
@@ -1807,21 +1807,13 @@ class MultiScaleRetention(nn.Module):
     def _scan_causal(
         self: Self, v: torch.Tensor, lam_h: torch.Tensor
     ) -> torch.Tensor:
-        disable_triton = env_bool(
-            (
-                "ENN_MSR_FORCE_TORCH",
-                "ENN_MSR_DISABLE_TRITON",
-                "ENN_DISABLE_TRITON_MSR",
-            ),
-            default=False,
-        )
+        disable_triton = env_bool("ENN_MSR_FORCE_TORCH", default=False)
         use_triton = bool(
             (not disable_triton)
             and self._triton_ok
             and v.is_cuda
             and torch.cuda.is_available()
             and (not _exporting_boundary())
-            and (not is_compiling())
         )
         if use_triton:
             try:

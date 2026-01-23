@@ -443,7 +443,7 @@ def export_and_validate(
         results["_state_save_error"] = repr(exc)
     with _temp_env("ENN_DISABLE_PIECEWISE_CALIB", "1"):
         for name, path in targets.items():
-            if state_path is not None and name in ("onnx", "ort", "tensorrt"):
+            if state_path is not None and name in ("onnx", "ort", "tensorrt", "executorch", "tensorflow", "litert"):
                 results[name] = _run_isolated_export(
                     name, str(path), str(state_path)
                 )

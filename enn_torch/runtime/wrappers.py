@@ -112,6 +112,8 @@ def _onnx_model(model: object) -> Iterator[object]:
         with _temp_environ(
             {
                 "ENN_MSR_FORCE_TORCH": "1",
+                "ENN_DISABLE_FLEX_ATTENTION": "1",
+                "ENN_DISABLE_SDPA": "1",
                 "ENN_DISABLE_PIECEWISE_CALIB": "1",
             },
             only_if_unset=True,
@@ -379,70 +381,77 @@ def _find_latest_onnx2tf_auto_json(out_dir: Path) -> Path | None:
     return candidates[0]
 
 
+
 def _run_onnx2tf(
     onnx_path: Path,
     out_dir: Path,
     *extra_args: str,
     dynamic_batch: bool = True,
-    retry_auto_prf: bool = True,
-    retry_batch_1: bool = True,
 ) -> None:
-    out_dir = Path(out_dir)
-    with contextlib.suppress(Exception):
-        out_dir.mkdir(parents=True, exist_ok=True)
-    base_args: list[str] = []
-    if _onnx2tf_supports("-nuo"):
-        base_args.append("-nuo")
-    if dynamic_batch and _onnx2tf_supports("-osd"):
-        base_args.append("-osd")
+    onnx_path = onnx_path.resolve()
+    out_dir = out_dir.resolve()
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    base_extra = [str(x) for x in extra_args if str(x)]
 
     def _cmd(*more: str) -> list[str]:
-        cmd = [
-            sys.executable,
-            "-m",
+        cmd: list[str] = [
             "onnx2tf",
             "-i",
             str(onnx_path),
             "-o",
             str(out_dir),
+            "-nuo",
         ]
-        cmd.extend([x for x in base_args if x])
-        cmd.extend([x for x in extra_args if x])
-        cmd.extend([x for x in more if x])
+        cmd.extend(base_extra)
+        cmd.extend([str(x) for x in more if str(x)])
         return cmd
 
-    last_exc: Exception | None = None
-    auto_json: Path | None = None
-    try:
-        _in_console(_cmd(), "onnx2tf")
-        return
-    except Exception as exc:
-        last_exc = exc
-
-    if retry_auto_prf and _onnx2tf_supports("-prf"):
-        auto_json = _find_latest_onnx2tf_auto_json(out_dir)
-        if auto_json is not None:
-            try:
-                _in_console(_cmd("-prf", str(auto_json)), "onnx2tf")
-                return
-            except Exception as exc:
-                last_exc = exc
-
-    if dynamic_batch and retry_batch_1 and _onnx2tf_supports("-b"):
+    def _try(*more: str) -> bool:
         try:
-            _in_console(_cmd("-b", "1"), "onnx2tf")
-            return
-        except Exception as exc:
-            last_exc = exc
+            _in_console(_cmd(*more), "onnx2tf", cwd=str(out_dir))
+            return True
+        except RuntimeError:
+            return False
 
-        if auto_json is not None and _onnx2tf_supports("-prf"):
-            try:
-                _in_console(_cmd("-b", "1", "-prf", str(auto_json)), "onnx2tf")
+    if _try():
+        return
+
+    auto_json = _find_latest_onnx2tf_auto_json(out_dir)
+
+    agj_flag: str | None = None
+    for cand in ("-agj", "--auto_generate_json"):
+        if _onnx2tf_supports(cand):
+            agj_flag = cand
+            break
+
+    if agj_flag is not None:
+        _try(agj_flag)
+        auto_json = _find_latest_onnx2tf_auto_json(out_dir)
+
+    if _onnx2tf_supports("-prf") and auto_json is not None:
+        if _try("-prf", str(auto_json)):
+            return
+
+    if dynamic_batch and _onnx2tf_supports("-b"):
+        if _try("-b", "1"):
+            return
+
+        if _onnx2tf_supports("-prf") and auto_json is not None:
+            if _try("-b", "1", "-prf", str(auto_json)):
                 return
-            except Exception as exc:
-                last_exc = exc
-    if last_exc is not None:
-        raise last_exc
+
+        if agj_flag is not None:
+            _try("-b", "1", agj_flag)
+            auto_json = _find_latest_onnx2tf_auto_json(out_dir)
+            if _onnx2tf_supports("-prf") and auto_json is not None:
+                if _try("-b", "1", "-prf", str(auto_json)):
+                    return
+
+    raise RuntimeError(
+        "onnx2tf conversion failed after multiple retries; "
+        "consider running onnx2tf manually to inspect the failing op"
+    )
 
 
 def _torch_export_program(
@@ -513,9 +522,9 @@ def _torch_export_program(
         raise
 
 
-def _in_console(cmd: object, desc: object) -> None:
+def _in_console(cmd: object, desc: object, *, cwd: object = None) -> None:
     try:
-        subprocess.run(list(cmd), check=True)
+        subprocess.run(list(cmd), check=True, cwd=cwd)
     except (OSError, subprocess.CalledProcessError) as exc:
         raise RuntimeError(f"{desc} failed with error: {exc}") from exc
 
@@ -1271,6 +1280,18 @@ class TensorRT(Format):
                 raise ImportError(
                     "TensorRT is required for this export."
                 ) from exc
+
+            if not torch.cuda.is_available():
+                raise ImportError(
+                    "TensorRT export requires CUDA-enabled PyTorch (torch.cuda.is_available() is False)."
+                )
+            try:
+                torch.cuda.current_device()
+            except Exception as cuda_exc:
+                raise ImportError(
+                    "CUDA runtime/driver is not available or incompatible for TensorRT export."
+                ) from cuda_exc
+
             trt_logger = trt.Logger(trt.Logger.WARNING)
             explicit_batch_flag = 0
             with contextlib.suppress(Exception):

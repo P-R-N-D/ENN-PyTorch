@@ -27,6 +27,7 @@ from ..core.datatypes import env_bool, env_int
 from ..core.graph import (
     coerce_checkpoint,
     is_checkpoint,
+    is_compiling,
     is_export_or_trace,
     is_meta_or_fake_tensor,
     is_symbolic,
@@ -57,9 +58,7 @@ try:
 except Exception:
     create_block_mask = None
     _HAS_FLEX_ATTENTION = False
-if env_bool("ENN_NO_FLEX_ATTENTION", False) or env_bool(
-    "ENN_DISABLE_FLEX_ATTENTION", False
-):
+if env_bool("ENN_DISABLE_FLEX_ATTENTION", False):
     _HAS_FLEX_ATTENTION = False
 _FLEX_KERNEL = FlexAttention(prefer_torch=True)
 _GATE_STATS_CKPT_FWD = env_bool("ENN_GATE_STATS_CKPT_FWD", False)
@@ -580,6 +579,9 @@ class DilatedAttention(nn.Module):
         max_size: int,
         value_checker: Callable[[TCache], bool] | None = None,
     ) -> TCache:
+        if is_symbolic() or is_export_or_trace() or is_compiling():
+            return factory_fn()
+
         last = getattr(self, last_attr_name, None)
         if last is not None and last[0] == key:
             return last[1]
@@ -2264,18 +2266,22 @@ class Scaler(nn.Module):
             return t
         feature_dim = t.shape[-1]
 
-        key = (str(t.device), t.dtype, "mean", "std")
-        with self._stats_cache_lock:
-            cache = getattr(self, f"_{cache_key_prefix}_stats_cache")
-            cached = cache.get(key)
-            if cached is None:
-                mean_b = mean_buf.to(device=t.device, dtype=t.dtype)
-                std_b = std_buf.to(device=t.device, dtype=t.dtype)
-                if len(cache) > self._stats_cache_max:
-                    cache.clear()
-                cache[key] = (mean_b, std_b)
-            else:
-                mean_b, std_b = cached
+        if is_symbolic() or is_export_or_trace() or is_compiling():
+            mean_b = mean_buf.to(device=t.device, dtype=t.dtype)
+            std_b = std_buf.to(device=t.device, dtype=t.dtype)
+        else:
+            key = (str(t.device), t.dtype, "mean", "std")
+            with self._stats_cache_lock:
+                cache = getattr(self, f"_{cache_key_prefix}_stats_cache")
+                cached = cache.get(key)
+                if cached is None:
+                    mean_b = mean_buf.to(device=t.device, dtype=t.dtype)
+                    std_b = std_buf.to(device=t.device, dtype=t.dtype)
+                    if len(cache) > self._stats_cache_max:
+                        cache.clear()
+                    cache[key] = (mean_b, std_b)
+                else:
+                    mean_b, std_b = cached
 
         if not is_symbolic() and mean_b.numel() not in (1, int(feature_dim)):
             raise RuntimeError(
@@ -2302,18 +2308,22 @@ class Scaler(nn.Module):
             return t
         feature_dim = t.shape[-1]
 
-        key = (str(t.device), t.dtype, "mean", "std")
-        with self._stats_cache_lock:
-            cache = getattr(self, f"_{cache_key_prefix}_stats_cache")
-            cached = cache.get(key)
-            if cached is None:
-                mean_b = mean_buf.to(device=t.device, dtype=t.dtype)
-                std_b = std_buf.to(device=t.device, dtype=t.dtype)
-                if len(cache) > self._stats_cache_max:
-                    cache.clear()
-                cache[key] = (mean_b, std_b)
-            else:
-                mean_b, std_b = cached
+        if is_symbolic() or is_export_or_trace() or is_compiling():
+            mean_b = mean_buf.to(device=t.device, dtype=t.dtype)
+            std_b = std_buf.to(device=t.device, dtype=t.dtype)
+        else:
+            key = (str(t.device), t.dtype, "mean", "std")
+            with self._stats_cache_lock:
+                cache = getattr(self, f"_{cache_key_prefix}_stats_cache")
+                cached = cache.get(key)
+                if cached is None:
+                    mean_b = mean_buf.to(device=t.device, dtype=t.dtype)
+                    std_b = std_buf.to(device=t.device, dtype=t.dtype)
+                    if len(cache) > self._stats_cache_max:
+                        cache.clear()
+                    cache[key] = (mean_b, std_b)
+                else:
+                    mean_b, std_b = cached
 
         if not is_symbolic() and mean_b.numel() not in (1, int(feature_dim)):
             raise RuntimeError(
