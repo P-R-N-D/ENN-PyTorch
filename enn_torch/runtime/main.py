@@ -4035,8 +4035,20 @@ def epochs(
                     except Exception:
                         ckpt_dir = None
                 if ckpt_dir:
-                    ckpt_path = os.path.join(ckpt_dir, "model.pt")
-                    tmp_path = ckpt_path + ".tmp"
+                    ckpt_ext = os.environ.get("ENN_CKPT_EXT")
+                    if ckpt_ext:
+                        if not ckpt_ext.startswith("."):
+                            ckpt_ext = "." + ckpt_ext
+                        ckpt_ext = ckpt_ext.lower()
+                    else:
+                        try:
+                            import openzl.ext
+
+                            ckpt_ext = ".ozl"
+                        except Exception:
+                            ckpt_ext = ".pt"
+
+                    ckpt_path = os.path.join(ckpt_dir, "model" + ckpt_ext)
                     model_sd = swa_helper.checkpoint_state_dict(
                         swa_target,
                         include_buffers=True,
@@ -4055,8 +4067,45 @@ def epochs(
                         f"Training ({str(device.type).upper()}) Updating Checkpoint at {round(ckpt_percentage)}% (Total = {int(ops.epochs)}, Finished = {int(epoch_idx)})",
                         flush=True,
                     )
-                    torch.save(model_sd, tmp_path)
-                    os.replace(tmp_path, ckpt_path)
+                    from ..api import save_model as _api_save_model
+
+                    _ozl_kwargs: dict[str, object] = {}
+                    if str(ckpt_path).lower().endswith(".ozl"):
+                        _lvl = os.environ.get("ENN_OPENZL_LEVEL")
+                        if _lvl:
+                            with contextlib.suppress(Exception):
+                                _ozl_kwargs["openzl_level"] = int(_lvl)
+                        _mss = os.environ.get("ENN_OPENZL_MIN_STREAM_SIZE")
+                        if _mss:
+                            with contextlib.suppress(Exception):
+                                _ozl_kwargs["openzl_min_stream_size"] = int(_mss)
+                        if "ENN_OPENZL_PACK_BY_DTYPE" in os.environ:
+                            with contextlib.suppress(Exception):
+                                _ozl_kwargs["openzl_pack_by_dtype"] = bool(
+                                    _env_flag("ENN_OPENZL_PACK_BY_DTYPE", True)
+                                )
+                        if "ENN_OPENZL_CONTENT_CHECKSUM" in os.environ:
+                            with contextlib.suppress(Exception):
+                                _ozl_kwargs["openzl_content_checksum"] = bool(
+                                    _env_flag("ENN_OPENZL_CONTENT_CHECKSUM", True)
+                                )
+                        if "ENN_OPENZL_COMPRESSED_CHECKSUM" in os.environ:
+                            with contextlib.suppress(Exception):
+                                _ozl_kwargs["openzl_compressed_checksum"] = bool(
+                                    _env_flag("ENN_OPENZL_COMPRESSED_CHECKSUM", True)
+                                )
+                        if "ENN_OPENZL_PERMISSIVE" in os.environ:
+                            with contextlib.suppress(Exception):
+                                _ozl_kwargs["openzl_permissive"] = bool(
+                                    _env_flag("ENN_OPENZL_PERMISSIVE", True)
+                                )
+
+                    _api_save_model(
+                        swa_target,
+                        ckpt_path,
+                        state_dict=model_sd,
+                        **_ozl_kwargs,
+                    )
                     _LOGGER.info(
                         "Training (%s) Updated Checkpoint at %d%% (Total = %d, Finished = %d)",
                         str(device.type).upper(),
@@ -5112,32 +5161,29 @@ def process(*args: Any, **kwargs: Any) -> object:
             ops.cfg_dict if isinstance(ops.cfg_dict, dict) else ops.cfg_dict
         )
         cfg = replace(cfg, device=device)
-        model = Model(ops.in_dim, ops.out_shape, config=cfg)
-        if ops.init_ckpt_dir is not None and os.path.isdir(ops.init_ckpt_dir):
-            fallback_init = os.path.join(ops.init_ckpt_dir, "model.pt")
-            if os.path.isfile(fallback_init):
-                cpu_state = _torch_load_checkpoint(
-                    fallback_init, map_location="cpu", weights_only=True
-                )
-                resize_scaler_buffer(model, cpu_state)
-                model.load_state_dict(cpu_state, strict=False)
-            else:
-                m_sd = get_model_state_dict(
-                    model,
-                    options=StateDictOptions(
-                        full_state_dict=True, cpu_offload=False
-                    ),
-                )
-                m_sd = _coerce_dcp_keys(m_sd)
-                with _filtered_warnings():
-                    load(
-                        state_dict={"model": m_sd},
-                        storage_reader=FileSystemReader(ops.init_ckpt_dir),
-                    )
-                resize_scaler_buffer(model, m_sd)
-                set_model_state_dict(
-                    model, m_sd, options=StateDictOptions(strict=False)
-                )
+        model: Model
+        if ops.init_ckpt_dir is not None and os.path.exists(ops.init_ckpt_dir):
+            from ..api import load_model as _api_load_model
+
+            init_path = str(ops.init_ckpt_dir)
+            if os.path.isdir(init_path):
+                for _name in ("model.ozl", "model.pt", "model.pth", "model.safetensors"):
+                    fp = os.path.join(init_path, _name)
+                    if os.path.isfile(fp):
+                        init_path = fp
+                        break
+
+            model = _api_load_model(
+                init_path,
+                in_dim=ops.in_dim,
+                out_shape=ops.out_shape,
+                config=cfg,
+                map_location="cpu",
+                openzl_memmap=bool(_env_flag("ENN_OPENZL_MEMMAP", True)),
+                openzl_lazy_tensors=bool(_env_flag("ENN_OPENZL_LAZY_TENSORS", True)),
+            )
+        else:
+            model = Model(ops.in_dim, ops.out_shape, config=cfg)
         if ops.sources is None:
             raise RuntimeError("RuntimeConfig.sources is required but None")
         metadata = Dataset.for_device(device)
@@ -5587,9 +5633,27 @@ def process(*args: Any, **kwargs: Any) -> object:
                 avg_helper = ema_helper
 
             if ops.ckpt_dir:
-                ckpt_path = os.path.join(ops.ckpt_dir, "model.pt")
+                ckpt_ext = os.environ.get("ENN_CKPT_EXT")
+                if ckpt_ext:
+                    if not ckpt_ext.startswith("."):
+                        ckpt_ext = "." + ckpt_ext
+                    ckpt_ext = ckpt_ext.lower()
+                else:
+                    try:
+                        import openzl.ext
+
+                        ckpt_ext = ".ozl"
+                    except Exception:
+                        ckpt_ext = ".pt"
+
+                ckpt_path = os.path.join(ops.ckpt_dir, "model" + ckpt_ext)
 
                 if not os.path.isfile(ckpt_path):
+                    for _alt in (".ozl", ".pt"):
+                        if _alt != ckpt_ext and os.path.isfile(
+                            os.path.join(ops.ckpt_dir, "model" + _alt)
+                        ):
+                            return
                     src_mod = (
                         tracked_module if tracked_module is not None else model
                     )
@@ -5654,7 +5718,33 @@ def process(*args: Any, **kwargs: Any) -> object:
                                 model_sd[k] = tb
 
                     _coerce_dcp_keys(model_sd)
-                    torch.save(model_sd, ckpt_path)
+
+                    from ..api import save_model as _api_save_model
+
+                    save_target = (
+                        src_mod.module
+                        if hasattr(src_mod, "module")
+                        else src_mod
+                    )
+                    _ozl_kwargs: dict[str, object] = {}
+                    if str(ckpt_path).lower().endswith(".ozl"):
+                        _lvl = os.environ.get("ENN_OPENZL_LEVEL")
+                        if _lvl:
+                            with contextlib.suppress(Exception):
+                                _ozl_kwargs["openzl_level"] = int(_lvl)
+                        _mss = os.environ.get("ENN_OPENZL_MIN_STREAM_SIZE")
+                        if _mss:
+                            with contextlib.suppress(Exception):
+                                _ozl_kwargs["openzl_min_stream_size"] = int(
+                                    _mss
+                                )
+
+                    _api_save_model(
+                        save_target,
+                        ckpt_path,
+                        state_dict=model_sd,
+                        **_ozl_kwargs,
+                    )
 
                     try:
                         del model_sd
@@ -5721,7 +5811,6 @@ def process(*args: Any, **kwargs: Any) -> object:
                         "compile_cudagraphs",
                         bool(_env_flag("ENN_COMPILE_CUDAGRAPHS", True)),
                     )
-        model = Model(ops.in_dim, ops.out_shape, config=cfg)
         if not ops.model_ckpt_dir:
             raise RuntimeError(
                 "predict/infer requires model_ckpt_dir (checkpoint directory). Set RuntimeConfig.model_ckpt_dir to a directory produced by train()."
@@ -5730,32 +5819,23 @@ def process(*args: Any, **kwargs: Any) -> object:
             raise RuntimeError(
                 f"predict/infer: model_ckpt_dir does not exist or is not a directory: {ops.model_ckpt_dir!r}"
             )
-        if ops.model_ckpt_dir is not None and os.path.isdir(
-            ops.model_ckpt_dir
-        ):
-            fallback_model = os.path.join(ops.model_ckpt_dir, "model.pt")
-            if os.path.isfile(fallback_model):
-                cpu_state = _torch_load_checkpoint(
-                    fallback_model, map_location="cpu", weights_only=True
-                )
-                resize_scaler_buffer(model, cpu_state)
-                model.load_state_dict(cpu_state, strict=False)
-            else:
-                m_sd = get_model_state_dict(
-                    model,
-                    options=StateDictOptions(
-                        full_state_dict=True, cpu_offload=True
-                    ),
-                )
-                m_sd = _coerce_dcp_keys(m_sd)
-                load(
-                    state_dict={"model": m_sd},
-                    storage_reader=FileSystemReader(ops.model_ckpt_dir),
-                )
-                resize_scaler_buffer(model, m_sd)
-                set_model_state_dict(
-                    model, m_sd, options=StateDictOptions(strict=False)
-                )
+        from ..api import load_model as _api_load_model
+
+        ckpt_source: str = str(ops.model_ckpt_dir)
+        for _name in ("model.ozl", "model.pt", "model.pth", "model.safetensors"):
+            fp = os.path.join(ckpt_source, _name)
+            if os.path.isfile(fp):
+                ckpt_source = fp
+                break
+        model = _api_load_model(
+            ckpt_source,
+            in_dim=ops.in_dim,
+            out_shape=ops.out_shape,
+            config=cfg,
+            map_location="cpu",
+            openzl_memmap=bool(_env_flag("ENN_OPENZL_MEMMAP", True)),
+            openzl_lazy_tensors=bool(_env_flag("ENN_OPENZL_LAZY_TENSORS", True)),
+        )
         model.to(device, non_blocking=device.type in ("cuda", "xpu")).eval()
         metadata = Dataset.for_device(device)
         model, _, _ = ModelPolicy.use_nvidia_layers(model, device=device)

@@ -287,7 +287,7 @@ def _validate_main_importability() -> None:
     with contextlib.suppress(Exception):
         setattr(main_mod, "__spec__", None)
     stub_dir = "/tmp" if os.path.isdir("/tmp") else os.getcwd()
-    stub_path = os.path.join(stub_dir, "stnet_mp_main.py")
+    stub_path = os.path.join(stub_dir, "enn_mp_main.py")
     try:
         if not os.path.isfile(stub_path):
             with open(stub_path, "w", encoding="utf-8") as f:

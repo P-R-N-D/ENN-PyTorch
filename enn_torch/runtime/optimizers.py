@@ -725,7 +725,7 @@ class StochasticWeightAverage(nn.Module):
         stream_max_inflight_mb: int = 64,
         use_mmap: bool | None = None,
         mmap_dir: str | None = None,
-        mmap_prefix: str = "stnet_swa_shadow",
+        mmap_prefix: str = "enn_swa_shadow",
         mmap_cleanup: bool | None = None,
         **kwargs: Any,
     ) -> None:
@@ -775,7 +775,7 @@ class StochasticWeightAverage(nn.Module):
 
         self._use_mmap = bool(use_mmap) if use_mmap is not None else True
         self._mmap_dir: str | None = None
-        self._mmap_prefix = str(mmap_prefix or "stnet_swa_shadow")
+        self._mmap_prefix = str(mmap_prefix or "enn_swa_shadow")
         self._mmap_cleanup = (
             bool(mmap_cleanup) if mmap_cleanup is not None else False
         )
