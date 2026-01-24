@@ -39,6 +39,10 @@ from ..core.tensor import is_meta_or_fake_tensor
 _FLEX_ATTN_COMPILED: dict[str, Any] = {}
 _FLEX_ATTN_COMPILE_LOCK = threading.Lock()
 _FLEX_KWARGS: set[str] = set()
+_FLEX_ATTN_SPECIALIZED: dict[tuple[Any, ...], Any] = {}
+_FLEX_ATTN_SPECIALIZE_LOCK = threading.Lock()
+_FLEX_ATTN_FAILED: dict[tuple[Any, ...], str] = {}
+_FLEX_ATTN_WARNED: set[str] = set()
 _HAS_TE = False
 _HAS_TORCH_FLEX = False
 _te = None
@@ -63,6 +67,175 @@ def _flex_attention_compile_mode() -> str:
         return global_mode
     return "reduce-overhead"
 
+
+def _warn_once(key: str, message: str) -> None:
+    if key in _FLEX_ATTN_WARNED:
+        return
+    _FLEX_ATTN_WARNED.add(key)
+    with contextlib.suppress(Exception):
+        warnings.warn(str(message), stacklevel=3)
+
+
+def _env_bool_optional(name: str) -> Optional[bool]:
+    if name not in os.environ:
+        return None
+    try:
+        return bool(env_bool(name, False))
+    except Exception:
+        return None
+
+
+def _flex_attention_dynamic_flag(mode: str) -> Optional[bool]:
+    for key in (
+        "ENN_FLEX_ATTENTION_DYNAMIC",
+        "ENN_FLEX_COMPILE_DYNAMIC",
+        "ENN_FLEXATTN_DYNAMIC",
+    ):
+        v = _env_bool_optional(key)
+        if isinstance(v, bool):
+            return v
+    cfg = get_runtime_cfg()
+    dyn = getattr(cfg, "compile_dynamic", None)
+    if isinstance(dyn, bool):
+        return dyn
+    return None
+
+
+def _flex_attention_cache_key(
+    *,
+    mode: str,
+    device: torch.device,
+    dtype: torch.dtype,
+    flex_kwargs: Mapping[str, Any],
+) -> tuple[Any, ...]:
+    score_mod = flex_kwargs.get("score_mod", None)
+    block_mask = flex_kwargs.get("block_mask", None)
+    kernel_options = flex_kwargs.get("kernel_options", None)
+    scale = flex_kwargs.get("scale", None)
+    enable_gqa = flex_kwargs.get("enable_gqa", None)
+    return_lse = flex_kwargs.get("return_lse", None)
+    drop = flex_kwargs.get("dropout_p", None)
+    if drop is None:
+        drop = flex_kwargs.get("dropout", None)
+    keys = tuple(sorted(str(k) for k in flex_kwargs.keys()))
+    return (
+        "flexattn",
+        str(mode),
+        str(device),
+        str(dtype),
+        keys,
+        int(id(score_mod)) if score_mod is not None else 0,
+        int(id(block_mask)) if block_mask is not None else 0,
+        int(id(kernel_options)) if kernel_options is not None else 0,
+        float(scale) if isinstance(scale, (int, float)) else None,
+        float(drop) if isinstance(drop, (int, float)) else None,
+        bool(enable_gqa) if enable_gqa is not None else None,
+        bool(return_lse) if return_lse is not None else None,
+    )
+
+
+def _compile_flex_attention_wrapper(
+    *,
+    mode: str,
+    dynamic: Optional[bool],
+    flex_kwargs: dict[str, Any],
+) -> Any:
+    if _torch_flex_attention is None:
+        raise RuntimeError("Flex Attention is not available")
+    frozen = dict(flex_kwargs)
+
+    def _wrapped(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> Any:
+        return _torch_flex_attention(q, k, v, **frozen)
+
+    return _stnet_compile(
+        _wrapped,
+        mode=mode,
+        dynamic=dynamic,
+        fullgraph=False,
+    )
+
+
+def _is_compile_failure(exc: BaseException) -> bool:
+    t = type(exc)
+    qual = f"{getattr(t, '__module__', '')}.{getattr(t, '__name__', '')}"
+    msg = str(exc)
+    needles = (
+        "torch._dynamo",
+        "torch._inductor",
+        "BackendCompilerFailed",
+        "LoweringException",
+        "Unsupported",
+        "CompileError",
+    )
+    if any(n in qual for n in needles):
+        return True
+    if any(n in msg for n in needles):
+        return True
+    return False
+
+
+def _call_torch_flex_attention_eager(
+    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, *, flex_kwargs: dict[str, Any]
+) -> Any:
+    if _torch_flex_attention is None:
+        raise RuntimeError("Flex Attention is not available")
+    with warnings.catch_warnings():
+        warnings.filterwarnings(
+            "ignore",
+            message=r"flex_attention called without torch\.compile",
+            category=UserWarning,
+        )
+        return _torch_flex_attention(q, k, v, **flex_kwargs)
+
+
+def _get_compiled_flex_attention_for_kwargs(
+    q: torch.Tensor, flex_kwargs: dict[str, Any]
+) -> tuple[Any, tuple[Any, ...]]:
+    if not _HAS_TORCH_FLEX or _torch_flex_attention is None:
+        raise RuntimeError("Flex Attention is not available")
+
+    if is_compiling() or is_tracing_or_exporting():
+        return _torch_flex_attention, ("flexattn", "raw")
+
+    if not torch_compiler_supported():
+        return _torch_flex_attention, ("flexattn", "raw")
+
+    mode = _flex_attention_compile_mode()
+    dynamic = _flex_attention_dynamic_flag(mode)
+    key = _flex_attention_cache_key(
+        mode=mode, device=q.device, dtype=q.dtype, flex_kwargs=flex_kwargs
+    )
+
+    cached = _FLEX_ATTN_SPECIALIZED.get(key)
+    if cached is not None:
+        return cached, key
+
+    failed = _FLEX_ATTN_FAILED.get(key)
+    if failed is not None:
+        return _torch_flex_attention, key
+
+    with _FLEX_ATTN_SPECIALIZE_LOCK:
+        cached = _FLEX_ATTN_SPECIALIZED.get(key)
+        if cached is not None:
+            return cached, key
+        failed = _FLEX_ATTN_FAILED.get(key)
+        if failed is not None:
+            return _torch_flex_attention, key
+        try:
+            compiled = _compile_flex_attention_wrapper(
+                mode=mode, dynamic=dynamic, flex_kwargs=flex_kwargs
+            )
+            _FLEX_ATTN_SPECIALIZED[key] = compiled
+            return compiled, key
+        except Exception as exc:
+            _FLEX_ATTN_FAILED[key] = f"{type(exc).__name__}: {exc}"
+            _warn_once(
+                f"flexattn-compile-failed-{hash(key)}",
+                "FlexAttention: torch.compile() failed; falling back to eager. "
+                f"(mode={mode!r}, dynamic={dynamic!r})\n"
+                f"{type(exc).__name__}: {exc}",
+            )
+            return _torch_flex_attention, key
 
 def _get_compiled_flex_attention() -> Any:
     if not _HAS_TORCH_FLEX or _torch_flex_attention is None:
@@ -1517,25 +1690,29 @@ class FlexAttention(nn.Module):
             if "kernel_options" in _FLEX_KWARGS and kernel_options is not None:
                 flex_kwargs["kernel_options"] = kernel_options
 
-            flex_fn = _get_compiled_flex_attention()
+            flex_fn, flex_key = _get_compiled_flex_attention_for_kwargs(q, flex_kwargs)
             try:
-                return flex_fn(q, k, v, **flex_kwargs)
+                if flex_fn is _torch_flex_attention:
+                    return _call_torch_flex_attention_eager(
+                        q, k, v, flex_kwargs=flex_kwargs
+                    )
+                return flex_fn(q, k, v)
             except Exception as exc:
-                msg = str(exc)
-
-                if (
-                    "matmul precision" in msg
-                    and "legacy" in msg
-                    and "new" in msg
-                ):
+                if _is_compile_failure(exc):
                     with contextlib.suppress(Exception):
-                        mode = _flex_attention_compile_mode()
-                        _FLEX_ATTN_COMPILED[mode] = _torch_flex_attention
-
-                with contextlib.suppress(Exception):
-                    mode = _flex_attention_compile_mode()
-                    _FLEX_ATTN_COMPILED[mode] = _torch_flex_attention
-                return _torch_flex_attention(q, k, v, **flex_kwargs)
+                        _FLEX_ATTN_FAILED[flex_key] = (
+                            f"{type(exc).__name__}: {exc}"
+                        )
+                        _FLEX_ATTN_SPECIALIZED.pop(flex_key, None)
+                    _warn_once(
+                        f"flexattn-runtime-failed-{hash(flex_key)}",
+                        "FlexAttention: compiled execution failed; falling back to eager.\n"
+                        f"{type(exc).__name__}: {exc}",
+                    )
+                    return _call_torch_flex_attention_eager(
+                        q, k, v, flex_kwargs=flex_kwargs
+                    )
+                raise
         return self._reference(
             q,
             k,

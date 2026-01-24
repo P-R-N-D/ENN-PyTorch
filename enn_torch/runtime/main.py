@@ -5691,6 +5691,16 @@ def process(*args: Any, **kwargs: Any) -> object:
         cfg = replace(cfg, device=device)
         if _env_flag("ENN_MAX_PERF", True):
             cm = canonicalize_compile_mode(getattr(cfg, "compile_mode", None))
+            if cm == "reduce-overhead" and getattr(cfg, "compile_dynamic", None) is None:
+                with contextlib.suppress(Exception):
+                    setattr(cfg, "compile_dynamic", False)
+            if "ENN_COMPILE_DYNAMIC" in os.environ:
+                with contextlib.suppress(Exception):
+                    setattr(
+                        cfg,
+                        "compile_dynamic",
+                        bool(_env_flag("ENN_COMPILE_DYNAMIC", False)),
+                    )
             if cm == "disabled":
                 default_cm = env_str("ENN_SERVE_COMPILE_MODE")
                 if not default_cm:
