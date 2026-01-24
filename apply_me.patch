@@ -1,0 +1,1361 @@
+diff --git a/enn_torch/api.py b/enn_torch/api.py
+index 05a762e..53b80f2 100644
+--- a/enn_torch/api.py
++++ b/enn_torch/api.py
+@@ -814,6 +814,16 @@ def load_model(
+     config: ModelConfig | Mapping[str, object] | None = None,
+     map_location: TorchDeviceLike | None = None,
+     weights_only: bool = True,
++    openzl_memmap: bool = True,
++    openzl_lazy_tensors: bool = True,
++    openzl_check_content_checksum: bool | None = None,
++    openzl_check_compressed_checksum: bool | None = None,
++    *,
++    # Aliases for readability when working specifically with ".ozl" files.
++    ozl_memmap: bool | None = None,
++    ozl_lazy_tensors: bool | None = None,
++    ozl_check_content_checksum: bool | None = None,
++    ozl_check_compressed_checksum: bool | None = None,
+ ) -> Model:
+     p = Path(checkpoint_path)
+     load_dev = (
+@@ -821,6 +831,16 @@ def load_model(
+         if map_location is not None
+         else torch.device("cpu")
+     )
++
++    # Apply .ozl alias kwargs if provided.
++    if ozl_memmap is not None:
++        openzl_memmap = bool(ozl_memmap)
++    if ozl_lazy_tensors is not None:
++        openzl_lazy_tensors = bool(ozl_lazy_tensors)
++    if ozl_check_content_checksum is not None:
++        openzl_check_content_checksum = bool(ozl_check_content_checksum)
++    if ozl_check_compressed_checksum is not None:
++        openzl_check_compressed_checksum = bool(ozl_check_compressed_checksum)
+     if p.is_dir():
+         meta = _parse_meta(p)
+         use_in_dim = int(
+@@ -905,14 +925,55 @@ def load_model(
+         resize_scaler_buffer(model, sd)
+         model.load_state_dict(sd, strict=False)
+         return model
+-    obj = _torch_load_checkpoint(
+-        p, map_location=map_location or "cpu", weights_only=weights_only
+-    )
++    if suffix == ".ozl":
++        from .runtime.io import _openzl_load_checkpoint
++
++        obj = _openzl_load_checkpoint(
++            p,
++            openzl_memmap=openzl_memmap,
++            openzl_lazy_tensors=openzl_lazy_tensors,
++            openzl_check_content_checksum=openzl_check_content_checksum,
++            openzl_check_compressed_checksum=openzl_check_compressed_checksum,
++        )
++    else:
++        obj = _torch_load_checkpoint(
++            p, map_location=map_location or "cpu", weights_only=weights_only
++        )
+     if isinstance(obj, dict):
+         meta_in_dim = obj.get("in_dim")
+         meta_out_shape = obj.get("out_shape")
+         meta_cfg = obj.get("config")
+-        sd = obj["state_dict"] if "state_dict" in obj else obj
++
++        sd = None
++        # Preferred keys for structured checkpoints.
++        for k in (
++            "state_dict",
++            "model_state_dict",
++            "model",
++            "model_sd",
++            "weights",
++            "model_weights",
++        ):
++            v = obj.get(k)
++            if isinstance(v, dict):
++                sd = v
++                break
++
++        # Allow loading a raw torch state_dict (torch.save(model.state_dict())).
++        if sd is None:
++            try:
++                if obj and all(
++                    isinstance(k, str) and torch.is_tensor(v)
++                    for k, v in obj.items()
++                ):
++                    sd = obj
++            except Exception:
++                sd = None
++
++        if sd is None:
++            raise RuntimeError(
++                f"Checkpoint did not contain a recognizable state_dict: {str(p)!r}"
++            )
+     else:
+         meta_in_dim = None
+         meta_out_shape = None
+@@ -949,6 +1010,22 @@ def save_model(
+     optimizer: torch.optim.Optimizer | None = None,
+     extra: Mapping[str, object] | None = None,
+     *args: Any,
++    state_dict: Mapping[str, torch.Tensor] | None = None,
++    openzl_level: int | None = None,
++    openzl_format_version: int | None = None,
++    openzl_min_stream_size: int | None = None,
++    openzl_content_checksum: bool | None = None,
++    openzl_compressed_checksum: bool | None = None,
++    openzl_permissive: bool | None = None,
++    openzl_pack_by_dtype: bool = True,
++    # Aliases for readability when working specifically with ".ozl" files.
++    ozl_level: int | None = None,
++    ozl_format_version: int | None = None,
++    ozl_min_stream_size: int | None = None,
++    ozl_content_checksum: bool | None = None,
++    ozl_compressed_checksum: bool | None = None,
++    ozl_permissive: bool | None = None,
++    ozl_pack_by_dtype: bool | None = None,
+     ema_averager: object | None = None,
+     swa_averager: object | None = None,
+     **kwargs: Any,
+@@ -961,6 +1038,39 @@ def save_model(
+             raise TypeError(
+                 "Positional args are only supported for export converters; use keyword arguments for TorchIO.save()."
+             )
++
++        # Apply .ozl alias kwargs if provided.
++        if ozl_level is not None:
++            openzl_level = ozl_level
++        if ozl_format_version is not None:
++            openzl_format_version = ozl_format_version
++        if ozl_min_stream_size is not None:
++            openzl_min_stream_size = ozl_min_stream_size
++        if ozl_content_checksum is not None:
++            openzl_content_checksum = ozl_content_checksum
++        if ozl_compressed_checksum is not None:
++            openzl_compressed_checksum = ozl_compressed_checksum
++        if ozl_permissive is not None:
++            openzl_permissive = ozl_permissive
++        if ozl_pack_by_dtype is not None:
++            openzl_pack_by_dtype = bool(ozl_pack_by_dtype)
++
++        # OpenZL options are keyword-only here but we pass them through to Builder.save.
++        if openzl_level is not None:
++            kwargs["openzl_level"] = openzl_level
++        if openzl_format_version is not None:
++            kwargs["openzl_format_version"] = openzl_format_version
++        if openzl_min_stream_size is not None:
++            kwargs["openzl_min_stream_size"] = openzl_min_stream_size
++        if openzl_content_checksum is not None:
++            kwargs["openzl_content_checksum"] = openzl_content_checksum
++        if openzl_compressed_checksum is not None:
++            kwargs["openzl_compressed_checksum"] = openzl_compressed_checksum
++        if openzl_permissive is not None:
++            kwargs["openzl_permissive"] = openzl_permissive
++        # Default to packing tensors by dtype for fewer streams and better compression.
++        kwargs.setdefault("openzl_pack_by_dtype", openzl_pack_by_dtype)
++
+         merged_extra = dict(extra or {})
+         if ema_averager is not None and hasattr(ema_averager, "state_dict"):
+             with contextlib.suppress(Exception):
+@@ -969,7 +1079,12 @@ def save_model(
+             with contextlib.suppress(Exception):
+                 merged_extra["swa_averager_state"] = swa_averager.state_dict()
+         out = Builder.save(
+-            model, p, optimizer=optimizer, extra=merged_extra or None, **kwargs
++            model,
++            p,
++            optimizer=optimizer,
++            extra=merged_extra or None,
++            state_dict=state_dict,
++            **kwargs,
+         )
+         return str(out)
+     conv = Exporter.for_export(p.suffix)
+@@ -1170,13 +1285,25 @@ def train(
+         _clear_device_caches()
+         with _start_context():
+             elastic_launch(lc, process)(ops)
+-        fallback = os.path.join(ckpt_dir, "model.pt")
+-        if os.path.isfile(fallback):
+-            cpu_state = coerce_tensor(
+-                _torch_load_checkpoint(
+-                    fallback, map_location="cpu", weights_only=True
+-                )
++        # Prefer file-based checkpoints (OpenZL .ozl first, then legacy .pt) and
++        # fall back to DCP directory checkpoints.
++        fallback: str | None = None
++        for fname in ("model.ozl", "model.pt"):
++            fp = os.path.join(ckpt_dir, fname)
++            if os.path.isfile(fp):
++                fallback = fp
++                break
++
++        if fallback is not None:
++            # Load on CPU first to keep peak GPU memory low.
++            loaded = load_model(
++                fallback,
++                in_dim=getattr(model, "in_dim", None),
++                out_shape=getattr(model, "out_shape", None),
++                map_location="cpu",
++                openzl_memmap=True,
+             )
++            cpu_state = coerce_tensor(loaded.state_dict())
+ 
+             if isinstance(model, torch.nn.Module) and _has_meta_tensors(model):
+                 with contextlib.suppress(Exception):
+@@ -1209,9 +1336,11 @@ def train(
+         restore_path: str | None = None
+ 
+         with contextlib.suppress(Exception):
+-            fp = os.path.join(str(ckpt_dir or ""), "model.pt")
+-            if fp and os.path.isfile(fp):
+-                restore_path = fp
++            for _name in ("model.ozl", "model.pt"):
++                fp = os.path.join(str(ckpt_dir or ""), _name)
++                if fp and os.path.isfile(fp):
++                    restore_path = fp
++                    break
+         if (
+             restore_path is None
+             and init_ckpt_path
+@@ -1235,11 +1364,23 @@ def train(
+                             _meta = True
+                             break
+                 if _meta:
+-                    cpu_state = coerce_tensor(
+-                        _torch_load_checkpoint(
+-                            restore_path, map_location="cpu", weights_only=True
++                    if str(restore_path).lower().endswith(".ozl"):
++                        loaded = load_model(
++                            restore_path,
++                            in_dim=getattr(model, "in_dim", None),
++                            out_shape=getattr(model, "out_shape", None),
++                            map_location="cpu",
++                            openzl_memmap=True,
++                        )
++                        cpu_state = coerce_tensor(loaded.state_dict())
++                    else:
++                        cpu_state = coerce_tensor(
++                            _torch_load_checkpoint(
++                                restore_path,
++                                map_location="cpu",
++                                weights_only=True,
++                            )
+                         )
+-                    )
+                     with contextlib.suppress(Exception):
+                         if hasattr(model, "to_empty"):
+                             model.to_empty(device="cpu")
+diff --git a/enn_torch/runtime/io.py b/enn_torch/runtime/io.py
+index 6871576..28af037 100644
+--- a/enn_torch/runtime/io.py
++++ b/enn_torch/runtime/io.py
+@@ -3,14 +3,17 @@ from __future__ import annotations
+ 
+ import contextlib
+ import inspect
++import json
+ import os
++import pickle
+ import re
+ import sys
+ import tempfile
+ import warnings
+ import weakref
++from base64 import b64decode, b64encode
+ from pathlib import Path
+-from typing import TYPE_CHECKING, Any, Iterator, Sequence, Self
++from typing import TYPE_CHECKING, Any, Iterator, Mapping, Sequence, Self
+ 
+ import torch
+ from torch import nn
+@@ -152,8 +155,760 @@ def is_required(module: str, pip_hint: str | None = None) -> None:
+         ) from err
+ 
+ 
++# ------------------------------
++# OpenZL (.ozl) checkpoint format
++# ------------------------------
++
++_OZL_MAGIC = "enn-openzl-ckpt-v1"
++_OZL_TENSOR_MARKER = "__ozl_tensor__"
++_OZL_DICT_MARKER = "__ozl_dict__"
++_OZL_TUPLE_MARKER = "__ozl_tuple__"
++_OZL_PICKLE_MARKER = "__ozl_pickle__"
++
++_OPENZL_COMPRESSOR: object | None = None
++_OPENZL_LOCK = Mutex()
++
++
++def _openzl_import() -> Any:
++    """Import OpenZL lazily.
++
++    We keep OpenZL as an optional dependency; callers should only import it when
++    saving/loading .ozl checkpoints.
++    """
++
++    is_required("openzl.ext", "pip install openzl")
++    import openzl.ext as zl  # type: ignore
++
++    return zl
++
++
++def _openzl_get_default_compressor() -> Any:
++    global _OPENZL_COMPRESSOR
++    cached = _OPENZL_COMPRESSOR
++    if cached is not None:
++        return cached
++    with _OPENZL_LOCK:
++        cached = _OPENZL_COMPRESSOR
++        if cached is not None:
++            return cached
++        zl = _openzl_import()
++        compressor = zl.Compressor()
++
++        # Build one generic backend, and reuse it everywhere. We'll use a selector
++        # to route float buffers through FloatDeconstruct (when supported).
++        compress_graph = zl.graphs.Compress()
++        entropy_graph = zl.graphs.Entropy()
++        compress_id = compress_graph(compressor)
++        entropy_id = entropy_graph(compressor)
++
++        # Float deconstruct graphs (only if the binding exposes them).
++        f16_graph: Any | None = None
++        bf16_graph: Any | None = None
++        f32_graph: Any | None = None
++        with contextlib.suppress(Exception):
++            f16_graph = zl.nodes.Float16Deconstruct()(  # type: ignore[attr-defined]
++                compressor, sign_frac=compress_id, exponent=entropy_id
++            )
++        with contextlib.suppress(Exception):
++            bf16_graph = zl.nodes.BFloat16Deconstruct()(  # type: ignore[attr-defined]
++                compressor, sign_frac=compress_id, exponent=entropy_id
++            )
++        with contextlib.suppress(Exception):
++            f32_graph = zl.nodes.Float32Deconstruct()(  # type: ignore[attr-defined]
++                compressor, sign_frac=compress_id, exponent=entropy_id
++            )
++
++
++        # Float64: generic byte-lane transpose via struct conversion + TransposeSplit.
++        # This is a broadly useful, lossless transform for float64 that can expose
++        # higher-order-byte patterns (similar to a byte-shuffle) to downstream codecs.
++        f64_graph: Any | None = None
++        with contextlib.suppress(Exception):
++            f64_graph = zl.nodes.ConvertNumToStructLE()(  # type: ignore[attr-defined]
++                compressor,
++                successor=zl.nodes.TransposeSplit()(  # type: ignore[attr-defined]
++                    compressor,
++                    successor=compress_id,
++                ),
++            )
++
++
++        # Integer graphs (general-purpose). Prefer FieldLZ for integer numeric data,
++        # and optionally add lightweight transforms when they are clearly beneficial.
++        int_fieldlz_id: Any = compress_id
++        int_rangepack_fieldlz_id: Any | None = None
++        int_zigzag_rangepack_fieldlz_id: Any | None = None
++        with contextlib.suppress(Exception):
++            int_fieldlz_id = zl.graphs.FieldLz()(compressor)
++        with contextlib.suppress(Exception):
++            int_rangepack_fieldlz_id = zl.nodes.RangePack()(  # type: ignore[attr-defined]
++                compressor, successor=int_fieldlz_id
++            )
++        with contextlib.suppress(Exception):
++            int_zigzag_rangepack_fieldlz_id = zl.nodes.Zigzag()(  # type: ignore[attr-defined]
++                compressor, successor=(int_rangepack_fieldlz_id or int_fieldlz_id)
++            )
++
++        class _ENNCheckpointSelector(zl.Selector):
++            def __init__(
++                self,
++                *,
++                serial_graph: Any,
++                default_numeric_graph: Any,
++                f16_graph: Any | None,
++                bf16_graph: Any | None,
++                f32_graph: Any | None,
++                f64_graph: Any | None,
++                int_fieldlz_graph: Any,
++                int_rangepack_graph: Any | None,
++                int_zigzag_rangepack_graph: Any | None,
++            ) -> None:
++                super().__init__()
++                self._serial_graph = serial_graph
++                self._default_numeric_graph = default_numeric_graph
++                self._float_graphs: dict[torch.dtype, Any] = {}
++                if f16_graph is not None:
++                    self._float_graphs[torch.float16] = f16_graph
++                if bf16_graph is not None:
++                    self._float_graphs[torch.bfloat16] = bf16_graph
++                if f32_graph is not None:
++                    self._float_graphs[torch.float32] = f32_graph
++                self._f64_graph = f64_graph
++
++                # Integer graphs (IDs).
++                self._int_fieldlz_graph = int_fieldlz_graph
++                self._int_rangepack_graph = int_rangepack_graph
++                self._int_zigzag_rangepack_graph = int_zigzag_rangepack_graph
++
++            def selector_description(self) -> Any:
++                return zl.SelectorDescription(
++                    name="enn_ckpt_selector",
++                    input_type_mask=zl.TypeMask.Serial | zl.TypeMask.Numeric,
++                )
++
++            @staticmethod
++            def _min_width_bytes_unsigned(v: int) -> int:
++                # Aligned with OpenZL's common 1/2/4/8-byte integer widths.
++                if v <= 0xFF:
++                    return 1
++                if v <= 0xFFFF:
++                    return 2
++                if v <= 0xFFFFFFFF:
++                    return 4
++                return 8
++
++            def _pick_int_graph(self, t: torch.Tensor) -> Any:
++                # Default: FieldLZ for ints (more structure-aware than generic zstd).
++                base = self._int_fieldlz_graph
++                def _env_int(name: str, default: int) -> int:
++                    with contextlib.suppress(Exception):
++                        v = os.environ.get(name, '')
++                        if v is None:
++                            return default
++                        v = v.strip()
++                        if not v:
++                            return default
++                        return int(v)
++                    return default
++                try:
++                    n = int(t.numel())
++                except Exception:
++                    return base
++
++                # AUTO scan knobs (keep defaults safe/cheap; override via env when needed).
++                min_n = _env_int('ENN_OPENZL_INT_AUTO_MIN_N', 128)
++                if min_n < 0:
++                    min_n = 0
++                if n < min_n:
++                    return base
++
++                try:
++                    flat = t.reshape(-1)
++                    max_sample = _env_int('ENN_OPENZL_INT_AUTO_SAMPLE_N', 4096)
++                    if max_sample <= 0:
++                        max_sample = 4096
++                    sample_n = max_sample if n > max_sample else n
++                    sample = flat[:sample_n]
++                    # torch reductions on CPU are fast enough for this sampling.
++                    min_v = int(sample.min().item())
++                    max_v = int(sample.max().item())
++                except Exception:
++                    return base
++
++                try:
++                    elem_bytes = int(t.element_size())
++                except Exception:
++                    elem_bytes = 0
++                if elem_bytes <= 1:
++                    return base
++
++                has_neg = min_v < 0
++                # Prefer Zigzag -> RangePack when the buffer contains negatives AND
++                # this will shrink the integer width.
++                if has_neg and self._int_zigzag_rangepack_graph is not None:
++                    absmax = max(abs(min_v), abs(max_v))
++                    max_map = absmax * 2 + 1
++                    need = self._min_width_bytes_unsigned(int(max_map))
++                    if need < elem_bytes:
++                        return self._int_zigzag_rangepack_graph
++
++                # Otherwise, try RangePack when it can shrink the width.
++                if self._int_rangepack_graph is not None:
++                    rng = max_v - min_v
++                    if rng < 0:
++                        rng = -rng
++                    need = self._min_width_bytes_unsigned(int(rng))
++                    if need < elem_bytes:
++                        return self._int_rangepack_graph
++
++                return base
++
++
++            @staticmethod
++            def _dominant_byte_ratio_u8(x: torch.Tensor) -> float:
++                """Return max(byte_frequency)/N for a uint8 tensor."""
++                try:
++                    n = int(x.numel())
++                    if n <= 0:
++                        return 0.0
++                    bc = torch.bincount(x.to(torch.int64), minlength=256)
++                    return float(bc.max().item()) / float(n)
++                except Exception:
++                    return 0.0
++
++            def _pick_f64_graph(self, t: torch.Tensor) -> Any:
++                """Auto-select float64 graph.
++
++                Default is auto-scan. We only use the transpose-based float64 graph when
++                MSB lanes show clear low-entropy patterns (common for bounded floats).
++                """
++                g = self._f64_graph
++                if g is None:
++                    return self._default_numeric_graph
++
++                def _env_int(name: str, default: int) -> int:
++                    with contextlib.suppress(Exception):
++                        v = os.environ.get(name, '')
++                        if v is None:
++                            return default
++                        v = v.strip()
++                        if not v:
++                            return default
++                        return int(v)
++                    return default
++
++                def _env_float(name: str, default: float) -> float:
++                    with contextlib.suppress(Exception):
++                        v = os.environ.get(name, '')
++                        if v is None:
++                            return default
++                        v = v.strip()
++                        if not v:
++                            return default
++                        return float(v)
++                    return default
++
++                # Optional override knob; keep default 'auto' for zero-config safety.
++                strat = os.environ.get('ENN_OPENZL_FP64_STRATEGY', 'auto').strip().lower()
++                if strat in ('compress', 'generic', 'off', '0', 'false'):
++                    return self._default_numeric_graph
++                if strat in ('transpose', 'on', '1', 'true'):
++                    return g
++
++                # Auto scan: small buffers aren't worth extra graph complexity.
++                try:
++                    n = int(t.numel())
++                except Exception:
++                    return g
++
++                min_n = _env_int('ENN_OPENZL_FP64_AUTO_MIN_N', 256)
++                if min_n < 0:
++                    min_n = 0
++                if n < min_n:
++                    return self._default_numeric_graph
++
++                try:
++                    flat = t.reshape(-1)
++                    max_sample = _env_int('ENN_OPENZL_FP64_AUTO_SAMPLE_N', 4096)
++                    if max_sample <= 0:
++                        max_sample = 4096
++                    sample_n = max_sample if n > max_sample else n
++                    sample = flat[:sample_n].contiguous()
++                    # Reinterpret as little-endian bytes: shape (sample_n, 8).
++                    b = sample.view(torch.uint8).view(sample_n, 8)
++                    # Most significant bytes are last for LE.
++                    lane7 = b[:, 7]
++                    lane6 = b[:, 6]
++
++                    u7 = int(torch.unique(lane7).numel())
++                    u6 = int(torch.unique(lane6).numel())
++
++                    # Heuristic: if MSB lanes have low uniqueness, transposing helps.
++                    u7_thr = _env_int('ENN_OPENZL_FP64_AUTO_UNIQUE_LANE7', 64)
++                    u6_thr = _env_int('ENN_OPENZL_FP64_AUTO_UNIQUE_LANE6', 128)
++                    if u7_thr < 1:
++                        u7_thr = 1
++                    if u6_thr < 1:
++                        u6_thr = 1
++                    if u7 <= u7_thr or u6 <= u6_thr:
++                        return g
++
++                    # Another signal: strong mode in MSB byte.
++                    dom_thr = _env_float('ENN_OPENZL_FP64_AUTO_DOMINANT_RATIO', 0.55)
++                    if dom_thr < 0.0:
++                        dom_thr = 0.0
++                    if dom_thr > 1.0:
++                        dom_thr = 1.0
++                    if self._dominant_byte_ratio_u8(lane7) >= dom_thr:
++                        return g
++                except Exception:
++                    # If scanning fails, prefer generic compression for stability.
++                    return self._default_numeric_graph
++
++                return self._default_numeric_graph
++            def select(self, state: Any, input: Any) -> Any:
++                # Route meta.json (serial) through the generic compress backend.
++                if input.type == zl.Type.Serial:
++                    return self._serial_graph
++                if input.type == zl.Type.Numeric:
++                    # Prefer torch dtype detection (covers bfloat16 reliably).
++                    t: torch.Tensor | None = None
++                    with contextlib.suppress(Exception):
++                        t = input.content.as_pytensor()
++                    if t is not None:
++                        dt = getattr(t, "dtype", None)
++                        if isinstance(dt, torch.dtype):
++                            if dt == torch.float64:
++                                return self._pick_f64_graph(t)
++                            g = self._float_graphs.get(dt)
++                            if g is not None:
++                                return g
++                        # Integer path (covers signed/unsigned/bool). Float dtypes were
++                        # already handled above.
++                        if not torch.is_floating_point(t):
++                            # Don't mis-handle complex / non-integer numeric buffers.
++                            with contextlib.suppress(Exception):
++                                if t.is_complex():
++                                    return self._default_numeric_graph
++                            if t.dtype == torch.bool:
++                                return self._pick_int_graph(t)
++                            try:
++                                torch.iinfo(t.dtype)
++                            except Exception:
++                                return self._default_numeric_graph
++                            return self._pick_int_graph(t)
++                    return self._default_numeric_graph
++                # Fallback (shouldn't happen for our checkpoint inputs).
++                return self._default_numeric_graph
++
++        selector_graph = compressor.register_selector_graph(
++            _ENNCheckpointSelector(
++                serial_graph=compress_id,
++                default_numeric_graph=compress_id,
++                f16_graph=f16_graph,
++                bf16_graph=bf16_graph,
++                f32_graph=f32_graph,
++                f64_graph=f64_graph,
++                int_fieldlz_graph=int_fieldlz_id,
++                int_rangepack_graph=int_rangepack_fieldlz_id,
++                int_zigzag_rangepack_graph=int_zigzag_rangepack_fieldlz_id,
++            )
++        )
++        compressor.select_starting_graph(selector_graph)
++        _OPENZL_COMPRESSOR = compressor
++        return compressor
++
++
++def _torch_dtype_from_str(dtype_str: str) -> torch.dtype:
++    # Accept both "torch.float32" and "float32".
++    s = str(dtype_str)
++    if s.startswith("torch."):
++        s = s.split(".", 1)[1]
++    dt = getattr(torch, s, None)
++    if not isinstance(dt, torch.dtype):
++        raise ValueError(f"Unsupported dtype string: {dtype_str!r}")
++    return dt
++
++
++def _ozl_jsonify(obj: object, *, tensors: list[torch.Tensor], tensor_table: list[dict[str, Any]]) -> object:
++    """Convert an arbitrary Python object into a JSON-serializable structure.
++
++    Torch tensors are extracted into `tensors` and represented by a lightweight
++    placeholder referencing `tensor_table`.
++    """
++
++    from ..core.tensor import coerce_tensor
++
++    if torch.is_tensor(obj):
++        t = coerce_tensor(obj)
++        tid = len(tensors)
++        tensors.append(t.reshape(-1))
++        tensor_table.append(
++            {
++                "dtype": str(t.dtype),
++                "shape": list(t.shape),
++                "numel": int(t.numel()),
++            }
++        )
++        return {_OZL_TENSOR_MARKER: tid}
++    if obj is None or isinstance(obj, (bool, int, float, str)):
++        return obj
++    if isinstance(obj, (list, tuple)):
++        seq = [_ozl_jsonify(v, tensors=tensors, tensor_table=tensor_table) for v in obj]
++        if isinstance(obj, tuple):
++            return {_OZL_TUPLE_MARKER: seq}
++        return seq
++    if isinstance(obj, dict):
++        items = [
++            [
++                _ozl_jsonify(k, tensors=tensors, tensor_table=tensor_table),
++                _ozl_jsonify(v, tensors=tensors, tensor_table=tensor_table),
++            ]
++            for k, v in obj.items()
++        ]
++        return {_OZL_DICT_MARKER: items}
++
++    # Best-effort fallback: try JSON coercion, else pickle.
++    try:
++        return coerce_json(obj)
++    except Exception:
++        try:
++            return {_OZL_PICKLE_MARKER: b64encode(pickle.dumps(obj)).decode("ascii")}
++        except Exception:
++            return repr(obj)
++
++
++def _ozl_unjsonify(
++    obj: object,
++    *,
++    tensors: list[torch.Tensor],
++    tensor_table: Sequence[Mapping[str, Any]],
++) -> object:
++    """Inverse of `_ozl_jsonify`. Re-inserts tensors from the decoded buffers."""
++
++    if isinstance(obj, list):
++        return [_ozl_unjsonify(v, tensors=tensors, tensor_table=tensor_table) for v in obj]
++    if isinstance(obj, dict):
++        if _OZL_TENSOR_MARKER in obj:
++            tid = int(obj[_OZL_TENSOR_MARKER])
++            entry = tensor_table[tid]
++            shape = tuple(int(x) for x in (entry.get("shape") or ()))
++            t = tensors[tid]
++            # Ensure shape matches even for scalars/empties.
++            return t.view(shape) if shape else t.reshape(())
++        if _OZL_TUPLE_MARKER in obj:
++            vals = obj.get(_OZL_TUPLE_MARKER) or []
++            return tuple(
++                _ozl_unjsonify(v, tensors=tensors, tensor_table=tensor_table) for v in vals
++            )
++        if _OZL_DICT_MARKER in obj:
++            out: dict[Any, Any] = {}
++            pairs = obj.get(_OZL_DICT_MARKER) or []
++            for k_raw, v_raw in pairs:
++                k = _ozl_unjsonify(k_raw, tensors=tensors, tensor_table=tensor_table)
++                v = _ozl_unjsonify(v_raw, tensors=tensors, tensor_table=tensor_table)
++                # JSON lists are unhashable; normalize if they appear as keys.
++                if isinstance(k, list):
++                    k = tuple(k)
++                out[k] = v
++            return out
++        if _OZL_PICKLE_MARKER in obj:
++            try:
++                return pickle.loads(b64decode(str(obj[_OZL_PICKLE_MARKER])))
++            except Exception:
++                return None
++        return {
++            k: _ozl_unjsonify(v, tensors=tensors, tensor_table=tensor_table)
++            for k, v in obj.items()
++        }
++    return obj
++
++
++def _openzl_pack_tensors_by_dtype(
++    tensors: Sequence[torch.Tensor], tensor_table: list[dict[str, Any]]
++) -> tuple[list[str], list[torch.Tensor]]:
++    """Pack 1D tensors into a small number of dtype-homogeneous buffers."""
++
++    # Group by dtype, but keep the original tensor id ordering within each group.
++    groups: dict[torch.dtype, list[tuple[int, torch.Tensor]]] = {}
++    for tid, t in enumerate(tensors):
++        groups.setdefault(t.dtype, []).append((tid, t))
++
++    dtype_order = sorted(groups.keys(), key=lambda d: str(d))
++    dtype_buffers: list[torch.Tensor] = []
++    dtype_names: list[str] = []
++
++    for buf_idx, dt in enumerate(dtype_order):
++        items = groups[dt]
++        total = int(sum(int(t.numel()) for _, t in items))
++        buf = torch.empty((total,), dtype=dt, device="cpu")
++        offset = 0
++        for tid, t in items:
++            n = int(t.numel())
++            if n:
++                buf[offset : offset + n].copy_(t, non_blocking=False)
++            tensor_table[tid]["buffer"] = int(buf_idx)
++            tensor_table[tid]["offset"] = int(offset)
++            offset += n
++        dtype_names.append(str(dt))
++        dtype_buffers.append(buf)
++
++    return dtype_names, dtype_buffers
++
++
++def _openzl_compress_payload(
++    payload: object,
++    *,
++    openzl_level: int | None = None,
++    openzl_format_version: int | None = None,
++    openzl_min_stream_size: int | None = None,
++    openzl_content_checksum: bool | None = None,
++    openzl_compressed_checksum: bool | None = None,
++    openzl_permissive: bool | None = None,
++    openzl_pack_by_dtype: bool = True,
++) -> bytes:
++    """Serialize + compress an arbitrary payload into a single OpenZL frame."""
++
++    zl = _openzl_import()
++    compressor = _openzl_get_default_compressor()
++
++    tensors: list[torch.Tensor] = []
++    tensor_table: list[dict[str, Any]] = []
++    payload_meta = _ozl_jsonify(payload, tensors=tensors, tensor_table=tensor_table)
++
++    if openzl_pack_by_dtype:
++        dtype_names, dtype_buffers = _openzl_pack_tensors_by_dtype(
++            tensors, tensor_table
++        )
++    else:
++        # One buffer per tensor.
++        dtype_names = [str(t.dtype) for t in tensors]
++        dtype_buffers = list(tensors)
++        for tid, t in enumerate(tensors):
++            tensor_table[tid]["buffer"] = int(tid)
++            tensor_table[tid]["offset"] = 0
++
++    meta = {
++        "magic": _OZL_MAGIC,
++        "payload": payload_meta,
++        "tensor_table": tensor_table,
++        "dtype_buffers": dtype_names,
++    }
++    meta_bytes = json.dumps(meta, separators=(",", ":")).encode("utf-8")
++
++    inputs: list[Any] = [zl.Input(zl.Type.Serial, meta_bytes)]
++    for buf in dtype_buffers:
++        # Numeric buffers allow OpenZL transforms (e.g. float deconstruct) to kick in.
++        inputs.append(zl.Input(zl.Type.Numeric, buf))
++
++    cctx = zl.CCtx()
++    cctx.ref_compressor(compressor)
++    # Prefer latest supported format version unless overridden.
++    fmt = (
++        int(openzl_format_version)
++        if openzl_format_version is not None
++        else int(getattr(zl, "MAX_FORMAT_VERSION", 0))
++    )
++    with contextlib.suppress(Exception):
++        cctx.set_parameter(zl.CParam.FormatVersion, fmt)
++    if openzl_level is not None:
++        with contextlib.suppress(Exception):
++            cctx.set_parameter(zl.CParam.CompressionLevel, int(openzl_level))
++    if openzl_min_stream_size is not None:
++        with contextlib.suppress(Exception):
++            cctx.set_parameter(zl.CParam.MinStreamSize, int(openzl_min_stream_size))
++    if openzl_content_checksum is not None:
++        with contextlib.suppress(Exception):
++            cctx.set_parameter(
++                zl.CParam.ContentChecksum, int(bool(openzl_content_checksum))
++            )
++    if openzl_compressed_checksum is not None:
++        with contextlib.suppress(Exception):
++            cctx.set_parameter(
++                zl.CParam.CompressedChecksum, int(bool(openzl_compressed_checksum))
++            )
++    if openzl_permissive is not None:
++        with contextlib.suppress(Exception):
++            cctx.set_parameter(
++                zl.CParam.PermissiveCompression, int(bool(openzl_permissive))
++            )
++
++    return bytes(cctx.compress(inputs))
++
++
++def _openzl_decompress_payload(
++    blob: object,
++    *,
++    openzl_lazy_tensors: bool = True,
++    openzl_check_content_checksum: bool | None = None,
++    openzl_check_compressed_checksum: bool | None = None,
++) -> object:
++    """Decompress + deserialize an OpenZL frame into the original payload."""
++
++    zl = _openzl_import()
++    dctx = zl.DCtx()
++    if openzl_check_content_checksum is not None:
++        with contextlib.suppress(Exception):
++            dctx.set_parameter(
++                zl.DParam.CheckContentChecksum,
++                int(bool(openzl_check_content_checksum)),
++            )
++    if openzl_check_compressed_checksum is not None:
++        with contextlib.suppress(Exception):
++            dctx.set_parameter(
++                zl.DParam.CheckCompressedChecksum,
++                int(bool(openzl_check_compressed_checksum)),
++            )
++
++    outs = dctx.decompress(blob)  # bytes-like
++    if not outs:
++        raise RuntimeError("OpenZL decompression returned no outputs")
++
++    meta_bytes = outs[0].content.as_bytes()
++    meta = json.loads(meta_bytes.decode("utf-8"))
++    if meta.get("magic") != _OZL_MAGIC:
++        raise ValueError("Not an ENN OpenZL checkpoint")
++
++    tensor_table = meta.get("tensor_table") or []
++    dtype_names = meta.get("dtype_buffers") or []
++
++    # Decode dtype buffers.
++    dtype_bufs: list[torch.Tensor] = []
++    for i, dt_name in enumerate(dtype_names):
++        target = _torch_dtype_from_str(dt_name)
++        raw = outs[i + 1].content.as_pytensor()
++        # Some bindings expose numeric buffers as uint{8,16,32,64}; reinterpret if needed.
++        if getattr(raw, "dtype", None) != target:
++            with contextlib.suppress(Exception):
++                raw = raw.view(target)
++        if getattr(raw, "dtype", None) != target:
++            # Fall back to a copy via bytes.
++            b = outs[i + 1].content.as_bytes()
++            raw = torch.frombuffer(b, dtype=target)
++        dtype_bufs.append(raw.reshape(-1))
++
++    # If requested, materialize dtype buffers to decouple tensors from OpenZL-managed buffers.
++    # This clones each dtype buffer once (still keeps per-tensor views cheap).
++    if not openzl_lazy_tensors:
++        dtype_bufs = [b.clone() for b in dtype_bufs]
++
++    # Materialize per-tensor views.
++    tensors: list[torch.Tensor] = [torch.empty(0)] * int(len(tensor_table))
++    for tid, entry in enumerate(tensor_table):
++        dt_name = entry.get("dtype")
++        shape = tuple(int(x) for x in (entry.get("shape") or ()))
++        numel = int(entry.get("numel") or 0)
++        buf_idx = int(entry.get("buffer") or 0)
++        offset = int(entry.get("offset") or 0)
++
++        if numel <= 0:
++            tensors[tid] = torch.empty(shape, dtype=_torch_dtype_from_str(dt_name))
++            continue
++        buf = dtype_bufs[buf_idx]
++        view = buf[offset : offset + numel]
++        # Ensure dtype matches what we recorded.
++        target = _torch_dtype_from_str(dt_name)
++        if getattr(view, "dtype", None) != target:
++            with contextlib.suppress(Exception):
++                view = view.view(target)
++        tensors[tid] = view.view(shape) if shape else view.reshape(())
++
++    payload_meta = meta.get("payload")
++    return _ozl_unjsonify(payload_meta, tensors=tensors, tensor_table=tensor_table)
++
++
++def _openzl_load_checkpoint(
++    path: PathLike,
++    *,
++    openzl_memmap: bool = True,
++    openzl_lazy_tensors: bool = True,
++    openzl_check_content_checksum: bool | None = None,
++    openzl_check_compressed_checksum: bool | None = None,
++) -> object:
++    """Load an OpenZL checkpoint from disk."""
++
++    p = Path(path)
++    if not p.is_file():
++        raise FileNotFoundError(str(p))
++
++    if not openzl_memmap:
++        data = p.read_bytes()
++        return _openzl_decompress_payload(
++            data,
++            openzl_lazy_tensors=openzl_lazy_tensors,
++            openzl_check_content_checksum=openzl_check_content_checksum,
++            openzl_check_compressed_checksum=openzl_check_compressed_checksum,
++        )
++
++    # Best-effort memory-map: if the binding rejects buffer objects, fall back.
++    import mmap
++
++    with p.open("rb") as f:
++        mm = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
++        try:
++            mv = memoryview(mm)
++            try:
++                return _openzl_decompress_payload(
++                    mv,
++                    openzl_lazy_tensors=openzl_lazy_tensors,
++                    openzl_check_content_checksum=openzl_check_content_checksum,
++                    openzl_check_compressed_checksum=openzl_check_compressed_checksum,
++                )
++            except TypeError:
++                return _openzl_decompress_payload(
++                    bytes(mv),
++                    openzl_lazy_tensors=openzl_lazy_tensors,
++                    openzl_check_content_checksum=openzl_check_content_checksum,
++                    openzl_check_compressed_checksum=openzl_check_compressed_checksum,
++                )
++        finally:
++            with contextlib.suppress(Exception):
++                mm.close()
++
++
++def _openzl_save_checkpoint(
++    path: PathLike,
++    payload: object,
++    *,
++    openzl_level: int | None = None,
++    openzl_format_version: int | None = None,
++    openzl_min_stream_size: int | None = None,
++    openzl_content_checksum: bool | None = None,
++    openzl_compressed_checksum: bool | None = None,
++    openzl_permissive: bool | None = None,
++    openzl_pack_by_dtype: bool = True,
++) -> None:
++    p = Path(path)
++    p.parent.mkdir(parents=True, exist_ok=True)
++    blob = _openzl_compress_payload(
++        payload,
++        openzl_level=openzl_level,
++        openzl_format_version=openzl_format_version,
++        openzl_min_stream_size=openzl_min_stream_size,
++        openzl_content_checksum=openzl_content_checksum,
++        openzl_compressed_checksum=openzl_compressed_checksum,
++        openzl_permissive=openzl_permissive,
++        openzl_pack_by_dtype=openzl_pack_by_dtype,
++    )
++
++    fd, tmp_name = tempfile.mkstemp(
++        prefix=p.name + ".",
++        suffix=p.suffix + ".tmp",
++        dir=str(p.parent),
++    )
++    os.close(fd)
++    tmp_path = Path(tmp_name)
++    try:
++        with tmp_path.open("wb") as f:
++            f.write(blob)
++        tmp_path.replace(p)
++    finally:
++        with contextlib.suppress(Exception):
++            tmp_path.unlink() if tmp_path.exists() else None
++
++
+ class Builder:
+-    NATIVE_EXTS = {".pt", ".pth", ".safetensors"}
++    NATIVE_EXTS = {".pt", ".pth", ".safetensors", ".ozl"}
+ 
+     @staticmethod
+     def is_target_native(path: PathLike) -> bool:
+@@ -166,6 +921,7 @@ class Builder:
+         path: PathLike,
+         optimizer: object | None = None,
+         extra: object | None = None,
++        state_dict: object | None = None,
+         **opts: Any,
+     ) -> object:
+         p = Path(path)
+@@ -213,6 +969,35 @@ class Builder:
+         with _save_sync(p, barrier=False):
+             if not is_rank0():
+                 return p
++            # Choose state_dict source (allows callers to override with a CPU offloaded dict).
++            sd = state_dict if state_dict is not None else model.state_dict()
++            if p.suffix == ".ozl":
++                payload = {**_make_meta(), "state_dict": sd, "format": "openzl-ckpt-v1"}
++                if optimizer is not None:
++                    with contextlib.suppress(Exception):
++                        payload["optimizer_state_dict"] = optimizer.state_dict()
++
++                _openzl_save_checkpoint(
++                    p,
++                    payload,
++                    openzl_level=opts.pop("openzl_level", None),
++                    openzl_format_version=opts.pop("openzl_format_version", None),
++                    openzl_min_stream_size=opts.pop("openzl_min_stream_size", None),
++                    openzl_content_checksum=opts.pop("openzl_content_checksum", None),
++                    openzl_compressed_checksum=opts.pop(
++                        "openzl_compressed_checksum", None
++                    ),
++                    openzl_permissive=opts.pop("openzl_permissive", None),
++                    openzl_pack_by_dtype=bool(opts.pop("openzl_pack_by_dtype", True)),
++                )
++                meta = _make_meta()
++                meta["format"] = "openzl-ckpt-v1"
++                write_json(p.with_name(p.name + ".json"), meta, indent=2)
++                with contextlib.suppress(Exception):
++                    legacy = p.with_suffix(".json")
++                    if legacy != p.with_name(p.name + ".json"):
++                        write_json(legacy, meta, indent=2)
++                return p
+             if p.suffix == ".safetensors":
+                 is_required("safetensors", "pip install safetensors")
+                 from safetensors.torch import save_file as save_tensors
+@@ -230,7 +1015,7 @@ class Builder:
+                     save_tensors(
+                         {
+                             k: coerce_tensor(v)
+-                            for k, v in model.state_dict().items()
++                            for k, v in (sd.items() if hasattr(sd, "items") else {})
+                         },
+                         str(tmp_path),
+                         metadata={"format": "safetensors-v1"},
+@@ -246,7 +1031,7 @@ class Builder:
+                     if legacy != p.with_name(p.name + ".json"):
+                         write_json(legacy, meta, indent=2)
+                 return p
+-            payload = {**_make_meta(), "state_dict": model.state_dict()}
++            payload = {**_make_meta(), "state_dict": sd}
+             if optimizer is not None:
+                 with contextlib.suppress(Exception):
+                     payload["optimizer_state_dict"] = optimizer.state_dict()
+@@ -360,4 +1145,4 @@ try:
+     from torch.serialization import add_safe_globals
+ except ImportError:
+     add_safe_globals = None
+-_register_safe_globals()
++_register_safe_globals()
+\ No newline at end of file
+diff --git a/enn_torch/runtime/main.py b/enn_torch/runtime/main.py
+index 1a39230..c280d23 100644
+--- a/enn_torch/runtime/main.py
++++ b/enn_torch/runtime/main.py
+@@ -4035,8 +4035,20 @@ def epochs(
+                     except Exception:
+                         ckpt_dir = None
+                 if ckpt_dir:
+-                    ckpt_path = os.path.join(ckpt_dir, "model.pt")
+-                    tmp_path = ckpt_path + ".tmp"
++                    ckpt_ext = os.environ.get("ENN_CKPT_EXT")
++                    if ckpt_ext:
++                        if not ckpt_ext.startswith("."):
++                            ckpt_ext = "." + ckpt_ext
++                        ckpt_ext = ckpt_ext.lower()
++                    else:
++                        try:
++                            import openzl.ext  # noqa: F401
++
++                            ckpt_ext = ".ozl"
++                        except Exception:
++                            ckpt_ext = ".pt"
++
++                    ckpt_path = os.path.join(ckpt_dir, "model" + ckpt_ext)
+                     model_sd = swa_helper.checkpoint_state_dict(
+                         swa_target,
+                         include_buffers=True,
+@@ -4055,8 +4067,45 @@ def epochs(
+                         f"Training ({str(device.type).upper()}) Updating Checkpoint at {round(ckpt_percentage)}% (Total = {int(ops.epochs)}, Finished = {int(epoch_idx)})",
+                         flush=True,
+                     )
+-                    torch.save(model_sd, tmp_path)
+-                    os.replace(tmp_path, ckpt_path)
++                    from ..api import save_model as _api_save_model
++
++                    _ozl_kwargs: dict[str, object] = {}
++                    if str(ckpt_path).lower().endswith(".ozl"):
++                        _lvl = os.environ.get("ENN_OPENZL_LEVEL")
++                        if _lvl:
++                            with contextlib.suppress(Exception):
++                                _ozl_kwargs["openzl_level"] = int(_lvl)
++                        _mss = os.environ.get("ENN_OPENZL_MIN_STREAM_SIZE")
++                        if _mss:
++                            with contextlib.suppress(Exception):
++                                _ozl_kwargs["openzl_min_stream_size"] = int(_mss)
++                        if "ENN_OPENZL_PACK_BY_DTYPE" in os.environ:
++                            with contextlib.suppress(Exception):
++                                _ozl_kwargs["openzl_pack_by_dtype"] = bool(
++                                    _env_flag("ENN_OPENZL_PACK_BY_DTYPE", True)
++                                )
++                        if "ENN_OPENZL_CONTENT_CHECKSUM" in os.environ:
++                            with contextlib.suppress(Exception):
++                                _ozl_kwargs["openzl_content_checksum"] = bool(
++                                    _env_flag("ENN_OPENZL_CONTENT_CHECKSUM", True)
++                                )
++                        if "ENN_OPENZL_COMPRESSED_CHECKSUM" in os.environ:
++                            with contextlib.suppress(Exception):
++                                _ozl_kwargs["openzl_compressed_checksum"] = bool(
++                                    _env_flag("ENN_OPENZL_COMPRESSED_CHECKSUM", True)
++                                )
++                        if "ENN_OPENZL_PERMISSIVE" in os.environ:
++                            with contextlib.suppress(Exception):
++                                _ozl_kwargs["openzl_permissive"] = bool(
++                                    _env_flag("ENN_OPENZL_PERMISSIVE", True)
++                                )
++
++                    _api_save_model(
++                        swa_target,
++                        ckpt_path,
++                        state_dict=model_sd,
++                        **_ozl_kwargs,
++                    )
+                     _LOGGER.info(
+                         "Training (%s) Updated Checkpoint at %d%% (Total = %d, Finished = %d)",
+                         str(device.type).upper(),
+@@ -5112,32 +5161,32 @@ def process(*args: Any, **kwargs: Any) -> object:
+             ops.cfg_dict if isinstance(ops.cfg_dict, dict) else ops.cfg_dict
+         )
+         cfg = replace(cfg, device=device)
+-        model = Model(ops.in_dim, ops.out_shape, config=cfg)
+-        if ops.init_ckpt_dir is not None and os.path.isdir(ops.init_ckpt_dir):
+-            fallback_init = os.path.join(ops.init_ckpt_dir, "model.pt")
+-            if os.path.isfile(fallback_init):
+-                cpu_state = _torch_load_checkpoint(
+-                    fallback_init, map_location="cpu", weights_only=True
+-                )
+-                resize_scaler_buffer(model, cpu_state)
+-                model.load_state_dict(cpu_state, strict=False)
+-            else:
+-                m_sd = get_model_state_dict(
+-                    model,
+-                    options=StateDictOptions(
+-                        full_state_dict=True, cpu_offload=False
+-                    ),
+-                )
+-                m_sd = _coerce_dcp_keys(m_sd)
+-                with _filtered_warnings():
+-                    load(
+-                        state_dict={"model": m_sd},
+-                        storage_reader=FileSystemReader(ops.init_ckpt_dir),
+-                    )
+-                resize_scaler_buffer(model, m_sd)
+-                set_model_state_dict(
+-                    model, m_sd, options=StateDictOptions(strict=False)
+-                )
++        model: Model
++        if ops.init_ckpt_dir is not None and os.path.exists(ops.init_ckpt_dir):
++            # Load a model checkpoint via the public API helper so we support
++            # both DCP directories and single-file checkpoints (.pt/.safetensors/.ozl).
++            from ..api import load_model as _api_load_model
++
++            init_path = str(ops.init_ckpt_dir)
++            if os.path.isdir(init_path):
++                # Prefer explicit single-file checkpoints when present.
++                for _name in ("model.ozl", "model.pt", "model.pth", "model.safetensors"):
++                    fp = os.path.join(init_path, _name)
++                    if os.path.isfile(fp):
++                        init_path = fp
++                        break
++
++            model = _api_load_model(
++                init_path,
++                in_dim=ops.in_dim,
++                out_shape=ops.out_shape,
++                config=cfg,
++                map_location="cpu",
++                openzl_memmap=bool(_env_flag("ENN_OPENZL_MEMMAP", True)),
++                openzl_lazy_tensors=bool(_env_flag("ENN_OPENZL_LAZY_TENSORS", True)),
++            )
++        else:
++            model = Model(ops.in_dim, ops.out_shape, config=cfg)
+         if ops.sources is None:
+             raise RuntimeError("RuntimeConfig.sources is required but None")
+         metadata = Dataset.for_device(device)
+@@ -5587,9 +5636,28 @@ def process(*args: Any, **kwargs: Any) -> object:
+                 avg_helper = ema_helper
+ 
+             if ops.ckpt_dir:
+-                ckpt_path = os.path.join(ops.ckpt_dir, "model.pt")
++                ckpt_ext = os.environ.get("ENN_CKPT_EXT")
++                if ckpt_ext:
++                    if not ckpt_ext.startswith("."):
++                        ckpt_ext = "." + ckpt_ext
++                    ckpt_ext = ckpt_ext.lower()
++                else:
++                    try:
++                        import openzl.ext  # noqa: F401
++
++                        ckpt_ext = ".ozl"
++                    except Exception:
++                        ckpt_ext = ".pt"
++
++                ckpt_path = os.path.join(ops.ckpt_dir, "model" + ckpt_ext)
+ 
++                # Avoid duplicating checkpoints when format preference changes.
+                 if not os.path.isfile(ckpt_path):
++                    for _alt in (".ozl", ".pt"):
++                        if _alt != ckpt_ext and os.path.isfile(
++                            os.path.join(ops.ckpt_dir, "model" + _alt)
++                        ):
++                            return
+                     src_mod = (
+                         tracked_module if tracked_module is not None else model
+                     )
+@@ -5654,7 +5722,33 @@ def process(*args: Any, **kwargs: Any) -> object:
+                                 model_sd[k] = tb
+ 
+                     _coerce_dcp_keys(model_sd)
+-                    torch.save(model_sd, ckpt_path)
++
++                    from ..api import save_model as _api_save_model
++
++                    save_target = (
++                        src_mod.module
++                        if hasattr(src_mod, "module")
++                        else src_mod
++                    )
++                    _ozl_kwargs: dict[str, object] = {}
++                    if str(ckpt_path).lower().endswith(".ozl"):
++                        _lvl = os.environ.get("ENN_OPENZL_LEVEL")
++                        if _lvl:
++                            with contextlib.suppress(Exception):
++                                _ozl_kwargs["openzl_level"] = int(_lvl)
++                        _mss = os.environ.get("ENN_OPENZL_MIN_STREAM_SIZE")
++                        if _mss:
++                            with contextlib.suppress(Exception):
++                                _ozl_kwargs["openzl_min_stream_size"] = int(
++                                    _mss
++                                )
++
++                    _api_save_model(
++                        save_target,
++                        ckpt_path,
++                        state_dict=model_sd,
++                        **_ozl_kwargs,
++                    )
+ 
+                     try:
+                         del model_sd
+@@ -5721,7 +5815,6 @@ def process(*args: Any, **kwargs: Any) -> object:
+                         "compile_cudagraphs",
+                         bool(_env_flag("ENN_COMPILE_CUDAGRAPHS", True)),
+                     )
+-        model = Model(ops.in_dim, ops.out_shape, config=cfg)
+         if not ops.model_ckpt_dir:
+             raise RuntimeError(
+                 "predict/infer requires model_ckpt_dir (checkpoint directory). Set RuntimeConfig.model_ckpt_dir to a directory produced by train()."
+@@ -5730,32 +5823,23 @@ def process(*args: Any, **kwargs: Any) -> object:
+             raise RuntimeError(
+                 f"predict/infer: model_ckpt_dir does not exist or is not a directory: {ops.model_ckpt_dir!r}"
+             )
+-        if ops.model_ckpt_dir is not None and os.path.isdir(
+-            ops.model_ckpt_dir
+-        ):
+-            fallback_model = os.path.join(ops.model_ckpt_dir, "model.pt")
+-            if os.path.isfile(fallback_model):
+-                cpu_state = _torch_load_checkpoint(
+-                    fallback_model, map_location="cpu", weights_only=True
+-                )
+-                resize_scaler_buffer(model, cpu_state)
+-                model.load_state_dict(cpu_state, strict=False)
+-            else:
+-                m_sd = get_model_state_dict(
+-                    model,
+-                    options=StateDictOptions(
+-                        full_state_dict=True, cpu_offload=True
+-                    ),
+-                )
+-                m_sd = _coerce_dcp_keys(m_sd)
+-                load(
+-                    state_dict={"model": m_sd},
+-                    storage_reader=FileSystemReader(ops.model_ckpt_dir),
+-                )
+-                resize_scaler_buffer(model, m_sd)
+-                set_model_state_dict(
+-                    model, m_sd, options=StateDictOptions(strict=False)
+-                )
++        from ..api import load_model as _api_load_model
++
++        ckpt_source: str = str(ops.model_ckpt_dir)
++        for _name in ("model.ozl", "model.pt", "model.pth", "model.safetensors"):
++            fp = os.path.join(ckpt_source, _name)
++            if os.path.isfile(fp):
++                ckpt_source = fp
++                break
++        model = _api_load_model(
++            ckpt_source,
++            in_dim=ops.in_dim,
++            out_shape=ops.out_shape,
++            config=cfg,
++            map_location="cpu",
++            openzl_memmap=bool(_env_flag("ENN_OPENZL_MEMMAP", True)),
++            openzl_lazy_tensors=bool(_env_flag("ENN_OPENZL_LAZY_TENSORS", True)),
++        )
+         model.to(device, non_blocking=device.type in ("cuda", "xpu")).eval()
+         metadata = Dataset.for_device(device)
+         model, _, _ = ModelPolicy.use_nvidia_layers(model, device=device)
