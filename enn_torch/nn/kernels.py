@@ -216,27 +216,34 @@ def _is_compile_failure(exc: BaseException) -> bool:
 
 
 def _call_with_flex_warn_guard(fn: Callable[[], Any]) -> tuple[Any, bool]:
-    with warnings.catch_warnings(record=True) as rec:
-        warnings.simplefilter("always")
-        out = fn()
     saw_uncompiled = False
-    for w in rec:
-        msg = str(getattr(w, "message", ""))
+
+    orig_showwarning = warnings.showwarning
+
+    def _showwarning(
+        message: Any,
+        category: type[Warning],
+        filename: str,
+        lineno: int,
+        file: Any = None,
+        line: str | None = None,
+    ) -> None:
+        nonlocal saw_uncompiled
+        try:
+            msg = str(message)
+        except Exception:
+            msg = ""
         if _FLEX_ATTN_UNCOMPILED_NEEDLE in msg:
             saw_uncompiled = True
-            continue
+            return
+        return orig_showwarning(message, category, filename, lineno, file=file, line=line)
+
+    with warnings.catch_warnings():
+        warnings.showwarning = _showwarning
         try:
-            warnings.showwarning(
-                w.message,
-                w.category,
-                w.filename,
-                w.lineno,
-                getattr(w, "file", None),
-                getattr(w, "line", None),
-            )
-        except Exception:
-            with contextlib.suppress(Exception):
-                warnings.warn(str(w.message), category=w.category, stacklevel=3)
+            out = fn()
+        finally:
+            warnings.showwarning = orig_showwarning
     return out, saw_uncompiled
 
 
