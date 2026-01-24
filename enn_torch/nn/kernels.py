@@ -40,6 +40,8 @@ from ..core.tensor import is_meta_or_fake_tensor
 
 _FLEX_ATTN_COMPILED: dict[str, Any] = {}
 _FLEX_ATTN_COMPILE_LOCK = threading.Lock()
+_FLEX_ATTN_BASE_COMPILED: dict[tuple[Any, ...], Any] = {}
+_FLEX_ATTN_BASE_COMPILE_LOCK = threading.Lock()
 _FLEX_KWARGS: set[str] = set()
 _FLEX_ATTN_SPECIALIZED: dict[tuple[Any, ...], Any] = {}
 _FLEX_ATTN_SPECIALIZE_LOCK = threading.Lock()
@@ -150,17 +152,34 @@ def _compile_flex_attention_wrapper(
         raise RuntimeError("Flex Attention is not available")
     frozen = dict(flex_kwargs)
 
+    dyn_key = dynamic if dynamic is None else bool(dynamic)
+    base_key = ("flexattn-base", str(mode), dyn_key)
+    base = _FLEX_ATTN_BASE_COMPILED.get(base_key)
+    if base is None:
+        with _FLEX_ATTN_BASE_COMPILE_LOCK:
+            base = _FLEX_ATTN_BASE_COMPILED.get(base_key)
+            if base is None:
+                with skip_non_infra_dispatch_mode():
+                    with warnings.catch_warnings():
+                        warnings.filterwarnings(
+                            "ignore",
+                            message=r"flex_attention called without torch\.compile",
+                            category=UserWarning,
+                        )
+                        base = _stnet_compile(
+                            _torch_flex_attention,
+                            mode=mode,
+                            dynamic=dynamic,
+                            fullgraph=False,
+                        )
+                _FLEX_ATTN_BASE_COMPILED[base_key] = base
+    if base is _torch_flex_attention:
+        return _torch_flex_attention
+
     def _wrapped(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> Any:
-        return _torch_flex_attention(q, k, v, **frozen)
+        return base(q, k, v, **frozen)
 
-    with skip_non_infra_dispatch_mode():
-        return _stnet_compile(
-            _wrapped,
-            mode=mode,
-            dynamic=dynamic,
-            fullgraph=False,
-        )
-
+    return _wrapped
 
 def _is_compile_failure(exc: BaseException) -> bool:
     t = type(exc)
