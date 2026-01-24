@@ -18,13 +18,12 @@ from ..core.graph import (
     assert_trace,
     canonicalize_compile_mode,
     is_compiling,
+    is_dynamo_compiling,
     is_export_or_trace,
     is_symbolic,
     is_tracing_or_exporting,
-    _is_dynamo_compiling,
     torch_compiler_disable,
     torch_compiler_supported,
-    graph_break,
 )
 from ..core.graph import (
     compile as _stnet_compile,
@@ -200,7 +199,7 @@ def _get_compiled_flex_attention_for_kwargs(
     if not _HAS_TORCH_FLEX or _torch_flex_attention is None:
         raise RuntimeError("Flex Attention is not available")
 
-    if _is_dynamo_compiling() or is_tracing_or_exporting():
+    if is_dynamo_compiling() or is_tracing_or_exporting():
         return _torch_flex_attention, ("flexattn", "raw")
 
     if not torch_compiler_supported():
@@ -251,7 +250,7 @@ def _get_compiled_flex_attention() -> Any:
     if not _HAS_TORCH_FLEX or _torch_flex_attention is None:
         raise RuntimeError("Flex Attention is not available")
 
-    if _is_dynamo_compiling() or is_tracing_or_exporting():
+    if is_dynamo_compiling() or is_tracing_or_exporting():
         return _torch_flex_attention
 
     if not torch_compiler_supported():
@@ -1765,10 +1764,6 @@ class FlexAttention(nn.Module):
                     is_causal=bool(is_causal),
                     score_mod=score_mod,
                 )
-            if _is_dynamo_compiling():
-                cm = _flex_attention_compile_mode()
-                if cm in {"max-autotune", "max-autotune-no-cudagraphs"}:
-                    graph_break()
             flex_kwargs: dict[str, Any] = {}
             if "score_mod" in _FLEX_KWARGS and score_mod is not None:
                 flex_kwargs["score_mod"] = score_mod

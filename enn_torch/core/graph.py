@@ -283,20 +283,17 @@ def _dispatch_mode_stack() -> list[Any]:
         return []
 
 
-def _is_dynamo_compiling() -> bool:
+def is_dynamo_compiling() -> bool:
     with suppress(Exception):
         comp = getattr(torch, "compiler", None)
         fn = getattr(comp, "is_dynamo_compiling", None)
-        if callable(fn) and bool(fn()):
-            return True
+        if callable(fn):
+            return bool(fn())
     with suppress(Exception):
         dyn = getattr(torch, "_dynamo", None)
         fn = getattr(dyn, "is_dynamo_compiling", None)
-        if callable(fn) and bool(fn()):
-            return True
-        fn = getattr(dyn, "is_compiling", None)
-        if callable(fn) and bool(fn()):
-            return True
+        if callable(fn):
+            return bool(fn())
     return False
 
 
