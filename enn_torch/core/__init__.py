@@ -10,6 +10,7 @@ __all__ = [
     "compat",
     "distributed",
     "graph",
+    "checkpoint",
     "precision",
     "profiler",
     "concurrency",
