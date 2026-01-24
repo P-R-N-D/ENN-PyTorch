@@ -1915,7 +1915,7 @@ class GraphSequential(nn.Module):
         preserve_rng_state: bool | None = None,
         determinism_check: str | None = None,
     ) -> Callable[..., Any]:
-        from ..core.graph import coerce_checkpoint
+        from ..core.checkpoint import coerce_checkpoint
 
         if isinstance(step, nn.Module):
             ref = weakref.ref(step)

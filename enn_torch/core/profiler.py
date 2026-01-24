@@ -730,7 +730,7 @@ def _get_2d_weights(mod: nn.Module) -> List[Tuple[str, torch.Tensor, bool]]:
 
 def _get_te_weights(mod: nn.Module) -> List[Tuple[str, torch.Tensor, bool]]:
     try:
-        cache = getattr(mod, "_stnet_te_weight_cache", None)
+        cache = getattr(mod, "_enn_te_weight_cache", None)
         if (
             isinstance(cache, dict)
             and cache.get("v") == 1
@@ -741,7 +741,7 @@ def _get_te_weights(mod: nn.Module) -> List[Tuple[str, torch.Tensor, bool]]:
         cache = None
     entries = _get_2d_weights(mod)
     try:
-        setattr(mod, "_stnet_te_weight_cache", {"v": 1, "entries": entries})
+        setattr(mod, "_enn_te_weight_cache", {"v": 1, "entries": entries})
     except Exception:
         pass
     return entries

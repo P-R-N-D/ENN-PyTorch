@@ -10,9 +10,10 @@ from typing import Any, Callable, List, Optional, Sequence, Tuple, Self
 import torch
 import torch.nn as nn
 
+from ..core.checkpoint import coerce_checkpoint
 from ..core.compat import StochasticDepth
 from ..core.distributed import _from_hsdp_module
-from ..core.graph import coerce_checkpoint, is_export_or_trace, is_symbolic
+from ..core.graph import is_export_or_trace, is_symbolic
 from .layers import CrossAttention, DilatedAttention, Retention, norm_layer
 
 _LOGGER = logging.getLogger(__name__)

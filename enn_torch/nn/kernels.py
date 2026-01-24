@@ -27,7 +27,7 @@ from ..core.graph import (
     torch_compiler_supported,
 )
 from ..core.graph import (
-    compile as _stnet_compile,
+    compile as _model_compile,
 )
 from ..core.profiler import FLOP_PROFILER, capture
 from ..core.system import (
@@ -180,7 +180,7 @@ def _compile_flex_attention_wrapper(
                             message=r"flex_attention called without torch\.compile",
                             category=UserWarning,
                         )
-                        base = _stnet_compile(
+                        base = _model_compile(
                             _torch_flex_attention,
                             mode=mode,
                             dynamic=dynamic,
@@ -335,7 +335,7 @@ def _get_compiled_flex_attention() -> Any:
         if cached is not None:
             return cached
         try:
-            compiled = _stnet_compile(_torch_flex_attention, mode=mode)
+            compiled = _model_compile(_torch_flex_attention, mode=mode)
         except Exception:
             compiled = _torch_flex_attention
         _FLEX_ATTN_COMPILED[mode] = compiled
