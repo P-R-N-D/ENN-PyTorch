@@ -307,17 +307,18 @@ class _FlexMaskMod:
         q_idx: torch.Tensor,
         kv_idx: torch.Tensor,
     ) -> torch.Tensor:
+        _ = h
         dq = q_idx - kv_idx
-        keep = torch.ones_like(dq, dtype=torch.bool)
+        keep = kv_idx == kv_idx 
         if self._kv_limit is not None:
-            keep &= kv_idx < self._kv_limit
+            keep = keep & (kv_idx < self._kv_limit)
         if self.causal:
-            keep &= kv_idx <= q_idx
+            keep = keep & (kv_idx <= q_idx)
         if self.win is not None:
-            keep &= dq.abs() <= self.win
+            keep = keep & (dq.abs() <= self.win)
         if self.dilation > 1:
-            keep &= (dq % self.dilation) == 0
-        return keep & ~self.kpm[b, kv_idx]
+            keep = keep & ((dq % self.dilation) == 0)
+        return keep & (~self.kpm[b, kv_idx])
 
 
 class _FlexDilatedMaskMod:
@@ -343,18 +344,15 @@ class _FlexDilatedMaskMod:
     ) -> torch.Tensor:
         _ = (b, h)
         dq = q_idx - kv_idx
-        keep = torch.ones_like(dq, dtype=torch.bool)
-        try:
-            if int(self.L_k) > int(self.L_q):
-                keep &= kv_idx < int(self.L_q)
-        except Exception:
-            pass
+        keep = kv_idx == kv_idx
+        if int(self.L_k) > int(self.L_q):
+            keep = keep & (kv_idx < int(self.L_q))
         if self.causal:
-            keep &= kv_idx <= q_idx
+            keep = keep & (kv_idx <= q_idx)
         if self.win is not None:
-            keep &= dq.abs() <= int(self.win)
+            keep = keep & (dq.abs() <= int(self.win))
         if self.dilation > 1:
-            keep &= (dq % int(self.dilation)) == 0
+            keep = keep & ((dq % int(self.dilation)) == 0)
         return keep
 
 

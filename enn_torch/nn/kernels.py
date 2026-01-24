@@ -43,6 +43,8 @@ _FLEX_ATTN_SPECIALIZED: dict[tuple[Any, ...], Any] = {}
 _FLEX_ATTN_SPECIALIZE_LOCK = threading.Lock()
 _FLEX_ATTN_FAILED: dict[tuple[Any, ...], str] = {}
 _FLEX_ATTN_WARNED: set[str] = set()
+_FLEX_ATTN_RESOURCE_KOPTS: dict[int, dict[str, Any]] = {}
+_FLEX_ATTN_RESOURCE_KOPTS_LOCK = threading.Lock()
 _HAS_TE = False
 _HAS_TORCH_FLEX = False
 _te = None
@@ -304,6 +306,90 @@ def _env_int(name: str, default: int) -> int:
         return int(v)
     except Exception:
         return int(default)
+
+
+def _looks_like_triton_resource_error(exc: BaseException) -> bool:
+
+    msg = str(exc)
+    if "No valid triton configs" not in msg:
+        return False
+    needles = (
+        "out of resource",
+        "OutOfResources",
+        "Hardware limit",
+        "Reducing block sizes",
+        "num_stages",
+    )
+    return any(n in msg for n in needles)
+
+
+def _resource_safe_kernel_options(existing: Any) -> dict[str, Any]:
+
+    key = int(id(existing)) if existing is not None else 0
+    cached = _FLEX_ATTN_RESOURCE_KOPTS.get(key)
+    if cached is not None:
+        return cached
+    with _FLEX_ATTN_RESOURCE_KOPTS_LOCK:
+        cached = _FLEX_ATTN_RESOURCE_KOPTS.get(key)
+        if cached is not None:
+            return cached
+        opts: dict[str, Any] = {}
+        if isinstance(existing, Mapping):
+            with contextlib.suppress(Exception):
+                opts.update(dict(existing))
+
+        opts.setdefault("BLOCK_M", _env_int("ENN_FLEX_BLOCK_M", 64))
+        opts.setdefault("BLOCK_N", _env_int("ENN_FLEX_BLOCK_N", 64))
+        opts.setdefault("num_stages", _env_int("ENN_FLEX_NUM_STAGES", 1))
+        opts.setdefault("num_warps", _env_int("ENN_FLEX_NUM_WARPS", 4))
+
+        if "WRITE_DQ" not in opts:
+            opts["WRITE_DQ"] = bool(env_bool("ENN_FLEX_WRITE_DQ", False))
+
+        _FLEX_ATTN_RESOURCE_KOPTS[key] = opts
+        return opts
+
+
+def _looks_like_triton_resource_error(exc: BaseException) -> bool:
+    msg = str(exc)
+    if "No valid triton configs" not in msg:
+        return False
+    needles = ("out of resource", "OutOfResources", "Hardware limit", "num_stages")
+    return any(n in msg for n in needles)
+
+
+def _resource_safe_kernel_options(existing: Any) -> Optional[dict[str, Any]]:
+
+    if (existing is not None) and (not isinstance(existing, Mapping)):
+        return None
+
+    key = int(id(existing)) if existing is not None else 0
+    cached = _FLEX_ATTN_RESOURCE_KOPTS.get(key)
+    if cached is not None:
+        return cached
+
+    base: dict[str, Any] = {}
+    if isinstance(existing, Mapping):
+        for k, v in existing.items():
+            base[str(k)] = v
+
+    base.setdefault("BLOCK_M", _env_int("ENN_FLEX_BLOCK_M", 64))
+    base.setdefault("BLOCK_N", _env_int("ENN_FLEX_BLOCK_N", 64))
+    base.setdefault("num_stages", _env_int("ENN_FLEX_NUM_STAGES", 1))
+    base.setdefault("num_warps", _env_int("ENN_FLEX_NUM_WARPS", 4))
+    base.setdefault("bwd_num_stages", _env_int("ENN_FLEX_BWD_NUM_STAGES", 1))
+    base.setdefault("bwd_num_warps", _env_int("ENN_FLEX_BWD_NUM_WARPS", 4))
+    base.setdefault("bwd_BLOCK_M1", _env_int("ENN_FLEX_BWD_BLOCK_M1", 32))
+    base.setdefault("bwd_BLOCK_N1", _env_int("ENN_FLEX_BWD_BLOCK_N1", 32))
+    if "WRITE_DQ" not in base and "bwd_WRITE_DQ" not in base:
+        base["bwd_WRITE_DQ"] = bool(env_bool("ENN_FLEX_BWD_WRITE_DQ", False))
+
+    with _FLEX_ATTN_RESOURCE_KOPTS_LOCK:
+        cached = _FLEX_ATTN_RESOURCE_KOPTS.get(key)
+        if cached is None:
+            _FLEX_ATTN_RESOURCE_KOPTS[key] = base
+            cached = base
+    return cached
 
 
 def _python_token_mask_from_mask_mod(
@@ -1710,6 +1796,40 @@ class FlexAttention(nn.Module):
                             f"{type(exc).__name__}: {exc}"
                         )
                         _FLEX_ATTN_SPECIALIZED.pop(flex_key, None)
+
+                    if (
+                        _looks_like_triton_resource_error(exc)
+                        and ("kernel_options" in _FLEX_KWARGS)
+                    ):
+                        try:
+                            flex_kwargs2 = dict(flex_kwargs)
+                            existing = flex_kwargs2.get("kernel_options", None)
+                            flex_kwargs2["kernel_options"] = _resource_safe_kernel_options(
+                                existing
+                            )
+                            flex_fn2, flex_key2 = _get_compiled_flex_attention_for_kwargs(
+                                q, flex_kwargs2
+                            )
+                            if flex_fn2 is not _torch_flex_attention:
+                                try:
+                                    return flex_fn2(q, k, v)
+                                except Exception as exc2:
+                                    if _is_compile_failure(exc2):
+                                        with contextlib.suppress(Exception):
+                                            _FLEX_ATTN_FAILED[flex_key2] = (
+                                                f"{type(exc2).__name__}: {exc2}"
+                                            )
+                                            _FLEX_ATTN_SPECIALIZED.pop(
+                                                flex_key2, None
+                                            )
+                                    else:
+                                        raise
+                            return _call_torch_flex_attention_eager(
+                                q, k, v, flex_kwargs=flex_kwargs2
+                            )
+                        except Exception:
+                            pass
+
                     _warn_once(
                         f"flexattn-runtime-failed-{hash(flex_key)}",
                         "FlexAttention: compiled execution failed; falling back to eager.\n"
