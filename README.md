@@ -19,6 +19,7 @@ This repository also includes a worked example notebook (`notebook.ipynb`) and a
 - **onnxruntime**: >= 1.23.2
 - **onnxscript**: >= 0.5.7
 - **onnx_ir**: >= 0.1.14
+- **openzl**: >= 0.1.0 (If error happens when building wheel, install this using the official GitHub repository by Meta Platforms, Inc. (e.g., `pip install "openzl @ git+https://github.com/facebook/openzl.git#subdirectory=py"`)
 - **ml_dtypes**: >= 0.5.4
 - **psutil**: >= 7.2.1
 - **py-cpuinfo**: >= 9.0.0
