@@ -22,6 +22,7 @@ from ..core.graph import (
     is_export_or_trace,
     is_symbolic,
     is_tracing_or_exporting,
+    skip_non_infra_dispatch_mode,
     torch_compiler_disable,
     torch_compiler_supported,
 )
@@ -152,12 +153,13 @@ def _compile_flex_attention_wrapper(
     def _wrapped(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> Any:
         return _torch_flex_attention(q, k, v, **frozen)
 
-    return _stnet_compile(
-        _wrapped,
-        mode=mode,
-        dynamic=dynamic,
-        fullgraph=False,
-    )
+    with skip_non_infra_dispatch_mode():
+        return _stnet_compile(
+            _wrapped,
+            mode=mode,
+            dynamic=dynamic,
+            fullgraph=False,
+        )
 
 
 def _is_compile_failure(exc: BaseException) -> bool:
@@ -184,13 +186,14 @@ def _call_torch_flex_attention_eager(
 ) -> Any:
     if _torch_flex_attention is None:
         raise RuntimeError("Flex Attention is not available")
-    with warnings.catch_warnings():
-        warnings.filterwarnings(
-            "ignore",
-            message=r"flex_attention called without torch\.compile",
-            category=UserWarning,
-        )
-        return _torch_flex_attention(q, k, v, **flex_kwargs)
+    with skip_non_infra_dispatch_mode():
+        with warnings.catch_warnings():
+            warnings.filterwarnings(
+                "ignore",
+                message=r"flex_attention called without torch\.compile",
+                category=UserWarning,
+            )
+            return _torch_flex_attention(q, k, v, **flex_kwargs)
 
 
 def _get_compiled_flex_attention_for_kwargs(
@@ -1789,6 +1792,9 @@ class FlexAttention(nn.Module):
                     return _call_torch_flex_attention_eager(
                         q, k, v, flex_kwargs=flex_kwargs
                     )
+                if not is_dynamo_compiling():
+                    with skip_non_infra_dispatch_mode():
+                        return flex_fn(q, k, v)
                 return flex_fn(q, k, v)
             except Exception as exc:
                 if _is_compile_failure(exc):

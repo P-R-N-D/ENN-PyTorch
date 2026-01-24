@@ -283,6 +283,37 @@ def _dispatch_mode_stack() -> list[Any]:
         return []
 
 
+@contextlib.contextmanager
+def skip_non_infra_dispatch_mode() -> Iterator[None]:
+    try:
+        from torch.utils._python_dispatch import (
+            _disable_current_modes,
+            is_in_torch_dispatch_mode,
+        )
+    except Exception:
+        yield
+        return
+
+    active_non_infra = False
+    with suppress(Exception):
+        active_non_infra = bool(is_in_torch_dispatch_mode(include_infra_modes=False))
+    if not active_non_infra:
+        with suppress(Exception):
+            active_non_infra = bool(is_in_torch_dispatch_mode(False))
+    if not active_non_infra:
+        with suppress(Exception):
+            active_non_infra = bool(is_in_torch_dispatch_mode())
+    if not active_non_infra:
+        yield
+        return
+
+    try:
+        with _disable_current_modes():
+            yield
+    except Exception:
+        yield
+
+
 def is_dynamo_compiling() -> bool:
     with suppress(Exception):
         comp = getattr(torch, "compiler", None)
