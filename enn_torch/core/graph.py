@@ -4,6 +4,7 @@ from __future__ import annotations
 import contextlib
 import importlib
 import logging
+import sys
 import threading
 import traceback
 from contextlib import AbstractContextManager, nullcontext, suppress
@@ -281,6 +282,47 @@ def _dispatch_mode_stack() -> list[Any]:
         return [mode] if mode is not None else []
     except Exception:
         return []
+
+
+@contextlib.contextmanager
+def skip_non_infra_dispatch_mode() -> Iterator[None]:
+    try:
+        from torch.utils._python_dispatch import (
+            _disable_current_modes,
+            is_in_torch_dispatch_mode,
+        )
+    except Exception:
+        yield
+        return
+
+    active_non_infra = False
+    with suppress(Exception):
+        active_non_infra = bool(is_in_torch_dispatch_mode(include_infra_modes=False))
+    if not active_non_infra:
+        with suppress(Exception):
+            active_non_infra = bool(is_in_torch_dispatch_mode(False))
+    if not active_non_infra:
+        with suppress(Exception):
+            active_non_infra = bool(is_in_torch_dispatch_mode())
+    if not active_non_infra:
+        yield
+        return
+
+    try:
+        cm = _disable_current_modes()
+        cm.__enter__()
+    except Exception:
+        yield
+        return
+
+    exc_type = exc = tb = None
+    try:
+        yield
+    except Exception:
+        exc_type, exc, tb = sys.exc_info()
+        raise
+    finally:
+        cm.__exit__(exc_type, exc, tb)
 
 
 def is_dynamo_compiling() -> bool:
