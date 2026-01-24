@@ -42,6 +42,9 @@ _FLEX_ATTN_COMPILED: dict[str, Any] = {}
 _FLEX_ATTN_COMPILE_LOCK = threading.Lock()
 _FLEX_ATTN_BASE_COMPILED: dict[tuple[Any, ...], Any] = {}
 _FLEX_ATTN_BASE_COMPILE_LOCK = threading.Lock()
+_FLEX_ATTN_VERIFIED: set[tuple[Any, ...]] = set()
+_FLEX_ATTN_VERIFIED_LOCK = threading.Lock()
+_FLEX_ATTN_UNCOMPILED_NEEDLE = "flex_attention called without torch.compile"
 _FLEX_KWARGS: set[str] = set()
 _FLEX_ATTN_SPECIALIZED: dict[tuple[Any, ...], Any] = {}
 _FLEX_ATTN_SPECIALIZE_LOCK = threading.Lock()
@@ -104,7 +107,18 @@ def _flex_attention_dynamic_flag(mode: str) -> Optional[bool]:
     dyn = getattr(cfg, "compile_dynamic", None)
     if isinstance(dyn, bool):
         return dyn
+    if str(mode) in {"max-autotune", "max-autotune-no-cudagraphs"}:
+        return True
     return None
+
+
+def _flex_attention_fallback_modes(mode: str) -> tuple[str, ...]:
+    m = str(mode)
+    if m == "max-autotune":
+        return ("max-autotune-no-cudagraphs", "reduce-overhead")
+    if m == "max-autotune-no-cudagraphs":
+        return ("reduce-overhead",)
+    return ()
 
 
 def _flex_attention_cache_key(
@@ -181,6 +195,7 @@ def _compile_flex_attention_wrapper(
 
     return _wrapped
 
+
 def _is_compile_failure(exc: BaseException) -> bool:
     t = type(exc)
     qual = f"{getattr(t, '__module__', '')}.{getattr(t, '__name__', '')}"
@@ -198,6 +213,31 @@ def _is_compile_failure(exc: BaseException) -> bool:
     if any(n in msg for n in needles):
         return True
     return False
+
+
+def _call_with_flex_warn_guard(fn: Callable[[], Any]) -> tuple[Any, bool]:
+    with warnings.catch_warnings(record=True) as rec:
+        warnings.simplefilter("always")
+        out = fn()
+    saw_uncompiled = False
+    for w in rec:
+        msg = str(getattr(w, "message", ""))
+        if _FLEX_ATTN_UNCOMPILED_NEEDLE in msg:
+            saw_uncompiled = True
+            continue
+        try:
+            warnings.showwarning(
+                w.message,
+                w.category,
+                w.filename,
+                w.lineno,
+                getattr(w, "file", None),
+                getattr(w, "line", None),
+            )
+        except Exception:
+            with contextlib.suppress(Exception):
+                warnings.warn(str(w.message), category=w.category, stacklevel=3)
+    return out, saw_uncompiled
 
 
 def _call_torch_flex_attention_eager(
@@ -1811,10 +1851,65 @@ class FlexAttention(nn.Module):
                     return _call_torch_flex_attention_eager(
                         q, k, v, flex_kwargs=flex_kwargs
                     )
-                if not is_dynamo_compiling():
-                    with skip_non_infra_dispatch_mode():
-                        return flex_fn(q, k, v)
-                return flex_fn(q, k, v)
+
+                def _run(fn: Callable[[], Any]) -> Any:
+                    if not is_dynamo_compiling():
+                        with skip_non_infra_dispatch_mode():
+                            return fn()
+                    return fn()
+
+                mode_key = (
+                    str(flex_key[1])
+                    if isinstance(flex_key, tuple) and len(flex_key) > 1
+                    else ""
+                )
+                needs_verify = (
+                    (mode_key in {"max-autotune", "max-autotune-no-cudagraphs"})
+                    and (not is_dynamo_compiling())
+                )
+                verified = False
+                if needs_verify:
+                    with _FLEX_ATTN_VERIFIED_LOCK:
+                        verified = flex_key in _FLEX_ATTN_VERIFIED
+
+                if not needs_verify or verified:
+                    return _run(lambda: flex_fn(q, k, v))
+
+                out, saw_uncompiled = _call_with_flex_warn_guard(
+                    lambda: _run(lambda: flex_fn(q, k, v))
+                )
+                if not saw_uncompiled:
+                    with _FLEX_ATTN_VERIFIED_LOCK:
+                        _FLEX_ATTN_VERIFIED.add(flex_key)
+                    return out
+
+                for fb_mode in _flex_attention_fallback_modes(mode_key):
+                    try:
+                        dyn_fb = _flex_attention_dynamic_flag(fb_mode)
+                        fb_fn = _compile_flex_attention_wrapper(
+                            mode=fb_mode,
+                            dynamic=dyn_fb,
+                            flex_kwargs=flex_kwargs,
+                        )
+                        if fb_fn is _torch_flex_attention:
+                            continue
+                        _FLEX_ATTN_SPECIALIZED[flex_key] = fb_fn
+                        out2, saw2 = _call_with_flex_warn_guard(
+                            lambda: _run(lambda: fb_fn(q, k, v))
+                        )
+                        if not saw2:
+                            with _FLEX_ATTN_VERIFIED_LOCK:
+                                _FLEX_ATTN_VERIFIED.add(flex_key)
+                            return out2
+                    except Exception:
+                        pass
+
+                with contextlib.suppress(Exception):
+                    _FLEX_ATTN_FAILED[flex_key] = "uncompiled-warning"
+                    _FLEX_ATTN_SPECIALIZED.pop(flex_key, None)
+                return _call_torch_flex_attention_eager(
+                    q, k, v, flex_kwargs=flex_kwargs
+                )
             except Exception as exc:
                 if _is_compile_failure(exc):
                     with contextlib.suppress(Exception):
