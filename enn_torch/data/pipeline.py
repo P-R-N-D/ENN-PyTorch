@@ -1139,10 +1139,10 @@ def fetch(
     )
     with contextlib.suppress(Exception):
         if train_loader is not None:
-            setattr(train_loader, "_stnet_sampler_scale", scale_ctl)
-            setattr(train_loader, "_stnet_epochables", list(train_epochables))
+            setattr(train_loader, "_enn_sampler_scale", scale_ctl)
+            setattr(train_loader, "_enn_epochables", list(train_epochables))
         if val_loader is not None:
-            setattr(val_loader, "_stnet_sampler_scale", scale_ctl)
+            setattr(val_loader, "_enn_sampler_scale", scale_ctl)
     return {
         "training_loader": train_loader,
         "validation_loader": val_loader,
@@ -1347,13 +1347,13 @@ class Session:
             if self.training_loader is not None:
                 setattr(
                     self.training_loader,
-                    "_stnet_sampler_scale",
+                    "_enn_sampler_scale",
                     self.sampler_scale,
                 )
             if self.validation_loader is not None:
                 setattr(
                     self.validation_loader,
-                    "_stnet_sampler_scale",
+                    "_enn_sampler_scale",
                     self.sampler_scale,
                 )
         with contextlib.suppress(Exception):
@@ -1362,11 +1362,11 @@ class Session:
                 and self.training_loader is not None
             ):
                 epochables = getattr(
-                    self.raw_training_loader, "_stnet_epochables", None
+                    self.raw_training_loader, "_enn_epochables", None
                 )
                 if epochables is not None:
                     setattr(
-                        self.training_loader, "_stnet_epochables", epochables
+                        self.training_loader, "_enn_epochables", epochables
                     )
         self._opened = True
         return self

@@ -24,12 +24,12 @@ import torch.nn.functional as F
 from tensordict import TensorDictBase
 
 from ..config import ModelConfig
+from ..core.checkpoint import coerce_checkpoint
 from ..core.concurrency import Mutex, is_gil_enabled
 from ..core.datatypes import env_bool, env_first_int, env_int
 from ..core.distributed import _from_hsdp_module
 from ..core.graph import (
     canonicalize_compile_mode,
-    coerce_checkpoint,
     cudagraph_mark_step_begin,
     cudagraph_mark_step_end,
     graph_break,

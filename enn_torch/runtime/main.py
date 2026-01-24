@@ -66,15 +66,14 @@ from ..core.distributed import (
     no_sync,
     to_hsdp_module,
 )
+from ..core.checkpoint import from_checkpoint, to_checkpoint
 from ..core.graph import (
     canonicalize_compile_mode,
     compile_distributed_safe,
     compile_safe,
     cudagraph_mark_step_begin,
     cudagraph_mark_step_end,
-    from_checkpoint,
     inference_mode,
-    to_checkpoint,
     to_submodule,
 )
 from ..core.policies import DistributedPolicy, ModelPolicy, PrecisionPolicy
@@ -389,10 +388,10 @@ def _get_torch_profiler(
             with_stack=with_stack,
             with_flops=with_flops,
         )
-        setattr(prof, "_stnet_row_limit", int(row_limit))
-        setattr(prof, "_stnet_group_by_shape", bool(group_by_shape))
-        setattr(prof, "_stnet_out_dir", str(out_dir))
-        setattr(prof, "_stnet_tag", str(tag))
+        setattr(prof, "_enn_row_limit", int(row_limit))
+        setattr(prof, "_enn_group_by_shape", bool(group_by_shape))
+        setattr(prof, "_enn_out_dir", str(out_dir))
+        setattr(prof, "_enn_tag", str(tag))
         return prof
     except Exception:
         return None
@@ -407,10 +406,10 @@ def _get_profiler_summary(
 ) -> None:
     if prof is None:
         return
-    row_limit = int(getattr(prof, "_stnet_row_limit", 40) or 40)
-    group_by_shape = bool(getattr(prof, "_stnet_group_by_shape", False))
-    out_dir = str(getattr(prof, "_stnet_out_dir", ""))
-    tag = str(getattr(prof, "_stnet_tag", header))
+    row_limit = int(getattr(prof, "_enn_row_limit", 40) or 40)
+    group_by_shape = bool(getattr(prof, "_enn_group_by_shape", False))
+    out_dir = str(getattr(prof, "_enn_out_dir", ""))
+    tag = str(getattr(prof, "_enn_tag", header))
     try:
         ka = prof.key_averages(group_by_input_shape=group_by_shape)
     except Exception:
@@ -534,7 +533,7 @@ def _get_sampler_scaler(
     for _ in range(depth):
         if obj is None:
             break
-        ctl = getattr(obj, "_stnet_sampler_scale", None)
+        ctl = getattr(obj, "_enn_sampler_scale", None)
         if ctl is not None:
             return ctl
         obj = getattr(obj, "_src", None) or getattr(obj, "src", None)
@@ -630,7 +629,7 @@ def _recover_oom(
     )
     if inst_pressure is not None and int(oom_try) <= 1:
         cur_step_total = int(
-            getattr(inst_pressure, "_stnet_step_total", 0) or 0
+            getattr(inst_pressure, "_enn_step_total", 0) or 0
         )
         if to_checkpoint(
             model,
@@ -2990,7 +2989,7 @@ def epochs(
         )
         for epoch_idx in range(int(total_epochs)):
             with contextlib.suppress(Exception):
-                epochables = getattr(train_loader, "_stnet_epochables", None)
+                epochables = getattr(train_loader, "_enn_epochables", None)
                 if epochables is not None:
                     for obj in epochables:
                         fn = getattr(obj, "set_epoch", None)
@@ -3297,7 +3296,7 @@ def epochs(
                                         with contextlib.suppress(Exception):
                                             setattr(
                                                 inst_step,
-                                                "_stnet_step_total",
+                                                "_enn_step_total",
                                                 int(delta_gate_auto_step_total),
                                             )
                                         peak = None
@@ -3324,7 +3323,7 @@ def epochs(
                                             prev_ema = float(
                                                 getattr(
                                                     inst_step,
-                                                    "_stnet_peak_ema",
+                                                    "_enn_peak_ema",
                                                     0.0,
                                                 )
                                                 or 0.0
@@ -3341,7 +3340,7 @@ def epochs(
                                             ):
                                                 setattr(
                                                     inst_step,
-                                                    "_stnet_peak_ema",
+                                                    "_enn_peak_ema",
                                                     float(ema),
                                                 )
                                             spike = (
