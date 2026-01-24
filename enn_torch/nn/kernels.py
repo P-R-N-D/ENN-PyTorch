@@ -18,6 +18,7 @@ from ..core.graph import (
     assert_trace,
     canonicalize_compile_mode,
     is_compiling,
+    is_dynamo_compiling,
     is_export_or_trace,
     is_symbolic,
     is_tracing_or_exporting,
@@ -198,7 +199,7 @@ def _get_compiled_flex_attention_for_kwargs(
     if not _HAS_TORCH_FLEX or _torch_flex_attention is None:
         raise RuntimeError("Flex Attention is not available")
 
-    if is_compiling() or is_tracing_or_exporting():
+    if is_dynamo_compiling() or is_tracing_or_exporting():
         return _torch_flex_attention, ("flexattn", "raw")
 
     if not torch_compiler_supported():
@@ -249,7 +250,7 @@ def _get_compiled_flex_attention() -> Any:
     if not _HAS_TORCH_FLEX or _torch_flex_attention is None:
         raise RuntimeError("Flex Attention is not available")
 
-    if is_compiling() or is_tracing_or_exporting():
+    if is_dynamo_compiling() or is_tracing_or_exporting():
         return _torch_flex_attention
 
     if not torch_compiler_supported():
