@@ -104,6 +104,7 @@ def _flex_attention_dynamic_flag(mode: str) -> Optional[bool]:
 def _flex_attention_cache_key(
     *,
     mode: str,
+    dynamic: Optional[bool],
     device: torch.device,
     dtype: torch.dtype,
     flex_kwargs: Mapping[str, Any],
@@ -121,6 +122,7 @@ def _flex_attention_cache_key(
     return (
         "flexattn",
         str(mode),
+        (dynamic if dynamic is None else bool(dynamic)),
         str(device),
         str(dtype),
         keys,
@@ -203,7 +205,11 @@ def _get_compiled_flex_attention_for_kwargs(
     mode = _flex_attention_compile_mode()
     dynamic = _flex_attention_dynamic_flag(mode)
     key = _flex_attention_cache_key(
-        mode=mode, device=q.device, dtype=q.dtype, flex_kwargs=flex_kwargs
+        mode=mode,
+        dynamic=dynamic,
+        device=q.device,
+        dtype=q.dtype,
+        flex_kwargs=flex_kwargs,
     )
 
     cached = _FLEX_ATTN_SPECIALIZED.get(key)
