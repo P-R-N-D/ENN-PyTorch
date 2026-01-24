@@ -8,6 +8,9 @@
 # The canonical dependency set is in `pyproject.toml`.
 
 # Base runtime (mirrors pyproject.toml -> [project].dependencies)
+#
+# If error happens when building wheel of openzl, install this using the official GitHub repository by Meta Platforms, Inc.
+# `pip install "openzl @ git+https://github.com/facebook/openzl.git#subdirectory=py"`
 numpy>=2.4.1
 psutil>=7.2.1
 py-cpuinfo>=9.0.0
@@ -25,6 +28,7 @@ onnxruntime>=1.23.2
 onnxscript>=0.5.7
 onnxoptimizer>=0.4.2
 onnx_ir>=0.1.14
+openzl>=0.1.0
 ml_dtypes>=0.5.4
 
 # Checkpoint / IO formats (optional)
