@@ -5380,7 +5380,7 @@ def process(*args: Any, **kwargs: Any) -> object:
             skew=ops.loss_skew,
         )
         top_loss = LinearCombinationLoss(
-            coefficient=[1.0, 0.0],
+            coefficient=[0.5, 0.5],
             loss=[top_df, top_z],
             reduce_each=True,
             auto_schedule=True,
@@ -5394,7 +5394,7 @@ def process(*args: Any, **kwargs: Any) -> object:
             reduction="mean",
         )
         bottom_loss.base = LinearCombinationLoss(
-            coefficient=[1.0, 0.0],
+            coefficient=[0.5, 0.5],
             loss=[local_crps, local_t],
             reduce_each=False,
             auto_schedule=True,
