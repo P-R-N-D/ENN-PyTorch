@@ -41,6 +41,17 @@ _INDUCTOR_WARN_FILTER_LOCK = Mutex(reentrant=True)
 _INDUCTOR_MAX_AUTOTUNE_SMS_FILTERED = False
 
 
+def _is_in_jupyter() -> bool:
+    try:
+        if "ipykernel" in sys.modules:
+            return True
+        if "google.colab" in sys.modules:
+            return True
+    except Exception:
+        return False
+    return False
+
+
 def _suppress_inductor_max_autotune_sms_warning() -> None:
     global _INDUCTOR_MAX_AUTOTUNE_SMS_FILTERED
     if _INDUCTOR_MAX_AUTOTUNE_SMS_FILTERED:
@@ -610,9 +621,18 @@ def compile(
                     if hasattr(_inductor_config, attr):
                         _scoped_inductor_overrides[attr] = value
 
+                default_subproc = not _is_in_jupyter()
+                want_subproc = env_bool(
+                    (
+                        "ENN_INDUCTOR_AUTOTUNE_IN_SUBPROC",
+                        "ENN_AUTOTUNE_IN_SUBPROC",
+                        "TORCHINDUCTOR_AUTOTUNE_IN_SUBPROC",
+                    ),
+                    default=default_subproc,
+                )
                 with suppress(Exception):
-                    _inductor_config.autotune_in_subproc = True
-                _want("autotune_in_subproc", True)
+                    _inductor_config.autotune_in_subproc = bool(want_subproc)
+                _want("autotune_in_subproc", bool(want_subproc))
                 with suppress(Exception):
                     _inductor_config.autotune_local_cache = True
                 _want("autotune_local_cache", True)
@@ -666,8 +686,20 @@ def compile(
                                 int(override_raw)
                                 override_valid = True
                         if not override_valid:
-                            _inductor_config.compile_threads = 1
-                            _want("compile_threads", 1)
+                            local_world = env_first_int(
+                                (
+                                    "ENN_LOCAL_WORLD_SIZE",
+                                    "LOCAL_WORLD_SIZE",
+                                    "SLURM_NTASKS_PER_NODE",
+                                ),
+                                1,
+                            )
+                            threads = 1
+                            if int(local_world) <= 1 and _is_in_jupyter():
+                                cpu_count = int(CPU.count() or 1)
+                                threads = max(1, min(4, int(cpu_count) // 2))
+                            _inductor_config.compile_threads = int(threads)
+                            _want("compile_threads", int(threads))
     try:
         backend_value = backend
         mode_value: Optional[str] = None
