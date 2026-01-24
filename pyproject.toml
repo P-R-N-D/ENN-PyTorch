@@ -50,6 +50,7 @@ dependencies = [
   "onnxscript>=0.5.7",
   "onnxoptimizer>=0.4.2",
   "onnx_ir>=0.1.14",
+  "openzl>=0.1.0",
   "ml_dtypes>=0.5.4",
 ]
 
