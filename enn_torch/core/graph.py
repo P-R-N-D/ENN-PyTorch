@@ -4,6 +4,7 @@ from __future__ import annotations
 import contextlib
 import importlib
 import logging
+import sys
 import threading
 import traceback
 from contextlib import AbstractContextManager, nullcontext, suppress
@@ -308,10 +309,20 @@ def skip_non_infra_dispatch_mode() -> Iterator[None]:
         return
 
     try:
-        with _disable_current_modes():
-            yield
+        cm = _disable_current_modes()
+        cm.__enter__()
     except Exception:
         yield
+        return
+
+    exc_type = exc = tb = None
+    try:
+        yield
+    except Exception:
+        exc_type, exc, tb = sys.exc_info()
+        raise
+    finally:
+        cm.__exit__(exc_type, exc, tb)
 
 
 def is_dynamo_compiling() -> bool:
