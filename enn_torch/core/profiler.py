@@ -2125,7 +2125,7 @@ class _GraphProfiler:
 
 class _FlopProfiler:
     _stack_var: contextvars.ContextVar[Tuple[_Acc, ...]] = (
-        contextvars.ContextVar("stnet_flops_stack", default=())
+        contextvars.ContextVar("enn_flops_stack", default=())
     )
     _nvtx_getter: Optional[Callable[[], float]] = None
 

@@ -814,6 +814,10 @@ def load_model(
     config: ModelConfig | Mapping[str, object] | None = None,
     map_location: TorchDeviceLike | None = None,
     weights_only: bool = True,
+    openzl_memmap: bool = True,
+    openzl_lazy_tensors: bool = True,
+    openzl_check_content_checksum: bool | None = None,
+    openzl_check_compressed_checksum: bool | None = None,
 ) -> Model:
     p = Path(checkpoint_path)
     load_dev = (
@@ -821,6 +825,7 @@ def load_model(
         if map_location is not None
         else torch.device("cpu")
     )
+
     if p.is_dir():
         meta = _parse_meta(p)
         use_in_dim = int(
@@ -905,14 +910,54 @@ def load_model(
         resize_scaler_buffer(model, sd)
         model.load_state_dict(sd, strict=False)
         return model
-    obj = _torch_load_checkpoint(
-        p, map_location=map_location or "cpu", weights_only=weights_only
-    )
+    if suffix == ".ozl":
+        from .runtime.io import _openzl_load_checkpoint
+
+        obj = _openzl_load_checkpoint(
+            p,
+            openzl_memmap=openzl_memmap,
+            openzl_lazy_tensors=openzl_lazy_tensors,
+            openzl_check_content_checksum=openzl_check_content_checksum,
+            openzl_check_compressed_checksum=openzl_check_compressed_checksum,
+            weights_only=weights_only,
+        )
+    else:
+        obj = _torch_load_checkpoint(
+            p, map_location=map_location or "cpu", weights_only=weights_only
+        )
     if isinstance(obj, dict):
         meta_in_dim = obj.get("in_dim")
         meta_out_shape = obj.get("out_shape")
         meta_cfg = obj.get("config")
-        sd = obj["state_dict"] if "state_dict" in obj else obj
+
+        sd = None
+        for k in (
+            "state_dict",
+            "model_state_dict",
+            "model",
+            "model_sd",
+            "weights",
+            "model_weights",
+        ):
+            v = obj.get(k)
+            if isinstance(v, dict):
+                sd = v
+                break
+
+        if sd is None:
+            try:
+                if obj and all(
+                    isinstance(k, str) and torch.is_tensor(v)
+                    for k, v in obj.items()
+                ):
+                    sd = obj
+            except Exception:
+                sd = None
+
+        if sd is None:
+            raise RuntimeError(
+                f"Checkpoint did not contain a recognizable state_dict: {str(p)!r}"
+            )
     else:
         meta_in_dim = None
         meta_out_shape = None
@@ -949,6 +994,14 @@ def save_model(
     optimizer: torch.optim.Optimizer | None = None,
     extra: Mapping[str, object] | None = None,
     *args: Any,
+    state_dict: Mapping[str, torch.Tensor] | None = None,
+    openzl_level: int | None = None,
+    openzl_format_version: int | None = None,
+    openzl_min_stream_size: int | None = None,
+    openzl_content_checksum: bool | None = None,
+    openzl_compressed_checksum: bool | None = None,
+    openzl_permissive: bool | None = None,
+    openzl_pack_by_dtype: bool = True,
     ema_averager: object | None = None,
     swa_averager: object | None = None,
     **kwargs: Any,
@@ -961,6 +1014,21 @@ def save_model(
             raise TypeError(
                 "Positional args are only supported for export converters; use keyword arguments for TorchIO.save()."
             )
+
+        if openzl_level is not None:
+            kwargs["openzl_level"] = openzl_level
+        if openzl_format_version is not None:
+            kwargs["openzl_format_version"] = openzl_format_version
+        if openzl_min_stream_size is not None:
+            kwargs["openzl_min_stream_size"] = openzl_min_stream_size
+        if openzl_content_checksum is not None:
+            kwargs["openzl_content_checksum"] = openzl_content_checksum
+        if openzl_compressed_checksum is not None:
+            kwargs["openzl_compressed_checksum"] = openzl_compressed_checksum
+        if openzl_permissive is not None:
+            kwargs["openzl_permissive"] = openzl_permissive
+        kwargs.setdefault("openzl_pack_by_dtype", openzl_pack_by_dtype)
+
         merged_extra = dict(extra or {})
         if ema_averager is not None and hasattr(ema_averager, "state_dict"):
             with contextlib.suppress(Exception):
@@ -969,7 +1037,12 @@ def save_model(
             with contextlib.suppress(Exception):
                 merged_extra["swa_averager_state"] = swa_averager.state_dict()
         out = Builder.save(
-            model, p, optimizer=optimizer, extra=merged_extra or None, **kwargs
+            model,
+            p,
+            optimizer=optimizer,
+            extra=merged_extra or None,
+            state_dict=state_dict,
+            **kwargs,
         )
         return str(out)
     conv = Exporter.for_export(p.suffix)
@@ -1058,7 +1131,7 @@ def train(
             "ENN_INIT_CKPT_LOCAL", default=(_max_nodes <= 1)
         )
         if use_local_init:
-            init_dir = tempfile.mkdtemp(prefix=f"stnet_init_ckpt_{run_id}_")
+            init_dir = tempfile.mkdtemp(prefix=f"enn_init_ckpt_{run_id}_")
         else:
             init_dir = new_dir("init_ckpt")
 
@@ -1170,13 +1243,22 @@ def train(
         _clear_device_caches()
         with _start_context():
             elastic_launch(lc, process)(ops)
-        fallback = os.path.join(ckpt_dir, "model.pt")
-        if os.path.isfile(fallback):
-            cpu_state = coerce_tensor(
-                _torch_load_checkpoint(
-                    fallback, map_location="cpu", weights_only=True
-                )
+        fallback: str | None = None
+        for fname in ("model.ozl", "model.pt"):
+            fp = os.path.join(ckpt_dir, fname)
+            if os.path.isfile(fp):
+                fallback = fp
+                break
+
+        if fallback is not None:
+            loaded = load_model(
+                fallback,
+                in_dim=getattr(model, "in_dim", None),
+                out_shape=getattr(model, "out_shape", None),
+                map_location="cpu",
+                openzl_memmap=True,
             )
+            cpu_state = coerce_tensor(loaded.state_dict())
 
             if isinstance(model, torch.nn.Module) and _has_meta_tensors(model):
                 with contextlib.suppress(Exception):
@@ -1209,9 +1291,11 @@ def train(
         restore_path: str | None = None
 
         with contextlib.suppress(Exception):
-            fp = os.path.join(str(ckpt_dir or ""), "model.pt")
-            if fp and os.path.isfile(fp):
-                restore_path = fp
+            for _name in ("model.ozl", "model.pt"):
+                fp = os.path.join(str(ckpt_dir or ""), _name)
+                if fp and os.path.isfile(fp):
+                    restore_path = fp
+                    break
         if (
             restore_path is None
             and init_ckpt_path
@@ -1235,11 +1319,23 @@ def train(
                             _meta = True
                             break
                 if _meta:
-                    cpu_state = coerce_tensor(
-                        _torch_load_checkpoint(
-                            restore_path, map_location="cpu", weights_only=True
+                    if str(restore_path).lower().endswith(".ozl"):
+                        loaded = load_model(
+                            restore_path,
+                            in_dim=getattr(model, "in_dim", None),
+                            out_shape=getattr(model, "out_shape", None),
+                            map_location="cpu",
+                            openzl_memmap=True,
                         )
-                    )
+                        cpu_state = coerce_tensor(loaded.state_dict())
+                    else:
+                        cpu_state = coerce_tensor(
+                            _torch_load_checkpoint(
+                                restore_path,
+                                map_location="cpu",
+                                weights_only=True,
+                            )
+                        )
                     with contextlib.suppress(Exception):
                         if hasattr(model, "to_empty"):
                             model.to_empty(device="cpu")
