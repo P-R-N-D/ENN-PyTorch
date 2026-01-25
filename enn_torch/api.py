@@ -919,6 +919,7 @@ def load_model(
             openzl_lazy_tensors=openzl_lazy_tensors,
             openzl_check_content_checksum=openzl_check_content_checksum,
             openzl_check_compressed_checksum=openzl_check_compressed_checksum,
+            weights_only=weights_only,
         )
     else:
         obj = _torch_load_checkpoint(

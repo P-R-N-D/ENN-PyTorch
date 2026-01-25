@@ -529,10 +529,16 @@ def _openzl_unjsonify(
     *,
     tensors: list[torch.Tensor],
     tensor_table: Sequence[Mapping[str, Any]],
+    allow_pickle: bool = True,
 ) -> object:
 
     if isinstance(obj, list):
-        return [_openzl_unjsonify(v, tensors=tensors, tensor_table=tensor_table) for v in obj]
+        return [
+            _openzl_unjsonify(
+                v, tensors=tensors, tensor_table=tensor_table, allow_pickle=allow_pickle
+            )
+            for v in obj
+        ]
     if isinstance(obj, dict):
         if _OPENZL_TENSOR_MARKER in obj:
             tid = int(obj[_OPENZL_TENSOR_MARKER])
@@ -543,25 +549,47 @@ def _openzl_unjsonify(
         if _OPENZL_TUPLE_MARKER in obj:
             vals = obj.get(_OPENZL_TUPLE_MARKER) or []
             return tuple(
-                _openzl_unjsonify(v, tensors=tensors, tensor_table=tensor_table) for v in vals
+                _openzl_unjsonify(
+                    v,
+                    tensors=tensors,
+                    tensor_table=tensor_table,
+                    allow_pickle=allow_pickle,
+                )
+                for v in vals
             )
         if _OPENZL_DICT_MARKER in obj:
             out: dict[Any, Any] = {}
             pairs = obj.get(_OPENZL_DICT_MARKER) or []
             for k_raw, v_raw in pairs:
-                k = _openzl_unjsonify(k_raw, tensors=tensors, tensor_table=tensor_table)
-                v = _openzl_unjsonify(v_raw, tensors=tensors, tensor_table=tensor_table)
+                k = _openzl_unjsonify(
+                    k_raw,
+                    tensors=tensors,
+                    tensor_table=tensor_table,
+                    allow_pickle=allow_pickle,
+                )
+                v = _openzl_unjsonify(
+                    v_raw,
+                    tensors=tensors,
+                    tensor_table=tensor_table,
+                    allow_pickle=allow_pickle,
+                )
                 if isinstance(k, list):
                     k = tuple(k)
                 out[k] = v
             return out
         if _OPENZL_PICKLE_MARKER in obj:
+            if not allow_pickle:
+                raise RuntimeError(
+                    "OpenZL pickle deserialization is disabled when weights_only=True."
+                )
             try:
                 return pickle.loads(b64decode(str(obj[_OPENZL_PICKLE_MARKER])))
             except Exception:
                 return None
         return {
-            k: _openzl_unjsonify(v, tensors=tensors, tensor_table=tensor_table)
+            k: _openzl_unjsonify(
+                v, tensors=tensors, tensor_table=tensor_table, allow_pickle=allow_pickle
+            )
             for k, v in obj.items()
         }
     return obj
@@ -679,6 +707,7 @@ def _openzl_decompress_payload(
     openzl_lazy_tensors: bool = True,
     openzl_check_content_checksum: bool | None = None,
     openzl_check_compressed_checksum: bool | None = None,
+    weights_only: bool = True,
 ) -> object:
 
     zl = _openzl_import()
@@ -743,7 +772,12 @@ def _openzl_decompress_payload(
         tensors[tid] = view.view(shape) if shape else view.reshape(())
 
     payload_meta = meta.get("payload")
-    return _openzl_unjsonify(payload_meta, tensors=tensors, tensor_table=tensor_table)
+    return _openzl_unjsonify(
+        payload_meta,
+        tensors=tensors,
+        tensor_table=tensor_table,
+        allow_pickle=not weights_only,
+    )
 
 
 def _openzl_load_checkpoint(
@@ -753,6 +787,7 @@ def _openzl_load_checkpoint(
     openzl_lazy_tensors: bool = True,
     openzl_check_content_checksum: bool | None = None,
     openzl_check_compressed_checksum: bool | None = None,
+    weights_only: bool = True,
 ) -> object:
 
     p = Path(path)
@@ -766,6 +801,7 @@ def _openzl_load_checkpoint(
             openzl_lazy_tensors=openzl_lazy_tensors,
             openzl_check_content_checksum=openzl_check_content_checksum,
             openzl_check_compressed_checksum=openzl_check_compressed_checksum,
+            weights_only=weights_only,
         )
 
     import mmap
@@ -780,6 +816,7 @@ def _openzl_load_checkpoint(
                     openzl_lazy_tensors=openzl_lazy_tensors,
                     openzl_check_content_checksum=openzl_check_content_checksum,
                     openzl_check_compressed_checksum=openzl_check_compressed_checksum,
+                    weights_only=weights_only,
                 )
             except TypeError:
                 return _openzl_decompress_payload(
@@ -787,6 +824,7 @@ def _openzl_load_checkpoint(
                     openzl_lazy_tensors=openzl_lazy_tensors,
                     openzl_check_content_checksum=openzl_check_content_checksum,
                     openzl_check_compressed_checksum=openzl_check_compressed_checksum,
+                    weights_only=weights_only,
                 )
         finally:
             with contextlib.suppress(Exception):
