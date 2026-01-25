@@ -473,7 +473,7 @@ def _openzl_get_default_compressor() -> Any:
         return compressor
 
 
-def _openzl_get_fallback_compressor() -> Any:
+def _openzl_compat_compressor() -> Any:
     global _OPENZL_FALLBACK_COMPRESSOR
     cached = _OPENZL_FALLBACK_COMPRESSOR
     if cached is not None:
@@ -660,7 +660,7 @@ def _openzl_compress_payload(
     compressors = [_openzl_get_default_compressor()]
     fallback = None
     with contextlib.suppress(Exception):
-        fallback = _openzl_get_fallback_compressor()
+        fallback = _openzl_compat_compressor()
     if fallback is not None and fallback is not compressors[0]:
         compressors.append(fallback)
 
