@@ -999,6 +999,9 @@ class Builder:
             if optimizer is not None:
                 with contextlib.suppress(Exception):
                     payload["optimizer_state_dict"] = optimizer.state_dict()
+            for key in list(opts):
+                if str(key).startswith("openzl_"):
+                    opts.pop(key)
             save_temp(p, payload, **opts)
             return p
 

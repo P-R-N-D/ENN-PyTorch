@@ -2153,7 +2153,7 @@ class BoundedExecutor(futures.Executor):
 
 
 class Mutex:
-    __slots__ = ("_lock", "_acquire", "_release", "_locked_fn")
+    __slots__ = ("_lock", "_acquire", "_release", "_locked_fn", "__weakref__")
 
     def __init__(self: Self, *args: Any, reentrant: bool = False) -> None:
         lock = threading.RLock() if bool(reentrant) else threading.Lock()
