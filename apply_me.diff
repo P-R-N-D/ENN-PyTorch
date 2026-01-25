@@ -1,0 +1,1204 @@
+diff --git a/README.md b/README.md
+index 4a87087..bc84c11 100644
+--- a/README.md
++++ b/README.md
+@@ -35,7 +35,7 @@ This repository also includes a worked example notebook (`notebook.ipynb`) and a
+ ## Features
+ - **APIs** (`enn_torch.runtime.workflow`): build/load models, elastic train/predict entrypoints (uses `torch.distributed.elastic`), and checkpoint/export helpers.
+ - **Templated configurations** (`enn_torch.config`): dataclass configs with coercion/validation and string canonicalizers for modeling type, normalization, and compile options.
+-- **Neural network stacks** (`enn_torch.nn`): spatio-temporal TokenFuser/TokenCollector blocks, attention variants, scaler + recorder modules, AMP negotiation guard band (`ModelConfig.safety_margin_pow2`).
++- **Neural network stacks** (`enn_torch.nn`): spatio-temporal **Fuser/Collector** backbone, Perceiver-style set fusion, attention variants, scaler + recorder modules, AMP negotiation guard band (`ModelConfig.safety_margin_pow2`).
+ - **Data pipeline** (`enn_torch.data`): `torchdata.nodes`-driven memmap pipeline with TensorDict support, prefetch/pin/pool options, and scale-aware dataset metadata.
+ - **Runnable tasks** (`enn_torch.runtime`): thread/NUMA tuning, free-threaded/no-GIL optimizations, mixed-precision helpers, history recorder, and OOM recovery hooks. ONNX/ORT/onnxscript/onnx_ir/torch.export (PT2) out of the box; optional platform-dependent backends (TensorRT/CoreML/ExecuTorch/onnx-tf) via extras. elastic launch wiring and group setup for multi-process CPU/GPU runs.
+ - **Losses/optimizers/profiling** (`enn_torch.core`): Student’s t losses, SWA helpers, FLOP/IO timing.
+@@ -47,19 +47,36 @@ High-level flow used by `enn_torch.nn.architecture.Model`:
+ ```
+ Input features (B x C_in)
+   → Scaler (feature normalization)
+-  → TokenFuser
+-      → TokenizedView (spatial extractor)
+-      → TokenizedView (temporal extractor)
+-      → CrossTransformer fusion (spatial|temporal)
+-      → Aggregation + MLP head → output vector
+-  → TokenCollector (temporal controller head)
++  → Fuser
++      → one-or-more *tasks* (orderless views)
++          → Template (RetNet front-end; `mode ∈ {spatial, temporal}`)
++          → optional BYOM submodel (user-managed, detachable)
++      → Perceiver-style latent bottleneck fusion (fixed K)
++      → MLP head → output vector
++  → Collector (temporal controller head)
+   → Optional linear branch (configurable)
+ ```
+ 
+ Key building blocks:
+-- **Scaler** for input feature normalization, with an optional linear branch when `use_linear_branch` is enabled in the config.【F:enn_torch/nn/architecture.py†L1032-L1049】
+-- **TokenFuser** builds spatial/temporal TokenizedViews and fuses them via a CrossTransformer before projecting through the head MLP to the output dimension.【F:enn_torch/nn/architecture.py†L659-L836】
+-- **TokenCollector** acts as the temporal controller head for the model instance.【F:enn_torch/nn/architecture.py†L1051-L1061】
++- **Scaler** for input feature normalization, with an optional linear branch when `use_linear_branch` is enabled in the config.
++- **Template** is the unified task module: it performs tokenization + RetNet extraction in either `spatial` or `temporal` mode and outputs `(B, N, D)` tokens.
++- **Fuser** holds a dynamic set of tasks (1+), runs them in an orderless way, and fuses all task tokens into a single high-dimensional view using a Perceiver-style latent bottleneck.
++- **Collector** acts as the temporal controller head for the model instance.
++
++### Dynamic tasks (BYOM)
++
++At runtime you can add/remove tasks without creating a new `Model` instance:
++
++```python
++model.add_task("spatial_aux", mode="spatial", weight=0.5)
++model.update_task("spatial_aux", submodel=my_byom_module)  # attach
++model.update_task("spatial_aux", submodel=None)            # detach
++model.remove_task("spatial_aux")
++```
++
++Notes:
++- Task mutations must happen **before** wrapping the model with DDP/HSDP.
++- BYOM submodels are intentionally excluded from `state_dict` (detachable). They are user-managed.
+ 
+ ## Installation
+ 1. Install the appropriate **PyTorch** build for your accelerator first (CUDA/ROCm/XPU/CPU).
+diff --git a/enn_torch/nn/architecture.py b/enn_torch/nn/architecture.py
+index 3754902..74c5c79 100644
+--- a/enn_torch/nn/architecture.py
++++ b/enn_torch/nn/architecture.py
+@@ -55,6 +55,7 @@ from ..schema import get_feature_key, get_label_key
+ from .blocks import (
+     CrossTransformer,
+     LongNet,
++    Perceiver,
+     RetNet,
+     _autofit_microbatch,
+     _coerce_modeling_types,
+@@ -74,6 +75,9 @@ from .layers import (
+ _LOGGER = logging.getLogger(__name__)
+ TConfig = TypeVar("TConfig")
+ 
++# Sentinel for optional arguments where `None` is a meaningful value.
++_UNSET: object = object()
++
+ 
+ def _prod_int(shape: Sequence[int]) -> int:
+     return int(math.prod(int(v) for v in shape))
+@@ -752,10 +756,10 @@ class Template(nn.Module):
+ 
+     Notes
+     -----
+-    * `mode="temporal"` supports streaming state via `state`/`return_state`.
+-    * `mode="spatial"` is stateless; `state` is ignored and `return_state` is not supported.
++    * ``mode="temporal"`` supports streaming state via ``state``/``return_state``.
++    * ``mode="spatial"`` is stateless; ``state`` is ignored and ``return_state`` is not supported.
+ 
+-    The module itself is part of the backbone (trainable). Any user-provided
++    The module itself is part of the *backbone* (trainable). Any user-provided
+     BYOM submodel should be attached outside of this module so its weights are
+     not mixed into the backbone state_dict.
+     """
+@@ -773,6 +777,8 @@ class Template(nn.Module):
+         drop_path: float = 0.0,
+         norm_type: str = "layernorm",
+         mode: str | None = None,
++        weight: float = 1.0,
++        eps: float = 1e-6,
+         **kwargs: Any,
+     ) -> None:
+         super().__init__()
+@@ -783,26 +789,45 @@ class Template(nn.Module):
+         self.nhead = int(nhead)
+         self.depth = int(depth)
+         self.head_dim = int(self.d_model // max(1, self.nhead))
++
++        # Stored for introspection/serialization.
++        self.mlp_ratio = float(mlp_ratio)
++        self.dropout = float(dropout)
++        self.drop_path = float(drop_path)
++        self.norm_type = str(norm_type)
++
+         self.mode = self._coerce_mode(mode)
+ 
++        # Non-trainable per-task knobs (persisted via state_dict).
++        self.register_buffer(
++            "task_weight",
++            torch.tensor(float(weight), dtype=torch.float32),
++            persistent=True,
++        )
++        self.register_buffer(
++            "task_eps",
++            torch.tensor(float(eps), dtype=torch.float32),
++            persistent=True,
++        )
++
+         self.tokenizer = nn.Linear(self.in_dim, self.tokens * self.d_model)
+ 
+-        drops = stochastic_depth_schedule(drop_path, self.depth)
++        drops = stochastic_depth_schedule(self.drop_path, self.depth)
+         self.blocks = nn.ModuleList(
+             [
+                 RetNet(
+                     self.d_model,
+                     self.nhead,
+-                    mlp_ratio=mlp_ratio,
+-                    dropout=dropout,
++                    mlp_ratio=self.mlp_ratio,
++                    dropout=self.dropout,
+                     drop_path=drops[i],
+-                    norm_type=norm_type,
++                    norm_type=self.norm_type,
+                     mode=self.mode,
+                 )
+                 for i in range(int(self.depth))
+             ]
+         )
+-        self.norm = norm_layer(norm_type, int(self.d_model))
++        self.norm = norm_layer(self.norm_type, int(self.d_model))
+         self._ckpt_enabled = True
+         self._ckpt_min_bytes = int(64 * 1024 * 1024)
+ 
+@@ -829,6 +854,7 @@ class Template(nn.Module):
+     def set_mode(self: Self, mode: str) -> None:
+         m = self._coerce_mode(mode)
+         self.mode = m
++        # Best-effort propagation into nested retention blocks.
+         for blk in self.blocks:
+             with contextlib.suppress(Exception):
+                 blk.mode = m
+@@ -837,6 +863,69 @@ class Template(nn.Module):
+                 if retention is not None:
+                     retention.mode = m
+ 
++    @property
++    def weight(self: Self) -> torch.Tensor:
++        """Per-task scalar weight (buffer), clamped by eps."""
++
++        w = cast(torch.Tensor, getattr(self, "task_weight"))
++        e = cast(torch.Tensor, getattr(self, "task_eps"))
++        # Guard against NaN/Inf to keep fusion numerically stable.
++        w = torch.where(torch.isfinite(w), w, torch.zeros_like(w))
++        e = torch.where(torch.isfinite(e), e, torch.zeros_like(e))
++        w = torch.clamp(w, min=0.0)
++        e = torch.clamp(e, min=0.0)
++        return torch.maximum(w, e)
++
++    @property
++    def eps(self: Self) -> torch.Tensor:
++        """Per-task epsilon knob (buffer)."""
++
++        return cast(torch.Tensor, getattr(self, "task_eps"))
++
++    def set_weight(self: Self, weight: float) -> None:
++        """Update task_weight buffer (raw, before eps clamp)."""
++
++        with torch.no_grad():
++            tw = getattr(self, "task_weight", None)
++            if not torch.is_tensor(tw):
++                self.register_buffer(
++                    "task_weight",
++                    torch.tensor(float(weight), dtype=torch.float32),
++                    persistent=True,
++                )
++            else:
++                tw.fill_(float(weight))
++
++    def set_eps(self: Self, eps: float) -> None:
++        with torch.no_grad():
++            self.eps.fill_(float(eps))
++
++    def to_spec(self: Self, *, name: str) -> dict[str, Any]:
++        """Return a JSON-serializable task spec for checkpoint meta.json."""
++
++        def _f(x: Any, default: float) -> float:
++            if torch.is_tensor(x):
++                with contextlib.suppress(Exception):
++                    return float(x.detach().cpu().item())
++            with contextlib.suppress(Exception):
++                return float(x)
++            return float(default)
++
++        return {
++            "name": str(name),
++            "mode": str(getattr(self, "mode", "spatial")),
++            "tokens": int(getattr(self, "tokens", 0) or 0),
++            "depth": int(getattr(self, "depth", 0) or 0),
++            "d_model": int(getattr(self, "d_model", 0) or 0),
++            "nhead": int(getattr(self, "nhead", 0) or 0),
++            "mlp_ratio": float(getattr(self, "mlp_ratio", 4.0)),
++            "dropout": float(getattr(self, "dropout", 0.0)),
++            "drop_path": float(getattr(self, "drop_path", 0.0)),
++            "norm_type": str(getattr(self, "norm_type", "layernorm")),
++            "weight": _f(getattr(self, "task_weight", None), 1.0),
++            "eps": _f(getattr(self, "task_eps", None), 1e-6),
++        }
++
+     @staticmethod
+     def _coerce_state_tensor(
+         state: Any,
+@@ -853,6 +942,8 @@ class Template(nn.Module):
+         Mirrors TemporalExtractor._coerce_state_tensor so Template can be used
+         as a drop-in temporal view.
+         """
++
++        del args
+         if state is None:
+             return None
+         strict = env_bool(
+@@ -904,24 +995,21 @@ class Template(nn.Module):
+                 elif int(t.shape[1]) == int(depth):
+                     st = t.permute(1, 0, 2, 3)
+                 else:
+-                    return _bad(f"4D tensor missing depth axis={int(depth)}")
++                    return _bad(
++                        f"tensor shape={tuple(map(int, t.shape))} does not match depth={int(depth)}"
++                    )
+             elif t.dim() == 3:
+-                if tuple(map(int, t.shape)) != (
+-                    int(batch_size),
+-                    int(nhead),
+-                    int(head_dim),
+-                ):
++                # Single-layer state -> put it in layer0.
++                if tuple(map(int, t.shape)) != (int(batch_size), int(nhead), int(head_dim)):
+                     return _bad(
+-                        f"3D tensor shape={tuple(map(int, t.shape))} expected=({int(batch_size)},{int(nhead)},{int(head_dim)})"
++                        f"tensor shape={tuple(map(int, t.shape))} expected=({int(batch_size)},{int(nhead)},{int(head_dim)})"
+                     )
+-                st = torch.zeros(
+-                    (int(depth), int(batch_size), int(nhead), int(head_dim)),
+-                    device=device,
+-                    dtype=dtype,
+-                )
+-                st[0] = t.to(device=device, dtype=dtype)
++                st = t.new_zeros((int(depth), int(batch_size), int(nhead), int(head_dim)))
++                st[0] = t
+             else:
+-                return _bad(f"tensor dim must be 3 or 4, got {int(t.dim())}")
++                return _bad(
++                    f"tensor dim={int(t.dim())} expected 3 or 4"
++                )
+ 
+             if tuple(map(int, st.shape)) != (
+                 int(depth),
+@@ -1183,7 +1271,25 @@ class Template(nn.Module):
+         return out
+ 
+ 
++
++
+ class Fuser(nn.Module):
++    """Backbone fuser.
++
++    - Holds an arbitrary number of *tasks* (orderless set of low-dim views).
++    - Each task is represented by a :class:`Template` (RetNet front-end) plus an
++      optional user-provided submodel (BYOM) attached *after* the template.
++    - Task tokens are fused into a single high-dim view via a Perceiver-style
++      latent bottleneck (fixed K = fused_tokens), keeping cost bounded even when
++      many tasks are present.
++
++    Notes
++    -----
++    * Task add/update/remove **must happen before** wrapping with DDP/HSDP.
++      (Changing parameters after DDP construction is not supported.)
++    * BYOM submodels are intentionally kept **out of state_dict** (detachable).
++    """
++
+     def __init__(
+         self: Self,
+         in_dim: int,
+@@ -1199,132 +1305,90 @@ class Fuser(nn.Module):
+         ] = None,
+     ) -> None:
+         super().__init__()
++        del args, fusions
+         self.in_dim = int(in_dim)
+         self.out_shape = tuple((int(v) for v in out_shape))
+         self.out_dim = int(math.prod(self.out_shape) if self.out_shape else 1)
+         self.d_model = int(config.d_model)
+         self.nhead = int(config.heads)
+         self.modeling_type = _coerce_modeling_types(config.modeling_type)
+-        self.spatial_tokens = max(
+-            1, int(getattr(config, "spatial_latents", 1))
+-        )
+-        self.temporal_tokens = max(
+-            1, int(getattr(config, "temporal_latents", 1))
+-        )
+-        self.fused_tokens = max(
+-            1, int(self.spatial_tokens + self.temporal_tokens)
+-        )
++        self.spatial_tokens = max(1, int(getattr(config, "spatial_latents", 1)))
++        self.temporal_tokens = max(1, int(getattr(config, "temporal_latents", 1)))
++        self.fused_tokens = max(1, int(self.spatial_tokens + self.temporal_tokens))
++
++        # Defaults used when adding tasks dynamically.
++        self._default_spatial_depth = max(1, int(getattr(config, "spatial_depth", 1)))
++        self._default_temporal_depth = max(1, int(getattr(config, "temporal_depth", 1)))
++
+         self.mlp_ratio = float(getattr(config, "mlp_ratio", 4.0))
+         self.dropout = float(getattr(config, "dropout", 0.0))
+         self.drop_path = float(getattr(config, "drop_path", 0.0))
+-        self.norm_type = str(
+-            getattr(config, "normalization_method", "layernorm")
+-        )
+-        self.gate_blend_alpha = float(
+-            getattr(
+-                config,
+-                "fuser_blend_alpha",
+-                getattr(config, "fuser_gate_blend", 0.0),
+-            )
+-        )
+-        self.gate_blend_alpha = float(
+-            min(max(self.gate_blend_alpha, 0.0), 1.0)
+-        )
++        self.norm_type = str(getattr(config, "normalization_method", "layernorm"))
++
++        # Task registry (trainable backbone parts).
+         self.view_encoders = nn.ModuleDict()
++
++        # User-space detachable submodels (NOT registered -> not in state_dict).
++        self._task_submodels: dict[str, nn.Module] = {}
++
++        # The primary temporal task name controls the streaming state contract.
++        self.primary_temporal_task = "temporal"
++
+         if views is None:
+-            spatial_extractor = SpatialExtractor(
++            self.view_encoders["spatial"] = Template(
++                self.in_dim,
++                self.spatial_tokens,
+                 self.d_model,
+                 self.nhead,
+-                depth=max(1, int(getattr(config, "spatial_depth", 1))),
++                depth=int(self._default_spatial_depth),
+                 mlp_ratio=self.mlp_ratio,
+                 dropout=self.dropout,
+                 drop_path=self.drop_path,
+                 norm_type=self.norm_type,
++                mode="spatial",
+             )
+-            temporal_extractor = TemporalExtractor(
++            self.view_encoders["temporal"] = Template(
++                self.in_dim,
++                self.temporal_tokens,
+                 self.d_model,
+                 self.nhead,
+-                depth=max(1, int(getattr(config, "temporal_depth", 1))),
++                depth=int(self._default_temporal_depth),
+                 mlp_ratio=self.mlp_ratio,
+                 dropout=self.dropout,
+                 drop_path=self.drop_path,
+                 norm_type=self.norm_type,
+-            )
+-            self.view_encoders["spatial"] = TokenizedView(
+-                self.in_dim,
+-                self.spatial_tokens,
+-                self.d_model,
+-                spatial_extractor,
+-            )
+-            self.view_encoders["temporal"] = TokenizedView(
+-                self.in_dim,
+-                self.temporal_tokens,
+-                self.d_model,
+-                temporal_extractor,
++                mode="temporal",
+             )
+         else:
+-            items = (
+-                views.items() if isinstance(views, Mapping) else list(views)
+-            )
++            items = views.items() if isinstance(views, Mapping) else list(views)
+             for name, mod in items:
+                 key = str(name)
+                 if not isinstance(mod, nn.Module):
+                     raise TypeError("views must contain modules")
+                 self.view_encoders[key] = mod
+-        if "spatial" in self.view_encoders:
+-            self.spatial_tokenized_view = self.view_encoders["spatial"]
+-            self.spatial_net = self.spatial_tokenized_view
+-        if "temporal" in self.view_encoders:
+-            self.temporal_tokenized_view = self.view_encoders["temporal"]
+-            self.temporal_net = self.temporal_tokenized_view
+-        self.pair_fusers = nn.ModuleDict()
+-        self._pair_endpoints: dict[str, tuple[str, str]] = {}
+-        if fusions is None:
+-            key, (a, b) = self._canon_pair_key_static(("spatial", "temporal"))
+-            self.pair_fusers[key] = CrossTransformer(
+-                self.d_model,
+-                self.nhead,
+-                dropout=self.dropout,
+-                norm_type=self.norm_type,
+-                mlp_ratio=self.mlp_ratio,
+-                drop_path=self.drop_path,
+-            )
+-            self._pair_endpoints[key] = (a, b)
+-        else:
+-            items = (
+-                fusions.items()
+-                if isinstance(fusions, Mapping)
+-                else list(fusions)
+-            )
+-            for raw_key, mod in items:
+-                if not isinstance(mod, nn.Module):
+-                    raise TypeError("fusions must contain modules")
+-                key, (a, b) = self._canon_pair_key_static(raw_key)
+-                if a == b:
+-                    raise ValueError("fusion endpoints must differ")
+-                self.pair_fusers[key] = mod
+-                self._pair_endpoints[key] = (a, b)
+-        if "spatial|temporal" in self.pair_fusers:
+-            self.perception = self.pair_fusers["spatial|temporal"]
+-        elif len(self.pair_fusers) == 1:
+-            only_key = next(iter(self.pair_fusers.keys()))
+-            self.perception = self.pair_fusers[only_key]
+-        hid = int(self.d_model * max(1.0, self.mlp_ratio))
+-        self._agg_norm = norm_layer(self.norm_type, self.d_model)
+-        self._agg_phi = nn.Sequential(
+-            nn.Linear(self.d_model, hid),
+-            nn.GELU(),
+-            nn.Linear(hid, self.d_model),
+-        )
+-        self._agg_gate = nn.Sequential(
+-            nn.Linear(self.d_model, hid),
+-            nn.GELU(),
+-            nn.Linear(hid, 1),
+-        )
+-        self._token_generator = nn.Linear(
+-            self.d_model, self.fused_tokens * self.d_model
++
++        # Compatibility aliases used by the compiler/export helpers.
++        self._refresh_aliases()
++
++        # Set-fusion core (fixed latent array K=fused_tokens).
++        perceiver_depth = int(getattr(config, "perceiver_depth", 2))
++        self.perception = Perceiver(
++            self.d_model,
++            self.nhead,
++            num_latents=self.fused_tokens,
++            depth=max(1, perceiver_depth),
++            mlp_ratio=self.mlp_ratio,
++            dropout=self.dropout,
++            drop_path=self.drop_path,
++            norm_type=self.norm_type,
+         )
++
++        # Legacy slots (kept to reduce churn in exporter/compile hooks).
++        self.pair_fusers = nn.ModuleDict()
++        self.fusions = self.pair_fusers
++
+         self.norm = norm_layer(self.norm_type, self.d_model)
++        hid = int(self.d_model * max(1.0, self.mlp_ratio))
+         self.head_hidden_dim = hid
+         self.head = nn.Sequential(
+             norm_layer(self.norm_type, self.d_model),
+@@ -1333,29 +1397,190 @@ class Fuser(nn.Module):
+             nn.Dropout(self.dropout),
+             nn.Linear(hid, self.out_dim),
+         )
++
++        # Public alias (historical name).
+         self.views = self.view_encoders
+-        self.fusions = self.pair_fusers
+ 
+-    @staticmethod
+-    def _canon_pair_key_static(
+-        raw: str | Tuple[str, str],
+-    ) -> tuple[str, tuple[str, str]]:
+-        if isinstance(raw, str):
+-            parts = [p for p in raw.split("|") if p]
+-            if len(parts) != 2:
+-                raise ValueError("fusion key string must be 'a|b'")
+-            a, b = str(parts[0]), str(parts[1])
+-        elif isinstance(raw, (tuple, list)) and len(raw) == 2:
+-            a, b = str(raw[0]), str(raw[1])
++    # ---------------------------------------------------------------------
++    # Pickling hygiene: keep BYOM out of pickled state.
++    # ---------------------------------------------------------------------
++    def __getstate__(self: Self) -> dict[str, object]:
++        state = super().__getstate__()
++        state.pop("_task_submodels", None)
++        return state
++
++    def __setstate__(self: Self, state: dict[str, object]) -> None:
++        super().__setstate__(state)
++        self._task_submodels = {}
++
++    # ---------------------------------------------------------------------
++    # Task management API
++    # ---------------------------------------------------------------------
++    def list_tasks(self: Self) -> list[str]:
++        return list(self.view_encoders.keys())
++
++    def add_task(
++        self: Self,
++        name: str,
++        mode: str,
++        *,
++        tokens: Optional[int] = None,
++        depth: Optional[int] = None,
++        weight: float = 1.0,
++        eps: float = 1e-6,
++        submodel: Optional[nn.Module] = None,
++        replace: bool = False,
++    ) -> None:
++        key = str(name)
++        if not key:
++            raise ValueError("task name must be non-empty")
++        if (key in self.view_encoders) and (not replace):
++            raise KeyError(f"task already exists: {key!r}")
++        mode_l = str(mode or "spatial").strip().lower()
++        if mode_l not in {"spatial", "temporal"}:
++            raise ValueError("mode must be 'spatial' or 'temporal'")
++
++        if tokens is None:
++            tokens = int(self.temporal_tokens if mode_l == "temporal" else self.spatial_tokens)
++        if depth is None:
++            # Prefer the current backbone depths; fall back to config defaults.
++            depth = int(
++                getattr(self.temporal_net, "depth", 0)
++                if mode_l == "temporal"
++                else getattr(self.spatial_net, "depth", 0)
++            )
++            if depth <= 0:
++                depth = int(
++                    self._default_temporal_depth
++                    if mode_l == "temporal"
++                    else self._default_spatial_depth
++                )
++
++        self.view_encoders[key] = Template(
++            self.in_dim,
++            int(tokens),
++            self.d_model,
++            self.nhead,
++            depth=max(1, int(depth)),
++            mlp_ratio=self.mlp_ratio,
++            dropout=self.dropout,
++            drop_path=self.drop_path,
++            norm_type=self.norm_type,
++            mode=mode_l,
++            weight=float(weight),
++            eps=float(eps),
++        )
++        if submodel is not None:
++            if not isinstance(submodel, nn.Module):
++                raise TypeError("submodel must be an nn.Module")
++            self._task_submodels[key] = submodel
++        self._refresh_aliases()
++
++    def update_task(
++        self: Self,
++        name: str,
++        *,
++        mode: Optional[str] = None,
++        tokens: Optional[int] = None,
++        depth: Optional[int] = None,
++        weight: Optional[float] = None,
++        eps: Optional[float] = None,
++        submodel: Any = _UNSET,
++    ) -> None:
++        key = str(name)
++        if key not in self.view_encoders:
++            raise KeyError(f"task not found: {key!r}")
++        mod = self.view_encoders[key]
++        if isinstance(mod, Template):
++            if mode is not None:
++                mod.set_mode(str(mode))
++            if weight is not None:
++                mod.set_weight(float(weight))
++            if eps is not None:
++                mod.set_eps(float(eps))
++
++            # Tokens/depth changes require rebuilding the Template.
++            need_rebuild = (tokens is not None) or (depth is not None)
++            if need_rebuild:
++                new_tokens = int(tokens if tokens is not None else mod.tokens)
++                new_depth = int(depth if depth is not None else mod.depth)
++                rebuilt = Template(
++                    self.in_dim,
++                    new_tokens,
++                    self.d_model,
++                    self.nhead,
++                    depth=max(1, new_depth),
++                    mlp_ratio=self.mlp_ratio,
++                    dropout=self.dropout,
++                    drop_path=self.drop_path,
++                    norm_type=self.norm_type,
++                    mode=str(getattr(mod, "mode", "spatial")),
++                    weight=float(getattr(mod, "weight", 1.0)),
++                    eps=float(getattr(mod, "eps", 1e-6)),
++                )
++                self.view_encoders[key] = rebuilt
+         else:
+-            raise TypeError("fusion key must be 'a|b' or (a, b)")
+-        x, y = (a, b) if a <= b else (b, a)
+-        return f"{x}|{y}", (x, y)
++            # Custom task module: we can only attach a BYOM submodel here.
++            if any(v is not None for v in (mode, tokens, depth, weight, eps)):
++                raise TypeError(
++                    "update_task can only change (mode/tokens/depth/weight/eps) for Template tasks"
++                )
+ 
+-    def _canon_pair_key(
+-        self: Self, raw: str | Tuple[str, str]
+-    ) -> tuple[str, tuple[str, str]]:
+-        return self._canon_pair_key_static(raw)
++        # BYOM attach/detach.
++        if submodel is not _UNSET:
++            if submodel is None:
++                self._task_submodels.pop(key, None)
++            else:
++                if not isinstance(submodel, nn.Module):
++                    raise TypeError("submodel must be an nn.Module")
++                self._task_submodels[key] = submodel
++
++        self._refresh_aliases()
++
++    def remove_task(self: Self, name: str) -> None:
++        key = str(name)
++        if key not in self.view_encoders:
++            raise KeyError(f"task not found: {key!r}")
++        del self.view_encoders[key]
++        self._task_submodels.pop(key, None)
++        if self.primary_temporal_task == key:
++            self.primary_temporal_task = "temporal"
++        self._refresh_aliases()
++
++    def get_task_specs(self: Self) -> list[dict[str, Any]]:
++        specs: list[dict[str, Any]] = []
++        for name, mod in self.view_encoders.items():
++            if isinstance(mod, Template):
++                specs.append(mod.to_spec(name=name))
++        return specs
++
++    # ---------------------------------------------------------------------
++    # Internal helpers
++    # ---------------------------------------------------------------------
++    def _refresh_aliases(self: Self) -> None:
++        # Compatibility fields expected by older parts of the codebase.
++        self.views = self.view_encoders
++        if "spatial" in self.view_encoders:
++            self.spatial_net = self.view_encoders["spatial"]
++            self.spatial_tokenized_view = self.spatial_net
++        else:
++            self.spatial_net = None
++            self.spatial_tokenized_view = None
++
++        if self.primary_temporal_task in self.view_encoders:
++            self.temporal_net = self.view_encoders[self.primary_temporal_task]
++        elif "temporal" in self.view_encoders:
++            self.temporal_net = self.view_encoders["temporal"]
++        else:
++            # Fallback: first task whose mode looks temporal.
++            tn = None
++            for k, m in self.view_encoders.items():
++                if self._task_mode(k, m) == "temporal":
++                    tn = m
++                    self.primary_temporal_task = k
++                    break
++            self.temporal_net = tn
++        self.temporal_tokenized_view = self.temporal_net
+ 
+     @staticmethod
+     def _as_3d_tokens(t: torch.Tensor) -> torch.Tensor:
+@@ -1367,42 +1592,44 @@ class Fuser(nn.Module):
+             )
+         return t
+ 
+-    def _aggregate_tokens(
+-        self: Self, token_sets: Sequence[torch.Tensor]
+-    ) -> torch.Tensor:
+-        if len(token_sets) < 1:
+-            raise ValueError("no token sets to aggregate")
+-        summaries = torch.stack(
+-            [self._agg_norm(ts.mean(dim=1)) for ts in token_sets], dim=1
+-        )
+-        feats = self._agg_phi(summaries)
+-        logits = self._agg_gate(feats).squeeze(-1)
+-        w_soft = torch.softmax(logits, dim=1)
+-        K = feats.size(1)
+-        w_uni = feats.new_ones((feats.size(0), K)) / K
+-        a = float(self.gate_blend_alpha)
+-        w = (1.0 - a) * w_uni + a * w_soft
+-        fused_vec = torch.bmm(w.unsqueeze(1), feats).squeeze(1)
+-        B = fused_vec.size(0)
+-        tokens = (
+-            self._token_generator(fused_vec)
+-            .reshape(B, self.fused_tokens, self.d_model)
+-            .contiguous()
+-        )
+-        return tokens
+-
+     @staticmethod
+-    def _pick_view(
+-        views: Mapping[str, torch.Tensor],
+-        preferred: Sequence[str],
+-        fallback_first: bool = True,
+-    ) -> torch.Tensor:
+-        for k in preferred:
+-            if k in views:
+-                return views[k]
+-        if fallback_first:
+-            return next(iter(views.values()))
+-        raise KeyError(f"missing views: {preferred}")
++    def _task_mode(name: str, mod: nn.Module) -> str:
++        raw = getattr(mod, "mode", None)
++        if isinstance(raw, str):
++            key = raw.strip().lower()
++            if key in {"t", "temporal"}:
++                return "temporal"
++            if key in {"s", "spatial"}:
++                return "spatial"
++        n = str(name).strip().lower()
++        if n in {"t", "temporal"}:
++            return "temporal"
++        return "spatial"
++
++    def _collect_task_names(self: Self, modeling_type: str) -> list[str]:
++        mode_l = _coerce_modeling_types(modeling_type)
++        names = list(self.view_encoders.keys())
++        if mode_l == "ss":
++            chosen = [
++                n for n in names if self._task_mode(n, self.view_encoders[n]) == "spatial"
++            ]
++            return chosen if chosen else names
++        if mode_l == "tt":
++            chosen = [
++                n for n in names if self._task_mode(n, self.view_encoders[n]) == "temporal"
++            ]
++            return chosen if chosen else names
++        return names
++
++    def _apply_submodel(self: Self, name: str, tokens: torch.Tensor) -> torch.Tensor:
++        sub = self._task_submodels.get(name)
++        if sub is None:
++            return tokens
++        # BYOM is user-managed. We only guarantee tensor plumbing.
++        out = sub(tokens)
++        if isinstance(out, (tuple, list)):
++            out = out[0] if out else tokens
++        return self._as_3d_tokens(cast(torch.Tensor, out))
+ 
+     def _run_views(
+         self: Self,
+@@ -1412,47 +1639,92 @@ class Fuser(nn.Module):
+         want_state: bool = False,
+         causal_mask: Optional[torch.Tensor] = None,
+     ) -> tuple[dict[str, torch.Tensor], Optional[Any]]:
++        del args
+         out: dict[str, torch.Tensor] = {}
+         next_state: Optional[Any] = None
+         for name, mod in self.view_encoders.items():
+-            if name == "temporal":
+-                if want_state:
++            if name == self.primary_temporal_task and want_state:
++                # Streaming contract is only applied to the primary temporal task.
++                try:
+                     y = mod(
+                         x,
+                         state=temporal_state,
+                         return_state=True,
+                         causal_mask=causal_mask,
+                     )
+-                    if isinstance(y, (tuple, list)) and len(y) == 2:
+-                        tokens, next_state = y[0], y[1]
+-                    else:
+-                        tokens = y
++                except TypeError:
++                    y = mod(x)
++                if isinstance(y, (tuple, list)) and len(y) == 2:
++                    tokens, next_state = y[0], y[1]
+                 else:
++                    tokens = y
++            elif name == self.primary_temporal_task:
++                try:
+                     tokens = mod(
+                         x,
+                         state=temporal_state,
+                         return_state=False,
+                         causal_mask=causal_mask,
+                     )
++                except TypeError:
++                    tokens = mod(x)
+             else:
+                 tokens = mod(x)
+             tokens = self._as_3d_tokens(cast(torch.Tensor, tokens))
++            tokens = self._apply_submodel(name, tokens)
+             out[name] = tokens
+         return out, next_state
+ 
+-    def _run_fusions(
+-        self: Self, views: Mapping[str, torch.Tensor]
+-    ) -> list[torch.Tensor]:
+-        out: list[torch.Tensor] = []
+-        for key, fuser in self.pair_fusers.items():
+-            a, b = self._pair_endpoints.get(key, (None, None))
+-            if a is None or b is None:
+-                continue
+-            if a not in views or b not in views:
++    def _gather_tokens(
++        self: Self,
++        views: Mapping[str, torch.Tensor],
++        modeling_type: str,
++        eps: float = 1e-12,
++    ) -> torch.Tensor:
++        names = self._collect_task_names(modeling_type)
++        token_sets: list[torch.Tensor] = []
++        weights: list[torch.Tensor] = []
++        for name in names:
++            if name not in views:
+                 continue
+-            out.append(fuser(views[a], views[b]))
+-        return out
++            ts = self._as_3d_tokens(views[name])
++            mod = self.view_encoders[name]
++            w = getattr(mod, "weight", None) if mod is not None else None
++            if torch.is_tensor(w):
++                w_t = w.to(device=ts.device, dtype=ts.dtype)
++            else:
++                w_t = ts.new_tensor(float(w) if w is not None else 1.0)
+ 
++            # Per-task epsilon floor: prevents accidental hard-masking and keeps
++            # every task contributing at least a tiny amount unless you set eps=0.
++            e = getattr(mod, "eps", None) if mod is not None else None
++            if torch.is_tensor(e):
++                e_t = e.to(device=ts.device, dtype=ts.dtype)
++            else:
++                e_t = ts.new_tensor(float(e) if e is not None else 0.0)
++            w_t = torch.maximum(w_t, e_t.clamp_min(0.0))
++
++            token_sets.append(ts)
++            weights.append(w_t)
++        if not token_sets:
++            raise ValueError("no token sets to fuse")
++
++        if len(weights) > 1:
++            w = torch.stack(weights, dim=0)
++            # Normalize weights to keep the average scale ~1.0.
++            w = w / (w.mean().clamp_min(float(eps)))
++        else:
++            w = weights[0].reshape(1)
++
++        scaled: list[torch.Tensor] = []
++        for i, ts in enumerate(token_sets):
++            wi = w[i] if w.numel() > 1 else w[0]
++            scaled.append(ts * wi)
++        return torch.cat(scaled, dim=1)
++
++    # ---------------------------------------------------------------------
++    # Forward
++    # ---------------------------------------------------------------------
+     @torch_compiler_disable(
+         reason="Fuser orchestrates eager + compiled submodules",
+         recursive=False,
+@@ -1473,16 +1745,8 @@ class Fuser(nn.Module):
+             want_state=bool(return_temporal_state),
+             causal_mask=causal_mask,
+         )
+-        mode_l = _coerce_modeling_types(self.modeling_type)
+-        if mode_l == "ss":
+-            chosen = [self._pick_view(views, ("spatial", "s"))]
+-        elif mode_l == "tt":
+-            chosen = [self._pick_view(views, ("temporal", "t"))]
+-        else:
+-            fused = self._run_fusions(views)
+-            chosen = fused if len(fused) > 0 else list(views.values())
+-        chosen = [self._as_3d_tokens(t) for t in chosen]
+-        tokens = self._aggregate_tokens(chosen)
++        tokens_in = self._gather_tokens(views, self.modeling_type)
++        tokens = self.perception(tokens_in)
+         context = self.decode(tokens, apply_norm=False)
+         if bool(return_temporal_state):
+             return tokens, context, next_state
+@@ -1551,16 +1815,8 @@ class Fuser(nn.Module):
+         views, _ = self._run_views(
+             x, temporal_state=None, want_state=False, causal_mask=None
+         )
+-        mode_l = _coerce_modeling_types(self.modeling_type)
+-        if mode_l == "ss":
+-            chosen = [self._pick_view(views, ("spatial", "s"))]
+-        elif mode_l == "tt":
+-            chosen = [self._pick_view(views, ("temporal", "t"))]
+-        else:
+-            fused = self._run_fusions(views)
+-            chosen = fused if len(fused) > 0 else list(views.values())
+-        chosen = [self._as_3d_tokens(t) for t in chosen]
+-        tokens = self._aggregate_tokens(chosen)
++        tokens_in = self._gather_tokens(views, self.modeling_type)
++        tokens = self.perception(tokens_in)
+         context = self.decode(tokens, apply_norm=False)
+         return tokens, context
+ 
+@@ -1618,7 +1874,7 @@ class Model(nn.Module):
+         self.temporal_token_collector = Collector(
+             int(config.d_model),
+             int(config.heads),
+-            depth=max(1, int(getattr(config, "temporal_depth", 1))),
++            depth=int(self._default_temporal_depth),
+             mlp_ratio=float(getattr(config, "mlp_ratio", 4.0)),
+             dropout=float(getattr(config, "dropout", 0.0)),
+             batch_first=True,
+@@ -2065,21 +2321,40 @@ class Model(nn.Module):
+             return compiled_any, eager_items, compiled_items
+ 
+         def _compile_temporal_piecewise(view: nn.Module) -> bool:
+-            extractor = getattr(view, "extractor", None)
+-            blocks = (
+-                getattr(extractor, "blocks", None) if extractor is not None else None
+-            )
++            # Supports both legacy TokenizedView(extractor.blocks) and new Template(blocks).
++            blocks = getattr(view, 'blocks', None)
++            if blocks is None:
++                extractor = getattr(view, 'extractor', None)
++                blocks = getattr(extractor, 'blocks', None) if extractor is not None else None
+             if not isinstance(blocks, nn.ModuleList):
+                 return False
+             compiled_any, eager_items, _ = _compile_modulelist_inplace(
+-                blocks, label="temporal.blocks"
++                blocks, label='temporal.blocks'
+             )
+             if compiled_any:
+                 self._eager_temporal_blocks = eager_items
+             return compiled_any
+ 
+         def _compile_perception_piecewise(perception: nn.Module) -> bool:
++            """Compile Perceiver/CrossTransformer internals without compiling the whole block.
++
++            Supports:
++              - Perceiver(...).layers (ModuleList of Resampler layers)
++              - legacy CrossTransformer(...).cross (ModuleList)
++            """
++
+             compiled_any = False
++
++            layers = getattr(perception, "layers", None)
++            if isinstance(layers, nn.ModuleList):
++                c_any, eager_items, _ = _compile_modulelist_inplace(
++                    layers, label="perception.layers"
++                )
++                compiled_any |= c_any
++                if c_any:
++                    self._eager_perception_layers = eager_items
++
++            # Legacy CrossTransformer path (kept for backwards compatibility).
+             cross = getattr(perception, "cross", None)
+             if isinstance(cross, nn.ModuleList):
+                 c_any, eager_items, _ = _compile_modulelist_inplace(
+@@ -2092,6 +2367,7 @@ class Model(nn.Module):
+                     if len(cross) >= 2:
+                         perception.cross_s = cross[0]
+                         perception.cross_t = cross[1]
++
+             mix = getattr(perception, "mix", None)
+             if isinstance(mix, nn.Module):
+                 compiled = _compile_one(mix, label="perception.mix")
+@@ -2099,8 +2375,10 @@ class Model(nn.Module):
+                     compiled_any = True
+                     self._eager_perception_mix = mix
+                     setattr(perception, "mix", compiled)
++
+             return compiled_any
+ 
++
+         staged_heavy = bool(
+             nogil_opt
+             or compile_mode_canonical
+@@ -2221,6 +2499,91 @@ class Model(nn.Module):
+     def config(self: Self) -> ModelConfig:
+         return self.__config
+ 
++    # -----------------------------------------------------------------
++    # Task management API (public, in-place)
++    # -----------------------------------------------------------------
++    def add_task(
++        self: Self,
++        name: str,
++        mode: str,
++        *,
++        tokens: Optional[int] = None,
++        depth: Optional[int] = None,
++        weight: float = 1.0,
++        eps: float = 1e-6,
++        submodel: Optional[nn.Module] = None,
++        replace: bool = False,
++    ) -> None:
++        """Add a new task (orderless view) to the backbone.
++
++        This is a thin wrapper delegating to :class:`Fuser`.
++
++        Notes
++        -----
++        * Must be called **before** DDP/HSDP wrapping.
++        * The optional `submodel` is treated as BYOM and is not included in
++          `state_dict` (detachable).
++        """
++
++        self.fuser.add_task(
++            name,
++            mode,
++            tokens=tokens,
++            depth=depth,
++            weight=weight,
++            eps=eps,
++            submodel=submodel,
++            replace=replace,
++        )
++        # Task mutation can invalidate compiled module caches.
++        self._compiled_processor_temporal_net = None
++        self._compiled_processor_perception = None
++        self._compiled_processor_decode = None
++        self._eager_processor_temporal_net = getattr(self.processor, "temporal_net", None)
++        self._eager_processor_perception = getattr(self.processor, "perception", None)
++
++    def update_task(
++        self: Self,
++        name: str,
++        *,
++        mode: Optional[str] = None,
++        tokens: Optional[int] = None,
++        depth: Optional[int] = None,
++        weight: Optional[float] = None,
++        eps: Optional[float] = None,
++        submodel: Any = _UNSET,
++    ) -> None:
++        """Update an existing task in-place.
++
++        * `submodel=_UNSET` (default) leaves BYOM attachment unchanged.
++        * `submodel=None` explicitly detaches/removes any previously attached BYOM.
++        """
++
++        self.fuser.update_task(
++            name,
++            mode=mode,
++            tokens=tokens,
++            depth=depth,
++            weight=weight,
++            eps=eps,
++            submodel=submodel,
++        )
++        self._compiled_processor_temporal_net = None
++        self._compiled_processor_perception = None
++        self._compiled_processor_decode = None
++        self._eager_processor_temporal_net = getattr(self.processor, "temporal_net", None)
++        self._eager_processor_perception = getattr(self.processor, "perception", None)
++
++    def remove_task(self: Self, name: str) -> None:
++        """Remove a task from the backbone in-place."""
++
++        self.fuser.remove_task(name)
++        self._compiled_processor_temporal_net = None
++        self._compiled_processor_perception = None
++        self._compiled_processor_decode = None
++        self._eager_processor_temporal_net = getattr(self.processor, "temporal_net", None)
++        self._eager_processor_perception = getattr(self.processor, "perception", None)
++
+     def to(self: Self, *args: Any, **kwargs: Any) -> "Model":
+         out = super().to(*args, **kwargs)
+         with contextlib.suppress(Exception):
+@@ -2320,11 +2683,13 @@ class Model(nn.Module):
+ 
+         with contextlib.suppress(Exception):
+             eager_blocks = getattr(self, "_eager_temporal_blocks", None)
+-            blocks = getattr(
+-                getattr(getattr(proc, "temporal_net", None), "extractor", None),
+-                "blocks",
+-                None,
+-            )
++            blocks = getattr(getattr(proc, "temporal_net", None), "blocks", None)
++            if blocks is None:
++                blocks = getattr(
++                    getattr(getattr(proc, "temporal_net", None), "extractor", None),
++                    "blocks",
++                    None,
++                )
+             if isinstance(blocks, nn.ModuleList) and isinstance(eager_blocks, list):
+                 if len(eager_blocks) == len(blocks):
+                     cur_items = list(blocks)
+@@ -2336,6 +2701,23 @@ class Model(nn.Module):
+                         for i, item in enumerate(eager_blocks):
+                             blocks[i] = item
+         with contextlib.suppress(Exception):
++            # Perceiver path
++            eager_layers = getattr(self, "_eager_perception_layers", None)
++            perception = getattr(proc, "perception", None)
++            layers = getattr(perception, "layers", None)
++            if isinstance(layers, nn.ModuleList) and isinstance(eager_layers, list):
++                if len(eager_layers) == len(layers):
++                    cur_items = list(layers)
++                    if any(
++                        cur_items[i] is not eager_layers[i]
++                        for i in range(len(eager_layers))
++                    ):
++                        list_swaps.append((layers, cur_items))
++                        for i, item in enumerate(eager_layers):
++                            layers[i] = item
++
++        with contextlib.suppress(Exception):
++            # Legacy CrossTransformer path (kept for older checkpoints)
+             eager_cross = getattr(self, "_eager_perception_cross", None)
+             perception = getattr(proc, "perception", None)
+             cross = getattr(perception, "cross", None)
+diff --git a/enn_torch/nn/blocks.py b/enn_torch/nn/blocks.py
+index b84dcf5..ac43c06 100644
+--- a/enn_torch/nn/blocks.py
++++ b/enn_torch/nn/blocks.py
+@@ -633,5 +633,5 @@ class Perceiver(nn.Module):
+         return self.norm(lat)
+ 
+ 
+-# Alias for the correct spelling (common typo in notebooks/docs).
++# Alias for the historical misspelling (common typo in notebooks/docs).
+ Perciever = Perceiver
+diff --git a/enn_torch/nn/layers.py b/enn_torch/nn/layers.py
+index 98fdaa5..ba63fc0 100644
+--- a/enn_torch/nn/layers.py
++++ b/enn_torch/nn/layers.py
+@@ -1367,7 +1367,7 @@ class CrossAttention(nn.Module):
+ class Resampler(nn.Module):
+     """Perceiver-style resampler layer.
+ 
+-    This is an *atomic* layer used by the higher-level `Perciever` block.
++    This is an *atomic* layer used by the higher-level `Perceiver` block.
+ 
+     It updates a fixed-size latent array (queries) using:
+ 
+diff --git a/notebook.ipynb b/notebook.ipynb
+index 5ead28d..165534a 100644
+--- a/notebook.ipynb
++++ b/notebook.ipynb
+@@ -715,6 +715,40 @@
+     "model = new_model(in_dim=D, out_shape=label_shape, config=config).to(device)"
+    ]
+   },
++  {
++   "cell_type": "markdown",
++   "metadata": {},
++   "source": [
++    "## 6.1 Optional: Dynamic tasks (orderless multi-view fusion)\n",
++    "\n",
++    "You can add/update/remove tasks (Templates) **in-place**. Each task produces a projected token set\n",
++    "and the fuser combines all tasks **without relying on any task order**.\n",
++    "\n",
++    "- `mode`: `\"spatial\"` or `\"temporal\"` (temporal tasks may optionally participate in streaming state)\n",
++    "- `weight`: optional scalar importance (defaults to 1.0)\n",
++    "- `submodel`: optional BYOM module that runs **after** the task Template and **before** fusion\n"
++   ]
++  },
++  {
++   "cell_type": "code",
++   "execution_count": null,
++   "metadata": {},
++   "outputs": [],
++   "source": [
++    "# Add a new extra spatial task (Template only, no BYOM)\n",
++    "model.add_task(name=\"extra_spatial\", mode=\"spatial\", weight=1.0)\n",
++    "\n",
++    "# Attach/detach a BYOM module later (kept out of backbone checkpoints by design)\n",
++    "# model.update_task(name=\"extra_spatial\", submodel=my_submodel)\n",
++    "# model.update_task(name=\"extra_spatial\", submodel=None)\n",
++    "\n",
++    "# Re-weight a task without changing shapes\n",
++    "model.update_task(name=\"extra_spatial\", weight=0.5)\n",
++    "\n",
++    "# Remove a task if you no longer want it in the served artifact\n",
++    "# model.remove_task(name=\"extra_spatial\")\n"
++   ]
++  },
+   {
+    "cell_type": "markdown",
+    "id": "ee21915d",
