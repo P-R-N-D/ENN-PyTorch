@@ -47,48 +47,49 @@ from torch.distributed.checkpoint.state_dict import (
 )
 from torch.distributed.launcher.api import LaunchConfig, elastic_launch
 
-from .config import (
+from ..config import (
     ModelConfig,
     RuntimeConfig,
     _extract_model_config_dict,
     coerce_model_config,
     runtime_config,
 )
-from .core.datatypes import env_bool, read_json
-from .core.distributed import (
+from ..core.datatypes import env_bool, read_json
+from ..core.distributed import (
     get_available_host,
     get_preferred_ip,
     init_master_addr,
 )
-from .core.graph import inference_mode
-from .core.policies import WorkerPolicy
-from .core.system import (
+from ..core.graph import inference_mode
+from ..core.policies import WorkerPolicy
+from ..core.system import (
     _start_context,
     init_python_path,
     init_start_method,
     new_dir,
     optimal_start_method,
 )
-from .core.tensor import coerce_tensor
-from .data import collate
-from .data.collate import (
+from ..core.tensor import coerce_tensor
+from .. import schema
+from ..data import collate
+from ..data.collate import (
     MappingSlicer,
     TensorDictSlicer,
 )
-from .data.collate import (
+from ..data.collate import (
     postprocess as _postprocess_pipeline,
 )
-from .data.pipeline import (
+from ..data.pipeline import (
     Dataset,
     default_underflow_action,
     iter_dataset,
     normalize_underflow_action,
     preload_memmap,
 )
-from .nn.architecture import Model
-from .nn.layers import Recorder, resize_scaler_buffer
-from .runtime.io import _filtered_warnings, _torch_load_checkpoint, is_required
-from .runtime.main import _coerce_dcp_keys, process
+from ..nn.architecture import Model
+from ..nn.layers import Recorder, resize_scaler_buffer
+from .io import _filtered_warnings, _torch_load_checkpoint, is_required
+from .main import _coerce_dcp_keys, process
 
 _IGNORED_WARNING_PATTERNS: tuple[str, ...] = (
     "torch.distributed is disabled, unavailable or uninitialized",
@@ -340,12 +341,12 @@ def _adapt_source(
         allow_columns
         and isinstance(d, Mapping)
         and all(not isinstance(v, Mapping) for v in d.values())
-        and not collate.is_feature_label_batch_mapping(d)
+        and not schema.is_feature_label_batch_mapping(d)
     ):
         count, getter = collate.column_cursor(d)
         return count, getter, False
-    if isinstance(d, Mapping) and collate.is_feature_label_batch_mapping(d):
-        f_key = collate.get_feature_key(d)
+    if isinstance(d, Mapping) and schema.is_feature_label_batch_mapping(d):
+        f_key = schema.get_feature_key(d)
         if f_key is None:
             return 0, None, True
         count = _value_len(d.get(f_key))
@@ -748,17 +749,17 @@ def _to_torch_dtype(dt: object) -> Optional[torch.dtype]:
 def _get_float_precision(obj: object) -> torch.dtype:
     try:
         if TensorDictBase is not None and isinstance(obj, TensorDictBase):
-            X_td, _ = collate.get_row(obj, labels_required=False)
+            X_td, _ = schema.get_row(obj, labels_required=False)
             if X_td is None:
                 return torch.float32
             if not bool(torch.is_tensor(X_td)):
                 X_td = torch.as_tensor(X_td)
             dt = _to_torch_dtype(getattr(X_td, "dtype", None))
             return torch.float64 if dt == torch.float64 else torch.float32
-        if isinstance(obj, Mapping) and collate.is_feature_label_batch_mapping(
+        if isinstance(obj, Mapping) and schema.is_feature_label_batch_mapping(
             obj
         ):
-            f_key = collate.get_feature_key(obj)
+            f_key = schema.get_feature_key(obj)
             if f_key is not None and f_key in obj:
                 X_all = obj.get(f_key)
                 dt = _to_torch_dtype(getattr(X_all, "dtype", None))
@@ -911,7 +912,7 @@ def load_model(
         model.load_state_dict(sd, strict=False)
         return model
     if suffix == ".ozl":
-        from .runtime.io import _openzl_load_checkpoint
+        from .io import _openzl_load_checkpoint
 
         obj = _openzl_load_checkpoint(
             p,
@@ -1006,7 +1007,7 @@ def save_model(
     swa_averager: object | None = None,
     **kwargs: Any,
 ) -> str:
-    from .runtime.io import Builder, Exporter
+    from .io import Builder, Exporter
 
     p = Path(path)
     if Builder.is_target_native(p):

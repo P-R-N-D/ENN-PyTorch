@@ -6,6 +6,7 @@ include README.md
 # Source + lightweight human-readable config/docs only
 # (Ensure 'enn_torch' matches your actual package directory name)
 recursive-include enn_torch *.py *.json *.yaml *.yml *.ini *.cfg *.md *.txt
+recursive-exclude debug *
 
 # Generic junk / build outputs
 # Note: Re-typed spaces to ensure no non-breaking space characters

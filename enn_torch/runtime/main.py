@@ -106,6 +106,7 @@ from ..core.system import (
     sync_accelerator,
 )
 from ..core.tensor import is_meta_or_fake_tensor, to_torch_tensor
+from .. import schema
 from ..data import collate
 from ..data.collate import ShardCollector
 from ..data.pipeline import Dataset
@@ -2374,7 +2375,7 @@ def _warmup_scaler_stats(
         y_min = None
         y_max = None
         for batch in train_loader:
-            fx, ly = collate.get_row(batch, labels_required=True)
+            fx, ly = schema.get_row(batch, labels_required=True)
             with inference_mode(torch.nn.Identity()):
                 xf = fx.reshape(-1, fx.shape[-1]).to(dev_x, dt_x)
                 yf = ly.reshape(-1, ly.shape[-1]).to(dev_y, dt_y)
@@ -4067,7 +4068,7 @@ def epochs(
                         f"Training ({str(device.type).upper()}) Updating Checkpoint at {round(ckpt_percentage)}% (Total = {int(ops.epochs)}, Finished = {int(epoch_idx)})",
                         flush=True,
                     )
-                    from ..api import save_model as _api_save_model
+                    from .workflow import save_model as _api_save_model
 
                     _ozl_kwargs: dict[str, object] = {}
                     if str(ckpt_path).lower().endswith(".ozl"):
@@ -4141,7 +4142,7 @@ def epochs(
         total_n = 0
         target_chunk_bytes = 16 * 1024 * 1024
         for batch in train_loader:
-            x_b, y_b = collate.get_row(batch, labels_required=True)
+            x_b, y_b = schema.get_row(batch, labels_required=True)
             x_raw = x_b.to(device)
             y_raw = y_b.to(scaler_y_device)
             y_flat = (
@@ -5163,7 +5164,7 @@ def process(*args: Any, **kwargs: Any) -> object:
         cfg = replace(cfg, device=device)
         model: Model
         if ops.init_ckpt_dir is not None and os.path.exists(ops.init_ckpt_dir):
-            from ..api import load_model as _api_load_model
+            from .workflow import load_model as _api_load_model
 
             init_path = str(ops.init_ckpt_dir)
             if os.path.isdir(init_path):
@@ -5719,7 +5720,7 @@ def process(*args: Any, **kwargs: Any) -> object:
 
                     _coerce_dcp_keys(model_sd)
 
-                    from ..api import save_model as _api_save_model
+                    from .workflow import save_model as _api_save_model
 
                     save_target = (
                         src_mod.module
@@ -5819,7 +5820,7 @@ def process(*args: Any, **kwargs: Any) -> object:
             raise RuntimeError(
                 f"predict/infer: model_ckpt_dir does not exist or is not a directory: {ops.model_ckpt_dir!r}"
             )
-        from ..api import load_model as _api_load_model
+        from .workflow import load_model as _api_load_model
 
         ckpt_source: str = str(ops.model_ckpt_dir)
         for _name in ("model.ozl", "model.pt", "model.pth", "model.safetensors"):

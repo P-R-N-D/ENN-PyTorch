@@ -51,7 +51,7 @@ from ..core.system import (
     set_runtime_cfg,
 )
 from ..core.tensor import is_meta_or_fake_tensor, symint_safe_expand_as
-from ..data.collate import get_feature_key, get_label_key
+from ..schema import get_feature_key, get_label_key
 from .blocks import (
     CrossTransformer,
     LongNet,

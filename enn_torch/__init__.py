@@ -11,7 +11,6 @@ if TYPE_CHECKING:
     from .nn.architecture import Model
 
 __all__ = [
-    "api",
     "config",
     "core",
     "data",
@@ -26,38 +25,38 @@ __all__ = [
 
 
 def __getattr__(name: str) -> ModuleType:
-    if name in {"core", "data", "nn", "runtime", "api", "config"}:
+    if name in {"core", "data", "nn", "runtime", "config"}:
         return importlib.import_module(f"enn_torch.{name}")
     raise AttributeError(f"module 'enn_torch' has no attribute {name!r}")
 
 
 def new_model(*args: Any, **kwargs: Any) -> Model:
-    from . import api
+    from .runtime import workflow
 
-    return api.new_model(*args, **kwargs)
+    return workflow.new_model(*args, **kwargs)
 
 
 def load_model(*args: Any, **kwargs: Any) -> Model:
-    from . import api
+    from .runtime import workflow
 
-    return api.load_model(*args, **kwargs)
+    return workflow.load_model(*args, **kwargs)
 
 
 def save_model(*args: Any, **kwargs: Any) -> str:
-    from . import api
+    from .runtime import workflow
 
-    return api.save_model(*args, **kwargs)
+    return workflow.save_model(*args, **kwargs)
 
 
 def train(*args: Any, **kwargs: Any) -> Model:
-    from . import api
+    from .runtime import workflow
 
-    return api.train(*args, **kwargs)
+    return workflow.train(*args, **kwargs)
 
 
 def predict(
     *args: Any, **kwargs: Any
 ) -> TensorDictBase | dict[str, TensorDictBase]:
-    from . import api
+    from .runtime import workflow
 
-    return api.predict(*args, **kwargs)
+    return workflow.predict(*args, **kwargs)
