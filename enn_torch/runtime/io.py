@@ -43,6 +43,7 @@ _OPENZL_TUPLE_MARKER = "__ozl_tuple__"
 _OPENZL_PICKLE_MARKER = "__ozl_pickle__"
 
 _OPENZL_COMPRESSOR: object | None = None
+_OPENZL_FALLBACK_COMPRESSOR: object | None = None
 _OPENZL_LOCK = Mutex()
 
 def _register_safe_globals() -> None:
@@ -472,6 +473,24 @@ def _openzl_get_default_compressor() -> Any:
         return compressor
 
 
+def _openzl_get_fallback_compressor() -> Any:
+    global _OPENZL_FALLBACK_COMPRESSOR
+    cached = _OPENZL_FALLBACK_COMPRESSOR
+    if cached is not None:
+        return cached
+    with _OPENZL_LOCK:
+        cached = _OPENZL_FALLBACK_COMPRESSOR
+        if cached is not None:
+            return cached
+        zl = _openzl_import()
+        compressor = zl.Compressor()
+        compress_graph = zl.graphs.Compress()
+        compress_id = compress_graph(compressor)
+        compressor.select_starting_graph(compress_id)
+        _OPENZL_FALLBACK_COMPRESSOR = compressor
+        return compressor
+
+
 def _torch_dtype_from_str(dtype_str: str) -> torch.dtype:
     s = str(dtype_str)
     if s.startswith("torch."):
@@ -638,7 +657,12 @@ def _openzl_compress_payload(
 ) -> bytes:
 
     zl = _openzl_import()
-    compressor = _openzl_get_default_compressor()
+    compressors = [_openzl_get_default_compressor()]
+    fallback = None
+    with contextlib.suppress(Exception):
+        fallback = _openzl_get_fallback_compressor()
+    if fallback is not None and fallback is not compressors[0]:
+        compressors.append(fallback)
 
     tensors: list[torch.Tensor] = []
     tensor_table: list[dict[str, Any]] = []
@@ -667,38 +691,51 @@ def _openzl_compress_payload(
     for buf in dtype_buffers:
         inputs.append(zl.Input(zl.Type.Numeric, buf))
 
-    cctx = zl.CCtx()
-    cctx.ref_compressor(compressor)
-    fmt = (
-        int(openzl_format_version)
-        if openzl_format_version is not None
-        else int(getattr(zl, "MAX_FORMAT_VERSION", 0))
-    )
-    with contextlib.suppress(Exception):
-        cctx.set_parameter(zl.CParam.FormatVersion, fmt)
-    if openzl_level is not None:
+    last_exc: Exception | None = None
+    for compressor in compressors:
+        cctx = zl.CCtx()
+        cctx.ref_compressor(compressor)
+        fmt = (
+            int(openzl_format_version)
+            if openzl_format_version is not None
+            else int(getattr(zl, "MAX_FORMAT_VERSION", 0))
+        )
         with contextlib.suppress(Exception):
-            cctx.set_parameter(zl.CParam.CompressionLevel, int(openzl_level))
-    if openzl_min_stream_size is not None:
-        with contextlib.suppress(Exception):
-            cctx.set_parameter(zl.CParam.MinStreamSize, int(openzl_min_stream_size))
-    if openzl_content_checksum is not None:
-        with contextlib.suppress(Exception):
-            cctx.set_parameter(
-                zl.CParam.ContentChecksum, int(bool(openzl_content_checksum))
-            )
-    if openzl_compressed_checksum is not None:
-        with contextlib.suppress(Exception):
-            cctx.set_parameter(
-                zl.CParam.CompressedChecksum, int(bool(openzl_compressed_checksum))
-            )
-    if openzl_permissive is not None:
-        with contextlib.suppress(Exception):
-            cctx.set_parameter(
-                zl.CParam.PermissiveCompression, int(bool(openzl_permissive))
-            )
-
-    return bytes(cctx.compress(inputs))
+            cctx.set_parameter(zl.CParam.FormatVersion, fmt)
+        if openzl_level is not None:
+            with contextlib.suppress(Exception):
+                cctx.set_parameter(
+                    zl.CParam.CompressionLevel, int(openzl_level)
+                )
+        if openzl_min_stream_size is not None:
+            with contextlib.suppress(Exception):
+                cctx.set_parameter(
+                    zl.CParam.MinStreamSize, int(openzl_min_stream_size)
+                )
+        if openzl_content_checksum is not None:
+            with contextlib.suppress(Exception):
+                cctx.set_parameter(
+                    zl.CParam.ContentChecksum, int(bool(openzl_content_checksum))
+                )
+        if openzl_compressed_checksum is not None:
+            with contextlib.suppress(Exception):
+                cctx.set_parameter(
+                    zl.CParam.CompressedChecksum,
+                    int(bool(openzl_compressed_checksum)),
+                )
+        if openzl_permissive is not None:
+            with contextlib.suppress(Exception):
+                cctx.set_parameter(
+                    zl.CParam.PermissiveCompression,
+                    int(bool(openzl_permissive)),
+                )
+        try:
+            return bytes(cctx.compress(inputs))
+        except Exception as exc:
+            last_exc = exc
+    if last_exc is not None:
+        raise last_exc
+    raise RuntimeError("OpenZL compression failed without an error")
 
 
 def _openzl_decompress_payload(
