@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import contextlib
 import inspect
+import logging
 import json
 import os
 import pickle
@@ -19,7 +20,7 @@ import torch
 from torch import nn
 
 from ..core.concurrency import Mutex
-from ..core.datatypes import PathLike, coerce_json, save_temp, write_json
+from ..core.datatypes import PathLike, coerce_json, save_temp, write_json, env_bool
 from ..core.distributed import distributed_barrier, is_rank0
 
 if TYPE_CHECKING:
@@ -45,6 +46,10 @@ _OPENZL_PICKLE_MARKER = "__ozl_pickle__"
 _OPENZL_COMPRESSOR: object | None = None
 _OPENZL_FALLBACK_COMPRESSOR: object | None = None
 _OPENZL_LOCK = Mutex()
+
+_LOGGER = logging.getLogger(__name__)
+_OPENZL_DEFAULT_BUILD_LOGGED = False
+_OPENZL_FALLBACK_LOGGED = False
 
 def _register_safe_globals() -> None:
     with contextlib.suppress(Exception):
@@ -657,12 +662,44 @@ def _openzl_compress_payload(
 ) -> bytes:
 
     zl = _openzl_import()
-    compressors = [_openzl_get_default_compressor()]
-    fallback = None
-    with contextlib.suppress(Exception):
-        fallback = _openzl_compat_compressor()
-    if fallback is not None and fallback is not compressors[0]:
-        compressors.append(fallback)
+    if openzl_permissive is None:
+        openzl_permissive = not env_bool('ENN_OPENZL_STRICT', False)
+
+    compat_only = env_bool('ENN_OPENZL_COMPAT_ONLY', False)
+    no_compat_fallback = env_bool('ENN_OPENZL_NO_COMPAT_FALLBACK', False)
+
+    compressors: list[Any] = []
+    default_build_exc: Exception | None = None
+
+    if not compat_only:
+        try:
+            compressors.append(_openzl_get_default_compressor())
+        except Exception as exc:
+            default_build_exc = exc
+            if no_compat_fallback:
+                raise
+            global _OPENZL_DEFAULT_BUILD_LOGGED
+            if not _OPENZL_DEFAULT_BUILD_LOGGED:
+                _LOGGER.warning(
+                    'OpenZL default compressor graph build failed; falling back to compat compressor. '
+                    'Set ENN_OPENZL_STRICT=1 and ENN_OPENZL_NO_COMPAT_FALLBACK=1 to debug. Error: %s',
+                    exc,
+                )
+                _OPENZL_DEFAULT_BUILD_LOGGED = True
+
+    if compat_only or (not no_compat_fallback):
+        with contextlib.suppress(Exception):
+            fallback = _openzl_compat_compressor()
+            if fallback is not None:
+                if compat_only:
+                    compressors = [fallback]
+                elif fallback not in compressors:
+                    compressors.append(fallback)
+
+    if not compressors:
+        if default_build_exc is not None:
+            raise default_build_exc
+        raise RuntimeError('OpenZL compressor initialization failed')
 
     tensors: list[torch.Tensor] = []
     tensor_table: list[dict[str, Any]] = []
@@ -676,66 +713,76 @@ def _openzl_compress_payload(
         dtype_names = [str(t.dtype) for t in tensors]
         dtype_buffers = list(tensors)
         for tid, t in enumerate(tensors):
-            tensor_table[tid]["buffer"] = int(tid)
-            tensor_table[tid]["offset"] = 0
+            tensor_table[tid]['buffer'] = int(tid)
+            tensor_table[tid]['offset'] = 0
 
     meta = {
-        "magic": _OPENZL_MAGIC,
-        "payload": payload_meta,
-        "tensor_table": tensor_table,
-        "dtype_buffers": dtype_names,
+        'magic': _OPENZL_MAGIC,
+        'payload': payload_meta,
+        'tensor_table': tensor_table,
+        'dtype_buffers': dtype_names,
     }
-    meta_bytes = json.dumps(meta, separators=(",", ":")).encode("utf-8")
+    meta_bytes = json.dumps(meta, separators=(',', ':')).encode('utf-8')
 
     inputs: list[Any] = [zl.Input(zl.Type.Serial, meta_bytes)]
     for buf in dtype_buffers:
         inputs.append(zl.Input(zl.Type.Numeric, buf))
 
     last_exc: Exception | None = None
-    for compressor in compressors:
+    for idx, compressor in enumerate(compressors):
         cctx = zl.CCtx()
         cctx.ref_compressor(compressor)
+
         fmt = (
             int(openzl_format_version)
             if openzl_format_version is not None
-            else int(getattr(zl, "MAX_FORMAT_VERSION", 0))
+            else int(getattr(zl, 'MAX_FORMAT_VERSION', 0))
         )
         with contextlib.suppress(Exception):
             cctx.set_parameter(zl.CParam.FormatVersion, fmt)
+
         if openzl_level is not None:
             with contextlib.suppress(Exception):
-                cctx.set_parameter(
-                    zl.CParam.CompressionLevel, int(openzl_level)
-                )
+                cctx.set_parameter(zl.CParam.CompressionLevel, int(openzl_level))
+
         if openzl_min_stream_size is not None:
             with contextlib.suppress(Exception):
-                cctx.set_parameter(
-                    zl.CParam.MinStreamSize, int(openzl_min_stream_size)
-                )
+                cctx.set_parameter(zl.CParam.MinStreamSize, int(openzl_min_stream_size))
+
         if openzl_content_checksum is not None:
             with contextlib.suppress(Exception):
                 cctx.set_parameter(
                     zl.CParam.ContentChecksum, int(bool(openzl_content_checksum))
                 )
+
         if openzl_compressed_checksum is not None:
             with contextlib.suppress(Exception):
                 cctx.set_parameter(
-                    zl.CParam.CompressedChecksum,
-                    int(bool(openzl_compressed_checksum)),
+                    zl.CParam.CompressedChecksum, int(bool(openzl_compressed_checksum))
                 )
-        if openzl_permissive is not None:
-            with contextlib.suppress(Exception):
-                cctx.set_parameter(
-                    zl.CParam.PermissiveCompression,
-                    int(bool(openzl_permissive)),
-                )
+
+        with contextlib.suppress(Exception):
+            cctx.set_parameter(
+                zl.CParam.PermissiveCompression, int(bool(openzl_permissive))
+            )
+
         try:
-            return bytes(cctx.compress(inputs))
+            out = bytes(cctx.compress(inputs))
+            if idx > 0:
+                global _OPENZL_FALLBACK_LOGGED
+                if env_bool('ENN_OPENZL_LOG_FALLBACK', True) and not _OPENZL_FALLBACK_LOGGED:
+                    _LOGGER.warning(
+                        'OpenZL compression used compat fallback compressor due to prior failure: %s',
+                        last_exc,
+                    )
+                    _OPENZL_FALLBACK_LOGGED = True
+            return out
         except Exception as exc:
             last_exc = exc
+
     if last_exc is not None:
         raise last_exc
-    raise RuntimeError("OpenZL compression failed without an error")
+    raise RuntimeError('OpenZL compression failed without an error')
 
 
 def _openzl_decompress_payload(
