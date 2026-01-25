@@ -33,7 +33,7 @@ This repository also includes a worked example notebook (`notebook.ipynb`) and a
 - DataFrame integrations (pandas, pandas-on-Spark, polars) are optional. install the corresponding extra (e.g., `pip install -e .[pandas]`) when needed.
 
 ## Features
-- **APIs** (`enn_torch.api`): build/load models, elastic train/predict entrypoints (uses `torch.distributed.elastic`), and checkpoint/export helpers.
+- **APIs** (`enn_torch.runtime.workflow`): build/load models, elastic train/predict entrypoints (uses `torch.distributed.elastic`), and checkpoint/export helpers.
 - **Templated configurations** (`enn_torch.config`): dataclass configs with coercion/validation and string canonicalizers for modeling type, normalization, and compile options.
 - **Neural network stacks** (`enn_torch.nn`): spatio-temporal TokenFuser/TokenCollector blocks, attention variants, scaler + recorder modules, AMP negotiation guard band (`ModelConfig.safety_margin_pow2`).
 - **Data pipeline** (`enn_torch.data`): `torchdata.nodes`-driven memmap pipeline with TensorDict support, prefetch/pin/pool options, and scale-aware dataset metadata.
@@ -224,7 +224,6 @@ Notebook demo:
 ```
 enn_torch/
   __init__.py
-  api.py
   config.py
   core/
     __init__.py
@@ -233,6 +232,8 @@ enn_torch/
     datatypes.py          # env parsing + small type utilities
     distributed.py        # elastic launch + process group utilities
     graph.py              # torch.compile helpers, graph break utilities
+  runtime/
+    workflow.py           # build/load models, elastic train/predict entrypoints
     policies.py           # thread/data policy heuristics
     precision.py          # dtype/precision helpers
     profiler.py           # lightweight FLOP/IO timers

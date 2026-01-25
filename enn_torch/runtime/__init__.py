@@ -10,6 +10,7 @@ __all__ = [
     "losses",
     "optimizers",
     "wrappers",
+    "workflow",
 ]
 
 

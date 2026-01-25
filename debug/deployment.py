@@ -18,7 +18,7 @@ import numpy as np
 import torch
 from tensordict import TensorDict
 
-from enn_torch.api import new_model, train
+from enn_torch.runtime.workflow import new_model, train
 from enn_torch.config import ModelConfig, PatchConfig
 from enn_torch.core.tensor import extract_tensor, from_buffer
 from enn_torch.runtime.io import Exporter

@@ -16,7 +16,7 @@ import psutil
 import torch
 from tensordict import TensorDict
 
-from enn_torch.api import new_model, predict, train
+from enn_torch.runtime.workflow import new_model, predict, train
 from enn_torch.config import ModelConfig, PatchConfig
 from enn_torch.core.system import get_device
 
@@ -315,7 +315,7 @@ def main() -> None:
         in_dim=td_train["X"].shape[1], out_shape=(S, T), config=config
     ).to(device)
     train_epochs = 6
-    print("[train] starting... (elastic_launch inside enn_torch.api.train)")
+    print("[train] starting... (elastic_launch inside enn_torch.runtime.workflow.train)")
     trained_model, train_metrics = monitor_run(
         lambda: train(
             model,
