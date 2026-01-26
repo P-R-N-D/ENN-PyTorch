@@ -1,0 +1,279 @@
+--- a/enn_torch/nn/architecture.py
++++ b/enn_torch/nn/architecture.py
+@@ -698,6 +698,82 @@
+ 
+         self._resolve_stream_task_id()
+ 
++        # ---- Subgraph partitioning helpers (runtime-only) ----
++        # These make compile boundaries explicit:
++        #   [task units] -> [backbone (perceiver)] -> [head (decode)]
++        # They are safe for export/trace because graph_break/cudagraph markers
++        # are no-ops outside torch.compile/cudagraph contexts.
++        self._compile_cudagraphs = bool(getattr(config, "compile_cudagraphs", False))
++        self._decode_graph: nn.Module | None = None
++        self._backbone_graph: nn.Module | None = None
++        try:
++            # Local import to avoid heavy deps at import time.
++            from ..runtime.wrappers import CallArguments, GraphSequential
++
++            class _PackPerceiverArgs(nn.Module):
++                def forward(
++                    self,
++                    all_tokens: torch.Tensor,
++                    attn_bias: Optional[torch.Tensor] = None,
++                ) -> CallArguments:
++                    return CallArguments(
++                        args=(all_tokens,), kwargs={"attn_bias": attn_bias}
++                    )
++
++            class _PackFusedAndDecode(nn.Module):
++                def __init__(self, decode_mod: nn.Module) -> None:
++                    super().__init__()
++                    self.decode = decode_mod
++
++                def forward(
++                    self, fused_tokens: torch.Tensor
++                ) -> tuple[torch.Tensor, torch.Tensor]:
++                    ctx = cast(torch.Tensor, self.decode(fused_tokens))
++                    return fused_tokens, ctx
++
++            device = next(self.parameters()).device
++
++            # Head graph: norm -> mean pool -> head -> reshape
++            self._decode_graph = (
++                GraphSequential(
++                    steps=[
++                        GraphSequential.path("norm"),
++                        GraphSequential.mean(dim=1),
++                        GraphSequential.path("head"),
++                    ],
++                    out_shape=self.out_shape,
++                    name="decode",
++                    root=self,
++                )
++                .to(device)
++                .bind()
++            )
++
++            # Backbone graph: (pack args -> perceiver) -> graph_break -> decode
++            # Returns both fused_tokens and decoded context.
++            self._backbone_graph = (
++                GraphSequential(
++                    steps=[
++                        GraphSequential.cudagraph_begin(),
++                        GraphSequential.own(_PackPerceiverArgs(), name="pack_args"),
++                        GraphSequential.path("perceiver"),
++                        GraphSequential.break_graph(),
++                        GraphSequential.own(
++                            _PackFusedAndDecode(self._decode_graph),
++                            name="pack_decode",
++                        ),
++                        GraphSequential.cudagraph_end(),
++                    ],
++                    name="backbone",
++                    root=self,
++                )
++                .to(device)
++                .bind()
++            )
++        except Exception:
++            self._decode_graph = None
++            self._backbone_graph = None
++
+ 
+ 
+     def __getstate__(self: Self) -> dict[str, object]:
+@@ -1116,24 +1192,44 @@
+     ) -> Optional[torch.Tensor]:
+         if len(token_sets) <= 1:
+             return None
+-        ws = []
+-        eps = []
+-        counts = []
++        exporting = False
++        with contextlib.suppress(Exception):
++            exporting = bool(is_export_or_trace())
++
++        # Avoid data-dependent guards (e.g. `.item()` on buffers) and tracer
++        # constants (`torch.as_tensor(list)`), while keeping shapes flexible.
++        w_list: list[torch.Tensor] = []
++        e_list: list[torch.Tensor] = []
++        counts: list[int] = []
+         for n, t in zip(names, token_sets):
+             tmpl = self.tasks[n]
+-            wv = float(getattr(tmpl, "weight", torch.tensor(1.0)).item())
+-            ev = float(getattr(tmpl, "eps", torch.tensor(1e-6)).item())
+-            ws.append(wv)
+-            eps.append(ev)
+-            counts.append(int(t.size(1)))
++            if not isinstance(tmpl, nn.Module):
++                raise TypeError(f"Task '{n}' is not an nn.Module")
++
++            w = getattr(tmpl, "weight", None)
++            e = getattr(tmpl, "eps", None)
++            if not isinstance(w, torch.Tensor):
++                w = torch.as_tensor(1.0, dtype=torch.float32, device=device)
++            if not isinstance(e, torch.Tensor):
++                e = torch.as_tensor(1e-6, dtype=torch.float32, device=device)
++            w_list.append(w.to(device=device, dtype=torch.float32).reshape(()))
++            e_list.append(e.to(device=device, dtype=torch.float32).reshape(()))
++
++            # Export prefers static, but BYOM can change token count; keep
++            # runtime accurate when not exporting.
++            if exporting:
++                cnt = int(getattr(tmpl, "tokens", int(t.size(1))))
++            else:
++                cnt = int(t.size(1))
++            counts.append(cnt)
+         if any(c <= 0 for c in counts):
+             return None
+-        w_t = torch.as_tensor(ws, dtype=torch.float32, device=device)
+-        e_t = torch.as_tensor(eps, dtype=torch.float32, device=device)
+-        n_t = torch.as_tensor(counts, dtype=torch.float32, device=device)
++        w_t = torch.stack(w_list, dim=0)
++        e_t = torch.stack(e_list, dim=0)
++        n_t = torch.tensor(counts, dtype=torch.float32, device=device)
+         per_tok = torch.maximum(w_t, e_t) / torch.clamp(n_t, min=1.0)
+         logw = torch.log(per_tok.clamp_min(1e-12))
+-        rep = torch.as_tensor(counts, dtype=torch.long, device=device)
++        rep = torch.tensor(counts, dtype=torch.long, device=device)
+         bias_vec = torch.repeat_interleave(logw, rep, dim=0).to(dtype=dtype)
+         return bias_vec.view(1, 1, 1, -1)
+ 
+@@ -1224,6 +1320,10 @@
+                 )
+             token_sets.append(out_tokens)
+ 
++        # ---- Compile boundary: end of per-task units ----
++        # Keeps the task loop out of the backbone graph (when compiling).
++        graph_break()
++
+         if len(token_sets) < 1:
+             raise RuntimeError("No tasks produced tokens")
+ 
+@@ -1232,6 +1332,9 @@
+         else:
+             all_tokens = torch.cat(token_sets, dim=1)
+ 
++        # ---- Compile boundary: task aggregation -> attn-bias/backbone ----
++        graph_break()
++
+         attn_bias = self._build_attn_bias(
+             names,
+             token_sets,
+@@ -1239,8 +1342,26 @@
+             dtype=all_tokens.dtype,
+         )
+ 
+-        fused_tokens = self.perceiver(all_tokens, attn_bias=attn_bias)
+-        context = self.decode(fused_tokens, apply_norm=True)
++        # ---- Backbone (perceiver) + head (decode) ----
++        bg = getattr(self, "_backbone_graph", None)
++        if isinstance(bg, nn.Module):
++            fused_tokens, context = cast(
++                tuple[torch.Tensor, torch.Tensor], bg(all_tokens, attn_bias)
++            )
++        else:
++            if (
++                self._compile_cudagraphs
++                and getattr(all_tokens.device, "type", None) == "cuda"
++            ):
++                cudagraph_mark_step_begin()
++                fused_tokens = self.perceiver(all_tokens, attn_bias=attn_bias)
++                cudagraph_mark_step_end()
++            else:
++                fused_tokens = self.perceiver(all_tokens, attn_bias=attn_bias)
++
++            # ---- Compile boundary: backbone -> head ----
++            graph_break()
++            context = self.decode(fused_tokens, apply_norm=True)
+ 
+         if return_temporal_state:
+             if state_is_map:
+@@ -1253,6 +1374,12 @@
+         return cast(torch.Tensor, tokens), cast(torch.Tensor, ctx)
+ 
+     def decode(self: Self, tokens: torch.Tensor, *, apply_norm: bool = True) -> torch.Tensor:
++        # Prefer the partitioned decode graph when available.
++        if apply_norm:
++            dg = getattr(self, "_decode_graph", None)
++            if isinstance(dg, nn.Module):
++                return cast(torch.Tensor, dg(tokens))
++
+         x = tokens
+         if apply_norm:
+             x = self.norm(x)
+
+--- a/enn_torch/nn/blocks.py
++++ b/enn_torch/nn/blocks.py
+@@ -250,7 +250,12 @@
+ 
+         y = self.norm1(x)
+         qkv = self.qkv(y)
+-        q, k, v = qkv.view(B, K, 3, self.nhead, self.head_dim).permute(2, 0, 3, 1, 4)
++        # Avoid Python-level iteration over tensors during tracing/export.
++        q, k, v = (
++            qkv.view(B, K, 3, self.nhead, self.head_dim)
++            .permute(2, 0, 3, 1, 4)
++            .unbind(0)
++        )
+ 
+         attn_out = self.attn(
+             q,
+
+--- a/enn_torch/nn/layers.py
++++ b/enn_torch/nn/layers.py
+@@ -219,8 +219,10 @@
+         win: Optional[int],
+         causal: bool,
+     ) -> None:
+-        self.L_q = int(L_q)
+-        self.L_k = int(L_k)
++        # L_q/L_k can become tensor-like during tracing/export paths.
++        # Avoid `int(tensor)` which triggers TracerWarning and can break export.
++        self.L_q = L_q if torch.is_tensor(L_q) else int(L_q)
++        self.L_k = L_k if torch.is_tensor(L_k) else int(L_k)
+         self.dilation = max(1, int(dilation))
+         self.win = None if win is None else int(win)
+         self.causal = bool(causal)
+@@ -231,8 +233,28 @@
+         _ = (b, h)
+         dq = q_idx - kv_idx
+         keep = kv_idx == kv_idx
+-        if int(self.L_k) > int(self.L_q):
+-            keep = keep & (kv_idx < int(self.L_q))
++        L_q = self.L_q
++        L_k = self.L_k
++        if torch.is_tensor(L_q) or torch.is_tensor(L_k):
++            Lq = (
++                L_q.to(device=kv_idx.device)
++                if torch.is_tensor(L_q)
++                else kv_idx.new_tensor(int(L_q))
++            )
++            Lk = (
++                L_k.to(device=kv_idx.device)
++                if torch.is_tensor(L_k)
++                else kv_idx.new_tensor(int(L_k))
++            )
++            cond = Lk > Lq
++            keep = keep & torch.where(
++                cond,
++                (kv_idx < Lq),
++                torch.ones_like(keep, dtype=torch.bool),
++            )
++        else:
++            if int(L_k) > int(L_q):
++                keep = keep & (kv_idx < int(L_q))
+         if self.causal:
+             keep = keep & (kv_idx <= q_idx)
+         if self.win is not None:
+@@ -698,7 +720,8 @@
+             )
+         B, Lq, D = latents.shape
+         _, Lk, Dk = tokens.shape
+-        if int(D) != int(self.d_model) or int(Dk) != int(self.d_model):
++        # Avoid `int(tensor)` conversions (can appear under tracing/export).
++        if (latents.size(-1) != self.d_model) or (tokens.size(-1) != self.d_model):
+             raise ValueError(
+                 f"Resampler expects last dim D={self.d_model}, got latents D={D} tokens D={Dk}"
+             )
