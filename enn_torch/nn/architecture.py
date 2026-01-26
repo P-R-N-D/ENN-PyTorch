@@ -1220,8 +1220,15 @@ class Fuser(nn.Module):
         n_t = torch.tensor(counts, dtype=torch.float32, device=device)
         per_tok = torch.maximum(w_t, e_t) / torch.clamp(n_t, min=1.0)
         logw = torch.log(per_tok.clamp_min(1e-12))
-        rep = torch.tensor(counts, dtype=torch.long, device=device)
-        bias_vec = torch.repeat_interleave(logw, rep, dim=0).to(dtype=dtype)
+        if exporting:
+            parts: list[torch.Tensor] = []
+            for i, cnt in enumerate(counts):
+                c = int(cnt)
+                parts.append(logw[i].expand((c,)))
+            bias_vec = torch.cat(parts, dim=0).to(dtype=dtype)
+        else:
+            rep = torch.tensor(counts, dtype=torch.long, device=device)
+            bias_vec = torch.repeat_interleave(logw, rep, dim=0).to(dtype=dtype)
         return bias_vec.view(1, 1, 1, -1)
 
     def forward(
