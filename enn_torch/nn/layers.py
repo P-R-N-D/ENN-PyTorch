@@ -538,6 +538,7 @@ class DilatedAttention(nn.Module):
             context is None
             and (not need_weights)
             and (not return_attn_mask)
+            and key_padding_mask is None
             and _HAS_FLEX_ATTENTION
             and getattr(_FLEX_KERNEL, "has_torch_backend", False)
             and (self._get_torch_mha() is not None)
