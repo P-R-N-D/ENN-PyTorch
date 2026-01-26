@@ -2564,10 +2564,11 @@ def update_checkpoint_bar(
         inc = int(finish)
     except Exception:
         inc = 1
-    if inc = 0:
-        chpt_expr = f"(Total = {int(total)}, Finished = {int(position)}) Checkpoint in Progress"
+    finished = int(position) + (1 if inc > 0 else 0)
+    if inc == 0:
+        chpt_expr = f"(Total = {int(total)}, Finished = {finished}) Checkpoint in Progress"
     elif inc > 0:
-        chpt_expr = f"(Total = {int(total)}, Finished = {int(position)}) Checkpoint Completed"
+        chpt_expr = f"(Total = {int(total)}, Finished = {finished}) Checkpoint Completed"
     bar.unit = chpt_expr
     bar.update(inc)
 
