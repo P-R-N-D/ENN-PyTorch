@@ -1,0 +1,9 @@
+diff --git a/enn_torch/nn/architecture.py b/enn_torch/nn/architecture.py
+--- a/enn_torch/nn/architecture.py
++++ b/enn_torch/nn/architecture.py
+@@
+-            if out_tokens.dim() != 3 or int(out_tokens.size(-1)) != int(self.d_model):
++            if out_tokens.dim() != 3 or out_tokens.size(-1) != self.d_model:
+                 raise ValueError(
+                     f"Task '{name}' must return tokens shaped (B,N,{self.d_model}); got {tuple(out_tokens.shape)}"
+                 )
