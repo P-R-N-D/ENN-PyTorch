@@ -314,6 +314,11 @@ def main() -> None:
     model = new_model(
         in_dim=td_train["X"].shape[1], out_shape=(S, T), config=config
     ).to(device)
+
+    with contextlib.suppress(Exception):
+        model.add_task("extra_spatial", mode="spatial", weight=0.25)
+        model.update_task("extra_spatial", weight=0.5)
+        print("[lifecycle] tasks:", model.list_tasks())
     train_epochs = 6
     print("[train] starting... (elastic_launch inside enn_torch.runtime.workflow.train)")
     trained_model, train_metrics = monitor_run(

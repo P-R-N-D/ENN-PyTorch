@@ -39,6 +39,7 @@ from .kernels import (
     MultiHeadAttention,
     MultiScaleRetention,
 )
+from .activations import GeGLU
 
 _DILATED_MASK_CACHE_ENTRY_MAX_BYTES = env_int(
     "ENN_DILATED_MASK_CACHE_ENTRY_MAX_BYTES", 64 * 1024 * 1024
@@ -135,83 +136,6 @@ def _tensor_stats(
     return v, m, mn, mx
 
 
-def _stream_flex_attention(
-    self: Any,
-    qh: torch.Tensor,
-    kh: torch.Tensor,
-    vh: torch.Tensor,
-    *args: Any,
-    group_size: int,
-    block_size: int,
-    win: int | None,
-    scale: float,
-    dropout_p: float,
-    kpm_k: Optional[torch.Tensor],
-    q_pad: Optional[torch.Tensor],
-) -> torch.Tensor:
-    if not _HAS_FLEX_ATTENTION:
-        raise RuntimeError("FlexAttention backend is not available")
-    B, H, L_q, _ = qh.shape
-    L_k = int(kh.shape[2])
-    embed_dim = int(self.embed_dim)
-    out_full: Optional[torch.Tensor] = None
-    for b0 in range(0, B, group_size):
-        b1 = min(B, b0 + group_size)
-        B_g = b1 - b0
-        qh_g, kh_g, vh_g = qh[b0:b1], kh[b0:b1], vh[b0:b1]
-        kpm_g = (
-            kpm_k[b0:b1] if (kpm_k is not None and kpm_k.dim() == 2) else None
-        )
-        if kpm_g is None:
-            block_mask_g = self._get_flex_block_mask(
-                B_g,
-                H,
-                L_q,
-                L_k,
-                device=qh.device,
-                block_size=block_size,
-                win=win,
-            )
-        else:
-            mask_mod = _FlexMaskMod(
-                L_q, L_k, self.causal, win, self.dilation, kpm_g
-            )
-            block_mask_g = create_block_mask(
-                mask_mod,
-                B_g,
-                H,
-                L_q,
-                L_k,
-                device=qh.device,
-                BLOCK_SIZE=block_size,
-            )
-        y_g = _FLEX_KERNEL(
-            qh_g,
-            kh_g,
-            vh_g,
-            block_mask=block_mask_g,
-            scale=scale,
-            dropout_p=dropout_p,
-            training=bool(self.training),
-        )
-
-        out_g = self.out_proj(
-            y_g.transpose(1, 2).contiguous().view(B_g, L_q, embed_dim)
-        )
-        if q_pad is not None:
-            out_g = out_g.masked_fill(q_pad[b0:b1].unsqueeze(-1), 0.0)
-        if out_full is None:
-            if B_g == B:
-                return out_g
-            out_full = out_g.new_empty((B, *out_g.shape[1:]))
-        out_full[b0:b1] = out_g
-    if out_full is None:
-        raise RuntimeError(
-            "Internal error: flex_attention produced no outputs"
-        )
-    return out_full
-
-
 def resize_scaler_buffer(model: nn.Module, state: Mapping[str, Any]) -> None:
     scaler: Optional[Scaler] = None
     for module in model.modules():
@@ -265,59 +189,22 @@ def resize_scaler_buffer(model: nn.Module, state: Mapping[str, Any]) -> None:
                     setattr(scaler, name, new_buf)
 
 
-def norm_layer(norm_type: str, dim: int) -> nn.Module:
+def norm_layer(norm_type: str, dim: int, eps: float = 1e-6) -> nn.Module:
     norm = str(norm_type).strip().lower()
     match norm:
         case "ln" | "layernorm" | "layer_norm" | "layer-norm":
-            return nn.LayerNorm(dim)
+            return nn.LayerNorm(dim, eps=eps)
         case "bn" | "batchnorm" | "batch_norm" | "batch-norm":
-            return nn.BatchNorm1d(dim)
+            return nn.BatchNorm1d(dim, eps=eps)
         case "rms" | "rmsnorm" | "rms_norm" | "rms-norm":
             try:
                 from torch.nn import RMSNorm
 
-                return RMSNorm(dim)
+                return RMSNorm(dim, eps=eps)
             except Exception:
-                return nn.LayerNorm(dim)
+                return nn.LayerNorm(dim, eps=eps)
         case _:
-            return nn.LayerNorm(dim)
-
-
-class _FlexMaskMod:
-    def __init__(
-        self: Self,
-        L_q: int,
-        L_k: int,
-        causal: bool,
-        win: int | None,
-        dilation: int,
-        kpm: torch.Tensor,
-    ) -> None:
-        self._kv_limit = L_q if L_k > L_q else None
-        self.causal = causal
-        self.win = win
-        self.dilation = dilation
-        self.kpm = kpm.to(torch.bool)
-
-    def __call__(
-        self: Self,
-        b: int,
-        h: int,
-        q_idx: torch.Tensor,
-        kv_idx: torch.Tensor,
-    ) -> torch.Tensor:
-        _ = h
-        dq = q_idx - kv_idx
-        keep = kv_idx == kv_idx 
-        if self._kv_limit is not None:
-            keep = keep & (kv_idx < self._kv_limit)
-        if self.causal:
-            keep = keep & (kv_idx <= q_idx)
-        if self.win is not None:
-            keep = keep & (dq.abs() <= self.win)
-        if self.dilation > 1:
-            keep = keep & ((dq % self.dilation) == 0)
-        return keep & (~self.kpm[b, kv_idx])
+            return nn.LayerNorm(dim, eps=eps)
 
 
 class _FlexDilatedMaskMod:
@@ -474,859 +361,244 @@ class Retention(nn.Module):
         return out, None
 
 
+
 class DilatedAttention(nn.Module):
     def __init__(
-        self: Self,
+        self,
         embed_dim: int,
         num_heads: int,
-        *args: Any,
-        dilation: int = 1,
-        window_size: Optional[int] = None,
-        causal: bool = False,
         dropout: float = 0.0,
-        mlp_ratio: float = 4.0,
-        batch_first: bool = True,
         bias: bool = True,
-        **kwargs: Any,
+        batch_first: bool = True,
+        causal: bool = False,
+        window_size: Optional[int] = None,
+        dilation: int = 1,
+        ffn_ratio: float = 4.0,
+        mlp_ratio: Optional[float] = None,
+        activation: str = "gelu",
+        drop_path: float = 0.0,
     ) -> None:
         super().__init__()
-        if embed_dim % max(1, num_heads) != 0:
-            raise ValueError(
-                f"embed_dim {embed_dim} must be divisible by num_heads {num_heads}"
-            )
+
         self.embed_dim = int(embed_dim)
-        self.num_heads = int(num_heads)
-        self.dilation = int(dilation)
-        self.window_size = window_size
-        self.causal = bool(causal)
+        self.nhead = int(num_heads)
+        if self.embed_dim % self.nhead != 0:
+            raise ValueError(
+                f"embed_dim ({self.embed_dim}) must be divisible by num_heads ({self.nhead})"
+            )
+        self.head_dim = self.embed_dim // self.nhead
+
         self.batch_first = bool(batch_first)
-        self.nhead = self.num_heads
-        self.head_dim = int(self.embed_dim // max(self.nhead, 1))
+        self.causal = bool(causal)
+        self.window_size = int(window_size) if window_size is not None else None
+        self.dilation = int(dilation) if dilation is not None else 1
+        if self.dilation < 1:
+            raise ValueError("dilation must be >= 1")
+
         self.dropout_p = float(dropout)
-        self.__stf_attention_profile__ = {
-            "format": "xs",
-            "num_heads": self.nhead,
-            "head_dim": self.head_dim,
-            "dropout_attr": "dropout_p",
-            "effective_window_attr": ["window_size"],
-            "include_softmax_scale_dropout": True,
-        }
+
         self.norm1 = _Norm(self.embed_dim)
-        self.qkv = nn.Linear(self.embed_dim, 3 * self.embed_dim, bias=bias)
-        self.out_proj = nn.Linear(self.embed_dim, self.embed_dim, bias=bias)
-        self.dropout = nn.Dropout(dropout)
         self.norm2 = _Norm(self.embed_dim)
-        hidden = int(mlp_ratio * self.embed_dim)
+        self.dropout = nn.Dropout(self.dropout_p)
+        self.drop_path = (
+            StochasticDepth(drop_path) if drop_path > 0 else nn.Identity()
+        )
+
+        self.mha = MultiHeadAttention(
+            self.embed_dim,
+            self.nhead,
+            dropout=self.dropout_p,
+            bias=bias,
+            batch_first=self.batch_first,
+        )
+
+        if mlp_ratio is not None:
+            ffn_ratio = mlp_ratio
+        hidden = int(self.embed_dim * float(ffn_ratio))
+        if activation.lower() == "gelu":
+            act = nn.GELU()
+        elif activation.lower() == "silu":
+            act = nn.SiLU()
+        elif activation.lower() == "relu":
+            act = nn.ReLU()
+        else:
+            raise ValueError(f"Unsupported activation: {activation}")
+
         self.ffn = nn.Sequential(
-            nn.Linear(self.embed_dim, hidden, bias=True),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden, self.embed_dim, bias=True),
+            nn.Linear(self.embed_dim, hidden, bias=bias),
+            act,
+            nn.Dropout(self.dropout_p),
+            nn.Linear(hidden, self.embed_dim, bias=bias),
         )
-        self.length_bucket_multiple: int = 64
-        self._dot_attn = DotProductAttention(
-            num_heads=self.nhead, head_dim=self.head_dim
-        )
-        self._dot_attn_mask_kw: str | None = "attn_mask"
-        self._dot_attn_dropout_kw: str | None = None
-        self._dot_attn_training_kw: str | None = "training"
-        self._dot_attn_causal_kw: str | None = None
-        with contextlib.suppress(Exception):
-            import inspect
 
-            params = inspect.signature(self._dot_attn.forward).parameters
-            if "attn_mask" in params:
-                self._dot_attn_mask_kw = "attn_mask"
-            elif "mask" in params:
-                self._dot_attn_mask_kw = "mask"
-            elif "attention_mask" in params:
-                self._dot_attn_mask_kw = "attention_mask"
-            else:
-                self._dot_attn_mask_kw = None
-            if "training" in params:
-                self._dot_attn_training_kw = "training"
-            else:
-                self._dot_attn_training_kw = None
-            if "dropout_p" in params:
-                self._dot_attn_dropout_kw = "dropout_p"
-            elif "dropout" in params:
-                self._dot_attn_dropout_kw = "dropout"
-            else:
-                self._dot_attn_dropout_kw = None
-            if "is_causal" in params:
-                self._dot_attn_causal_kw = "is_causal"
-            elif "causal" in params:
-                self._dot_attn_causal_kw = "causal"
-            else:
-                self._dot_attn_causal_kw = None
-        self._mask_cache_lock = Mutex()
-        self._flex_block_mask_cache_lock = Mutex()
-        self._mask_cache = OrderedDict()
-        self._flex_block_mask_cache = OrderedDict()
-        self._mask_cache_last: tuple[Any, Any] | None = None
-        self._flex_block_mask_cache_last: tuple[Any, Any] | None = None
+        self._mask_cache_len: int = 0
+        self._mask_cache: Optional[torch.Tensor] = None
+        self._mask_cache_device: Optional[torch.device] = None
 
-    def _get_cached_item(
-        self: Self,
-        cache: OrderedDict[object, TCache] | None,
-        lock: Mutex | None,
-        key: object,
-        factory_fn: Callable[[], TCache],
-        last_attr_name: str,
-        max_size: int,
-        value_checker: Callable[[TCache], bool] | None = None,
-    ) -> TCache:
-        if is_symbolic() or is_export_or_trace() or is_compiling():
-            return factory_fn()
+        self._flex_cache_len: int = 0
+        self._flex_cache_device: Optional[torch.device] = None
+        self._flex_block_mask = None
 
-        last = getattr(self, last_attr_name, None)
-        if last is not None and last[0] == key:
-            return last[1]
-        is_flex = str(last_attr_name).startswith("_flex")
-        cache_attr = "_flex_block_mask_cache" if is_flex else "_mask_cache"
-        lock_attr = (
-            "_flex_block_mask_cache_lock" if is_flex else "_mask_cache_lock"
-        )
-        if cache is None:
-            cache = OrderedDict()
-            setattr(self, cache_attr, cache)
-        if lock is None:
-            lock = Mutex()
-            setattr(self, lock_attr, lock)
+    def _get_torch_mha(self) -> Optional[nn.MultiheadAttention]:
+        impl = getattr(self.mha, "impl", None)
+        torch_mha = getattr(impl, "mha", None)
+        return torch_mha
 
-        with lock:
-            cached = cache.get(key)
-            if cached is not None:
-                with contextlib.suppress(Exception):
-                    cache.move_to_end(key)
-                setattr(self, last_attr_name, (key, cached))
-                return cached
+    def _project_qkv_for_flex(self, x_bld: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, nn.Linear]:
+        torch_mha = self._get_torch_mha()
+        if torch_mha is None:
+            raise RuntimeError("Flex path requires torch MultiheadAttention backend")
 
-        item = factory_fn()
-        if value_checker and not value_checker(item):
-            return item
+        qkv = F.linear(x_bld, torch_mha.in_proj_weight, torch_mha.in_proj_bias)
+        B, L, _ = qkv.shape
+        qkv = qkv.view(B, L, 3, self.nhead, self.head_dim).transpose(1, 3)  # (B, H, 3, L, Dh)
+        q = qkv[:, :, 0]
+        k = qkv[:, :, 1]
+        v = qkv[:, :, 2]
+        out_proj = torch_mha.out_proj
+        return q, k, v, out_proj
 
-        with lock:
-            if key in cache:
-                item = cache[key]
-                with contextlib.suppress(Exception):
-                    cache.move_to_end(key)
-            else:
-                cache[key] = item
-                with contextlib.suppress(Exception):
-                    cache.move_to_end(key)
-                if len(cache) > int(max_size):
-                    with contextlib.suppress(Exception):
-                        cache.popitem(last=False)
-            setattr(self, last_attr_name, (key, item))
-        return item
-
-    def __getstate__(self: Self) -> dict[str, object]:
-        state = super().__getstate__()
-        state.pop("_mask_cache_lock", None)
-        state.pop("_flex_block_mask_cache_lock", None)
-        state.pop("_mask_cache", None)
-        state.pop("_flex_block_mask_cache", None)
-        state.pop("_mask_cache_last", None)
-        state.pop("_flex_block_mask_cache_last", None)
-        return state
-
-    def __setstate__(self: Self, state: dict[str, object]) -> None:
-        super().__setstate__(state)
-        self._mask_cache_lock = Mutex()
-        self._flex_block_mask_cache_lock = Mutex()
-        self._mask_cache = OrderedDict()
-        self._flex_block_mask_cache = OrderedDict()
-        self._mask_cache_last = None
-        self._flex_block_mask_cache_last = None
-
-    def _get_mask(self: Self, L: int, device: torch.device) -> torch.Tensor:
-        tracing = False
-        try:
-            tracing = bool(is_symbolic())
-        except Exception:
-            tracing = False
-        if not tracing:
-            try:
-                tracing = bool(
-                    torch.jit.is_tracing() or torch.jit.is_scripting()
-                )
-            except Exception:
-                tracing = False
-        if tracing:
-            return _get_dilated_mask(
+    def _get_mask(self, L: int, device: torch.device) -> torch.Tensor:
+        if (
+            self._mask_cache is None
+            or self._mask_cache_len != L
+            or self._mask_cache_device != device
+        ):
+            m = _get_dilated_mask(
                 L,
                 dilation=self.dilation,
                 window_size=self.window_size,
                 causal=self.causal,
                 device=device,
             )
-        if L > _DILATED_MASK_CACHE_MAX_L:
-            return _get_dilated_mask(
-                L,
-                dilation=self.dilation,
-                window_size=self.window_size,
-                causal=self.causal,
-                device=device,
-            )
-        win_key = int(self.window_size) if self.window_size is not None else -1
-        key = (
-            L,
-            int(self.dilation),
-            win_key,
-            int(self.causal),
-            _device_key(device),
-        )
+            self._mask_cache = m
+            self._mask_cache_len = L
+            self._mask_cache_device = device
+        return self._mask_cache
 
-        def _factory() -> torch.Tensor:
-            return _get_dilated_mask(
-                L,
-                dilation=self.dilation,
-                window_size=self.window_size,
-                causal=self.causal,
-                device=device,
-            )
-
-        def _checker(mask: torch.Tensor) -> bool:
-            mask_bytes = int(mask.numel()) * int(mask.element_size())
-            return mask_bytes <= _DILATED_MASK_CACHE_ENTRY_MAX_BYTES
-
-        return self._get_cached_item(
-            getattr(self, "_mask_cache", None),
-            getattr(self, "_mask_cache_lock", None),
-            key,
-            _factory,
-            "_mask_cache_last",
-            _DILATED_MASK_CACHE_MAX,
-            _checker,
-        )
-
-    def _get_flex_block_mask(
-        self: Self,
-        B: int,
-        H: int,
-        L_q: int,
-        L_k: int,
-        *args: Any,
-        device: torch.device,
-        block_size: int,
-        win: Optional[int],
-    ) -> Any:
-        win_key = int(win) if win is not None else -1
-        key = (
-            _device_key(device),
-            int(B),
-            int(H),
-            int(L_q),
-            int(L_k),
-            int(block_size),
-            int(self.dilation),
-            win_key,
-            int(self.causal),
-        )
-
-        def _factory() -> torch.Tensor:
-            if create_block_mask is None:
-                raise RuntimeError("create_block_mask was not imported")
+    def _get_flex_block_mask(self, L: int, device: torch.device):
+        if not _HAS_FLEX_ATTENTION or create_block_mask is None:
+            return None
+        if (
+            self._flex_block_mask is None
+            or self._flex_cache_len != L
+            or self._flex_cache_device != device
+        ):
             mask_mod = _FlexDilatedMaskMod(
-                L_q=int(L_q),
-                L_k=int(L_k),
-                dilation=int(self.dilation),
-                win=win,
-                causal=bool(self.causal),
+                L_q=L,
+                L_k=L,
+                dilation=self.dilation,
+                win=self.window_size,
+                causal=self.causal,
             )
-            return create_block_mask(
-                mask_mod,
-                B,
-                H,
-                L_q,
-                L_k,
+            self._flex_block_mask = create_block_mask(
+                mask_mod=mask_mod,
+                B=1,
+                H=self.nhead,
+                Q_LEN=L,
+                KV_LEN=L,
                 device=device,
-                BLOCK_SIZE=int(block_size),
             )
-
-        def _checker(_: object) -> bool:
-            try:
-                est = int(B) * int(H) * int(L_q) * int(L_k)
-            except Exception:
-                est = _FLEX_BLOCK_MASK_CACHE_EST_MAX_BYTES + 1
-            return est <= _FLEX_BLOCK_MASK_CACHE_EST_MAX_BYTES
-
-        return self._get_cached_item(
-            getattr(self, "_flex_block_mask_cache", None),
-            getattr(self, "_flex_block_mask_cache_lock", None),
-            key,
-            _factory,
-            "_flex_block_mask_cache_last",
-            _FLEX_BLOCK_MASK_CACHE_MAX,
-            _checker,
-        )
-
-    def _call_dot_attn(
-        self: Self,
-        q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
-        *args: Any,
-        attn_mask: Optional[torch.Tensor],
-        dropout_p: float,
-        is_causal: bool,
-    ) -> torch.Tensor:
-        attn = getattr(self, "_dot_attn", None)
-        if attn is None:
-            attn = DotProductAttention(
-                num_heads=self.nhead, head_dim=self.head_dim
-            )
-            self._dot_attn = attn
-        kwargs: dict[str, Any] = {}
-        mask_kw = getattr(self, "_dot_attn_mask_kw", "attn_mask")
-        if attn_mask is not None:
-            if mask_kw is not None:
-                kwargs[str(mask_kw)] = attn_mask
-            else:
-                kwargs["attn_mask"] = attn_mask
-        train_kw = getattr(self, "_dot_attn_training_kw", None)
-        if train_kw is not None:
-            kwargs[str(train_kw)] = bool(self.training)
-        drop_kw = getattr(self, "_dot_attn_dropout_kw", None)
-        if drop_kw is not None:
-            kwargs[str(drop_kw)] = float(dropout_p)
-        causal_kw = getattr(self, "_dot_attn_causal_kw", None)
-        if causal_kw is not None:
-            kwargs[str(causal_kw)] = bool(is_causal)
-        return attn(q, k, v, **kwargs)
-
-    def _run_with_oom_retry(
-        self: Self,
-        func: Callable[[int], torch.Tensor],
-        B: int,
-        device: torch.device,
-    ) -> torch.Tensor:
-        group = int(B)
-        last_oom: BaseException | None = None
-        while group >= 1:
-            try:
-                return func(group)
-            except Exception as e:
-                if not is_oom_error(e):
-                    raise
-                last_oom = e
-                with contextlib.suppress(Exception):
-                    empty_device_cache(
-                        device=device, do_gc=False, min_interval_s=0.0
-                    )
-                group //= 2
-        if last_oom is None:
-            raise RuntimeError(
-                "OOM retry reached unreachable state (no exception captured)"
-            )
-        raise last_oom
+            self._flex_cache_len = L
+            self._flex_cache_device = device
+        return self._flex_block_mask
 
     def forward(
-        self: Self,
+        self,
         x: torch.Tensor,
+        context: Optional[torch.Tensor] = None,
         key_padding_mask: Optional[torch.Tensor] = None,
         need_weights: bool = False,
-        average_attn_weights: bool = False,
+        average_attn_weights: bool = True,
+        cache_position: Optional[torch.Tensor] = None,
+        strict_cache: bool = False,
         skip_ffn_checkpoint: bool = False,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        return_attn_mask: bool = False,
+    ):
+        del cache_position, strict_cache, skip_ffn_checkpoint
+
         transposed = False
         if not self.batch_first:
-            if x.dim() != 3:
-                raise ValueError(
-                    f"DilatedAttention expects a 3D tensor, got shape {tuple(x.shape)}"
-                )
-            L0, B0, _ = x.shape
             x = x.transpose(0, 1)
-            if key_padding_mask is not None:
-                if key_padding_mask.dim() != 2:
-                    raise ValueError(
-                        f"key_padding_mask must be 2D, got rank {key_padding_mask.dim()}"
-                    )
-                if key_padding_mask.shape == (B0, L0):
-                    pass
-                elif key_padding_mask.shape == (L0, B0):
-                    key_padding_mask = key_padding_mask.transpose(0, 1)
-                else:
-                    raise ValueError(
-                        "key_padding_mask shape mismatch for batch_first=False: "
-                        f"expected (B,L)=({B0},{L0}) or (L,B)=({L0},{B0}), got {tuple(key_padding_mask.shape)}"
-                    )
+            if context is not None:
+                context = context.transpose(0, 1)
             transposed = True
-        if x.dim() != 3:
-            raise ValueError(
-                f"DilatedAttention expects a 3D tensor (B,L,D), got shape {tuple(x.shape)}"
-            )
-        B, L, D = x.shape
-        tracing = False
-        try:
-            tracing = bool(is_symbolic())
-        except Exception:
-            tracing = False
-        if not tracing:
-            try:
-                tracing = bool(
-                    torch.jit.is_tracing() or torch.jit.is_scripting()
-                )
-            except Exception:
-                tracing = False
-        if not tracing:
-            try:
-                if is_meta_or_fake_tensor(x) or is_meta_or_fake_tensor(
-                    key_padding_mask
-                ):
-                    tracing = True
-            except Exception:
-                pass
-        if (not tracing) and D != self.embed_dim:
-            raise ValueError(
-                f"x.shape[-1]={D} must match embed_dim={self.embed_dim}"
-            )
-        want_weights = bool(need_weights)
-        avg_weights = bool(average_attn_weights) if want_weights else False
-        kpm: Optional[torch.Tensor] = None
-        if key_padding_mask is not None:
-            if key_padding_mask.shape != (B, L):
-                raise ValueError(
-                    f"key_padding_mask must be (B, L)=({B},{L}), got {tuple(key_padding_mask.shape)}"
-                )
-            kpm = key_padding_mask
-            if kpm.dtype is not torch.bool:
-                kpm = kpm.to(torch.bool)
-            if kpm.device != x.device:
-                with contextlib.suppress(Exception):
-                    kpm = kpm.to(device=x.device, non_blocking=True)
-            with contextlib.suppress(Exception):
-                kpm = kpm.contiguous()
-        q_pad: Optional[torch.Tensor] = None
-        if kpm is not None:
-            q_pad = kpm
-            with contextlib.suppress(Exception):
-                q_pad = q_pad.contiguous()
-        use_flex = bool(
-            _HAS_FLEX_ATTENTION
-            and x.is_cuda
-            and (not want_weights)
-            and (not tracing)
+
+        B, L, _ = x.shape
+        device = x.device
+
+        x_norm = self.norm1(x)
+        kv = x_norm if context is None else self.norm1(context)
+
+        q_pad = key_padding_mask
+        if context is not None:
+            q_pad = None
+
+        use_flex = (
+            context is None
+            and (not need_weights)
+            and (not return_attn_mask)
+            and key_padding_mask is None
+            and _HAS_FLEX_ATTENTION
+            and getattr(_FLEX_KERNEL, "has_torch_backend", False)
+            and (self._get_torch_mha() is not None)
         )
-        if want_weights or tracing:
-            L_k = L
-            pad_len = 0
+
+        attn_mask_keep: Optional[torch.Tensor] = None
+        attn_weights = None
+
+        if use_flex:
+            block_mask = self._get_flex_block_mask(L, device)
+            if block_mask is None:
+                use_flex = False
+
+        if use_flex:
+            q, k, v, out_proj = self._project_qkv_for_flex(x_norm)
+            a = _FLEX_KERNEL(
+                q,
+                k,
+                v,
+                block_mask=block_mask,
+                scale=None,
+                dropout_p=self.dropout_p if self.training else 0.0,
+                training=bool(self.training),
+            )
+            a = a.transpose(1, 2).contiguous().view(B, L, self.embed_dim)
+            attn_out = out_proj(a)
         else:
-            base_mult = max(
-                int(getattr(self, "length_bucket_multiple", 64)), 1
-            )
-            if L <= 512:
-                mult = base_mult
-            elif L <= 2048:
-                mult = base_mult * 2
+            use_is_causal = False
+            attn_mask = None
+            if self.dilation == 1 and self.window_size is None:
+                use_is_causal = bool(self.causal)
             else:
-                mult = base_mult * 4
-            mult = max(mult, 1)
-            L_k = ((L + mult - 1) // mult) * mult
-            pad_len = L_k - L
-        x_k = x
-        kpm_k: Optional[torch.Tensor] = kpm
-        if pad_len > 0:
-            x_pad = x.new_zeros((B, L_k, D))
-            x_pad[:, :L, :].copy_(x)
-            x_k = x_pad
-            if kpm is not None:
-                kpm_b = kpm.to(torch.bool)
-                kpm_pad = torch.ones(
-                    (B, L_k), device=kpm_b.device, dtype=torch.bool
-                )
-                kpm_pad[:, :L].copy_(kpm_b)
-                kpm_k = kpm_pad
-            elif (not bool(self.causal)) and (not use_flex):
-                kpm_pad_1d = torch.zeros(
-                    (L_k,), device=x.device, dtype=torch.bool
-                )
-                kpm_pad_1d[L:] = True
-                kpm_k = kpm_pad_1d
-            else:
-                kpm_k = None
-        x_k = self.norm1(x_k)
-        qkv = self.qkv(x_k)
-        q, k, v = qkv.chunk(3, dim=-1)
-        H = self.num_heads
-        Dh = self.head_dim
-        L_q = L
-        qh = q[:, :L_q, :].reshape(B, L_q, H, Dh).transpose(1, 2)
-        kh = k.reshape(B, L_k, H, Dh).transpose(1, 2)
-        vh = v.reshape(B, L_k, H, Dh).transpose(1, 2)
-        training = bool(self.training)
-        dropout_p = float(self.dropout_p) if training else 0.0
-        attn_w: Optional[torch.Tensor] = None
-        if want_weights:
-            is_simple = (int(self.dilation) == 1) and (
-                self.window_size is None
+                attn_mask_keep = self._get_mask(L, device)
+                attn_mask = (~attn_mask_keep)  # bool mask, True => masked
+
+            attn_out, attn_weights = self.mha(
+                x_norm,
+                kv,
+                kv,
+                key_padding_mask=key_padding_mask,
+                attn_mask=attn_mask,
+                need_weights=need_weights,
+                average_attn_weights=average_attn_weights,
+                is_causal=use_is_causal,
             )
-            base_mask_keep: Optional[torch.Tensor] = None
-            is_causal = False
-            if is_simple and bool(self.causal) and (kpm_k is None):
-                is_causal = True
-            elif not (is_simple and (not bool(self.causal))):
-                base_mask_full = self._get_mask(L_k, x_k.device)
-                base_mask_keep = base_mask_full[:L_q, :]
-            key_mask: Optional[torch.Tensor] = None
-            if kpm_k is not None:
-                kpm_b = kpm_k.to(torch.bool)
-                if kpm_b.dim() == 1:
-                    key_mask = kpm_b[None, None, None, :]
-                else:
-                    key_mask = kpm_b[:, None, None, :]
-            base_mask_out: Optional[torch.Tensor] = None
-            if base_mask_keep is not None:
-                base_mask_out = (~base_mask_keep).to(torch.bool)[
-                    None, None, :, :
-                ]
-            causal_mask: Optional[torch.Tensor] = None
-            if is_causal:
-                causal_mask = torch.ones(
-                    (L_q, L_k), device=qh.device, dtype=torch.bool
-                ).triu(diagonal=1)
-                causal_mask = causal_mask[None, None, :, :]
-            if tracing:
-                scores = torch.matmul(qh, kh.transpose(-2, -1)) * (
-                    1.0 / math.sqrt(float(Dh))
-                )
-                scores = scores.to(torch.float32)
-                if causal_mask is not None:
-                    scores.masked_fill_(causal_mask, float("-inf"))
-                if base_mask_out is not None:
-                    scores.masked_fill_(base_mask_out, float("-inf"))
-                if key_mask is not None:
-                    scores.masked_fill_(key_mask, float("-inf"))
-                probs = _stable_softmax(scores)
-                if dropout_p > 0.0:
-                    probs = F.dropout(probs, p=dropout_p, training=True)
-                if avg_weights:
-                    attn_w = probs.mean(dim=1).to(dtype=qh.dtype)
-                else:
-                    attn_w = probs.to(dtype=qh.dtype)
-                yg = torch.matmul(probs.to(dtype=vh.dtype), vh)
-                attn_out = self.out_proj(
-                    yg.transpose(1, 2)
-                    .contiguous()
-                    .view(B, L_q, self.embed_dim)
-                )
-                if q_pad is not None:
-                    attn_out = attn_out.masked_fill(q_pad.unsqueeze(-1), 0.0)
-            else:
-                env_mb = int(env_int("ENN_ATTN_WEIGHTS_BATCH_MICROBATCH", 0))
-                est = int(B) * int(H) * int(L_q) * int(L_k)
-                if env_mb > 0:
-                    group = max(1, min(int(B), int(env_mb)))
-                else:
-                    if est >= 64 * 1024 * 1024:
-                        group = 1
-                    elif est >= 32 * 1024 * 1024:
-                        group = 2
-                    elif est >= 16 * 1024 * 1024:
-                        group = 4
-                    elif est >= 8 * 1024 * 1024:
-                        group = 8
-                    else:
-                        group = int(B)
-                    group = max(1, min(int(B), int(group)))
-                out_full = qh.new_empty((B, L_q, self.embed_dim))
-                if avg_weights:
-                    attn_w_full = qh.new_empty((B, L_q, L_k))
-                else:
-                    attn_w_full = qh.new_empty((B, H, L_q, L_k))
 
-                def _chunk_weights_fn(grp: int) -> torch.Tensor:
-                    for b0 in range(0, B, grp):
-                        b1 = min(B, b0 + grp)
-                        scores = torch.matmul(
-                            qh[b0:b1], kh[b0:b1].transpose(-2, -1)
-                        ) * (1.0 / math.sqrt(float(Dh)))
-                        scores = scores.to(torch.float32)
-                        if causal_mask is not None:
-                            scores.masked_fill_(causal_mask, float("-inf"))
-                        if base_mask_out is not None:
-                            scores.masked_fill_(base_mask_out, float("-inf"))
-                        if key_mask is not None:
-                            scores.masked_fill_(
-                                (
-                                    key_mask
-                                    if key_mask.shape[0] == 1
-                                    else key_mask[b0:b1]
-                                ),
-                                float("-inf"),
-                            )
-                        probs = _stable_softmax(scores)
-                        if dropout_p > 0.0:
-                            probs = F.dropout(
-                                probs, p=dropout_p, training=True
-                            )
-                        if avg_weights:
-                            attn_w_full[b0:b1] = probs.mean(dim=1).to(
-                                dtype=qh.dtype
-                            )
-                        else:
-                            attn_w_full[b0:b1] = probs.to(dtype=qh.dtype)
-                        yg = torch.matmul(probs.to(dtype=vh.dtype), vh[b0:b1])
-                        attn_out_g = self.out_proj(
-                            yg.transpose(1, 2)
-                            .contiguous()
-                            .view((b1 - b0), L_q, self.embed_dim)
-                        )
-                        if q_pad is not None:
-                            attn_out_g = attn_out_g.masked_fill(
-                                q_pad[b0:b1].unsqueeze(-1), 0.0
-                            )
-                        out_full[b0:b1] = attn_out_g
-                    return out_full
+        if q_pad is not None:
+            attn_out = attn_out.masked_fill(q_pad.unsqueeze(-1), 0.0)
 
-                attn_out = self._run_with_oom_retry(
-                    _chunk_weights_fn, group, x_k.device
-                )
-                attn_w = attn_w_full
-        elif use_flex:
-            win = (
-                int(self.window_size) if self.window_size is not None else None
-            )
-            if L_k <= 2048:
-                _block_size = 128
-            elif L_k <= 16384:
-                _block_size = 256
-            else:
-                _block_size = 512
-            scale = 1.0 / math.sqrt(float(Dh))
-            max_group = int(getattr(self, "flex_batch_microbatch", 0) or B)
-            max_group = max(1, min(B, max_group))
-            group = max_group
-
-            def _flex_fn(grp: int) -> torch.Tensor:
-                return _stream_flex_attention(
-                    self,
-                    qh,
-                    kh,
-                    vh,
-                    group_size=grp,
-                    block_size=_block_size,
-                    win=win,
-                    scale=scale,
-                    dropout_p=dropout_p,
-                    kpm_k=kpm_k,
-                    q_pad=q_pad,
-                )
-
-            attn_out = self._run_with_oom_retry(_flex_fn, group, x_k.device)
-        else:
-            is_simple = (int(self.dilation) == 1) and (
-                self.window_size is None
-            )
-            attn_out: Optional[torch.Tensor] = None
-            if (
-                (not tracing)
-                and is_simple
-                and bool(self.causal)
-                and (kpm_k is not None)
-                and isinstance(kpm_k, torch.Tensor)
-            ):
-                kpm_check: Optional[torch.Tensor] = None
-                if (
-                    isinstance(key_padding_mask, torch.Tensor)
-                    and key_padding_mask.device.type == "cpu"
-                ):
-                    kpm_check = key_padding_mask
-                elif (
-                    isinstance(kpm_k, torch.Tensor)
-                    and kpm_k.device.type == "cpu"
-                ):
-                    kpm_check = kpm_k
-                if kpm_check is not None:
-                    kpm_b = kpm_check.to(torch.bool)
-                    if is_export_or_trace():
-                        right_padded = False
-                    elif is_symbolic() or is_meta_or_fake_tensor(kpm_b):
-                        right_padded = False
-                    else:
-                        right_padded = True
-                        if kpm_b.shape[1] >= 2:
-                            right_padded = (
-                                not (kpm_b[:, :-1] & (~kpm_b[:, 1:]))
-                                .any()
-                                .item()
-                            )
-                    if right_padded:
-                        y_full = self._call_dot_attn(
-                            qh,
-                            kh,
-                            vh,
-                            attn_mask=None,
-                            dropout_p=dropout_p,
-                            is_causal=True,
-                        )
-                        attn_out = self.out_proj(
-                            y_full.transpose(1, 2)
-                            .contiguous()
-                            .view(B, L_q, self.embed_dim)
-                        )
-                        if q_pad is not None:
-                            attn_out = attn_out.masked_fill(
-                                q_pad.unsqueeze(-1), 0.0
-                            )
-            if attn_out is None:
-                base_mask_keep: Optional[torch.Tensor] = None
-                is_causal = False
-                if is_simple and bool(self.causal) and (kpm_k is None):
-                    is_causal = True
-                elif not (is_simple and (not bool(self.causal))):
-                    base_mask_full = self._get_mask(L_k, x_k.device)
-                    base_mask_keep = base_mask_full[:L_q, :]
-                    is_causal = False
-                key_mask: Optional[torch.Tensor] = None
-                if kpm_k is not None:
-                    kpm_b = kpm_k.to(torch.bool)
-                    if kpm_b.dim() == 1:
-                        key_mask = kpm_b[None, None, None, :]
-                    else:
-                        key_mask = kpm_b[:, None, None, :]
-                base_mask: Optional[torch.Tensor] = None
-                if base_mask_keep is not None:
-                    base_mask = (~base_mask_keep).to(torch.bool)
-                if base_mask is None:
-                    y = self._call_dot_attn(
-                        qh,
-                        kh,
-                        vh,
-                        attn_mask=key_mask,
-                        dropout_p=dropout_p,
-                        is_causal=bool(is_causal),
-                    )
-                else:
-                    base4 = base_mask[None, None, :, :]
-                    if key_mask is None:
-                        y = self._call_dot_attn(
-                            qh,
-                            kh,
-                            vh,
-                            attn_mask=base4,
-                            dropout_p=dropout_p,
-                            is_causal=False,
-                        )
-                    elif key_mask.shape[0] == 1:
-                        attn_mask = base4 | key_mask
-                        y = self._call_dot_attn(
-                            qh,
-                            kh,
-                            vh,
-                            attn_mask=attn_mask,
-                            dropout_p=dropout_p,
-                            is_causal=False,
-                        )
-                    else:
-                        if tracing:
-                            y = self._call_dot_attn(
-                                qh,
-                                kh,
-                                vh,
-                                attn_mask=base4 | key_mask,
-                                dropout_p=dropout_p,
-                                is_causal=False,
-                            )
-                        else:
-                            env_mb = int(
-                                env_int("ENN_SDPA_BATCH_MICROBATCH", 0)
-                            )
-                            group = int(env_mb)
-                            if group <= 0:
-                                est = int(B) * int(L_q) * int(L_k)
-                                if est >= 64 * 1024 * 1024:
-                                    group = 1
-                                elif est >= 16 * 1024 * 1024:
-                                    group = 2
-                                elif est >= 4 * 1024 * 1024:
-                                    group = 4
-                                else:
-                                    group = int(B)
-                            group = max(1, min(int(B), int(group)))
-
-                            def _sdpa_chunk_fn(grp: int) -> torch.Tensor:
-                                if grp >= B:
-                                    return self._call_dot_attn(
-                                        qh,
-                                        kh,
-                                        vh,
-                                        attn_mask=base4 | key_mask,
-                                        dropout_p=dropout_p,
-                                        is_causal=False,
-                                    )
-                                out_full = qh.new_empty((B, H, L_q, Dh))
-                                for b0 in range(0, B, grp):
-                                    b1 = min(B, b0 + grp)
-                                    y_g = self._call_dot_attn(
-                                        qh[b0:b1],
-                                        kh[b0:b1],
-                                        vh[b0:b1],
-                                        attn_mask=base4 | key_mask[b0:b1],
-                                        dropout_p=dropout_p,
-                                        is_causal=False,
-                                    )
-                                    out_full[b0:b1] = y_g
-                                return out_full
-
-                            y = self._run_with_oom_retry(
-                                _sdpa_chunk_fn, group, x_k.device
-                            )
-                attn_out = self.out_proj(
-                    y.transpose(1, 2).contiguous().view(B, L_q, self.embed_dim)
-                )
-                if q_pad is not None:
-                    attn_out = attn_out.masked_fill(q_pad.unsqueeze(-1), 0.0)
-        x_out = x + self.dropout(attn_out)
-        res2 = x_out
-        x_out = self.norm2(x_out)
-        ffn_bytes = 0
-        if not tracing:
-            try:
-                if isinstance(x_out, torch.Tensor) and x_out.dim() == 3:
-                    B, L, D = x_out.shape
-                    bytes_e = int(x_out.element_size())
-                    hidden = (
-                        int(getattr(self.ffn[0], "out_features", 0) or 0)
-                        if hasattr(self, "ffn")
-                        else 0
-                    )
-                    if hidden > 0:
-                        ffn_bytes = (
-                            int(B)
-                            * int(L)
-                            * (int(2) * int(hidden) + int(D))
-                            * int(bytes_e)
-                        )
-                    else:
-                        ffn_bytes = int(B) * int(L) * int(D) * int(bytes_e) * 9
-            except Exception:
-                ffn_bytes = 0
-        do_ckpt_ffn = (
-            (not bool(skip_ffn_checkpoint))
-            and self.training
-            and torch.is_grad_enabled()
-            and ffn_bytes >= int(64 * 1024 * 1024)
-        )
-        if do_ckpt_ffn:
-            x_out = coerce_checkpoint(
-                self.ffn,
-                x_out,
-                use_reentrant=True,
-                preserve_rng_state=True,
-                determinism_check="none",
-            )
-        else:
-            x_out = self.ffn(x_out)
-        x_out = res2 + self.dropout(x_out)
+        x = x + self.drop_path(self.dropout(attn_out))
+        x = x + self.drop_path(self.ffn(self.norm2(x)))
         if transposed:
-            x_out = x_out.transpose(0, 1)
-        if want_weights:
-            return x_out, attn_w
-        return x_out, None
+            x = x.transpose(0, 1)
 
+        if return_attn_mask:
+            if attn_mask_keep is None:
+                attn_mask_keep = self._get_mask(L, device)
+            return x, attn_weights, attn_mask_keep
 
+        return x, attn_weights
 class CrossAttention(nn.Module):
     def __init__(
         self: Self,
@@ -1362,6 +634,102 @@ class CrossAttention(nn.Module):
         ctx, _ = self.attn(qn, kvn, kvn, need_weights=False)
         ctx = self.out_proj(ctx)
         return q_tokens + self.drop_path(self.dropout(ctx))
+
+
+
+
+class Resampler(nn.Module):
+    def __init__(
+        self: Self,
+        d_model: int,
+        nhead: int,
+        *args: Any,
+        dropout: float = 0.0,
+        mlp_ratio: float = 4.0,
+        drop_path: float = 0.0,
+        norm_type: str = "layernorm",
+        bias: bool = True,
+        **kwargs: Any,
+    ) -> None:
+        super().__init__()
+        del args, kwargs
+        self.d_model = int(d_model)
+        self.nhead = int(nhead)
+        if self.d_model % max(1, self.nhead) != 0:
+            raise ValueError(
+                f"d_model {self.d_model} must be divisible by nhead {self.nhead}"
+            )
+        self.head_dim = int(self.d_model // max(1, self.nhead))
+        self.dropout_p = float(dropout)
+
+        def _norm() -> nn.Module:
+            nt = str(norm_type or "layernorm").strip().lower()
+            if nt in {"rms", "rmsnorm"} and hasattr(nn, "RMSNorm"):
+                return nn.RMSNorm(self.d_model)  # type: ignore[attr-defined]
+            return nn.LayerNorm(self.d_model)
+
+        self.norm_q = _norm()
+        self.norm_kv = _norm()
+
+        self.q_proj = nn.Linear(self.d_model, self.d_model, bias=bias)
+        self.k_proj = nn.Linear(self.d_model, self.d_model, bias=bias)
+        self.v_proj = nn.Linear(self.d_model, self.d_model, bias=bias)
+        self.attn = DotProductAttention(
+            num_heads=self.nhead, head_dim=self.head_dim
+        )
+        self.out_proj = nn.Linear(self.d_model, self.d_model, bias=bias)
+        self.dropout = nn.Dropout(self.dropout_p)
+        self.drop_path = StochasticDepth(p=float(drop_path), mode="row")
+
+        self.norm_ffn = _norm()
+        hid = int(self.d_model * float(mlp_ratio) * (2.0 / 3.0))
+        self.ffn = GeGLU(self.d_model, hid, out_dim=self.d_model, dropout=dropout)
+
+    def forward(
+        self: Self,
+        latents: torch.Tensor,
+        tokens: torch.Tensor,
+        attn_bias: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        if latents.dim() != 3 or tokens.dim() != 3:
+            raise ValueError(
+                "Resampler expects latents (B,Lq,D) and tokens (B,Lk,D), "
+                f"got {tuple(latents.shape)} and {tuple(tokens.shape)}"
+            )
+        B, Lq, D = latents.shape
+        _, Lk, Dk = tokens.shape
+        if int(D) != int(self.d_model) or int(Dk) != int(self.d_model):
+            raise ValueError(
+                f"Resampler expects last dim D={self.d_model}, got latents D={D} tokens D={Dk}"
+            )
+
+        q_in = self.norm_q(latents)
+        kv_in = self.norm_kv(tokens)
+
+        H = int(self.nhead)
+        Dh = int(self.head_dim)
+        q = self.q_proj(q_in).view(B, Lq, H, Dh).transpose(1, 2)  # (B,H,Lq,Dh)
+        k = self.k_proj(kv_in).view(B, Lk, H, Dh).transpose(1, 2)  # (B,H,Lk,Dh)
+        v = self.v_proj(kv_in).view(B, Lk, H, Dh).transpose(1, 2)  # (B,H,Lk,Dh)
+
+        attn_out = self.attn(
+            q,
+            k,
+            v,
+            attn_mask=attn_bias,
+            dropout_p=(self.dropout_p if self.training else 0.0),
+            is_causal=False,
+        )
+        if attn_out.dim() == 4:
+            attn_out = attn_out.transpose(1, 2).contiguous().view(B, Lq, D)
+        else:
+            raise RuntimeError(
+                f"Resampler attention returned unexpected shape {tuple(attn_out.shape)}"
+            )
+
+        latents = latents + self.drop_path(self.dropout(self.out_proj(attn_out)))
+        latents = latents + self.drop_path(self.dropout(self.ffn(self.norm_ffn(latents))))
+        return latents
 
 
 class SigmoidGate(nn.Module):

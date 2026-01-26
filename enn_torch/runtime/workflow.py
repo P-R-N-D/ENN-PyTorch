@@ -850,6 +850,10 @@ def load_model(
                 "Loading from a checkpoint directory requires in_dim and out_shape, or a valid meta.json inside the directory."
             )
         model = new_model(use_in_dim, use_out_shape, use_config)
+        with contextlib.suppress(Exception):
+            tasks = meta.get("tasks") if isinstance(meta, dict) else None
+            if tasks:
+                model.rebuild_tasks_from_specs(tasks)
         opts = StateDictOptions(full_state_dict=True)
         m_sd = get_model_state_dict(model, options=opts)
         load(
@@ -896,6 +900,10 @@ def load_model(
                 f"Invalid in_dim/out_shape metadata in {str(meta_path)!r}: in_dim={use_in_dim}, out_shape={use_out_shape}"
             )
         model = new_model(use_in_dim, use_out_shape, use_config)
+        with contextlib.suppress(Exception):
+            tasks = meta.get("tasks") if isinstance(meta, dict) else None
+            if tasks:
+                model.rebuild_tasks_from_specs(tasks)
         is_required("safetensors", "pip install safetensors")
         from safetensors.torch import load_file as load_tensors
 
@@ -982,6 +990,10 @@ def load_model(
             f"Invalid or missing in_dim/out_shape when loading checkpoint {str(p)!r}: in_dim={use_in_dim}, out_shape={use_out_shape}"
         )
     model = new_model(use_in_dim, use_out_shape, use_config)
+    with contextlib.suppress(Exception):
+        tasks = obj.get("tasks") if isinstance(obj, dict) else None
+        if tasks:
+            model.rebuild_tasks_from_specs(tasks)
     sd = _coerce_state_dict(sd) if isinstance(sd, dict) else sd
     with contextlib.suppress(Exception):
         resize_scaler_buffer(model, sd)

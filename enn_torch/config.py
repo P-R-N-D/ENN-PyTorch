@@ -406,6 +406,34 @@ def coerce_model_config(
     _i("temporal_depth", 1)
     _i("spatial_latents", 1)
     _i("temporal_latents", 1)
+
+    raw_fd = get("fuser_depth", getattr(_MODEL_DEFAULTS, "fuser_depth", None))
+    if raw_fd is None:
+        params["fuser_depth"] = None
+    else:
+        fd = _coerce_int(raw_fd, name="fuser_depth", minimum=0)
+        params["fuser_depth"] = None if int(fd) <= 0 else int(fd)
+    _i("fuser_self_attn_layers", 0)
+    stream_task_id_raw = _coerce_str(
+        get("stream_task_id", getattr(_MODEL_DEFAULTS, "stream_task_id", "") or ""),
+        "stream_task_id",
+        getattr(_MODEL_DEFAULTS, "stream_task_id", "") or "",
+        lower=False,
+    )
+    stream_task_id = str(stream_task_id_raw).strip()
+    params["stream_task_id"] = stream_task_id if stream_task_id else None
+    stream_task_name = _coerce_str(
+        get("stream_task_name", getattr(_MODEL_DEFAULTS, "stream_task_name", "") or ""),
+        "stream_task_name",
+        getattr(_MODEL_DEFAULTS, "stream_task_name", "") or "",
+        lower=False,
+    )
+    params["stream_task_name"] = stream_task_name
+    if params.get("stream_task_id") is None:
+        alias = str(stream_task_name).strip()
+        if alias:
+            params["stream_task_id"] = alias
+
     _b("use_linear_branch")
     _i("safety_margin_pow2", 0)
     _i("delta_gate_hidden_dim", 1)
@@ -676,6 +704,10 @@ class ModelConfig:
     spatial_latents: int = 64
     temporal_latents: int = 64
     modeling_type: str = "spatiotemporal"
+    fuser_depth: Optional[int] = None
+    fuser_self_attn_layers: int = 1
+    stream_task_id: Optional[str] = None
+    stream_task_name: str = ""
     fuser_blend_alpha: float = 0.0
     patch: PatchConfig = field(default_factory=PatchConfig)
     use_linear_branch: bool = False

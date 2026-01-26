@@ -90,6 +90,10 @@ def _build_model_and_sample(
     model = new_model(
         in_dim=td_train["X"].shape[1], out_shape=(S, T), config=cfg
     ).to(device)
+
+    with contextlib.suppress(Exception):
+        model.add_task('debug_extra', mode='spatial', weight=0.25)
+        print('[debug] tasks:', model.list_tasks())
     sample = td_train["X"][:4].to(device)
     return data, td_train, model, sample
 
@@ -436,8 +440,16 @@ def export_and_validate(
     }
     results: Dict[str, Any] = {}
     state_path = out_dir / "model.state_dict.pt"
+    task_spec_path = out_dir / "task_specs.json"
     try:
         torch.save(model.state_dict(), state_path)
+        with contextlib.suppress(Exception):
+            task_specs = getattr(model, "task_specs", None)
+            if callable(task_specs):
+                task_spec_path.write_text(
+                    json.dumps(task_specs(), ensure_ascii=False, indent=2),
+                    encoding="utf-8",
+                )
     except Exception as exc:
         state_path = None
         results["_state_save_error"] = repr(exc)
