@@ -474,7 +474,9 @@ def _torch_export_program(
     if isinstance(sample, torch.Tensor) and sample.ndim == 1:
         sample = sample.unsqueeze(0)
     if dynamic_batch and isinstance(sample, torch.Tensor) and sample.ndim >= 1:
-        sample = _pad_to_batch(sample, 2)
+        mode = os.environ.get("ENN_EXPORT_BATCH_DIM", "dynamic").strip().lower()
+        if mode not in {"0", "false", "off", "none", "static", "fixed"}:
+            sample = _pad_to_batch(sample, 2)
     dynamic_shapes = None
     if (
         (dynamic_batch or dynamic_seq)
