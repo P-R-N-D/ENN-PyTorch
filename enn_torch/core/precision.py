@@ -1,6 +1,8 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 import contextlib
 import importlib
 import io
@@ -317,6 +319,7 @@ def is_scale_safe(
     return ok
 
 
+@dataclass
 class DeviceMeta:
     device: torch.device
     device_type: str = "cpu"

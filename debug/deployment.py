@@ -118,9 +118,15 @@ def _run_isolated_export(
     env.setdefault("OPENBLAS_NUM_THREADS", "1")
     env.setdefault("NUMEXPR_NUM_THREADS", "1")
     env.setdefault("TORCH_NUM_THREADS", "1")
+    timeout_s = 120
+    with contextlib.suppress(Exception):
+        timeout_s = int(
+            os.environ.get("ENN_EXPORT_SUBPROCESS_TIMEOUT", str(timeout_s)).strip()
+            or str(timeout_s)
+        )
     try:
         p = subprocess.run(
-            cmd, capture_output=True, text=True, env=env, timeout=120
+            cmd, capture_output=True, text=True, env=env, timeout=timeout_s
         )
     except subprocess.TimeoutExpired as exc:
         return {
@@ -129,6 +135,15 @@ def _run_isolated_export(
             "stdout_tail": (exc.stdout or "")[-2000:],
             "stderr_tail": (exc.stderr or "")[-2000:],
         }
+    except Exception as exc:
+        if exc.__class__.__name__ == "SignalException":
+            return {
+                "status": "error",
+                "error": f"subprocess interrupted by signal ({exc})",
+                "stdout_tail": "",
+                "stderr_tail": "",
+            }
+        raise
     if p.returncode == 0:
 
         def _parse_last_json_line(text: str) -> dict[str, Any] | None:

@@ -219,8 +219,8 @@ class _FlexDilatedMaskMod:
         win: Optional[int],
         causal: bool,
     ) -> None:
-        self.L_q = int(L_q)
-        self.L_k = int(L_k)
+        self.L_q = L_q if torch.is_tensor(L_q) else int(L_q)
+        self.L_k = L_k if torch.is_tensor(L_k) else int(L_k)
         self.dilation = max(1, int(dilation))
         self.win = None if win is None else int(win)
         self.causal = bool(causal)
@@ -231,8 +231,28 @@ class _FlexDilatedMaskMod:
         _ = (b, h)
         dq = q_idx - kv_idx
         keep = kv_idx == kv_idx
-        if int(self.L_k) > int(self.L_q):
-            keep = keep & (kv_idx < int(self.L_q))
+        L_q = self.L_q
+        L_k = self.L_k
+        if torch.is_tensor(L_q) or torch.is_tensor(L_k):
+            Lq = (
+                L_q.to(device=kv_idx.device)
+                if torch.is_tensor(L_q)
+                else kv_idx.new_tensor(int(L_q))
+            )
+            Lk = (
+                L_k.to(device=kv_idx.device)
+                if torch.is_tensor(L_k)
+                else kv_idx.new_tensor(int(L_k))
+            )
+            cond = Lk > Lq
+            keep = keep & torch.where(
+                cond,
+                (kv_idx < Lq),
+                torch.ones_like(keep, dtype=torch.bool),
+            )
+        else:
+            if int(L_k) > int(L_q):
+                keep = keep & (kv_idx < int(L_q))
         if self.causal:
             keep = keep & (kv_idx <= q_idx)
         if self.win is not None:
@@ -698,7 +718,7 @@ class Resampler(nn.Module):
             )
         B, Lq, D = latents.shape
         _, Lk, Dk = tokens.shape
-        if int(D) != int(self.d_model) or int(Dk) != int(self.d_model):
+        if (latents.size(-1) != self.d_model) or (tokens.size(-1) != self.d_model):
             raise ValueError(
                 f"Resampler expects last dim D={self.d_model}, got latents D={D} tokens D={Dk}"
             )
