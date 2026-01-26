@@ -61,15 +61,14 @@ Input features (B x C_in)
 Key building blocks:
 - **Scaler**: input feature normalization, with an optional linear branch when `use_linear_branch` is enabled.
 - **Template**: a single *task* = tokenizer + RetNet stack. Each task has:
-  - a unique internal **`task_id`** (the key used inside the model / `ModuleDict` — mostly internal)
-  - a unique human-friendly **`name`** (stable alias for UX / manifests — primary external identifier)
+  - a unique **name** (this is the key used inside the model / `ModuleDict` and the primary external identifier)
   - optional metadata: `description`, `tags`
-  - If you omit `task_id` in `add_task(...)`, a random non-colliding id is auto-generated.
-  - `name` must be unique **among names**. If omitted/empty/whitespace, it defaults to `task_id`.
-  - `update_task(...)` / `remove_task(...)` accept a `name` (preferred) or a `task_id`.
+  - Task names are normalized (`strip()` and `.` → `_`) to stay `state_dict`-safe.
+  - If you pass `None` / blank / duplicate names to `add_task(...)`, a UUID-based name is generated and returned (with a collision check).
+  - `update_task(...)` / `remove_task(...)` accept a task name. When loading older checkpoints, legacy `task_id` values are accepted as aliases and remapped on load.
 - **Fuser**: runs all selected tasks, fuses their token-sets in an orderless way via a Perceiver-style latent array, then decodes to the output vector.
   - Per-task `weight` is applied as an attention log-bias (token-count-normalized) to reflect view importance without imposing any ordering.
-  - `forward_stream` supports a single temporal stream state (Tensor for `stream_task_id`) or a dict mapping `task_id -> state` for multiple temporal tasks.
+  - `forward_stream` supports a single temporal stream state (`Tensor` for `stream_task_name`) or a dict mapping `task_name -> state` for multiple temporal tasks.
 - **Collector**: the temporal controller head for the model instance.
 
 ## Installation

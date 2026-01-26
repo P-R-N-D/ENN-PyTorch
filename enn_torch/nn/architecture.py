@@ -683,13 +683,13 @@ class Fuser(nn.Module):
         self._user_submodels: dict[str, nn.Module] = {}
 
         self._task_meta: dict[str, dict[str, Any]] = {}
-        self._task_name_to_id: dict[str, str] = {}
+        self._legacy_task_id_to_name: dict[str, str] = {}
 
-        raw_stream = getattr(config, "stream_task_id", None)
+        raw_stream = getattr(config, "stream_task_name", None)
         if raw_stream is None:
-            raw_stream = getattr(config, "stream_task_name", None)
-        self.stream_task_id: str = str(raw_stream).strip() if raw_stream else ""
-        self.stream_task_name: str = self.stream_task_id
+            raw_stream = getattr(config, "stream_task_id", None)
+        self.stream_task_name: str = str(raw_stream).strip() if raw_stream else ""
+        self.stream_task_id: str = self.stream_task_name
 
         if tasks is None:
             self._init_default_tasks(config)
@@ -756,317 +756,344 @@ class Fuser(nn.Module):
             )
 
     def _resolve_stream_task_id(self: Self) -> None:
-        def _normalize_stream_ref(value: object) -> str:
-            raw = str(value or "")
-            return raw.replace("\r", "").replace("\n", "").strip()
+        preferred = self._normalize_task_name(getattr(self, "stream_task_name", ""))
+        if not preferred:
+            preferred = self._normalize_task_name(getattr(self, "stream_task_id", ""))
 
-        sid = _normalize_stream_ref(getattr(self, "stream_task_id", ""))
-        name = _normalize_stream_ref(getattr(self, "stream_task_name", ""))
-        chosen = ""
-        for raw in (sid, name):
-            if not raw:
-                continue
+        chosen: Optional[str] = None
+        if preferred:
             try:
-                resolved = self.resolve_task_id(raw)
+                candidate = self.resolve_task_name(preferred)
             except KeyError:
-                continue
-            tmpl = self.tasks[resolved] if resolved in self.tasks else None
-            if isinstance(tmpl, Template) and str(getattr(tmpl, "mode", "")) == "temporal":
-                chosen = resolved
-                break
+                candidate = None
+            if candidate is not None and candidate in self.tasks:
+                if getattr(self.tasks[candidate], "mode", "") == "temporal":
+                    chosen = candidate
 
-        if not chosen:
-            temporal_ids = [
-                str(k)
-                for k, t in self.tasks.items()
-                if isinstance(t, Template) and str(getattr(t, "mode", "")) == "temporal"
-            ]
-            if temporal_ids:
-                chosen = sorted(temporal_ids)[0]
+        if chosen is None:
+            for k, t in self.tasks.items():
+                if getattr(t, "mode", "") == "temporal":
+                    chosen = k
+                    break
 
-        self.stream_task_id = chosen
-        self.stream_task_name = chosen
+        if chosen is None:
+            for fallback in ("temporal", "stream"):
+                if fallback in self.tasks:
+                    chosen = fallback
+                    break
+
+        if chosen is None:
+            chosen = next(iter(self.tasks.keys()), "")
+
+        self.stream_task_name = str(chosen or "")
+        self.stream_task_id = self.stream_task_name
 
         cfg = getattr(self, "cfg", None) or getattr(self, "__enn_instance_config__", None)
         if cfg is not None:
             with contextlib.suppress(Exception):
-                setattr(cfg, "stream_task_id", chosen if chosen else None)
+                setattr(cfg, "stream_task_name", self.stream_task_name or "")
             with contextlib.suppress(Exception):
-                setattr(cfg, "stream_task_name", chosen if chosen else "")
+                setattr(cfg, "stream_task_id", self.stream_task_name or None)
 
-    def get_task_name(self: Self, task_id: str) -> str:
-        meta = self._task_meta.get(str(task_id))
-        if isinstance(meta, dict):
-            nm = str(meta.get("name") or "").strip()
-            if nm:
-                return nm
-        return str(task_id)
+    def _normalize_task_name(self: Self, value: object) -> str:
+        s = "" if value is None else str(value)
+        s = s.replace("\r", "").replace("\n", "").strip()
+        if "." in s:
+            s = s.replace(".", "_")
+        return s
 
-    def resolve_task_id(self: Self, task_id_or_name: str) -> str:
-        raw = str(task_id_or_name)
-        key = raw.strip()
-        if key.startswith("name:"):
-            nm = key[len("name:") :].strip()
-            hit = self._task_name_to_id.get(nm)
-            if hit is not None and str(hit) in self.tasks:
-                return str(hit)
-            raise KeyError(f"Unknown task name: {nm!r}")
-
-        if key.startswith("id:"):
-            tid = key[len("id:") :].strip()
-            if tid in self.tasks:
-                return tid
-            raise KeyError(f"Unknown task id: {tid!r}")
-
-        hit = self._task_name_to_id.get(key)
-        if hit is not None and str(hit) in self.tasks:
-            return str(hit)
-        if key in self.tasks:
-            return key
-        raise KeyError(f"Unknown task id/name: {task_id_or_name!r}")
-
-    def list_tasks(self: Self, *, by: str = "name") -> list[str]:
-        by_l = str(by or "name").strip().lower()
-        if by_l in {"id", "task_id"}:
-            return list(self.tasks.keys())
-        if by_l in {"name", "alias"}:
-            return [self.get_task_name(k) for k in self.tasks.keys()]
-        raise ValueError(f"Invalid list_tasks(by=...): {by!r} (expected 'id' or 'name')")
-
-    def task_specs(self: Self) -> list[dict[str, Any]]:
-        specs: list[dict[str, Any]] = []
-        for task_id, tmpl in self.tasks.items():
-            if not isinstance(tmpl, Template):
+    def _generate_unique_uuid_name(self: Self, *, exclude: Optional[str] = None) -> str:
+        exclude = str(exclude) if exclude is not None else None
+        while True:
+            candidate = uuid.uuid4().hex
+            if exclude is not None and candidate == exclude:
                 continue
-            meta = self._task_meta.get(str(task_id), {})
-            name = str(meta.get("name") or "").strip() or str(task_id)
-            desc = str(meta.get("description") or "")
-            tags = meta.get("tags") or []
-            if not isinstance(tags, list):
-                tags = list(tags) if isinstance(tags, (tuple, set)) else []
+            if candidate not in self.tasks:
+                return candidate
+
+    def _ensure_unique_task_name(self: Self, preferred: object, *, exclude: Optional[str] = None) -> str:
+        candidate = self._normalize_task_name(preferred)
+        if not candidate:
+            return self._generate_unique_uuid_name(exclude=exclude)
+        if exclude is not None and candidate == exclude:
+            return candidate
+        if candidate in self.tasks:
+            return self._generate_unique_uuid_name(exclude=exclude)
+        return candidate
+
+    @property
+    def task_names(self: Self) -> list[str]:
+        return list(self.tasks.keys())
+
+    def get_task_name(self: Self, task_spec: str) -> str:
+        return self.resolve_task_name(task_spec)
+
+    def resolve_task_name(self: Self, task_spec: str) -> str:
+        raw = self._normalize_task_name(task_spec)
+        lowered = raw.lower()
+        if lowered.startswith("name:"):
+            raw = self._normalize_task_name(raw.split(":", 1)[1])
+        elif lowered.startswith("id:"):
+            raw = self._normalize_task_name(raw.split(":", 1)[1])
+
+        if raw in self.tasks:
+            return raw
+
+        mapped = self._legacy_task_id_to_name.get(raw)
+        if mapped and mapped in self.tasks:
+            return mapped
+
+        raise KeyError(f"Unknown task '{task_spec}'. Known tasks: {sorted(self.tasks.keys())}")
+
+    def resolve_task_id(self: Self, task_spec: str) -> str:
+        return self.resolve_task_name(task_spec)
+
+    def list_tasks(self: Self, by: str = "name") -> list[str]:
+        return sorted(self.tasks.keys())
+
+    def task_specs(self: Self) -> list[Dict[str, Any]]:
+        specs: list[Dict[str, Any]] = []
+        for name, t in self.tasks.items():
+            meta = self._task_meta.get(name, {})
             specs.append(
                 {
-                    "task_id": str(task_id),
                     "name": name,
-                    "description": desc,
-                    "tags": [str(t) for t in tags],
-                    "mode": str(getattr(tmpl, "mode", "spatial")),
-                    "tokens": int(getattr(tmpl, "tokens", 1)),
-                    "depth": int(getattr(tmpl, "depth", 1)),
-                    "weight": float(getattr(tmpl, "weight", torch.tensor(1.0)).item()),
-                    "eps": float(getattr(tmpl, "eps", torch.tensor(1e-6)).item()),
-                    "has_submodel": bool(str(task_id) in self._user_submodels),
+                    "description": str(meta.get("description") or ""),
+                    "tags": list(meta.get("tags") or []),
+                    "mode": str(getattr(t, "mode", "spatial")),
+                    "tokens": int(getattr(t, "tokens", 1)),
+                    "depth": int(getattr(t, "depth", 1)),
+                    "weight": float(getattr(t, "weight", torch.as_tensor(1.0)).detach().cpu().item()),
+                    "eps": float(getattr(t, "eps", torch.as_tensor(1e-6)).detach().cpu().item()),
+                    "has_submodel": bool(name in self._user_submodels),
                 }
             )
         return specs
 
-    def rebuild_tasks_from_specs(
-        self: Self, specs: Sequence[Mapping[str, Any]]
-    ) -> None:
-        self._user_submodels = {}
+    def rebuild_tasks_from_specs(self: Self, specs: Sequence[Dict[str, Any]]) -> None:
         self.tasks = nn.ModuleDict()
         self._task_meta = {}
-        self._task_name_to_id = {}
+        self._user_submodels = {}
+        self._legacy_task_id_to_name = {}
 
-        for s in specs:
-            sd = dict(s)
-            task_id = sd.get("task_id") or sd.get("id")
-            name = sd.get("name") or sd.get("alias") or sd.get("display_name")
-            if task_id is None:
-                task_id = name
-                name = None
-            if task_id is None:
-                raise ValueError(f"Invalid task spec missing task_id/name: {sd!r}")
-
-            mode = str(sd.get("mode", "spatial"))
-            tokens = sd.get("tokens", None)
-            depth = sd.get("depth", None)
-            weight = float(sd.get("weight", 1.0))
-            eps = float(sd.get("eps", 1e-6))
-            description = str(sd.get("description", ""))
-            tags = sd.get("tags", None)
-
-            self.add_task(
-                name=str(name) if name is not None else None,
-                task_id=str(task_id),
-                description=description,
-                tags=tags,
-                mode=mode,
-                tokens=int(tokens) if tokens is not None else None,
-                depth=int(depth) if depth is not None else None,
-                weight=weight,
-                eps=eps,
-                submodel=None,
-            )
-        if not self.tasks:
+        if not specs:
             self._init_default_tasks()
+            self._resolve_stream_task_id()
+            return
 
-    def _generate_task_id(self: Self) -> str:
-        for _ in range(100):
-            cand = "task_" + uuid.uuid4().hex[:12]
-            if cand not in self.tasks and cand not in self._task_name_to_id:
-                return cand
-        cand = "task_" + uuid.uuid4().hex
-        while cand in self.tasks or cand in self._task_name_to_id:
-            cand = "task_" + uuid.uuid4().hex
-        return cand
+        for spec in specs:
+            if not isinstance(spec, dict):
+                continue
+
+            legacy_ids: list[str] = []
+            for k in ("task_id", "legacy_task_id", "id"):
+                v = spec.get(k)
+                if v is not None and str(v).strip():
+                    legacy_ids.append(str(v).strip())
+
+            preferred_name = spec.get("name")
+            if preferred_name is None or not str(preferred_name).strip():
+                preferred_name = legacy_ids[0] if legacy_ids else None
+
+            final_name = self.add_task(
+                preferred_name,
+                mode=spec.get("mode", "spatial"),
+                description=spec.get("description"),
+                tags=spec.get("tags"),
+                weight=spec.get("weight", 1.0),
+                eps=spec.get("eps", 1e-6),
+                submodel=None,
+                tokens=spec.get("tokens"),
+                depth=spec.get("depth"),
+            )
+
+            for lid in legacy_ids:
+                lid_norm = self._normalize_task_name(lid)
+                if lid_norm and lid_norm != final_name:
+                    self._legacy_task_id_to_name[lid_norm] = final_name
+
+        self._resolve_stream_task_id()
+
+    def remap_legacy_task_ids_in_state_dict(
+        self: Self,
+        state_dict: Mapping[str, torch.Tensor],
+    ) -> Mapping[str, torch.Tensor]:
+        if not self._legacy_task_id_to_name:
+            return state_dict
+
+        changed = False
+        remapped: Dict[str, torch.Tensor] = {}
+        for k, v in state_dict.items():
+            parts = k.split(".")
+            for i in range(len(parts) - 1):
+                if parts[i] == "tasks":
+                    legacy = parts[i + 1]
+                    mapped = self._legacy_task_id_to_name.get(legacy)
+                    if mapped:
+                        parts[i + 1] = mapped
+            new_k = ".".join(parts)
+            if new_k != k:
+                changed = True
+            remapped[new_k] = v
+
+        return remapped if changed else state_dict
 
     def add_task(
         self: Self,
         name: Optional[str] = None,
         *,
-        task_id: Optional[str] = None,
-        description: str = "",
+        mode: str = "spatial",
+        description: Optional[str] = None,
         tags: Optional[Sequence[str]] = None,
-        mode: str,
-        tokens: Optional[int] = None,
-        depth: Optional[int] = None,
         weight: float = 1.0,
         eps: float = 1e-6,
         submodel: Optional[nn.Module] = None,
+        tokens: Optional[int] = None,
+        depth: Optional[int] = None,
+        task_id: Optional[str] = None,
     ) -> str:
-        mode_str = str(mode)
-        if mode_str not in {"spatial", "temporal"}:
-            raise ValueError(f"Invalid task mode: {mode!r} (expected 'spatial'|'temporal')")
+        mode = Template._coerce_mode(mode)
 
-        if task_id is None or str(task_id).strip() == "":
-            task_id = self._generate_task_id()
-        task_id = str(task_id)
-        if task_id in self.tasks:
-            raise KeyError(f"Task id already exists: {task_id}")
+        preferred = name
+        if preferred is None or not str(preferred).strip():
+            preferred = task_id
 
-        name_s = str(name or "").strip()
-        if not name_s:
-            name_s = task_id
-        if name_s in self._task_name_to_id:
-            raise KeyError(f"Task name already exists: {name_s}")
+        nm = self._ensure_unique_task_name(preferred)
 
-        tk = int(tokens) if tokens is not None else (
-            self.temporal_tokens if mode_str == "temporal" else self.spatial_tokens
-        )
-        dp = int(depth) if depth is not None else int(
-            getattr(self.cfg, "temporal_depth", 1)
-            if mode_str == "temporal"
-            else getattr(self.cfg, "spatial_depth", 1)
-        )
+        if tokens is None:
+            tokens = int(self.spatial_tokens if mode == "spatial" else self.temporal_tokens)
+        if depth is None:
+            cfg = self.cfg
+            depth = int(getattr(cfg, "spatial_depth", 1) if mode == "spatial" else getattr(cfg, "temporal_depth", 1))
 
         tmpl = Template(
             self.in_dim,
-            tk,
-            int(self.d_model),
-            int(self.nhead),
-            dp,
-            mode=mode_str,
-            mlp_ratio=float(getattr(self.cfg, "mlp_ratio", 4.0)),
-            dropout=float(getattr(self.cfg, "dropout", 0.0)),
-            drop_path=float(getattr(self.cfg, "drop_path", 0.0)),
-            norm_type=str(getattr(self.cfg, "normalization_method", "layernorm")),
-            weight=float(weight),
-            eps=float(eps),
+            int(tokens),
+            self.d_model,
+            self.nhead,
+            int(depth),
+            mode=mode,
+            mlp_ratio=self.mlp_ratio,
+            dropout=self.dropout,
+            drop_path=self.drop_path,
+            norm_type=self.norm_type,
+            weight=weight,
+            eps=eps,
+            ckpt_enabled=getattr(self.cfg, "ckpt_enabled", True),
+            ckpt_min_bytes=getattr(self.cfg, "ckpt_min_bytes", 64 * 1024 * 1024),
         )
 
-        tag_list: list[str]
-        if tags is None:
-            tag_list = []
-        elif isinstance(tags, str):
-            tag_list = [str(tags)]
-        else:
-            tag_list = [str(t) for t in list(tags)]
+        tags_list: list[str] = []
+        if tags is not None:
+            tags_iter = (tags,) if isinstance(tags, str) else tags
+            for t in tags_iter:
+                s = str(t).strip()
+                if s and s not in tags_list:
+                    tags_list.append(s)
 
-        self.tasks[task_id] = tmpl
-        self._task_meta[task_id] = {
-            "name": name_s,
-            "description": str(description or ""),
-            "tags": tag_list,
+        self.tasks[nm] = tmpl
+        self._task_meta[nm] = {
+            "description": str(description) if description is not None else "",
+            "tags": tags_list,
         }
-        self._task_name_to_id[name_s] = task_id
 
         if submodel is not None:
-            self._user_submodels[str(task_id)] = submodel
-            torch_compiler_disable(
-                submodel,
-                attr="forward",
-                reason="BYOM submodel forward is not part of backbone graph",
-                recursive=True,
-            )
+            self._user_submodels[nm] = submodel
         self._resolve_stream_task_id()
-        return str(task_id)
+        return nm
 
     def update_task(
         self: Self,
-        task_id: str,
+        task_name: str,
         *,
+        mode: object = _META_UNSET,
         name: object = _META_UNSET,
         description: object = _META_UNSET,
         tags: object = _META_UNSET,
-        mode: Optional[str] = None,
-        weight: Optional[float] = None,
-        eps: Optional[float] = None,
         submodel: object = _SUBMODEL_UNSET,
-    ) -> None:
-        tid = self.resolve_task_id(task_id)
-        tmpl = cast(Template, self.tasks[str(tid)])
+        weight: object = _META_UNSET,
+        eps: object = _META_UNSET,
+    ) -> str:
+        key = self.resolve_task_name(task_name)
 
-        if mode is not None:
+        tmpl = self.tasks[key]
+        meta = self._task_meta.get(key)
+        if meta is None:
+            meta = {"description": "", "tags": []}
+            self._task_meta[key] = meta
+
+        if mode is not _META_UNSET:
             tmpl.set_mode(str(mode))
-        if weight is not None:
+
+        if weight is not _META_UNSET:
             tmpl.set_weight(float(weight))
-        if eps is not None:
+
+        if eps is not _META_UNSET:
             tmpl.set_eps(float(eps))
 
-        meta = self._task_meta.setdefault(str(tid), {"name": str(tid), "description": "", "tags": []})
-        old_name = str(meta.get("name") or "").strip() or str(tid)
-
-        if name is not _META_UNSET:
-            new_name = str(name or "").strip()
-            if not new_name:
-                new_name = str(tid)
-            if new_name != old_name:
-                hit = self._task_name_to_id.get(new_name)
-                if hit is not None and str(hit) != str(tid):
-                    raise KeyError(f"Task name already exists: {new_name}")
-                self._task_name_to_id.pop(old_name, None)
-                self._task_name_to_id[new_name] = str(tid)
-                meta["name"] = new_name
-
         if description is not _META_UNSET:
-            meta["description"] = str(description or "")
+            meta["description"] = "" if description is None else str(description)
 
         if tags is not _META_UNSET:
-            if tags is None:
-                meta["tags"] = []
-            else:
-                if isinstance(tags, str):
-                    meta["tags"] = [tags]
-                else:
-                    meta["tags"] = [str(t) for t in list(tags)]
+            tags_list: list[str] = []
+            if tags is not None:
+                tags_iter = (tags,) if isinstance(tags, str) else tags
+                for t in tags_iter:
+                    s = str(t).strip()
+                    if s and s not in tags_list:
+                        tags_list.append(s)
+            meta["tags"] = tags_list
 
         if submodel is not _SUBMODEL_UNSET:
             if submodel is None:
-                self._user_submodels.pop(str(tid), None)
+                self._user_submodels.pop(key, None)
             else:
-                assert isinstance(submodel, nn.Module)
-                self._user_submodels[str(tid)] = submodel
-                torch_compiler_disable(
-                    submodel,
-                    attr="forward",
-                    reason="BYOM submodel forward is not part of backbone graph",
-                    recursive=True,
-                )
+                self._user_submodels[key] = submodel
+
+        if name is not _META_UNSET:
+            new_key = self._ensure_unique_task_name(name, exclude=key)
+            if new_key != key:
+                mod = self.tasks[key]
+                del self.tasks[key]
+                self.tasks[new_key] = mod
+                self._task_meta[new_key] = self._task_meta.pop(key, {})
+                if key in self._user_submodels:
+                    self._user_submodels[new_key] = self._user_submodels.pop(key)
+                for lid, mapped in list(self._legacy_task_id_to_name.items()):
+                    if mapped == key:
+                        self._legacy_task_id_to_name[lid] = new_key
+                if getattr(self, "stream_task_name", "") == key:
+                    self.stream_task_name = new_key
+                if getattr(self, "stream_task_id", "") == key:
+                    self.stream_task_id = new_key
+                key = new_key
 
         self._resolve_stream_task_id()
+        return key
 
-    def remove_task(self: Self, task_id: str) -> None:
-        tid = self.resolve_task_id(task_id)
-        self._user_submodels.pop(str(tid), None)
-        meta = self._task_meta.pop(str(tid), None)
-        if isinstance(meta, dict):
-            nm = str(meta.get("name") or "").strip()
-            if nm:
-                self._task_name_to_id.pop(nm, None)
-        del self.tasks[str(tid)]
-        if not self.tasks:
-            self._init_default_tasks()
+    def remove_task(self: Self, task_name: str, *, strict: bool = False) -> None:
+        if strict and not self.tasks:
+            raise KeyError("No tasks are configured")
+
+        key = self.resolve_task_name(task_name)
+        if strict and key not in self.tasks:
+            raise KeyError(f"Unknown task '{task_name}'.")
+
+        if key in self.tasks:
+            del self.tasks[key]
+
+        self._task_meta.pop(key, None)
+        self._user_submodels.pop(key, None)
+
+        for lid, mapped in list(self._legacy_task_id_to_name.items()):
+            if mapped == key:
+                del self._legacy_task_id_to_name[lid]
+
+        if getattr(self, "stream_task_name", "") == key:
+            self.stream_task_name = ""
+        if getattr(self, "stream_task_id", "") == key:
+            self.stream_task_id = ""
+
         self._resolve_stream_task_id()
 
     def _select_tasks_for_modeling_type(self: Self) -> list[str]:
@@ -3129,6 +3156,15 @@ class Model(nn.Module):
                     _reshard()
 
 
+    def load_state_dict(self, state_dict, *args, **kwargs):
+        try:
+            remap = getattr(self.fuser, "remap_legacy_task_ids_in_state_dict", None)
+            if callable(remap):
+                state_dict = remap(state_dict)
+        except Exception:
+            pass
+        return super().load_state_dict(state_dict, *args, **kwargs)
+
     def list_tasks(self: Self, *, by: str = "name") -> list[str]:
         return self.fuser.list_tasks(by=by)
 
@@ -3150,54 +3186,54 @@ class Model(nn.Module):
         self: Self,
         name: Optional[str] = None,
         *,
-        task_id: Optional[str] = None,
-        description: str = "",
+        mode: str = "spatial",
+        description: Optional[str] = None,
         tags: Optional[Sequence[str]] = None,
-        mode: str,
-        tokens: Optional[int] = None,
-        depth: Optional[int] = None,
         weight: float = 1.0,
         eps: float = 1e-6,
         submodel: Optional[nn.Module] = None,
+        tokens: Optional[int] = None,
+        depth: Optional[int] = None,
+        task_id: Optional[str] = None,
     ) -> str:
         return self.fuser.add_task(
             name,
-            task_id=task_id,
+            mode=mode,
             description=description,
             tags=tags,
-            mode=mode,
             tokens=tokens,
             depth=depth,
             weight=weight,
             eps=eps,
             submodel=submodel,
+            task_id=task_id,
         )
 
     def update_task(
         self: Self,
-        task_id: str,
+        task_name: str,
         *,
+        mode: object = _META_UNSET,
         name: object = _META_UNSET,
         description: object = _META_UNSET,
         tags: object = _META_UNSET,
-        mode: Optional[str] = None,
-        weight: Optional[float] = None,
-        eps: Optional[float] = None,
-        submodel: object = _SUBMODEL_UNSET,
-    ) -> None:
-        self.fuser.update_task(
-            task_id,
+        submodel: Union[torch.nn.Module, None, object] = _SUBMODEL_UNSET,
+        weight: object = _META_UNSET,
+        eps: object = _META_UNSET,
+    ) -> str:
+        return self.fuser.update_task(
+            task_name,
+            mode=mode,
             name=name,
             description=description,
             tags=tags,
-            mode=mode,
+            submodel=submodel,
             weight=weight,
             eps=eps,
-            submodel=submodel,
         )
 
-    def remove_task(self: Self, task_id: str) -> None:
-        self.fuser.remove_task(task_id)
+    def remove_task(self: Self, task_name: str, *, strict: bool = False) -> None:
+        self.fuser.remove_task(task_name, strict=strict)
 
     def predict(
         self: Self,
