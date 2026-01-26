@@ -1,6 +1,6 @@
 # ENN-PyTorch
 
-Elastic Neural Networks (ENN), modular neural networks for high-performance computing (HPC) — flexible and efficient by design, adaptive and stable at runtime, implemented in PyTorch. This features pragmatic utilities for data pipelines, training, export, and system tuning. The package is structured to keep the *model code* small while providing a clean façade over configuration, I/O, distributed runtime, and export helpers.
+Elastic Neural Networks (ENN), MLaaS (Machine Learning as a Service) framework for high-performance computing (HPC) — flexible and efficient by design, adaptive and stable at runtime, implemented in PyTorch. This features pragmatic utilities for data pipelines, training, export, and system tuning. The package is structured to keep the *model code* small while providing a clean façade over configuration, I/O, distributed runtime, and export helpers.
 
 This repository also includes a worked example notebook (`notebook.ipynb`) and a sample data (`raw_data.xlsx`) demonstrating a tabular‑to‑grid regression workflow.
 
