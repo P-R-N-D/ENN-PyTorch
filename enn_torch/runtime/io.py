@@ -51,6 +51,14 @@ _LOGGER = logging.getLogger(__name__)
 _OPENZL_DEFAULT_BUILD_LOGGED = False
 _OPENZL_FALLBACK_LOGGED = False
 
+def _is_openzl_temporarily_unavailable(exc: BaseException) -> bool:
+    msg = str(exc)
+    return (
+        "OpenZL error code: 81" in msg
+        or "Temporary OpenZL library limitation" in msg
+        or "temporary library limitation" in msg.lower()
+    )
+
 def _register_safe_globals() -> None:
     with contextlib.suppress(Exception):
         if add_safe_globals:
@@ -824,12 +832,18 @@ def _openzl_decompress_payload(
     dtype_bufs: list[torch.Tensor] = []
     for i, dt_name in enumerate(dtype_names):
         target = _torch_dtype_from_str(dt_name)
-        raw = outs[i + 1].content.as_pytensor()
-        if getattr(raw, "dtype", None) != target:
+        out = outs[i + 1].content
+        raw: torch.Tensor | None = None
+        try:
+            raw = out.as_pytensor()
+        except Exception:
+            raw = None
+
+        if raw is not None and getattr(raw, "dtype", None) != target:
             with contextlib.suppress(Exception):
                 raw = raw.view(target)
-        if getattr(raw, "dtype", None) != target:
-            b = outs[i + 1].content.as_bytes()
+        if raw is None or getattr(raw, "dtype", None) != target:
+            b = out.as_bytes()
             raw = torch.frombuffer(b, dtype=target)
         dtype_bufs.append(raw.reshape(-1))
 
@@ -1030,27 +1044,70 @@ class Builder:
                     with contextlib.suppress(Exception):
                         payload["optimizer_state_dict"] = optimizer.state_dict()
 
-                _openzl_save_checkpoint(
-                    p,
-                    payload,
-                    openzl_level=opts.pop("openzl_level", None),
-                    openzl_format_version=opts.pop("openzl_format_version", None),
-                    openzl_min_stream_size=opts.pop("openzl_min_stream_size", None),
-                    openzl_content_checksum=opts.pop("openzl_content_checksum", None),
-                    openzl_compressed_checksum=opts.pop(
-                        "openzl_compressed_checksum", None
-                    ),
-                    openzl_permissive=opts.pop("openzl_permissive", None),
-                    openzl_pack_by_dtype=bool(opts.pop("openzl_pack_by_dtype", True)),
-                )
-                meta = _make_meta()
-                meta["format"] = "openzl-ckpt-v1"
-                write_json(p.with_name(p.name + ".json"), meta, indent=2)
-                with contextlib.suppress(Exception):
-                    legacy = p.with_suffix(".json")
-                    if legacy != p.with_name(p.name + ".json"):
-                        write_json(legacy, meta, indent=2)
-                return p
+                try:
+                    _openzl_save_checkpoint(
+                        p,
+                        payload,
+                        openzl_level=opts.pop("openzl_level", None),
+                        openzl_format_version=opts.pop("openzl_format_version", None),
+                        openzl_min_stream_size=opts.pop("openzl_min_stream_size", None),
+                        openzl_content_checksum=opts.pop("openzl_content_checksum", None),
+                        openzl_compressed_checksum=opts.pop(
+                            "openzl_compressed_checksum", None
+                        ),
+                        openzl_permissive=opts.pop("openzl_permissive", None),
+                        openzl_pack_by_dtype=bool(
+                            opts.pop("openzl_pack_by_dtype", True)
+                        ),
+                    )
+                    meta = _make_meta()
+                    meta["format"] = "openzl-ckpt-v1"
+                    write_json(p.with_name(p.name + ".json"), meta, indent=2)
+                    with contextlib.suppress(Exception):
+                        legacy = p.with_suffix(".json")
+                        if legacy != p.with_name(p.name + ".json"):
+                            write_json(legacy, meta, indent=2)
+                    return p
+                except Exception as exc:
+                    if env_bool("ENN_OPENZL_STRICT", False) or env_bool(
+                        "ENN_OPENZL_NO_TORCH_FALLBACK", False
+                    ):
+                        raise
+                    if env_bool("ENN_OPENZL_LOG_FALLBACK", True):
+                        _LOGGER.warning(
+                            "OpenZL checkpoint write failed; falling back to torch.save (.pt). Error: %s",
+                            exc,
+                        )
+                    with contextlib.suppress(Exception):
+                        if (
+                            _is_openzl_temporarily_unavailable(exc)
+                            and "ENN_CKPT_EXT" not in os.environ
+                        ):
+                            os.environ["ENN_CKPT_EXT"] = ".pt"
+
+                    pt_path = p.with_suffix(".pt")
+                    pt_payload = {
+                        **_make_meta(),
+                        "state_dict": sd,
+                        "format": "torch-ckpt-v1",
+                    }
+                    if optimizer is not None:
+                        with contextlib.suppress(Exception):
+                            pt_payload[
+                                "optimizer_state_dict"
+                            ] = optimizer.state_dict()
+                    save_temp(pt_path, pt_payload, **opts)
+
+                    meta = _make_meta()
+                    meta["format"] = "torch-ckpt-v1"
+                    write_json(
+                        pt_path.with_name(pt_path.name + ".json"), meta, indent=2
+                    )
+                    with contextlib.suppress(Exception):
+                        legacy = pt_path.with_suffix(".json")
+                        if legacy != pt_path.with_name(pt_path.name + ".json"):
+                            write_json(legacy, meta, indent=2)
+                    return pt_path
             if p.suffix == ".safetensors":
                 is_required("safetensors", "pip install safetensors")
                 from safetensors.torch import save_file as save_tensors
