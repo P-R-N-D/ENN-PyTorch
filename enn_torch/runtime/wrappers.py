@@ -466,6 +466,11 @@ def _torch_export_program(
     strict: bool = True,
     tag: str = "torch.export",
 ) -> object:
+    with contextlib.suppress(Exception):
+        import torch._functorch.predispatch as _pd
+
+        _pd.lazy_load_decompositions()
+
     if isinstance(sample, torch.Tensor) and sample.ndim == 1:
         sample = sample.unsqueeze(0)
     if dynamic_batch and isinstance(sample, torch.Tensor) and sample.ndim >= 1:
@@ -522,6 +527,35 @@ def _torch_export_program(
             call_kw["strict"] = False
             return _call(**call_kw)
         raise
+
+
+def _sanitize_exported_program(exported: object) -> object:
+    gm = getattr(exported, "graph_module", None)
+    g = getattr(gm, "graph", None) if gm is not None else None
+    if g is None:
+        return exported
+
+    with contextlib.suppress(Exception):
+        g.eliminate_dead_code()
+
+    for node in list(getattr(g, "nodes", ())):
+        try:
+            if node.op != "call_function":
+                continue
+            tgt = getattr(node, "target", None)
+            name = getattr(tgt, "__name__", "")
+            mod = getattr(tgt, "__module__", "")
+            if name == "lazy_load_decompositions" and "torch._functorch.predispatch" in mod:
+                if not getattr(node, "users", {}):
+                    g.erase_node(node)
+        except Exception:
+            continue
+
+    with contextlib.suppress(Exception):
+        g.lint()
+    with contextlib.suppress(Exception):
+        gm.recompile()
+    return exported
 
 
 def _in_console(cmd: object, desc: object, *, cwd: object = None) -> None:
@@ -998,6 +1032,7 @@ class TorchExport(Format):
 
             with _no_empty_tensor(serving_model):
                 exported = self._export_program(wrapper, sample, **kwargs)
+                exported = _sanitize_exported_program(exported)
 
             dst = Path(dst)
             dst.parent.mkdir(parents=True, exist_ok=True)

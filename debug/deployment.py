@@ -118,9 +118,15 @@ def _run_isolated_export(
     env.setdefault("OPENBLAS_NUM_THREADS", "1")
     env.setdefault("NUMEXPR_NUM_THREADS", "1")
     env.setdefault("TORCH_NUM_THREADS", "1")
+    timeout_s = 120
+    with contextlib.suppress(Exception):
+        timeout_s = int(
+            os.environ.get("ENN_EXPORT_SUBPROCESS_TIMEOUT", str(timeout_s)).strip()
+            or str(timeout_s)
+        )
     try:
         p = subprocess.run(
-            cmd, capture_output=True, text=True, env=env, timeout=120
+            cmd, capture_output=True, text=True, env=env, timeout=timeout_s
         )
     except subprocess.TimeoutExpired as exc:
         return {
@@ -129,6 +135,15 @@ def _run_isolated_export(
             "stdout_tail": (exc.stdout or "")[-2000:],
             "stderr_tail": (exc.stderr or "")[-2000:],
         }
+    except Exception as exc:
+        if exc.__class__.__name__ == "SignalException":
+            return {
+                "status": "error",
+                "error": f"subprocess interrupted by signal ({exc})",
+                "stdout_tail": "",
+                "stderr_tail": "",
+            }
+        raise
     if p.returncode == 0:
 
         def _parse_last_json_line(text: str) -> dict[str, Any] | None:
@@ -168,6 +183,23 @@ def _ensure_state_shapes_for_scaler(
     if not isinstance(sd, dict):
         return
 
+    def _model_device(mod: torch.nn.Module) -> torch.device:
+        with contextlib.suppress(StopIteration):
+            return next(mod.parameters()).device
+        with contextlib.suppress(StopIteration):
+            return next(mod.buffers()).device
+        return torch.device("cpu")
+
+    def _alloc_replacement(
+        existing: torch.Tensor | None,
+        shape: torch.Size,
+        *,
+        fallback_mod: torch.nn.Module,
+    ) -> torch.Tensor:
+        if torch.is_tensor(existing):
+            return torch.empty(shape, device=existing.device, dtype=existing.dtype)
+        return torch.empty(shape, device=_model_device(fallback_mod), dtype=torch.float32)
+
     def _is_scaler_key(k: str) -> bool:
         return k.startswith("scaler.") or ".scaler." in k
 
@@ -197,7 +229,11 @@ def _ensure_state_shapes_for_scaler(
         if hasattr(mod, "_buffers") and name in getattr(mod, "_buffers", {}):
             buf = mod._buffers.get(name)
             if torch.is_tensor(buf) and tuple(buf.shape) != tuple(tgt.shape):
-                mod._buffers[name] = torch.empty_like(tgt)
+                mod._buffers[name] = _alloc_replacement(
+                    buf,
+                    tgt.shape,
+                    fallback_mod=mod,
+                )
                 setattr(mod, name, mod._buffers[name])
             continue
 
@@ -211,7 +247,12 @@ def _ensure_state_shapes_for_scaler(
                 and tuple(prm.shape) != tuple(tgt.shape)
             ):
                 mod._parameters[name] = torch.nn.Parameter(
-                    torch.empty_like(tgt), requires_grad=prm.requires_grad
+                    _alloc_replacement(
+                        prm,
+                        tgt.shape,
+                        fallback_mod=mod,
+                    ),
+                    requires_grad=prm.requires_grad,
                 )
                 setattr(mod, name, mod._parameters[name])
             continue

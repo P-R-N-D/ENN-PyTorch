@@ -250,7 +250,11 @@ class _LatentSelfBlock(nn.Module):
 
         y = self.norm1(x)
         qkv = self.qkv(y)
-        q, k, v = qkv.view(B, K, 3, self.nhead, self.head_dim).permute(2, 0, 3, 1, 4)
+        q, k, v = (
+            qkv.view(B, K, 3, self.nhead, self.head_dim)
+            .permute(2, 0, 3, 1, 4)
+            .unbind(0)
+        )
 
         attn_out = self.attn(
             q,

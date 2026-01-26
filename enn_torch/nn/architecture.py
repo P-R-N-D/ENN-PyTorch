@@ -698,6 +698,73 @@ class Fuser(nn.Module):
 
         self._resolve_stream_task_id()
 
+        self._compile_cudagraphs = bool(getattr(config, "compile_cudagraphs", False))
+        self._decode_graph: nn.Module | None = None
+        self._backbone_graph: nn.Module | None = None
+        try:
+            from ..runtime.wrappers import CallArguments, GraphSequential
+
+            class _PackPerceiverArgs(nn.Module):
+                def forward(
+                    self,
+                    all_tokens: torch.Tensor,
+                    attn_bias: Optional[torch.Tensor] = None,
+                ) -> CallArguments:
+                    return CallArguments(
+                        args=(all_tokens,), kwargs={"attn_bias": attn_bias}
+                    )
+
+            class _PackFusedAndDecode(nn.Module):
+                def __init__(self, decode_mod: nn.Module) -> None:
+                    super().__init__()
+                    self.decode = decode_mod
+
+                def forward(
+                    self, fused_tokens: torch.Tensor
+                ) -> tuple[torch.Tensor, torch.Tensor]:
+                    ctx = cast(torch.Tensor, self.decode(fused_tokens))
+                    return fused_tokens, ctx
+
+            device = next(self.parameters()).device
+
+            self._decode_graph = (
+                GraphSequential(
+                    steps=[
+                        GraphSequential.path("norm"),
+                        GraphSequential.mean(dim=1),
+                        GraphSequential.path("head"),
+                    ],
+                    out_shape=self.out_shape,
+                    name="decode",
+                    root=self,
+                )
+                .to(device)
+                .bind()
+            )
+
+            self._backbone_graph = (
+                GraphSequential(
+                    steps=[
+                        GraphSequential.cudagraph_begin(),
+                        GraphSequential.own(_PackPerceiverArgs(), name="pack_args"),
+                        GraphSequential.path("perceiver"),
+                        GraphSequential.break_graph(),
+                        GraphSequential.own(
+                            _PackFusedAndDecode(self._decode_graph),
+                            name="pack_decode",
+                        ),
+                        GraphSequential.cudagraph_end(),
+                    ],
+                    name="backbone",
+                    root=self,
+                )
+                .to(device)
+                .bind()
+            )
+        except Exception:
+            self._decode_graph = None
+            self._backbone_graph = None
+
 
 
     def __getstate__(self: Self) -> dict[str, object]:
@@ -1116,24 +1183,40 @@ class Fuser(nn.Module):
     ) -> Optional[torch.Tensor]:
         if len(token_sets) <= 1:
             return None
-        ws = []
-        eps = []
-        counts = []
+        exporting = False
+        with contextlib.suppress(Exception):
+            exporting = bool(is_export_or_trace())
+
+        w_list: list[torch.Tensor] = []
+        e_list: list[torch.Tensor] = []
+        counts: list[int] = []
         for n, t in zip(names, token_sets):
             tmpl = self.tasks[n]
-            wv = float(getattr(tmpl, "weight", torch.tensor(1.0)).item())
-            ev = float(getattr(tmpl, "eps", torch.tensor(1e-6)).item())
-            ws.append(wv)
-            eps.append(ev)
-            counts.append(int(t.size(1)))
+            if not isinstance(tmpl, nn.Module):
+                raise TypeError(f"Task '{n}' is not an nn.Module")
+
+            w = getattr(tmpl, "weight", None)
+            e = getattr(tmpl, "eps", None)
+            if not isinstance(w, torch.Tensor):
+                w = torch.as_tensor(1.0, dtype=torch.float32, device=device)
+            if not isinstance(e, torch.Tensor):
+                e = torch.as_tensor(1e-6, dtype=torch.float32, device=device)
+            w_list.append(w.to(device=device, dtype=torch.float32).reshape(()))
+            e_list.append(e.to(device=device, dtype=torch.float32).reshape(()))
+
+            if exporting:
+                cnt = int(getattr(tmpl, "tokens", int(t.size(1))))
+            else:
+                cnt = int(t.size(1))
+            counts.append(cnt)
         if any(c <= 0 for c in counts):
             return None
-        w_t = torch.as_tensor(ws, dtype=torch.float32, device=device)
-        e_t = torch.as_tensor(eps, dtype=torch.float32, device=device)
-        n_t = torch.as_tensor(counts, dtype=torch.float32, device=device)
+        w_t = torch.stack(w_list, dim=0)
+        e_t = torch.stack(e_list, dim=0)
+        n_t = torch.tensor(counts, dtype=torch.float32, device=device)
         per_tok = torch.maximum(w_t, e_t) / torch.clamp(n_t, min=1.0)
         logw = torch.log(per_tok.clamp_min(1e-12))
-        rep = torch.as_tensor(counts, dtype=torch.long, device=device)
+        rep = torch.tensor(counts, dtype=torch.long, device=device)
         bias_vec = torch.repeat_interleave(logw, rep, dim=0).to(dtype=dtype)
         return bias_vec.view(1, 1, 1, -1)
 
@@ -1224,6 +1307,8 @@ class Fuser(nn.Module):
                 )
             token_sets.append(out_tokens)
 
+        graph_break()
+
         if len(token_sets) < 1:
             raise RuntimeError("No tasks produced tokens")
 
@@ -1232,6 +1317,8 @@ class Fuser(nn.Module):
         else:
             all_tokens = torch.cat(token_sets, dim=1)
 
+        graph_break()
+
         attn_bias = self._build_attn_bias(
             names,
             token_sets,
@@ -1239,8 +1326,24 @@ class Fuser(nn.Module):
             dtype=all_tokens.dtype,
         )
 
-        fused_tokens = self.perceiver(all_tokens, attn_bias=attn_bias)
-        context = self.decode(fused_tokens, apply_norm=True)
+        bg = getattr(self, "_backbone_graph", None)
+        if isinstance(bg, nn.Module):
+            fused_tokens, context = cast(
+                tuple[torch.Tensor, torch.Tensor], bg(all_tokens, attn_bias)
+            )
+        else:
+            if (
+                self._compile_cudagraphs
+                and getattr(all_tokens.device, "type", None) == "cuda"
+            ):
+                cudagraph_mark_step_begin()
+                fused_tokens = self.perceiver(all_tokens, attn_bias=attn_bias)
+                cudagraph_mark_step_end()
+            else:
+                fused_tokens = self.perceiver(all_tokens, attn_bias=attn_bias)
+
+            graph_break()
+            context = self.decode(fused_tokens, apply_norm=True)
 
         if return_temporal_state:
             if state_is_map:
@@ -1253,6 +1356,11 @@ class Fuser(nn.Module):
         return cast(torch.Tensor, tokens), cast(torch.Tensor, ctx)
 
     def decode(self: Self, tokens: torch.Tensor, *, apply_norm: bool = True) -> torch.Tensor:
+        if apply_norm:
+            dg = getattr(self, "_decode_graph", None)
+            if isinstance(dg, nn.Module):
+                return cast(torch.Tensor, dg(tokens))
+
         x = tokens
         if apply_norm:
             x = self.norm(x)
@@ -3157,6 +3265,90 @@ class Model(nn.Module):
 
 
     def load_state_dict(self, state_dict, *args, **kwargs):
+        def _ensure_scaler_shapes(model, sd):
+            if not isinstance(sd, dict):
+                return
+
+            def _model_device(mod: torch.nn.Module) -> torch.device:
+                with contextlib.suppress(StopIteration):
+                    return next(mod.parameters()).device
+                with contextlib.suppress(StopIteration):
+                    return next(mod.buffers()).device
+                return torch.device("cpu")
+
+            def _alloc_replacement(
+                *,
+                existing: Optional[torch.Tensor],
+                shape: torch.Size,
+                fallback_mod: torch.nn.Module,
+                dtype: Optional[torch.dtype] = None,
+            ) -> torch.Tensor:
+                if torch.is_tensor(existing):
+                    dev = existing.device
+                    dt = existing.dtype if dtype is None else dtype
+                else:
+                    dev = _model_device(fallback_mod)
+                    dt = torch.float32 if dtype is None else dtype
+                return torch.empty(shape, device=dev, dtype=dt)
+
+            def _is_scaler_key(k: str) -> bool:
+                return k.startswith("scaler.") or ".scaler." in k
+
+            for full_key, val in sd.items():
+                if not isinstance(full_key, str) or not _is_scaler_key(full_key):
+                    continue
+                if not torch.is_tensor(val):
+                    continue
+                parts = full_key.split(".")
+                mod = model
+                ok = True
+                for p in parts[:-1]:
+                    if not hasattr(mod, p):
+                        ok = False
+                        break
+                    mod = getattr(mod, p)
+                    if not isinstance(mod, torch.nn.Module):
+                        ok = False
+                        break
+                if not ok:
+                    continue
+                name = parts[-1]
+                tgt = val.detach()
+                if hasattr(mod, "_buffers") and name in getattr(mod, "_buffers", {}):
+                    buf = mod._buffers.get(name)
+                    if torch.is_tensor(buf) and tuple(buf.shape) != tuple(tgt.shape):
+                        mod._buffers[name] = _alloc_replacement(
+                            existing=buf,
+                            shape=tgt.shape,
+                            fallback_mod=mod,
+                            dtype=buf.dtype,
+                        )
+                        setattr(mod, name, mod._buffers[name])
+                    continue
+                if hasattr(mod, "_parameters") and name in getattr(mod, "_parameters", {}):
+                    prm = mod._parameters.get(name)
+                    if (
+                        prm is not None
+                        and torch.is_tensor(prm)
+                        and tuple(prm.shape) != tuple(tgt.shape)
+                    ):
+                        mod._parameters[name] = torch.nn.Parameter(
+                            _alloc_replacement(
+                                existing=prm,
+                                shape=tgt.shape,
+                                fallback_mod=mod,
+                                dtype=prm.dtype,
+                            ),
+                            requires_grad=prm.requires_grad,
+                        )
+                        setattr(mod, name, mod._parameters[name])
+                    continue
+
+        try:
+            _ensure_scaler_shapes(self, state_dict)
+        except Exception:
+            pass
+
         try:
             remap = getattr(self.fuser, "remap_legacy_task_ids_in_state_dict", None)
             if callable(remap):
