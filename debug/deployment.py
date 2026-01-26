@@ -183,6 +183,23 @@ def _ensure_state_shapes_for_scaler(
     if not isinstance(sd, dict):
         return
 
+    def _model_device(mod: torch.nn.Module) -> torch.device:
+        with contextlib.suppress(StopIteration):
+            return next(mod.parameters()).device
+        with contextlib.suppress(StopIteration):
+            return next(mod.buffers()).device
+        return torch.device("cpu")
+
+    def _alloc_replacement(
+        existing: torch.Tensor | None,
+        shape: torch.Size,
+        *,
+        fallback_mod: torch.nn.Module,
+    ) -> torch.Tensor:
+        if torch.is_tensor(existing):
+            return torch.empty(shape, device=existing.device, dtype=existing.dtype)
+        return torch.empty(shape, device=_model_device(fallback_mod), dtype=torch.float32)
+
     def _is_scaler_key(k: str) -> bool:
         return k.startswith("scaler.") or ".scaler." in k
 
@@ -212,7 +229,11 @@ def _ensure_state_shapes_for_scaler(
         if hasattr(mod, "_buffers") and name in getattr(mod, "_buffers", {}):
             buf = mod._buffers.get(name)
             if torch.is_tensor(buf) and tuple(buf.shape) != tuple(tgt.shape):
-                mod._buffers[name] = torch.empty_like(tgt)
+                mod._buffers[name] = _alloc_replacement(
+                    buf,
+                    tgt.shape,
+                    fallback_mod=mod,
+                )
                 setattr(mod, name, mod._buffers[name])
             continue
 
@@ -226,7 +247,12 @@ def _ensure_state_shapes_for_scaler(
                 and tuple(prm.shape) != tuple(tgt.shape)
             ):
                 mod._parameters[name] = torch.nn.Parameter(
-                    torch.empty_like(tgt), requires_grad=prm.requires_grad
+                    _alloc_replacement(
+                        prm,
+                        tgt.shape,
+                        fallback_mod=mod,
+                    ),
+                    requires_grad=prm.requires_grad,
                 )
                 setattr(mod, name, mod._parameters[name])
             continue

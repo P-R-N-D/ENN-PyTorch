@@ -3269,6 +3269,28 @@ class Model(nn.Module):
             if not isinstance(sd, dict):
                 return
 
+            def _model_device(mod: torch.nn.Module) -> torch.device:
+                with contextlib.suppress(StopIteration):
+                    return next(mod.parameters()).device
+                with contextlib.suppress(StopIteration):
+                    return next(mod.buffers()).device
+                return torch.device("cpu")
+
+            def _alloc_replacement(
+                *,
+                existing: Optional[torch.Tensor],
+                shape: torch.Size,
+                fallback_mod: torch.nn.Module,
+                dtype: Optional[torch.dtype] = None,
+            ) -> torch.Tensor:
+                if torch.is_tensor(existing):
+                    dev = existing.device
+                    dt = existing.dtype if dtype is None else dtype
+                else:
+                    dev = _model_device(fallback_mod)
+                    dt = torch.float32 if dtype is None else dtype
+                return torch.empty(shape, device=dev, dtype=dt)
+
             def _is_scaler_key(k: str) -> bool:
                 return k.startswith("scaler.") or ".scaler." in k
 
@@ -3295,7 +3317,12 @@ class Model(nn.Module):
                 if hasattr(mod, "_buffers") and name in getattr(mod, "_buffers", {}):
                     buf = mod._buffers.get(name)
                     if torch.is_tensor(buf) and tuple(buf.shape) != tuple(tgt.shape):
-                        mod._buffers[name] = torch.empty_like(tgt)
+                        mod._buffers[name] = _alloc_replacement(
+                            existing=buf,
+                            shape=tgt.shape,
+                            fallback_mod=mod,
+                            dtype=buf.dtype,
+                        )
                         setattr(mod, name, mod._buffers[name])
                     continue
                 if hasattr(mod, "_parameters") and name in getattr(mod, "_parameters", {}):
@@ -3306,7 +3333,13 @@ class Model(nn.Module):
                         and tuple(prm.shape) != tuple(tgt.shape)
                     ):
                         mod._parameters[name] = torch.nn.Parameter(
-                            torch.empty_like(tgt), requires_grad=prm.requires_grad
+                            _alloc_replacement(
+                                existing=prm,
+                                shape=tgt.shape,
+                                fallback_mod=mod,
+                                dtype=prm.dtype,
+                            ),
+                            requires_grad=prm.requires_grad,
                         )
                         setattr(mod, name, mod._parameters[name])
                     continue
