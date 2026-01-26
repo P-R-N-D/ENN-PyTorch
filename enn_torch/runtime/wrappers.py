@@ -11,6 +11,7 @@ import shutil
 import subprocess
 import sys
 import threading
+import types
 import warnings
 import weakref
 from dataclasses import dataclass
@@ -35,6 +36,118 @@ _FORWARD_PARAM_CACHE: dict[object, object] = {}
 _FORWARD_PARAM_CACHE_LOCK = Mutex()
 _ONNX2TF_HELP_CACHE: str | None = None
 _ONNX2TF_HELP_LOCK = Mutex(reentrant=True)
+
+
+def _export_strip_slots_enabled() -> bool:
+    v = os.environ.get("ENN_EXPORT_STRIP_SLOTS", "1").strip().lower()
+    return v not in ("0", "false", "off", "no", "n")
+
+
+def _gil_disabled() -> bool:
+    fn = getattr(sys, "_is_gil_enabled", None)
+    if callable(fn):
+        try:
+            return not bool(fn())
+        except Exception:
+            return False
+    return False
+
+
+def _export_strip_locks_enabled() -> bool:
+    v = os.environ.get("ENN_EXPORT_STRIP_LOCKS", "").strip().lower()
+    if not v:
+        return not _gil_disabled()
+    return v not in ("0", "false", "off", "no", "n")
+
+
+def _is_lock_like(v: object) -> bool:
+    if isinstance(v, (Mutex,)):
+        return True
+    try:
+        tn = type(v).__name__.lower()
+        tm = type(v).__module__
+        if tm in ("_thread", "threading") and "lock" in tn:
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def _is_export_problem_attr(v: object) -> bool:
+    if v is None:
+        return False
+    if isinstance(v, (torch.Tensor, nn.Parameter, nn.Module)):
+        return False
+    if isinstance(v, (str, bytes, int, float, bool)):
+        return False
+    if isinstance(v, (torch.dtype, torch.device)):
+        return False
+    if isinstance(
+        v,
+        (types.FunctionType, types.BuiltinFunctionType, types.MethodType),
+    ):
+        return False
+    if _is_lock_like(v):
+        return True
+    if isinstance(
+        v,
+        (
+            weakref.ReferenceType,
+            weakref.WeakSet,
+            weakref.WeakKeyDictionary,
+            weakref.WeakValueDictionary,
+        ),
+    ):
+        return True
+    if _export_strip_slots_enabled():
+        try:
+            t = type(v)
+            if getattr(t, "__module__", "").startswith("torch"):
+                return False
+            slots = getattr(t, "__slots__", None)
+            if slots:
+                return True
+        except Exception:
+            pass
+    return False
+
+
+@contextlib.contextmanager
+def _strip_for_export(model: object) -> Iterator[None]:
+    if not isinstance(model, nn.Module):
+        yield
+        return
+    removed: list[tuple[object, str, object]] = []
+    try:
+        allow_strip_locks = _export_strip_locks_enabled()
+
+        def _lock_guard_enabled(mod: nn.Module, lock_attr: str) -> bool:
+            if not lock_attr.endswith("_lock"):
+                return False
+            guard = lock_attr[: -len("_lock")] + "_use_lock"
+            with contextlib.suppress(Exception):
+                return bool(getattr(mod, guard))
+            return False
+
+        for module in model.modules():
+            d = getattr(module, "__dict__", None)
+            if not isinstance(d, dict) or not d:
+                continue
+            for k, v in list(d.items()):
+                if k in ("_modules", "_parameters", "_buffers"):
+                    continue
+                if _is_lock_like(v):
+                    if (not allow_strip_locks) or _lock_guard_enabled(module, k):
+                        continue
+                if _is_export_problem_attr(v):
+                    with contextlib.suppress(Exception):
+                        removed.append((module, k, v))
+                        delattr(module, k)
+        yield
+    finally:
+        for obj, k, v in reversed(removed):
+            with contextlib.suppress(Exception):
+                setattr(obj, k, v)
 
 
 @contextlib.contextmanager
@@ -475,7 +588,9 @@ def _torch_export_program(
         sample = sample.unsqueeze(0)
     if dynamic_batch and isinstance(sample, torch.Tensor) and sample.ndim >= 1:
         mode = os.environ.get("ENN_EXPORT_BATCH_DIM", "dynamic").strip().lower()
-        if mode not in {"0", "false", "off", "none", "static", "fixed"}:
+        if mode in {"0", "false", "off", "none"}:
+            dynamic_batch = False
+        elif mode not in {"static", "fixed"}:
             sample = _pad_to_batch(sample, 2)
     dynamic_shapes = None
     if (
@@ -530,7 +645,7 @@ def _torch_export_program(
         call_kw["strict"] = bool(strict)
 
     def _call(**kw: Any) -> Any:
-        with torch.no_grad():
+        with _strip_for_export(wrapper), torch.no_grad():
             return torch_export(wrapper, (sample,), **kw)
 
     def _is_constraint_violation(exc: BaseException) -> bool:
@@ -541,6 +656,14 @@ def _torch_export_program(
             or "marked batch as dynamic" in msg
             or "marked seq as dynamic" in msg
         )
+
+    default_allow_non_strict = "0" if sys.version_info >= (3, 12) else "1"
+    allow_non_strict = (
+        os.environ.get("ENN_EXPORT_ALLOW_NON_STRICT", default_allow_non_strict)
+        .strip()
+        .lower()
+        not in ("0", "false", "off", "no", "n")
+    )
 
     try:
         return _call(**call_kw)
@@ -556,14 +679,11 @@ def _torch_export_program(
             return _call(**stripped)
         raise
     except Exception as exc:
-        if call_kw.get("strict", False):
-            call_kw["strict"] = False
-            try:
-                return _call(**call_kw)
-            except Exception as exc2:
-                exc = exc2
-
-        if call_kw.get("dynamic_shapes") is not None and _is_constraint_violation(exc):
+        if (
+            call_kw.get("strict", False)
+            and call_kw.get("dynamic_shapes") is not None
+            and _is_constraint_violation(exc)
+        ):
             try:
                 Dim = torch.export.Dim
                 auto_hint = getattr(Dim, "AUTO", None)
@@ -589,6 +709,11 @@ def _torch_export_program(
             retry_kw = dict(call_kw)
             retry_kw.pop("dynamic_shapes", None)
             return _call(**retry_kw)
+        if call_kw.get("strict", False):
+            if not allow_non_strict:
+                raise
+            call_kw["strict"] = False
+            return _call(**call_kw)
         raise
 
 
@@ -748,7 +873,10 @@ class _ONNXExporter:
             training = torch.onnx.TrainingMode.EVAL
         sig_keys = _export_sig_keys()
         has_dynamo = "dynamo" in sig_keys
-        exporters = [True, False] if prefer_dynamo and has_dynamo else [False]
+        if has_dynamo:
+            exporters = [True, False] if prefer_dynamo else [False, True]
+        else:
+            exporters = [False]
         errors: list[str] = []
         seen: set[int] = set()
         for opset in (opset_version, *(opset_fallback or ())):

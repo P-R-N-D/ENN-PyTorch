@@ -118,12 +118,28 @@ def _run_isolated_export(
     env.setdefault("OPENBLAS_NUM_THREADS", "1")
     env.setdefault("NUMEXPR_NUM_THREADS", "1")
     env.setdefault("TORCH_NUM_THREADS", "1")
+    env.setdefault("PYTHONFAULTHANDLER", "1")
+    env.setdefault("ENN_EXPORT_FAULTHANDLER", "1")
+    env.setdefault("ENN_EXPORT_TRACEBACK_AFTER_SEC", "30")
+    if fmt_name.strip().lower() in ("onnx", "ort"):
+        env.setdefault("ENN_ONNX_PREFER_DYNAMO", "1")
     timeout_s = 120
     with contextlib.suppress(Exception):
         timeout_s = int(
             os.environ.get("ENN_EXPORT_SUBPROCESS_TIMEOUT", str(timeout_s)).strip()
             or str(timeout_s)
         )
+    def _tail_text(v: object, n: int = 2000) -> str:
+        if v is None:
+            return ""
+        if isinstance(v, bytes):
+            try:
+                s = v.decode("utf-8", errors="replace")
+            except Exception:
+                s = repr(v)
+            return s[-n:]
+        return str(v)[-n:]
+
     try:
         p = subprocess.run(
             cmd, capture_output=True, text=True, env=env, timeout=timeout_s
@@ -132,8 +148,8 @@ def _run_isolated_export(
         return {
             "status": "error",
             "error": "subprocess export timed out",
-            "stdout_tail": (exc.stdout or "")[-2000:],
-            "stderr_tail": (exc.stderr or "")[-2000:],
+            "stdout_tail": _tail_text(getattr(exc, "stdout", "")),
+            "stderr_tail": _tail_text(getattr(exc, "stderr", "")),
         }
     except Exception as exc:
         if exc.__class__.__name__ == "SignalException":
@@ -146,10 +162,12 @@ def _run_isolated_export(
         raise
     if p.returncode == 0:
 
-        def _parse_last_json_line(text: str) -> dict[str, Any] | None:
+        def _parse_last_json_line(text: object) -> dict[str, Any] | None:
             if not text:
                 return None
-            lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+            if isinstance(text, bytes):
+                text = text.decode("utf-8", errors="replace")
+            lines = [ln.strip() for ln in str(text).splitlines() if ln.strip()]
             for ln in reversed(lines):
                 if ln.startswith("{") and ln.endswith("}"):
                     try:
@@ -160,20 +178,20 @@ def _run_isolated_export(
 
         obj = _parse_last_json_line(p.stdout)
         if obj is not None:
-            obj.setdefault("_stdout_tail", (p.stdout or "")[-2000:])
-            obj.setdefault("_stderr_tail", (p.stderr or "")[-2000:])
+            obj.setdefault("_stdout_tail", _tail_text(p.stdout))
+            obj.setdefault("_stderr_tail", _tail_text(p.stderr))
             return obj
         return {
             "status": "error",
             "error": "subprocess returned non-json output",
-            "stdout": (p.stdout or "")[-2000:],
-            "stderr": (p.stderr or "")[-2000:],
+            "stdout": _tail_text(p.stdout),
+            "stderr": _tail_text(p.stderr),
         }
     return {
         "status": "error",
         "error": f"subprocess export failed (returncode={p.returncode})",
-        "stdout_tail": (p.stdout or "")[-2000:],
-        "stderr_tail": (p.stderr or "")[-2000:],
+        "stdout_tail": _tail_text(p.stdout),
+        "stderr_tail": _tail_text(p.stderr),
     }
 
 
@@ -430,6 +448,18 @@ def _temp_env(k: str, v: str) -> Iterator[None]:
 
 
 def _export_only_main(fmt_name: str, out_path: str, state_path: str) -> int:
+    with contextlib.suppress(Exception):
+        if os.environ.get("ENN_EXPORT_FAULTHANDLER", "1").strip() != "0":
+            import faulthandler
+
+            faulthandler.enable(all_threads=True)
+            after_s = 30
+            with contextlib.suppress(Exception):
+                after_s = int(
+                    os.environ.get("ENN_EXPORT_TRACEBACK_AFTER_SEC", "30").strip()
+                    or "30"
+                )
+            faulthandler.dump_traceback_later(after_s, repeat=True)
     device = torch.device("cpu")
     data, td_train, model, sample = _build_model_and_sample(device)
     sd = torch.load(state_path, map_location="cpu")
@@ -446,6 +476,7 @@ def _export_only_main(fmt_name: str, out_path: str, state_path: str) -> int:
         )
         return 1
     try:
+        print(f"[export-only] format={fmt_name} out={out_path}", flush=True)
         save_kw = {"sample_input": sample, "dynamic_batch": True}
         if str(fmt_name).strip().lower() in {
             "onnx",
@@ -458,7 +489,10 @@ def _export_only_main(fmt_name: str, out_path: str, state_path: str) -> int:
                 os.environ.get("ENN_ONNX_PREFER_DYNAMO", "0").strip().lower()
                 in ("1", "true", "yes", "y", "on")
             )
+        t0 = time.time()
         fmt.save(model, out_path, **save_kw)
+        dt = time.time() - t0
+        print(f"[export-only] done format={fmt_name} dt={dt:.2f}s", flush=True)
         print(json.dumps({"status": "ok"}))
         return 0
     except ImportError as exc:
@@ -508,7 +542,16 @@ def export_and_validate(
         results["_state_save_error"] = repr(exc)
     with _temp_env("ENN_DISABLE_PIECEWISE_CALIB", "1"):
         for name, path in targets.items():
-            if state_path is not None and name in ("onnx", "ort", "tensorrt", "executorch", "tensorflow", "litert"):
+            if state_path is not None and name in (
+                "pt2",
+                "onnx",
+                "ort",
+                "tensorrt",
+                "executorch",
+                "tensorflow",
+                "litert",
+                "coreml",
+            ):
                 results[name] = _run_isolated_export(
                     name, str(path), str(state_path)
                 )
@@ -707,7 +750,22 @@ def main() -> None:
     stats = export_and_validate(
         model, sample, td_train, Path("export_artifacts")
     )
-    print(json.dumps(stats, indent=2))
+    def _json_default(o: object) -> object:
+        if isinstance(o, bytes):
+            try:
+                return o.decode("utf-8", errors="replace")
+            except Exception:
+                return repr(o)
+        if isinstance(o, Path):
+            return str(o)
+        try:
+            if isinstance(o, np.generic):
+                return o.item()
+        except Exception:
+            pass
+        return repr(o)
+
+    print(json.dumps(stats, indent=2, ensure_ascii=False, default=_json_default))
 
 
 if __name__ == "__main__":
