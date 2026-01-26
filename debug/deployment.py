@@ -446,7 +446,19 @@ def _export_only_main(fmt_name: str, out_path: str, state_path: str) -> int:
         )
         return 1
     try:
-        fmt.save(model, out_path, sample_input=sample, dynamic_batch=True)
+        save_kw = {"sample_input": sample, "dynamic_batch": True}
+        if str(fmt_name).strip().lower() in {
+            "onnx",
+            "ort",
+            "tensorrt",
+            "tensorflow",
+            "litert",
+        }:
+            save_kw["prefer_dynamo"] = bool(
+                os.environ.get("ENN_ONNX_PREFER_DYNAMO", "0").strip().lower()
+                in ("1", "true", "yes", "y", "on")
+            )
+        fmt.save(model, out_path, **save_kw)
         print(json.dumps({"status": "ok"}))
         return 0
     except ImportError as exc:

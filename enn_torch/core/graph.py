@@ -392,7 +392,11 @@ def is_tracing_or_exporting() -> bool:
 
 
 def is_export_or_trace() -> bool:
-    return bool(is_tracing_or_exporting() or is_fake_tensor_mode_active())
+    return bool(
+        is_tracing_or_exporting()
+        or is_compiling()
+        or is_fake_tensor_mode_active()
+    )
 
 
 def is_symbolic() -> bool:

@@ -474,7 +474,9 @@ def _torch_export_program(
     if isinstance(sample, torch.Tensor) and sample.ndim == 1:
         sample = sample.unsqueeze(0)
     if dynamic_batch and isinstance(sample, torch.Tensor) and sample.ndim >= 1:
-        sample = _pad_to_batch(sample, 2)
+        mode = os.environ.get("ENN_EXPORT_BATCH_DIM", "dynamic").strip().lower()
+        if mode not in {"0", "false", "off", "none", "static", "fixed"}:
+            sample = _pad_to_batch(sample, 2)
     dynamic_shapes = None
     if (
         (dynamic_batch or dynamic_seq)
@@ -482,14 +484,36 @@ def _torch_export_program(
         and hasattr(torch.export, "Dim")
     ):
         spec: dict[int, object] = {}
+        Dim = torch.export.Dim
+
+        def _dim_from_mode(name: str, env_key: str) -> object | None:
+            mode = os.environ.get(env_key, "dynamic").strip().lower()
+            if mode in {"0", "false", "off", "none"}:
+                return None
+            if mode in {"auto", "adaptive"}:
+                return getattr(Dim, "AUTO", None)
+            if mode in {"static", "fixed"}:
+                return getattr(Dim, "STATIC", None)
+            try:
+                return Dim(name, min=1)
+            except Exception:
+                try:
+                    return Dim(name)
+                except Exception:
+                    return getattr(Dim, "AUTO", None)
         if dynamic_batch:
-            spec[0] = torch.export.Dim("batch")
+            bd = _dim_from_mode("batch", "ENN_EXPORT_BATCH_DIM")
+            if bd is not None:
+                spec[0] = bd
         if (
             dynamic_seq
             and isinstance(sample, torch.Tensor)
             and sample.ndim >= 2
         ):
-            spec[1] = torch.export.Dim("seq")
+            sd = _dim_from_mode("seq", "ENN_EXPORT_SEQ_DIM")
+            if sd is not None:
+                spec[1] = sd
+        spec = {k: v for k, v in spec.items() if v is not None}
         if spec:
             dynamic_shapes = (spec,)
     call_kw: dict[str, Any] = {}
@@ -509,6 +533,15 @@ def _torch_export_program(
         with torch.no_grad():
             return torch_export(wrapper, (sample,), **kw)
 
+    def _is_constraint_violation(exc: BaseException) -> bool:
+        msg = str(exc)
+        return (
+            "Constraints violated" in msg
+            or "specialized it to be a constant" in msg
+            or "marked batch as dynamic" in msg
+            or "marked seq as dynamic" in msg
+        )
+
     try:
         return _call(**call_kw)
     except TypeError as exc:
@@ -522,10 +555,40 @@ def _torch_export_program(
         if retry:
             return _call(**stripped)
         raise
-    except Exception:
+    except Exception as exc:
         if call_kw.get("strict", False):
             call_kw["strict"] = False
-            return _call(**call_kw)
+            try:
+                return _call(**call_kw)
+            except Exception as exc2:
+                exc = exc2
+
+        if call_kw.get("dynamic_shapes") is not None and _is_constraint_violation(exc):
+            try:
+                Dim = torch.export.Dim
+                auto_hint = getattr(Dim, "AUTO", None)
+                static_hint = getattr(Dim, "STATIC", None)
+            except Exception:
+                auto_hint, static_hint = None, None
+            if auto_hint is not None:
+                try:
+                    spec0 = call_kw["dynamic_shapes"][0]
+                    auto_spec = {
+                        k: (
+                            v
+                            if (static_hint is not None and v == static_hint)
+                            else auto_hint
+                        )
+                        for k, v in dict(spec0).items()
+                    }
+                    auto_kw = dict(call_kw)
+                    auto_kw["dynamic_shapes"] = (auto_spec,)
+                    return _call(**auto_kw)
+                except Exception:
+                    pass
+            retry_kw = dict(call_kw)
+            retry_kw.pop("dynamic_shapes", None)
+            return _call(**retry_kw)
         raise
 
 
@@ -1287,6 +1350,23 @@ class TensorRT(Format):
     ) -> object:
         del args
         dst = Path(dst)
+        if not torch.cuda.is_available():
+            raise ImportError(
+                "TensorRT export requires CUDA-enabled PyTorch (torch.cuda.is_available() is False)."
+            )
+        try:
+            torch.cuda.current_device()
+        except Exception as cuda_exc:
+            raise ImportError(
+                "CUDA runtime/driver is not available or incompatible for TensorRT export."
+            ) from cuda_exc
+        try:
+            import tensorrt as trt
+        except ImportError as exc:
+            raise ImportError(
+                "TensorRT is required for this export."
+            ) from exc
+
         with _onnx_model(model) as serving_model:
             onnx_path = _ONNXExporter.coerce(
                 serving_model,
@@ -1311,24 +1391,6 @@ class TensorRT(Format):
                         warnings.warn(
                             f"TensorRT graphsurgeon optimization failed; using unoptimized ONNX. ({exc})"
                         )
-            try:
-                import tensorrt as trt
-            except ImportError as exc:
-                raise ImportError(
-                    "TensorRT is required for this export."
-                ) from exc
-
-            if not torch.cuda.is_available():
-                raise ImportError(
-                    "TensorRT export requires CUDA-enabled PyTorch (torch.cuda.is_available() is False)."
-                )
-            try:
-                torch.cuda.current_device()
-            except Exception as cuda_exc:
-                raise ImportError(
-                    "CUDA runtime/driver is not available or incompatible for TensorRT export."
-                ) from cuda_exc
-
             trt_logger = trt.Logger(trt.Logger.WARNING)
             explicit_batch_flag = 0
             with contextlib.suppress(Exception):
