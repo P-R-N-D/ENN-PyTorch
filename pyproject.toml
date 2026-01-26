@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "enn-torch"
 version = "1.0.0"
-description = "Elastic Neural Networks (ENN), MLaaS (Machine Learning as a Service) framework for high-performance computing (HPC) — flexible and efficient by design, adaptive and stable at runtime"
+description = "Elastic Neural Networks (ENN), MLOps framework for high-performance computing (HPC) — flexible and efficient by design, adaptive and stable at runtime"
 readme = { file = "README.md", content-type = "text/markdown" }
 requires-python = ">=3.12"
 license = { file = "LICENSE" }
