@@ -43,6 +43,36 @@ def _export_strip_slots_enabled() -> bool:
     return v not in ("0", "false", "off", "no", "n")
 
 
+def _gil_disabled() -> bool:
+    fn = getattr(sys, "_is_gil_enabled", None)
+    if callable(fn):
+        try:
+            return not bool(fn())
+        except Exception:
+            return False
+    return False
+
+
+def _export_strip_locks_enabled() -> bool:
+    v = os.environ.get("ENN_EXPORT_STRIP_LOCKS", "").strip().lower()
+    if not v:
+        return not _gil_disabled()
+    return v not in ("0", "false", "off", "no", "n")
+
+
+def _is_lock_like(v: object) -> bool:
+    if isinstance(v, (Mutex,)):
+        return True
+    try:
+        tn = type(v).__name__.lower()
+        tm = type(v).__module__
+        if tm in ("_thread", "threading") and "lock" in tn:
+            return True
+    except Exception:
+        pass
+    return False
+
+
 def _is_export_problem_attr(v: object) -> bool:
     if v is None:
         return False
@@ -57,7 +87,7 @@ def _is_export_problem_attr(v: object) -> bool:
         (types.FunctionType, types.BuiltinFunctionType, types.MethodType),
     ):
         return False
-    if isinstance(v, (Mutex,)):
+    if _is_lock_like(v):
         return True
     if isinstance(
         v,
@@ -69,13 +99,6 @@ def _is_export_problem_attr(v: object) -> bool:
         ),
     ):
         return True
-    try:
-        tn = type(v).__name__.lower()
-        tm = type(v).__module__
-        if tm in ("_thread", "threading") and "lock" in tn:
-            return True
-    except Exception:
-        pass
     if _export_strip_slots_enabled():
         try:
             t = type(v)
@@ -96,6 +119,16 @@ def _strip_for_export(model: object) -> Iterator[None]:
         return
     removed: list[tuple[object, str, object]] = []
     try:
+        allow_strip_locks = _export_strip_locks_enabled()
+
+        def _lock_guard_enabled(mod: nn.Module, lock_attr: str) -> bool:
+            if not lock_attr.endswith("_lock"):
+                return False
+            guard = lock_attr[: -len("_lock")] + "_use_lock"
+            with contextlib.suppress(Exception):
+                return bool(getattr(mod, guard))
+            return False
+
         for module in model.modules():
             d = getattr(module, "__dict__", None)
             if not isinstance(d, dict) or not d:
@@ -103,6 +136,9 @@ def _strip_for_export(model: object) -> Iterator[None]:
             for k, v in list(d.items()):
                 if k in ("_modules", "_parameters", "_buffers"):
                     continue
+                if _is_lock_like(v):
+                    if (not allow_strip_locks) or _lock_guard_enabled(module, k):
+                        continue
                 if _is_export_problem_attr(v):
                     with contextlib.suppress(Exception):
                         removed.append((module, k, v))
