@@ -241,7 +241,10 @@ def _decorate_compiler_disable(
     kwargs: dict[str, Any] = {}
     if reason is not None:
         kwargs["reason"] = reason
-    kwargs["recursive"] = bool(recursive)
+    recursive = bool(recursive)
+    if not recursive:
+        recursive = True
+    kwargs["recursive"] = recursive
     for opts in (
         kwargs,
         {k: v for k, v in kwargs.items() if k != "recursive"},
