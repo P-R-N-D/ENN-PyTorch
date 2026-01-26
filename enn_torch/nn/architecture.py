@@ -1205,7 +1205,11 @@ class Fuser(nn.Module):
             e_list.append(e.to(device=device, dtype=torch.float32).reshape(()))
 
             if exporting:
-                cnt = int(getattr(tmpl, "tokens", int(t.size(1))))
+                tok = getattr(tmpl, "tokens", None)
+                if tok is not None:
+                    cnt = int(tok)
+                else:
+                    cnt = int(t.size(1))
             else:
                 cnt = int(t.size(1))
             counts.append(cnt)
