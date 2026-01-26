@@ -11,10 +11,12 @@ import torch
 import torch.nn as nn
 
 from ..core.checkpoint import coerce_checkpoint
-from ..core.compat import StochasticDepth
 from ..core.distributed import _from_hsdp_module
 from ..core.graph import is_export_or_trace, is_symbolic
-from .layers import CrossAttention, DilatedAttention, Retention, norm_layer
+from ..core.compat import StochasticDepth
+from .activations import GeGLU
+from .layers import CrossAttention, DilatedAttention, Retention, Resampler, norm_layer
+from .kernels import DotProductAttention
 
 _LOGGER = logging.getLogger(__name__)
 _MODELING_TYPE_ALIASES: dict[str, str] = {
@@ -201,6 +203,149 @@ def stochastic_depth_schedule(drop_path: float, depth: int) -> List[float]:
         float(i * float(drop_path) / float(depth - 1)) for i in range(depth)
     ]
 
+
+
+
+class _LatentSelfBlock(nn.Module):
+    def __init__(
+        self,
+        *,
+        d_model: int,
+        nhead: int,
+        mlp_ratio: float,
+        norm_type: str,
+        eps: float = 1e-6,
+        dropout: float,
+        drop_path: float,
+    ) -> None:
+        super().__init__()
+
+        if d_model % nhead != 0:
+            raise ValueError(f"d_model ({d_model}) must be divisible by nhead ({nhead})")
+
+        self.d_model = int(d_model)
+        self.nhead = int(nhead)
+        self.head_dim = self.d_model // self.nhead
+
+        self.norm1 = norm_layer(norm_type=norm_type, dim=self.d_model, eps=eps)
+        self.qkv = nn.Linear(self.d_model, 3 * self.d_model, bias=True)
+        self.out_proj = nn.Linear(self.d_model, self.d_model, bias=True)
+        self.attn = DotProductAttention(num_heads=self.nhead, head_dim=self.head_dim)
+
+        self.dropout = nn.Dropout(dropout)
+        self.drop_path = (
+            StochasticDepth(drop_path) if drop_path > 0.0 else nn.Identity()
+        )
+
+        self.norm2 = norm_layer(norm_type=norm_type, dim=self.d_model, eps=eps)
+        inner_dim = int(self.d_model * mlp_ratio)
+        self.ff = nn.Sequential(
+            GeGLU(self.d_model, inner_dim, out_dim=inner_dim, bias=True),
+            nn.Dropout(dropout),
+            nn.Linear(inner_dim, self.d_model, bias=True),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        B, K, D = x.shape
+
+        y = self.norm1(x)
+        qkv = self.qkv(y)
+        q, k, v = qkv.view(B, K, 3, self.nhead, self.head_dim).permute(2, 0, 3, 1, 4)
+
+        attn_out = self.attn(
+            q,
+            k,
+            v,
+            attn_mask=None,
+            is_causal=False,
+            dropout_p=self.dropout.p if self.training else 0.0,
+        )
+        attn_out = attn_out.transpose(1, 2).contiguous().view(B, K, D)
+        attn_out = self.out_proj(attn_out)
+
+        x = x + self.drop_path(self.dropout(attn_out))
+        x = x + self.drop_path(self.ff(self.norm2(x)))
+        return x
+
+
+class Perceiver(nn.Module):
+    def __init__(
+        self: Self,
+        d_model: int,
+        nhead: int,
+        num_latents: int,
+        depth: int,
+        *args: Any,
+        self_attn_layers: int = 1,
+        mlp_ratio: float = 4.0,
+        dropout: float = 0.0,
+        drop_path: float = 0.0,
+        norm_type: str = "layernorm",
+        **kwargs: Any,
+    ) -> None:
+        super().__init__()
+        del args, kwargs
+        self.d_model = int(d_model)
+        self.nhead = int(nhead)
+        self.num_latents = max(1, int(num_latents))
+        self.depth = max(1, int(depth))
+        self.self_attn_layers = max(0, int(self_attn_layers))
+        self.norm_type = str(norm_type)
+
+        self.latents = nn.Parameter(torch.randn(self.num_latents, self.d_model) * 0.02)
+
+        total_layers = int(self.depth) * (1 + int(self.self_attn_layers))
+        drops = stochastic_depth_schedule(float(drop_path), total_layers)
+        dp_it = iter(drops)
+
+        self.cross = nn.ModuleList(
+            [
+                Resampler(
+                    d_model=self.d_model,
+                    nhead=self.nhead,
+                    dropout=float(dropout),
+                    mlp_ratio=float(mlp_ratio),
+                    drop_path=float(next(dp_it, 0.0)),
+                    norm_type=str(norm_type),
+                )
+                for _ in range(int(self.depth))
+            ]
+        )
+        self.self_blocks = nn.ModuleList(
+            [
+                _LatentSelfBlock(
+                    d_model=self.d_model,
+                    nhead=self.nhead,
+                    mlp_ratio=float(mlp_ratio),
+                    dropout=float(dropout),
+                    drop_path=float(next(dp_it, 0.0)),
+                    norm_type=str(norm_type),
+                )
+                for _ in range(int(self.depth) * int(self.self_attn_layers))
+            ]
+        )
+        self.norm = norm_layer(str(norm_type), self.d_model)
+
+    def forward(
+        self: Self,
+        tokens: torch.Tensor,
+        attn_bias: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        if tokens.dim() != 3:
+            raise ValueError(
+                f"Perceiver expects tokens (B,N,D), got shape {tuple(tokens.shape)}"
+            )
+        B = tokens.size(0)
+        latents = self.latents.unsqueeze(0).expand(B, -1, -1)
+
+        j = 0
+        for i in range(int(self.depth)):
+            latents = self.cross[i](latents, tokens, attn_bias=attn_bias)
+            for _ in range(int(self.self_attn_layers)):
+                if j < len(self.self_blocks):
+                    latents = self.self_blocks[j](latents)
+                j += 1
+        return self.norm(latents)
 
 class RetNet(nn.Module):
     def __init__(
@@ -457,107 +602,3 @@ class LongNet(nn.Module):
         ):
             out = out.transpose(0, 1)
         return out, attn_w
-
-
-class CrossTransformer(nn.Module):
-    def __init__(
-        self: Self,
-        d_model: int,
-        nhead: int,
-        *args: Any,
-        dropout: float = 0.0,
-        norm_type: str = "layernorm",
-        mlp_ratio: float = 4.0,
-        drop_path: float = 0.0,
-        cross: Optional[Sequence[nn.Module]] = None,
-        **kwargs: Any,
-    ) -> None:
-        super().__init__()
-        if cross is None:
-            cross_mods: List[nn.Module] = [
-                CrossAttention(
-                    d_model, nhead, dropout=dropout, norm_type=norm_type
-                ),
-                CrossAttention(
-                    d_model, nhead, dropout=dropout, norm_type=norm_type
-                ),
-            ]
-        else:
-            cross_mods = list(cross)
-            if len(cross_mods) != 2:
-                raise ValueError(
-                    f"CrossTransformer expects 2 modules, got {len(cross_mods)}"
-                )
-        self.cross = nn.ModuleList(cross_mods)
-        self.cross_s = self.cross[0]
-        self.cross_t = self.cross[1]
-        self.mix_norm = norm_layer(norm_type, 2 * d_model)
-        hid = int(2 * d_model * mlp_ratio * (2.0 / 3.0))
-        from .activations import GeGLU
-
-        self.mix = GeGLU(2 * d_model, hid, out_dim=d_model, dropout=dropout)
-        self.dropout = nn.Dropout(dropout)
-        self.drop_path = StochasticDepth(p=drop_path, mode="row")
-        self._fixed_mode: Optional[str] = getattr(self, "modeling_type", None)
-
-    def forward(
-        self: Self,
-        tokens_a: torch.Tensor,
-        tokens_b: torch.Tensor,
-        mode: Optional[str] = None,
-    ) -> torch.Tensor:
-        spatial_tokens, temporal_tokens = tokens_a, tokens_b
-        if spatial_tokens.dim() != 3 or temporal_tokens.dim() != 3:
-            raise ValueError("Expects 3D tensors")
-        if not torch.jit.is_tracing():
-            if spatial_tokens.size(0) != temporal_tokens.size(0):
-                raise ValueError("Batch mismatch")
-            if spatial_tokens.size(2) != temporal_tokens.size(2):
-                raise ValueError("Hidden dim mismatch")
-        mode_l = _coerce_modeling_types(self._fixed_mode or mode or "st")
-
-        def _impl(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
-            if mode_l == "ss":
-                return self.cross[0](a, b)
-            if mode_l == "tt":
-                return self.cross[1](b, a)
-            s_context = self.cross[0](a, b)
-            t_context = self.cross[1](b, a)
-            base_s = torch.cat(
-                [
-                    s_context,
-                    t_context.mean(dim=1, keepdim=True).expand_as(s_context),
-                ],
-                dim=-1,
-            )
-            fused_s = self.mix(self.mix_norm(base_s))
-            out_s = s_context + self.drop_path(self.dropout(fused_s))
-            base_t = torch.cat(
-                [
-                    t_context,
-                    s_context.mean(dim=1, keepdim=True).expand_as(t_context),
-                ],
-                dim=-1,
-            )
-            fused_t = self.mix(self.mix_norm(base_t))
-            out_t = t_context + self.drop_path(self.dropout(fused_t))
-            return torch.cat([out_s, out_t], dim=1)
-
-        def _ckpt_impl(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
-            if torch.is_grad_enabled():
-                _from_hsdp_module(self)
-            return _impl(a, b)
-
-        if (
-            self.training
-            and torch.is_grad_enabled()
-            and not is_export_or_trace()
-        ):
-            return coerce_checkpoint(
-                _ckpt_impl,
-                spatial_tokens,
-                temporal_tokens,
-                use_reentrant=True,
-                preserve_rng_state=True,
-            )
-        return _impl(spatial_tokens, temporal_tokens)

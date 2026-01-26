@@ -35,7 +35,7 @@ This repository also includes a worked example notebook (`notebook.ipynb`) and a
 ## Features
 - **APIs** (`enn_torch.runtime.workflow`): build/load models, elastic train/predict entrypoints (uses `torch.distributed.elastic`), and checkpoint/export helpers.
 - **Templated configurations** (`enn_torch.config`): dataclass configs with coercion/validation and string canonicalizers for modeling type, normalization, and compile options.
-- **Neural network stacks** (`enn_torch.nn`): spatio-temporal TokenFuser/TokenCollector blocks, attention variants, scaler + recorder modules, AMP negotiation guard band (`ModelConfig.safety_margin_pow2`).
+- **Neural network stacks** (`enn_torch.nn`): spatio-temporal Fuser/Collector blocks (Template tasks + Perceiver resampler), attention variants, scaler + recorder modules, AMP negotiation guard band (`ModelConfig.safety_margin_pow2`).
 - **Data pipeline** (`enn_torch.data`): `torchdata.nodes`-driven memmap pipeline with TensorDict support, prefetch/pin/pool options, and scale-aware dataset metadata.
 - **Runnable tasks** (`enn_torch.runtime`): thread/NUMA tuning, free-threaded/no-GIL optimizations, mixed-precision helpers, history recorder, and OOM recovery hooks. ONNX/ORT/onnxscript/onnx_ir/torch.export (PT2) out of the box; optional platform-dependent backends (TensorRT/CoreML/ExecuTorch/onnx-tf) via extras. elastic launch wiring and group setup for multi-process CPU/GPU runs.
 - **Losses/optimizers/profiling** (`enn_torch.core`): Student’s t losses, SWA helpers, FLOP/IO timing.
@@ -47,19 +47,30 @@ High-level flow used by `enn_torch.nn.architecture.Model`:
 ```
 Input features (B x C_in)
   → Scaler (feature normalization)
-  → TokenFuser
-      → TokenizedView (spatial extractor)
-      → TokenizedView (temporal extractor)
-      → CrossTransformer fusion (spatial|temporal)
+  → Fuser
+      → Template tasks (one or more)
+          → Tokenizer (Linear: C_in → tokens × d_model)
+          → RetNet stack (mode = spatial | temporal)
+          → (optional) user submodel hook (BYOM; not checkpointed)
+      → Perceiver fusion (Resampler cross-attn + latent self-attn)
       → Aggregation + MLP head → output vector
-  → TokenCollector (temporal controller head)
+  → Collector (temporal controller head)
   → Optional linear branch (configurable)
 ```
 
 Key building blocks:
-- **Scaler** for input feature normalization, with an optional linear branch when `use_linear_branch` is enabled in the config.【F:enn_torch/nn/architecture.py†L1032-L1049】
-- **TokenFuser** builds spatial/temporal TokenizedViews and fuses them via a CrossTransformer before projecting through the head MLP to the output dimension.【F:enn_torch/nn/architecture.py†L659-L836】
-- **TokenCollector** acts as the temporal controller head for the model instance.【F:enn_torch/nn/architecture.py†L1051-L1061】
+- **Scaler**: input feature normalization, with an optional linear branch when `use_linear_branch` is enabled.
+- **Template**: a single *task* = tokenizer + RetNet stack. Each task has:
+  - a unique internal **`task_id`** (the key used inside the model / `ModuleDict` — mostly internal)
+  - a unique human-friendly **`name`** (stable alias for UX / manifests — primary external identifier)
+  - optional metadata: `description`, `tags`
+  - If you omit `task_id` in `add_task(...)`, a random non-colliding id is auto-generated.
+  - `name` must be unique **among names**. If omitted/empty/whitespace, it defaults to `task_id`.
+  - `update_task(...)` / `remove_task(...)` accept a `name` (preferred) or a `task_id`.
+- **Fuser**: runs all selected tasks, fuses their token-sets in an orderless way via a Perceiver-style latent array, then decodes to the output vector.
+  - Per-task `weight` is applied as an attention log-bias (token-count-normalized) to reflect view importance without imposing any ordering.
+  - `forward_stream` supports a single temporal stream state (Tensor for `stream_task_id`) or a dict mapping `task_id -> state` for multiple temporal tasks.
+- **Collector**: the temporal controller head for the model instance.
 
 ## Installation
 1. Install the appropriate **PyTorch** build for your accelerator first (CUDA/ROCm/XPU/CPU).

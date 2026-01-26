@@ -976,7 +976,7 @@ class Builder:
         p = Path(path)
 
         def _make_meta() -> dict[str, Any]:
-            return {
+            meta: dict[str, Any] = {
                 "version": 1,
                 "in_dim": int(getattr(model, "in_dim", 0)),
                 "out_shape": tuple(
@@ -986,6 +986,11 @@ class Builder:
                 "pytorch_version": torch.__version__,
                 "extra": coerce_json(extra or {}),
             }
+            with contextlib.suppress(Exception):
+                task_specs = getattr(model, "task_specs", None)
+                if callable(task_specs):
+                    meta["tasks"] = task_specs()
+            return meta
 
         if not p.suffix and p.exists() and p.is_dir():
             from torch.distributed.checkpoint import FileSystemWriter

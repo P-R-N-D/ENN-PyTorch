@@ -4,6 +4,7 @@ from __future__ import annotations
 import contextlib
 import logging
 import math
+import uuid
 from typing import (
     Any,
     Callable,
@@ -53,9 +54,9 @@ from ..core.system import (
 from ..core.tensor import is_meta_or_fake_tensor, symint_safe_expand_as
 from ..schema import get_feature_key, get_label_key
 from .blocks import (
-    CrossTransformer,
     LongNet,
     RetNet,
+    Perceiver,
     _autofit_microbatch,
     _coerce_modeling_types,
     _coerce_tensor,
@@ -63,8 +64,7 @@ from .blocks import (
     _prealloc_microbatch,
     _size_of_retnet,
     norm_layer,
-    stochastic_depth_schedule,
-)
+    stochastic_depth_schedule,)
 from .layers import (
     Recorder,
     Scaler,
@@ -73,6 +73,10 @@ from .layers import (
 
 _LOGGER = logging.getLogger(__name__)
 TConfig = TypeVar("TConfig")
+
+_SUBMODEL_UNSET: object = object()
+
+_META_UNSET: object = object()
 
 
 def _prod_int(shape: Sequence[int]) -> int:
@@ -188,390 +192,9 @@ def _dot_product_attention_cls() -> Any:
         return None
 
 
-class SpatialExtractor(nn.Module):
-    def __init__(
-        self: Self,
-        d_model: int,
-        nhead: int,
-        depth: int,
-        *args: Any,
-        mlp_ratio: float = 4.0,
-        dropout: float = 0.0,
-        drop_path: float = 0.0,
-        norm_type: str = "layernorm",
-        **kwargs: Any,
-    ) -> None:
-        super().__init__()
-        del args, kwargs
-        drops = stochastic_depth_schedule(drop_path, depth)
-        self.blocks = nn.ModuleList(
-            [
-                RetNet(
-                    d_model,
-                    nhead,
-                    mlp_ratio=mlp_ratio,
-                    dropout=dropout,
-                    drop_path=drops[i],
-                    norm_type=norm_type,
-                    mode="spatial",
-                )
-                for i in range(int(depth))
-            ]
-        )
-        self.norm = norm_layer(norm_type, int(d_model))
-        self._ckpt_enabled = True
-        self._ckpt_min_bytes = int(64 * 1024 * 1024)
-
-    def forward(
-        self: Self,
-        x: torch.Tensor,
-        coords: Optional[torch.Tensor] = None,
-        attn_mask: Optional[torch.Tensor] = None,
-        *args: Any,
-        **kwargs: Any,
-    ) -> torch.Tensor:
-        del coords, args, kwargs
-        out = x
-        do_ckpt = (
-            self.training
-            and torch.is_grad_enabled()
-            and bool(getattr(self, "_ckpt_enabled", True))
-            and not is_export_or_trace()
-        )
-        if do_ckpt:
-            est = 0
-            with contextlib.suppress(Exception):
-                blk0 = self.blocks[0] if len(self.blocks) > 0 else None
-                if blk0 is not None:
-                    per_blk = _size_of_retnet(out, blk0, mode="spatial")
-                    est = int(per_blk) * int(len(self.blocks))
-                else:
-                    est = (
-                        int(out.numel())
-                        * int(out.element_size())
-                        * int(len(self.blocks))
-                    )
-            do_ckpt = bool(
-                est >= int(getattr(self, "_ckpt_min_bytes", 0) or 0)
-            )
-        for blk in self.blocks:
-            if do_ckpt:
-
-                def _f(t: torch.Tensor, _blk: RetNet = blk) -> torch.Tensor:
-                    if torch.is_grad_enabled():
-                        _from_hsdp_module(self)
-                        _from_hsdp_module(_blk)
-                    y, _ = _blk(
-                        t, causal_mask=attn_mask, state=None, mode="spatial"
-                    )
-                    return y
-
-                out = cast(
-                    torch.Tensor,
-                    coerce_checkpoint(
-                        _f, out, use_reentrant=True, preserve_rng_state=True
-                    ),
-                )
-            else:
-                out, _ = blk(
-                    out, causal_mask=attn_mask, state=None, mode="spatial"
-                )
-        return self.norm(out)
 
 
-class TemporalExtractor(nn.Module):
-    def __init__(
-        self: Self,
-        d_model: int,
-        nhead: int,
-        depth: int,
-        *args: Any,
-        mlp_ratio: float = 4.0,
-        dropout: float = 0.0,
-        drop_path: float = 0.0,
-        norm_type: str = "layernorm",
-        **kwargs: Any,
-    ) -> None:
-        super().__init__()
-        del args, kwargs
-        self.d_model = int(d_model)
-        self.nhead = int(nhead)
-        self.depth = int(depth)
-        self.head_dim = int(self.d_model // max(1, self.nhead))
-        drops = stochastic_depth_schedule(drop_path, depth)
-        self.blocks = nn.ModuleList(
-            [
-                RetNet(
-                    self.d_model,
-                    self.nhead,
-                    mlp_ratio=mlp_ratio,
-                    dropout=dropout,
-                    drop_path=drops[i],
-                    norm_type=norm_type,
-                    mode="temporal",
-                )
-                for i in range(int(depth))
-            ]
-        )
-        self.norm = norm_layer(norm_type, int(d_model))
-        self._ckpt_enabled = True
-        self._ckpt_min_bytes = int(64 * 1024 * 1024)
-
-    @staticmethod
-    def _coerce_state_tensor(
-        state: Any,
-        *args: Any,
-        depth: int,
-        batch_size: int,
-        nhead: int,
-        head_dim: int,
-        device: torch.device,
-        dtype: torch.dtype,
-    ) -> Optional[torch.Tensor]:
-        if state is None:
-            return None
-        strict = env_bool(
-            ("ENN_STRICT_TEMPORAL_STATE", "ENN_STRICT_STATE"),
-            default=False,
-        )
-
-        def _bad(reason: str) -> Optional[torch.Tensor]:
-            if not strict:
-                return None
-            cand_type = type(state).__name__
-            cand_shape = None
-            try:
-                if isinstance(state, torch.Tensor):
-                    cand_shape = tuple(state.shape)
-            except Exception:
-                cand_shape = None
-            raise ValueError(
-                "Invalid temporal_state: "
-                + reason
-                + ". Expected Tensor (depth,B,H,Dh) or Tensor (B,depth,H,Dh) or list/tuple length=depth of per-layer (B,H,Dh). "
-                + f"Got type={cand_type} shape={cand_shape}."
-            )
-
-        cand: Any = state
-        if isinstance(state, Mapping):
-            layers = state.get("layers", None)
-            if layers is not None:
-                cand = layers
-            else:
-                for key in (
-                    "state",
-                    "temporal_state",
-                    "retention_state",
-                    "msr_state",
-                ):
-                    v = state.get(key, None)
-                    if isinstance(v, torch.Tensor):
-                        cand = v
-                        break
-        if isinstance(cand, torch.Tensor):
-            t = cand
-            if t.dim() == 4 and int(t.shape[2]) == 1:
-                t = t[:, :, 0, :]
-            if t.dim() == 4:
-                if int(t.shape[0]) == int(depth):
-                    st = t
-                elif int(t.shape[1]) == int(depth):
-                    st = t.permute(1, 0, 2, 3)
-                else:
-                    return _bad(f"4D tensor missing depth axis={int(depth)}")
-            elif t.dim() == 3:
-                if tuple(map(int, t.shape)) != (
-                    int(batch_size),
-                    int(nhead),
-                    int(head_dim),
-                ):
-                    return _bad(
-                        f"3D tensor shape={tuple(map(int, t.shape))} expected=({int(batch_size)},{int(nhead)},{int(head_dim)})"
-                    )
-                st = torch.zeros(
-                    (int(depth), int(batch_size), int(nhead), int(head_dim)),
-                    device=device,
-                    dtype=dtype,
-                )
-                st[0] = t.to(device=device, dtype=dtype)
-            else:
-                return _bad(f"tensor dim must be 3 or 4, got {int(t.dim())}")
-            if tuple(map(int, st.shape)) != (
-                int(depth),
-                int(batch_size),
-                int(nhead),
-                int(head_dim),
-            ):
-                return _bad(
-                    f"coerced tensor shape={tuple(map(int, st.shape))} expected=({int(depth)},{int(batch_size)},{int(nhead)},{int(head_dim)})"
-                )
-            if st.device != device or st.dtype != dtype:
-                st = st.to(device=device, dtype=dtype)
-            return st.contiguous()
-        if isinstance(cand, (list, tuple)):
-            out = torch.zeros(
-                (int(depth), int(batch_size), int(nhead), int(head_dim)),
-                device=device,
-                dtype=dtype,
-            )
-            n = min(int(depth), len(cand))
-            for i in range(n):
-                v = cand[i]
-                if isinstance(v, Mapping):
-                    for key in (
-                        "state",
-                        "temporal_state",
-                        "retention_state",
-                        "msr_state",
-                    ):
-                        vv = v.get(key, None)
-                        if isinstance(vv, torch.Tensor):
-                            v = vv
-                            break
-                if not isinstance(v, torch.Tensor):
-                    continue
-                t = v
-                if t.dim() == 4 and int(t.shape[2]) == 1:
-                    t = t[:, :, 0, :]
-                if t.dim() != 3:
-                    continue
-                if tuple(map(int, t.shape)) != (
-                    int(batch_size),
-                    int(nhead),
-                    int(head_dim),
-                ):
-                    continue
-                out[i] = t.to(device=device, dtype=dtype)
-            return out.contiguous()
-
-        return _bad(f"unrecognized state type {type(cand).__name__}")
-
-    def forward(
-        self: Self,
-        x: torch.Tensor,
-        causal_mask: Optional[torch.Tensor] = None,
-        state: Any = None,
-        *args: Any,
-        return_state: bool = False,
-        **kwargs: Any,
-    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-        del args, kwargs
-        B = x.size(0)
-        st_tensor: Optional[torch.Tensor] = None
-        if state is not None:
-            depth = int(self.depth)
-            H = int(self.nhead)
-            Dh = int(self.head_dim)
-            if isinstance(state, torch.Tensor):
-                t = state
-                if t.dim() == 4 and int(t.shape[2]) == 1:
-                    t = t[:, :, 0, :]
-                st: Optional[torch.Tensor] = None
-                if t.dim() == 4:
-                    if tuple(map(int, t.shape)) == (depth, B, H, Dh):
-                        st = t
-                    elif tuple(map(int, t.shape)) == (B, depth, H, Dh):
-                        st = t.permute(1, 0, 2, 3)
-                elif t.dim() == 3:
-                    if tuple(map(int, t.shape)) == (B, H, Dh):
-                        st = t.new_zeros((depth, B, H, Dh))
-                        st[0] = t
-                if st is not None:
-                    if st.device != x.device or st.dtype != x.dtype:
-                        st = st.to(device=x.device, dtype=x.dtype)
-                    st_tensor = st.contiguous()
-                else:
-                    st_tensor = self._coerce_state_tensor(
-                        state,
-                        depth=depth,
-                        batch_size=B,
-                        nhead=H,
-                        head_dim=Dh,
-                        device=x.device,
-                        dtype=x.dtype,
-                    )
-            else:
-                st_tensor = self._coerce_state_tensor(
-                    state,
-                    depth=depth,
-                    batch_size=B,
-                    nhead=H,
-                    head_dim=Dh,
-                    device=x.device,
-                    dtype=x.dtype,
-                )
-        do_ckpt = (
-            self.training
-            and torch.is_grad_enabled()
-            and bool(getattr(self, "_ckpt_enabled", True))
-            and not return_state
-            and st_tensor is None
-            and not is_export_or_trace()
-        )
-        if do_ckpt:
-            est = 0
-            with contextlib.suppress(Exception):
-                blk0 = self.blocks[0] if len(self.blocks) > 0 else None
-                if blk0 is not None:
-                    per_blk = _size_of_retnet(x, blk0, mode="temporal")
-                    est = int(per_blk) * int(len(self.blocks))
-                else:
-                    est = (
-                        int(x.numel())
-                        * int(x.element_size())
-                        * int(len(self.blocks))
-                    )
-            do_ckpt = bool(
-                est >= int(getattr(self, "_ckpt_min_bytes", 0) or 0)
-            )
-        next_state: Optional[torch.Tensor] = None
-        if return_state:
-            next_state = x.new_empty(
-                (int(self.depth), B, int(self.nhead), int(self.head_dim))
-            )
-        for i, blk in enumerate(self.blocks):
-            blk_state = None
-            if st_tensor is not None and i < int(self.depth):
-                blk_state = st_tensor[i]
-            if do_ckpt:
-
-                def _f(t: torch.Tensor, _blk: RetNet = blk) -> torch.Tensor:
-                    if torch.is_grad_enabled():
-                        _from_hsdp_module(self)
-                        _from_hsdp_module(_blk)
-                    y, _ = _blk(
-                        t, causal_mask=causal_mask, state=None, mode="temporal"
-                    )
-                    return y
-
-                x = cast(
-                    torch.Tensor,
-                    coerce_checkpoint(
-                        _f, x, use_reentrant=True, preserve_rng_state=True
-                    ),
-                )
-            else:
-                x, blk_next_state = blk(
-                    x,
-                    causal_mask=causal_mask,
-                    state=blk_state,
-                    mode="temporal",
-                )
-                if next_state is not None:
-                    if blk_next_state is None:
-                        blk_next_state = x.new_zeros(
-                            (B, int(self.nhead), int(self.head_dim))
-                        )
-                    next_state[i] = blk_next_state
-        x = self.norm(x)
-        if next_state is not None:
-            if not torch.is_grad_enabled():
-                next_state = next_state.detach()
-            return x, next_state.contiguous()
-        return x
-
-
-class TokenCollector(nn.Module):
+class Collector(nn.Module):
     def __init__(
         self: Self,
         embed_dim: int,
@@ -605,6 +228,7 @@ class TokenCollector(nn.Module):
         self.microbatch: int = 0
         self._auto_microbatch_pending: bool = True
         self._runtime_lock = Mutex()
+
 
     def __getstate__(self: Self) -> dict[str, object]:
         state = super().__getstate__()
@@ -659,7 +283,7 @@ class TokenCollector(nn.Module):
     ) -> torch.Tensor:
         if tokens.ndim != 3:
             raise ValueError(
-                f"TokenCollector.run expects tokens (B,N,D), got shape {tuple(tokens.shape)}"
+                f"Collector.run expects tokens (B,N,D), got shape {tuple(tokens.shape)}"
             )
         B = tokens.size(0)
         if graph_break_fn is not None:
@@ -705,184 +329,346 @@ class TokenCollector(nn.Module):
         return refined
 
 
-class TokenizedView(nn.Module):
+class Template(nn.Module):
     def __init__(
         self: Self,
         in_dim: int,
         tokens: int,
         d_model: int,
-        extractor: nn.Module,
+        nhead: int,
+        depth: int,
+        *args: Any,
+        mode: str = "spatial",
+        mlp_ratio: float = 4.0,
+        dropout: float = 0.0,
+        drop_path: float = 0.0,
+        norm_type: str = "layernorm",
+        weight: float = 1.0,
+        eps: float = 1e-6,
+        ckpt_enabled: bool = True,
+        ckpt_min_bytes: int = 64 * 1024 * 1024,
+        **kwargs: Any,
     ) -> None:
         super().__init__()
+        del args, kwargs
         self.in_dim = int(in_dim)
-        self.tokens = int(tokens)
+        self.tokens = max(1, int(tokens))
         self.d_model = int(d_model)
+        self.nhead = max(1, int(nhead))
+        self.depth = max(1, int(depth))
+        self.head_dim = int(self.d_model // max(1, self.nhead))
+        self.mode = self._coerce_mode(mode)
+        self.mlp_ratio = float(mlp_ratio)
+        self.dropout = float(dropout)
+        self.drop_path = float(drop_path)
+        self.norm_type = str(norm_type)
+
         self.tokenizer = nn.Linear(self.in_dim, self.tokens * self.d_model)
-        self.extractor = extractor
+        drops = stochastic_depth_schedule(float(self.drop_path), int(self.depth))
+        self.blocks = nn.ModuleList(
+            [
+                RetNet(
+                    self.d_model,
+                    self.nhead,
+                    mlp_ratio=float(self.mlp_ratio),
+                    dropout=float(self.dropout),
+                    drop_path=float(drops[i] if i < len(drops) else 0.0),
+                    norm_type=str(self.norm_type),
+                    mode=str(self.mode),
+                )
+                for i in range(int(self.depth))
+            ]
+        )
+        self.norm = norm_layer(self.norm_type, self.d_model)
 
-    @property
-    def depth(self: Self) -> int:
-        return int(getattr(self.extractor, "depth", 0) or 0)
+        self.register_buffer(
+            "weight", torch.as_tensor(float(weight), dtype=torch.float32), persistent=True
+        )
+        self.register_buffer(
+            "eps", torch.as_tensor(float(eps), dtype=torch.float32), persistent=True
+        )
 
-    @property
-    def nhead(self: Self) -> int:
-        return int(getattr(self.extractor, "nhead", 0) or 0)
+        self._ckpt_enabled = bool(ckpt_enabled)
+        self._ckpt_min_bytes = int(ckpt_min_bytes)
 
-    @property
-    def head_dim(self: Self) -> int:
-        return int(getattr(self.extractor, "head_dim", 0) or 0)
+    @staticmethod
+    def _coerce_mode(mode: str) -> str:
+        m = str(mode or "spatial").strip().lower()
+        if m in {"s", "spatial", "ss", "sxs"}:
+            return "spatial"
+        if m in {"t", "temporal", "tt", "txt"}:
+            return "temporal"
+        raise ValueError(f"Unknown mode '{mode}' (expected 'spatial' or 'temporal')")
 
-    def forward(self: Self, x: torch.Tensor, *args: Any, **kwargs: Any) -> Any:
+    def set_mode(self: Self, mode: str) -> None:
+        self.mode = self._coerce_mode(mode)
+
+    def set_weight(self: Self, weight: float) -> None:
+        self.weight.data = torch.as_tensor(float(weight), dtype=self.weight.dtype, device=self.weight.device)
+
+    def set_eps(self: Self, eps: float) -> None:
+        self.eps.data = torch.as_tensor(float(eps), dtype=self.eps.dtype, device=self.eps.device)
+
+    @staticmethod
+    def _coerce_state_tensor(
+        state: Any,
+        B: int,
+        depth: int,
+        nhead: int,
+        head_dim: int,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> Optional[torch.Tensor]:
+        if state is None:
+            return None
+        if not isinstance(state, torch.Tensor):
+            raise TypeError("state must be a torch.Tensor or None")
+        if state.dim() != 4:
+            raise ValueError(
+                f"state must be shaped (depth,B,H,Dh), got {tuple(state.shape)}"
+            )
+        if int(state.shape[0]) != int(depth):
+            raise ValueError(
+                f"state depth mismatch: expected {int(depth)} got {int(state.shape[0])}"
+            )
+        if int(state.shape[1]) != int(B):
+            raise ValueError(
+                f"state batch mismatch: expected {int(B)} got {int(state.shape[1])}"
+            )
+        if int(state.shape[2]) != int(nhead):
+            raise ValueError(
+                f"state head mismatch: expected {int(nhead)} got {int(state.shape[2])}"
+            )
+        if int(state.shape[3]) != int(head_dim):
+            raise ValueError(
+                f"state head_dim mismatch: expected {int(head_dim)} got {int(state.shape[3])}"
+            )
+        if state.dtype != dtype:
+            state = state.to(dtype=dtype)
+        if state.device != device:
+            state = state.to(device=device)
+        return state.contiguous()
+
+    def forward(
+        self: Self,
+        x: torch.Tensor,
+        *args: Any,
+        state: Optional[torch.Tensor] = None,
+        return_state: bool = False,
+        causal_mask: Optional[torch.Tensor] = None,
+        **kwargs: Any,
+    ) -> Any:
+        del args, kwargs
         B = x.size(0)
         tokens = (
             self.tokenizer(x)
             .reshape(B, self.tokens, self.d_model)
             .contiguous()
         )
-        return self.extractor(tokens, *args, **kwargs)
+        m = str(self.mode)
+        if m == "spatial":
+            if state is not None:
+                raise ValueError("state is only supported when mode=='temporal'")
+            if return_state:
+                raise ValueError("return_state is only supported when mode=='temporal'")
+            return self._forward_spatial(tokens, causal_mask=causal_mask)
+        if m == "temporal":
+            return self._forward_temporal(
+                tokens, state=state, return_state=return_state, causal_mask=causal_mask
+            )
+        raise RuntimeError(f"Invalid Template.mode {m!r}")
+
+    def _forward_spatial(
+        self: Self, tokens: torch.Tensor, causal_mask: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        x = tokens
+        do_ckpt = bool(
+            self.training
+            and torch.is_grad_enabled()
+            and bool(getattr(self, "_ckpt_enabled", True))
+        )
+        if do_ckpt and int(getattr(self, "_ckpt_min_bytes", 0) or 0) > 0:
+            try:
+                est = int(
+                    _size_of_retnet(x, self.blocks[0], mode="spatial")
+                )
+            except Exception:
+                est = 0
+            do_ckpt = bool(est >= int(getattr(self, "_ckpt_min_bytes", 0) or 0))
+        for blk in self.blocks:
+            if do_ckpt:
+
+                def _f(t: torch.Tensor, _blk: RetNet = blk) -> torch.Tensor:
+                    if torch.is_grad_enabled():
+                        _from_hsdp_module(self)
+                        _from_hsdp_module(_blk)
+                    y, _ = _blk(t, causal_mask=causal_mask, state=None, mode="spatial")
+                    return y
+
+                x = cast(
+                    torch.Tensor,
+                    coerce_checkpoint(
+                        _f, x, use_reentrant=True, preserve_rng_state=True
+                    ),
+                )
+            else:
+                x, _ = blk(x, causal_mask=causal_mask, state=None, mode="spatial")
+        return self.norm(x)
+
+    def _forward_temporal(
+        self: Self,
+        tokens: torch.Tensor,
+        *,
+        state: Optional[torch.Tensor],
+        return_state: bool,
+        causal_mask: Optional[torch.Tensor] = None,
+    ) -> Any:
+        x = tokens
+        B = int(x.shape[0])
+        st_tensor = self._coerce_state_tensor(
+            state,
+            B=B,
+            depth=int(self.depth),
+            nhead=int(self.nhead),
+            head_dim=int(self.head_dim),
+            dtype=x.dtype,
+            device=x.device,
+        )
+        do_ckpt = bool(
+            self.training
+            and torch.is_grad_enabled()
+            and bool(getattr(self, "_ckpt_enabled", True))
+            and (st_tensor is None)
+            and (not return_state)
+        )
+        if do_ckpt and int(getattr(self, "_ckpt_min_bytes", 0) or 0) > 0:
+            try:
+                est = int(
+                    _size_of_retnet(x, self.blocks[0], mode="temporal")
+                )
+            except Exception:
+                est = 0
+            do_ckpt = bool(est >= int(getattr(self, "_ckpt_min_bytes", 0) or 0))
+        next_state: Optional[torch.Tensor] = None
+        if return_state:
+            next_state = x.new_empty(
+                (int(self.depth), B, int(self.nhead), int(self.head_dim))
+            )
+        for i, blk in enumerate(self.blocks):
+            blk_state = None
+            if st_tensor is not None and i < int(self.depth):
+                blk_state = st_tensor[i]
+            if do_ckpt:
+
+                def _f(t: torch.Tensor, _blk: RetNet = blk) -> torch.Tensor:
+                    if torch.is_grad_enabled():
+                        _from_hsdp_module(self)
+                        _from_hsdp_module(_blk)
+                    y, _ = _blk(t, causal_mask=causal_mask, state=None, mode="temporal")
+                    return y
+
+                x = cast(
+                    torch.Tensor,
+                    coerce_checkpoint(
+                        _f, x, use_reentrant=True, preserve_rng_state=True
+                    ),
+                )
+            else:
+                x, blk_next_state = blk(
+                    x,
+                    causal_mask=causal_mask,
+                    state=blk_state,
+                    mode="temporal",
+                )
+                if next_state is not None:
+                    if blk_next_state is None:
+                        blk_next_state = x.new_zeros(
+                            (B, int(self.nhead), int(self.head_dim))
+                        )
+                    next_state[i] = blk_next_state
+        x = self.norm(x)
+        if next_state is not None:
+            if not torch.is_grad_enabled():
+                next_state = next_state.detach()
+            return x, next_state.contiguous()
+        return x
 
 
-class TokenFuser(nn.Module):
+class Fuser(nn.Module):
     def __init__(
         self: Self,
         in_dim: int,
         out_shape: Sequence[int],
         config: ModelConfig,
         *args: Any,
-        views: Optional[
-            Mapping[str, nn.Module] | Sequence[Tuple[str, nn.Module]]
-        ] = None,
-        fusions: Optional[
-            Mapping[str | Tuple[str, str], nn.Module]
-            | Sequence[Tuple[str | Tuple[str, str], nn.Module]]
-        ] = None,
+        tasks: Optional[Sequence[Mapping[str, Any]]] = None,
+        **kwargs: Any,
     ) -> None:
         super().__init__()
+        del args, kwargs
         self.in_dim = int(in_dim)
         self.out_shape = tuple((int(v) for v in out_shape))
         self.out_dim = int(math.prod(self.out_shape) if self.out_shape else 1)
+
+        self.cfg: ModelConfig = config
+        self.__enn_instance_config__ = config
+
         self.d_model = int(config.d_model)
         self.nhead = int(config.heads)
         self.modeling_type = _coerce_modeling_types(config.modeling_type)
-        self.spatial_tokens = max(
-            1, int(getattr(config, "spatial_latents", 1))
-        )
-        self.temporal_tokens = max(
-            1, int(getattr(config, "temporal_latents", 1))
-        )
-        self.fused_tokens = max(
-            1, int(self.spatial_tokens + self.temporal_tokens)
-        )
+        self.spatial_tokens = max(1, int(getattr(config, "spatial_latents", 1)))
+        self.temporal_tokens = max(1, int(getattr(config, "temporal_latents", 1)))
+        self.fused_tokens = max(1, int(self.spatial_tokens + self.temporal_tokens))
+
         self.mlp_ratio = float(getattr(config, "mlp_ratio", 4.0))
         self.dropout = float(getattr(config, "dropout", 0.0))
         self.drop_path = float(getattr(config, "drop_path", 0.0))
-        self.norm_type = str(
-            getattr(config, "normalization_method", "layernorm")
-        )
-        self.gate_blend_alpha = float(
-            getattr(
-                config,
-                "fuser_blend_alpha",
-                getattr(config, "fuser_gate_blend", 0.0),
-            )
-        )
-        self.gate_blend_alpha = float(
-            min(max(self.gate_blend_alpha, 0.0), 1.0)
-        )
-        self.view_encoders = nn.ModuleDict()
-        if views is None:
-            spatial_extractor = SpatialExtractor(
-                self.d_model,
-                self.nhead,
-                depth=max(1, int(getattr(config, "spatial_depth", 1))),
-                mlp_ratio=self.mlp_ratio,
-                dropout=self.dropout,
-                drop_path=self.drop_path,
-                norm_type=self.norm_type,
-            )
-            temporal_extractor = TemporalExtractor(
-                self.d_model,
-                self.nhead,
-                depth=max(1, int(getattr(config, "temporal_depth", 1))),
-                mlp_ratio=self.mlp_ratio,
-                dropout=self.dropout,
-                drop_path=self.drop_path,
-                norm_type=self.norm_type,
-            )
-            self.view_encoders["spatial"] = TokenizedView(
-                self.in_dim,
-                self.spatial_tokens,
-                self.d_model,
-                spatial_extractor,
-            )
-            self.view_encoders["temporal"] = TokenizedView(
-                self.in_dim,
-                self.temporal_tokens,
-                self.d_model,
-                temporal_extractor,
+        self.norm_type = str(getattr(config, "normalization_method", "layernorm"))
+
+        raw_fd = getattr(config, "fuser_depth", None)
+        if raw_fd is None:
+            raw_fd = max(
+                1,
+                int(getattr(config, "spatial_depth", 1)),
+                int(getattr(config, "temporal_depth", 1)),
             )
         else:
-            items = (
-                views.items() if isinstance(views, Mapping) else list(views)
-            )
-            for name, mod in items:
-                key = str(name)
-                if not isinstance(mod, nn.Module):
-                    raise TypeError("views must contain modules")
-                self.view_encoders[key] = mod
-        if "spatial" in self.view_encoders:
-            self.spatial_tokenized_view = self.view_encoders["spatial"]
-            self.spatial_net = self.spatial_tokenized_view
-        if "temporal" in self.view_encoders:
-            self.temporal_tokenized_view = self.view_encoders["temporal"]
-            self.temporal_net = self.temporal_tokenized_view
-        self.pair_fusers = nn.ModuleDict()
-        self._pair_endpoints: dict[str, tuple[str, str]] = {}
-        if fusions is None:
-            key, (a, b) = self._canon_pair_key_static(("spatial", "temporal"))
-            self.pair_fusers[key] = CrossTransformer(
-                self.d_model,
-                self.nhead,
-                dropout=self.dropout,
-                norm_type=self.norm_type,
-                mlp_ratio=self.mlp_ratio,
-                drop_path=self.drop_path,
-            )
-            self._pair_endpoints[key] = (a, b)
-        else:
-            items = (
-                fusions.items()
-                if isinstance(fusions, Mapping)
-                else list(fusions)
-            )
-            for raw_key, mod in items:
-                if not isinstance(mod, nn.Module):
-                    raise TypeError("fusions must contain modules")
-                key, (a, b) = self._canon_pair_key_static(raw_key)
-                if a == b:
-                    raise ValueError("fusion endpoints must differ")
-                self.pair_fusers[key] = mod
-                self._pair_endpoints[key] = (a, b)
-        if "spatial|temporal" in self.pair_fusers:
-            self.perception = self.pair_fusers["spatial|temporal"]
-        elif len(self.pair_fusers) == 1:
-            only_key = next(iter(self.pair_fusers.keys()))
-            self.perception = self.pair_fusers[only_key]
+            try:
+                raw_fd = int(raw_fd)
+            except Exception:
+                raw_fd = max(
+                    1,
+                    int(getattr(config, "spatial_depth", 1)),
+                    int(getattr(config, "temporal_depth", 1)),
+                )
+            if int(raw_fd) <= 0:
+                raw_fd = max(
+                    1,
+                    int(getattr(config, "spatial_depth", 1)),
+                    int(getattr(config, "temporal_depth", 1)),
+                )
+        self.perceiver_depth = max(1, int(raw_fd))
+
+        raw_sa = getattr(config, "fuser_self_attn_layers", 1)
+        try:
+            raw_sa = int(raw_sa)
+        except Exception:
+            raw_sa = 1
+        self.self_attn_layers = max(0, int(raw_sa))
+
+        self.perceiver = Perceiver(
+            d_model=self.d_model,
+            nhead=self.nhead,
+            num_latents=self.fused_tokens,
+            depth=self.perceiver_depth,
+            self_attn_layers=self.self_attn_layers,
+            mlp_ratio=self.mlp_ratio,
+            dropout=self.dropout,
+            drop_path=self.drop_path,
+            norm_type=self.norm_type,
+        )
+
         hid = int(self.d_model * max(1.0, self.mlp_ratio))
-        self._agg_norm = norm_layer(self.norm_type, self.d_model)
-        self._agg_phi = nn.Sequential(
-            nn.Linear(self.d_model, hid),
-            nn.GELU(),
-            nn.Linear(hid, self.d_model),
-        )
-        self._agg_gate = nn.Sequential(
-            nn.Linear(self.d_model, hid),
-            nn.GELU(),
-            nn.Linear(hid, 1),
-        )
-        self._token_generator = nn.Linear(
-            self.d_model, self.fused_tokens * self.d_model
-        )
         self.norm = norm_layer(self.norm_type, self.d_model)
         self.head_hidden_dim = hid
         self.head = nn.Sequential(
@@ -892,236 +678,548 @@ class TokenFuser(nn.Module):
             nn.Dropout(self.dropout),
             nn.Linear(hid, self.out_dim),
         )
-        self.views = self.view_encoders
-        self.fusions = self.pair_fusers
 
-    @staticmethod
-    def _canon_pair_key_static(
-        raw: str | Tuple[str, str],
-    ) -> tuple[str, tuple[str, str]]:
-        if isinstance(raw, str):
-            parts = [p for p in raw.split("|") if p]
-            if len(parts) != 2:
-                raise ValueError("fusion key string must be 'a|b'")
-            a, b = str(parts[0]), str(parts[1])
-        elif isinstance(raw, (tuple, list)) and len(raw) == 2:
-            a, b = str(raw[0]), str(raw[1])
+        self.tasks: nn.ModuleDict = nn.ModuleDict()
+        self._user_submodels: dict[str, nn.Module] = {}
+
+        self._task_meta: dict[str, dict[str, Any]] = {}
+        self._task_name_to_id: dict[str, str] = {}
+
+        raw_stream = getattr(config, "stream_task_id", None)
+        if raw_stream is None:
+            raw_stream = getattr(config, "stream_task_name", None)
+        self.stream_task_id: str = str(raw_stream).strip() if raw_stream else ""
+        self.stream_task_name: str = self.stream_task_id
+
+        if tasks is None:
+            self._init_default_tasks(config)
         else:
-            raise TypeError("fusion key must be 'a|b' or (a, b)")
-        x, y = (a, b) if a <= b else (b, a)
-        return f"{x}|{y}", (x, y)
+            self.rebuild_tasks_from_specs(tasks)
 
-    def _canon_pair_key(
-        self: Self, raw: str | Tuple[str, str]
-    ) -> tuple[str, tuple[str, str]]:
-        return self._canon_pair_key_static(raw)
+        self._resolve_stream_task_id()
 
-    @staticmethod
-    def _as_3d_tokens(t: torch.Tensor) -> torch.Tensor:
-        if t.dim() == 2:
-            return t.unsqueeze(1)
-        if t.dim() != 3:
-            raise ValueError(
-                f"expected tokens shaped (B,N,D) or (B,D), got {tuple(t.shape)}"
+
+
+    def __getstate__(self: Self) -> dict[str, object]:
+        d = self.__dict__.copy()
+        d.pop("_user_submodels", None)
+        return d
+
+    def __setstate__(self: Self, state: dict[str, object]) -> None:
+        self.__dict__.update(state)
+        self._user_submodels = {}
+
+    def _init_default_tasks(self: Self, config: Optional[ModelConfig] = None) -> None:
+        cfg = config or getattr(self, "cfg", None) or getattr(self, "__enn_instance_config__", None)
+        if cfg is None:
+            raise RuntimeError("Fuser requires a ModelConfig to initialize default tasks")
+
+        mt = str(self.modeling_type)
+        if mt in {"ss"}:
+            self.add_task(
+                "spatial",
+                mode="spatial",
+                tokens=int(self.spatial_tokens),
+                depth=int(getattr(cfg, "spatial_depth", 1)),
+                weight=1.0,
+                eps=1e-6,
+                submodel=None,
             )
-        return t
+        elif mt in {"tt"}:
+            self.add_task(
+                "temporal",
+                mode="temporal",
+                tokens=int(self.temporal_tokens),
+                depth=int(getattr(cfg, "temporal_depth", 1)),
+                weight=1.0,
+                eps=1e-6,
+                submodel=None,
+            )
+        else:
+            self.add_task(
+                "spatial",
+                mode="spatial",
+                tokens=int(self.spatial_tokens),
+                depth=int(getattr(cfg, "spatial_depth", 1)),
+                weight=1.0,
+                eps=1e-6,
+                submodel=None,
+            )
+            self.add_task(
+                "temporal",
+                mode="temporal",
+                tokens=int(self.temporal_tokens),
+                depth=int(getattr(cfg, "temporal_depth", 1)),
+                weight=1.0,
+                eps=1e-6,
+                submodel=None,
+            )
 
-    def _aggregate_tokens(
-        self: Self, token_sets: Sequence[torch.Tensor]
-    ) -> torch.Tensor:
-        if len(token_sets) < 1:
-            raise ValueError("no token sets to aggregate")
-        summaries = torch.stack(
-            [self._agg_norm(ts.mean(dim=1)) for ts in token_sets], dim=1
-        )
-        feats = self._agg_phi(summaries)
-        logits = self._agg_gate(feats).squeeze(-1)
-        w_soft = torch.softmax(logits, dim=1)
-        K = feats.size(1)
-        w_uni = feats.new_ones((feats.size(0), K)) / K
-        a = float(self.gate_blend_alpha)
-        w = (1.0 - a) * w_uni + a * w_soft
-        fused_vec = torch.bmm(w.unsqueeze(1), feats).squeeze(1)
-        B = fused_vec.size(0)
-        tokens = (
-            self._token_generator(fused_vec)
-            .reshape(B, self.fused_tokens, self.d_model)
-            .contiguous()
-        )
-        return tokens
+    def _resolve_stream_task_id(self: Self) -> None:
+        sid = str(getattr(self, "stream_task_id", "") or "").strip()
+        chosen = ""
+        if sid and sid in self.tasks:
+            tmpl = self.tasks[sid]
+            if isinstance(tmpl, Template) and str(getattr(tmpl, "mode", "")) == "temporal":
+                chosen = sid
 
-    @staticmethod
-    def _pick_view(
-        views: Mapping[str, torch.Tensor],
-        preferred: Sequence[str],
-        fallback_first: bool = True,
-    ) -> torch.Tensor:
-        for k in preferred:
-            if k in views:
-                return views[k]
-        if fallback_first:
-            return next(iter(views.values()))
-        raise KeyError(f"missing views: {preferred}")
+        if not chosen:
+            temporal_ids = [
+                str(k)
+                for k, t in self.tasks.items()
+                if isinstance(t, Template) and str(getattr(t, "mode", "")) == "temporal"
+            ]
+            if temporal_ids:
+                chosen = sorted(temporal_ids)[0]
 
-    def _run_views(
+        self.stream_task_id = chosen
+        self.stream_task_name = chosen
+
+        cfg = getattr(self, "cfg", None) or getattr(self, "__enn_instance_config__", None)
+        if cfg is not None:
+            with contextlib.suppress(Exception):
+                setattr(cfg, "stream_task_id", chosen if chosen else None)
+            with contextlib.suppress(Exception):
+                setattr(cfg, "stream_task_name", chosen if chosen else "")
+
+    def get_task_name(self: Self, task_id: str) -> str:
+        meta = self._task_meta.get(str(task_id))
+        if isinstance(meta, dict):
+            nm = str(meta.get("name") or "").strip()
+            if nm:
+                return nm
+        return str(task_id)
+
+    def resolve_task_id(self: Self, task_id_or_name: str) -> str:
+        raw = str(task_id_or_name)
+        key = raw.strip()
+        if key.startswith("name:"):
+            nm = key[len("name:") :].strip()
+            hit = self._task_name_to_id.get(nm)
+            if hit is not None and str(hit) in self.tasks:
+                return str(hit)
+            raise KeyError(f"Unknown task name: {nm!r}")
+
+        if key.startswith("id:"):
+            tid = key[len("id:") :].strip()
+            if tid in self.tasks:
+                return tid
+            raise KeyError(f"Unknown task id: {tid!r}")
+
+        hit = self._task_name_to_id.get(key)
+        if hit is not None and str(hit) in self.tasks:
+            return str(hit)
+        if key in self.tasks:
+            return key
+        raise KeyError(f"Unknown task id/name: {task_id_or_name!r}")
+
+    def list_tasks(self: Self, *, by: str = "name") -> list[str]:
+        by_l = str(by or "name").strip().lower()
+        if by_l in {"id", "task_id"}:
+            return list(self.tasks.keys())
+        if by_l in {"name", "alias"}:
+            return [self.get_task_name(k) for k in self.tasks.keys()]
+        raise ValueError(f"Invalid list_tasks(by=...): {by!r} (expected 'id' or 'name')")
+
+    def task_specs(self: Self) -> list[dict[str, Any]]:
+        specs: list[dict[str, Any]] = []
+        for task_id, tmpl in self.tasks.items():
+            if not isinstance(tmpl, Template):
+                continue
+            meta = self._task_meta.get(str(task_id), {})
+            name = str(meta.get("name") or "").strip() or str(task_id)
+            desc = str(meta.get("description") or "")
+            tags = meta.get("tags") or []
+            if not isinstance(tags, list):
+                tags = list(tags) if isinstance(tags, (tuple, set)) else []
+            specs.append(
+                {
+                    "task_id": str(task_id),
+                    "name": name,
+                    "description": desc,
+                    "tags": [str(t) for t in tags],
+                    "mode": str(getattr(tmpl, "mode", "spatial")),
+                    "tokens": int(getattr(tmpl, "tokens", 1)),
+                    "depth": int(getattr(tmpl, "depth", 1)),
+                    "weight": float(getattr(tmpl, "weight", torch.tensor(1.0)).item()),
+                    "eps": float(getattr(tmpl, "eps", torch.tensor(1e-6)).item()),
+                    "has_submodel": bool(str(task_id) in self._user_submodels),
+                }
+            )
+        return specs
+
+    def rebuild_tasks_from_specs(
+        self: Self, specs: Sequence[Mapping[str, Any]]
+    ) -> None:
+        self._user_submodels = {}
+        self.tasks = nn.ModuleDict()
+        self._task_meta = {}
+        self._task_name_to_id = {}
+
+        for s in specs:
+            sd = dict(s)
+            task_id = sd.get("task_id") or sd.get("id")
+            name = sd.get("name") or sd.get("alias") or sd.get("display_name")
+            if task_id is None:
+                task_id = name
+                name = None
+            if task_id is None:
+                raise ValueError(f"Invalid task spec missing task_id/name: {sd!r}")
+
+            mode = str(sd.get("mode", "spatial"))
+            tokens = sd.get("tokens", None)
+            depth = sd.get("depth", None)
+            weight = float(sd.get("weight", 1.0))
+            eps = float(sd.get("eps", 1e-6))
+            description = str(sd.get("description", ""))
+            tags = sd.get("tags", None)
+
+            self.add_task(
+                name=str(name) if name is not None else None,
+                task_id=str(task_id),
+                description=description,
+                tags=tags,
+                mode=mode,
+                tokens=int(tokens) if tokens is not None else None,
+                depth=int(depth) if depth is not None else None,
+                weight=weight,
+                eps=eps,
+                submodel=None,
+            )
+        if not self.tasks:
+            self._init_default_tasks()
+
+    def _generate_task_id(self: Self) -> str:
+        for _ in range(100):
+            cand = "task_" + uuid.uuid4().hex[:12]
+            if cand not in self.tasks and cand not in self._task_name_to_id:
+                return cand
+        cand = "task_" + uuid.uuid4().hex
+        while cand in self.tasks or cand in self._task_name_to_id:
+            cand = "task_" + uuid.uuid4().hex
+        return cand
+
+    def add_task(
         self: Self,
-        x: torch.Tensor,
-        *args: Any,
-        temporal_state: Any = None,
-        want_state: bool = False,
-        causal_mask: Optional[torch.Tensor] = None,
-    ) -> tuple[dict[str, torch.Tensor], Optional[Any]]:
-        out: dict[str, torch.Tensor] = {}
-        next_state: Optional[Any] = None
-        for name, mod in self.view_encoders.items():
-            if name == "temporal":
-                if want_state:
-                    y = mod(
-                        x,
-                        state=temporal_state,
-                        return_state=True,
-                        causal_mask=causal_mask,
-                    )
-                    if isinstance(y, (tuple, list)) and len(y) == 2:
-                        tokens, next_state = y[0], y[1]
-                    else:
-                        tokens = y
-                else:
-                    tokens = mod(
-                        x,
-                        state=temporal_state,
-                        return_state=False,
-                        causal_mask=causal_mask,
-                    )
+        name: Optional[str] = None,
+        *,
+        task_id: Optional[str] = None,
+        description: str = "",
+        tags: Optional[Sequence[str]] = None,
+        mode: str,
+        tokens: Optional[int] = None,
+        depth: Optional[int] = None,
+        weight: float = 1.0,
+        eps: float = 1e-6,
+        submodel: Optional[nn.Module] = None,
+    ) -> str:
+        mode_str = str(mode)
+        if mode_str not in {"spatial", "temporal"}:
+            raise ValueError(f"Invalid task mode: {mode!r} (expected 'spatial'|'temporal')")
+
+        if task_id is None or str(task_id).strip() == "":
+            task_id = self._generate_task_id()
+        task_id = str(task_id)
+        if task_id in self.tasks:
+            raise KeyError(f"Task id already exists: {task_id}")
+
+        name_s = str(name or "").strip()
+        if not name_s:
+            name_s = task_id
+        if name_s in self._task_name_to_id:
+            raise KeyError(f"Task name already exists: {name_s}")
+
+        tk = int(tokens) if tokens is not None else (
+            self.temporal_tokens if mode_str == "temporal" else self.spatial_tokens
+        )
+        dp = int(depth) if depth is not None else int(
+            getattr(self.cfg, "temporal_depth", 1)
+            if mode_str == "temporal"
+            else getattr(self.cfg, "spatial_depth", 1)
+        )
+
+        tmpl = Template(
+            self.in_dim,
+            tk,
+            int(self.d_model),
+            int(self.nhead),
+            dp,
+            mode=mode_str,
+            mlp_ratio=float(getattr(self.cfg, "mlp_ratio", 4.0)),
+            dropout=float(getattr(self.cfg, "dropout", 0.0)),
+            drop_path=float(getattr(self.cfg, "drop_path", 0.0)),
+            norm_type=str(getattr(self.cfg, "normalization_method", "layernorm")),
+            weight=float(weight),
+            eps=float(eps),
+        )
+
+        tag_list: list[str]
+        if tags is None:
+            tag_list = []
+        elif isinstance(tags, str):
+            tag_list = [str(tags)]
+        else:
+            tag_list = [str(t) for t in list(tags)]
+
+        self.tasks[task_id] = tmpl
+        self._task_meta[task_id] = {
+            "name": name_s,
+            "description": str(description or ""),
+            "tags": tag_list,
+        }
+        self._task_name_to_id[name_s] = task_id
+
+        if submodel is not None:
+            self._user_submodels[str(task_id)] = submodel
+            torch_compiler_disable(
+                submodel,
+                attr="forward",
+                reason="BYOM submodel forward is not part of backbone graph",
+                recursive=True,
+            )
+        self._resolve_stream_task_id()
+        return str(task_id)
+
+    def update_task(
+        self: Self,
+        task_id: str,
+        *,
+        name: object = _META_UNSET,
+        description: object = _META_UNSET,
+        tags: object = _META_UNSET,
+        mode: Optional[str] = None,
+        weight: Optional[float] = None,
+        eps: Optional[float] = None,
+        submodel: object = _SUBMODEL_UNSET,
+    ) -> None:
+        tid = self.resolve_task_id(task_id)
+        tmpl = cast(Template, self.tasks[str(tid)])
+
+        if mode is not None:
+            tmpl.set_mode(str(mode))
+        if weight is not None:
+            tmpl.set_weight(float(weight))
+        if eps is not None:
+            tmpl.set_eps(float(eps))
+
+        meta = self._task_meta.setdefault(str(tid), {"name": str(tid), "description": "", "tags": []})
+        old_name = str(meta.get("name") or "").strip() or str(tid)
+
+        if name is not _META_UNSET:
+            new_name = str(name or "").strip()
+            if not new_name:
+                new_name = str(tid)
+            if new_name != old_name:
+                hit = self._task_name_to_id.get(new_name)
+                if hit is not None and str(hit) != str(tid):
+                    raise KeyError(f"Task name already exists: {new_name}")
+                self._task_name_to_id.pop(old_name, None)
+                self._task_name_to_id[new_name] = str(tid)
+                meta["name"] = new_name
+
+        if description is not _META_UNSET:
+            meta["description"] = str(description or "")
+
+        if tags is not _META_UNSET:
+            if tags is None:
+                meta["tags"] = []
             else:
-                tokens = mod(x)
-            tokens = self._as_3d_tokens(cast(torch.Tensor, tokens))
-            out[name] = tokens
-        return out, next_state
+                if isinstance(tags, str):
+                    meta["tags"] = [tags]
+                else:
+                    meta["tags"] = [str(t) for t in list(tags)]
 
-    def _run_fusions(
-        self: Self, views: Mapping[str, torch.Tensor]
-    ) -> list[torch.Tensor]:
-        out: list[torch.Tensor] = []
-        for key, fuser in self.pair_fusers.items():
-            a, b = self._pair_endpoints.get(key, (None, None))
-            if a is None or b is None:
-                continue
-            if a not in views or b not in views:
-                continue
-            out.append(fuser(views[a], views[b]))
-        return out
+        if submodel is not _SUBMODEL_UNSET:
+            if submodel is None:
+                self._user_submodels.pop(str(tid), None)
+            else:
+                assert isinstance(submodel, nn.Module)
+                self._user_submodels[str(tid)] = submodel
+                torch_compiler_disable(
+                    submodel,
+                    attr="forward",
+                    reason="BYOM submodel forward is not part of backbone graph",
+                    recursive=True,
+                )
 
-    @torch_compiler_disable(
-        reason="TokenFuser orchestrates eager + compiled submodules",
-        recursive=False,
-    )
+        self._resolve_stream_task_id()
+
+    def remove_task(self: Self, task_id: str) -> None:
+        tid = self.resolve_task_id(task_id)
+        self._user_submodels.pop(str(tid), None)
+        meta = self._task_meta.pop(str(tid), None)
+        if isinstance(meta, dict):
+            nm = str(meta.get("name") or "").strip()
+            if nm:
+                self._task_name_to_id.pop(nm, None)
+        del self.tasks[str(tid)]
+        if not self.tasks:
+            self._init_default_tasks()
+        self._resolve_stream_task_id()
+
+    def _select_tasks_for_modeling_type(self: Self) -> list[str]:
+        mt = str(self.modeling_type)
+        if mt == "ss":
+            spatial = [k for k, t in self.tasks.items() if getattr(t, "mode", "") == "spatial"]
+            return spatial if spatial else list(self.tasks.keys())
+        if mt == "tt":
+            temporal = [k for k, t in self.tasks.items() if getattr(t, "mode", "") == "temporal"]
+            return temporal if temporal else list(self.tasks.keys())
+        return list(self.tasks.keys())
+
+    def _build_attn_bias(
+        self: Self,
+        names: Sequence[str],
+        token_sets: Sequence[torch.Tensor],
+        *,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> Optional[torch.Tensor]:
+        if len(token_sets) <= 1:
+            return None
+        ws = []
+        eps = []
+        counts = []
+        for n, t in zip(names, token_sets):
+            tmpl = self.tasks[n]
+            wv = float(getattr(tmpl, "weight", torch.tensor(1.0)).item())
+            ev = float(getattr(tmpl, "eps", torch.tensor(1e-6)).item())
+            ws.append(wv)
+            eps.append(ev)
+            counts.append(int(t.size(1)))
+        if any(c <= 0 for c in counts):
+            return None
+        w_t = torch.as_tensor(ws, dtype=torch.float32, device=device)
+        e_t = torch.as_tensor(eps, dtype=torch.float32, device=device)
+        n_t = torch.as_tensor(counts, dtype=torch.float32, device=device)
+        per_tok = torch.maximum(w_t, e_t) / torch.clamp(n_t, min=1.0)
+        logw = torch.log(per_tok.clamp_min(1e-12))
+        rep = torch.as_tensor(counts, dtype=torch.long, device=device)
+        bias_vec = torch.repeat_interleave(logw, rep, dim=0).to(dtype=dtype)
+        return bias_vec.view(1, 1, 1, -1)
+
     def forward(
         self: Self,
         x: torch.Tensor,
         *args: Any,
-        temporal_state: Any = None,
+        temporal_state: object = None,
         return_temporal_state: bool = False,
         causal_mask: Optional[torch.Tensor] = None,
         **kwargs: Any,
     ) -> Any:
         del args, kwargs
-        views, next_state = self._run_views(
-            x,
-            temporal_state=temporal_state,
-            want_state=bool(return_temporal_state),
-            causal_mask=causal_mask,
-        )
-        mode_l = _coerce_modeling_types(self.modeling_type)
-        if mode_l == "ss":
-            chosen = [self._pick_view(views, ("spatial", "s"))]
-        elif mode_l == "tt":
-            chosen = [self._pick_view(views, ("temporal", "t"))]
-        else:
-            fused = self._run_fusions(views)
-            chosen = fused if len(fused) > 0 else list(views.values())
-        chosen = [self._as_3d_tokens(t) for t in chosen]
-        tokens = self._aggregate_tokens(chosen)
-        context = self.decode(tokens, apply_norm=False)
-        if bool(return_temporal_state):
-            return tokens, context, next_state
-        return tokens, context
+        names = self._select_tasks_for_modeling_type()
+        token_sets: list[torch.Tensor] = []
 
-    def forward_state(
-        self: Self,
-        x: torch.Tensor,
-        *args: Any,
-        temporal_state: Any = None,
-        causal_mask: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        tokens, context, next_state = self.forward(
-            x,
-            temporal_state=temporal_state,
-            return_temporal_state=True,
-            causal_mask=causal_mask,
-        )
-        if isinstance(next_state, torch.Tensor):
-            return tokens, context, next_state
-        B = x.size(0)
-        tn = getattr(self, "temporal_net", None)
-        if tn is not None:
-            depth = int(getattr(tn, "depth", 0))
-            nhead = int(getattr(tn, "nhead", self.nhead))
-            head_dim = int(
-                getattr(tn, "head_dim", max(1, self.d_model // max(1, nhead)))
+        state_is_map = isinstance(temporal_state, Mapping)
+        next_state_map: dict[str, torch.Tensor] = {}
+        next_state: Optional[torch.Tensor] = None
+
+        if (not state_is_map) and (temporal_state is not None) and (not isinstance(temporal_state, torch.Tensor)):
+            raise TypeError(
+                "temporal_state must be None, a torch.Tensor, or a Mapping[str, torch.Tensor]"
             )
+
+        if (not state_is_map) and isinstance(temporal_state, torch.Tensor):
+            sid = str(getattr(self, "stream_task_id", "") or "").strip()
+            if not sid:
+                raise ValueError(
+                    "temporal_state was provided but stream_task_id is not set (no temporal task selected)"
+                )
+
+        for name in names:
+            tmpl = self.tasks[name]
+            out_tokens: Any
+
+            if isinstance(tmpl, Template) and str(getattr(tmpl, "mode", "")) == "temporal":
+                st_in: Optional[torch.Tensor] = None
+                if state_is_map:
+                    st_raw = cast(Mapping[str, object], temporal_state).get(str(name), None)
+                    if st_raw is not None and not isinstance(st_raw, torch.Tensor):
+                        raise TypeError(
+                            f"temporal_state[{name!r}] must be a torch.Tensor or None; got {type(st_raw)}"
+                        )
+                    st_in = cast(Optional[torch.Tensor], st_raw)
+                else:
+                    if str(name) == str(getattr(self, "stream_task_id", "")):
+                        st_in = cast(Optional[torch.Tensor], temporal_state)
+
+                if return_temporal_state:
+                    out_tokens, st_out = tmpl(
+                        x,
+                        state=st_in,
+                        return_state=True,
+                        causal_mask=causal_mask,
+                    )
+                    if isinstance(st_out, torch.Tensor):
+                        if state_is_map:
+                            next_state_map[str(name)] = st_out
+                        elif str(name) == str(getattr(self, "stream_task_id", "")):
+                            next_state = st_out
+                else:
+                    out_tokens = tmpl(
+                        x,
+                        state=st_in,
+                        return_state=False,
+                        causal_mask=causal_mask,
+                    )
+            else:
+                out_tokens = tmpl(x)
+
+            if not isinstance(out_tokens, torch.Tensor):
+                raise TypeError(
+                    f"Task '{name}' must return a torch.Tensor tokens (B,N,D); got {type(out_tokens)}"
+                )
+
+            sm = self._user_submodels.get(str(name))
+            if sm is not None:
+                out_tokens = sm(out_tokens)
+                if not isinstance(out_tokens, torch.Tensor):
+                    raise TypeError(
+                        f"BYOM for task '{name}' must return torch.Tensor; got {type(out_tokens)}"
+                    )
+
+            if out_tokens.dim() != 3 or int(out_tokens.size(-1)) != int(self.d_model):
+                raise ValueError(
+                    f"Task '{name}' must return tokens shaped (B,N,{self.d_model}); got {tuple(out_tokens.shape)}"
+                )
+            token_sets.append(out_tokens)
+
+        if len(token_sets) < 1:
+            raise RuntimeError("No tasks produced tokens")
+
+        if len(token_sets) == 1:
+            all_tokens = token_sets[0]
         else:
-            depth = 0
-            nhead = int(self.nhead)
-            head_dim = int(max(1, self.d_model // max(1, nhead)))
-        filler = tokens.new_zeros(
-            (max(1, depth), B, max(1, nhead), max(1, head_dim))
-        )
-        return tokens, context, filler
+            all_tokens = torch.cat(token_sets, dim=1)
 
-    def forward_stream(
-        self: Self,
-        x: torch.Tensor,
-        *args: Any,
-        temporal_state: Optional[torch.Tensor] = None,
-        causal_mask: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        tokens, context, next_state = self.forward_state(
-            x,
-            temporal_state=temporal_state,
-            causal_mask=causal_mask,
+        attn_bias = self._build_attn_bias(
+            names,
+            token_sets,
+            device=all_tokens.device,
+            dtype=all_tokens.dtype,
         )
-        return tokens, context, next_state
 
-    def decode(
-        self: Self, tokens: torch.Tensor, *args: Any, apply_norm: bool = False
-    ) -> torch.Tensor:
+        fused_tokens = self.perceiver(all_tokens, attn_bias=attn_bias)
+        context = self.decode(fused_tokens, apply_norm=True)
+
+        if return_temporal_state:
+            if state_is_map:
+                return fused_tokens, context, next_state_map
+            return fused_tokens, context, next_state
+        return fused_tokens, context
+
+    def forward_export(self: Self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        tokens, ctx = self.forward(x, temporal_state=None, return_temporal_state=False)
+        return cast(torch.Tensor, tokens), cast(torch.Tensor, ctx)
+
+    def decode(self: Self, tokens: torch.Tensor, *, apply_norm: bool = True) -> torch.Tensor:
+        x = tokens
         if apply_norm:
-            tokens = self.norm(tokens)
-        pooled = tokens.mean(dim=1)
-        flat = self.head(pooled)
-        return flat.reshape(tokens.shape[0], *self.out_shape)
-
-    def forward_export(
-        self: Self, x: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        if not isinstance(x, torch.Tensor):
-            raise TypeError("forward_export expects a Tensor")
-        views, _ = self._run_views(
-            x, temporal_state=None, want_state=False, causal_mask=None
-        )
-        mode_l = _coerce_modeling_types(self.modeling_type)
-        if mode_l == "ss":
-            chosen = [self._pick_view(views, ("spatial", "s"))]
-        elif mode_l == "tt":
-            chosen = [self._pick_view(views, ("temporal", "t"))]
-        else:
-            fused = self._run_fusions(views)
-            chosen = fused if len(fused) > 0 else list(views.values())
-        chosen = [self._as_3d_tokens(t) for t in chosen]
-        tokens = self._aggregate_tokens(chosen)
-        context = self.decode(tokens, apply_norm=False)
-        return tokens, context
+            x = self.norm(x)
+        pooled = x.mean(dim=1)
+        out = self.head(pooled)
+        return out.reshape(out.shape[0], *self.out_shape)
 
 
 class Model(nn.Module):
@@ -1169,12 +1267,12 @@ class Model(nn.Module):
             if self.is_norm_linear
             else None
         )
-        self.fuser = TokenFuser(self.in_dim, self.out_shape, config=config).to(
+        self.fuser = Fuser(self.in_dim, self.out_shape, config=config).to(
             self._device
         )
         self.processor = self.fuser
         bucket = self._get_cfg(config, "length_bucket_multiple", 64, int)
-        self.temporal_token_collector = TokenCollector(
+        self.temporal_token_collector = Collector(
             int(config.d_model),
             int(config.heads),
             depth=max(1, int(getattr(config, "temporal_depth", 1))),
@@ -1491,12 +1589,9 @@ class Model(nn.Module):
         self.microbatch: int = 0
         self._auto_microbatch_pending: bool = True
         self._runtime_lock = Mutex()
-        self._eager_processor_temporal_net = getattr(
-            self.processor, "temporal_net", None
-        )
-        self._eager_processor_perception = getattr(
-            self.processor, "perception", None
-        )
+        self._eager_fuser_perceiver = getattr(self.fuser, "perceiver", None)
+        self._eager_perceiver_cross: Optional[list[nn.Module]] = None
+        self._eager_perceiver_self_blocks: Optional[list[nn.Module]] = None
         self._decode_compiled: Optional[nn.Module] = None
         try:
             self.register_buffer(
@@ -1623,51 +1718,32 @@ class Model(nn.Module):
                 _modulelist_swap(modlist, compiled_items)
             return compiled_any, eager_items, compiled_items
 
-        def _compile_temporal_piecewise(view: nn.Module) -> bool:
-            extractor = getattr(view, "extractor", None)
-            blocks = (
-                getattr(extractor, "blocks", None) if extractor is not None else None
-            )
-            if not isinstance(blocks, nn.ModuleList):
-                return False
-            compiled_any, eager_items, _ = _compile_modulelist_inplace(
-                blocks, label="temporal.blocks"
-            )
-            if compiled_any:
-                self._eager_temporal_blocks = eager_items
-            return compiled_any
-
-        def _compile_perception_piecewise(perception: nn.Module) -> bool:
+        def _compile_perceiver_piecewise(perceiver: nn.Module) -> bool:
             compiled_any = False
-            cross = getattr(perception, "cross", None)
+            cross = getattr(perceiver, "cross", None)
             if isinstance(cross, nn.ModuleList):
                 c_any, eager_items, _ = _compile_modulelist_inplace(
-                    cross, label="perception.cross"
+                    cross, label="perceiver.cross"
                 )
-                compiled_any |= c_any
                 if c_any:
-                    self._eager_perception_cross = eager_items
-                with contextlib.suppress(Exception):
-                    if len(cross) >= 2:
-                        perception.cross_s = cross[0]
-                        perception.cross_t = cross[1]
-            mix = getattr(perception, "mix", None)
-            if isinstance(mix, nn.Module):
-                compiled = _compile_one(mix, label="perception.mix")
-                if compiled is not mix:
                     compiled_any = True
-                    self._eager_perception_mix = mix
-                    setattr(perception, "mix", compiled)
+                    self._eager_perceiver_cross = eager_items
+            self_blocks = getattr(perceiver, "self_blocks", None)
+            if isinstance(self_blocks, nn.ModuleList):
+                s_any, eager_items, _ = _compile_modulelist_inplace(
+                    self_blocks, label="perceiver.self_blocks"
+                )
+                if s_any:
+                    compiled_any = True
+                    self._eager_perceiver_self_blocks = eager_items
             return compiled_any
-
         staged_heavy = bool(
             nogil_opt
             or compile_mode_canonical
             in {"max-autotune", "max-autotune-no-cudagraphs"}
         )
         compiled_decode = False
-        compiled_temporal = False
-        compiled_perception = False
+        compiled_perceiver = False
         if compile_enabled:
             with compile_patch_ctx:
                 try:
@@ -1699,75 +1775,29 @@ class Model(nn.Module):
                 _empty_cache()
 
                 try:
-                    _cur = getattr(self.processor, "temporal_net", None)
-                    if isinstance(_cur, nn.Module):
+                    perceiver = getattr(self.fuser, "perceiver", None)
+                    if isinstance(perceiver, nn.Module):
                         if staged_heavy:
-                            compiled_temporal = _compile_temporal_piecewise(_cur)
-                        if not compiled_temporal:
-                            _orig = self._eager_processor_temporal_net
-                            if _orig is not None:
-                                _compiled = _compile_one(
-                                    _orig, label="fuser temporal view"
-                                )
-                                self.processor.temporal_net = _compiled
-                                with contextlib.suppress(Exception):
-                                    if hasattr(self.processor, "view_encoders") and (
-                                        "temporal" in self.processor.view_encoders
-                                    ):
-                                        self.processor.view_encoders[
-                                            "temporal"
-                                        ] = _compiled
-                                compiled_temporal = _compiled is not _orig
+                            compiled_perceiver = _compile_perceiver_piecewise(perceiver)
+                        if not compiled_perceiver:
+                            orig = getattr(self, "_eager_fuser_perceiver", None)
+                            if isinstance(orig, nn.Module):
+                                _compiled = _compile_one(orig, label="fuser.perceiver")
+                                self.fuser.perceiver = _compiled
+                                compiled_perceiver = _compiled is not orig
                 except Exception:
                     _LOGGER.warning(
-                        "torch.compile failed for fuser temporal view; continuing eagerly",
+                        "torch.compile failed for fuser perceiver; continuing eagerly",
                         exc_info=True,
                     )
                 _empty_cache()
 
-                try:
-                    _cur = getattr(self.processor, "perception", None)
-                    if isinstance(_cur, nn.Module):
-                        if staged_heavy:
-                            compiled_perception = _compile_perception_piecewise(_cur)
-                        if not compiled_perception:
-                            _orig = self._eager_processor_perception
-                            if _orig is not None:
-                                _compiled = _compile_one(
-                                    _orig,
-                                    label="fuser primary pair fuser",
-                                )
-                                self.processor.perception = _compiled
-                                with contextlib.suppress(Exception):
-                                    if hasattr(self.processor, "pair_fusers"):
-                                        if (
-                                            "spatial|temporal"
-                                            in self.processor.pair_fusers
-                                        ):
-                                            self.processor.pair_fusers[
-                                                "spatial|temporal"
-                                            ] = _compiled
-                                        elif len(self.processor.pair_fusers) == 1:
-                                            _pair = next(
-                                                iter(self.processor.pair_fusers.keys())
-                                            )
-                                            self.processor.pair_fusers[_pair] = _compiled
-                                compiled_perception = _compiled is not _orig
-                except Exception:
-                    _LOGGER.warning(
-                        "torch.compile failed for fuser primary pair fuser; continuing eagerly",
-                        exc_info=True,
-                    )
-                _empty_cache()
         self._compiled_submodules = {
             "decode": bool(compiled_decode),
-            "temporal_net": bool(compiled_temporal),
-            "perception": bool(compiled_perception),
+            "perceiver": bool(compiled_perceiver),
         }
-        self._pad_compiled_microbatch = bool(
-            compiled_decode or compiled_temporal or compiled_perception
-        )
-        self._amp_dtype_cache: Dict[Tuple[Any, ...], torch.dtype] = {}
+        self._pad_compiled_microbatch = bool(compiled_decode or compiled_perceiver)
+        self._amp_dtype_cache: dict[Tuple[Any, ...], torch.dtype] = {}
         self._amp_dtype_cache_last_key: Tuple[Any, ...] | None = None
         self._amp_dtype_cache_last_dtype: torch.dtype | None = None
         self._amp_dtype_cache_max = 64
@@ -1786,6 +1816,7 @@ class Model(nn.Module):
             if isinstance(getattr(self, "logger", None), Recorder):
                 self.logger.cpu()
         return cast(Model, out)
+
 
     def __getstate__(self: Self) -> dict[str, object]:
         ctx = contextlib.nullcontext()
@@ -1824,102 +1855,59 @@ class Model(nn.Module):
 
     @contextlib.contextmanager
     def eager_for_export(self: Self) -> None:
-        proc = getattr(self, "processor", None)
+        proc = getattr(self, "fuser", None)
         if proc is None:
-            proc = getattr(self, "fuser", None)
+            proc = getattr(self, "processor", None)
         if proc is None:
             yield self
             return
 
-        def _sync_after_swap(swapped: str) -> None:
-            if swapped == "temporal_net":
-                with contextlib.suppress(Exception):
-                    if hasattr(proc, "view_encoders") and (
-                        "temporal" in proc.view_encoders
-                    ):
-                        proc.view_encoders["temporal"] = proc.temporal_net
-            elif swapped == "perception":
-                with contextlib.suppress(Exception):
-                    if hasattr(proc, "pair_fusers"):
-                        if "spatial|temporal" in proc.pair_fusers:
-                            proc.pair_fusers["spatial|temporal"] = (
-                                proc.perception
-                            )
-                        elif len(proc.pair_fusers) == 1:
-                            k = next(iter(proc.pair_fusers.keys()))
-                            proc.pair_fusers[k] = proc.perception
-
         swaps: list[tuple[object, str, Any]] = []
         list_swaps: list[tuple[nn.ModuleList, list[nn.Module]]] = []
+
         with contextlib.suppress(Exception):
-            eager_temporal = getattr(
-                self, "_eager_processor_temporal_net", None
-            )
-            if isinstance(eager_temporal, nn.Module):
-                cur = getattr(proc, "temporal_net", None)
-                if cur is not eager_temporal and cur is not None:
-                    swaps.append((proc, "temporal_net", cur))
-                    proc.temporal_net = eager_temporal
-                    _sync_after_swap("temporal_net")
+            eager_perceiver = getattr(self, "_eager_fuser_perceiver", None)
+            if isinstance(eager_perceiver, nn.Module):
+                cur = getattr(proc, "perceiver", None)
+                if cur is not None and cur is not eager_perceiver:
+                    swaps.append((proc, "perceiver", cur))
+                    proc.perceiver = eager_perceiver
+
         with contextlib.suppress(Exception):
-            eager_perception = getattr(
-                self, "_eager_processor_perception", None
+            perceiver = getattr(proc, "perceiver", None)
+            cross = getattr(perceiver, "cross", None) if perceiver is not None else None
+            eager_cross = getattr(self, "_eager_perceiver_cross", None)
+            if isinstance(cross, nn.ModuleList) and isinstance(eager_cross, list):
+                if len(eager_cross) == len(cross):
+                    cur_items = list(cross)
+                    if any(cur_items[i] is not eager_cross[i] for i in range(len(cross))):
+                        list_swaps.append((cross, cur_items))
+                        for i, item in enumerate(eager_cross):
+                            cross[i] = item
+
+        with contextlib.suppress(Exception):
+            perceiver = getattr(proc, "perceiver", None)
+            self_blocks = (
+                getattr(perceiver, "self_blocks", None) if perceiver is not None else None
             )
-            if isinstance(eager_perception, nn.Module):
-                cur = getattr(proc, "perception", None)
-                if cur is not eager_perception and cur is not None:
-                    swaps.append((proc, "perception", cur))
-                    proc.perception = eager_perception
-                    _sync_after_swap("perception")
+            eager_self = getattr(self, "_eager_perceiver_self_blocks", None)
+            if isinstance(self_blocks, nn.ModuleList) and isinstance(eager_self, list):
+                if len(eager_self) == len(self_blocks):
+                    cur_items = list(self_blocks)
+                    if any(
+                        cur_items[i] is not eager_self[i]
+                        for i in range(len(self_blocks))
+                    ):
+                        list_swaps.append((self_blocks, cur_items))
+                        for i, item in enumerate(eager_self):
+                            self_blocks[i] = item
+
         with contextlib.suppress(Exception):
             dc = getattr(self, "_decode_compiled", None)
             if isinstance(dc, nn.Module):
                 swaps.append((self, "_decode_compiled", dc))
                 self._decode_compiled = None
 
-        with contextlib.suppress(Exception):
-            eager_blocks = getattr(self, "_eager_temporal_blocks", None)
-            blocks = getattr(
-                getattr(getattr(proc, "temporal_net", None), "extractor", None),
-                "blocks",
-                None,
-            )
-            if isinstance(blocks, nn.ModuleList) and isinstance(eager_blocks, list):
-                if len(eager_blocks) == len(blocks):
-                    cur_items = list(blocks)
-                    if any(
-                        cur_items[i] is not eager_blocks[i]
-                        for i in range(len(eager_blocks))
-                    ):
-                        list_swaps.append((blocks, cur_items))
-                        for i, item in enumerate(eager_blocks):
-                            blocks[i] = item
-        with contextlib.suppress(Exception):
-            eager_cross = getattr(self, "_eager_perception_cross", None)
-            perception = getattr(proc, "perception", None)
-            cross = getattr(perception, "cross", None)
-            if isinstance(cross, nn.ModuleList) and isinstance(eager_cross, list):
-                if len(eager_cross) == len(cross):
-                    cur_items = list(cross)
-                    if any(
-                        cur_items[i] is not eager_cross[i]
-                        for i in range(len(eager_cross))
-                    ):
-                        list_swaps.append((cross, cur_items))
-                        for i, item in enumerate(eager_cross):
-                            cross[i] = item
-                    with contextlib.suppress(Exception):
-                        if len(cross) >= 2 and perception is not None:
-                            perception.cross_s = cross[0]
-                            perception.cross_t = cross[1]
-        with contextlib.suppress(Exception):
-            eager_mix = getattr(self, "_eager_perception_mix", None)
-            perception = getattr(proc, "perception", None)
-            if isinstance(eager_mix, nn.Module) and perception is not None:
-                cur_mix = getattr(perception, "mix", None)
-                if isinstance(cur_mix, nn.Module) and (cur_mix is not eager_mix):
-                    swaps.append((perception, "mix", cur_mix))
-                    perception.mix = eager_mix
         try:
             yield self
         finally:
@@ -1930,15 +1918,13 @@ class Model(nn.Module):
             for target, name, old in swaps:
                 with contextlib.suppress(Exception):
                     setattr(target, name, old)
-                if target is proc:
-                    _sync_after_swap(name)
 
     def _run_forward_core(
         self: Self,
         features: torch.Tensor,
         *args: Any,
         export: bool = False,
-        temporal_state: Optional[torch.Tensor] = None,
+        temporal_state: object = None,
         causal_mask: Optional[torch.Tensor] = None,
         sanitize_nan: bool = True,
         calibrate_output: bool = True,
@@ -1946,7 +1932,7 @@ class Model(nn.Module):
         base_dtype: Optional[torch.dtype] = None,
     ) -> tuple[
         torch.Tensor,
-        torch.Tensor | None,
+        object | None,
         torch.Tensor | None,
         torch.Tensor,
         torch.Tensor,
@@ -2062,11 +2048,11 @@ class Model(nn.Module):
         self: Self,
         features: torch.Tensor,
         *args: Any,
-        temporal_state: Optional[torch.Tensor] = None,
+        temporal_state: object = None,
         causal_mask: Optional[torch.Tensor] = None,
         calibrate_output: bool = True,
         sanitize_nan: bool = True,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, Any]:
         if not isinstance(features, torch.Tensor):
             raise TypeError("forward_stream expects a Tensor input")
         pred, next_state, _, _, _, _, _, _ = self._run_forward_core(
@@ -2632,7 +2618,7 @@ class Model(nn.Module):
 
             def _encode(
                 inp: torch.Tensor,
-            ) -> Tuple[torch.Tensor, torch.Tensor]:
+            ) -> Tuple[torch.Tensor, Any]:
                 with (
                     Autocast.float(device, metadata=meta)
                     if amp_enabled
@@ -3129,6 +3115,77 @@ class Model(nn.Module):
             if _did_unshard_fuser and callable(_reshard):
                 with contextlib.suppress(Exception):
                     _reshard()
+
+
+    def list_tasks(self: Self, *, by: str = "name") -> list[str]:
+        return self.fuser.list_tasks(by=by)
+
+    def resolve_task_id(self: Self, task_id_or_name: str) -> str:
+        return self.fuser.resolve_task_id(task_id_or_name)
+
+    def get_task_name(self: Self, task_id: str) -> str:
+        return self.fuser.get_task_name(task_id)
+
+    def task_specs(self: Self) -> list[dict[str, Any]]:
+        return self.fuser.task_specs()
+
+    def rebuild_tasks_from_specs(
+        self: Self, specs: Sequence[Mapping[str, Any]]
+    ) -> None:
+        self.fuser.rebuild_tasks_from_specs(specs)
+
+    def add_task(
+        self: Self,
+        name: Optional[str] = None,
+        *,
+        task_id: Optional[str] = None,
+        description: str = "",
+        tags: Optional[Sequence[str]] = None,
+        mode: str,
+        tokens: Optional[int] = None,
+        depth: Optional[int] = None,
+        weight: float = 1.0,
+        eps: float = 1e-6,
+        submodel: Optional[nn.Module] = None,
+    ) -> str:
+        return self.fuser.add_task(
+            name,
+            task_id=task_id,
+            description=description,
+            tags=tags,
+            mode=mode,
+            tokens=tokens,
+            depth=depth,
+            weight=weight,
+            eps=eps,
+            submodel=submodel,
+        )
+
+    def update_task(
+        self: Self,
+        task_id: str,
+        *,
+        name: object = _META_UNSET,
+        description: object = _META_UNSET,
+        tags: object = _META_UNSET,
+        mode: Optional[str] = None,
+        weight: Optional[float] = None,
+        eps: Optional[float] = None,
+        submodel: object = _SUBMODEL_UNSET,
+    ) -> None:
+        self.fuser.update_task(
+            task_id,
+            name=name,
+            description=description,
+            tags=tags,
+            mode=mode,
+            weight=weight,
+            eps=eps,
+            submodel=submodel,
+        )
+
+    def remove_task(self: Self, task_id: str) -> None:
+        self.fuser.remove_task(task_id)
 
     def predict(
         self: Self,
