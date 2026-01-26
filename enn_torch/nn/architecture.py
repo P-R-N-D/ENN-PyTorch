@@ -756,12 +756,24 @@ class Fuser(nn.Module):
             )
 
     def _resolve_stream_task_id(self: Self) -> None:
-        sid = str(getattr(self, "stream_task_id", "") or "").strip()
+        def _normalize_stream_ref(value: object) -> str:
+            raw = str(value or "")
+            return raw.replace("\r", "").replace("\n", "").strip()
+
+        sid = _normalize_stream_ref(getattr(self, "stream_task_id", ""))
+        name = _normalize_stream_ref(getattr(self, "stream_task_name", ""))
         chosen = ""
-        if sid and sid in self.tasks:
-            tmpl = self.tasks[sid]
+        for raw in (sid, name):
+            if not raw:
+                continue
+            try:
+                resolved = self.resolve_task_id(raw)
+            except KeyError:
+                continue
+            tmpl = self.tasks.get(resolved)
             if isinstance(tmpl, Template) and str(getattr(tmpl, "mode", "")) == "temporal":
-                chosen = sid
+                chosen = resolved
+                break
 
         if not chosen:
             temporal_ids = [
