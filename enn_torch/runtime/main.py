@@ -2517,6 +2517,61 @@ def update_progress_bar(
         bar.update(inc)
 
 
+def get_checkpoint_bar(
+    *args: Any,
+    title: str,
+    total: int,
+    device: torch.device,
+    **kwargs: Any,
+) -> object:
+    try:
+        if (
+            torch.distributed.is_initialized()
+            and torch.distributed.get_rank() != 0
+        ):
+            return None
+    except Exception:
+        pass
+    if int(total) <= 0:
+        return None
+    bar = tqdm(
+        total=int(total),
+        desc=f"{title} ({device.type.upper()}) ",
+        unit=f"(Total = {int(total)}, Finished = 0) Checkpoint in Progress",
+        bar_format="{desc}"
+        + "{bar} {percentage:3.2f} % "
+        + "{unit}",
+        colour="green",
+        ascii=True,
+        position=0,
+        leave=False,
+        file=sys.stdout,
+    )
+    return bar
+
+
+def update_checkpoint_bar(
+    bar: object,
+    finish: bool,
+    total: int,
+    position: int,
+    *args: Any,
+    **kwargs: Any,
+) -> None:
+    if bar is None:
+        return
+    try:
+        inc = int(finish)
+    except Exception:
+        inc = 1
+    if inc = 0:
+        chpt_expr = f"(Total = {int(total)}, Finished = {int(position)}) Checkpoint in Progress"
+    elif inc > 0:
+        chpt_expr = f"(Total = {int(total)}, Finished = {int(position)}) Checkpoint Completed"
+    bar.unit = chpt_expr
+    bar.update(inc)
+
+
 def epochs(
     model: nn.Module,
     device: torch.device,
@@ -2918,6 +2973,11 @@ def epochs(
         )
     status_bar = (
         get_progress_bar(title="Training", total=total_updates, device=device)
+        if local_rank == 0
+        else None
+    )
+    checkpoint_bar = (
+        get_checkpoint_bar(title="Training", total=int(ops.epochs), device=device)
         if local_rank == 0
         else None
     )
@@ -4057,19 +4117,11 @@ def epochs(
                     )
                     _coerce_dcp_keys(model_sd)
                     ckpt_percentage = 100 * float(int(epoch_idx + 1) / int(ops.epochs))
-                    _LOGGER.info(
-                        "Training (%s) Checkpoint in Progress at %3.2f %% (Total = %d, Finished = %d)",
-                        str(device.type).upper(),
-                        round(ckpt_percentage, 2),
-                        int(ops.epochs),
-                        int(epoch_idx),
-                    )
-                    print(
-                        f"Training ({str(device.type).upper()}) Checkpoint in Progress at {round(ckpt_percentage, 2)} % (Total = {int(ops.epochs)}, Finished = {int(epoch_idx)})",
-                        flush=True,
+                    update_checkpoint_bar(
+                        checkpoint_bar, finish=False, total=int(ops.epochs), position=int(epoch_idx)
                     )
                     from .workflow import save_model as _api_save_model
-
+                    
                     _ozl_kwargs: dict[str, object] = {}
                     if str(ckpt_path).lower().endswith(".ozl"):
                         _lvl = os.environ.get("ENN_OPENZL_LEVEL")
@@ -4107,16 +4159,8 @@ def epochs(
                         state_dict=model_sd,
                         **_ozl_kwargs,
                     )
-                    _LOGGER.info(
-                        "Training (%s) Checkpoint Successful at %3.2f %% (Total = %d, Finished = %d)",
-                        str(device.type).upper(),
-                        round(ckpt_percentage, 2),
-                        int(ops.epochs),
-                        int(epoch_idx + 1),
-                    )
-                    print(
-                        f"Training ({str(device.type).upper()}) Checkpoint Successful at {round(ckpt_percentage, 2)} % (Total = {int(ops.epochs)}, Finished = {int(epoch_idx + 1)})",
-                        flush=True,
+                    update_checkpoint_bar(
+                        checkpoint_bar, finish=True, total=int(ops.epochs), position=int(epoch_idx)
                     )
                     try:
                         del model_sd
