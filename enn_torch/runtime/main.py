@@ -2471,7 +2471,7 @@ def get_progress_bar(
         desc=f"{title} ({device.type.upper()}) ",
         unit="I/O < 0.01 MB/s, COM < 0.01 TFLOPS",
         bar_format="{desc}"
-        + "{bar} {percentage:3.0f}% "
+        + "{bar} {percentage:3.2f}% "
         + "({unit}) Elapsed: {elapsed}, Remaining: {remaining}",
         colour="green",
         ascii=True,
@@ -4058,14 +4058,14 @@ def epochs(
                     _coerce_dcp_keys(model_sd)
                     ckpt_percentage = 100 * float(int(epoch_idx + 1) / int(ops.epochs))
                     _LOGGER.info(
-                        "Training (%s) Checkpoint in Progress at %d%% (Total = %d, Finished = %d)",
+                        "Training (%s) Checkpoint in Progress at %3.2f%% (Total = %d, Finished = %d)",
                         str(device.type).upper(),
-                        round(ckpt_percentage),
+                        round(ckpt_percentage, 2),
                         int(ops.epochs),
                         int(epoch_idx),
                     )
                     print(
-                        f"Training ({str(device.type).upper()}) Checkpoint in Progress at {round(ckpt_percentage)}% (Total = {int(ops.epochs)}, Finished = {int(epoch_idx)})",
+                        f"Training ({str(device.type).upper()}) Checkpoint in Progress at {round(ckpt_percentage, 2)}% (Total = {int(ops.epochs)}, Finished = {int(epoch_idx)})",
                         flush=True,
                     )
                     from .workflow import save_model as _api_save_model
@@ -4108,14 +4108,14 @@ def epochs(
                         **_ozl_kwargs,
                     )
                     _LOGGER.info(
-                        "Training (%s) Checkpoint Successful at %d%% (Total = %d, Finished = %d)",
+                        "Training (%s) Checkpoint Successful at %3.2f%% (Total = %d, Finished = %d)",
                         str(device.type).upper(),
-                        round(ckpt_percentage),
+                        round(ckpt_percentage, 2),
                         int(ops.epochs),
                         int(epoch_idx + 1),
                     )
                     print(
-                        f"Training ({str(device.type).upper()}) Checkpoint Successful at {round(ckpt_percentage)}% (Total = {int(ops.epochs)}, Finished = {int(epoch_idx + 1)})",
+                        f"Training ({str(device.type).upper()}) Checkpoint Successful at {round(ckpt_percentage, 2)}% (Total = {int(ops.epochs)}, Finished = {int(epoch_idx + 1)})",
                         flush=True,
                     )
                     try:
