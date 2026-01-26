@@ -2316,7 +2316,7 @@ class TensorDictSlicer:
         return self.td[s:e]
 
 
-class ShardCollector:
+class Unsharder:
     __slots__ = (
         "chunk_dir",
         "rank",

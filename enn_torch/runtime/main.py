@@ -108,7 +108,7 @@ from ..core.system import (
 from ..core.tensor import is_meta_or_fake_tensor, to_torch_tensor
 from .. import schema
 from ..data import collate
-from ..data.collate import ShardCollector
+from ..data.collate import Unsharder
 from ..data.pipeline import Dataset
 from ..nn.architecture import Model
 from ..nn.layers import Recorder, resize_scaler_buffer
@@ -4604,7 +4604,7 @@ def infer(
         else None
     )
     row_cursor = 0
-    writer = ShardCollector(
+    writer = Unsharder(
         chunk_dir=str(chunk_dir),
         rank=int(rank),
         use_mmt_pred_parts=bool(use_mmt_pred_parts),
