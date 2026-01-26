@@ -919,13 +919,23 @@ def torch_compiler_disable(
         fn = getattr(target, attr)
         if getattr(fn, _NO_COMPILE_SENTINEL, False):
             return True
-        decorator = _decorate_compiler_disable(
-            reason=reason, recursive=recursive
-        )
+        decorator = _decorate_compiler_disable(reason=reason, recursive=recursive)
         try:
-            wrapped = decorator(fn)
+            non_export_wrapped = decorator(fn)
         except Exception:
             return False
+
+        if non_export_wrapped is fn:
+            wrapped = fn
+        else:
+            import functools
+
+            @functools.wraps(fn)
+            def wrapped(*a: Any, **kw: Any) -> Any:
+                if is_export_or_trace():
+                    return fn(*a, **kw)
+                return non_export_wrapped(*a, **kw)
+
         with suppress(Exception):
             setattr(wrapped, _NO_COMPILE_SENTINEL, True)
         try:
@@ -935,7 +945,19 @@ def torch_compiler_disable(
         return True
     decorator = _decorate_compiler_disable(reason=reason, recursive=recursive)
     if callable(target):
-        return decorator(target)
+        fn = target
+        non_export_wrapped = decorator(fn)
+        if non_export_wrapped is fn:
+            return fn
+        import functools
+
+        @functools.wraps(fn)
+        def wrapped(*a: Any, **kw: Any) -> Any:
+            if is_export_or_trace():
+                return fn(*a, **kw)
+            return non_export_wrapped(*a, **kw)
+
+        return wrapped
     return decorator
 
 

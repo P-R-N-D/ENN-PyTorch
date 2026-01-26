@@ -524,7 +524,7 @@ class Template(nn.Module):
         causal_mask: Optional[torch.Tensor] = None,
     ) -> Any:
         x = tokens
-        B = int(x.shape[0])
+        B = x.size(0)
         st_tensor = self._coerce_state_tensor(
             state,
             B=B,
@@ -1205,7 +1205,11 @@ class Fuser(nn.Module):
             e_list.append(e.to(device=device, dtype=torch.float32).reshape(()))
 
             if exporting:
-                cnt = int(getattr(tmpl, "tokens", int(t.size(1))))
+                tok = getattr(tmpl, "tokens", None)
+                if tok is not None:
+                    cnt = int(tok)
+                else:
+                    cnt = int(t.size(1))
             else:
                 cnt = int(t.size(1))
             counts.append(cnt)
@@ -1301,7 +1305,7 @@ class Fuser(nn.Module):
                         f"BYOM for task '{name}' must return torch.Tensor; got {type(out_tokens)}"
                     )
 
-            if out_tokens.dim() != 3 or int(out_tokens.size(-1)) != int(self.d_model):
+            if out_tokens.dim() != 3 or out_tokens.size(-1) != self.d_model:
                 raise ValueError(
                     f"Task '{name}' must return tokens shaped (B,N,{self.d_model}); got {tuple(out_tokens.shape)}"
                 )
