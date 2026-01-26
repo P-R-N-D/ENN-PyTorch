@@ -876,6 +876,11 @@ class Fuser(nn.Module):
         self._user_submodels = {}
         self._legacy_task_id_to_name = {}
 
+        if not specs:
+            self._init_default_tasks()
+            self._resolve_stream_task_id()
+            return
+
         for spec in specs:
             if not isinstance(spec, dict):
                 continue
@@ -980,7 +985,8 @@ class Fuser(nn.Module):
 
         tags_list: list[str] = []
         if tags is not None:
-            for t in tags:
+            tags_iter = (tags,) if isinstance(tags, str) else tags
+            for t in tags_iter:
                 s = str(t).strip()
                 if s and s not in tags_list:
                     tags_list.append(s)
@@ -1031,7 +1037,8 @@ class Fuser(nn.Module):
         if tags is not _META_UNSET:
             tags_list: list[str] = []
             if tags is not None:
-                for t in tags:
+                tags_iter = (tags,) if isinstance(tags, str) else tags
+                for t in tags_iter:
                     s = str(t).strip()
                     if s and s not in tags_list:
                         tags_list.append(s)
