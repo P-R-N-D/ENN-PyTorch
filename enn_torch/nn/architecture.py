@@ -770,7 +770,7 @@ class Fuser(nn.Module):
                 resolved = self.resolve_task_id(raw)
             except KeyError:
                 continue
-            tmpl = self.tasks.get(resolved)
+            tmpl = self.tasks[resolved] if resolved in self.tasks else None
             if isinstance(tmpl, Template) and str(getattr(tmpl, "mode", "")) == "temporal":
                 chosen = resolved
                 break
