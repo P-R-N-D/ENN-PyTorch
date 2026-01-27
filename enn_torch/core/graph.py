@@ -315,30 +315,30 @@ def skip_non_infra_dispatch_mode() -> Iterator[None]:
 
 
 def is_dynamo_compiling() -> bool:
-    with suppress(Exception):
-        comp = getattr(torch, "compiler", None)
-        fn = getattr(comp, "is_dynamo_compiling", None)
-        if callable(fn):
-            return bool(fn())
-    with suppress(Exception):
-        dyn = getattr(torch, "_dynamo", None)
-        fn = getattr(dyn, "is_dynamo_compiling", None)
-        if callable(fn):
-            return bool(fn())
+    comp = getattr(torch, "compiler", None)
+    fn = getattr(comp, "is_dynamo_compiling", None) if comp is not None else None
+    if callable(fn) and bool(fn()):
+        return True
+    dyn = getattr(torch, "_dynamo", None)
+    fn = getattr(dyn, "is_dynamo_compiling", None) if dyn is not None else None
+    if callable(fn) and bool(fn()):
+        return True
     return False
 
 
 def is_compiling() -> bool:
     dyn = getattr(torch, "_dynamo", None)
-    fn = getattr(dyn, "is_compiling", None)
+    fn = getattr(dyn, "is_compiling", None) if dyn is not None else None
     if callable(fn) and bool(fn()):
         return True
-    fn = getattr(dyn, "is_dynamo_compiling", None)
+    fn = (
+        getattr(dyn, "is_dynamo_compiling", None) if dyn is not None else None
+    )
     if callable(fn) and bool(fn()):
         return True
 
     comp = getattr(torch, "compiler", None)
-    fn = getattr(comp, "is_compiling", None)
+    fn = getattr(comp, "is_compiling", None) if comp is not None else None
     if callable(fn) and bool(fn()):
         return True
     return False
@@ -358,21 +358,16 @@ def is_fake_tensor_mode_active() -> bool:
 
 def is_tracing_or_exporting() -> bool:
     jit = getattr(torch, "jit", None)
-    if jit is not None:
-        fn = getattr(jit, "is_tracing", None)
-        if callable(fn) and bool(fn()):
-            return True
-        fn = getattr(jit, "is_scripting", None)
-        if callable(fn) and bool(fn()):
-            return True
+    if jit is not None and (torch.jit.is_tracing() or torch.jit.is_scripting()):
+        return True
 
     comp = getattr(torch, "compiler", None)
-    fn = getattr(comp, "is_exporting", None)
+    fn = getattr(comp, "is_exporting", None) if comp is not None else None
     if callable(fn) and bool(fn()):
         return True
 
     onnx = getattr(torch, "onnx", None)
-    fn = getattr(onnx, "is_in_onnx_export", None)
+    fn = getattr(onnx, "is_in_onnx_export", None) if onnx is not None else None
     if callable(fn) and bool(fn()):
         return True
 
@@ -844,17 +839,25 @@ def torch_compiler_supported() -> bool:
 
 
 def cudagraph_mark_step_begin() -> None:
+    if is_export_or_trace():
+        return
     mark_step = getattr(_TORCH_COMPILER, "cudagraph_mark_step_begin", None)
     if callable(mark_step):
-        with suppress(Exception):
+        try:
             mark_step()
+        except Exception:
+            pass
 
 
 def cudagraph_mark_step_end() -> None:
+    if is_export_or_trace():
+        return
     mark_step = getattr(_TORCH_COMPILER, "cudagraph_mark_step_end", None)
     if callable(mark_step):
-        with suppress(Exception):
+        try:
             mark_step()
+        except Exception:
+            pass
 
 
 def graph_break() -> None:
