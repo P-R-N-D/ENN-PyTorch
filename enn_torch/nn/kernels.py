@@ -80,6 +80,7 @@ except Exception:
 
 _HAS_TE = False
 te = None
+
 if torch.cuda.is_available() and getattr(get_device(), "type", "cpu") == "cuda":
     try:
         import transformer_engine.pytorch as te
@@ -88,7 +89,6 @@ if torch.cuda.is_available() and getattr(get_device(), "type", "cpu") == "cuda":
     except Exception:
         _HAS_TE = False
         pass
-
 
 _FLEX_ATTN_COMPILED: dict[str, Any] = {}
 _FLEX_ATTN_COMPILE_LOCK = threading.Lock()
@@ -104,7 +104,6 @@ _FLEX_ATTN_FAILED: dict[tuple[Any, ...], str] = {}
 _FLEX_ATTN_WARNED: set[str] = set()
 _FLEX_ATTN_RESOURCE_KOPTS: dict[int, dict[str, Any]] = {}
 _FLEX_ATTN_RESOURCE_KOPTS_LOCK = threading.Lock()
-_te = None
 
 
 def _flex_attention_disabled() -> bool:
@@ -115,7 +114,6 @@ def _flex_attention_compile_mode() -> str:
     cfg = get_runtime_cfg()
     global_mode = getattr(cfg, "compile_mode", "disabled")
     global_mode = canonicalize_compile_mode(global_mode)
-
     if global_mode in {"disabled", "aot-eager"}:
         return "aot-eager"
     if global_mode == "reduce-overhead":
@@ -213,7 +211,6 @@ def _compile_flex_attention_wrapper(
     if _torch_flex_attention is None:
         raise RuntimeError("Flex Attention is not available")
     frozen = dict(flex_kwargs)
-
     dyn_key = dynamic if dynamic is None else bool(dynamic)
     base_key = ("flexattn-base", str(mode), dyn_key)
     base = _FLEX_ATTN_BASE_COMPILED.get(base_key)
@@ -265,7 +262,6 @@ def _is_compile_failure(exc: BaseException) -> bool:
 
 def _call_with_flex_warn_guard(fn: Callable[[], Any]) -> tuple[Any, bool]:
     saw_uncompiled = False
-
     orig_showwarning = warnings.showwarning
 
     def _showwarning(
@@ -321,13 +317,10 @@ def _get_compiled_flex_attention_for_kwargs(
 ) -> tuple[Any, tuple[Any, ...]]:
     if not _HAS_TORCH_FLEX or _torch_flex_attention is None:
         raise RuntimeError("Flex Attention is not available")
-
     if is_dynamo_compiling() or is_tracing_or_exporting():
         return _torch_flex_attention, ("flexattn", "raw")
-
     if not torch_compiler_supported():
         return _torch_flex_attention, ("flexattn", "raw")
-
     mode = _flex_attention_compile_mode()
     dynamic = _flex_attention_dynamic_flag(mode)
     key = _flex_attention_cache_key(
@@ -337,15 +330,12 @@ def _get_compiled_flex_attention_for_kwargs(
         dtype=q.dtype,
         flex_kwargs=flex_kwargs,
     )
-
     cached = _FLEX_ATTN_SPECIALIZED.get(key)
     if cached is not None:
         return cached, key
-
     failed = _FLEX_ATTN_FAILED.get(key)
     if failed is not None:
         return _torch_flex_attention, key
-
     with _FLEX_ATTN_SPECIALIZE_LOCK:
         cached = _FLEX_ATTN_SPECIALIZED.get(key)
         if cached is not None:
@@ -373,18 +363,14 @@ def _get_compiled_flex_attention_for_kwargs(
 def _get_compiled_flex_attention() -> Any:
     if not _HAS_TORCH_FLEX or _torch_flex_attention is None:
         raise RuntimeError("Flex Attention is not available")
-
     if is_dynamo_compiling() or is_tracing_or_exporting():
         return _torch_flex_attention
-
     if not torch_compiler_supported():
         return _torch_flex_attention
-
     mode = _flex_attention_compile_mode()
     cached = _FLEX_ATTN_COMPILED.get(mode)
     if cached is not None:
         return cached
-
     with _FLEX_ATTN_COMPILE_LOCK:
         cached = _FLEX_ATTN_COMPILED.get(mode)
         if cached is not None:
@@ -434,7 +420,6 @@ def _env_int(name: str, default: int) -> int:
 
 
 def _looks_like_triton_resource_error(exc: BaseException) -> bool:
-
     msg = str(exc)
     if "No valid triton configs" not in msg:
         return False
@@ -449,7 +434,6 @@ def _looks_like_triton_resource_error(exc: BaseException) -> bool:
 
 
 def _resource_safe_kernel_options(existing: Any) -> dict[str, Any]:
-
     key = int(id(existing)) if existing is not None else 0
     cached = _FLEX_ATTN_RESOURCE_KOPTS.get(key)
     if cached is not None:
@@ -462,15 +446,12 @@ def _resource_safe_kernel_options(existing: Any) -> dict[str, Any]:
         if isinstance(existing, Mapping):
             with contextlib.suppress(Exception):
                 opts.update(dict(existing))
-
         opts.setdefault("BLOCK_M", _env_int("ENN_FLEX_BLOCK_M", 64))
         opts.setdefault("BLOCK_N", _env_int("ENN_FLEX_BLOCK_N", 64))
         opts.setdefault("num_stages", _env_int("ENN_FLEX_NUM_STAGES", 1))
         opts.setdefault("num_warps", _env_int("ENN_FLEX_NUM_WARPS", 4))
-
         if "WRITE_DQ" not in opts:
             opts["WRITE_DQ"] = bool(env_bool("ENN_FLEX_WRITE_DQ", False))
-
         _FLEX_ATTN_RESOURCE_KOPTS[key] = opts
         return opts
 
@@ -484,20 +465,16 @@ def _looks_like_triton_resource_error(exc: BaseException) -> bool:
 
 
 def _resource_safe_kernel_options(existing: Any) -> Optional[dict[str, Any]]:
-
     if (existing is not None) and (not isinstance(existing, Mapping)):
         return None
-
     key = int(id(existing)) if existing is not None else 0
     cached = _FLEX_ATTN_RESOURCE_KOPTS.get(key)
     if cached is not None:
         return cached
-
     base: dict[str, Any] = {}
     if isinstance(existing, Mapping):
         for k, v in existing.items():
             base[str(k)] = v
-
     base.setdefault("BLOCK_M", _env_int("ENN_FLEX_BLOCK_M", 64))
     base.setdefault("BLOCK_N", _env_int("ENN_FLEX_BLOCK_N", 64))
     base.setdefault("num_stages", _env_int("ENN_FLEX_NUM_STAGES", 1))
@@ -508,7 +485,6 @@ def _resource_safe_kernel_options(existing: Any) -> Optional[dict[str, Any]]:
     base.setdefault("bwd_BLOCK_N1", _env_int("ENN_FLEX_BWD_BLOCK_N1", 32))
     if "WRITE_DQ" not in base and "bwd_WRITE_DQ" not in base:
         base["bwd_WRITE_DQ"] = bool(env_bool("ENN_FLEX_BWD_WRITE_DQ", False))
-
     with _FLEX_ATTN_RESOURCE_KOPTS_LOCK:
         cached = _FLEX_ATTN_RESOURCE_KOPTS.get(key)
         if cached is None:
@@ -794,7 +770,6 @@ def _call_mha_compat(
         no_avg = dict(call_kwargs)
         del no_avg["average_attn_weights"]
         kw_variants = (call_kwargs, no_avg)
-
     is_causal_arg = {"is_causal": is_causal} if is_causal is not None else {}
     for kw in kw_variants:
         with contextlib.suppress(TypeError):
@@ -1619,7 +1594,6 @@ class DotProductAttention(nn.Module):
                 )
                 final_mask = (mask_bias + bias_float).contiguous()
             sdpa_is_causal = False
-
         exporting = _exporting_boundary()
         disable_sdpa = env_bool(("ENN_DISABLE_SDPA",), default=False)
         force_sdpa = env_bool(("ENN_FORCE_SDPA",), default=False)
@@ -1839,7 +1813,6 @@ class FlexAttention(nn.Module):
                     flex_kwargs["dropout"] = float(dropout_p)
             if "kernel_options" in _FLEX_KWARGS and kernel_options is not None:
                 flex_kwargs["kernel_options"] = kernel_options
-
             flex_fn, flex_key = _get_compiled_flex_attention_for_kwargs(q, flex_kwargs)
             try:
                 if flex_fn is _torch_flex_attention:
@@ -1865,10 +1838,8 @@ class FlexAttention(nn.Module):
                 if needs_verify:
                     with _FLEX_ATTN_VERIFIED_LOCK:
                         verified = flex_key in _FLEX_ATTN_VERIFIED
-
                 if not needs_verify or verified:
                     return _run(lambda: flex_fn(q, k, v))
-
                 out, saw_uncompiled = _call_with_flex_warn_guard(
                     lambda: _run(lambda: flex_fn(q, k, v))
                 )
@@ -1876,7 +1847,6 @@ class FlexAttention(nn.Module):
                     with _FLEX_ATTN_VERIFIED_LOCK:
                         _FLEX_ATTN_VERIFIED.add(flex_key)
                     return out
-
                 for fb_mode in _flex_attention_fallback_modes(mode_key):
                     try:
                         dyn_fb = _flex_attention_dynamic_flag(fb_mode)
@@ -1897,7 +1867,6 @@ class FlexAttention(nn.Module):
                             return out2
                     except Exception:
                         pass
-
                 with contextlib.suppress(Exception):
                     _FLEX_ATTN_FAILED[flex_key] = "uncompiled-warning"
                     _FLEX_ATTN_SPECIALIZED.pop(flex_key, None)
@@ -1909,7 +1878,6 @@ class FlexAttention(nn.Module):
                     with contextlib.suppress(Exception):
                         _FLEX_ATTN_FAILED[flex_key] = f"{type(exc).__name__}: {exc}"
                         _FLEX_ATTN_SPECIALIZED.pop(flex_key, None)
-
                     if _looks_like_triton_resource_error(exc) and (
                         "kernel_options" in _FLEX_KWARGS
                     ):
@@ -1939,7 +1907,6 @@ class FlexAttention(nn.Module):
                             )
                         except Exception:
                             pass
-
                     _warn_once(
                         f"flexattn-runtime-failed-{hash(flex_key)}",
                         "FlexAttention: compiled execution failed; falling back to eager.\n"
@@ -1994,7 +1961,6 @@ class MultiScaleRetention(nn.Module):
     ) -> torch.Tensor:
         H = int(self.nhead)
         calc_dtype = dtype if dtype in (torch.float32, torch.float64) else torch.float32
-
         beta = getattr(self, "_beta", None)
         if not (
             isinstance(beta, torch.Tensor)
@@ -2032,7 +1998,6 @@ class MultiScaleRetention(nn.Module):
                 attn_mask.shape[1] == v.shape[1],
                 "attn_mask length mismatch",
             )
-
         mask = (
             attn_mask.to(device=v.device, non_blocking=True).unsqueeze(-1).unsqueeze(-1)
         )
@@ -2092,7 +2057,6 @@ class MultiScaleRetention(nn.Module):
         else:
             if L <= 0:
                 return state_tensor.new_zeros((B, H, Dh))
-
         if (
             isinstance(attn_mask, torch.Tensor)
             and attn_mask.dim() == 2
