@@ -6,6 +6,7 @@ import contextlib
 import json
 import os
 import re
+import signal
 import subprocess
 import sys
 import time
@@ -136,6 +137,7 @@ def _run_isolated_export(
             os.environ.get("ENN_EXPORT_SUBPROCESS_TIMEOUT", str(timeout_s)).strip()
             or str(timeout_s)
         )
+
     def _tail_text(v: object, n: int = 2000) -> str:
         if v is None:
             return ""
@@ -147,26 +149,30 @@ def _run_isolated_export(
             return s[-n:]
         return str(v)[-n:]
 
+    p = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        env=env,
+        start_new_session=True,
+    )
     try:
-        p = subprocess.run(
-            cmd, capture_output=True, text=True, env=env, timeout=timeout_s
-        )
-    except subprocess.TimeoutExpired as exc:
+        out, err = p.communicate(timeout=timeout_s)
+    except subprocess.TimeoutExpired:
+        with contextlib.suppress(Exception):
+            os.killpg(p.pid, signal.SIGKILL)
+        with contextlib.suppress(Exception):
+            p.kill()
+        out2, err2 = ("", "")
+        with contextlib.suppress(Exception):
+            out2, err2 = p.communicate(timeout=5)
         return {
             "status": "error",
             "error": "subprocess export timed out",
-            "stdout_tail": _tail_text(getattr(exc, "stdout", "")),
-            "stderr_tail": _tail_text(getattr(exc, "stderr", "")),
+            "stdout_tail": _tail_text(out2 or out),
+            "stderr_tail": _tail_text(err2 or err),
         }
-    except Exception as exc:
-        if exc.__class__.__name__ == "SignalException":
-            return {
-                "status": "error",
-                "error": f"subprocess interrupted by signal ({exc})",
-                "stdout_tail": "",
-                "stderr_tail": "",
-            }
-        raise
     if p.returncode == 0:
 
         def _parse_last_json_line(text: object) -> dict[str, Any] | None:
@@ -177,28 +183,26 @@ def _run_isolated_export(
             lines = [ln.strip() for ln in str(text).splitlines() if ln.strip()]
             for ln in reversed(lines):
                 if ln.startswith("{") and ln.endswith("}"):
-                    try:
+                    with contextlib.suppress(Exception):
                         return json.loads(ln)
-                    except Exception:
-                        continue
             return None
 
-        obj = _parse_last_json_line(p.stdout)
+        obj = _parse_last_json_line(out)
         if obj is not None:
-            obj.setdefault("_stdout_tail", _tail_text(p.stdout))
-            obj.setdefault("_stderr_tail", _tail_text(p.stderr))
+            obj.setdefault("_stdout_tail", _tail_text(out))
+            obj.setdefault("_stderr_tail", _tail_text(err))
             return obj
         return {
             "status": "error",
             "error": "subprocess returned non-json output",
-            "stdout": _tail_text(p.stdout),
-            "stderr": _tail_text(p.stderr),
+            "stdout": _tail_text(out),
+            "stderr": _tail_text(err),
         }
     return {
         "status": "error",
         "error": f"subprocess export failed (returncode={p.returncode})",
-        "stdout_tail": _tail_text(p.stdout),
-        "stderr_tail": _tail_text(p.stderr),
+        "stdout_tail": _tail_text(out),
+        "stderr_tail": _tail_text(err),
     }
 
 
