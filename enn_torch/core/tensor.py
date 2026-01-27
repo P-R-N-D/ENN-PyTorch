@@ -10,6 +10,12 @@ from typing import Any, Iterator, TypeVar
 
 import torch
 
+try:
+    import torch._dynamo as _dynamo
+except Exception:
+    _dynamo = None
+
+
 _T = TypeVar("_T")
 
 
@@ -38,44 +44,11 @@ def _optional_attr(
     return val
 
 
-try:
-    import torch._dynamo as _dynamo
-except Exception:
-    _dynamo = None
-
-
 def _dynamo_is_compiling() -> bool:
     try:
         return bool(_dynamo is not None and _dynamo.is_compiling())
     except Exception:
         return False
-
-
-_disable_functional_mode = _optional_attr(
-    "torch._subclasses.functional_tensor",
-    "disable_functional_mode",
-    None,
-    predicate=callable,
-)
-_mb_unwrap_functional_tensor = _optional_attr(
-    "torch._subclasses.functional_tensor",
-    "mb_unwrap_functional_tensor",
-    None,
-    predicate=callable,
-)
-
-_tdx_is_fake = _optional_attr(
-    "torchdistx.fake", "is_fake", None, predicate=callable
-)
-FakeTensor = _optional_attr(
-    "torch._subclasses.fake_tensor",
-    "FakeTensor",
-    (),
-    predicate=inspect.isclass,
-)
-TensorDictBase = _optional_attr(
-    "tensordict", "TensorDictBase", (), predicate=inspect.isclass
-)
 
 
 def _call_from_buffer(
@@ -318,3 +291,29 @@ def symint_safe_expand(
 
 def symint_safe_expand_as(t: torch.Tensor, ref: torch.Tensor) -> torch.Tensor:
     return symint_safe_expand(t, ref.shape)
+
+
+_disable_functional_mode = _optional_attr(
+    "torch._subclasses.functional_tensor",
+    "disable_functional_mode",
+    None,
+    predicate=callable,
+)
+_mb_unwrap_functional_tensor = _optional_attr(
+    "torch._subclasses.functional_tensor",
+    "mb_unwrap_functional_tensor",
+    None,
+    predicate=callable,
+)
+_tdx_is_fake = _optional_attr(
+    "torchdistx.fake", "is_fake", None, predicate=callable
+)
+FakeTensor = _optional_attr(
+    "torch._subclasses.fake_tensor",
+    "FakeTensor",
+    (),
+    predicate=inspect.isclass,
+)
+TensorDictBase = _optional_attr(
+    "tensordict", "TensorDictBase", (), predicate=inspect.isclass
+)
