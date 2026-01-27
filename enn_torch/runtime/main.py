@@ -193,13 +193,11 @@ def _is_nvml_blocked(now: object | None = None) -> object:
 def _is_nvml_available() -> object:
     global _nvml, _NVML_READY, _NVML_TRIED
     nogil = bool(CPU.is_optimized_for_no_gil())
-
     if _is_nvml_blocked():
         if nogil:
             with _NVML_LOCK:
                 return bool(_NVML_READY)
         return bool(_NVML_READY)
-
     if nogil:
         with _NVML_LOCK:
             if _NVML_TRIED:
@@ -599,7 +597,6 @@ def _recover_oom(
     if optimizer is not None:
         with contextlib.suppress(Exception):
             optimizer.zero_grad(set_to_none=True)
-
     inst_pressure = to_submodule(model) or (
         model.module if hasattr(model, "module") else model
     )
@@ -616,7 +613,6 @@ def _recover_oom(
             if sleep_s > 0.0:
                 time.sleep(float(sleep_s))
             return ("retry", grad_accum_steps)
-
     reduced_any = False
     inst = to_submodule(model)
     if inst is not None:
@@ -1113,27 +1109,22 @@ def _configure_torch_nccl_env(device: TorchDeviceLike) -> None:
     world = 1
     with contextlib.suppress(Exception):
         world = int(env_int("WORLD_SIZE", 1) or 1)
-
     if "TORCH_NCCL_ENABLE_MONITORING" not in os.environ:
         default_mon = 0 if int(world) <= 1 else 1
         mon = int(env_int("ENN_TORCH_NCCL_ENABLE_MONITORING", default_mon))
         os.environ["TORCH_NCCL_ENABLE_MONITORING"] = str(int(mon))
-
     if "TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC" not in os.environ:
         default_hb = 3600 if int(world) <= 1 else 600
         hb = int(env_int("ENN_TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC", default_hb))
         os.environ["TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC"] = str(int(hb))
-
     if "TORCH_NCCL_DUMP_ON_TIMEOUT" not in os.environ:
         default_dump = 0 if int(world) <= 1 else 1
         dump = int(env_int("ENN_TORCH_NCCL_DUMP_ON_TIMEOUT", default_dump))
         os.environ["TORCH_NCCL_DUMP_ON_TIMEOUT"] = str(int(dump))
-
     if "TORCH_NCCL_ASYNC_ERROR_HANDLING" not in os.environ:
         default_ae = 0 if int(world) <= 1 else 3
         ae = int(env_int("ENN_TORCH_NCCL_ASYNC_ERROR_HANDLING", default_ae))
         os.environ["TORCH_NCCL_ASYNC_ERROR_HANDLING"] = str(int(ae))
-
     if "TORCH_NCCL_BLOCKING_WAIT" not in os.environ:
         default_bw = 1 if int(world) <= 1 else 0
         bw = int(env_int("ENN_TORCH_NCCL_BLOCKING_WAIT", default_bw))
@@ -1812,7 +1803,6 @@ def _pin(
             y_dtype = getattr(meta, "label_float_dtype", Y_src.dtype)
             Y_st, y_tok, y_pinned = stage_tensor(Y_src, dtype=y_dtype)
         t_ready = time.perf_counter_ns()
-
         if use_timer:
             pair = _get_thread_events(device, slot="h2d")
             if pair is not None:
@@ -2212,12 +2202,10 @@ def _warmup_scaler_stats(model: object, train_loader: object, ops: object) -> No
     dev_y = model_for_scaler.scaler.y_mean.device
     dt_x = model_for_scaler.scaler.x_mean.dtype
     dt_y = model_for_scaler.scaler.y_mean.dtype
-
     try:
         stats = collate.load_scaler_stats(ops.sources)
     except Exception:
         stats = None
-
     if stats:
         x_cnt = int(stats.get("train_count") or 0)
         y_cnt = int(stats.get("train_count") or 0)
@@ -2261,7 +2249,6 @@ def _warmup_scaler_stats(model: object, train_loader: object, ops: object) -> No
                     mx = yf.amax(0)
                     y_min = mn if y_min is None else torch.minimum(y_min, mn)
                     y_max = mx if y_max is None else torch.maximum(y_max, mx)
-
         if is_distributed():
             for tensor in (x_sum, x_ss, y_sum, y_ss):
                 if tensor is not None:
@@ -2276,7 +2263,6 @@ def _warmup_scaler_stats(model: object, train_loader: object, ops: object) -> No
             torch.distributed.all_reduce(counts, torch.distributed.ReduceOp.SUM)
             x_cnt = int(counts[0])
             y_cnt = int(counts[1])
-
     eps = float(model_for_scaler.scaler.eps)
     for cnt, sm, ss, mean_buf, std_buf in (
         (
@@ -2300,7 +2286,6 @@ def _warmup_scaler_stats(model: object, train_loader: object, ops: object) -> No
             std_buf.resize_(mean.shape).copy_(
                 (ss / cnt - mean**2).clamp_min(eps).sqrt()
             )
-
     if y_min is not None:
         model_for_scaler.scaler.y_min.resize_(y_min.shape).copy_(y_min)
     if y_max is not None:
@@ -2454,7 +2439,6 @@ def epochs(
     from ..data.nodes import Sampler
 
     ddp_fallback: bool = bool(kwargs.pop("ddp_fallback", False))
-
     if train_loader is None:
         raise RuntimeError("epochs requires a training dataloader")
     meta = dataset if isinstance(dataset, Dataset) else Dataset.for_device(device)
@@ -2870,7 +2854,6 @@ def epochs(
                     fn = getattr(train_loader, "set_epoch", None)
                     if callable(fn):
                         fn(int(epoch_idx))
-
             if is_distributed() and _env_flag("ENN_DIST_SYNC_EPOCH", False):
                 target_module = model.module if hasattr(model, "module") else model
                 distributed_sync(target_module, device=device)
@@ -2895,7 +2878,6 @@ def epochs(
                 lw_top_sum = None
                 lw_bottom_sum = None
                 lw_count = 0
-
                 train_iter = iter(train_loader)
                 try:
                     _first_raw = next(train_iter)
@@ -2929,7 +2911,6 @@ def epochs(
                             "[DIAG] train: loader chain: %s",
                             " -> ".join(chain),
                         )
-
                         base = getattr(train_loader, "_base_iterable", None)
                         if base is not None:
                             try:
@@ -2946,7 +2927,6 @@ def epochs(
                                     "[DIAG] train: probing _base_iterable failed: %s",
                                     e,
                                 )
-
                         src = getattr(train_loader, "_src", None)
                         if src is not None:
                             try:
@@ -3118,7 +3098,6 @@ def epochs(
                                         scaler.step(optimizer)
                                         scaler.update()
                                         optimizer.zero_grad(set_to_none=True)
-
                                         if ema_helper is not None:
                                             ema_target = (
                                                 model.module
@@ -3126,7 +3105,6 @@ def epochs(
                                                 else model
                                             )
                                             ema_helper.update(ema_target)
-
                                         target_for_step = (
                                             model.module
                                             if hasattr(model, "module")
@@ -3794,7 +3772,6 @@ def epochs(
                             ckpt_ext = ".ozl"
                         except Exception:
                             ckpt_ext = ".pt"
-
                     ckpt_path = os.path.join(ckpt_dir, "model" + ckpt_ext)
                     model_sd = swa_helper.checkpoint_state_dict(
                         swa_target,
@@ -3841,7 +3818,6 @@ def epochs(
                                 _ozl_kwargs["openzl_permissive"] = bool(
                                     _env_flag("ENN_OPENZL_PERMISSIVE", True)
                                 )
-
                     _api_save_model(
                         swa_target,
                         ckpt_path,
@@ -4387,7 +4363,6 @@ def infer(
 
             row_ids_buf = None
             pad_buf = None
-
             dl_type = type(data_loader).__name__
             dl_len = None
             with contextlib.suppress(Exception):
@@ -4423,7 +4398,6 @@ def infer(
                             break
                         cur = nxt
                     _LOGGER.error("[DIAG] infer: loader chain: %s", " -> ".join(chain))
-
                     base = getattr(data_loader, "_base_iterable", None)
                     if base is not None:
                         try:
@@ -4440,7 +4414,6 @@ def infer(
                                 "[DIAG] infer: probing _base_iterable failed: %s",
                                 e,
                             )
-
                     src = getattr(data_loader, "_src", None)
                     if src is not None:
                         try:
@@ -4545,7 +4518,6 @@ def infer(
                 else:
                     mb_eager = min(bs, int(mb_cfg))
                 mb_eager = max(1, int(mb_eager))
-
                 use_td_cg = bool(
                     td_cg_active and (td_cg_mod is not None) and (td_cg_mb is not None)
                 )
@@ -4963,10 +4935,8 @@ def process(*args: Any, **kwargs: Any) -> object:
         _validate_model_dtype_unity(_m_pre, device)
         _validate_no_meta_tensors(_m_pre)
         _validate_no_fake_dtensor(_m_pre)
-
         dist_policy = DistributedPolicy.from_env()
         hsdp_wrapped = False
-
         if (
             is_distributed()
             and get_world_size(device) > 1
@@ -5006,7 +4976,6 @@ def process(*args: Any, **kwargs: Any) -> object:
                                 if isinstance(blk, torch.nn.Module):
                                     _wrap_once(blk, is_root=False)
                         _wrap_once(root_mod, is_root=False)
-
                 model = to_hsdp_module(
                     model,
                     mesh=mesh,
@@ -5023,22 +4992,18 @@ def process(*args: Any, **kwargs: Any) -> object:
                     reshard_after_forward=False,
                     sync_module_states=True,
                 )
-
             hsdp_wrapped = True
-
         _m_post = model.module if hasattr(model, "module") else model
         _validate_model_dtype_unity(_m_post, device)
         _validate_no_meta_tensors(_m_post)
         _validate_no_fake_dtensor(_m_post)
         _enable_meta_monitor(_m_post)
-
         ddp_fallback = bool(
             is_distributed()
             and get_world_size(device) > 1
             and (not hsdp_wrapped)
             and dist_policy.prefer_ddp
         )
-
         if dist_policy.sync_state:
             distributed_sync(_m_post, device=device, policy=dist_policy.collective)
         net_params = [p for p in model.parameters()]
@@ -5201,7 +5166,6 @@ def process(*args: Any, **kwargs: Any) -> object:
             ema_helper = None
             swa_helper = None
             swa_start_epoch = int(total_epochs)
-
             try:
                 has_bn = any(
                     isinstance(m, nn.modules.batchnorm._BatchNorm)
@@ -5209,9 +5173,7 @@ def process(*args: Any, **kwargs: Any) -> object:
                 )
             except Exception:
                 has_bn = False
-
             use_swa = not has_bn
-
             if local_rank == 0:
                 if use_swa:
                     swa_start_epoch = 0
@@ -5228,7 +5190,6 @@ def process(*args: Any, **kwargs: Any) -> object:
                     ema_helper = ExponentialMovingAverage(
                         tracked_module, decay=0.9999, metadata=metadata
                     )
-
             amp_dtype = getattr(precision, "amp_float", None)
             compute_dtype = amp_dtype or param_dtype
             scaler = torch.amp.GradScaler(
@@ -5275,7 +5236,6 @@ def process(*args: Any, **kwargs: Any) -> object:
             elif ema_helper is not None and getattr(ema_helper, "shadow", None):
                 avg_tag = "ema"
                 avg_helper = ema_helper
-
             if ops.ckpt_dir:
                 ckpt_ext = os.environ.get("ENN_CKPT_EXT")
                 if ckpt_ext:
@@ -5289,9 +5249,7 @@ def process(*args: Any, **kwargs: Any) -> object:
                         ckpt_ext = ".ozl"
                     except Exception:
                         ckpt_ext = ".pt"
-
                 ckpt_path = os.path.join(ops.ckpt_dir, "model" + ckpt_ext)
-
                 if not os.path.isfile(ckpt_path):
                     for _alt in (".ozl", ".pt"):
                         if _alt != ckpt_ext and os.path.isfile(
@@ -5304,7 +5262,6 @@ def process(*args: Any, **kwargs: Any) -> object:
                         if avg_helper is not None
                         else None
                     )
-
                     if avg_helper is not None and hasattr(
                         avg_helper, "checkpoint_state_dict"
                     ):
@@ -5334,7 +5291,6 @@ def process(*args: Any, **kwargs: Any) -> object:
                                 if tv.device.type != "cpu":
                                     tv = tv.to("cpu")
                                 model_sd[k] = tv
-
                         max_bytes = 25 * 1024 * 1024
                         if src_mod is not None:
                             for k, b in src_mod.named_buffers(recurse=True):
@@ -5357,7 +5313,6 @@ def process(*args: Any, **kwargs: Any) -> object:
                                 if tb.device.type != "cpu":
                                     tb = tb.to("cpu")
                                 model_sd[k] = tb
-
                     _coerce_dcp_keys(model_sd)
 
                     from .workflow import save_model as _api_save_model
@@ -5375,23 +5330,19 @@ def process(*args: Any, **kwargs: Any) -> object:
                         if _mss:
                             with contextlib.suppress(Exception):
                                 _ozl_kwargs["openzl_min_stream_size"] = int(_mss)
-
                     _api_save_model(
                         save_target,
                         ckpt_path,
                         state_dict=model_sd,
                         **_ozl_kwargs,
                     )
-
                     try:
                         del model_sd
                     except Exception:
                         pass
-
         with contextlib.suppress(Exception):
             if swa_helper is not None and hasattr(swa_helper, "close"):
                 swa_helper.close()
-
         torch.distributed.barrier(
             device_ids=[local_rank] if device.type in ("cuda", "xpu") else None
         )
@@ -5459,6 +5410,7 @@ def process(*args: Any, **kwargs: Any) -> object:
             raise RuntimeError(
                 f"predict/infer: model_ckpt_dir does not exist or is not a directory: {ops.model_ckpt_dir!r}"
             )
+            
         from .workflow import load_model as _api_load_model
 
         ckpt_source: str = str(ops.model_ckpt_dir)
