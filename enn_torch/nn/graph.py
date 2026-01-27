@@ -11,10 +11,10 @@ from typing import Any, Callable, Dict, Iterator, List, Optional
 import torch
 from torch import nn
 
-from .concurrency import Mutex
-from .datatypes import env_bool, env_first, env_first_int
-from .system import CPU, is_accelerator_available
-from .tensor import is_meta_or_fake_tensor
+from ..core.concurrency import Mutex
+from ..data.datatypes import env_bool, env_first, env_first_int
+from ..core.system import CPU, is_accelerator_available
+from ..core.tensor import is_meta_or_fake_tensor
 
 _COLLECTIVE_NAMES: tuple[str, ...] = (
     "all_gather",

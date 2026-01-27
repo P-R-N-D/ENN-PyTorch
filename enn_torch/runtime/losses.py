@@ -11,7 +11,7 @@ from torch import Tensor, nn
 from torch.distributions import Normal, StudentT
 from torch.nn import functional as F
 
-from ..core.graph import is_compiling
+from ..nn.graph import is_compiling
 from ..core.tensor import to_tensor_like
 
 _MAD_SCALE_CACHE = {}

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import importlib
+import sys
 from types import ModuleType
 from typing import TYPE_CHECKING, Any
 
@@ -25,7 +26,12 @@ __all__ = [
 
 
 def __getattr__(name: str) -> ModuleType:
-    if name in {"core", "data", "nn", "runtime", "config"}:
+    if name == "config":
+        module = importlib.import_module("enn_torch.core.config")
+        sys.modules.setdefault(f"{__name__}.config", module)
+        globals()["config"] = module
+        return module
+    if name in {"core", "data", "nn", "runtime"}:
         return importlib.import_module(f"enn_torch.{name}")
     raise AttributeError(f"module 'enn_torch' has no attribute {name!r}")
 

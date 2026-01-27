@@ -9,8 +9,8 @@ from typing import Any, Callable, Iterator
 import torch
 from torch import nn
 
-from .datatypes import env_bool, env_first
-from .distributed import broadcast_scalar, is_dtensor_active
+from ..data.datatypes import env_bool, env_first
+from ..runtime.distributed import broadcast_scalar, is_dtensor_active
 from .graph import is_export_or_trace, to_submodule
 
 try:

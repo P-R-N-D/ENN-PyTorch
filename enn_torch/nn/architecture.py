@@ -24,14 +24,14 @@ import torch.nn as nn
 import torch.nn.functional as F
 from tensordict import TensorDictBase
 
-from ..config import ModelConfig
-from ..core.checkpoint import coerce_checkpoint
+from ..core.config import ModelConfig
+from .checkpoint import coerce_checkpoint
 from ..core.concurrency import Mutex, is_gil_enabled
-from ..core.datatypes import env_bool, env_first_int, env_int
-from ..core.distributed import _from_hsdp_module
-from ..core.graph import canonicalize_compile_mode
-from ..core.graph import compile as compile_module
-from ..core.graph import (
+from ..data.datatypes import env_bool, env_first_int, env_int
+from ..runtime.distributed import _from_hsdp_module
+from .graph import canonicalize_compile_mode
+from .graph import compile as compile_module
+from .graph import (
     cudagraph_mark_step_begin,
     cudagraph_mark_step_end,
     graph_break,
@@ -45,7 +45,7 @@ from ..core.policies import LossWeightPolicy
 from ..core.precision import Autocast
 from ..core.system import CPU, empty_device_cache, get_device, set_runtime_cfg
 from ..core.tensor import is_meta_or_fake_tensor, symint_safe_expand_as
-from ..schema import get_feature_key, get_label_key
+from ..data.schema import get_feature_key, get_label_key
 from .blocks import (
     LongNet,
     Perceiver,
@@ -660,7 +660,7 @@ class Fuser(nn.Module):
         self._decode_graph: nn.Module | None = None
         self._backbone_graph: nn.Module | None = None
         try:
-            from ..runtime.wrappers import CallArguments, GraphSequential
+            from .wrappers import CallArguments, GraphSequential
 
             class _PackPerceiverArgs(nn.Module):
                 def forward(
@@ -1818,7 +1818,7 @@ class Model(nn.Module):
         if compile_enabled:
             with compile_patch_ctx:
                 try:
-                    from ..runtime.wrappers import GraphSequential
+                    from .wrappers import GraphSequential
 
                     _decode_mod = (
                         GraphSequential(

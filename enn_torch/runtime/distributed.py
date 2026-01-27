@@ -15,8 +15,8 @@ import torch
 import torch.distributed as dist
 from torch.optim import Optimizer
 
-from .datatypes import env_bool
-from .system import CPU, get_device, get_num_accelerators
+from ..data.datatypes import env_bool
+from ..core.system import CPU, get_device, get_num_accelerators
 
 try:
     from torch.distributed._composable.fsdp import fully_shard

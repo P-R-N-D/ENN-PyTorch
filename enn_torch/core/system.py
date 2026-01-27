@@ -25,7 +25,13 @@ from typing import TYPE_CHECKING, Any, Callable, Optional, Sequence, Tuple, Unio
 import torch
 import torch.multiprocessing
 
-from .datatypes import env_bool, env_first, env_first_float, env_first_int, parse_bool
+from ..data.datatypes import (
+    env_bool,
+    env_first,
+    env_first_float,
+    env_first_int,
+    parse_bool,
+)
 
 try:
     from zoneinfo import ZoneInfo

@@ -35,11 +35,11 @@ from torch.distributed.checkpoint.state_dict import (
 )
 from tqdm.auto import tqdm
 
-from .. import schema
-from ..config import RuntimeConfig, coerce_model_config
-from ..core.checkpoint import from_checkpoint, to_checkpoint
+from ..data import schema
+from ..core.config import RuntimeConfig, coerce_model_config
+from ..nn.checkpoint import from_checkpoint, to_checkpoint
 from ..core.concurrency import Mutex, TensorPagePool, TensorSpooler, new_affinity
-from ..core.datatypes import (
+from ..data.datatypes import (
     env_bool,
     env_first,
     env_first_int,
@@ -48,7 +48,7 @@ from ..core.datatypes import (
     env_str,
     read_json,
 )
-from ..core.distributed import (
+from .distributed import (
     broadcast_scalar,
     distributed_all_reduce_grads,
     distributed_barrier,
@@ -60,7 +60,7 @@ from ..core.distributed import (
     no_sync,
     to_hsdp_module,
 )
-from ..core.graph import (
+from ..nn.graph import (
     canonicalize_compile_mode,
     compile_distributed_safe,
     compile_safe,
@@ -1256,7 +1256,7 @@ def _get_sample_size(
         training_mode = bool(model.training)
         meta = dataset if isinstance(dataset, Dataset) else Dataset.for_device(device)
         try:
-            from ..core.graph import inference_mode
+            from ..nn.graph import inference_mode
             from ..core.precision import Autocast
 
             feats, labels, *_rest = meta.preprocess(batch, return_keys=False)
