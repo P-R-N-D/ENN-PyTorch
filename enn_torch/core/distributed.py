@@ -18,9 +18,27 @@ from torch.optim import Optimizer
 from .datatypes import env_bool
 from .system import CPU, get_device, get_num_accelerators
 
+try:
+    from torch.distributed._composable.fsdp import fully_shard
+except ImportError:
+    with contextlib.suppress(ImportError):
+        from torch.distributed.fsdp import fully_shard
+try:
+    from torch.distributed.algorithms.join import Join as _TorchJoin
+except ImportError:
+    _TorchJoin = None
+Join = _TorchJoin
+try:
+    from torch.distributed.tensor import DTensor as _DTensor
+except ImportError:
+    try:
+        from torch.distributed._tensor import DTensor as _DTensor
+    except ImportError:
+        _DTensor = None
+
+
 _DTENSOR_ACTIVE: bool = False
 _GLOOX_GLOO_PG_CACHE: dict[tuple[int, ...], ProcessGroup] = {}
-fully_shard = None
 
 
 def _set_dtensor_active() -> None:
@@ -1243,22 +1261,3 @@ def get_distributed_mesh(
         return (mesh, "fsdp2")
     except Exception:
         return (None, "none")
-
-
-try:
-    from torch.distributed._composable.fsdp import fully_shard
-except ImportError:
-    with contextlib.suppress(ImportError):
-        from torch.distributed.fsdp import fully_shard
-try:
-    from torch.distributed.algorithms.join import Join as _TorchJoin
-except ImportError:
-    _TorchJoin = None
-Join = _TorchJoin
-try:
-    from torch.distributed.tensor import DTensor as _DTensor
-except ImportError:
-    try:
-        from torch.distributed._tensor import DTensor as _DTensor
-    except ImportError:
-        _DTensor = None
