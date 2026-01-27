@@ -25,8 +25,6 @@ from ..core.graph import (
     skip_non_infra_dispatch_mode,
     torch_compiler_disable,
     torch_compiler_supported,
-)
-from ..core.graph import (
     compile as _model_compile,
 )
 from ..core.profiler import FLOP_PROFILER, capture
@@ -37,6 +35,64 @@ from ..core.system import (
     get_runtime_config,
 )
 from ..core.tensor import is_meta_or_fake_tensor
+
+try:
+    import triton
+    import triton.language as tl
+
+    _HAS_TRITON_LIB = True
+    _HAS_TRITON_MSR = bool(torch.cuda.is_available())
+except Exception:
+    _HAS_TRITON_LIB = False
+    _HAS_TRITON_MSR = False
+
+    class _TritonStub:
+        def jit(
+            self: Self,
+            fn: Callable[..., object] | None = None,
+            **kwargs: object,
+        ) -> Callable[..., object]:
+            return fn if fn else lambda f: f
+
+        @staticmethod
+        def cdiv(a: int, b: int) -> int:
+            return (int(a) + int(b) - 1) // max(1, int(b))
+
+    class _TLStub:
+        constexpr = object()
+
+    triton = _TritonStub()
+    tl = _TLStub()
+
+try:
+    from torch.nn.attention.flex_attention import (
+        create_mask as _torch_create_mask,
+        flex_attention as _torch_flex_attention,
+    )
+
+    _HAS_TORCH_FLEX = True
+    with contextlib.suppress(Exception):
+        _FLEX_KWARGS = set(
+            inspect.signature(_torch_flex_attention).parameters.keys()
+        )
+except Exception:
+    _torch_create_mask = None
+    _torch_flex_attention = None
+    _HAS_TORCH_FLEX = False
+    pass
+
+if (
+    torch.cuda.is_available()
+    and getattr(get_device(), "type", "cpu") == "cuda"
+):
+    try:
+        import transformer_engine.pytorch as te
+
+        _HAS_TE = True
+    except Exception:
+        _HAS_TE = False
+        pass
+
 
 _FLEX_ATTN_COMPILED: dict[str, Any] = {}
 _FLEX_ATTN_COMPILE_LOCK = threading.Lock()
@@ -52,11 +108,7 @@ _FLEX_ATTN_FAILED: dict[tuple[Any, ...], str] = {}
 _FLEX_ATTN_WARNED: set[str] = set()
 _FLEX_ATTN_RESOURCE_KOPTS: dict[int, dict[str, Any]] = {}
 _FLEX_ATTN_RESOURCE_KOPTS_LOCK = threading.Lock()
-_HAS_TE = False
-_HAS_TORCH_FLEX = False
 _te = None
-_torch_create_mask = None
-_torch_flex_attention = None
 
 
 def _flex_attention_disabled() -> bool:
@@ -122,7 +174,7 @@ def _flex_attention_fallback_modes(mode: str) -> tuple[str, ...]:
 
 
 def _flex_attention_cache_key(
-    *,
+    *args: Any,
     mode: str,
     dynamic: Optional[bool],
     device: torch.device,
@@ -157,7 +209,7 @@ def _flex_attention_cache_key(
 
 
 def _compile_flex_attention_wrapper(
-    *,
+    *args: Any,
     mode: str,
     dynamic: Optional[bool],
     flex_kwargs: dict[str, Any],
@@ -248,7 +300,7 @@ def _call_with_flex_warn_guard(fn: Callable[[], Any]) -> tuple[Any, bool]:
 
 
 def _call_torch_flex_attention_eager(
-    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, *, flex_kwargs: dict[str, Any]
+    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, *args: Any, flex_kwargs: dict[str, Any]
 ) -> Any:
     if _torch_flex_attention is None:
         raise RuntimeError("Flex Attention is not available")
@@ -2450,57 +2502,5 @@ class MultiHeadAttention(nn.Module):
         )
 
 
-try:
-    import triton
-    import triton.language as tl
-
-    _HAS_TRITON_LIB = True
-    _HAS_TRITON_MSR = bool(torch.cuda.is_available())
-except Exception:
-    _HAS_TRITON_LIB = False
-    _HAS_TRITON_MSR = False
-
-    class _TritonStub:
-        def jit(
-            self: Self,
-            fn: Callable[..., object] | None = None,
-            **kwargs: object,
-        ) -> Callable[..., object]:
-            return fn if fn else lambda f: f
-
-        @staticmethod
-        def cdiv(a: int, b: int) -> int:
-            return (int(a) + int(b) - 1) // max(1, int(b))
-
-    class _TLStub:
-        constexpr = object()
-
-    triton = _TritonStub()
-    tl = _TLStub()
-try:
-    from torch.nn.attention.flex_attention import (
-        create_mask as _torch_create_mask,
-    )
-    from torch.nn.attention.flex_attention import (
-        flex_attention as _torch_flex_attention,
-    )
-
-    _HAS_TORCH_FLEX = True
-    with contextlib.suppress(Exception):
-        _FLEX_KWARGS = set(
-            inspect.signature(_torch_flex_attention).parameters.keys()
-        )
-except Exception:
-    pass
-if (
-    torch.cuda.is_available()
-    and getattr(get_device(), "type", "cpu") == "cuda"
-):
-    try:
-        import transformer_engine.pytorch as te
-
-        _HAS_TE = True
-    except Exception:
-        pass
 if _flex_attention_disabled():
     _HAS_TORCH_FLEX = False
