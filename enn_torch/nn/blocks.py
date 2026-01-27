@@ -205,8 +205,6 @@ def stochastic_depth_schedule(drop_path: float, depth: int) -> List[float]:
     ]
 
 
-
-
 class _LatentSelfBlock(nn.Module):
     def __init__(
         self,
@@ -220,24 +218,19 @@ class _LatentSelfBlock(nn.Module):
         drop_path: float,
     ) -> None:
         super().__init__()
-
         if d_model % nhead != 0:
             raise ValueError(f"d_model ({d_model}) must be divisible by nhead ({nhead})")
-
         self.d_model = int(d_model)
         self.nhead = int(nhead)
         self.head_dim = self.d_model // self.nhead
-
         self.norm1 = norm_layer(norm_type=norm_type, dim=self.d_model, eps=eps)
         self.qkv = nn.Linear(self.d_model, 3 * self.d_model, bias=True)
         self.out_proj = nn.Linear(self.d_model, self.d_model, bias=True)
         self.attn = DotProductAttention(num_heads=self.nhead, head_dim=self.head_dim)
-
         self.dropout = nn.Dropout(dropout)
         self.drop_path = (
             StochasticDepth(drop_path) if drop_path > 0.0 else nn.Identity()
         )
-
         self.norm2 = norm_layer(norm_type=norm_type, dim=self.d_model, eps=eps)
         inner_dim = int(self.d_model * mlp_ratio)
         self.ff = nn.Sequential(
@@ -248,7 +241,6 @@ class _LatentSelfBlock(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, K, D = x.shape
-
         y = self.norm1(x)
         qkv = self.qkv(y)
         q, k, v = (
@@ -256,7 +248,6 @@ class _LatentSelfBlock(nn.Module):
             .permute(2, 0, 3, 1, 4)
             .unbind(0)
         )
-
         attn_out = self.attn(
             q,
             k,
@@ -267,7 +258,6 @@ class _LatentSelfBlock(nn.Module):
         )
         attn_out = attn_out.transpose(1, 2).contiguous().view(B, K, D)
         attn_out = self.out_proj(attn_out)
-
         x = x + self.drop_path(self.dropout(attn_out))
         x = x + self.drop_path(self.ff(self.norm2(x)))
         return x
@@ -351,6 +341,7 @@ class Perceiver(nn.Module):
                     latents = self.self_blocks[j](latents)
                 j += 1
         return self.norm(latents)
+
 
 class RetNet(nn.Module):
     def __init__(
