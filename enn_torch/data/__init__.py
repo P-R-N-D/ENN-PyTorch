@@ -5,8 +5,11 @@ import importlib
 from types import ModuleType
 
 __all__ = [
+    "collate",
+    "datatypes",
     "nodes",
     "pipeline",
+    "schema",
 ]
 
 

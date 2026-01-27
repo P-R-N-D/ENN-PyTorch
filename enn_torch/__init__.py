@@ -2,8 +2,11 @@
 from __future__ import annotations
 
 import importlib
+import sys
 from types import ModuleType
 from typing import TYPE_CHECKING, Any
+
+from .core import config as _config
 
 if TYPE_CHECKING:
     from tensordict import TensorDictBase
@@ -23,9 +26,14 @@ __all__ = [
     "train",
 ]
 
+sys.modules[f"{__name__}.config"] = _config
+config = _config
+
 
 def __getattr__(name: str) -> ModuleType:
-    if name in {"core", "data", "nn", "runtime", "config"}:
+    if name == "config":
+        return config
+    if name in {"core", "data", "nn", "runtime"}:
         return importlib.import_module(f"enn_torch.{name}")
     raise AttributeError(f"module 'enn_torch' has no attribute {name!r}")
 

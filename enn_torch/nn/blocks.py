@@ -10,10 +10,10 @@ from typing import Any, Callable, List, Optional, Self, Sequence, Tuple
 import torch
 import torch.nn as nn
 
-from ..core.checkpoint import coerce_checkpoint
+from .checkpoint import coerce_checkpoint
 from ..core.compat import StochasticDepth
-from ..core.distributed import _from_hsdp_module
-from ..core.graph import is_export_or_trace, is_symbolic
+from ..runtime.distributed import _from_hsdp_module
+from .graph import is_export_or_trace, is_symbolic
 from .activations import GeGLU
 from .kernels import DotProductAttention
 from .layers import CrossAttention, DilatedAttention, Resampler, Retention, norm_layer

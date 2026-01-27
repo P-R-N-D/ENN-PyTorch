@@ -24,10 +24,10 @@ from tensordict import TensorDict
 from torch import nn
 
 from ..core.concurrency import Mutex
-from ..core.datatypes import PathLike, write_json
+from ..data.datatypes import PathLike, write_json
 from ..core.tensor import extract_tensor, from_buffer
-from ..nn.layers import Recorder
-from .io import _load_model_config, _temp_environ, is_required
+from .layers import Recorder
+from ..runtime.io import _load_model_config, _temp_environ, is_required
 
 if "_dynamo_is_compiling" not in globals():
     try:
@@ -1913,7 +1913,7 @@ class GraphSequential(nn.Module):
 
     @staticmethod
     def break_graph() -> Callable[..., Any]:
-        from ..core.graph import graph_break
+        from ..nn.graph import graph_break
 
         def _op(*a: Any, **kw: Any) -> Any:
             graph_break()
@@ -1927,7 +1927,7 @@ class GraphSequential(nn.Module):
 
     @staticmethod
     def cudagraph_begin(*args: Any, disable_compile: bool = True) -> Callable[..., Any]:
-        from ..core.graph import cudagraph_mark_step_begin, torch_compiler_disable
+        from ..nn.graph import cudagraph_mark_step_begin, torch_compiler_disable
 
         def _op(*a: Any, **kw: Any) -> Any:
             cudagraph_mark_step_begin()
@@ -1948,7 +1948,7 @@ class GraphSequential(nn.Module):
 
     @staticmethod
     def cudagraph_end(*args: Any, disable_compile: bool = True) -> Callable[..., Any]:
-        from ..core.graph import cudagraph_mark_step_end, torch_compiler_disable
+        from ..nn.graph import cudagraph_mark_step_end, torch_compiler_disable
 
         def _op(*a: Any, **kw: Any) -> Any:
             cudagraph_mark_step_end()
@@ -1974,7 +1974,7 @@ class GraphSequential(nn.Module):
         reason: str | None = None,
         recursive: bool = False,
     ) -> Callable[..., Any]:
-        from ..core.graph import torch_compiler_disable
+        from ..nn.graph import torch_compiler_disable
 
         if isinstance(step, nn.Module):
             ref = weakref.ref(step)
@@ -2007,7 +2007,7 @@ class GraphSequential(nn.Module):
         preserve_rng_state: bool | None = None,
         determinism_check: str | None = None,
     ) -> Callable[..., Any]:
-        from ..core.checkpoint import coerce_checkpoint
+        from ..nn.checkpoint import coerce_checkpoint
 
         if isinstance(step, nn.Module):
             ref = weakref.ref(step)

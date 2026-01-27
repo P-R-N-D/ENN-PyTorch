@@ -19,7 +19,7 @@ import numpy as np
 import torch
 from tensordict import TensorDict
 
-from enn_torch.config import ModelConfig, PatchConfig
+from enn_torch.core.config import ModelConfig, PatchConfig
 from enn_torch.core.tensor import extract_tensor, from_buffer
 from enn_torch.runtime.io import Exporter
 from enn_torch.runtime.workflow import new_model, train
@@ -347,7 +347,7 @@ def _draft_export_diagnostics(
         info["error"] = f"torch.export import failed: {exc!r}"
         return info
     try:
-        from enn_torch.runtime.wrappers import _onnx_model, _TensorOutputModule
+        from enn_torch.nn.wrappers import _onnx_model, _TensorOutputModule
     except Exception as exc:
         info["error"] = f"could not import ONNX wrapper helpers: {exc!r}"
         return info

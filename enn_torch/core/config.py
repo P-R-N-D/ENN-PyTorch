@@ -22,10 +22,10 @@ from typing import (
 
 import torch
 
-from .core.graph import canonicalize_compile_mode
+from ..nn.graph import canonicalize_compile_mode
 
 if TYPE_CHECKING:
-    from .data.pipeline import Source
+    from ..data.pipeline import Source
 else:
     Source = Dict[str, Any]
 

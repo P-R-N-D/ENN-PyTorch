@@ -20,8 +20,8 @@ import torch
 from torch import nn
 
 from ..core.concurrency import Mutex
-from ..core.datatypes import PathLike, coerce_json, env_bool, save_temp, write_json
-from ..core.distributed import distributed_barrier, is_rank0
+from ..data.datatypes import PathLike, coerce_json, env_bool, save_temp, write_json
+from .distributed import distributed_barrier, is_rank0
 
 try:
     from torch.serialization import add_safe_globals
@@ -29,7 +29,7 @@ except ImportError:
     add_safe_globals = None
 
 if TYPE_CHECKING:
-    from .wrappers import Format
+    from ..nn.wrappers import Format
 
 
 _IGNORED_WARNINGS = (
@@ -153,7 +153,7 @@ def _save_sync(
 
 def _load_model_config(model: object) -> object:
     try:
-        from ..config import _extract_model_config_dict
+        from ..core.config import _extract_model_config_dict
 
         return _extract_model_config_dict(model)
     except Exception:
@@ -1168,10 +1168,10 @@ class Exporter:
             if cls._defaults_registered:
                 return
             try:
-                from . import wrappers as _w
+                from ..nn import wrappers as _w
             except Exception as exc:
                 raise RuntimeError(
-                    "Exporter backends live in enn_torch.runtime.wrappers, but it could not be imported. "
+                    "Exporter backends live in enn_torch.nn.wrappers, but it could not be imported. "
                     "Install the optional export dependencies (e.g. tensordict) or avoid calling Exporter.for_export()."
                 ) from exc
             cls._ONNXExporter = getattr(_w, "_ONNXExporter", None)

@@ -35,7 +35,7 @@ from tensordict import (
 )
 
 from ..core.concurrency import TensorPagePool, TensorSpooler
-from ..core.datatypes import (
+from .datatypes import (
     PathLike,
     dtype_from_name,
     env_first_int,
@@ -47,7 +47,7 @@ from ..core.datatypes import (
     write_json,
 )
 from ..core.system import Memory, is_accelerator_available
-from ..schema import canonicalize_keys_, get_row
+from .schema import canonicalize_keys_, get_row
 
 _LOGGER = logging.getLogger(__name__)
 

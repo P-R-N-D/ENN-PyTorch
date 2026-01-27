@@ -16,7 +16,7 @@ import psutil
 import torch
 from tensordict import TensorDict
 
-from enn_torch.config import ModelConfig, PatchConfig
+from enn_torch.core.config import ModelConfig, PatchConfig
 from enn_torch.core.system import get_device
 from enn_torch.runtime.workflow import new_model, predict, train
 

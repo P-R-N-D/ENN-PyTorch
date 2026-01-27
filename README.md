@@ -34,7 +34,7 @@ This repository also includes a worked example notebook (`notebook.ipynb`) and a
 
 ## Features
 - **APIs** (`enn_torch.runtime.workflow`): build/load models, elastic train/predict entrypoints (uses `torch.distributed.elastic`), and checkpoint/export helpers.
-- **Templated configurations** (`enn_torch.config`): dataclass configs with coercion/validation and string canonicalizers for modeling type, normalization, and compile options.
+- **Templated configurations** (`enn_torch.core.config`): dataclass configs with coercion/validation and string canonicalizers for modeling type, normalization, and compile options.
 - **Neural network stacks** (`enn_torch.nn`): spatio-temporal Fuser/Collector blocks (Template tasks + Perceiver resampler), attention variants, scaler + recorder modules, AMP negotiation guard band (`ModelConfig.safety_margin_pow2`).
 - **Data pipeline** (`enn_torch.data`): `torchdata.nodes`-driven memmap pipeline with TensorDict support, prefetch/pin/pool options, and scale-aware dataset metadata.
 - **Runnable tasks** (`enn_torch.runtime`): thread/NUMA tuning, free-threaded/no-GIL optimizations, mixed-precision helpers, history recorder, and OOM recovery hooks. ONNX/ORT/onnxscript/onnx_ir/torch.export (PT2) out of the box; optional platform-dependent backends (TensorRT/CoreML/ExecuTorch/onnx-tf) via extras. elastic launch wiring and group setup for multi-process CPU/GPU runs.
@@ -145,7 +145,7 @@ import torch
 
 import enn_torch
 
-from enn_torch.config import ModelConfig
+from enn_torch.core.config import ModelConfig
 from enn_torch.runtime.losses import StudentsTLoss
 from enn_torch.core.policies import optimize_threads
 
@@ -234,14 +234,11 @@ Notebook demo:
 ```
 enn_torch/
   __init__.py
-  config.py
   core/
     __init__.py
+    config.py
     compat.py             # accelerator/memory helpers, meta/fake tensor guards
     concurrency.py        # threading/affinity helpers
-    datatypes.py          # env parsing + small type utilities
-    distributed.py        # elastic launch + process group utilities
-    graph.py              # torch.compile helpers, graph break utilities
   runtime/
     workflow.py           # build/load models, elastic train/predict entrypoints
     policies.py           # thread/data policy heuristics
@@ -251,30 +248,35 @@ enn_torch/
     tensor.py             # tensor helpers + from_buffer context manager
   data/
     __init__.py
+    datatypes.py          # env parsing + small type utilities
     nodes.py              # torchdata nodes, Sampler/Loader, memmap writer/reader
     pipeline.py           # dataset fetch, collate, session orchestration
+    schema.py             # feature/label key helpers, input schema utilities
     collate.py            # dataset storage helpers
   runtime/
     __init__.py
+    distributed.py        # elastic launch + process group utilities
     io.py                 # exporters (ONNX/ORT/torch.export (PT2)/etc.), checkpoint save/load
     main.py               # training loop, predict path, elastic worker entrypoint
     losses.py             # Student’s t, regression losses, mask utils
     optimizers.py         # SGD/AdamW wrappers, SWA helper
-    wrappers.py           # export/runtime wrappers
   nn/
     __init__.py
     activations.py
     architecture.py
     blocks.py
+    checkpoint.py         # activation checkpoint helpers
+    graph.py              # torch.compile helpers, graph break utilities
     kernels.py
     layers.py
+    wrappers.py           # export/runtime wrappers
 ```
 
 ## Configuration notes
 
 ### ModelConfig string options
 
-`enn_torch.config.coerce_model_config()` normalizes common separator variants in a few string fields
+`enn_torch.core.config.coerce_model_config()` normalizes common separator variants in a few string fields
 to reduce "almost-right" config bugs:
 
 - `modeling_type`: canonical values `{ss, tt, st}`.

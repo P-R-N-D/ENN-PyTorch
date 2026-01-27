@@ -42,17 +42,17 @@ from torch.distributed.checkpoint.state_dict import (
 )
 from torch.distributed.launcher.api import LaunchConfig, elastic_launch
 
-from .. import schema
-from ..config import (
+from ..data import schema
+from ..core.config import (
     ModelConfig,
     RuntimeConfig,
     _extract_model_config_dict,
     coerce_model_config,
     runtime_config,
 )
-from ..core.datatypes import env_bool, read_json
-from ..core.distributed import get_available_host, get_preferred_ip, init_master_addr
-from ..core.graph import inference_mode
+from ..data.datatypes import env_bool, read_json
+from .distributed import get_available_host, get_preferred_ip, init_master_addr
+from ..nn.graph import inference_mode
 from ..core.policies import WorkerPolicy
 from ..core.system import (
     _start_context,
@@ -64,7 +64,6 @@ from ..core.system import (
 from ..core.tensor import coerce_tensor
 from ..data import collate
 from ..data.collate import MappingSlicer, TensorDictSlicer
-from ..data.collate import postprocess as _postprocess_pipeline
 from ..data.pipeline import (
     Dataset,
     default_underflow_action,
@@ -1496,19 +1495,3 @@ def predict(
             else:
                 logger.info("predict debug: preserving tmp_dir=%s", tmp_dir)
 
-
-def postprocess(
-    source: PathLike,
-    *args: Any,
-    output: str | None = "memory",
-    path: PathLike | None = None,
-    overwrite: str = "error",
-) -> PredictionOutput:
-    del args
-    with inference_mode(torch.nn.Identity()):
-        return _postprocess_pipeline(
-            source,
-            output=output,
-            path=path,
-            overwrite=overwrite,
-        )

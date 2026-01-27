@@ -5,12 +5,9 @@ import importlib
 from types import ModuleType
 
 __all__ = [
-    "datatypes",
+    "config",
     "tensor",
     "compat",
-    "distributed",
-    "graph",
-    "checkpoint",
     "precision",
     "profiler",
     "concurrency",

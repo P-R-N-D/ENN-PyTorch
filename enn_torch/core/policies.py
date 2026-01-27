@@ -21,14 +21,14 @@ import torch
 import torch.nn as nn
 
 from .concurrency import Mutex
-from .datatypes import (
+from ..data.datatypes import (
     default_underflow_action,
     env_first_int,
     env_float,
     env_str,
     normalize_underflow_action,
 )
-from .graph import clear_model_cache
+from ..nn.graph import clear_model_cache
 from .precision import Autocast, DeviceMeta, Quantization, is_scale_safe
 from .system import (
     CPU,

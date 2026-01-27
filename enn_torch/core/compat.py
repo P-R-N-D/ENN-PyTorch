@@ -10,7 +10,7 @@ import torch
 from torch import nn
 
 from .concurrency import Mutex
-from .graph import compile_distributed_safe
+from ..nn.graph import compile_distributed_safe
 
 _PATCH_LOCK = Mutex(reentrant=True)
 _TORCH_COMPAT: TorchCompat | None = None

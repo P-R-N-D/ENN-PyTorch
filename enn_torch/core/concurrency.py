@@ -25,7 +25,7 @@ from typing import Any, Callable, Optional, Protocol, Self, Tuple
 
 import torch
 
-from .datatypes import (
+from ..data.datatypes import (
     env_first,
     env_first_float,
     env_first_int,

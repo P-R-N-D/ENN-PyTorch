@@ -5,11 +5,11 @@ import importlib
 from types import ModuleType
 
 __all__ = [
+    "distributed",
     "io",
     "main",
     "losses",
     "optimizers",
-    "wrappers",
     "workflow",
 ]
 
