@@ -37,7 +37,6 @@ if "_dynamo_is_compiling" not in globals():
         def _dynamo_is_compiling() -> bool:
             return False
 
-
 _EXPORT_SIG_CACHE: object | None = None
 _EXPORT_SIG_LOCK = Mutex()
 _EXPORT_WARN_FILTERS_INSTALLED = False
@@ -385,20 +384,16 @@ def _onnx_options(kwargs: object, *args: Any, target: str = "onnx") -> object:
 
 def _coerce_onnx_path(dst: PathLike, kwargs: object) -> object:
     dst_p = Path(dst)
-
     onnx_override = None
     with contextlib.suppress(Exception):
         if isinstance(kwargs, dict):
             onnx_override = kwargs.get("onnx_path")
         else:
             onnx_override = getattr(kwargs, "onnx_path", None)
-
     if onnx_override:
         return Path(onnx_override)
-
     if dst_p.suffix.lower() == ".onnx":
         return dst_p
-
     return dst_p.with_name(dst_p.name + ".onnx")
 
 
@@ -495,7 +490,6 @@ def _run_onnx2tf(
     onnx_path = onnx_path.resolve()
     out_dir = out_dir.resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
-
     base_extra = [str(x) for x in extra_args if str(x)]
 
     def _cmd(*more: str) -> list[str]:
@@ -524,36 +518,29 @@ def _run_onnx2tf(
         return
 
     auto_json = _find_latest_onnx2tf_auto_json(out_dir)
-
     agj_flag: str | None = None
     for cand in ("-agj", "--auto_generate_json"):
         if _onnx2tf_supports(cand):
             agj_flag = cand
             break
-
     if agj_flag is not None:
         _try(agj_flag)
         auto_json = _find_latest_onnx2tf_auto_json(out_dir)
-
     if _onnx2tf_supports("-prf") and auto_json is not None:
         if _try("-prf", str(auto_json)):
             return
-
     if dynamic_batch and _onnx2tf_supports("-b"):
         if _try("-b", "1"):
             return
-
         if _onnx2tf_supports("-prf") and auto_json is not None:
             if _try("-b", "1", "-prf", str(auto_json)):
                 return
-
         if agj_flag is not None:
             _try("-b", "1", agj_flag)
             auto_json = _find_latest_onnx2tf_auto_json(out_dir)
             if _onnx2tf_supports("-prf") and auto_json is not None:
                 if _try("-b", "1", "-prf", str(auto_json)):
                     return
-
     raise RuntimeError(
         "onnx2tf conversion failed after multiple retries; "
         "consider running onnx2tf manually to inspect the failing op"
@@ -574,7 +561,6 @@ def _torch_export_program(
         import torch._functorch.predispatch as _pd
 
         _pd.lazy_load_decompositions()
-
     if isinstance(sample, torch.Tensor) and sample.ndim == 1:
         sample = sample.unsqueeze(0)
     if dynamic_batch and isinstance(sample, torch.Tensor) and sample.ndim >= 1:
@@ -649,7 +635,6 @@ def _torch_export_program(
     allow_non_strict = os.environ.get(
         "ENN_EXPORT_ALLOW_NON_STRICT", default_allow_non_strict
     ).strip().lower() not in ("0", "false", "off", "no", "n")
-
     try:
         return _call(**call_kw)
     except TypeError as exc:
@@ -707,10 +692,8 @@ def _sanitize_exported_program(exported: object) -> object:
     g = getattr(gm, "graph", None) if gm is not None else None
     if g is None:
         return exported
-
     with contextlib.suppress(Exception):
         g.eliminate_dead_code()
-
     for node in list(getattr(g, "nodes", ())):
         try:
             if node.op != "call_function":
@@ -726,7 +709,6 @@ def _sanitize_exported_program(exported: object) -> object:
                     g.erase_node(node)
         except Exception:
             continue
-
     with contextlib.suppress(Exception):
         g.lint()
     with contextlib.suppress(Exception):
@@ -983,7 +965,6 @@ class _ORTBuilder:
         if level == ort.GraphOptimizationLevel.ORT_ENABLE_ALL:
             disabled_optimizers = ["NchwcTransformer"]
         optimized_onnx_path = None
-
         if save_optimized_onnx_model:
             optimized_onnx_path = ort_path.with_suffix(".optimized.onnx")
             try:
@@ -1006,7 +987,6 @@ class _ORTBuilder:
                     RuntimeWarning,
                 )
                 optimized_onnx_path = None
-
         levels_to_try = [level]
         if level == ort.GraphOptimizationLevel.ORT_ENABLE_ALL:
             levels_to_try.extend(
@@ -1025,7 +1005,6 @@ class _ORTBuilder:
             )
         elif level == ort.GraphOptimizationLevel.ORT_ENABLE_BASIC:
             levels_to_try.append(ort.GraphOptimizationLevel.ORT_DISABLE_ALL)
-
         last_exc: Exception | None = None
         for lvl in levels_to_try:
             try:
@@ -1053,10 +1032,8 @@ class _ORTBuilder:
             except Exception as exc:
                 last_exc = exc
                 continue
-
         if last_exc is not None:
             raise RuntimeError("ORT export failed.") from last_exc
-
         return (ort_path, optimized_onnx_path)
 
 
@@ -1118,7 +1095,6 @@ class TorchInductor(Format):
                 "torch._inductor (TorchInductor) is required for AOT compilation. "
                 "Install a PyTorch build with torch.compile/TorchInductor support."
             ) from exc
-
         with _onnx_model(model) as serving_model:
             sample = kwargs.get("sample_input")
             sample = _pad_sample(serving_model, sample)
@@ -1135,10 +1111,8 @@ class TorchInductor(Format):
                 strict=bool(kwargs.get("strict", True)),
                 tag="TorchInductor export",
             )
-
             dst = Path(dst)
             dst.parent.mkdir(parents=True, exist_ok=True)
-
             inductor_configs = kwargs.get("inductor_configs")
             aoti_kw: dict[str, Any] = {}
             try:
@@ -1153,7 +1127,6 @@ class TorchInductor(Format):
                 aoti_kw["package_path"] = str(dst)
                 if inductor_configs is not None:
                     aoti_kw["inductor_configs"] = inductor_configs
-
             try:
                 out_path = aoti_compile_and_package(exported, **aoti_kw)
             except TypeError as exc:
@@ -1163,16 +1136,13 @@ class TorchInductor(Format):
                     if k in stripped and f"'{k}'" in msg:
                         stripped.pop(k, None)
                 out_path = aoti_compile_and_package(exported, **stripped)
-
             out = Path(str(out_path))
             if out != dst:
                 with contextlib.suppress(Exception):
                     shutil.copyfile(out, dst)
                 out = dst
-
             with contextlib.suppress(Exception):
                 _write_export_meta(model, out, format_name=self.name or "aoti")
-
         return (out,)
 
 
@@ -1195,26 +1165,21 @@ class TorchExport(Format):
             raise ImportError(
                 "torch.export is required for PT2 export (PyTorch 2.0+)."
             ) from exc
-
         with _onnx_model(model) as serving_model:
             sample = kwargs.get("sample_input")
             sample = _pad_sample(serving_model, sample)
             if isinstance(sample, torch.Tensor) and sample.ndim == 1:
                 sample = sample.unsqueeze(0)
             wrapper = _TensorOutputModule(serving_model).eval()
-
             with _no_empty_tensor(serving_model):
                 exported = self._export_program(wrapper, sample, **kwargs)
                 exported = _sanitize_exported_program(exported)
-
             dst = Path(dst)
             dst.parent.mkdir(parents=True, exist_ok=True)
             with from_buffer():
                 torch_save(exported, str(dst))
-
             with contextlib.suppress(Exception):
                 _write_export_meta(model, dst, format_name=self.name or "pt2")
-
         return (dst,)
 
     def _export_program(
@@ -1228,7 +1193,6 @@ class TorchExport(Format):
             raise ImportError(
                 "torch.export is required for PT2 export (PyTorch 2.0+)."
             ) from exc
-
         return _torch_export_program(
             torch_export,
             wrapper,
@@ -1272,7 +1236,6 @@ class ExecuTorch(Format):
                 sample = sample.unsqueeze(0)
             wrapper = _TensorOutputModule(serving_model).eval()
             dst.parent.mkdir(parents=True, exist_ok=True)
-
             dyn_batch = bool(kwargs.get("dynamic_batch", True))
             dyn_seq = bool(kwargs.get("dynamic_seq", False))
             strict = bool(kwargs.get("strict", True))
@@ -1468,7 +1431,6 @@ class TensorRT(Format):
             import tensorrt as trt
         except ImportError as exc:
             raise ImportError("TensorRT is required for this export.") from exc
-
         with _onnx_model(model) as serving_model:
             onnx_path = _ONNXExporter.coerce(
                 serving_model,
@@ -1509,10 +1471,8 @@ class TensorRT(Format):
                     network = stack.enter_context(create_network(explicit_batch_flag))
                 except TypeError:
                     network = stack.enter_context(create_network())
-
                 parser = stack.enter_context(trt.OnnxParser(network, trt_logger))
                 config = stack.enter_context(builder.create_builder_config())
-
                 workspace_size_bytes = int(kwargs.get("workspace_size_bytes", 1 << 30))
                 if hasattr(config, "set_memory_pool_limit"):
                     config.set_memory_pool_limit(
@@ -1566,7 +1526,6 @@ class TensorRT(Format):
                         engine = build_engine(network, config)
                         if engine is not None:
                             engine_blob = getattr(engine, "serialize", lambda: None)()
-
                 if engine_blob is None:
                     raise RuntimeError("Failed to build the TensorRT engine.")
                 try:
@@ -1625,7 +1584,6 @@ class CoreML(Format):
         import coremltools as ct
 
         dst = Path(dst)
-
         with _onnx_model(model) as serving_model:
             sample = _pad_sample(serving_model, kwargs.get("sample_input"))
             wrapper = _TensorOutputModule(serving_model).eval()
@@ -1705,7 +1663,6 @@ class LiteRT(Format):
         )
         have_ai_edge = importlib.util.find_spec("ai_edge_torch") is not None
         have_onnx2tf = importlib.util.find_spec("onnx2tf") is not None
-
         with _onnx_model(model) as serving_model:
             if prefer_ai_edge and have_ai_edge:
                 try:
@@ -1715,7 +1672,6 @@ class LiteRT(Format):
                     sample = _pad_sample(serving_model, sample, batch=1)
                     if isinstance(sample, torch.Tensor) and sample.ndim == 1:
                         sample = sample.unsqueeze(0)
-
                     wrapper = _TensorOutputModule(serving_model).eval()
                     edge_model = ai_edge_torch.convert(wrapper, (sample,))
                     exporter = getattr(edge_model, "export", None)
@@ -1725,7 +1681,6 @@ class LiteRT(Format):
                         )
                     dst.parent.mkdir(parents=True, exist_ok=True)
                     exporter(str(dst))
-
                     with contextlib.suppress(Exception):
                         _write_export_meta(
                             model,
@@ -1742,25 +1697,21 @@ class LiteRT(Format):
                         )
                     else:
                         raise
-
             if not have_onnx2tf:
                 raise ImportError(
                     "LiteRT export requires ai-edge-torch (preferred) or onnx2tf (fallback). "
                     "Try: pip install ai-edge-torch (or: pip install onnx2tf)"
                 )
             is_required("onnx2tf", "pip install onnx2tf")
-
             onnx_path = _ONNXExporter.coerce(
                 serving_model,
                 _coerce_onnx_path(dst, kwargs),
                 **_onnx_options(kwargs, target="litert"),
             )
-
             work_dir = dst.with_name(dst.name + ".onnx2tf")
             if work_dir.exists():
                 shutil.rmtree(work_dir, ignore_errors=True)
             work_dir.mkdir(parents=True, exist_ok=True)
-
             _run_onnx2tf(
                 Path(onnx_path),
                 work_dir,
@@ -1772,7 +1723,6 @@ class LiteRT(Format):
                 raise RuntimeError("onnx2tf did not produce a .tflite model.")
             dst.parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(tflites[0], dst)
-
             with contextlib.suppress(Exception):
                 _write_export_meta(
                     model,
@@ -1803,14 +1753,12 @@ class TensorFlow(Format):
             saved_model_dir = dst.with_suffix("")
         else:
             saved_model_dir = dst
-
         with _onnx_model(model) as serving_model:
             onnx_path = _ONNXExporter.coerce(
                 serving_model,
                 _coerce_onnx_path(saved_model_dir, kwargs),
                 **_onnx_options(kwargs, target="tensorflow"),
             )
-
             with TemporaryDirectory() as tmpd:
                 tmp_out = Path(tmpd) / "onnx2tf_out"
                 tmp_out.mkdir(parents=True, exist_ok=True)
@@ -1829,7 +1777,6 @@ class TensorFlow(Format):
                     shutil.rmtree(saved_model_dir)
                 saved_model_dir.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copytree(src_dir, saved_model_dir)
-
         with contextlib.suppress(Exception):
             _write_export_meta(
                 model,
@@ -1837,7 +1784,6 @@ class TensorFlow(Format):
                 format_name=self.name or "tensorflow",
                 extra={"backend": "onnx2tf", "onnx_path": str(onnx_path)},
             )
-
         return (saved_model_dir,)
 
 
@@ -1867,17 +1813,14 @@ class GraphSequential(nn.Module):
         self._name = str(name or "subgraph")
         self._owned = nn.ModuleList()
         self._refs_materialized = False
-
         self._root_ref: weakref.ReferenceType[nn.Module] | None = (
             weakref.ref(root) if root is not None else None
         )
         self._path_cache: dict[str, weakref.ReferenceType[nn.Module]] = {}
         self._path_cache_lock = threading.Lock()
-
         self._out_shape_kind, self._out_shape_spec = self._normalize_out_shape(
             out_shape
         )
-
         compiled_steps: list[tuple[object, ...]] = []
         for raw in steps:
             step, extra_args, extra_kwargs = self._parse_step(raw)
@@ -1930,9 +1873,7 @@ class GraphSequential(nn.Module):
                     meta = {"control": str(tag)}
                 compiled_steps.append(("fn", step, extra_args, extra_kwargs, meta))
                 continue
-
             raise TypeError(f"Unsupported GraphSequential step: {type(step)!r}")
-
         if not compiled_steps:
             raise ValueError("GraphSequential requires at least one step.")
         self._steps: list[tuple[object, ...]] = compiled_steps
@@ -2120,11 +2061,9 @@ class GraphSequential(nn.Module):
         if root is not None:
             self.set_root(root)
         self._refs_materialized = True
-
         rebound: list[tuple[object, ...]] = []
         for item in list(self._steps):
             kind, payload, extra_args, extra_kwargs, meta = self._split_step(item)
-
             if kind == "path":
                 path = str(payload)
                 mod = self._resolve_path(path)
@@ -2132,7 +2071,6 @@ class GraphSequential(nn.Module):
                 m["path"] = path
                 rebound.append(("ref", mod, extra_args, extra_kwargs, m))
                 continue
-
             if kind == "ref" and payload is None:
                 path = meta.get("path") if isinstance(meta, dict) else None
                 if isinstance(path, str):
@@ -2151,16 +2089,13 @@ class GraphSequential(nn.Module):
                     raise RuntimeError(
                         "GraphSequential.bind() encountered an unresolved ref without a path hint."
                     )
-
             if kind == "ref" and isinstance(payload, weakref.ReferenceType):
                 with contextlib.suppress(Exception):
                     mod = payload()
                     if isinstance(mod, nn.Module):
                         rebound.append(("ref", mod, extra_args, extra_kwargs, meta))
                         continue
-
             rebound.append((kind, payload, extra_args, extra_kwargs, meta))
-
         self._steps = rebound
         return self
 
@@ -2169,13 +2104,11 @@ class GraphSequential(nn.Module):
             cur: Any = CallArguments(args=tuple(args), kwargs=dict(kwargs))
         else:
             cur = args[0] if len(args) == 1 else tuple(args)
-
         for item in self._steps:
             kind, payload, extra_args, extra_kwargs, meta = self._split_step(item)
             cur = self._apply_step(
                 kind, payload, cur, extra_args, extra_kwargs, meta=meta
             )
-
         return self._apply_out_shape(cur)
 
     def extra_repr(self: Self) -> str:
@@ -2183,7 +2116,6 @@ class GraphSequential(nn.Module):
 
     def __getstate__(self: Self) -> dict[str, object]:
         state = super().__getstate__()
-
         steps = state.get("_steps", [])
         sanitized: list[tuple[object, ...]] = []
         if isinstance(steps, list):
@@ -2194,7 +2126,6 @@ class GraphSequential(nn.Module):
                 else:
                     sanitized.append((kind, payload, extra_args, extra_kwargs, meta))
             state["_steps"] = sanitized
-
         state["_root_ref"] = None
         state["_path_cache"] = {}
         state["_path_cache_lock"] = None
@@ -2232,7 +2163,6 @@ class GraphSequential(nn.Module):
             raise TypeError("Invalid GraphSequential internal step format.")
         kind = str(item[0])
         payload = item[1]
-
         raw_args = item[2]
         if raw_args is None:
             extra_args: tuple[Any, ...] = ()
@@ -2243,7 +2173,6 @@ class GraphSequential(nn.Module):
                 extra_args = tuple(raw_args)
             except TypeError:
                 extra_args = (raw_args,)
-
         raw_kwargs = item[3]
         if raw_kwargs is None:
             extra_kwargs: dict[str, Any] = {}
@@ -2251,7 +2180,6 @@ class GraphSequential(nn.Module):
             extra_kwargs = dict(raw_kwargs)
         else:
             extra_kwargs = dict(raw_kwargs) if hasattr(raw_kwargs, "items") else {}
-
         meta = item[4] if len(item) >= 5 else None
         return kind, payload, extra_args, extra_kwargs, meta
 
@@ -2302,13 +2230,11 @@ class GraphSequential(nn.Module):
             mod = ref()
             if mod is not None:
                 return mod
-
         root = self._root_ref() if self._root_ref is not None else None
         if root is None:
             raise RuntimeError(
                 "GraphSequential requires `root=` (or set_root()) when using ModulePath steps."
             )
-
         mod: nn.Module | None = None
         if hasattr(root, "get_submodule"):
             try:
@@ -2329,10 +2255,8 @@ class GraphSequential(nn.Module):
                     )
                 cur = nxt
             mod = cur
-
         if not isinstance(mod, nn.Module):
             raise TypeError(f"get_submodule({path!r}) did not return an nn.Module")
-
         with self._path_cache_lock:
             self._path_cache[path] = weakref.ref(mod)
         return mod
@@ -2343,7 +2267,6 @@ class GraphSequential(nn.Module):
             raise RuntimeError(
                 "GraphSequential requires `root=` (or set_root()) when using ModulePath steps."
             )
-
         mod: nn.Module | None = None
         if hasattr(root, "get_submodule"):
             try:
@@ -2364,7 +2287,6 @@ class GraphSequential(nn.Module):
                     )
                 cur = nxt
             mod = cur
-
         if not isinstance(mod, nn.Module):
             raise TypeError(f"get_submodule({path!r}) did not return an nn.Module")
         return mod
@@ -2386,7 +2308,6 @@ class GraphSequential(nn.Module):
             merged = dict(kwargs)
             merged.update(extra_kwargs)
             kwargs = merged
-
         if kind == "ref":
             mod: nn.Module | None = None
             path = meta.get("path") if isinstance(meta, dict) else None
@@ -2431,7 +2352,6 @@ class GraphSequential(nn.Module):
                     "out_shape is set but the pipeline output is not a Tensor."
                 )
             return _reshape_one(out, spec)
-
         if kind == "seq":
             if not isinstance(out, (tuple, list)):
                 raise RuntimeError(
@@ -2479,11 +2399,9 @@ class GraphSequential(nn.Module):
 
         if root is not None:
             self.set_root(root)
-
         steps_out: list[object] = []
         for item in list(self._steps):
             kind, payload, extra_args, extra_kwargs, meta = self._split_step(item)
-
             if kind == "fn":
                 fn = payload
                 if strip_control_ops and bool(getattr(fn, self._CONTROL_ATTR, "")):
@@ -2507,12 +2425,10 @@ class GraphSequential(nn.Module):
                         mod = self._resolve_path(str(path))
                 else:
                     raise TypeError(f"Unknown GraphSequential step kind: {kind!r}")
-
                 if not isinstance(mod, nn.Module):
                     raise RuntimeError(
                         f"extract_for_serving could not resolve module for step kind={kind!r}"
                     )
-
                 if clone_modules:
                     try:
                         mod = copy.deepcopy(mod)
@@ -2523,7 +2439,6 @@ class GraphSequential(nn.Module):
                             RuntimeWarning,
                         )
                 step_obj = OwnedModule(module=mod)
-
             if extra_args and extra_kwargs:
                 steps_out.append((step_obj, extra_args, extra_kwargs))
             elif extra_args:
@@ -2532,7 +2447,6 @@ class GraphSequential(nn.Module):
                 steps_out.append((step_obj, extra_kwargs))
             else:
                 steps_out.append(step_obj)
-
         out = GraphSequential(
             steps=steps_out,
             out_shape=(
