@@ -30,7 +30,6 @@ class GLU(nn.Module):
             raise ValueError(f"Dropout {dropout} invalid")
         if not isinstance(activation, nn.Module):
             raise TypeError(f"Invalid activation type: {type(activation)}")
-
         self.check_input, self.activation = bool(check_input), activation
         self.in_proj = nn.Linear(self.in_dim, 2 * self.hid, bias=bias)
         self.dropout = nn.Identity() if dropout == 0.0 else nn.Dropout(dropout)
