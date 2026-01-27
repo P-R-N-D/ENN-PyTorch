@@ -30,6 +30,7 @@ from .system import (
     is_int8_supported,
 )
 
+
 _Int8DynamicActivationInt8WeightConfig = None
 _Int8WeightOnlyConfig = None
 _LOGGER = logging.getLogger(__name__)
