@@ -14,6 +14,14 @@ import threading
 import types
 import warnings
 import weakref
+
+if "_dynamo_is_compiling" not in globals():
+    try:
+        from torch._dynamo import is_compiling as _dynamo_is_compiling  # type: ignore
+    except Exception:
+        def _dynamo_is_compiling() -> bool:  # type: ignore
+            return False
+
 from dataclasses import dataclass
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -2419,6 +2427,38 @@ class GraphSequential(nn.Module):
             self._path_cache[path] = weakref.ref(mod)
         return mod
 
+    def _resolve_path_nocache(self: Self, path: str) -> nn.Module:
+        root = self._root_ref() if self._root_ref is not None else None
+        if root is None:
+            raise RuntimeError(
+                "GraphSequential requires `root=` (or set_root()) when using ModulePath steps."
+            )
+
+        mod: nn.Module | None = None
+        if hasattr(root, "get_submodule"):
+            try:
+                mod = root.get_submodule(path)
+            except Exception:
+                mod = None
+        if mod is None:
+            cur: nn.Module = root
+            for part in str(path).split("."):
+                child = getattr(cur, "_modules", None)
+                if isinstance(child, dict) and part in child:
+                    nxt = child.get(part)
+                else:
+                    nxt = getattr(cur, part, None)
+                if not isinstance(nxt, nn.Module):
+                    raise AttributeError(
+                        f"Failed to resolve submodule path {path!r} at {part!r}."
+                    )
+                cur = nxt
+            mod = cur
+
+        if not isinstance(mod, nn.Module):
+            raise TypeError(f"get_submodule({path!r}) did not return an nn.Module")
+        return mod
+
     def _apply_step(
         self: Self,
         kind: str,
@@ -2438,11 +2478,19 @@ class GraphSequential(nn.Module):
             kwargs = merged
 
         if kind == "ref":
-            mod = payload() if callable(payload) else None
+            mod: nn.Module | None = None
+            if (not _dynamo_is_compiling()) and isinstance(
+                payload, weakref.ReferenceType
+            ):
+                mod = payload()
             if mod is None:
                 path = meta.get("path") if isinstance(meta, dict) else None
                 if isinstance(path, str):
-                    mod = self._resolve_path(path)
+                    mod = (
+                        self._resolve_path_nocache(path)
+                        if _dynamo_is_compiling()
+                        else self._resolve_path(path)
+                    )
                 else:
                     raise RuntimeError(
                         "A shared submodule reference was cleared (or not bound) before GraphSequential.forward()."
@@ -2552,7 +2600,11 @@ class GraphSequential(nn.Module):
                 elif kind == "path":
                     mod = self._resolve_path(str(payload))
                 elif kind == "ref":
-                    mod = payload() if callable(payload) else None
+                    mod = (
+                        payload()
+                        if isinstance(payload, weakref.ReferenceType)
+                        else None
+                    )
                     if (
                         mod is None
                         and isinstance(meta, dict)
