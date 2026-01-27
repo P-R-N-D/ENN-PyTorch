@@ -20,9 +20,9 @@ from typing import (
     Iterator,
     Mapping,
     Optional,
+    Self,
     Sequence,
     Tuple,
-    Self,
 )
 
 import torch
@@ -45,12 +45,7 @@ from ..core.concurrency import (
     new_affinity,
     new_thread,
 )
-from ..core.datatypes import (
-    dtype_from_name,
-    env_bool,
-    env_first_int,
-    read_json,
-)
+from ..core.datatypes import dtype_from_name, env_bool, env_first_int, read_json
 from ..core.graph import inference_mode
 from ..core.policies import WorkerPolicy
 from ..core.system import (
@@ -66,7 +61,6 @@ from ..core.system import (
     new_accelerator_event,
     new_accelerator_stream,
 )
-
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -144,9 +138,7 @@ def _wait_accel_event_done(
     d_base, d_max, d_stop_min = _accel_event_poll_params()
     base_sleep_s = base_sleep_s if base_sleep_s is not None else d_base
     max_sleep_s = max_sleep_s if max_sleep_s is not None else d_max
-    stop_min_sleep_s = (
-        stop_min_sleep_s if stop_min_sleep_s is not None else d_stop_min
-    )
+    stop_min_sleep_s = stop_min_sleep_s if stop_min_sleep_s is not None else d_stop_min
     sleep_s = max(0.0, float(base_sleep_s))
     max_s = max(sleep_s, float(max_sleep_s))
     stop_min_s = max(0.0, float(stop_min_sleep_s))
@@ -171,14 +163,10 @@ def _normalize_device_spec(
         return device
     if isinstance(device, str):
         return torch.device(device)
-    if isinstance(device, Sequence) and not isinstance(
-        device, (str, bytes, bytearray)
-    ):
+    if isinstance(device, Sequence) and not isinstance(device, (str, bytes, bytearray)):
         devs: list[torch.device] = []
         for d in device:
-            devs.append(
-                d if isinstance(d, torch.device) else torch.device(str(d))
-            )
+            devs.append(d if isinstance(d, torch.device) else torch.device(str(d)))
         return devs if devs else torch.device("cpu")
     return torch.device(device)
 
@@ -187,9 +175,7 @@ def _primary_device(
     device_spec: torch.device | list[torch.device],
 ) -> torch.device:
     return (
-        device_spec[0]
-        if isinstance(device_spec, list) and device_spec
-        else device_spec
+        device_spec[0] if isinstance(device_spec, list) and device_spec else device_spec
     )
 
 
@@ -216,12 +202,8 @@ class Governor:
             v, mn, mx = state
         except Exception:
             v, mn, mx = None, 0.5, 2.0
-        self._min_scale = (
-            float(mn) if isinstance(mn, (int, float, str)) else 0.5
-        )
-        self._max_scale = (
-            float(mx) if isinstance(mx, (int, float, str)) else 2.0
-        )
+        self._min_scale = float(mn) if isinstance(mn, (int, float, str)) else 0.5
+        self._max_scale = float(mx) if isinstance(mx, (int, float, str)) else 2.0
         if v is None:
             self._v = multiprocessing.Value("d", 1.0, lock=True)
         else:
@@ -284,9 +266,7 @@ class Governor:
         try:
             with self._v.get_lock():
                 cur = float(self._v.value)
-                self._v.value = float(
-                    min(float(self._max_scale), cur * float(f))
-                )
+                self._v.value = float(min(float(self._max_scale), cur * float(f)))
         except Exception:
             pass
 
@@ -300,9 +280,7 @@ class Governor:
         try:
             with self._v.get_lock():
                 cur = float(self._v.value)
-                self._v.value = float(
-                    max(float(self._min_scale), cur * float(f))
-                )
+                self._v.value = float(max(float(self._min_scale), cur * float(f)))
         except Exception:
             pass
 
@@ -322,15 +300,11 @@ class Sampler(torch.utils.data.Sampler):
         self.dir = os.fspath(memmap_dir)
         self.split = str(split)
         self._meta: Mapping[str, Any] = self._load_meta(self.dir)
-        self._sampler_scale = (
-            sampler_scale if sampler_scale is not None else Governor()
-        )
+        self._sampler_scale = sampler_scale if sampler_scale is not None else Governor()
         self._S_B_cap = 0
         self._N = int(self._meta.get("N", 0))
         if self._N <= 0:
-            raise ValueError(
-                f"meta.json under {self.dir} has non-positive N={self._N}"
-            )
+            raise ValueError(f"meta.json under {self.dir} has non-positive N={self._N}")
         feat_rel = str(self._meta.get("features_path", "features.mmt"))
         feat_path = os.path.join(self.dir, feat_rel)
         lab_rel_raw = self._meta.get("labels_path", "labels.mmt")
@@ -349,17 +323,13 @@ class Sampler(torch.utils.data.Sampler):
                     lab_rel = ""
                     lab_path = ""
                 else:
-                    raise FileNotFoundError(
-                        f"labels.mmt not found under: {lab_path}"
-                    )
+                    raise FileNotFoundError(f"labels.mmt not found under: {lab_path}")
         fdim = int(self._meta.get("feature_dim", 0))
         lshape_meta = list(self._meta.get("label_shape") or [])
         f_dtype = dtype_from_name(
             self._meta.get("features_dtype", "float64"), torch.float64
         )
-        l_dtype = dtype_from_name(
-            self._meta.get("labels_dtype", "int64"), torch.int64
-        )
+        l_dtype = dtype_from_name(self._meta.get("labels_dtype", "int64"), torch.int64)
         self._include_row_ids = env_bool("ENN_INCLUDE_ROW_IDS", default=True)
         self._feat_path = feat_path
         self._lab_path = lab_path if lab_path else None
@@ -425,9 +395,7 @@ class Sampler(torch.utils.data.Sampler):
         self._num_shards = 1
         self._shard_id = 0
         self._key = ""
-        self._label_shape: Tuple[int, ...] = (
-            tuple(lshape) if lshape else tuple()
-        )
+        self._label_shape: Tuple[int, ...] = tuple(lshape) if lshape else tuple()
         train_start = int(self._meta.get("train_start", 0))
         train_end = int(self._meta.get("train_end", self._N))
         val_start = int(self._meta.get("val_start", 0))
@@ -451,9 +419,7 @@ class Sampler(torch.utils.data.Sampler):
             raise FileNotFoundError(f"meta.json not found under: {memmap_dir}")
         meta = read_json(meta_path)
         if not isinstance(meta, Mapping):
-            raise ValueError(
-                f"meta.json under {memmap_dir} must contain a mapping"
-            )
+            raise ValueError(f"meta.json under {memmap_dir} must contain a mapping")
         return meta
 
     def _effective_batch_size(self: Self) -> int:
@@ -654,9 +620,7 @@ class Sampler(torch.utils.data.Sampler):
             ):
                 if len(seq) == 0:
                     return self._slice(base, base)
-                idx_tensor = (
-                    torch.as_tensor(seq, dtype=torch.long).reshape(-1) + base
-                )
+                idx_tensor = torch.as_tensor(seq, dtype=torch.long).reshape(-1) + base
                 return self._gather(idx_tensor, features, labels)
             case _:
                 i = base + int(idx)
@@ -676,11 +640,7 @@ class Sampler(torch.utils.data.Sampler):
     def _shard(self: Self) -> None:
         try:
             dist = getattr(torch, "distributed", None)
-            if (
-                dist is not None
-                and dist.is_available()
-                and dist.is_initialized()
-            ):
+            if dist is not None and dist.is_available() and dist.is_initialized():
                 self._num_shards = max(1, int(dist.get_world_size()))
                 self._shard_id = max(0, int(dist.get_rank()))
                 return
@@ -719,8 +679,7 @@ class Sampler(torch.utils.data.Sampler):
         if bool(getattr(self, "_S_shuffle", True)):
             g = torch.Generator(device="cpu")
             g.manual_seed(
-                int(getattr(self, "_S_seed", 0))
-                + int(getattr(self, "_S_epoch", 0))
+                int(getattr(self, "_S_seed", 0)) + int(getattr(self, "_S_epoch", 0))
             )
             order = torch.randperm(n_blocks, generator=g, dtype=torch.int64)
         else:
@@ -833,9 +792,7 @@ class Multiplexer:
         self: Self,
         *args: Any,
         stop_criteria: str = "ALL_DATASETS_EXHAUSTED",
-        weights: Optional[
-            Mapping[str, float] | Sequence[float] | float | int
-        ] = None,
+        weights: Optional[Mapping[str, float] | Sequence[float] | float | int] = None,
         seed: int = 0,
         **kwargs: Any,
     ) -> None:
@@ -873,9 +830,7 @@ class Multiplexer:
             node, "WEIGHTED_SAMPLER_STATE_KEY", "weighted_sampler_state"
         )
         ny_key = _node_state_key(node, "NUM_YIELDED_KEY", "num_yielded")
-        ex_key = _node_state_key(
-            node, "DATASETS_EXHAUSTED_KEY", "datasets_exhausted"
-        )
+        ex_key = _node_state_key(node, "DATASETS_EXHAUSTED_KEY", "datasets_exhausted")
         dns_key = _node_state_key(
             node, "DATASET_NODE_STATES_KEY", "dataset_node_states"
         )
@@ -923,9 +878,7 @@ class Multiplexer:
             for k, v in dict(sources).items():
                 kk = str(k)
                 if kk in sources_map:
-                    raise ValueError(
-                        f"sources has duplicate key after str(): {kk!r}"
-                    )
+                    raise ValueError(f"sources has duplicate key after str(): {kk!r}")
                 sources_map[kk] = v
         else:
             raise TypeError(
@@ -964,9 +917,7 @@ class Multiplexer:
             for k, v in dict(raw).items():
                 kk = str(k)
                 if kk in w_in:
-                    raise ValueError(
-                        f"weights has duplicate key after str(): {kk!r}"
-                    )
+                    raise ValueError(f"weights has duplicate key after str(): {kk!r}")
                 w_in[kk] = _coerce_weight(v, where=f"weights[{kk!r}]")
             if not w_in:
                 raise ValueError(
@@ -1002,8 +953,7 @@ class Multiplexer:
                     f"weights sequence length mismatch: expected {expected}, got {len(seq)}"
                 )
             w_seq = [
-                _coerce_weight(v, where=f"weights[{i}]")
-                for i, v in enumerate(seq)
+                _coerce_weight(v, where=f"weights[{i}]") for i, v in enumerate(seq)
             ]
             if not any((float(v) > 0.0) for v in w_seq):
                 raise ValueError(
@@ -1070,9 +1020,7 @@ class Mapper:
         self._prefetch_factor = pf
         self.prefetch_factor = self._prefetch_factor
         self.device = (
-            device
-            if isinstance(device, torch.device)
-            else torch.device(device)
+            device if isinstance(device, torch.device) else torch.device(device)
         )
         self.non_blocking = bool(non_blocking)
         pin = (
@@ -1125,18 +1073,14 @@ class Loader:
     ) -> None:
         node_obj = node or dataset
         if not isinstance(node_obj, BaseNode):
-            raise TypeError(
-                "Loader supports only torchdata.nodes.BaseNode instances."
-            )
+            raise TypeError("Loader supports only torchdata.nodes.BaseNode instances.")
         self._device = _normalize_device_spec(device)
         self._nogil = bool(CPU.is_optimized_for_no_gil())
         self._non_blocking = bool(non_blocking)
         self._length = int(length) if length is not None else None
         depth = max(1, int(prefetch_factor))
         with suppress(Exception):
-            depth_env = int(
-                env_first_int(("ENN_PREFETCH_DEPTH",), default=0) or 0
-            )
+            depth_env = int(env_first_int(("ENN_PREFETCH_DEPTH",), default=0) or 0)
             if depth_env > 0:
                 depth = int(depth_env)
         self._prefetch_depth = max(1, min(32, int(depth)))
@@ -1186,9 +1130,7 @@ class Loader:
             thr = max(1, int(self._threads_hint))
             self._num_shards = acc * thr
             dev_idx = self._local_device_index()
-            self._shard_id = max(
-                0, min(self._num_shards - 1, int(dev_idx * thr))
-            )
+            self._shard_id = max(0, min(self._num_shards - 1, int(dev_idx * thr)))
         except Exception:
             pass
 
@@ -1238,11 +1180,7 @@ class Loader:
     def _device_for_current_thread(self: Self) -> torch.device:
         if isinstance(self._device, list):
             tid = threading.get_ident()
-            guard = (
-                self._thread2dev_lock
-                if self._nogil
-                else contextlib.nullcontext()
-            )
+            guard = self._thread2dev_lock if self._nogil else contextlib.nullcontext()
             with guard:
                 dev = self._thread2dev.get(tid)
                 if dev is None:
@@ -1288,9 +1226,7 @@ class Loader:
         **kwargs: Any,
     ) -> "Loader":
         if not isinstance(source, BaseNode):
-            raise TypeError(
-                "Loader.compose expects a torchdata.nodes.BaseNode source."
-            )
+            raise TypeError("Loader.compose expects a torchdata.nodes.BaseNode source.")
         return Loader(
             device=device,
             node=source,
@@ -1319,9 +1255,7 @@ class Stream(BufferQueue):
         super().__init__(max_batches=depth)
         self._src = iterable
         self._device = (
-            torch.device(device)
-            if not isinstance(device, torch.device)
-            else device
+            torch.device(device) if not isinstance(device, torch.device) else device
         )
         self._depth = max(1, int(depth))
         self._non_blocking = bool(non_blocking)
@@ -1332,9 +1266,7 @@ class Stream(BufferQueue):
         )
         self._gpu_guard_bytes = int(gpu_guard_bytes or 0)
         self._host_guard_bytes = int(host_guard_bytes or 0)
-        use_accel = isinstance(
-            self._device, torch.device
-        ) and self._device.type in (
+        use_accel = isinstance(self._device, torch.device) and self._device.type in (
             "cuda",
             "xpu",
             "mps",
@@ -1342,33 +1274,24 @@ class Stream(BufferQueue):
         self._pin = bool(kwargs.get("pin_host", use_accel))
         self._pin_pool = False
         self._host_pool: Optional[TensorPagePool] = None
-        if (
-            self._pin
-            and self._non_blocking
-            and is_stream_supported(self._device.type)
-        ):
+        if self._pin and self._non_blocking and is_stream_supported(self._device.type):
             use_pool = env_bool("ENN_PREFETCH_PIN_POOL", default=True)
             cap_default = max(8, max(2, int(self._depth) * 2))
             cap = env_first_int(
                 ("ENN_PREFETCH_PIN_POOL_CAPACITY",), default=cap_default
             )
             if use_pool and int(cap) > 0:
-                self._host_pool = TensorPagePool(
-                    capacity=int(cap), pin_memory=True
-                )
+                self._host_pool = TensorPagePool(capacity=int(cap), pin_memory=True)
                 self._pin_pool = True
         self._accel_stream: Optional[object] = None
         self._accel_event_pool: Optional[queue.SimpleQueue] = None
         self._session = bool(_session)
-        ttl_ms = int(
-            env_first_int(("ENN_PREFETCH_GUARD_TTL_MS",), default=10) or 10
-        )
+        ttl_ms = int(env_first_int(("ENN_PREFETCH_GUARD_TTL_MS",), default=10) or 10)
         self._guard_ttl_s = max(0.0, float(ttl_ms) / 1000.0)
         self._join_timeout_s = 0.5
         with suppress(Exception):
             jt_ms = int(
-                env_first_int(("ENN_THREAD_JOIN_TIMEOUT_MS",), default=500)
-                or 500
+                env_first_int(("ENN_THREAD_JOIN_TIMEOUT_MS",), default=500) or 500
             )
             self._join_timeout_s = max(0.0, float(jt_ms) / 1000.0)
 
@@ -1402,11 +1325,7 @@ class Stream(BufferQueue):
             return type(obj)(*(self._apply_structure(x, func) for x in obj))
         if isinstance(obj, dict):
             return {
-                k: (
-                    v
-                    if k in ("row_ids", "keys")
-                    else self._apply_structure(v, func)
-                )
+                k: (v if k in ("row_ids", "keys") else self._apply_structure(v, func))
                 for k, v in obj.items()
             }
         return func(obj)
@@ -1426,8 +1345,7 @@ class Stream(BufferQueue):
             if not torch.is_tensor(t) or t.device == device:
                 return t
             nb = self._non_blocking and (
-                t.device.type != "cpu"
-                or (hasattr(t, "is_pinned") and t.is_pinned())
+                t.device.type != "cpu" or (hasattr(t, "is_pinned") and t.is_pinned())
             )
             return t.to(device, non_blocking=nb)
 
@@ -1555,9 +1473,7 @@ class Stream(BufferQueue):
                         if ev is not None:
                             _wait_accel_event_done(ev, stopped=self.is_stopped)
                         try:
-                            with accelerator_stream(
-                                self._accel_stream, device.type
-                            ):
+                            with accelerator_stream(self._accel_stream, device.type):
                                 batch_dev = self._to_device(batch, device)
                                 if ev is not None:
                                     try:
@@ -1573,9 +1489,7 @@ class Stream(BufferQueue):
                                         self._host_pool.release(tok)
                             if not self.put((batch_dev, ev), timeout=None):
                                 if ev is not None and pool is not None:
-                                    _wait_accel_event_done(
-                                        ev, stopped=self.is_stopped
-                                    )
+                                    _wait_accel_event_done(ev, stopped=self.is_stopped)
                                     with suppress(Exception):
                                         pool.put(ev)
                                 break
@@ -1585,9 +1499,7 @@ class Stream(BufferQueue):
                                     with suppress(Exception):
                                         self._host_pool.release(tok)
                             if ev is not None and pool is not None:
-                                _wait_accel_event_done(
-                                    ev, stopped=self.is_stopped
-                                )
+                                _wait_accel_event_done(ev, stopped=self.is_stopped)
                                 with suppress(Exception):
                                     pool.put(ev)
                             raise
@@ -1615,9 +1527,7 @@ class Stream(BufferQueue):
 
         device = getattr(self, "_device", torch.device("cpu"))
         use_device = device.type in {"cuda", "mps", "xpu"}
-        use_accel_stream = bool(
-            self._non_blocking and is_stream_supported(device.type)
-        )
+        use_accel_stream = bool(self._non_blocking and is_stream_supported(device.type))
 
         iterable = getattr(self, "_iterable", self._src)
         gpu_guard_bytes = int(getattr(self, "_gpu_guard_bytes", 0) or 0)

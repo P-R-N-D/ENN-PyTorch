@@ -67,9 +67,7 @@ TCache = TypeVar("TCache")
 if env_bool("ENN_DISABLE_FLEX_ATTENTION", False):
     _HAS_FLEX_ATTENTION = False
 else:
-    _HAS_FLEX_ATTENTION = (
-        _HAS_FLEX_ATTENTION_LIB and _FLEX_KERNEL.has_torch_backend
-    )
+    _HAS_FLEX_ATTENTION = _HAS_FLEX_ATTENTION_LIB and _FLEX_KERNEL.has_torch_backend
 
 
 def _device_key(device: torch.device) -> Tuple[str, int]:
@@ -112,9 +110,7 @@ def _get_dilated_mask(
         if window_size is None
         else (dist <= window_size)
     )
-    not_future = (
-        (j <= i) if causal else torch.ones_like(congruent, dtype=torch.bool)
-    )
+    not_future = (j <= i) if causal else torch.ones_like(congruent, dtype=torch.bool)
     allowed = congruent & within & not_future
     return allowed.contiguous()
 
@@ -319,29 +315,21 @@ class Retention(nn.Module):
         tracing = bool(is_symbolic())
         if (not tracing) and L <= 0:
             out0 = x_in.new_zeros(x_in.shape)
-            return (
-                out0.to(restore_dtype) if restore_dtype is not None else out0
-            )
+            return out0.to(restore_dtype) if restore_dtype is not None else out0
         msr = self.msr
         H = int(msr.nhead)
         Dh = int(msr.head_dim)
         q = msr.q_proj(x_in).view(B, L, H, Dh)
         v = msr.v_proj(x_in).view(B, L, H, Dh)
         v = msr._apply_kpm_to_v(v, attn_mask)
-        lam_h = msr._decay_lambda(v.device, v.dtype).to(
-            dtype=v.dtype, device=v.device
-        )
+        lam_h = msr._decay_lambda(v.device, v.dtype).to(dtype=v.dtype, device=v.device)
         state_fwd = msr._scan_causal(v, lam_h)
         state_bwd = msr._scan_causal(v.flip(1), lam_h).flip(1)
         calc_dtype = (
-            torch.float32
-            if v.dtype in (torch.float16, torch.bfloat16)
-            else v.dtype
+            torch.float32 if v.dtype in (torch.float16, torch.bfloat16) else v.dtype
         )
         bi_state = (
-            state_fwd.to(calc_dtype)
-            + state_bwd.to(calc_dtype)
-            - v.to(calc_dtype)
+            state_fwd.to(calc_dtype) + state_bwd.to(calc_dtype) - v.to(calc_dtype)
         ).to(dtype=v.dtype)
         y = (q * bi_state).contiguous().view(B, L, int(msr.d_model))
         y = msr.norm(y)
@@ -369,21 +357,16 @@ class Retention(nn.Module):
             mode if mode is not None else getattr(self, "mode", None)
         )
         if eff_mode != "spatial":
-            h = self.msr(
-                x, attn_mask=attn_mask, state=state, return_state=True
-            )
+            h = self.msr(x, attn_mask=attn_mask, state=state, return_state=True)
             if isinstance(h, tuple):
                 out, new_state = h
             else:
                 out, new_state = h, state
-            if isinstance(new_state, torch.Tensor) and (
-                not torch.is_grad_enabled()
-            ):
+            if isinstance(new_state, torch.Tensor) and (not torch.is_grad_enabled()):
                 new_state = new_state.detach()
             return out, new_state
         out = self._forward_bidirectional(x, attn_mask=attn_mask)
         return out, None
-
 
 
 class DilatedAttention(nn.Module):
@@ -424,9 +407,7 @@ class DilatedAttention(nn.Module):
         self.norm1 = _Norm(self.embed_dim)
         self.norm2 = _Norm(self.embed_dim)
         self.dropout = nn.Dropout(self.dropout_p)
-        self.drop_path = (
-            StochasticDepth(drop_path) if drop_path > 0 else nn.Identity()
-        )
+        self.drop_path = StochasticDepth(drop_path) if drop_path > 0 else nn.Identity()
 
         self.mha = MultiHeadAttention(
             self.embed_dim,
@@ -468,7 +449,9 @@ class DilatedAttention(nn.Module):
         torch_mha = getattr(impl, "mha", None)
         return torch_mha
 
-    def _project_qkv_for_flex(self, x_bld: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, nn.Linear]:
+    def _project_qkv_for_flex(
+        self, x_bld: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, nn.Linear]:
         torch_mha = self._get_torch_mha()
         if torch_mha is None:
             raise RuntimeError("Flex path requires torch MultiheadAttention backend")
@@ -600,7 +583,7 @@ class DilatedAttention(nn.Module):
                 use_is_causal = bool(self.causal)
             else:
                 attn_mask_keep = self._get_mask(L, device)
-                attn_mask = (~attn_mask_keep)
+                attn_mask = ~attn_mask_keep
 
             attn_out, attn_weights = self.mha(
                 x_norm,
@@ -627,6 +610,8 @@ class DilatedAttention(nn.Module):
             return x, attn_weights, attn_mask_keep
 
         return x, attn_weights
+
+
 class CrossAttention(nn.Module):
     def __init__(
         self: Self,
@@ -662,8 +647,6 @@ class CrossAttention(nn.Module):
         ctx, _ = self.attn(qn, kvn, kvn, need_weights=False)
         ctx = self.out_proj(ctx)
         return q_tokens + self.drop_path(self.dropout(ctx))
-
-
 
 
 class Resampler(nn.Module):
@@ -702,9 +685,7 @@ class Resampler(nn.Module):
         self.q_proj = nn.Linear(self.d_model, self.d_model, bias=bias)
         self.k_proj = nn.Linear(self.d_model, self.d_model, bias=bias)
         self.v_proj = nn.Linear(self.d_model, self.d_model, bias=bias)
-        self.attn = DotProductAttention(
-            num_heads=self.nhead, head_dim=self.head_dim
-        )
+        self.attn = DotProductAttention(num_heads=self.nhead, head_dim=self.head_dim)
         self.out_proj = nn.Linear(self.d_model, self.d_model, bias=bias)
         self.dropout = nn.Dropout(self.dropout_p)
         self.drop_path = StochasticDepth(p=float(drop_path), mode="row")
@@ -756,7 +737,9 @@ class Resampler(nn.Module):
             )
 
         latents = latents + self.drop_path(self.dropout(self.out_proj(attn_out)))
-        latents = latents + self.drop_path(self.dropout(self.ffn(self.norm_ffn(latents))))
+        latents = latents + self.drop_path(
+            self.dropout(self.ffn(self.norm_ffn(latents)))
+        )
         return latents
 
 
@@ -907,9 +890,7 @@ class SigmoidGate(nn.Module):
     def consume_fallback_stats(self: Self) -> torch.Tensor:
         return self.consume_fallback_tensor_stats()
 
-    @torch_compiler_disable(
-        reason="SigmoidGate fallback stats update", recursive=False
-    )
+    @torch_compiler_disable(reason="SigmoidGate fallback stats update", recursive=False)
     def _fb_add_stats(
         self: Self,
         count: float,
@@ -929,33 +910,19 @@ class SigmoidGate(nn.Module):
             with lock:
                 self._fb_count.add_(float(count))
                 self._fb_width_sum.add_(width_sum.to(dtype=torch.float32))
-                self._fb_active_low_sum.add_(
-                    active_low_sum.to(dtype=torch.float32)
-                )
-                self._fb_active_high_sum.add_(
-                    active_high_sum.to(dtype=torch.float32)
-                )
-                self._fb_edge_low_sum.add_(
-                    edge_low_sum.to(dtype=torch.float32)
-                )
-                self._fb_edge_high_sum.add_(
-                    edge_high_sum.to(dtype=torch.float32)
-                )
+                self._fb_active_low_sum.add_(active_low_sum.to(dtype=torch.float32))
+                self._fb_active_high_sum.add_(active_high_sum.to(dtype=torch.float32))
+                self._fb_edge_low_sum.add_(edge_low_sum.to(dtype=torch.float32))
+                self._fb_edge_high_sum.add_(edge_high_sum.to(dtype=torch.float32))
 
-    def _expand_tiles(
-        self: Self, p_tile: torch.Tensor, dim: int
-    ) -> torch.Tensor:
+    def _expand_tiles(self: Self, p_tile: torch.Tensor, dim: int) -> torch.Tensor:
         if self.tile_size <= 0:
-            raise RuntimeError(
-                "SigmoidGate._expand_tiles called with tile_size<=0"
-            )
+            raise RuntimeError("SigmoidGate._expand_tiles called with tile_size<=0")
         b = p_tile.size(0)
         tile = int(self.tile_size)
         n_tiles = p_tile.size(1)
         d_pad = int(n_tiles * tile)
-        p_full = (
-            p_tile.unsqueeze(-1).expand(b, n_tiles, tile).reshape(b, d_pad)
-        )
+        p_full = p_tile.unsqueeze(-1).expand(b, n_tiles, tile).reshape(b, d_pad)
         return p_full[:, : int(dim)]
 
     @staticmethod
@@ -1008,17 +975,14 @@ class SigmoidGate(nn.Module):
             mask = (width >= min_w).to(dtype=torch.float32)
             w_safe = torch.maximum(width, width.new_full((), float(eps)))
             q = torch.clamp(
-                (p.to(dtype=torch.float32) - p_low.to(dtype=torch.float32))
-                / w_safe,
+                (p.to(dtype=torch.float32) - p_low.to(dtype=torch.float32)) / w_safe,
                 0.0,
                 1.0,
             )
             m = float(min(max(float(edge_reg_frac), eps), 0.49))
             inv_m = 1.0 / m
             pen_low = (F.relu(m - q) * inv_m).pow(float(edge_reg_power)) * mask
-            pen_high = (F.relu(q - (1.0 - m)) * inv_m).pow(
-                float(edge_reg_power)
-            ) * mask
+            pen_high = (F.relu(q - (1.0 - m)) * inv_m).pow(float(edge_reg_power)) * mask
             denom = mask.sum() + float(eps)
             er_l = pen_low.sum() / denom
             er_h = pen_high.sum() / denom
@@ -1074,19 +1038,14 @@ class SigmoidGate(nn.Module):
             int(v) for v in self._normalize_tile_shape(self.event_shape)
         )
         grid_shape = tuple(
-            (int(d) + int(t) - 1) // int(t)
-            for d, t in zip(event_shape_t, tile_shape_t)
+            (int(d) + int(t) - 1) // int(t) for d, t in zip(event_shape_t, tile_shape_t)
         )
-        pad_shape = tuple(
-            int(g) * int(t) for g, t in zip(grid_shape, tile_shape_t)
-        )
+        pad_shape = tuple(int(g) * int(t) for g, t in zip(grid_shape, tile_shape_t))
         pads = []
         for orig, padded in reversed(list(zip(event_shape_t, pad_shape))):
             pads.extend([0, int(padded - orig)])
 
-        pad_needed = any(
-            int(p) > int(o) for p, o in zip(pad_shape, event_shape_t)
-        )
+        pad_needed = any(int(p) > int(o) for p, o in zip(pad_shape, event_shape_t))
         b_nd, r_nd = (
             b32.reshape(B, *event_shape_t),
             r32.reshape(B, *event_shape_t),
@@ -1099,18 +1058,14 @@ class SigmoidGate(nn.Module):
             for i, (orig, padded) in enumerate(zip(event_shape_t, pad_shape)):
                 if int(padded) == int(orig):
                     continue
-                v = (
-                    torch.arange(int(padded), device=b_nd.device) < int(orig)
-                ).view(
+                v = (torch.arange(int(padded), device=b_nd.device) < int(orig)).view(
                     *([1] * i),
                     int(padded),
                     *([1] * (len(event_shape_t) - i - 1)),
                 )
                 mask_bool = v if mask_bool is None else (mask_bool & v)
             if mask_bool is None:
-                mask_bool = torch.ones(
-                    pad_shape, device=b_nd.device, dtype=torch.bool
-                )
+                mask_bool = torch.ones(pad_shape, device=b_nd.device, dtype=torch.bool)
 
         view_shape, interleaved = [B], []
         for g, t in zip(grid_shape, tile_shape_t):
@@ -1120,9 +1075,7 @@ class SigmoidGate(nn.Module):
         tile_dims = tuple(range(2, 1 + 2 * len(event_shape_t), 2))
 
         mask = (
-            mask_bool.reshape(*interleaved)
-            .unsqueeze(0)
-            .to(dtype=torch.float32)
+            mask_bool.reshape(*interleaved).unsqueeze(0).to(dtype=torch.float32)
             if mask_bool is not None
             else None
         )
@@ -1152,16 +1105,8 @@ class SigmoidGate(nn.Module):
 
         if z_min is not None and z_max is not None:
             try:
-                zmin_t = (
-                    z_min.reshape(1, *interleaved)
-                    if z_min.numel() > 1
-                    else z_min
-                )
-                zmax_t = (
-                    z_max.reshape(1, *interleaved)
-                    if z_max.numel() > 1
-                    else z_max
-                )
+                zmin_t = z_min.reshape(1, *interleaved) if z_min.numel() > 1 else z_min
+                zmax_t = z_max.reshape(1, *interleaved) if z_max.numel() > 1 else z_max
                 if pad_needed and z_min.numel() > 1:
                     zmin_t = F.pad(
                         z_min.reshape(1, *event_shape_t), tuple(pads)
@@ -1270,15 +1215,11 @@ class SigmoidGate(nn.Module):
             width = (p_high - p_low).to(dtype=torch.float32)
             denom = max(float(p_ceil - p_floor), float(eps))
             tthr = float(max(float(stat_width_frac) * denom, eps))
-            active_low = (p_low - float(p_floor)).to(
-                dtype=torch.float32
-            ) >= tthr
-            active_high = (float(p_ceil) - p_high).to(
-                dtype=torch.float32
-            ) >= tthr
-            edge_thr = torch.maximum(
-                width, width.new_full((), float(eps))
-            ) * float(max(float(stat_edge_frac), 0.0))
+            active_low = (p_low - float(p_floor)).to(dtype=torch.float32) >= tthr
+            active_high = (float(p_ceil) - p_high).to(dtype=torch.float32) >= tthr
+            edge_thr = torch.maximum(width, width.new_full((), float(eps))) * float(
+                max(float(stat_edge_frac), 0.0)
+            )
             self._fb_add_stats(
                 float(p.numel()),
                 width.sum(),
@@ -1326,12 +1267,8 @@ class SigmoidGate(nn.Module):
             res = residue.detach() if self.detach_inputs else residue
             b32 = b.to(dtype=torch.float32)
             r32 = res.to(dtype=torch.float32)
-            b_rms = torch.sqrt(
-                torch.mean(b32 * b32, dim=1, keepdim=True) + self.eps
-            )
-            r_rms = torch.sqrt(
-                torch.mean(r32 * r32, dim=1, keepdim=True) + self.eps
-            )
+            b_rms = torch.sqrt(torch.mean(b32 * b32, dim=1, keepdim=True) + self.eps)
+            r_rms = torch.sqrt(torch.mean(r32 * r32, dim=1, keepdim=True) + self.eps)
             feats.append(b_rms.to(dtype=tokens.dtype))
             feats.append(r_rms.to(dtype=tokens.dtype))
         x = feats[0] if len(feats) == 1 else torch.cat(feats, dim=1)
@@ -1361,11 +1298,9 @@ class SigmoidGate(nn.Module):
                 elif symbolic:
                     use_tile_nd = True
                 else:
-                    use_tile_nd = int(base.shape[0]) == int(
-                        residue.shape[0]
-                    ) and int(self._prod_int(self.event_shape)) == int(
-                        base.shape[1]
-                    )
+                    use_tile_nd = int(base.shape[0]) == int(residue.shape[0]) and int(
+                        self._prod_int(self.event_shape)
+                    ) == int(base.shape[1])
             except Exception:
                 use_tile_nd = False
         if use_tile_nd:
@@ -1404,9 +1339,7 @@ class SigmoidGate(nn.Module):
                 if zmax.numel() != 1:
                     zmax = zmax.reshape(1, -1)
                 sign = torch.where(r32 >= 0, 1.0, -1.0)
-                r_safe = torch.where(
-                    r32.abs() < self.eps, sign * self.eps, r32
-                )
+                r_safe = torch.where(r32.abs() < self.eps, sign * self.eps, r32)
                 p_a = (zmin - b32) / r_safe
                 p_b = (zmax - b32) / r_safe
                 p_low_bound = torch.minimum(p_a, p_b).max(dim=1).values
@@ -1533,9 +1466,7 @@ class Scaler(nn.Module):
             self._x_stats_cache.clear()
             self._y_stats_cache.clear()
 
-    def _apply(
-        self: Self, fn: Callable[[torch.Tensor], torch.Tensor]
-    ) -> "Scaler":
+    def _apply(self: Self, fn: Callable[[torch.Tensor], torch.Tensor]) -> "Scaler":
         super()._apply(fn)
         with contextlib.suppress(Exception):
             for name in (
@@ -1805,12 +1736,8 @@ class Scaler(nn.Module):
             self.affine_a.resize_(a.shape)
         if self.affine_b.shape != b.shape:
             self.affine_b.resize_(b.shape)
-        self.affine_a.copy_(
-            a.to(self.affine_a.device, dtype=self.affine_a.dtype)
-        )
-        self.affine_b.copy_(
-            b.to(self.affine_b.device, dtype=self.affine_b.dtype)
-        )
+        self.affine_a.copy_(a.to(self.affine_a.device, dtype=self.affine_a.dtype))
+        self.affine_b.copy_(b.to(self.affine_b.device, dtype=self.affine_b.dtype))
         self.pw_x.resize_((1, 1))
         self.pw_x.zero_()
         self.pw_y.resize_((1, 1))
@@ -1835,9 +1762,7 @@ class Scaler(nn.Module):
             raise ValueError(f"Unsupported calibration mode: {mode}")
 
     @torch.no_grad()
-    def _fit_affine(
-        self: Self, z_raw: torch.Tensor, z_true: torch.Tensor
-    ) -> None:
+    def _fit_affine(self: Self, z_raw: torch.Tensor, z_true: torch.Tensor) -> None:
         if z_raw.numel() == 0 or z_true.numel() == 0:
             return
         x = z_raw.detach()
@@ -2137,11 +2062,7 @@ class Recorder(nn.Module):
 
                 now = datetime.datetime.now().astimezone()
                 tzinfo = now.tzinfo
-                tz_key = (
-                    getattr(tzinfo, "key", None)
-                    if tzinfo is not None
-                    else None
-                )
+                tz_key = getattr(tzinfo, "key", None) if tzinfo is not None else None
                 tz_name = tzinfo.tzname(now) if tzinfo is not None else None
                 tz_env = None
                 try:
@@ -2198,9 +2119,7 @@ class Recorder(nn.Module):
                 model_name = platform.processor() or (
                     cpu_list[0] if cpu_list else "Unknown CPU"
                 )
-            arch_name = platform.machine() or (
-                arch_list[0] if arch_list else "unknown"
-            )
+            arch_name = platform.machine() or (arch_list[0] if arch_list else "unknown")
             cpu_models = [str(model_name) for _ in range(int(n_cores))]
             arch_norm = [str(arch_name) for _ in range(int(n_cores))]
         except Exception:
@@ -2220,10 +2139,7 @@ class Recorder(nn.Module):
             self.ram_gb = float(ram_gb)
         backend_devices: List[str] = []
         try:
-            from ..core.system import (
-                get_num_accelerators,
-                is_accelerator_available,
-            )
+            from ..core.system import get_num_accelerators, is_accelerator_available
 
             if is_accelerator_available("cuda"):
                 num_cuda = int(get_num_accelerators("cuda") or 0)
@@ -2429,9 +2345,7 @@ class Recorder(nn.Module):
         self._records.clear()
         self._global_step = 0
 
-    def _apply(
-        self: Self, fn: Callable[[torch.Tensor], torch.Tensor]
-    ) -> "Recorder":
+    def _apply(self: Self, fn: Callable[[torch.Tensor], torch.Tensor]) -> "Recorder":
         super()._apply(fn)
         with contextlib.suppress(Exception):
             for name, buf in self._buffers.items():

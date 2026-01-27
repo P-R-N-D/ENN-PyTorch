@@ -17,10 +17,10 @@ from typing import (
     Iterator,
     List,
     Optional,
+    Self,
     Sequence,
     Tuple,
     Union,
-    Self,
 )
 
 import torch
@@ -32,7 +32,6 @@ from ..core.policies import ModelPolicy, PrecisionPolicy
 from ..core.precision import Autocast, is_scale_safe
 from ..core.system import get_device, optimal_optimizer_params
 from ..data.pipeline import Dataset
-
 
 _LOGGER = logging.getLogger(__name__)
 _OPT_LOGGED_KEYS: "OrderedDict[object, None]" = OrderedDict()
@@ -86,9 +85,7 @@ def _log_optimizer(
         if len(_OPT_LOGGED_KEYS) > _OPT_LOGGED_MAX:
             _OPT_LOGGED_KEYS.popitem(last=False)
     try:
-        msg = "[OPT][DECISION] " + json.dumps(
-            payload, sort_keys=True, default=str
-        )
+        msg = "[OPT][DECISION] " + json.dumps(payload, sort_keys=True, default=str)
     except Exception:
         msg = f"[OPT][DECISION] {payload}"
     if logger is not None:
@@ -104,8 +101,7 @@ def _get_expected_args(ctor: Any) -> Optional[frozenset[str]]:
         return (
             None
             if any(
-                p.kind == inspect.Parameter.VAR_KEYWORD
-                for p in sig.parameters.values()
+                p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()
             )
             else frozenset(sig.parameters.keys())
         )
@@ -121,8 +117,7 @@ def _coerce_kwargs(ctor: Any, kwargs: Dict[str, Any]) -> Dict[str, Any]:
         try:
             sig = inspect.signature(ctor)
             if any(
-                p.kind == inspect.Parameter.VAR_KEYWORD
-                for p in sig.parameters.values()
+                p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()
             ):
                 return dict(kwargs)
             allowed = frozenset(sig.parameters.keys())
@@ -132,19 +127,13 @@ def _coerce_kwargs(ctor: Any, kwargs: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _dataset_for_device(
-    model_or_params: Union[
-        nn.Module, Iterable[nn.Parameter], Sequence[Dict[str, Any]]
-    ],
+    model_or_params: Union[nn.Module, Iterable[nn.Parameter], Sequence[Dict[str, Any]]],
     metadata: Optional["Dataset[Any]"] = None,
 ) -> Tuple[torch.device, "Dataset[Any]"]:
     ref_tensor: Optional[torch.Tensor] = None
     if isinstance(model_or_params, nn.Module):
         ref_tensor = ModelPolicy._peek_layer(model_or_params)
-    elif (
-        metadata is None
-        and isinstance(model_or_params, Sequence)
-        and model_or_params
-    ):
+    elif metadata is None and isinstance(model_or_params, Sequence) and model_or_params:
         try:
             first = model_or_params[0]
             if isinstance(first, dict):
@@ -165,18 +154,14 @@ def _dataset_for_device(
     dev = (
         torch.device(metadata.device)
         if metadata
-        else ref_tensor.device
-        if ref_tensor is not None
-        else get_device()
+        else ref_tensor.device if ref_tensor is not None else get_device()
     )
     meta = Autocast.coerce_metadata(dev, metadata=metadata)
     return torch.device(meta.device), meta
 
 
 def _coerce_params(
-    model_or_params: Union[
-        nn.Module, Iterable[nn.Parameter], Sequence[Dict[str, Any]]
-    ],
+    model_or_params: Union[nn.Module, Iterable[nn.Parameter], Sequence[Dict[str, Any]]],
 ) -> Union[List[nn.Parameter], List[Dict[str, Any]]]:
     if isinstance(model_or_params, nn.Module):
         return list(model_or_params.parameters())
@@ -228,9 +213,7 @@ def _cpu_offload(
     if src.device.type == "cpu":
         if pin_memory:
             with contextlib.suppress(Exception):
-                out = torch.empty(
-                    src.shape, device="cpu", dtype=dtype, pin_memory=True
-                )
+                out = torch.empty(src.shape, device="cpu", dtype=dtype, pin_memory=True)
                 out.copy_(src, non_blocking=nb)
                 return out
             with contextlib.suppress(Exception):
@@ -238,9 +221,7 @@ def _cpu_offload(
         return src.clone()
     if pin_memory:
         with contextlib.suppress(Exception):
-            out = torch.empty(
-                src.shape, device="cpu", dtype=dtype, pin_memory=True
-            )
+            out = torch.empty(src.shape, device="cpu", dtype=dtype, pin_memory=True)
             out.copy_(src, non_blocking=nb)
             return out
     return src.to(device="cpu", dtype=dtype)
@@ -359,11 +340,7 @@ class AdamW:
     ) -> optim.Optimizer:
         params = _coerce_params(model_or_params)
         dev, meta = _dataset_for_device(
-            (
-                model_or_params
-                if isinstance(model_or_params, nn.Module)
-                else params
-            ),
+            (model_or_params if isinstance(model_or_params, nn.Module) else params),
             metadata,
         )
 
@@ -405,8 +382,7 @@ class AdamW:
         if not selected_opt and mode == "float" and dev.type == "cuda":
             float8_dtypes = Autocast.float8_formats()
             safe_fp8 = not getattr(meta, "has_scale", False) or any(
-                is_scale_safe(dtype, meta, safety_margin=2.0)
-                for dtype in float8_dtypes
+                is_scale_safe(dtype, meta, safety_margin=2.0) for dtype in float8_dtypes
             )
             hw_ok, _ = Dataset.is_float8_supported(dev)
             if safe_fp8 and hw_ok:
@@ -433,9 +409,7 @@ class AdamW:
                     if getattr(meta, "scale_is_integral", None) is False:
                         return False
                     lo, hi = (-128.0, 127.0) if bits == 8 else (-8.0, 7.0)
-                    if (
-                        mn := getattr(meta, "scale_min_value", None)
-                    ) is not None and (
+                    if (mn := getattr(meta, "scale_min_value", None)) is not None and (
                         mx := getattr(meta, "scale_max_value", None)
                     ) is not None:
                         try:
@@ -480,9 +454,7 @@ class AdamW:
                             break
 
         if not selected_opt:
-            flags = optimal_optimizer_params(
-                dev, use_foreach=None, use_fused=False
-            )
+            flags = optimal_optimizer_params(dev, use_foreach=None, use_fused=False)
             selected_opt = optim.AdamW(
                 params,
                 **_coerce_kwargs(optim.AdamW, {**common_kwargs, **flags}),
@@ -540,13 +512,9 @@ class ExponentialMovingAverage(nn.Module):
         self.decay = float(decay)
         self.pin_memory = bool(pin_memory) if pin_memory is not None else False
         self.update_every = max(1, int(update_every))
-        self.non_blocking = (
-            bool(non_blocking) if non_blocking is not None else False
-        )
+        self.non_blocking = bool(non_blocking) if non_blocking is not None else False
         meta = metadata if isinstance(metadata, Dataset) else None
-        dev = torch.device(
-            Autocast.coerce_metadata(get_device(), metadata=meta).device
-        )
+        dev = torch.device(Autocast.coerce_metadata(get_device(), metadata=meta).device)
         self.master_float, self.master_int = _master_cpu_dtypes(dev, meta)
         self.shadow: Dict[str, torch.Tensor] = {}
         self.collected: Dict[str, torch.Tensor] = {}
@@ -573,11 +541,7 @@ class ExponentialMovingAverage(nn.Module):
         if t.is_floating_point():
             return self.master_float
         if t.is_complex():
-            return (
-                torch.complex128
-                if t.dtype == torch.complex128
-                else torch.complex64
-            )
+            return torch.complex128 if t.dtype == torch.complex128 else torch.complex64
         return self.master_int
 
     def _scratch_view(
@@ -607,9 +571,7 @@ class ExponentialMovingAverage(nn.Module):
         self.shadow = shadow
 
     @torch.no_grad()
-    def update(
-        self: Self, model: nn.Module, optimizer: object | None = None
-    ) -> None:
+    def update(self: Self, model: nn.Module, optimizer: object | None = None) -> None:
         _ = optimizer
         self._step += 1
         if self.update_every > 1 and (self._step % self.update_every) != 0:
@@ -657,9 +619,7 @@ class ExponentialMovingAverage(nn.Module):
                 cur.copy_(tmp)
 
     @torch.no_grad()
-    def store(
-        self: Self, model: nn.Module, optimizer: object | None = None
-    ) -> None:
+    def store(self: Self, model: nn.Module, optimizer: object | None = None) -> None:
         _ = optimizer
         self.collected = {}
         collected = self.collected
@@ -672,9 +632,7 @@ class ExponentialMovingAverage(nn.Module):
             )
 
     @torch.no_grad()
-    def restore(
-        self: Self, model: nn.Module, optimizer: object | None = None
-    ) -> None:
+    def restore(self: Self, model: nn.Module, optimizer: object | None = None) -> None:
         _ = optimizer
         if not self.collected:
             return
@@ -683,17 +641,13 @@ class ExponentialMovingAverage(nn.Module):
             if not isinstance(prev, torch.Tensor):
                 continue
             try:
-                p.copy_(
-                    prev.to(device=p.device, dtype=p.dtype), non_blocking=False
-                )
+                p.copy_(prev.to(device=p.device, dtype=p.dtype), non_blocking=False)
             except Exception:
                 with contextlib.suppress(Exception):
                     p.data = prev.to(device=p.device, dtype=p.dtype)
 
     @torch.no_grad()
-    def apply(
-        self: Self, model: nn.Module, optimizer: object | None = None
-    ) -> None:
+    def apply(self: Self, model: nn.Module, optimizer: object | None = None) -> None:
         _ = optimizer
         shadow = self.shadow
         if not shadow:
@@ -735,26 +689,18 @@ class StochasticWeightAverage(nn.Module):
         self._has_bn = _has_batchnorm_modules(model)
 
         meta = metadata if isinstance(metadata, Dataset) else None
-        dev = torch.device(
-            Autocast.coerce_metadata(get_device(), metadata=meta).device
-        )
+        dev = torch.device(Autocast.coerce_metadata(get_device(), metadata=meta).device)
         self._model_device = dev
         self._master_float, self._master_int = _master_cpu_dtypes(dev, meta)
         self._master_complex = (
-            torch.complex128
-            if self._master_float == torch.float64
-            else torch.complex64
+            torch.complex128 if self._master_float == torch.float64 else torch.complex64
         )
 
         self._avg_dtype = avg_dtype
-        self._pin_memory = (
-            bool(pin_memory) if pin_memory is not None else False
-        )
+        self._pin_memory = bool(pin_memory) if pin_memory is not None else False
 
         self._non_blocking = (
-            bool(non_blocking)
-            if non_blocking is not None
-            else bool(self._pin_memory)
+            bool(non_blocking) if non_blocking is not None else bool(self._pin_memory)
         )
         self._update_every = max(1, int(update_every))
         self._step: int = 0
@@ -764,9 +710,7 @@ class StochasticWeightAverage(nn.Module):
 
         self._scratch: Dict[torch.dtype, torch.Tensor] = {}
 
-        self._stream_chunk_bytes = max(
-            1 << 20, int(stream_chunk_mb) * 1024 * 1024
-        )
+        self._stream_chunk_bytes = max(1 << 20, int(stream_chunk_mb) * 1024 * 1024)
         self._stream_max_inflight_bytes = max(
             int(self._stream_chunk_bytes),
             int(stream_max_inflight_mb) * 1024 * 1024,
@@ -777,15 +721,11 @@ class StochasticWeightAverage(nn.Module):
         self._use_mmap = bool(use_mmap) if use_mmap is not None else True
         self._mmap_dir: str | None = None
         self._mmap_prefix = str(mmap_prefix or "enn_swa_shadow")
-        self._mmap_cleanup = (
-            bool(mmap_cleanup) if mmap_cleanup is not None else False
-        )
+        self._mmap_cleanup = bool(mmap_cleanup) if mmap_cleanup is not None else False
         self._mmap_created_temp = False
         self._mmap_files: Dict[torch.dtype, str] = {}
         self._mmap_base: Dict[torch.dtype, torch.Tensor] = {}
-        self._mmap_layout: Dict[
-            str, tuple[torch.dtype, int, int, tuple[int, ...]]
-        ] = {}
+        self._mmap_layout: Dict[str, tuple[torch.dtype, int, int, tuple[int, ...]]] = {}
 
         if self._use_mmap:
             try:
@@ -921,9 +861,7 @@ class StochasticWeightAverage(nn.Module):
         self._shadow = shadow
         self._mmap_layout = layout
 
-    def _scratch_view(
-        self: Self, numel: int, dtype: torch.dtype
-    ) -> torch.Tensor:
+    def _scratch_view(self: Self, numel: int, dtype: torch.dtype) -> torch.Tensor:
         n = int(numel)
         if n <= 0:
             return torch.empty((0,), device="cpu", dtype=dtype)
@@ -966,17 +904,13 @@ class StochasticWeightAverage(nn.Module):
         if total <= 0:
             return
 
-        dt_size = int(
-            torch.empty((), dtype=dtype, device="cpu").element_size()
-        )
+        dt_size = int(torch.empty((), dtype=dtype, device="cpu").element_size())
         chunk_elems = max(1, int(self._stream_chunk_bytes // max(1, dt_size)))
 
         for off in range(0, total, chunk_elems):
             n = min(chunk_elems, total - off)
             buf = self._scratch_view(n, dtype)
-            buf.copy_(
-                v_flat[off : off + n], non_blocking=bool(self._non_blocking)
-            )
+            buf.copy_(v_flat[off : off + n], non_blocking=bool(self._non_blocking))
             if bool(self._non_blocking) and v.device.type != "cpu":
                 self._sync_device(v.device.type)
             dst_flat[off : off + n].copy_(buf, non_blocking=False)
@@ -1006,17 +940,13 @@ class StochasticWeightAverage(nn.Module):
         inv_n1 = 1.0 / float(int(n_averaged) + 1)
         one_m = 1.0 - inv_n1
 
-        dt_size = int(
-            torch.empty((), dtype=dtype, device="cpu").element_size()
-        )
+        dt_size = int(torch.empty((), dtype=dtype, device="cpu").element_size())
         chunk_elems = max(1, int(self._stream_chunk_bytes // max(1, dt_size)))
 
         for off in range(0, total, chunk_elems):
             n = min(chunk_elems, total - off)
             buf = self._scratch_view(n, dtype)
-            buf.copy_(
-                v_flat[off : off + n], non_blocking=bool(self._non_blocking)
-            )
+            buf.copy_(v_flat[off : off + n], non_blocking=bool(self._non_blocking))
             if bool(self._non_blocking) and v.device.type != "cpu":
                 self._sync_device(v.device.type)
             dst_chunk = dst_flat[off : off + n]
@@ -1128,10 +1058,7 @@ class StochasticWeightAverage(nn.Module):
                     if getattr(b, "is_meta", False) or b.device.type == "meta":
                         continue
                     try:
-                        if (
-                            max_bytes
-                            and (b.numel() * b.element_size()) > max_bytes
-                        ):
+                        if max_bytes and (b.numel() * b.element_size()) > max_bytes:
                             continue
                     except Exception:
                         pass
@@ -1192,9 +1119,7 @@ class StochasticWeightAverage(nn.Module):
         return {
             "n_averaged": int(self._n_averaged),
             "update_every": int(self._update_every),
-            "avg_dtype": str(self._avg_dtype)
-            if self._avg_dtype is not None
-            else None,
+            "avg_dtype": str(self._avg_dtype) if self._avg_dtype is not None else None,
             "use_mmap": bool(self._use_mmap),
             "mmap_dir": str(self._mmap_dir) if self._mmap_dir else None,
             "mmap_files": dict(self._mmap_files),

@@ -20,26 +20,12 @@ from dataclasses import dataclass
 from datetime import timezone, tzinfo
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
-from typing import (
-    TYPE_CHECKING,
-    Any,
-    Callable,
-    Optional,
-    Sequence,
-    Tuple,
-    Union,
-)
+from typing import TYPE_CHECKING, Any, Callable, Optional, Sequence, Tuple, Union
 
 import torch
 import torch.multiprocessing
 
-from .datatypes import (
-    env_bool,
-    env_first,
-    env_first_float,
-    env_first_int,
-    parse_bool,
-)
+from .datatypes import env_bool, env_first, env_first_float, env_first_int, parse_bool
 
 try:
     from zoneinfo import ZoneInfo
@@ -159,11 +145,7 @@ def _mutex_lock(name: str) -> _thread.LockType:
 
 def _device_from(device: Optional[Union[torch.device, str]]) -> torch.device:
     if device is not None:
-        return (
-            device
-            if isinstance(device, torch.device)
-            else torch.device(str(device))
-        )
+        return device if isinstance(device, torch.device) else torch.device(str(device))
     if torch.cuda.is_available():
         return torch.device("cuda")
     return torch.device("cpu")
@@ -184,15 +166,11 @@ def _log_msg(
         getattr(_LOGGER, level)(msg)
 
 
-def _log_info(
-    logger: logging.Logger | Callable[[str], None] | None, msg: str
-) -> None:
+def _log_info(logger: logging.Logger | Callable[[str], None] | None, msg: str) -> None:
     _log_msg(logger, msg, "info")
 
 
-def _log_debug(
-    logger: logging.Logger | Callable[[str], None] | None, msg: str
-) -> None:
+def _log_debug(logger: logging.Logger | Callable[[str], None] | None, msg: str) -> None:
     _log_msg(logger, msg, "debug")
 
 
@@ -209,11 +187,7 @@ def _clear_device_index(
     if device is None:
         return ("all", -1)
     try:
-        dev = (
-            device
-            if isinstance(device, torch.device)
-            else torch.device(str(device))
-        )
+        dev = device if isinstance(device, torch.device) else torch.device(str(device))
     except (TypeError, ValueError, RuntimeError):
         return ("all", -1)
     idx = int(dev.index) if dev.index is not None else -1
@@ -226,11 +200,7 @@ def _clear_device_index(
     elif dev.type == "xpu" and idx < 0:
         try:
             xpu = getattr(torch, "xpu", None)
-            cur = (
-                getattr(xpu, "current_device", None)
-                if xpu is not None
-                else None
-            )
+            cur = getattr(xpu, "current_device", None) if xpu is not None else None
             if callable(cur):
                 idx = int(cur())
         except (RuntimeError, TypeError, ValueError):
@@ -248,9 +218,7 @@ def _read_text_file(path: str) -> Optional[str]:
 
 def _read_int_file(path: str) -> Optional[int]:
     return (
-        int(s)
-        if (s := _read_text_file(path)) and s != "max" and s.isdigit()
-        else None
+        int(s) if (s := _read_text_file(path)) and s != "max" and s.isdigit() else None
     )
 
 
@@ -389,9 +357,7 @@ def _get_allowed_cpu_linux() -> Optional[float]:
         pass
     try:
         cpu_rel: Optional[str] = None
-        with open(
-            "/proc/self/cgroup", "r", encoding="utf-8", errors="ignore"
-        ) as fh:
+        with open("/proc/self/cgroup", "r", encoding="utf-8", errors="ignore") as fh:
             for ln in fh:
                 parts = ln.strip().split(":")
                 if len(parts) >= 3:
@@ -450,9 +416,7 @@ def _get_allowed_cpu_darwin() -> Optional[int]:
             val = ctypes.c_int(0)
             size = ctypes.c_size_t(ctypes.sizeof(val))
             ret = int(
-                sysctlbyname(
-                    name, ctypes.byref(val), ctypes.byref(size), None, 0
-                )
+                sysctlbyname(name, ctypes.byref(val), ctypes.byref(size), None, 0)
             )
             if ret == 0:
                 n = int(val.value)
@@ -477,9 +441,7 @@ def _get_allowed_cpu_windows() -> Optional[list[int]]:
             h = get_proc()
             proc_mask = ctypes.c_size_t(0)
             sys_mask = ctypes.c_size_t(0)
-            ok = int(
-                get_mask(h, ctypes.byref(proc_mask), ctypes.byref(sys_mask))
-            )
+            ok = int(get_mask(h, ctypes.byref(proc_mask), ctypes.byref(sys_mask)))
             if ok:
                 m = int(proc_mask.value)
                 if m:
@@ -584,9 +546,7 @@ def empty_device_cache(
     if not env_bool("ENN_EMPTY_CACHE", True):
         return
     if min_interval_s is None:
-        min_interval_s = env_first_float(
-            ("ENN_EMPTY_CACHE_MIN_INTERVAL_S",), 0.5
-        )
+        min_interval_s = env_first_float(("ENN_EMPTY_CACHE_MIN_INTERVAL_S",), 0.5)
     with contextlib.suppress(Exception):
         min_interval_s = float(min_interval_s)
     if not isinstance(min_interval_s, (int, float)):
@@ -606,14 +566,10 @@ def empty_device_cache(
     with contextlib.suppress(Exception):
         accelerator = getattr(torch, "accelerator", None)
         memory_mod = (
-            getattr(accelerator, "memory", None)
-            if accelerator is not None
-            else None
+            getattr(accelerator, "memory", None) if accelerator is not None else None
         )
         empty_cache = (
-            getattr(memory_mod, "empty_cache", None)
-            if memory_mod is not None
-            else None
+            getattr(memory_mod, "empty_cache", None) if memory_mod is not None else None
         )
         if callable(empty_cache):
             empty_cache()
@@ -639,9 +595,7 @@ def empty_device_cache(
         xpu_mod = getattr(torch, "xpu", None)
         if _call(getattr(xpu_mod, "empty_cache", None)) is None:
             memory_mod = (
-                getattr(xpu_mod, "memory", None)
-                if xpu_mod is not None
-                else None
+                getattr(xpu_mod, "memory", None) if xpu_mod is not None else None
             )
             _call(getattr(memory_mod, "empty_cache", None))
         return
@@ -660,9 +614,7 @@ def empty_device_cache(
             xpu_mod = getattr(torch, "xpu", None)
             if _call(getattr(xpu_mod, "empty_cache", None)) is None:
                 memory_mod = (
-                    getattr(xpu_mod, "memory", None)
-                    if xpu_mod is not None
-                    else None
+                    getattr(xpu_mod, "memory", None) if xpu_mod is not None else None
                 )
                 _call(getattr(memory_mod, "empty_cache", None))
         case _:
@@ -677,11 +629,7 @@ def is_oom_error(exc: BaseException) -> bool:
     for mod_name in ("cuda", "xpu", "mps"):
         with contextlib.suppress(Exception):
             mod = getattr(torch, mod_name, None)
-            typ = (
-                getattr(mod, "OutOfMemoryError", None)
-                if mod is not None
-                else None
-            )
+            typ = getattr(mod, "OutOfMemoryError", None) if mod is not None else None
             if isinstance(typ, type) and isinstance(exc, typ):
                 return True
     msg = str(exc).lower()
@@ -756,11 +704,7 @@ def available_device_memory(
     device: Union[torch.device, str],
 ) -> Optional[float]:
     try:
-        dev = (
-            device
-            if isinstance(device, torch.device)
-            else torch.device(str(device))
-        )
+        dev = device if isinstance(device, torch.device) else torch.device(str(device))
     except Exception:
         return None
     if dev.type not in {"cuda", "xpu", "mps"}:
@@ -804,11 +748,7 @@ def available_accelerator_memory(
     device: Union[torch.device, str],
 ) -> Optional[int]:
     try:
-        dev = (
-            device
-            if isinstance(device, torch.device)
-            else torch.device(str(device))
-        )
+        dev = device if isinstance(device, torch.device) else torch.device(str(device))
     except Exception:
         return None
     v = _call(getattr(Memory, "device_mem_get_info", None), dev)
@@ -836,11 +776,7 @@ def allocated_accelerator_memory(
     device: Union[torch.device, str],
 ) -> Optional[int]:
     try:
-        dev = (
-            device
-            if isinstance(device, torch.device)
-            else torch.device(str(device))
-        )
+        dev = device if isinstance(device, torch.device) else torch.device(str(device))
     except Exception:
         return None
     if not is_accelerator_available(dev.type):
@@ -858,11 +794,7 @@ def allocated_accelerator_memory(
 
 def flush_accelerator_memory_stats(device: Union[torch.device, str]) -> None:
     try:
-        dev = (
-            device
-            if isinstance(device, torch.device)
-            else torch.device(str(device))
-        )
+        dev = device if isinstance(device, torch.device) else torch.device(str(device))
     except Exception:
         return
     if not is_accelerator_available(dev.type):
@@ -879,11 +811,7 @@ def accelerator_max_allocated_memory(
     device: Union[torch.device, str],
 ) -> Optional[int]:
     try:
-        dev = (
-            device
-            if isinstance(device, torch.device)
-            else torch.device(str(device))
-        )
+        dev = device if isinstance(device, torch.device) else torch.device(str(device))
     except Exception:
         return None
     if not is_accelerator_available(dev.type):
@@ -909,11 +837,7 @@ def accelerator(
     device: torch.device,
 ) -> contextlib.AbstractContextManager[None]:
     try:
-        dev = (
-            device
-            if isinstance(device, torch.device)
-            else torch.device(str(device))
-        )
+        dev = device if isinstance(device, torch.device) else torch.device(str(device))
     except Exception:
         return contextlib.nullcontext()
     mod = _acc_mod(dev.type)
@@ -924,11 +848,7 @@ def accelerator(
 
 def sync_accelerator(device: Union[torch.device, str]) -> None:
     try:
-        dev = (
-            device
-            if isinstance(device, torch.device)
-            else torch.device(str(device))
-        )
+        dev = device if isinstance(device, torch.device) else torch.device(str(device))
         if is_accelerator_available(dev.type):
             mod = _acc_mod(dev.type)
             if dev.type == "mps":
@@ -974,11 +894,7 @@ def new_accelerator_event(
 ) -> object | None:
     del args
     try:
-        dev = (
-            device
-            if isinstance(device, torch.device)
-            else torch.device(str(device))
-        )
+        dev = device if isinstance(device, torch.device) else torch.device(str(device))
     except Exception:
         return None
     dt = str(getattr(dev, "type", "cpu") or "cpu")
@@ -1044,11 +960,7 @@ def accelerator_stream(
 
 def new_accelerator_stream(device: torch.device) -> object | None:
     try:
-        dev = (
-            device
-            if isinstance(device, torch.device)
-            else torch.device(str(device))
-        )
+        dev = device if isinstance(device, torch.device) else torch.device(str(device))
     except Exception:
         return None
     dt = str(getattr(dev, "type", "cpu") or "cpu")
@@ -1058,11 +970,7 @@ def new_accelerator_stream(device: torch.device) -> object | None:
 
 def current_accelerator_stream(device: torch.device) -> object | None:
     try:
-        dev = (
-            device
-            if isinstance(device, torch.device)
-            else torch.device(str(device))
-        )
+        dev = device if isinstance(device, torch.device) else torch.device(str(device))
         mod = _acc_mod(dev.type)
         return (
             mod.current_stream(device=dev)
@@ -1113,16 +1021,12 @@ def set_float32_precision(
 
     with _mutex_lock("_FP32_PRECISION_LOCK"):
         cache_key = (
-            "cuda_fp32_precision_new"
-            if use_new_api
-            else "cuda_fp32_precision_old"
+            "cuda_fp32_precision_new" if use_new_api else "cuda_fp32_precision_old"
         )
         cache_val = (
             "tf32"
             if use_tf32
-            else "ieee"
-            if use_new_api
-            else ("high" if use_tf32 else "highest")
+            else "ieee" if use_new_api else ("high" if use_tf32 else "highest")
         )
         if _FP32_PRECISION_CACHE.get(cache_key) == cache_val:
             return
@@ -1359,9 +1263,7 @@ def default_temp() -> str:
 def new_dir(prefix: str) -> str:
     base = default_temp()
     os.makedirs(base, exist_ok=True)
-    directory = os.path.join(
-        base, f"{prefix}_{os.getpid()}_{os.urandom(4).hex()}"
-    )
+    directory = os.path.join(base, f"{prefix}_{os.getpid()}_{os.urandom(4).hex()}")
     os.makedirs(directory, exist_ok=True)
     return directory
 
@@ -1528,9 +1430,7 @@ def get_device_stats(
         float_dtypes = tuple(dict.fromkeys(floats))
     if not int_dtypes:
         int_dtypes = (torch.int8, torch.int16, torch.int32, torch.int64)
-    bits = env_first_int(
-        ("ENN_DATA_INT_QUANT_BITS", "ENN_INT_QUANT_BITS"), default=0
-    )
+    bits = env_first_int(("ENN_DATA_INT_QUANT_BITS", "ENN_INT_QUANT_BITS"), default=0)
     quant_bits = int(bits) if int(bits) > 0 else 8
     stats = Device(
         device=dev,
@@ -1769,26 +1669,19 @@ class CPU:
             with contextlib.suppress(Exception):
                 raw = cpuinfo.get_CPU.info()
                 if isinstance(raw, dict):
-                    raw = {
-                        k: v for k, v in raw.items() if not k.startswith("_")
-                    }
+                    raw = {k: v for k, v in raw.items() if not k.startswith("_")}
                     info["cpuinfo"] = raw
 
         out = json.dumps(info, sort_keys=True, ensure_ascii=True, default=str)
         if max_bytes is not None and max_bytes > 0:
             b = out.encode("utf-8")
             if len(b) > max_bytes:
-                out = (
-                    b[: max_bytes - 3].decode("utf-8", errors="ignore") + "..."
-                )
+                out = b[: max_bytes - 3].decode("utf-8", errors="ignore") + "..."
         return out
 
     @staticmethod
     def is_free_threaded_build() -> bool:
-        tag = (
-            getattr(getattr(sys, "implementation", None), "cache_tag", "")
-            or ""
-        )
+        tag = getattr(getattr(sys, "implementation", None), "cache_tag", "") or ""
         if isinstance(tag, str) and tag.endswith("t"):
             return True
         val = sysconfig.get_config_var("Py_GIL_DISABLED")
@@ -1834,14 +1727,10 @@ class Memory:
                     total = int(info[1])
         elif isinstance(info, dict):
             free_v = (
-                info.get("free")
-                or info.get("free_memory")
-                or info.get("free_bytes")
+                info.get("free") or info.get("free_memory") or info.get("free_bytes")
             )
             total_v = (
-                info.get("total")
-                or info.get("total_memory")
-                or info.get("total_bytes")
+                info.get("total") or info.get("total_memory") or info.get("total_bytes")
             )
             if total_v is None and info.get("bytes_limit", None) is not None:
                 total_v = info.get("bytes_limit", None)
@@ -1874,10 +1763,7 @@ class Memory:
             vm = psutil.virtual_memory()
             if getattr(vm, "available", None) is not None:
                 return int(vm.available)
-            if (
-                getattr(vm, "total", 0)
-                and getattr(vm, "used", None) is not None
-            ):
+            if getattr(vm, "total", 0) and getattr(vm, "used", None) is not None:
                 return int(vm.total - vm.used)
         except Exception:
             pass
@@ -1894,9 +1780,7 @@ class Memory:
             elif sys.platform == "darwin":
                 import subprocess
 
-                out = subprocess.check_output(["vm_stat"]).decode(
-                    "utf-8", "ignore"
-                )
+                out = subprocess.check_output(["vm_stat"]).decode("utf-8", "ignore")
                 page = None
                 free = None
                 inactive = None
@@ -1929,9 +1813,7 @@ class Memory:
 
                 stat = MEMORYSTATUSEX()
                 stat.dwLength = ctypes.sizeof(MEMORYSTATUSEX)
-                if ctypes.windll.kernel32.GlobalMemoryStatusEx(
-                    ctypes.byref(stat)
-                ):
+                if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(stat)):
                     return int(stat.ullAvailPhys)
         except Exception:
             pass
@@ -1966,9 +1848,7 @@ class Memory:
                 ),
                 None,
             ):
-                grp = os.path.join(
-                    "/sys/fs/cgroup/memory", mem_rel.lstrip("/")
-                )
+                grp = os.path.join("/sys/fs/cgroup/memory", mem_rel.lstrip("/"))
                 lim, use = (
                     _read_int_file(os.path.join(grp, "memory.limit_in_bytes")),
                     _read_int_file(os.path.join(grp, "memory.usage_in_bytes")),
@@ -1998,10 +1878,7 @@ class Memory:
             IsProcessInJob.restype = wt.BOOL
             hProc = kernel32.GetCurrentProcess()
             inJob = wt.BOOL()
-            if (
-                not IsProcessInJob(hProc, None, ctypes.byref(inJob))
-                or not inJob.value
-            ):
+            if not IsProcessInJob(hProc, None, ctypes.byref(inJob)) or not inJob.value:
                 return None
 
             class LARGE_INTEGER(ctypes.Union):
@@ -2078,11 +1955,7 @@ class Memory:
                 if 0 < v < (1 << 60):
                     cand_limits.append(v)
             if flags & JOB_OBJECT_LIMIT_WORKINGSET:
-                v = int(
-                    getattr(
-                        info.BasicLimitInformation, "MaximumWorkingSetSize", 0
-                    )
-                )
+                v = int(getattr(info.BasicLimitInformation, "MaximumWorkingSetSize", 0))
                 if 0 < v < (1 << 60):
                     cand_limits.append(v)
             if not cand_limits:
@@ -2137,9 +2010,9 @@ class Memory:
             elif sys.platform == "darwin":
                 import subprocess
 
-                out = subprocess.check_output(
-                    ["sysctl", "-n", "hw.memsize"]
-                ).decode("utf-8", "ignore")
+                out = subprocess.check_output(["sysctl", "-n", "hw.memsize"]).decode(
+                    "utf-8", "ignore"
+                )
                 if out.strip().isdigit():
                     return int(out.strip())
             elif os.name == "nt" or sys.platform.startswith("win"):
@@ -2154,9 +2027,7 @@ class Memory:
 
                 stat = MEMORYSTATUSEX()
                 stat.dwLength = ctypes.sizeof(MEMORYSTATUSEX)
-                if ctypes.windll.kernel32.GlobalMemoryStatusEx(
-                    ctypes.byref(stat)
-                ):
+                if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(stat)):
                     return int(stat.ullTotalPhys)
         except Exception:
             pass
@@ -2169,9 +2040,7 @@ class Memory:
         winjob = Memory._windows_limit()
         rlim = Memory._bsd_limit()
         candidates = [
-            x
-            for x in (base, cgroup, winjob, rlim)
-            if isinstance(x, int) and x >= 0
+            x for x in (base, cgroup, winjob, rlim) if isinstance(x, int) and x >= 0
         ]
         return max(0, min(candidates)) if candidates else 0
 

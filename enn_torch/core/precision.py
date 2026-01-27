@@ -1,8 +1,6 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
-from dataclasses import dataclass
-
 import contextlib
 import importlib
 import io
@@ -12,7 +10,8 @@ import math
 import threading
 from collections import OrderedDict
 from contextlib import AbstractContextManager
-from typing import Any, Callable, Dict, List, Optional, Tuple, Union, Self
+from dataclasses import dataclass
+from typing import Any, Callable, Dict, List, Optional, Self, Tuple, Union
 
 import torch
 from torch import nn
@@ -29,7 +28,6 @@ from .system import (
     is_float8_supported,
     is_int8_supported,
 )
-
 
 _Int8DynamicActivationInt8WeightConfig = None
 _Int8WeightOnlyConfig = None
@@ -76,9 +74,7 @@ def _import_torchao_quantization() -> None:
                 from torchao.quantization.quant_api import (
                     Int8WeightOnlyConfig as _Int8WeightOnlyConfig,
                 )
-                from torchao.quantization.quant_api import (
-                    quantize_ as _quantize_,
-                )
+                from torchao.quantization.quant_api import quantize_ as _quantize_
 
                 try:
                     from torchao.quantization import (
@@ -130,20 +126,14 @@ def _log_negotiation(
             _NEGO_LOGGED_KEYS.popitem(last=False)
 
     try:
-        msg = "[AMP][NEGOTIATE] " + json.dumps(
-            payload, sort_keys=True, default=str
-        )
+        msg = "[AMP][NEGOTIATE] " + json.dumps(payload, sort_keys=True, default=str)
     except Exception:
         msg = f"[AMP][NEGOTIATE] {payload}"
     lg.log(lvl, msg)
 
 
 def _parse_dtype(dtype: Any) -> str:
-    return (
-        str(dtype).split(".")[-1]
-        if isinstance(dtype, torch.dtype)
-        else str(dtype)
-    )
+    return str(dtype).split(".")[-1] if isinstance(dtype, torch.dtype) else str(dtype)
 
 
 def _to_serializable(x: Any) -> Any:
@@ -243,9 +233,7 @@ def _validate_dtype_safety(
 
     if getattr(dtype, "is_floating_point", False):
         info = torch.finfo(dtype)
-        if max_abs_f > (
-            ov_limit := float(info.max) / max(1.0, float(safety_margin))
-        ):
+        if max_abs_f > (ov_limit := float(info.max) / max(1.0, float(safety_margin))):
             return False, f"overflow({max_abs_f:.6g}>{ov_limit:.6g})"
         if (
             action == "forbid"
@@ -259,10 +247,7 @@ def _validate_dtype_safety(
                 math.isfinite(mp_f)
                 and mp_f > 0.0
                 and mp_f
-                < (
-                    uf_limit := float(info.tiny)
-                    * max(1.0, float(safety_margin))
-                )
+                < (uf_limit := float(info.tiny) * max(1.0, float(safety_margin)))
             ):
                 return False, f"underflow({mp_f:.6g}<{uf_limit:.6g})"
         return True, "ok"
@@ -364,9 +349,7 @@ class DeviceMeta:
         return False
 
     @classmethod
-    def for_device(
-        cls: type[Self], device: Union[torch.device, str]
-    ) -> "DeviceMeta":
+    def for_device(cls: type[Self], device: Union[torch.device, str]) -> "DeviceMeta":
         ds = get_device_stats(device)
         return cls(
             device=ds.device,
@@ -435,9 +418,7 @@ class Autocast:
         kind: str,
     ) -> Optional[str]:
         order = ("ao", "te") if preferred == "ao" else ("te", "ao")
-        is_supported = (
-            is_float8_supported if kind == "fp8" else is_int8_supported
-        )
+        is_supported = is_float8_supported if kind == "fp8" else is_int8_supported
 
         for backend in order:
             if backend == "te":
@@ -511,9 +492,7 @@ class Autocast:
     def _torchao_float8(
         cls: type[Self], enabled: bool
     ) -> List[AbstractContextManager[None]]:
-        return cls._get_backend_context(
-            "torchao.float8", "fp8_autocast", enabled
-        )
+        return cls._get_backend_context("torchao.float8", "fp8_autocast", enabled)
 
     @classmethod
     def _torchao_int8_backend(
@@ -716,11 +695,7 @@ class Autocast:
             if p2 is not None:
                 return float(2 ** max(0, min(30, int(p2 or 3)))), int(p2 or 3)
             margin = float(kwargs.pop("safety_margin", 8.0))
-            return (
-                (margin, int(round(math.log2(margin))))
-                if margin > 0
-                else (8.0, 3)
-            )
+            return (margin, int(round(math.log2(margin)))) if margin > 0 else (8.0, 3)
 
         safety_margin, safety_margin_pow2 = _parse_margin()
         underflow_override = normalize_underflow_action(
@@ -728,8 +703,7 @@ class Autocast:
             default=default_underflow_action(),
         )
         collect_checks = logger and (
-            logger.isEnabledFor(logging.DEBUG)
-            or logger.isEnabledFor(logging.INFO)
+            logger.isEnabledFor(logging.DEBUG) or logger.isEnabledFor(logging.INFO)
         )
         checks, selected, selected_from = [], None, "candidate"
 
@@ -783,9 +757,7 @@ class Autocast:
 
         if logger is not None:
             level = "info" if selected_from != "candidate" else "debug"
-            if logger.isEnabledFor(
-                logging.INFO if level == "info" else logging.DEBUG
-            ):
+            if logger.isEnabledFor(logging.INFO if level == "info" else logging.DEBUG):
                 scale_key = (
                     getattr(meta, "has_scale", False),
                     getattr(meta, "has_nonfinite", False),
@@ -837,9 +809,7 @@ class Autocast:
             requested_dtype,
             cls._last_float_dtype,
         )
-        extra = (
-            getattr(meta, "float_dtypes", None) if meta is not None else None
-        )
+        extra = getattr(meta, "float_dtypes", None) if meta is not None else None
         if extra:
             with contextlib.suppress(Exception):
                 candidates = tuple(
@@ -990,9 +960,7 @@ class Autocast:
     ) -> contextlib.AbstractContextManager[None]:
         dev = cls._device(device)
         meta = cls.coerce_metadata(dev, metadata=metadata)
-        int_candidates = tuple(getattr(meta, "int_dtypes", ())) or (
-            torch.int64,
-        )
+        int_candidates = tuple(getattr(meta, "int_dtypes", ())) or (torch.int64,)
         int_dtype = cls.negotiate(
             int_candidates,
             fallback=torch.int64,
@@ -1018,9 +986,7 @@ class Autocast:
             contexts = cls._torchao_int8(dev, True) if backend else []
             if contexts:
                 int_backend_used = backend
-            elif (
-                backend == "te" and cls._int_backend("ao", device=dev) == "ao"
-            ):
+            elif backend == "te" and cls._int_backend("ao", device=dev) == "ao":
                 if contexts := cls._torchao_int8(dev, True):
                     int_backend_used = "ao"
 
@@ -1059,8 +1025,7 @@ class Quantization:
     def is_ptq_available() -> bool:
         _import_torchao_quantization()
         return bool(
-            _PTQ_IMPL is not None
-            and _Int8DynamicActivationInt8WeightConfig is not None
+            _PTQ_IMPL is not None and _Int8DynamicActivationInt8WeightConfig is not None
         )
 
     @staticmethod
@@ -1075,9 +1040,7 @@ class Quantization:
         _ = args, kwargs
         _import_torchao_quantization()
         if _qp is None:
-            raise RuntimeError(
-                "torchao.quantization.quant_primitives unavailable"
-            )
+            raise RuntimeError("torchao.quantization.quant_primitives unavailable")
         _log_debug(
             logger,
             f"[INT8][QAT] prepare(dynamic_activations={dynamic_activations}, group={group_size})",
@@ -1088,23 +1051,17 @@ class Quantization:
                 Int8ActivationConfig,
                 Int8WeightConfig,
             )
-            from torchao.quantization.fake_quant import (
-                prepare_qat_ as _prepare_qat,
-            )
+            from torchao.quantization.fake_quant import prepare_qat_ as _prepare_qat
 
             cfg = FakeQuantizeConfig(
-                activation=Int8ActivationConfig(
-                    dynamic=bool(dynamic_activations)
-                ),
+                activation=Int8ActivationConfig(dynamic=bool(dynamic_activations)),
                 weight=Int8WeightConfig(group_size=int(group_size)),
             )
             _prepare_qat(model, cfg)
             clear_model_cache(model)
             return cfg
         except Exception as exc:
-            raise RuntimeError(
-                f"torchao QAT prepare unavailable: {exc}"
-            ) from exc
+            raise RuntimeError(f"torchao QAT prepare unavailable: {exc}") from exc
 
     @staticmethod
     def _apply_ptq(
@@ -1124,9 +1081,7 @@ class Quantization:
         cfg: Any
         why: str
         if bool(dynamic_activations):
-            cfg = _Int8DynamicActivationInt8WeightConfig(
-                group_size=int(group_size)
-            )
+            cfg = _Int8DynamicActivationInt8WeightConfig(group_size=int(group_size))
             why = "int8_dynamic_act_int8_weight"
         else:
             if _Int8WeightOnlyConfig is None:
@@ -1134,9 +1089,7 @@ class Quantization:
             cfg = _Int8WeightOnlyConfig(group_size=int(group_size))
             why = "int8_weight_only"
         try:
-            _log_info(
-                logger, f"[INT8][PTQ] applying {why} (group={group_size})"
-            )
+            _log_info(logger, f"[INT8][PTQ] applying {why} (group={group_size})")
             _PTQ_IMPL(model, cfg)
             clear_model_cache(model)
             return (model, True, why)

@@ -19,13 +19,12 @@ import numpy as np
 import torch
 from tensordict import TensorDict
 
-from enn_torch.runtime.workflow import new_model, train
 from enn_torch.config import ModelConfig, PatchConfig
 from enn_torch.core.tensor import extract_tensor, from_buffer
 from enn_torch.runtime.io import Exporter
+from enn_torch.runtime.workflow import new_model, train
 
 from .lifecycle import build_dataset
-
 
 _ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 _TL_LOG_RE = re.compile(r"(dedicated_log_torch_trace_[A-Za-z0-9_]+\.log)")
@@ -89,9 +88,9 @@ def _build_model_and_sample(
         modeling_type="spatiotemporal",
         compile_mode="disabled",
     )
-    model = new_model(
-        in_dim=td_train["X"].shape[1], out_shape=(S, T), config=cfg
-    ).to(device)
+    model = new_model(in_dim=td_train["X"].shape[1], out_shape=(S, T), config=cfg).to(
+        device
+    )
 
     if os.environ.get("ENN_DEPLOYMENT_DEBUG_EXTRA", "0").strip().lower() in (
         "1",
@@ -101,8 +100,8 @@ def _build_model_and_sample(
         "on",
     ):
         with contextlib.suppress(Exception):
-            model.add_task('debug_extra', mode='spatial', weight=0.25)
-    print('[debug] tasks:', model.list_tasks())
+            model.add_task("debug_extra", mode="spatial", weight=0.25)
+    print("[debug] tasks:", model.list_tasks())
     sample = td_train["X"][:4].to(device)
     return data, td_train, model, sample
 
@@ -229,7 +228,9 @@ def _ensure_state_shapes_for_scaler(
     ) -> torch.Tensor:
         if torch.is_tensor(existing):
             return torch.empty(shape, device=existing.device, dtype=existing.dtype)
-        return torch.empty(shape, device=_model_device(fallback_mod), dtype=torch.float32)
+        return torch.empty(
+            shape, device=_model_device(fallback_mod), dtype=torch.float32
+        )
 
     def _is_scaler_key(k: str) -> bool:
         return k.startswith("scaler.") or ".scaler." in k
@@ -268,9 +269,7 @@ def _ensure_state_shapes_for_scaler(
                 setattr(mod, name, mod._buffers[name])
             continue
 
-        if hasattr(mod, "_parameters") and name in getattr(
-            mod, "_parameters", {}
-        ):
+        if hasattr(mod, "_parameters") and name in getattr(mod, "_parameters", {}):
             prm = mod._parameters.get(name)
             if (
                 prm is not None
@@ -400,8 +399,8 @@ def _draft_export_diagnostics(
                                 info["tlparse_log"] = tl
                                 ex = _read_log_excerpt(tl)
                                 if ex:
-                                    info["tlparse_log_excerpt_tail"] = (
-                                        _truncate(ex, 12000)
+                                    info["tlparse_log_excerpt_tail"] = _truncate(
+                                        ex, 12000
                                     )
                         if wrec:
                             info["warnings"] = [
@@ -415,9 +414,9 @@ def _draft_export_diagnostics(
                                         info["tlparse_log"] = tl
                                         ex = _read_log_excerpt(tl)
                                         if ex:
-                                            info[
-                                                "tlparse_log_excerpt_tail"
-                                            ] = _truncate(ex, 12000)
+                                            info["tlparse_log_excerpt_tail"] = (
+                                                _truncate(ex, 12000)
+                                            )
                                         break
                         for attr in (
                             "errors",
@@ -427,9 +426,7 @@ def _draft_export_diagnostics(
                         ):
                             if hasattr(res, attr):
                                 try:
-                                    info[attr] = _truncate(
-                                        repr(getattr(res, attr))
-                                    )
+                                    info[attr] = _truncate(repr(getattr(res, attr)))
                                 except Exception:
                                     pass
                         return info
@@ -491,9 +488,7 @@ def _export_only_main(fmt_name: str, out_path: str, state_path: str) -> int:
         Path(out_path).suffix if Path(out_path).suffix else out_path
     )
     if fmt is None:
-        print(
-            json.dumps({"status": "error", "error": "no exporter registered"})
-        )
+        print(json.dumps({"status": "error", "error": "no exporter registered"}))
         return 1
     try:
         print(f"[export-only] format={fmt_name} out={out_path}", flush=True)
@@ -570,9 +565,7 @@ def export_and_validate(
         }
         for name, path in targets.items():
             if state_path is not None and name.strip().lower() in isolate:
-                results[name] = _run_isolated_export(
-                    name, str(path), str(state_path)
-                )
+                results[name] = _run_isolated_export(name, str(path), str(state_path))
                 if results[name].get("status") == "ok":
                     results[name] = {"status": "ok", "paths": [str(path)]}
                 elif results[name].get("status") == "skipped":
@@ -582,9 +575,7 @@ def export_and_validate(
                         "error": results[name].get("error", "skipped"),
                     }
                 continue
-            fmt = Exporter.for_export(
-                path.suffix if path.suffix else str(path)
-            )
+            fmt = Exporter.for_export(path.suffix if path.suffix else str(path))
             try:
                 if fmt is None:
                     raise RuntimeError("no exporter registered")
@@ -658,9 +649,7 @@ def export_and_validate(
                 try:
                     pt2_np = _to_numpy_materialized(pt2_out)
                     torch_np = _to_numpy_materialized(torch_out)
-                    validation["pt2_mae"] = float(
-                        np.mean(np.abs(pt2_np - torch_np))
-                    )
+                    validation["pt2_mae"] = float(np.mean(np.abs(pt2_np - torch_np)))
                     validation["pt2_out_stats"] = _stats_np(pt2_np)
                 except Exception as conv_exc:
                     validation["pt2_error"] = repr(conv_exc)
@@ -722,12 +711,7 @@ def export_and_validate(
                     inp_name = sess.get_inputs()[0].name
                     out = sess.run(
                         None,
-                        {
-                            inp_name: sample.detach()
-                            .cpu()
-                            .numpy()
-                            .astype(np.float32)
-                        },
+                        {inp_name: sample.detach().cpu().numpy().astype(np.float32)},
                     )[0]
                     validation[f"{name}_out_stats"] = _stats_np(out)
                 except Exception as exc:
@@ -742,15 +726,11 @@ def main() -> None:
     ap.add_argument("--state", default=None)
     args, _ = ap.parse_known_args()
     if args.export_only:
-        raise SystemExit(
-            _export_only_main(args.export_only, args.out, args.state)
-        )
+        raise SystemExit(_export_only_main(args.export_only, args.out, args.state))
 
     os.environ.setdefault("ENN_PREBATCH", "1")
     os.environ.setdefault("ENN_PREFETCH_FACTOR", "1")
-    data, td_train, model, sample = _build_model_and_sample(
-        torch.device("cpu")
-    )
+    data, td_train, model, sample = _build_model_and_sample(torch.device("cpu"))
     S = data["S"]
     T = data["T"]
     print(f"[export] dataset groups={data['B']} grid={S}x{T}")
@@ -765,9 +745,8 @@ def main() -> None:
         max_nodes=1,
     )
     model.eval()
-    stats = export_and_validate(
-        model, sample, td_train, Path("export_artifacts")
-    )
+    stats = export_and_validate(model, sample, td_train, Path("export_artifacts"))
+
     def _json_default(o: object) -> object:
         if isinstance(o, bytes):
             try:

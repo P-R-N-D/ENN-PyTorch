@@ -54,9 +54,7 @@ def train(*args: Any, **kwargs: Any) -> Model:
     return workflow.train(*args, **kwargs)
 
 
-def predict(
-    *args: Any, **kwargs: Any
-) -> TensorDictBase | dict[str, TensorDictBase]:
+def predict(*args: Any, **kwargs: Any) -> TensorDictBase | dict[str, TensorDictBase]:
     from .runtime import workflow
 
     return workflow.predict(*args, **kwargs)

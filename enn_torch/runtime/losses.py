@@ -4,7 +4,7 @@ from __future__ import annotations
 import contextlib
 import math
 from dataclasses import dataclass
-from typing import Any, List, Optional, Sequence, Tuple, Union, Self
+from typing import Any, List, Optional, Self, Sequence, Tuple, Union
 
 import torch
 from torch import Tensor, nn
@@ -13,7 +13,6 @@ from torch.nn import functional as F
 
 from ..core.graph import is_compiling
 from ..core.tensor import to_tensor_like
-
 
 Number = Union[float, int]
 TensorLike = Union[Number, torch.Tensor]
@@ -27,9 +26,7 @@ def _canonize_dims(
         return tuple(range(1, nd)) if nd > 1 else (0,)
     d_tup = (dims,) if isinstance(dims, int) else tuple(int(d) for d in dims)
     pos = {d + nd if d < 0 else d for d in d_tup}
-    out = tuple(
-        sorted(d for d in pos if 0 <= d < nd and (keep_batch or d != 0))
-    )
+    out = tuple(sorted(d for d in pos if 0 <= d < nd and (keep_batch or d != 0)))
     return out or ((1,) if nd > 1 else (0,))
 
 
@@ -39,9 +36,7 @@ def _median_over_dims(x: torch.Tensor, dims: Tuple[int, ...]) -> torch.Tensor:
     return x
 
 
-def _mad_std(
-    x: torch.Tensor, dims: Tuple[int, ...], eps: float
-) -> torch.Tensor:
+def _mad_std(x: torch.Tensor, dims: Tuple[int, ...], eps: float) -> torch.Tensor:
     return torch.clamp(
         _median_over_dims((x - _median_over_dims(x, dims)).abs(), dims)
         * 1.482602218505602,
@@ -59,9 +54,7 @@ def _coerce_std(
     dim_tuple = (
         ()
         if dim is None
-        else (
-            (int(dim),) if isinstance(dim, int) else tuple(int(d) for d in dim)
-        )
+        else ((int(dim),) if isinstance(dim, int) else tuple(int(d) for d in dim))
     )
     nd = int(x.dim())
     sample = math.prod(
@@ -78,16 +71,10 @@ def _coerce_std(
     correction = min(int(ddof), max(sample - 1, 0))
     x_work = x.to(dtype=_master_float_dtype(x))
     try:
-        var = torch.var(
-            x_work, dim=dim_tuple, correction=correction, keepdim=True
-        )
+        var = torch.var(x_work, dim=dim_tuple, correction=correction, keepdim=True)
     except TypeError:
-        var = torch.var(
-            x_work, dim=dim_tuple, unbiased=False, keepdim=True
-        ) * (
-            float(sample) / float(sample - correction)
-            if correction > 0
-            else 1.0
+        var = torch.var(x_work, dim=dim_tuple, unbiased=False, keepdim=True) * (
+            float(sample) / float(sample - correction) if correction > 0 else 1.0
         )
     return torch.sqrt(var.clamp(min=float(eps) ** 2)).clamp(min=float(eps))
 
@@ -165,9 +152,7 @@ def _nufft_nd(
         raise RuntimeError("cuFINUFFT requires CUDA")
 
     B, ndim = int(x_cplx.shape[0]), len(shape)
-    dtype_str = (
-        "complex128" if x_cplx.dtype == torch.complex128 else "complex64"
-    )
+    dtype_str = "complex128" if x_cplx.dtype == torch.complex128 else "complex64"
 
     def _exec_plan(
         n_trans: int, x: torch.Tensor, pts: Sequence[torch.Tensor]
@@ -207,9 +192,7 @@ def _nufft_nd(
     )
 
 
-def expand_to_pred(
-    mask: torch.Tensor, prediction: torch.Tensor
-) -> torch.Tensor:
+def expand_to_pred(mask: torch.Tensor, prediction: torch.Tensor) -> torch.Tensor:
     if mask.shape == prediction.shape:
         return mask
     try:
@@ -257,11 +240,7 @@ class MultipleQuantileLoss(nn.Module):
             1
             if 1 in candidates
             else (
-                0
-                if 0 in candidates
-                else candidates[0]
-                if len(candidates) == 1
-                else -1
+                0 if 0 in candidates else candidates[0] if len(candidates) == 1 else -1
             )
         )
 
@@ -333,11 +312,7 @@ class CRPSLoss(nn.Module):
             if torch.is_tensor(x)
             else torch.tensor(x, device=ref.device, dtype=ref.dtype)
         )
-        return (
-            t.view(*[1] * (ref.ndim - t.ndim), *t.shape)
-            if t.ndim < ref.ndim
-            else t
-        )
+        return t.view(*[1] * (ref.ndim - t.ndim), *t.shape) if t.ndim < ref.ndim else t
 
     def _dims(self: Self, pred: torch.Tensor) -> Tuple[int, ...]:
         return _canonize_dims(pred, self.dim, keep_batch=False)
@@ -353,9 +328,7 @@ class CRPSLoss(nn.Module):
         self: Self, err: torch.Tensor, dims: Tuple[int, ...]
     ) -> torch.Tensor:
         std = _coerce_std(err, dim=dims, ddof=self.ddof, eps=self.eps)
-        return torch.clamp(
-            std.detach() if self.detach_stats else std, min=self.eps
-        )
+        return torch.clamp(std.detach() if self.detach_stats else std, min=self.eps)
 
     def _crps_normal_analytic(
         self: Self, err: torch.Tensor, sigma: torch.Tensor
@@ -379,17 +352,14 @@ class CRPSLoss(nn.Module):
         dims: Tuple[int, ...],
     ) -> torch.Tensor:
         z_obs = (
-            (err / sigma.clamp(min=self.eps)).clamp(
-                min=-self.max_z, max=self.max_z
-            )
+            (err / sigma.clamp(min=self.eps)).clamp(min=-self.max_z, max=self.max_z)
             if self.max_z > 0
             else err / sigma.clamp(min=self.eps)
         )
         z_centered = z_obs - z_obs.mean(dim=dims, keepdim=True)
         m2 = (z_centered**2).mean(dim=dims, keepdim=True).clamp(min=self.eps)
         alpha = (
-            (z_centered**3).mean(dim=dims, keepdim=True)
-            / (m2.sqrt() ** 3 + self.eps)
+            (z_centered**3).mean(dim=dims, keepdim=True) / (m2.sqrt() ** 3 + self.eps)
         ).clamp(-5.0, 5.0)
         if self.detach_stats:
             alpha = alpha.detach()
@@ -422,9 +392,7 @@ class CRPSLoss(nn.Module):
             z_pair = delta.unsqueeze(0) * z0.abs() + tail.unsqueeze(0) * z1
             m_pairs = min(int(pair_k * (pair_k - 1)), 64)
             idx = torch.randint(0, pair_k, (m_pairs, 2), device=z_obs.device)
-            e2 = 0.5 * (z_pair[idx[:, 0]] - z_pair[idx[:, 1]]).abs().mean(
-                dim=0
-            )
+            e2 = 0.5 * (z_pair[idx[:, 0]] - z_pair[idx[:, 1]]).abs().mean(dim=0)
         else:
             e2 = torch.zeros_like(e1)
         return (sigma * (e1 - e2)).clamp(min=0.0)
@@ -437,9 +405,7 @@ class CRPSLoss(nn.Module):
         dims = self._dims(pred)
         err = target - pred
         if self.std_param is not None:
-            sigma = self._expand_params(self.std_param, pred).clamp(
-                min=self.eps
-            )
+            sigma = self._expand_params(self.std_param, pred).clamp(min=self.eps)
             if self.detach_stats:
                 sigma = sigma.detach()
         else:
@@ -451,9 +417,7 @@ class CRPSLoss(nn.Module):
         )
 
     @staticmethod
-    def _move_sample_dim_to_1(
-        pred: torch.Tensor, sample_dim: int
-    ) -> torch.Tensor:
+    def _move_sample_dim_to_1(pred: torch.Tensor, sample_dim: int) -> torch.Tensor:
         nd = int(pred.ndim)
         sd = sample_dim if sample_dim >= 0 else sample_dim + nd
         if not (0 <= sd < nd):
@@ -491,9 +455,7 @@ class CRPSLoss(nn.Module):
             )
         else:
             cap = candidates[-1]
-        allowed = sorted(
-            [c for c in candidates if c <= cap] or [candidates[0]]
-        )
+        allowed = sorted([c for c in candidates if c <= cap] or [candidates[0]])
         row_bytes = max(1, int(B) * int(S) * int(out_elem_size))
         tgt = 1 if S <= 256 else (2 if S <= 512 else (4 if S <= 1024 else 8))
         req = min(S, max(1, (S + tgt - 1) // tgt))
@@ -519,10 +481,7 @@ class CRPSLoss(nn.Module):
                 else int(get_accelerator_index("cuda"))
             )
         key = (dev.type, dev_idx, int(B), int(S), int(out_elem_size))
-        if (
-            self._energy_cdist_cache_key == key
-            and self._energy_cdist_cache_val
-        ):
+        if self._energy_cdist_cache_key == key and self._energy_cdist_cache_val:
             return int(self._energy_cdist_cache_val)
         budget = self._recommend_energy_cdist_max_bytes(
             int(B), int(S), dev, out_elem_size
@@ -555,9 +514,7 @@ class CRPSLoss(nn.Module):
             samples - target_m.reshape(B, 1, -1), dim=-1
         ).mean(dim=1)
         budget_bytes = self._energy_cdist_budget_bytes(B, S, samples)
-        max_elems = max(
-            1, int(budget_bytes // max(4, int(samples.element_size())))
-        )
+        max_elems = max(1, int(budget_bytes // max(4, int(samples.element_size()))))
         chunk = max(1, min(S, int(max_elems // max(B * S, 1))))
         acc_dt = (
             torch.float32
@@ -565,17 +522,13 @@ class CRPSLoss(nn.Module):
             else term1.dtype
         )
         sum_d = sum(
-            torch.cdist(samples[:, i : i + chunk], samples)
-            .sum(dim=(1, 2))
-            .to(acc_dt)
+            torch.cdist(samples[:, i : i + chunk], samples).sum(dim=(1, 2)).to(acc_dt)
             for i in range(0, S, chunk)
         )
         term2 = sum_d / float(S * (S - 1))
         return self._reduce((term1.to(acc_dt) - 0.5 * term2).clamp(min=0.0))
 
-    def forward(
-        self: Self, pred: torch.Tensor, target: torch.Tensor
-    ) -> torch.Tensor:
+    def forward(self: Self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
         return (
             self._crps_normal(pred, target)
             if self.mode == "normal"
@@ -642,11 +595,7 @@ class DistributionLoss(nn.Module):
     @staticmethod
     def _expand_params(x: TensorLike, ref: torch.Tensor) -> torch.Tensor:
         t = to_tensor_like(x, ref)
-        return (
-            t.view(*[1] * (ref.ndim - t.ndim), *t.shape)
-            if t.ndim < ref.ndim
-            else t
-        )
+        return t.view(*[1] * (ref.ndim - t.ndim), *t.shape) if t.ndim < ref.ndim else t
 
     @staticmethod
     def _safe_std(
@@ -681,11 +630,7 @@ class DistributionLoss(nn.Module):
             x = pred - target
         elif self.mu_mode == "pooled":
             mu = (
-                0.5
-                * (
-                    _median_over_dims(target, dims)
-                    + _median_over_dims(pred, dims)
-                )
+                0.5 * (_median_over_dims(target, dims) + _median_over_dims(pred, dims))
                 if self.skew
                 else 0.5
                 * (
@@ -705,11 +650,7 @@ class DistributionLoss(nn.Module):
         else:
             raise ValueError(f"Invalid mu_mode {self.mu_mode}")
 
-        mu = (
-            _median_over_dims(x, dims)
-            if self.skew
-            else red(x, dim=dims, keepdim=True)
-        )
+        mu = _median_over_dims(x, dims) if self.skew else red(x, dim=dims, keepdim=True)
         return mu.detach() if self.detach_stats else mu
 
     def compute_std(
@@ -776,9 +717,7 @@ class DistributionLoss(nn.Module):
             return F.softplus(beta * margin) / beta
         raise ValueError("Invalid penalty")
 
-    def forward(
-        self: Self, pred: torch.Tensor, target: torch.Tensor
-    ) -> torch.Tensor:
+    def forward(self: Self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
         if pred.shape != target.shape:
             raise ValueError("shape mismatch")
         dims = self._dims(pred)
@@ -788,9 +727,7 @@ class DistributionLoss(nn.Module):
         if self.clamp_max is not None:
             stat_abs = torch.clamp(stat_abs, max=float(self.clamp_max))
         return self.reduce(
-            self._apply_penalty(
-                self._compute_margin(stat_abs, pred, target, mu, std)
-            )
+            self._apply_penalty(self._compute_margin(stat_abs, pred, target, mu, std))
         )
 
 
@@ -852,14 +789,10 @@ class StandardNormalLoss(DistributionLoss):
         q = 0.5 + 0.5 * self.confidence if self.two_tailed else self.confidence
         try:
             self._z_threshold_f64 = float(
-                self._std_normal.icdf(
-                    torch.tensor(q, dtype=torch.float64)
-                ).item()
+                self._std_normal.icdf(torch.tensor(q, dtype=torch.float64)).item()
             )
         except Exception:
-            self._z_threshold_f64 = float(
-                self._std_normal.icdf(torch.tensor(q)).item()
-            )
+            self._z_threshold_f64 = float(self._std_normal.icdf(torch.tensor(q)).item())
 
     def _z_threshold(self: Self, device: Any, dtype: Any) -> torch.Tensor:
         return torch.tensor(self._z_threshold_f64, device=device, dtype=dtype)
@@ -881,11 +814,7 @@ class StandardNormalLoss(DistributionLoss):
             dims = self._dims(pred)
             z_mean = z.mean(dim=dims, keepdim=True)
             z_centered = z - z_mean
-            m2 = (
-                (z_centered**2)
-                .mean(dim=dims, keepdim=True)
-                .clamp(min=self.eps)
-            )
+            m2 = (z_centered**2).mean(dim=dims, keepdim=True).clamp(min=self.eps)
             m3 = (z_centered**3).mean(dim=dims, keepdim=True)
             gamma = m3 / (m2.sqrt() ** 3 + self.eps)
             if self.detach_stats:
@@ -896,9 +825,7 @@ class StandardNormalLoss(DistributionLoss):
             return z_abs - self._z_threshold(pred.device, pred.dtype)
         if self.metric.startswith("p"):
             try:
-                one_tail = torch.clamp(
-                    1.0 - Normal(0.0, 1.0).cdf(z_abs), min=self.eps
-                )
+                one_tail = torch.clamp(1.0 - Normal(0.0, 1.0).cdf(z_abs), min=self.eps)
             except NotImplementedError:
                 one_tail = torch.clamp(1.0 - _normal_cdf(z_abs), min=self.eps)
             p = 2.0 * one_tail if self.two_tailed else one_tail
@@ -972,9 +899,7 @@ class StudentsTLoss(DistributionLoss):
         df_scalar = (
             float(self.df.detach().cpu().item())
             if torch.is_tensor(self.df) and self.df.numel() == 1
-            else float(self.df)
-            if not torch.is_tensor(self.df)
-            else None
+            else float(self.df) if not torch.is_tensor(self.df) else None
         )
         df_requires_grad = torch.is_tensor(self.df) and self.df.requires_grad
         if (
@@ -987,9 +912,7 @@ class StudentsTLoss(DistributionLoss):
             return torch.tensor(
                 self._cached_t_threshold_f64, device=device, dtype=dtype
             )
-        df = to_tensor_like(
-            self.df, torch.empty((), device=device, dtype=dtype)
-        )
+        df = to_tensor_like(self.df, torch.empty((), device=device, dtype=dtype))
         try:
             dist = StudentT(df=df)
             thr = dist.icdf(torch.tensor(q, device=device, dtype=dtype))
@@ -1001,9 +924,7 @@ class StudentsTLoss(DistributionLoss):
             hi = torch.full_like(df, 50.0, dtype=dtype, device=device)
             for _ in range(64):
                 mid = 0.5 * (lo + hi)
-                mask = (
-                    _students_t_cdf(mid, df=df, loc=loc, scale=scale) >= target
-                )
+                mask = _students_t_cdf(mid, df=df, loc=loc, scale=scale) >= target
                 hi, lo = (
                     torch.where(mask, mid, hi),
                     torch.where(~mask, mid, lo),
@@ -1011,9 +932,7 @@ class StudentsTLoss(DistributionLoss):
             thr = 0.5 * (lo + hi)
         if df_scalar is not None and not df_requires_grad and thr.numel() == 1:
             try:
-                self._cached_t_threshold_f64 = float(
-                    thr.detach().double().cpu().item()
-                )
+                self._cached_t_threshold_f64 = float(thr.detach().double().cpu().item())
                 self._cached_t_df = float(df_scalar)
                 self._cached_t_q = float(q)
                 return torch.tensor(
@@ -1040,11 +959,7 @@ class StudentsTLoss(DistributionLoss):
             dims = self._dims(pred)
             t_mean = t.mean(dim=dims, keepdim=True)
             t_centered = t - t_mean
-            m2 = (
-                (t_centered**2)
-                .mean(dim=dims, keepdim=True)
-                .clamp(min=self.eps)
-            )
+            m2 = (t_centered**2).mean(dim=dims, keepdim=True).clamp(min=self.eps)
             m3 = (t_centered**3).mean(dim=dims, keepdim=True)
             gamma = m3 / (m2.sqrt() ** 3 + self.eps)
             if self.detach_stats:
@@ -1109,9 +1024,7 @@ class DataFidelityLoss(nn.Module):
 
     def _mse(self: Self, a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
         diff = (
-            (a - b).abs()
-            if (torch.is_complex(a) or torch.is_complex(b))
-            else (a - b)
+            (a - b).abs() if (torch.is_complex(a) or torch.is_complex(b)) else (a - b)
         )
         sq = diff * diff
         if self.reduction == "mean":
@@ -1197,13 +1110,9 @@ class LinearCombinationLoss(nn.Module):
         super().__init__()
         _ = args, kwargs
         if not isinstance(coefficient, Sequence):
-            raise TypeError(
-                f"coefficient must be a Sequence, got {type(coefficient)}"
-            )
+            raise TypeError(f"coefficient must be a Sequence, got {type(coefficient)}")
         if not isinstance(loss, Sequence):
-            raise TypeError(
-                f"loss must be a Sequence[nn.Module], got {type(loss)}"
-            )
+            raise TypeError(f"loss must be a Sequence[nn.Module], got {type(loss)}")
         if len(coefficient) == 0 or len(coefficient) != len(loss):
             raise ValueError(
                 f"invalid coefficient/loss length: len(coefficient)={len(coefficient)}, len(loss)={len(loss)}"
@@ -1222,18 +1131,10 @@ class LinearCombinationLoss(nn.Module):
         self.min_coeff = float(min_coeff)
         self.max_coeff = float(max_coeff)
         self.eps = float(eps)
-        self.register_buffer(
-            "loss_avg", torch.full_like(coeff_tensor, fill_value=1.0)
-        )
+        self.register_buffer("loss_avg", torch.full_like(coeff_tensor, fill_value=1.0))
 
-    def _update_coefficients(
-        self: Self, per_loss_vals: List[torch.Tensor]
-    ) -> None:
-        if (
-            (not self.auto_schedule)
-            or (not per_loss_vals)
-            or (not self.training)
-        ):
+    def _update_coefficients(self: Self, per_loss_vals: List[torch.Tensor]) -> None:
+        if (not self.auto_schedule) or (not per_loss_vals) or (not self.training):
             return
         with torch.no_grad():
             device = self.loss_avg.device
@@ -1258,9 +1159,7 @@ class LinearCombinationLoss(nn.Module):
 
     def forward(self: Self, pred: Tensor, target: Tensor) -> Tensor:
         weights = (
-            self.coefficient.detach()
-            .clone()
-            .to(device=pred.device, dtype=pred.dtype)
+            self.coefficient.detach().clone().to(device=pred.device, dtype=pred.dtype)
         )
         total = pred.new_tensor(self.offset, dtype=pred.dtype)
         per_loss_vals: List[torch.Tensor] = []
@@ -1327,9 +1226,7 @@ class TiledLoss(nn.Module):
         x: torch.Tensor, mask: Optional[torch.Tensor]
     ) -> torch.Tensor:
         return (
-            x.masked_select(mask)
-            if mask is not None and x.shape == mask.shape
-            else x
+            x.masked_select(mask) if mask is not None and x.shape == mask.shape else x
         )
 
     def _infer_base_reduction(
@@ -1343,9 +1240,7 @@ class TiledLoss(nn.Module):
         return (
             "none"
             if loss.shape == tile_pred.shape
-            else "mean"
-            if loss.numel() == 1 or loss.ndim == 0
-            else "none"
+            else "mean" if loss.numel() == 1 or loss.ndim == 0 else "none"
         )
 
     def reduce(
@@ -1355,14 +1250,10 @@ class TiledLoss(nn.Module):
         return (
             x2.mean()
             if self.reduction == "mean"
-            else x2.sum()
-            if self.reduction == "sum"
-            else x2
+            else x2.sum() if self.reduction == "sum" else x2
         )
 
-    def forward(
-        self: Self, pred: torch.Tensor, target: torch.Tensor
-    ) -> torch.Tensor:
+    def forward(self: Self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
         mask = self._mask(pred, target)
         if self.tile_dim is None or self.tile_size is None:
             v = self.base(pred, target)
@@ -1378,9 +1269,7 @@ class TiledLoss(nn.Module):
             else:
                 n = int(pred.numel())
             if v.numel() == 1:
-                total_sum = v.reshape(()) * (
-                    float(n) if base_red != "sum" else 1.0
-                )
+                total_sum = v.reshape(()) * (float(n) if base_red != "sum" else 1.0)
                 return (
                     total_sum
                     if self.reduction == "sum"
@@ -1388,11 +1277,7 @@ class TiledLoss(nn.Module):
                 )
             return v.sum() if self.reduction == "sum" else v.mean()
         nd = int(pred.ndim)
-        td = (
-            int(self.tile_dim) + nd
-            if int(self.tile_dim) < 0
-            else int(self.tile_dim)
-        )
+        td = int(self.tile_dim) + nd if int(self.tile_dim) < 0 else int(self.tile_dim)
         td = max(0, min(td, nd - 1))
         N = int(pred.shape[td])
         acc_dtype = (
@@ -1472,15 +1357,9 @@ class LossWeightController:
         if (total := top + bottom) <= 0.0:
             return (0.5, 0.5)
         ratio_top = max(self.min_weight, min(top / total, self.max_weight))
-        ratio_bottom = max(
-            self.min_weight, min(bottom / total, self.max_weight)
-        )
+        ratio_bottom = max(self.min_weight, min(bottom / total, self.max_weight))
         norm = ratio_top + ratio_bottom
-        return (
-            (0.5, 0.5)
-            if norm <= 0.0
-            else (ratio_top / norm, ratio_bottom / norm)
-        )
+        return (0.5, 0.5) if norm <= 0.0 else (ratio_top / norm, ratio_bottom / norm)
 
     def update(
         self: Self,

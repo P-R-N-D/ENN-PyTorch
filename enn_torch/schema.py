@@ -7,13 +7,8 @@ from typing import Any, Mapping, Optional
 import torch
 from tensordict import TensorDictBase
 
-
-_FEATURE_KEY_ALIASES = frozenset(
-    {"x", "feature", "features", "input", "inputs", "in"}
-)
-_LABEL_KEY_ALIASES = frozenset(
-    {"y", "label", "labels", "output", "outputs", "out"}
-)
+_FEATURE_KEY_ALIASES = frozenset({"x", "feature", "features", "input", "inputs", "in"})
+_LABEL_KEY_ALIASES = frozenset({"y", "label", "labels", "output", "outputs", "out"})
 
 
 def _td_set(td: TensorDictBase, key: str, value: Any) -> None:
@@ -34,9 +29,7 @@ def _resolve_key(
     if not isinstance(data, (Mapping, TensorDictBase)):
         raise TypeError(f"get_{name}_key expects Mapping/TensorDict")
     matches = [
-        str(k)
-        for k in data.keys()
-        if isinstance(k, str) and k.casefold() in aliases
+        str(k) for k in data.keys() if isinstance(k, str) and k.casefold() in aliases
     ]
     if len(matches) == 1:
         return matches[0]
@@ -55,9 +48,7 @@ def get_feature_key(data: Any) -> str:
     return _resolve_key(data, _FEATURE_KEY_ALIASES, "feature", True)
 
 
-def get_label_key(
-    data: Any, *args: Any, required: bool = True
-) -> Optional[str]:
+def get_label_key(data: Any, *args: Any, required: bool = True) -> Optional[str]:
     del args
     return _resolve_key(data, _LABEL_KEY_ALIASES, "label", required)
 
@@ -90,9 +81,7 @@ def get_row(
 ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
     del args
     return data[get_feature_key(data)], (
-        data[l]
-        if (l := get_label_key(data, required=labels_required))
-        else None
+        data[l] if (l := get_label_key(data, required=labels_required)) else None
     )
 
 

@@ -11,12 +11,12 @@ from typing import (
     Dict,
     Mapping,
     Optional,
+    Self,
     Sequence,
     Tuple,
     TypeVar,
     Union,
     cast,
-    Self,
 )
 
 import torch
@@ -29,8 +29,9 @@ from ..core.checkpoint import coerce_checkpoint
 from ..core.concurrency import Mutex, is_gil_enabled
 from ..core.datatypes import env_bool, env_first_int, env_int
 from ..core.distributed import _from_hsdp_module
+from ..core.graph import canonicalize_compile_mode
+from ..core.graph import compile as compile_module
 from ..core.graph import (
-    canonicalize_compile_mode,
     cudagraph_mark_step_begin,
     cudagraph_mark_step_end,
     graph_break,
@@ -39,22 +40,16 @@ from ..core.graph import (
     is_symbolic,
     torch_compiler_disable,
     torch_compiler_supported,
-    compile as compile_module,
 )
 from ..core.policies import LossWeightPolicy
 from ..core.precision import Autocast
-from ..core.system import (
-    CPU,
-    empty_device_cache,
-    get_device,
-    set_runtime_cfg,
-)
+from ..core.system import CPU, empty_device_cache, get_device, set_runtime_cfg
 from ..core.tensor import is_meta_or_fake_tensor, symint_safe_expand_as
 from ..schema import get_feature_key, get_label_key
 from .blocks import (
     LongNet,
-    RetNet,
     Perceiver,
+    RetNet,
     _autofit_microbatch,
     _coerce_modeling_types,
     _coerce_tensor,
@@ -62,13 +57,9 @@ from .blocks import (
     _prealloc_microbatch,
     _size_of_retnet,
     norm_layer,
-    stochastic_depth_schedule,)
-from .layers import (
-    Recorder,
-    Scaler,
-    SigmoidGate,
+    stochastic_depth_schedule,
 )
-
+from .layers import Recorder, Scaler, SigmoidGate
 
 _LOGGER = logging.getLogger(__name__)
 _SUBMODEL_UNSET: object = object()
@@ -117,9 +108,7 @@ def _tile_counts_grid(
         if g <= 0:
             counts_1d.append(torch.zeros((0,), device=device, dtype=dtype))
         elif g == 1:
-            counts_1d.append(
-                torch.tensor([float(d)], device=device, dtype=dtype)
-            )
+            counts_1d.append(torch.tensor([float(d)], device=device, dtype=dtype))
         else:
             last = max(1, int(d - (g - 1) * t))
             head = torch.full((g - 1,), float(t), device=device, dtype=dtype)
@@ -161,9 +150,7 @@ def _reduce_flat_to_grid(
     sum_v = blk.sum(dim=tile_dims)
     if reduce == "sum":
         return sum_v
-    counts = _tile_counts_grid(
-        ev, ts, device=blk.device, dtype=blk.dtype
-    ).unsqueeze(0)
+    counts = _tile_counts_grid(ev, ts, device=blk.device, dtype=blk.dtype).unsqueeze(0)
     return sum_v / torch.clamp(counts, min=float(eps))
 
 
@@ -187,8 +174,6 @@ def _dot_product_attention_cls() -> Any:
         return DotProductAttention
     except Exception:
         return None
-
-
 
 
 class Collector(nn.Module):
@@ -225,7 +210,6 @@ class Collector(nn.Module):
         self.microbatch: int = 0
         self._auto_microbatch_pending: bool = True
         self._runtime_lock = Mutex()
-
 
     def __getstate__(self: Self) -> dict[str, object]:
         state = super().__getstate__()
@@ -299,13 +283,9 @@ class Collector(nn.Module):
         with self._runtime_lock:
             mb_cur = int(self.microbatch) if self.microbatch else B
         mb = max(1, min(B, mb_cur))
-        infer_mode = (not torch.is_grad_enabled()) and (
-            not is_export_or_trace()
-        )
+        infer_mode = (not torch.is_grad_enabled()) and (not is_export_or_trace())
         controller_ctx = (
-            inference_mode(self.backbone)
-            if infer_mode
-            else contextlib.nullcontext()
+            inference_mode(self.backbone) if infer_mode else contextlib.nullcontext()
         )
         backbone = self.backbone
 
@@ -379,7 +359,9 @@ class Template(nn.Module):
         self.norm = norm_layer(self.norm_type, self.d_model)
 
         self.register_buffer(
-            "weight", torch.as_tensor(float(weight), dtype=torch.float32), persistent=True
+            "weight",
+            torch.as_tensor(float(weight), dtype=torch.float32),
+            persistent=True,
         )
         self.register_buffer(
             "eps", torch.as_tensor(float(eps), dtype=torch.float32), persistent=True
@@ -401,10 +383,14 @@ class Template(nn.Module):
         self.mode = self._coerce_mode(mode)
 
     def set_weight(self: Self, weight: float) -> None:
-        self.weight.data = torch.as_tensor(float(weight), dtype=self.weight.dtype, device=self.weight.device)
+        self.weight.data = torch.as_tensor(
+            float(weight), dtype=self.weight.dtype, device=self.weight.device
+        )
 
     def set_eps(self: Self, eps: float) -> None:
-        self.eps.data = torch.as_tensor(float(eps), dtype=self.eps.dtype, device=self.eps.device)
+        self.eps.data = torch.as_tensor(
+            float(eps), dtype=self.eps.dtype, device=self.eps.device
+        )
 
     @staticmethod
     def _coerce_state_tensor(
@@ -457,11 +443,7 @@ class Template(nn.Module):
     ) -> Any:
         del args, kwargs
         B = x.size(0)
-        tokens = (
-            self.tokenizer(x)
-            .reshape(B, self.tokens, self.d_model)
-            .contiguous()
-        )
+        tokens = self.tokenizer(x).reshape(B, self.tokens, self.d_model).contiguous()
         m = str(self.mode)
         if m == "spatial":
             if state is not None:
@@ -486,9 +468,7 @@ class Template(nn.Module):
         )
         if do_ckpt and int(getattr(self, "_ckpt_min_bytes", 0) or 0) > 0:
             try:
-                est = int(
-                    _size_of_retnet(x, self.blocks[0], mode="spatial")
-                )
+                est = int(_size_of_retnet(x, self.blocks[0], mode="spatial"))
             except Exception:
                 est = 0
             do_ckpt = bool(est >= int(getattr(self, "_ckpt_min_bytes", 0) or 0))
@@ -540,9 +520,7 @@ class Template(nn.Module):
         )
         if do_ckpt and int(getattr(self, "_ckpt_min_bytes", 0) or 0) > 0:
             try:
-                est = int(
-                    _size_of_retnet(x, self.blocks[0], mode="temporal")
-                )
+                est = int(_size_of_retnet(x, self.blocks[0], mode="temporal"))
             except Exception:
                 est = 0
             do_ckpt = bool(est >= int(getattr(self, "_ckpt_min_bytes", 0) or 0))
@@ -762,8 +740,6 @@ class Fuser(nn.Module):
             self._decode_graph = None
             self._backbone_graph = None
 
-
-
     def __getstate__(self: Self) -> dict[str, object]:
         d = self.__dict__.copy()
         d.pop("_user_submodels", None)
@@ -774,9 +750,15 @@ class Fuser(nn.Module):
         self._user_submodels = {}
 
     def _init_default_tasks(self: Self, config: Optional[ModelConfig] = None) -> None:
-        cfg = config or getattr(self, "cfg", None) or getattr(self, "__enn_instance_config__", None)
+        cfg = (
+            config
+            or getattr(self, "cfg", None)
+            or getattr(self, "__enn_instance_config__", None)
+        )
         if cfg is None:
-            raise RuntimeError("Fuser requires a ModelConfig to initialize default tasks")
+            raise RuntimeError(
+                "Fuser requires a ModelConfig to initialize default tasks"
+            )
 
         mt = str(self.modeling_type)
         if mt in {"ss"}:
@@ -852,7 +834,9 @@ class Fuser(nn.Module):
         self.stream_task_name = str(chosen or "")
         self.stream_task_id = self.stream_task_name
 
-        cfg = getattr(self, "cfg", None) or getattr(self, "__enn_instance_config__", None)
+        cfg = getattr(self, "cfg", None) or getattr(
+            self, "__enn_instance_config__", None
+        )
         if cfg is not None:
             with contextlib.suppress(Exception):
                 setattr(cfg, "stream_task_name", self.stream_task_name or "")
@@ -866,7 +850,9 @@ class Fuser(nn.Module):
             s = s.replace(".", "_")
         return s
 
-    def _generate_unique_uuid_name(self: Self, *args: Any, exclude: Optional[str] = None) -> str:
+    def _generate_unique_uuid_name(
+        self: Self, *args: Any, exclude: Optional[str] = None
+    ) -> str:
         exclude = str(exclude) if exclude is not None else None
         while True:
             candidate = uuid.uuid4().hex
@@ -875,7 +861,9 @@ class Fuser(nn.Module):
             if candidate not in self.tasks:
                 return candidate
 
-    def _ensure_unique_task_name(self: Self, preferred: object, *args: Any, exclude: Optional[str] = None) -> str:
+    def _ensure_unique_task_name(
+        self: Self, preferred: object, *args: Any, exclude: Optional[str] = None
+    ) -> str:
         candidate = self._normalize_task_name(preferred)
         if not candidate:
             return self._generate_unique_uuid_name(exclude=exclude)
@@ -907,7 +895,9 @@ class Fuser(nn.Module):
         if mapped and mapped in self.tasks:
             return mapped
 
-        raise KeyError(f"Unknown task '{task_spec}'. Known tasks: {sorted(self.tasks.keys())}")
+        raise KeyError(
+            f"Unknown task '{task_spec}'. Known tasks: {sorted(self.tasks.keys())}"
+        )
 
     def resolve_task_id(self: Self, task_spec: str) -> str:
         return self.resolve_task_name(task_spec)
@@ -927,8 +917,12 @@ class Fuser(nn.Module):
                     "mode": str(getattr(t, "mode", "spatial")),
                     "tokens": int(getattr(t, "tokens", 1)),
                     "depth": int(getattr(t, "depth", 1)),
-                    "weight": float(getattr(t, "weight", torch.as_tensor(1.0)).detach().cpu().item()),
-                    "eps": float(getattr(t, "eps", torch.as_tensor(1e-6)).detach().cpu().item()),
+                    "weight": float(
+                        getattr(t, "weight", torch.as_tensor(1.0)).detach().cpu().item()
+                    ),
+                    "eps": float(
+                        getattr(t, "eps", torch.as_tensor(1e-6)).detach().cpu().item()
+                    ),
                     "has_submodel": bool(name in self._user_submodels),
                 }
             )
@@ -1025,10 +1019,16 @@ class Fuser(nn.Module):
         nm = self._ensure_unique_task_name(preferred)
 
         if tokens is None:
-            tokens = int(self.spatial_tokens if mode == "spatial" else self.temporal_tokens)
+            tokens = int(
+                self.spatial_tokens if mode == "spatial" else self.temporal_tokens
+            )
         if depth is None:
             cfg = self.cfg
-            depth = int(getattr(cfg, "spatial_depth", 1) if mode == "spatial" else getattr(cfg, "temporal_depth", 1))
+            depth = int(
+                getattr(cfg, "spatial_depth", 1)
+                if mode == "spatial"
+                else getattr(cfg, "temporal_depth", 1)
+            )
 
         tmpl = Template(
             self.in_dim,
@@ -1126,7 +1126,9 @@ class Fuser(nn.Module):
         self._resolve_stream_task_id()
         return key
 
-    def remove_task(self: Self, task_name: str, *args: Any, strict: bool = False) -> None:
+    def remove_task(
+        self: Self, task_name: str, *args: Any, strict: bool = False
+    ) -> None:
         if strict and not self.tasks:
             raise KeyError("No tasks are configured")
         key = self.resolve_task_name(task_name)
@@ -1148,10 +1150,14 @@ class Fuser(nn.Module):
     def _select_tasks_for_modeling_type(self: Self) -> list[str]:
         mt = str(self.modeling_type)
         if mt == "ss":
-            spatial = [k for k, t in self.tasks.items() if getattr(t, "mode", "") == "spatial"]
+            spatial = [
+                k for k, t in self.tasks.items() if getattr(t, "mode", "") == "spatial"
+            ]
             return spatial if spatial else list(self.tasks.keys())
         if mt == "tt":
-            temporal = [k for k, t in self.tasks.items() if getattr(t, "mode", "") == "temporal"]
+            temporal = [
+                k for k, t in self.tasks.items() if getattr(t, "mode", "") == "temporal"
+            ]
             return temporal if temporal else list(self.tasks.keys())
         return list(self.tasks.keys())
 
@@ -1228,7 +1234,11 @@ class Fuser(nn.Module):
         next_state_map: dict[str, torch.Tensor] = {}
         next_state: Optional[torch.Tensor] = None
 
-        if (not state_is_map) and (temporal_state is not None) and (not isinstance(temporal_state, torch.Tensor)):
+        if (
+            (not state_is_map)
+            and (temporal_state is not None)
+            and (not isinstance(temporal_state, torch.Tensor))
+        ):
             raise TypeError(
                 "temporal_state must be None, a torch.Tensor, or a Mapping[str, torch.Tensor]"
             )
@@ -1244,10 +1254,15 @@ class Fuser(nn.Module):
             tmpl = self.tasks[name]
             out_tokens: Any
 
-            if isinstance(tmpl, Template) and str(getattr(tmpl, "mode", "")) == "temporal":
+            if (
+                isinstance(tmpl, Template)
+                and str(getattr(tmpl, "mode", "")) == "temporal"
+            ):
                 st_in: Optional[torch.Tensor] = None
                 if state_is_map:
-                    st_raw = cast(Mapping[str, object], temporal_state).get(str(name), None)
+                    st_raw = cast(Mapping[str, object], temporal_state).get(
+                        str(name), None
+                    )
                     if st_raw is not None and not isinstance(st_raw, torch.Tensor):
                         raise TypeError(
                             f"temporal_state[{name!r}] must be a torch.Tensor or None; got {type(st_raw)}"
@@ -1342,11 +1357,15 @@ class Fuser(nn.Module):
             return fused_tokens, context, next_state
         return fused_tokens, context
 
-    def forward_export(self: Self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def forward_export(
+        self: Self, x: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         tokens, ctx = self.forward(x, temporal_state=None, return_temporal_state=False)
         return cast(torch.Tensor, tokens), cast(torch.Tensor, ctx)
 
-    def decode(self: Self, tokens: torch.Tensor, *args: Any, apply_norm: bool = True) -> torch.Tensor:
+    def decode(
+        self: Self, tokens: torch.Tensor, *args: Any, apply_norm: bool = True
+    ) -> torch.Tensor:
         if apply_norm:
             dg = getattr(self, "_decode_graph", None)
             if isinstance(dg, nn.Module):
@@ -1379,16 +1398,11 @@ class Model(nn.Module):
         self.out_dim = int(math.prod(self.out_shape))
         if config.device is not None:
             self._device = torch.device(config.device)
-            if (
-                self._device.type in {"cuda", "xpu"}
-                and self._device.index is not None
-            ):
+            if self._device.type in {"cuda", "xpu"} and self._device.index is not None:
                 with contextlib.suppress(Exception):
                     from ..core.system import set_accelerator_index
 
-                    set_accelerator_index(
-                        self._device.type, int(self._device.index)
-                    )
+                    set_accelerator_index(self._device.type, int(self._device.index))
         else:
             self._device = get_device()
         self.scaler = Scaler().to(self._device)
@@ -1405,9 +1419,7 @@ class Model(nn.Module):
             if self.is_norm_linear
             else None
         )
-        self.fuser = Fuser(self.in_dim, self.out_shape, config=config).to(
-            self._device
-        )
+        self.fuser = Fuser(self.in_dim, self.out_shape, config=config).to(self._device)
         self.processor = self.fuser
         bucket = self._get_cfg(config, "length_bucket_multiple", 64, int)
         self.temporal_token_collector = Collector(
@@ -1533,9 +1545,7 @@ class Model(nn.Module):
                     if len(tile_shape) == 1:
                         tile_shape = tile_shape * out_ndim
                     elif len(tile_shape) < out_ndim:
-                        tile_shape = (1,) * (
-                            out_ndim - len(tile_shape)
-                        ) + tile_shape
+                        tile_shape = (1,) * (out_ndim - len(tile_shape)) + tile_shape
                     elif len(tile_shape) > out_ndim:
                         tile_shape = tile_shape[-out_ndim:]
         except Exception:
@@ -1641,9 +1651,7 @@ class Model(nn.Module):
             stat_width_frac=float(
                 getattr(config, "delta_gate_auto_k_width_frac", 0.05)
             ),
-            stat_edge_frac=float(
-                getattr(config, "delta_gate_auto_k_edge_frac", 0.02)
-            ),
+            stat_edge_frac=float(getattr(config, "delta_gate_auto_k_edge_frac", 0.02)),
         ).to(self._device)
         self.unsup_xx_weight = float(getattr(config, "unsup_xx_weight", 0.0))
         self.unsup_yy_weight = float(getattr(config, "unsup_yy_weight", 0.0))
@@ -1704,9 +1712,7 @@ class Model(nn.Module):
                 else float(w_high_cfg)
             )
         except Exception:
-            self.delta_gate_edge_reg_weight_low = float(
-                self.delta_gate_edge_reg_weight
-            )
+            self.delta_gate_edge_reg_weight_low = float(self.delta_gate_edge_reg_weight)
             self.delta_gate_edge_reg_weight_high = float(
                 self.delta_gate_edge_reg_weight
             )
@@ -1744,9 +1750,7 @@ class Model(nn.Module):
 
         set_runtime_cfg("compile_mode", compile_mode_canonical)
         compile_mode_arg = (
-            None
-            if compile_mode_canonical == "disabled"
-            else compile_mode_canonical
+            None if compile_mode_canonical == "disabled" else compile_mode_canonical
         )
         compile_requested = compile_mode_arg is not None
         compile_available = bool(torch_compiler_supported())
@@ -1799,9 +1803,7 @@ class Model(nn.Module):
 
         def _empty_cache() -> None:
             if getattr(self._device, "type", None) == "cuda":
-                empty_device_cache(
-                    device=self._device, do_gc=True, min_interval_s=0.0
-                )
+                empty_device_cache(device=self._device, do_gc=True, min_interval_s=0.0)
 
         def _compile_one(
             mod: nn.Module,
@@ -1875,10 +1877,10 @@ class Model(nn.Module):
                     compiled_any = True
                     self._eager_perceiver_self_blocks = eager_items
             return compiled_any
+
         staged_heavy = bool(
             nogil_opt
-            or compile_mode_canonical
-            in {"max-autotune", "max-autotune-no-cudagraphs"}
+            or compile_mode_canonical in {"max-autotune", "max-autotune-no-cudagraphs"}
         )
         compiled_decode = False
         compiled_perceiver = False
@@ -1955,7 +1957,6 @@ class Model(nn.Module):
                 self.logger.cpu()
         return cast(Model, out)
 
-
     def __getstate__(self: Self) -> dict[str, object]:
         ctx = contextlib.nullcontext()
         with contextlib.suppress(Exception):
@@ -2018,7 +2019,9 @@ class Model(nn.Module):
             if isinstance(cross, nn.ModuleList) and isinstance(eager_cross, list):
                 if len(eager_cross) == len(cross):
                     cur_items = list(cross)
-                    if any(cur_items[i] is not eager_cross[i] for i in range(len(cross))):
+                    if any(
+                        cur_items[i] is not eager_cross[i] for i in range(len(cross))
+                    ):
                         list_swaps.append((cross, cur_items))
                         for i, item in enumerate(eager_cross):
                             cross[i] = item
@@ -2026,7 +2029,9 @@ class Model(nn.Module):
         with contextlib.suppress(Exception):
             perceiver = getattr(proc, "perceiver", None)
             self_blocks = (
-                getattr(perceiver, "self_blocks", None) if perceiver is not None else None
+                getattr(perceiver, "self_blocks", None)
+                if perceiver is not None
+                else None
             )
             eager_self = getattr(self, "_eager_perceiver_self_blocks", None)
             if isinstance(self_blocks, nn.ModuleList) and isinstance(eager_self, list):
@@ -2111,18 +2116,14 @@ class Model(nn.Module):
             mean_tok = mean_tok.expand(-1, tokens.size(1), -1)
         tokens_centered = (tokens - mean_tok).contiguous()
         if export:
-            refined = self.temporal_token_collector.forward_export(
-                tokens_centered
-            )
+            refined = self.temporal_token_collector.forward_export(tokens_centered)
         else:
             refined = self.temporal_token_collector.forward(tokens_centered)[0]
         if sanitize_nan:
             refined = _coerce_tensor(refined, enabled=True, inplace=not export)
         residual = self.fuser.decode(refined, apply_norm=True)
         if sanitize_nan:
-            residual = _coerce_tensor(
-                residual, enabled=True, inplace=not export
-            )
+            residual = _coerce_tensor(residual, enabled=True, inplace=not export)
         enhanced = residual.reshape(b, -1).to(dtype=assembled.dtype)
         delta = enhanced - assembled
         p = None
@@ -2236,15 +2237,13 @@ class Model(nn.Module):
                 else:
                     w = p.detach().mean(dim=1).clamp(min=0.0)
                 loss_yy = (
-                    F.smooth_l1_loss(
-                        assembled, y_hat.detach(), reduction="none"
-                    ).mean(dim=1)
+                    F.smooth_l1_loss(assembled, y_hat.detach(), reduction="none").mean(
+                        dim=1
+                    )
                     * w
                 ).mean()
             else:
-                loss_yy = F.smooth_l1_loss(
-                    assembled, y_hat.detach(), reduction="mean"
-                )
+                loss_yy = F.smooth_l1_loss(assembled, y_hat.detach(), reduction="mean")
             aux_total += self.unsup_yy_weight * loss_yy.to(aux_total.dtype)
             aux_used = True
         if self.p_prior_weight > 0.0 and p is not None:
@@ -2269,9 +2268,7 @@ class Model(nn.Module):
             p_ceil = 1.0
             if self.delta_gate is not None:
                 with contextlib.suppress(Exception):
-                    gate_eps = float(
-                        getattr(self.delta_gate, "clip_eps", gate_eps)
-                    )
+                    gate_eps = float(getattr(self.delta_gate, "clip_eps", gate_eps))
                 with contextlib.suppress(Exception):
                     gate_eps = max(
                         gate_eps, float(getattr(self.delta_gate, "eps", 0.0))
@@ -2321,9 +2318,7 @@ class Model(nn.Module):
                             dtype=torch.float32,
                         ).unsqueeze(0)
                     else:
-                        p_grid = p.to(dtype=torch.float32).mean(
-                            dim=1, keepdim=True
-                        )
+                        p_grid = p.to(dtype=torch.float32).mean(dim=1, keepdim=True)
                 except Exception:
                     p_grid = None
                     w_grid = None
@@ -2331,9 +2326,7 @@ class Model(nn.Module):
                 tv = _tv_loss_grid(
                     p_grid, power=float(self.delta_gate_tv_power), eps=gate_eps
                 )
-                aux_total += self.delta_gate_tv_weight * tv.to(
-                    dtype=aux_total.dtype
-                )
+                aux_total += self.delta_gate_tv_weight * tv.to(dtype=aux_total.dtype)
                 aux_used = True
             if (
                 self.delta_gate_teacher_weight > 0.0
@@ -2375,8 +2368,7 @@ class Model(nn.Module):
                 scale_grid = torch.clamp(scale_grid, min=float(gate_eps))
                 temp = max(float(self.delta_gate_teacher_temp), float(gate_eps))
                 score = (
-                    (imp_grid / scale_grid - float(self.delta_gate_teacher_tau))
-                    / temp
+                    (imp_grid / scale_grid - float(self.delta_gate_teacher_tau)) / temp
                 ).clamp(min=-20.0, max=20.0)
                 p01 = torch.sigmoid(score)
                 p_target = p01 * float(p_ceil - p_floor) + float(p_floor)
@@ -2387,8 +2379,7 @@ class Model(nn.Module):
                 if w_grid is not None:
                     w = w_grid.to(device=p_grid.device, dtype=torch.float32)
                     loss_teacher = (
-                        (p_grid.to(dtype=torch.float32) - p_target).square()
-                        * w
+                        (p_grid.to(dtype=torch.float32) - p_target).square() * w
                     ).sum() / w.sum().clamp_min(float(gate_eps))
                 else:
                     loss_teacher = F.mse_loss(
@@ -2405,18 +2396,13 @@ class Model(nn.Module):
                 dtype=aux_total.dtype
             )
             aux_used = True
-        if (
-            self.delta_gate_edge_reg_weight_high > 0.0
-            and edge_reg_high is not None
-        ):
+        if self.delta_gate_edge_reg_weight_high > 0.0 and edge_reg_high is not None:
             aux_total += self.delta_gate_edge_reg_weight_high * edge_reg_high.to(
                 dtype=aux_total.dtype
             )
             aux_used = True
         if aux_used:
-            return (
-                (loss_val + aux_total) if (loss_val is not None) else aux_total
-            )
+            return (loss_val + aux_total) if (loss_val is not None) else aux_total
         return loss_val
 
     def _auto_microbatch(
@@ -2467,9 +2453,7 @@ class Model(nn.Module):
         net_loss: Optional[nn.Module] = None,
         global_loss: Optional[nn.Module] = None,
         local_loss: Optional[nn.Module] = None,
-        loss_weights: Optional[
-            Union[Tuple[float, float], LossWeightPolicy]
-        ] = None,
+        loss_weights: Optional[Union[Tuple[float, float], LossWeightPolicy]] = None,
         calibrate_output: bool = True,
         sanitize_nan: bool = True,
         return_loss: Optional[bool] = None,
@@ -2540,11 +2524,7 @@ class Model(nn.Module):
                 loss_weights = td_loss_weights
         device = _infer_module_device(self.fuser, self._device)
         x_raw = features
-        if (
-            isinstance(x_raw, torch.Tensor)
-            and x_raw.ndim == 3
-            and x_raw.shape[1] == 1
-        ):
+        if isinstance(x_raw, torch.Tensor) and x_raw.ndim == 3 and x_raw.shape[1] == 1:
             x_raw = x_raw.reshape(x_raw.shape[0], -1)
         if isinstance(x_raw, torch.Tensor) and x_raw.device != device:
             x_raw = x_raw.to(device=device, non_blocking=True)
@@ -2569,16 +2549,12 @@ class Model(nn.Module):
             amp_candidates = (torch.float32,)
         safety_margin_pow2 = 3
         try:
-            safety_margin_pow2 = int(
-                getattr(self.__config, "safety_margin_pow2", 3)
-            )
+            safety_margin_pow2 = int(getattr(self.__config, "safety_margin_pow2", 3))
         except Exception:
             safety_margin_pow2 = 3
         safety_margin_pow2 = max(0, min(30, safety_margin_pow2))
         dev_index = (
-            int(device.index)
-            if getattr(device, "index", None) is not None
-            else -1
+            int(device.index) if getattr(device, "index", None) is not None else -1
         )
         if meta is None:
             cache_key = (
@@ -2641,9 +2617,7 @@ class Model(nn.Module):
                     amp_dtype = self._amp_dtype_cache.get(cache_key)
                     if amp_dtype is None:
                         amp_dtype = negotiated
-                        if len(self._amp_dtype_cache) >= int(
-                            self._amp_dtype_cache_max
-                        ):
+                        if len(self._amp_dtype_cache) >= int(self._amp_dtype_cache_max):
                             self._amp_dtype_cache.clear()
                         self._amp_dtype_cache[cache_key] = amp_dtype
                     self._amp_dtype_cache_last_dtype = amp_dtype
@@ -2652,9 +2626,7 @@ class Model(nn.Module):
                 amp_dtype = self._amp_dtype_cache.get(cache_key)
                 if amp_dtype is None:
                     amp_dtype = negotiated
-                    if len(self._amp_dtype_cache) >= int(
-                        self._amp_dtype_cache_max
-                    ):
+                    if len(self._amp_dtype_cache) >= int(self._amp_dtype_cache_max):
                         self._amp_dtype_cache.clear()
                     self._amp_dtype_cache[cache_key] = amp_dtype
                 self._amp_dtype_cache_last_dtype = amp_dtype
@@ -2679,9 +2651,7 @@ class Model(nn.Module):
             or (local_loss is not None)
         )
         has_supervision = labels_flat is not None and has_any_loss
-        is_train_path = bool(
-            self.training and grad_enabled and has_supervision
-        )
+        is_train_path = bool(self.training and grad_enabled and has_supervision)
         _did_unshard_fuser = False
         _unshard = getattr(self.fuser, "unshard", None)
         _reshard = getattr(self.fuser, "reshard", None)
@@ -2708,10 +2678,7 @@ class Model(nn.Module):
                     base_dtype = next(self.parameters()).dtype
                 except Exception:
                     base_dtype = torch.float32 if amp_enabled else amp_dtype
-            if (
-                isinstance(x_scaled, torch.Tensor)
-                and x_scaled.device != device
-            ):
+            if isinstance(x_scaled, torch.Tensor) and x_scaled.device != device:
                 x_scaled = x_scaled.to(device=device, non_blocking=True)
             features_t = (
                 x_scaled.to(dtype=base_dtype)
@@ -2745,9 +2712,7 @@ class Model(nn.Module):
                                 1, int(getattr(self, "microbatch", 64) or 64)
                             )
                 with self._runtime_lock:
-                    mb_cfg = (
-                        int(self.microbatch) if self.microbatch else int(b)
-                    )
+                    mb_cfg = int(self.microbatch) if self.microbatch else int(b)
                 mb = max(1, min(int(b), mb_cfg))
 
             def _encode(
@@ -2761,9 +2726,7 @@ class Model(nn.Module):
                     return self.fuser(inp)
 
             enc_ctx = (
-                inference_mode(self.fuser)
-                if infer_mode
-                else contextlib.nullcontext()
+                inference_mode(self.fuser) if infer_mode else contextlib.nullcontext()
             )
             with enc_ctx:
                 if exporting:
@@ -2777,11 +2740,7 @@ class Model(nn.Module):
                             features_t,
                             mb,
                             _encode,
-                            pad_to=(
-                                int(mb)
-                                if self._pad_compiled_microbatch
-                                else None
-                            ),
+                            pad_to=(int(mb) if self._pad_compiled_microbatch else None),
                             out_dtype=base_dtype,
                             cast_slice=lambda t: self._cast_graph_safe(
                                 t, device, base_dtype
@@ -2814,9 +2773,7 @@ class Model(nn.Module):
                 mean = tokens.to(dtype=mean_dtype).mean(dim=1, keepdim=True)
             else:
                 mean = tokens.mean(dim=1, keepdim=True)
-            mean_cast = symint_safe_expand_as(
-                mean.to(dtype=tokens.dtype), tokens
-            )
+            mean_cast = symint_safe_expand_as(mean.to(dtype=tokens.dtype), tokens)
             tokens_centered = tokens - mean_cast
             if not tokens_centered.is_contiguous():
                 tokens_centered = tokens_centered.contiguous()
@@ -2844,9 +2801,7 @@ class Model(nn.Module):
             )
             graph_break()
             processor_ctx = (
-                inference_mode(self.fuser)
-                if infer_mode
-                else contextlib.nullcontext()
+                inference_mode(self.fuser) if infer_mode else contextlib.nullcontext()
             )
             with processor_ctx:
                 dc = getattr(self, "_decode_compiled", None)
@@ -2877,10 +2832,7 @@ class Model(nn.Module):
                         _run_decode_chunk,
                         pad_to=(
                             int(ctrl_mb)
-                            if (
-                                dc is not None
-                                and self._pad_compiled_microbatch
-                            )
+                            if (dc is not None and self._pad_compiled_microbatch)
                             else None
                         ),
                         stage="decoder",
@@ -2937,9 +2889,9 @@ class Model(nn.Module):
                         ):
                             return True
                         try:
-                            return bool(
-                                torch.isfinite(lo).all().item()
-                            ) and bool(torch.isfinite(hi).all().item())
+                            return bool(torch.isfinite(lo).all().item()) and bool(
+                                torch.isfinite(hi).all().item()
+                            )
                         except Exception:
                             return False
 
@@ -2980,9 +2932,7 @@ class Model(nn.Module):
                         z_min = (ylo_t - mean) / denom
                         z_max = (yhi_t - mean) / denom
                     else:
-                        if bool(
-                            getattr(self, "delta_gate_fallback_enabled", False)
-                        ):
+                        if bool(getattr(self, "delta_gate_fallback_enabled", False)):
                             k_low_buf = getattr(
                                 self, "delta_gate_fallback_k_low_buf", None
                             )
@@ -3000,9 +2950,7 @@ class Model(nn.Module):
                                         getattr(
                                             self,
                                             "delta_gate_fallback_k_low",
-                                            getattr(
-                                                self, "delta_gate_fallback_k", 0.0
-                                            ),
+                                            getattr(self, "delta_gate_fallback_k", 0.0),
                                         )
                                     )
                                 )
@@ -3017,9 +2965,7 @@ class Model(nn.Module):
                                         getattr(
                                             self,
                                             "delta_gate_fallback_k_high",
-                                            getattr(
-                                                self, "delta_gate_fallback_k", 0.0
-                                            ),
+                                            getattr(self, "delta_gate_fallback_k", 0.0),
                                         )
                                     )
                                 )
@@ -3142,14 +3088,10 @@ class Model(nn.Module):
                             enabled=sanitize_enabled,
                             inplace=sanitize_inplace,
                         )
-                    top_component = cast(
-                        torch.Tensor, global_loss(z_top, z_true)
-                    )
+                    top_component = cast(torch.Tensor, global_loss(z_top, z_true))
                     total = total + weights[0] * top_component
                 if local_loss is not None:
-                    bottom_component = cast(
-                        torch.Tensor, local_loss(y_bot, tgt)
-                    )
+                    bottom_component = cast(torch.Tensor, local_loss(y_bot, tgt))
                     total = total + weights[1] * bottom_component
                 loss_val = total
             elif use_net:
@@ -3182,9 +3124,7 @@ class Model(nn.Module):
             )
             if infer_mode and calibrate_output and (not is_cls_loss):
                 z_cal = self.scaler.calibrate(y_hat)
-                pred = self.scaler.denormalize_y(z_cal).reshape(
-                    b, *self.out_shape
-                )
+                pred = self.scaler.denormalize_y(z_cal).reshape(b, *self.out_shape)
             if td_input is not None:
                 if hasattr(td_input, "copy"):
                     out_td = td_input.copy()
@@ -3228,10 +3168,7 @@ class Model(nn.Module):
                         out_td.del_("loss_top")
                 if bottom_component is not None:
                     bottom_td = bottom_component
-                    if (
-                        isinstance(bottom_td, torch.Tensor)
-                        and bottom_td.ndim == 0
-                    ):
+                    if isinstance(bottom_td, torch.Tensor) and bottom_td.ndim == 0:
                         batch_size = tuple(out_td.batch_size)
                         if len(batch_size):
                             bottom_td = bottom_td.expand(batch_size)
@@ -3249,7 +3186,6 @@ class Model(nn.Module):
             if _did_unshard_fuser and callable(_reshard):
                 with contextlib.suppress(Exception):
                     _reshard()
-
 
     def load_state_dict(self, state_dict, *args, **kwargs):
         def _ensure_scaler_shapes(model, sd):
@@ -3312,7 +3248,9 @@ class Model(nn.Module):
                         )
                         setattr(mod, name, mod._buffers[name])
                     continue
-                if hasattr(mod, "_parameters") and name in getattr(mod, "_parameters", {}):
+                if hasattr(mod, "_parameters") and name in getattr(
+                    mod, "_parameters", {}
+                ):
                     prm = mod._parameters.get(name)
                     if (
                         prm is not None
@@ -3411,7 +3349,9 @@ class Model(nn.Module):
             eps=eps,
         )
 
-    def remove_task(self: Self, task_name: str, *args: Any, strict: bool = False) -> None:
+    def remove_task(
+        self: Self, task_name: str, *args: Any, strict: bool = False
+    ) -> None:
         self.fuser.remove_task(task_name, strict=strict)
 
     def predict(

@@ -34,12 +34,7 @@ from tensordict import (
     TensorDict,
     TensorDictBase,
 )
-from torch.distributed.checkpoint import (
-    FileSystemReader,
-    FileSystemWriter,
-    load,
-    save,
-)
+from torch.distributed.checkpoint import FileSystemReader, FileSystemWriter, load, save
 from torch.distributed.checkpoint.state_dict import (
     StateDictOptions,
     get_model_state_dict,
@@ -47,7 +42,7 @@ from torch.distributed.checkpoint.state_dict import (
 )
 from torch.distributed.launcher.api import LaunchConfig, elastic_launch
 
-import ..schema
+from .. import schema
 from ..config import (
     ModelConfig,
     RuntimeConfig,
@@ -56,11 +51,7 @@ from ..config import (
     runtime_config,
 )
 from ..core.datatypes import env_bool, read_json
-from ..core.distributed import (
-    get_available_host,
-    get_preferred_ip,
-    init_master_addr,
-)
+from ..core.distributed import get_available_host, get_preferred_ip, init_master_addr
 from ..core.graph import inference_mode
 from ..core.policies import WorkerPolicy
 from ..core.system import (
@@ -72,11 +63,8 @@ from ..core.system import (
 )
 from ..core.tensor import coerce_tensor
 from ..data import collate
-from ..data.collate import (
-    MappingSlicer,
-    TensorDictSlicer,
-    postprocess as _postprocess_pipeline,
-)
+from ..data.collate import MappingSlicer, TensorDictSlicer
+from ..data.collate import postprocess as _postprocess_pipeline
 from ..data.pipeline import (
     Dataset,
     default_underflow_action,
@@ -89,7 +77,6 @@ from ..nn.layers import Recorder, resize_scaler_buffer
 from .io import _filtered_warnings, _torch_load_checkpoint, is_required
 from .main import _coerce_dcp_keys, process
 
-
 _IGNORED_WARNING_PATTERNS: tuple[str, ...] = (
     "torch.distributed is disabled, unavailable or uninitialized",
     "TypedStorage is deprecated",
@@ -101,9 +88,7 @@ _IGNORED_WARNING_PATTERNS: tuple[str, ...] = (
     "Either mode or options can be specified, but both can't be specified at the same time\\.",
 )
 _IGNORED_WARNING_MESSAGE_RE = re.compile(
-    r".*(?:"
-    + "|".join((f"(?:{p})" for p in _IGNORED_WARNING_PATTERNS))
-    + r").*"
+    r".*(?:" + "|".join((f"(?:{p})" for p in _IGNORED_WARNING_PATTERNS)) + r").*"
 )
 P = ParamSpec("P")
 PathLike: TypeAlias = str | os.PathLike[str] | Path
@@ -186,10 +171,7 @@ def _clear_process_group() -> None:
     try:
         import torch.distributed
 
-        if (
-            torch.distributed.is_available()
-            and torch.distributed.is_initialized()
-        ):
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
             with contextlib.suppress(Exception):
                 torch.distributed.barrier()
             with contextlib.suppress(Exception):
@@ -213,15 +195,9 @@ def _clear_device_caches() -> None:
 
         gc.collect()
     with contextlib.suppress(Exception):
-        from .core.system import (
-            collect_accelerator_ipc,
-            empty_device_cache,
-            get_device,
-        )
+        from .core.system import collect_accelerator_ipc, empty_device_cache, get_device
 
-        empty_device_cache(
-            device=get_device(), do_gc=False, min_interval_s=0.0
-        )
+        empty_device_cache(device=get_device(), do_gc=False, min_interval_s=0.0)
         collect_accelerator_ipc()
 
 
@@ -263,9 +239,7 @@ def _save_model_checkpoint(
         with _filtered_warnings():
             m_sd = get_model_state_dict(
                 model,
-                options=StateDictOptions(
-                    full_state_dict=True, cpu_offload=True
-                ),
+                options=StateDictOptions(full_state_dict=True, cpu_offload=True),
             )
             save(
                 state_dict={"model": m_sd},
@@ -306,9 +280,7 @@ def _get_label_shape(
 ) -> Tuple[Any]:
     if first_in_dim is None:
         return (int(in_dim), tuple(lshape))
-    if int(in_dim) != int(first_in_dim) or tuple(lshape) != tuple(
-        first_label_shape
-    ):
+    if int(in_dim) != int(first_in_dim) or tuple(lshape) != tuple(first_label_shape):
         raise RuntimeError(
             f"Shape mismatch: {first_in_dim}/{first_label_shape} vs {in_dim}/{lshape}"
         )
@@ -321,9 +293,7 @@ def _adapt_source(
     def _value_len(value: object) -> Optional[int]:
         if isinstance(value, (str, bytes, bytearray)):
             return None
-        if isinstance(value, Mapping) and not isinstance(
-            value, TensorDictBase
-        ):
+        if isinstance(value, Mapping) and not isinstance(value, TensorDictBase):
             return None
         if hasattr(value, "__len__"):
             with contextlib.suppress(Exception):
@@ -361,9 +331,7 @@ def _adapt_source(
                 slices.append((key, value))
         slices_t = tuple(slices)
         constants = {
-            key: value
-            for key, value in constants.items()
-            if key not in dict(slices_t)
+            key: value for key, value in constants.items() if key not in dict(slices_t)
         }
         return count, MappingSlicer(constants, slices_t), False
     if isinstance(d, (list, tuple)):
@@ -475,9 +443,7 @@ def _reduce_batch_stats(recs: object) -> Optional[Mapping[str, Any]]:
                         (
                             0.0
                             if s in ("mean", "var")
-                            else float("inf")
-                            if s == "min"
-                            else float("-inf")
+                            else float("inf") if s == "min" else float("-inf")
                         ),
                     )
                 )
@@ -555,10 +521,7 @@ def _update_batch_stats(
         m_new = (m_prev * n_prev + m_inc * n_inc) / n_new
         v_new = max(
             0.0,
-            (
-                (v_prev + m_prev * m_prev) * n_prev
-                + (v_inc + m_inc * m_inc) * n_inc
-            )
+            ((v_prev + m_prev * m_prev) * n_prev + (v_inc + m_inc * m_inc) * n_inc)
             / n_new
             - m_new * m_new,
         )
@@ -603,22 +566,16 @@ def _update_history(
         run_stats = _reduce_batch_stats(records)
 
         epochs_val = (
-            int(meta.get("epochs", epochs))
-            if isinstance(meta, dict)
-            else int(epochs)
+            int(meta.get("epochs", epochs)) if isinstance(meta, dict) else int(epochs)
         )
         frac_val = (
             float(meta.get("val_frac", val_frac))
             if isinstance(meta, dict)
             else float(val_frac)
         )
-        sampled_n = (
-            int(meta.get("sampled_n", 0)) if isinstance(meta, dict) else 0
-        )
+        sampled_n = int(meta.get("sampled_n", 0)) if isinstance(meta, dict) else 0
 
-        train_split_n_est = int(
-            round(num_samples_dataset * max(0.0, 1.0 - frac_val))
-        )
+        train_split_n_est = int(round(num_samples_dataset * max(0.0, 1.0 - frac_val)))
         sampled_n_est = int(round(train_split_n_est * max(1, epochs_val)))
         if sampled_n <= 0:
             frac_val = max(0.0, min(1.0, frac_val))
@@ -688,11 +645,7 @@ def _update_history(
             **(cum_stats or {}),
         }
 
-        if (
-            model_dev_str
-            and train_dev_str
-            and str(model_dev_str) != str(train_dev_str)
-        ):
+        if model_dev_str and train_dev_str and str(model_dev_str) != str(train_dev_str):
             record["model_device"] = model_dev_str
 
         env_meta: Dict[str, Any] = dict(meta) if isinstance(meta, dict) else {}
@@ -755,24 +708,16 @@ def _get_float_precision(obj: object) -> torch.dtype:
                 X_td = torch.as_tensor(X_td)
             dt = _to_torch_dtype(getattr(X_td, "dtype", None))
             return torch.float64 if dt == torch.float64 else torch.float32
-        if isinstance(obj, Mapping) and schema.is_feature_label_batch_mapping(
-            obj
-        ):
+        if isinstance(obj, Mapping) and schema.is_feature_label_batch_mapping(obj):
             f_key = schema.get_feature_key(obj)
             if f_key is not None and f_key in obj:
                 X_all = obj.get(f_key)
                 dt = _to_torch_dtype(getattr(X_all, "dtype", None))
                 if dt is not None:
-                    return (
-                        torch.float64 if dt == torch.float64 else torch.float32
-                    )
+                    return torch.float64 if dt == torch.float64 else torch.float32
                 if isinstance(X_all, (list, tuple)) and X_all:
                     dt0 = _to_torch_dtype(getattr(X_all[0], "dtype", None))
-                    return (
-                        torch.float64
-                        if dt0 == torch.float64
-                        else torch.float32
-                    )
+                    return torch.float64 if dt0 == torch.float64 else torch.float32
         if torch.is_tensor(obj):
             dt = _to_torch_dtype(getattr(obj, "dtype", None))
             return torch.float64 if dt == torch.float64 else torch.float32
@@ -821,16 +766,12 @@ def load_model(
 ) -> Model:
     p = Path(checkpoint_path)
     load_dev = (
-        torch.device(map_location)
-        if map_location is not None
-        else torch.device("cpu")
+        torch.device(map_location) if map_location is not None else torch.device("cpu")
     )
 
     if p.is_dir():
         meta = _parse_meta(p)
-        use_in_dim = int(
-            in_dim if in_dim is not None else meta.get("in_dim") or 0
-        )
+        use_in_dim = int(in_dim if in_dim is not None else meta.get("in_dim") or 0)
         out_shape_meta = (
             out_shape if out_shape is not None else meta.get("out_shape") or ()
         )
@@ -855,13 +796,9 @@ def load_model(
                 model.rebuild_tasks_from_specs(tasks)
         opts = StateDictOptions(full_state_dict=True)
         m_sd = get_model_state_dict(model, options=opts)
-        load(
-            state_dict={"model": m_sd}, storage_reader=FileSystemReader(str(p))
-        )
+        load(state_dict={"model": m_sd}, storage_reader=FileSystemReader(str(p)))
         resize_scaler_buffer(model, m_sd)
-        set_model_state_dict(
-            model, m_sd, options=StateDictOptions(strict=False)
-        )
+        set_model_state_dict(model, m_sd, options=StateDictOptions(strict=False))
         return model
     if not p.exists():
         raise FileNotFoundError(f"Checkpoint file not found: {str(p)!r}")
@@ -955,8 +892,7 @@ def load_model(
         if sd is None:
             try:
                 if obj and all(
-                    isinstance(k, str) and torch.is_tensor(v)
-                    for k, v in obj.items()
+                    isinstance(k, str) and torch.is_tensor(v) for k, v in obj.items()
                 ):
                     sd = obj
             except Exception:
@@ -972,14 +908,10 @@ def load_model(
         meta_cfg = None
         sd = obj
     use_in_dim = int(in_dim if in_dim is not None else meta_in_dim)
-    out_shape_meta = (
-        out_shape if out_shape is not None else meta_out_shape or ()
-    )
+    out_shape_meta = out_shape if out_shape is not None else meta_out_shape or ()
     use_out_shape = tuple((int(x) for x in out_shape_meta))
     user_provided_config = config is not None
-    use_config = coerce_model_config(
-        config if user_provided_config else meta_cfg
-    )
+    use_config = coerce_model_config(config if user_provided_config else meta_cfg)
     if not user_provided_config:
         use_config.device = load_dev
     elif map_location is not None and use_config.device is None:
@@ -1129,9 +1061,7 @@ def train(
         if first_in_dim is None or not label_shape:
             raise RuntimeError("No training data")
         if manifest is not None:
-            payload = (
-                manifest if isinstance(manifest, dict) else list(manifest)
-            )
+            payload = manifest if isinstance(manifest, dict) else list(manifest)
             collate.write_json(
                 os.path.join(memmap_dir, "multinode.json"),
                 payload,
@@ -1139,9 +1069,7 @@ def train(
             )
 
         _max_nodes = int(max_nodes) if max_nodes is not None else 1
-        use_local_init = env_bool(
-            "ENN_INIT_CKPT_LOCAL", default=(_max_nodes <= 1)
-        )
+        use_local_init = env_bool("ENN_INIT_CKPT_LOCAL", default=(_max_nodes <= 1))
         if use_local_init:
             init_dir = tempfile.mkdtemp(prefix=f"enn_init_ckpt_{run_id}_")
         else:
@@ -1180,9 +1108,7 @@ def train(
                 if isinstance(model, torch.nn.Module):
                     model.to("cpu")
         rdzv = get_available_host(
-            rdzv_endpoint
-            or get_preferred_ip(allow_loopback=True)
-            or "127.0.0.1"
+            rdzv_endpoint or get_preferred_ip(allow_loopback=True) or "127.0.0.1"
         )
         master_addr, _master_port = init_master_addr(rdzv)
         _wp = WorkerPolicy.optimize()
@@ -1226,11 +1152,7 @@ def train(
         for key in RuntimeConfig.TRAIN_POS_ORDER[: len(args)]:
             default_kwargs.pop(key, None)
         default_kwargs.update(
-            {
-                key: value
-                for key, value in kwargs.items()
-                if key in default_kwargs
-            }
+            {key: value for key, value in kwargs.items() if key in default_kwargs}
         )
         ops = runtime_config("train", base, *args, **default_kwargs, **kwargs)
 
@@ -1284,9 +1206,7 @@ def train(
             m_sd = _coerce_dcp_keys(
                 get_model_state_dict(
                     model,
-                    options=StateDictOptions(
-                        full_state_dict=True, cpu_offload=True
-                    ),
+                    options=StateDictOptions(full_state_dict=True, cpu_offload=True),
                 )
             )
             load(
@@ -1294,9 +1214,7 @@ def train(
                 storage_reader=FileSystemReader(ckpt_dir),
             )
             resize_scaler_buffer(model, m_sd)
-            set_model_state_dict(
-                model, m_sd, options=StateDictOptions(strict=False)
-            )
+            set_model_state_dict(model, m_sd, options=StateDictOptions(strict=False))
         _update_history(model, ckpt_dir, epochs, val_frac, num_samples_dataset)
         return model
     finally:
@@ -1308,11 +1226,7 @@ def train(
                 if fp and os.path.isfile(fp):
                     restore_path = fp
                     break
-        if (
-            restore_path is None
-            and init_ckpt_path
-            and os.path.isfile(init_ckpt_path)
-        ):
+        if restore_path is None and init_ckpt_path and os.path.isfile(init_ckpt_path):
             restore_path = init_ckpt_path
 
         if isinstance(model, torch.nn.Module) and restore_path:
@@ -1324,10 +1238,7 @@ def train(
                         break
                 if not _meta:
                     for t in model.buffers(recurse=True):
-                        if (
-                            getattr(t, "is_meta", False)
-                            or t.device.type == "meta"
-                        ):
+                        if getattr(t, "is_meta", False) or t.device.type == "meta":
                             _meta = True
                             break
                 if _meta:
@@ -1385,16 +1296,12 @@ def predict(
     _init_distributed()
     out_shape = tuple(
         int(x)
-        for x in (
-            kwargs.pop("out_shape", getattr(model, "out_shape", None)) or ()
-        )
+        for x in (kwargs.pop("out_shape", getattr(model, "out_shape", None)) or ())
     )
     if not out_shape or any(x <= 0 for x in out_shape):
         raise ValueError(f"Invalid out_shape {out_shape}")
     multi_sources: dict[str, TensorDictBase] | None = None
-    if not isinstance(data, TensorDictBase) and isinstance(
-        data, (Mapping, Sequence)
-    ):
+    if not isinstance(data, TensorDictBase) and isinstance(data, (Mapping, Sequence)):
         items = data.items() if isinstance(data, Mapping) else enumerate(data)
         if all(isinstance(v, TensorDictBase) for _, v in items):
             multi_sources = {str(k): v for k, v in items}
@@ -1408,10 +1315,7 @@ def predict(
         out_multi: dict[str, TensorDictBase] = {}
         for k, td in multi_sources.items():
             key = str(k)
-            safe = (
-                str(k).replace(os.sep, "_").replace(os.altsep or os.sep, "_")
-                or "0"
-            )
+            safe = str(k).replace(os.sep, "_").replace(os.altsep or os.sep, "_") or "0"
             per_run_id = f"{base_run_id}-{safe}" if safe else base_run_id
             per_path: PathLike | None = path
             if output_mode0 == "file" and path_n0 is not None:
@@ -1450,9 +1354,7 @@ def predict(
                 ),
             )
         return out_multi
-    underflow_action = kwargs.pop(
-        "underflow_action", default_underflow_action()
-    )
+    underflow_action = kwargs.pop("underflow_action", default_underflow_action())
     chunk_size = kwargs.pop("chunk_size", None)
     output_mode = collate._coerce_prediction_output(output)
     overwrite_mode = collate._coerce_prediction_overwrite(overwrite)
@@ -1481,14 +1383,10 @@ def predict(
             output_mode = "memory"
     if output_mode == "file" and out_path and os.path.exists(out_path):
         if overwrite_mode == "resume" and os.path.isfile(out_path):
-            collate.validate_predictions_h5(
-                os.fspath(out_path), out_shape=out_shape
-            )
+            collate.validate_predictions_h5(os.fspath(out_path), out_shape=out_shape)
             return PersistentTensorDict(filename=out_path, mode="r")
         if overwrite_mode == "error":
-            raise FileExistsError(
-                f"predict: destination already exists: {out_path!r}"
-            )
+            raise FileExistsError(f"predict: destination already exists: {out_path!r}")
     writer_chunk_size = int(chunk_size) if chunk_size is not None else 8192
     master_dtype = _get_float_precision(data)
     ds = Dataset.for_device(
@@ -1557,9 +1455,7 @@ def predict(
             lc = LaunchConfig(
                 min_nodes=1,
                 max_nodes=(
-                    int(max_nodes)
-                    if max_nodes is not None
-                    else int(_wp.nproc_per_node)
+                    int(max_nodes) if max_nodes is not None else int(_wp.nproc_per_node)
                 ),
                 nproc_per_node=int(_wp.nproc_per_node),
                 rdzv_backend=str(rdzv_backend or "c10d"),
@@ -1577,9 +1473,7 @@ def predict(
                 elastic_launch(lc, process)(ops)
             chunks_dir = os.path.join(ckpt_dir, "pred_chunks")
             if not os.path.isdir(chunks_dir):
-                raise RuntimeError(
-                    f"predict: missing pred_chunks at {chunks_dir!r}"
-                )
+                raise RuntimeError(f"predict: missing pred_chunks at {chunks_dir!r}")
             store_float = collate._get_prediction_dtype(chunks_dir)
             pred_mmt_path = os.path.join(tmp_dir, "pred.mmt")
             collate.concat_memory_mapped_tensor(
@@ -1592,9 +1486,7 @@ def predict(
             X_mmt = collate.load_memmap_features(os.fspath(memmap_dir))
             Y_mmt = collate.open_memory_mapped_tensor(os.fspath(pred_mmt_path))
             if Y_mmt is None:
-                raise RuntimeError(
-                    "predict: failed to open assembled pred.mmt"
-                )
+                raise RuntimeError("predict: failed to open assembled pred.mmt")
             if out_path is not None:
                 out_td = collate.write_predictions_h5_atomic(
                     os.fspath(out_path),
