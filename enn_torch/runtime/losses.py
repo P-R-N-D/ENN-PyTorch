@@ -14,6 +14,7 @@ from torch.nn import functional as F
 from ..core.graph import is_compiling
 from ..core.tensor import to_tensor_like
 
+_MAD_SCALE_CACHE = {}
 Number = Union[float, int]
 TensorLike = Union[Number, torch.Tensor]
 
@@ -37,11 +38,15 @@ def _median_over_dims(x: torch.Tensor, dims: Tuple[int, ...]) -> torch.Tensor:
 
 
 def _mad_std(x: torch.Tensor, dims: Tuple[int, ...], eps: float) -> torch.Tensor:
-    return torch.clamp(
-        _median_over_dims((x - _median_over_dims(x, dims)).abs(), dims)
-        * 1.482602218505602,
-        min=float(eps),
-    )
+    key = (x.dtype, x.device)
+    scale = _MAD_SCALE_CACHE.get(key)
+    if scale is None:
+        p = torch.tensor(0.75, dtype=torch.float64, device=x.device)
+        q = torch.special.ndtri(p)  # norm.ppf(0.75)
+        scale = (1.0 / q).to(dtype=x.dtype, device=x.device)
+        _MAD_SCALE_CACHE[key] = scale
+    mad = _median_over_dims((x - _median_over_dims(x, dims)).abs(), dims) * scale
+    return torch.clamp(mad, min=torch.tensor(eps, dtype=x.dtype, device=x.device))
 
 
 def _master_float_dtype(x: torch.Tensor) -> torch.dtype:
@@ -150,7 +155,6 @@ def _nufft_nd(
         raise TypeError("x_cplx must be complex")
     if x_cplx.device.type != "cuda":
         raise RuntimeError("cuFINUFFT requires CUDA")
-
     B, ndim = int(x_cplx.shape[0]), len(shape)
     dtype_str = "complex128" if x_cplx.dtype == torch.complex128 else "complex64"
 
@@ -176,7 +180,6 @@ def _nufft_nd(
             return out
         except Exception:
             pass
-
     return torch.stack(
         [
             _exec_plan(
@@ -649,7 +652,6 @@ class DistributionLoss(nn.Module):
             return mu.detach() if self.detach_stats else mu
         else:
             raise ValueError(f"Invalid mu_mode {self.mu_mode}")
-
         mu = _median_over_dims(x, dims) if self.skew else red(x, dim=dims, keepdim=True)
         return mu.detach() if self.detach_stats else mu
 
@@ -1049,7 +1051,6 @@ class DataFidelityLoss(nn.Module):
             if x.dtype == torch.float64 or y.dtype == torch.float64
             else torch.complex64
         )
-
         if self.mode == "fft":
             Xk = _fft_nd(
                 x.to(cdtype) if not torch.is_complex(x) else x,
