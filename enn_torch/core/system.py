@@ -41,10 +41,26 @@ from .datatypes import (
     parse_bool,
 )
 
+try:
+    from zoneinfo import ZoneInfo
+except Exception:
+    ZoneInfo = None
+
+if TYPE_CHECKING:
+    from .concurrency import Mutex as _Mutex
+
+    _FP32_PRECISION_LOCK: _Mutex
+    _EMPTY_CACHE_LOCK: _Mutex
+    _DEVICE_STATS_LOCK: _Mutex
+    _CPU_PROC_LOCK: _Mutex
+    _RUNTIME_CFG_LOCK: _Mutex
+
 _CPU_PROC_CACHE: Optional[int] = None
 _DEVICE_STATS_CACHE: dict[Tuple[str, int], "Device"] = {}
+_ENN_MP_MAIN_STUB_PATH: Optional[str] = None
 _EMPTY_CACHE_LAST_CALL_S_BY_DEVICE: dict[Tuple[str, int], float] = {}
 _FP32_PRECISION_CACHE: dict[str, str] = {}
+_LOGGER = logging.getLogger(__name__)
 _LAZY_LOCK_INIT_LOCK = threading.Lock()
 _LAZY_LOCK_NAMES = {
     "_FP32_PRECISION_LOCK",
@@ -53,7 +69,6 @@ _LAZY_LOCK_NAMES = {
     "_CPU_PROC_LOCK",
     "_RUNTIME_CFG_LOCK",
 }
-_LOGGER = logging.getLogger(__name__)
 _RUNTIME_CFG = SimpleNamespace(
     deterministic=False,
     allow_tf32=None,
@@ -62,7 +77,6 @@ _RUNTIME_CFG = SimpleNamespace(
     sdpa_backends=None,
     te_first=True,
 )
-_ENN_MP_MAIN_STUB_PATH: Optional[str] = None
 _TZ_ALIASES = {
     k: v
     for k, v in [
@@ -2258,17 +2272,3 @@ class Memory:
         except Exception:
             return False
         return False
-
-
-try:
-    from zoneinfo import ZoneInfo
-except Exception:
-    ZoneInfo = None
-if TYPE_CHECKING:
-    from .concurrency import Mutex as _Mutex
-
-    _FP32_PRECISION_LOCK: _Mutex
-    _EMPTY_CACHE_LOCK: _Mutex
-    _DEVICE_STATS_LOCK: _Mutex
-    _CPU_PROC_LOCK: _Mutex
-    _RUNTIME_CFG_LOCK: _Mutex
