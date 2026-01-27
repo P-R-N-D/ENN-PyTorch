@@ -47,6 +47,7 @@ from torch.distributed.checkpoint.state_dict import (
 )
 from torch.distributed.launcher.api import LaunchConfig, elastic_launch
 
+import ..schema
 from ..config import (
     ModelConfig,
     RuntimeConfig,
@@ -70,13 +71,10 @@ from ..core.system import (
     optimal_start_method,
 )
 from ..core.tensor import coerce_tensor
-from .. import schema
 from ..data import collate
 from ..data.collate import (
     MappingSlicer,
     TensorDictSlicer,
-)
-from ..data.collate import (
     postprocess as _postprocess_pipeline,
 )
 from ..data.pipeline import (
@@ -90,6 +88,7 @@ from ..nn.architecture import Model
 from ..nn.layers import Recorder, resize_scaler_buffer
 from .io import _filtered_warnings, _torch_load_checkpoint, is_required
 from .main import _coerce_dcp_keys, process
+
 
 _IGNORED_WARNING_PATTERNS: tuple[str, ...] = (
     "torch.distributed is disabled, unavailable or uninitialized",
