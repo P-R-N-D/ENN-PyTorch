@@ -141,7 +141,6 @@ def _reduce_flat_to_grid(
         pads.extend([0, int(g * t - orig)])
     if any(p != 0 for p in pads):
         x_ev = F.pad(x_ev, tuple(pads))
-
     view_shape = [B]
     for g, t in zip(grid, ts):
         view_shape.extend([int(g), int(t)])
@@ -339,7 +338,6 @@ class Template(nn.Module):
         self.dropout = float(dropout)
         self.drop_path = float(drop_path)
         self.norm_type = str(norm_type)
-
         self.tokenizer = nn.Linear(self.in_dim, self.tokens * self.d_model)
         drops = stochastic_depth_schedule(float(self.drop_path), int(self.depth))
         self.blocks = nn.ModuleList(
@@ -357,7 +355,6 @@ class Template(nn.Module):
             ]
         )
         self.norm = norm_layer(self.norm_type, self.d_model)
-
         self.register_buffer(
             "weight",
             torch.as_tensor(float(weight), dtype=torch.float32),
@@ -366,7 +363,6 @@ class Template(nn.Module):
         self.register_buffer(
             "eps", torch.as_tensor(float(eps), dtype=torch.float32), persistent=True
         )
-
         self._ckpt_enabled = bool(ckpt_enabled)
         self._ckpt_min_bytes = int(ckpt_min_bytes)
 
@@ -584,22 +580,18 @@ class Fuser(nn.Module):
         self.in_dim = int(in_dim)
         self.out_shape = tuple((int(v) for v in out_shape))
         self.out_dim = int(math.prod(self.out_shape) if self.out_shape else 1)
-
         self.cfg: ModelConfig = config
         self.__enn_instance_config__ = config
-
         self.d_model = int(config.d_model)
         self.nhead = int(config.heads)
         self.modeling_type = _coerce_modeling_types(config.modeling_type)
         self.spatial_tokens = max(1, int(getattr(config, "spatial_latents", 1)))
         self.temporal_tokens = max(1, int(getattr(config, "temporal_latents", 1)))
         self.fused_tokens = max(1, int(self.spatial_tokens + self.temporal_tokens))
-
         self.mlp_ratio = float(getattr(config, "mlp_ratio", 4.0))
         self.dropout = float(getattr(config, "dropout", 0.0))
         self.drop_path = float(getattr(config, "drop_path", 0.0))
         self.norm_type = str(getattr(config, "normalization_method", "layernorm"))
-
         raw_fd = getattr(config, "fuser_depth", None)
         if raw_fd is None:
             raw_fd = max(
@@ -623,14 +615,12 @@ class Fuser(nn.Module):
                     int(getattr(config, "temporal_depth", 1)),
                 )
         self.perceiver_depth = max(1, int(raw_fd))
-
         raw_sa = getattr(config, "fuser_self_attn_layers", 1)
         try:
             raw_sa = int(raw_sa)
         except Exception:
             raw_sa = 1
         self.self_attn_layers = max(0, int(raw_sa))
-
         self.perceiver = Perceiver(
             d_model=self.d_model,
             nhead=self.nhead,
@@ -642,7 +632,6 @@ class Fuser(nn.Module):
             drop_path=self.drop_path,
             norm_type=self.norm_type,
         )
-
         hid = int(self.d_model * max(1.0, self.mlp_ratio))
         self.norm = norm_layer(self.norm_type, self.d_model)
         self.head_hidden_dim = hid
@@ -653,26 +642,20 @@ class Fuser(nn.Module):
             nn.Dropout(self.dropout),
             nn.Linear(hid, self.out_dim),
         )
-
         self.tasks: nn.ModuleDict = nn.ModuleDict()
         self._user_submodels: dict[str, nn.Module] = {}
-
         self._task_meta: dict[str, dict[str, Any]] = {}
         self._legacy_task_id_to_name: dict[str, str] = {}
-
         raw_stream = getattr(config, "stream_task_name", None)
         if raw_stream is None:
             raw_stream = getattr(config, "stream_task_id", None)
         self.stream_task_name: str = str(raw_stream).strip() if raw_stream else ""
         self.stream_task_id: str = self.stream_task_name
-
         if tasks is None:
             self._init_default_tasks(config)
         else:
             self.rebuild_tasks_from_specs(tasks)
-
         self._resolve_stream_task_id()
-
         self._compile_cudagraphs = bool(getattr(config, "compile_cudagraphs", False))
         self._decode_graph: nn.Module | None = None
         self._backbone_graph: nn.Module | None = None
@@ -701,7 +684,6 @@ class Fuser(nn.Module):
                     return fused_tokens, ctx
 
             device = next(self.parameters()).device
-
             self._decode_graph = (
                 GraphSequential(
                     steps=[
@@ -716,7 +698,6 @@ class Fuser(nn.Module):
                 .to(device)
                 .bind()
             )
-
             self._backbone_graph = (
                 GraphSequential(
                     steps=[
@@ -759,7 +740,6 @@ class Fuser(nn.Module):
             raise RuntimeError(
                 "Fuser requires a ModelConfig to initialize default tasks"
             )
-
         mt = str(self.modeling_type)
         if mt in {"ss"}:
             self.add_task(
@@ -805,7 +785,6 @@ class Fuser(nn.Module):
         preferred = self._normalize_task_name(getattr(self, "stream_task_name", ""))
         if not preferred:
             preferred = self._normalize_task_name(getattr(self, "stream_task_id", ""))
-
         chosen: Optional[str] = None
         if preferred:
             try:
@@ -815,25 +794,20 @@ class Fuser(nn.Module):
             if candidate is not None and candidate in self.tasks:
                 if getattr(self.tasks[candidate], "mode", "") == "temporal":
                     chosen = candidate
-
         if chosen is None:
             for k, t in self.tasks.items():
                 if getattr(t, "mode", "") == "temporal":
                     chosen = k
                     break
-
         if chosen is None:
             for fallback in ("temporal", "stream"):
                 if fallback in self.tasks:
                     chosen = fallback
                     break
-
         if chosen is None:
             chosen = next(iter(self.tasks.keys()), "")
-
         self.stream_task_name = str(chosen or "")
         self.stream_task_id = self.stream_task_name
-
         cfg = getattr(self, "cfg", None) or getattr(
             self, "__enn_instance_config__", None
         )
@@ -887,14 +861,11 @@ class Fuser(nn.Module):
             raw = self._normalize_task_name(raw.split(":", 1)[1])
         elif lowered.startswith("id:"):
             raw = self._normalize_task_name(raw.split(":", 1)[1])
-
         if raw in self.tasks:
             return raw
-
         mapped = self._legacy_task_id_to_name.get(raw)
         if mapped and mapped in self.tasks:
             return mapped
-
         raise KeyError(
             f"Unknown task '{task_spec}'. Known tasks: {sorted(self.tasks.keys())}"
         )
@@ -933,26 +904,21 @@ class Fuser(nn.Module):
         self._task_meta = {}
         self._user_submodels = {}
         self._legacy_task_id_to_name = {}
-
         if not specs:
             self._init_default_tasks()
             self._resolve_stream_task_id()
             return
-
         for spec in specs:
             if not isinstance(spec, dict):
                 continue
-
             legacy_ids: list[str] = []
             for k in ("task_id", "legacy_task_id", "id"):
                 v = spec.get(k)
                 if v is not None and str(v).strip():
                     legacy_ids.append(str(v).strip())
-
             preferred_name = spec.get("name")
             if preferred_name is None or not str(preferred_name).strip():
                 preferred_name = legacy_ids[0] if legacy_ids else None
-
             final_name = self.add_task(
                 preferred_name,
                 mode=spec.get("mode", "spatial"),
@@ -964,12 +930,10 @@ class Fuser(nn.Module):
                 tokens=spec.get("tokens"),
                 depth=spec.get("depth"),
             )
-
             for lid in legacy_ids:
                 lid_norm = self._normalize_task_name(lid)
                 if lid_norm and lid_norm != final_name:
                     self._legacy_task_id_to_name[lid_norm] = final_name
-
         self._resolve_stream_task_id()
 
     def remap_legacy_task_ids_in_state_dict(
@@ -978,7 +942,6 @@ class Fuser(nn.Module):
     ) -> Mapping[str, torch.Tensor]:
         if not self._legacy_task_id_to_name:
             return state_dict
-
         changed = False
         remapped: Dict[str, torch.Tensor] = {}
         for k, v in state_dict.items():
@@ -993,7 +956,6 @@ class Fuser(nn.Module):
             if new_k != k:
                 changed = True
             remapped[new_k] = v
-
         return remapped if changed else state_dict
 
     def add_task(
@@ -1011,13 +973,10 @@ class Fuser(nn.Module):
         task_id: Optional[str] = None,
     ) -> str:
         mode = Template._coerce_mode(mode)
-
         preferred = name
         if preferred is None or not str(preferred).strip():
             preferred = task_id
-
         nm = self._ensure_unique_task_name(preferred)
-
         if tokens is None:
             tokens = int(
                 self.spatial_tokens if mode == "spatial" else self.temporal_tokens
@@ -1029,7 +988,6 @@ class Fuser(nn.Module):
                 if mode == "spatial"
                 else getattr(cfg, "temporal_depth", 1)
             )
-
         tmpl = Template(
             self.in_dim,
             int(tokens),
@@ -1046,7 +1004,6 @@ class Fuser(nn.Module):
             ckpt_enabled=getattr(self.cfg, "ckpt_enabled", True),
             ckpt_min_bytes=getattr(self.cfg, "ckpt_min_bytes", 64 * 1024 * 1024),
         )
-
         tags_list: list[str] = []
         if tags is not None:
             tags_iter = (tags,) if isinstance(tags, str) else tags
@@ -1054,13 +1011,11 @@ class Fuser(nn.Module):
                 s = str(t).strip()
                 if s and s not in tags_list:
                     tags_list.append(s)
-
         self.tasks[nm] = tmpl
         self._task_meta[nm] = {
             "description": str(description) if description is not None else "",
             "tags": tags_list,
         }
-
         if submodel is not None:
             self._user_submodels[nm] = submodel
         self._resolve_stream_task_id()
@@ -1172,7 +1127,6 @@ class Fuser(nn.Module):
         if len(token_sets) <= 1:
             return None
         exporting = bool(is_export_or_trace())
-
         w_list: list[torch.Tensor] = []
         e_list: list[torch.Tensor] = []
         counts: list[int] = []
@@ -1180,7 +1134,6 @@ class Fuser(nn.Module):
             tmpl = self.tasks[n]
             if not isinstance(tmpl, nn.Module):
                 raise TypeError(f"Task '{n}' is not an nn.Module")
-
             w = getattr(tmpl, "weight", None)
             e = getattr(tmpl, "eps", None)
             if not isinstance(w, torch.Tensor):
@@ -1189,7 +1142,6 @@ class Fuser(nn.Module):
                 e = torch.as_tensor(1e-6, dtype=torch.float32, device=device)
             w_list.append(w.to(device=device, dtype=torch.float32).reshape(()))
             e_list.append(e.to(device=device, dtype=torch.float32).reshape(()))
-
             if exporting:
                 tok = getattr(tmpl, "tokens", None)
                 if tok is not None:
@@ -1229,11 +1181,9 @@ class Fuser(nn.Module):
         del args, kwargs
         names = self._select_tasks_for_modeling_type()
         token_sets: list[torch.Tensor] = []
-
         state_is_map = isinstance(temporal_state, Mapping)
         next_state_map: dict[str, torch.Tensor] = {}
         next_state: Optional[torch.Tensor] = None
-
         if (
             (not state_is_map)
             and (temporal_state is not None)
@@ -1242,18 +1192,15 @@ class Fuser(nn.Module):
             raise TypeError(
                 "temporal_state must be None, a torch.Tensor, or a Mapping[str, torch.Tensor]"
             )
-
         if (not state_is_map) and isinstance(temporal_state, torch.Tensor):
             sid = str(getattr(self, "stream_task_id", "") or "").strip()
             if not sid:
                 raise ValueError(
                     "temporal_state was provided but stream_task_id is not set (no temporal task selected)"
                 )
-
         for name in names:
             tmpl = self.tasks[name]
             out_tokens: Any
-
             if (
                 isinstance(tmpl, Template)
                 and str(getattr(tmpl, "mode", "")) == "temporal"
@@ -1271,7 +1218,6 @@ class Fuser(nn.Module):
                 else:
                     if str(name) == str(getattr(self, "stream_task_id", "")):
                         st_in = cast(Optional[torch.Tensor], temporal_state)
-
                 if return_temporal_state:
                     out_tokens, st_out = tmpl(
                         x,
@@ -1293,12 +1239,10 @@ class Fuser(nn.Module):
                     )
             else:
                 out_tokens = tmpl(x)
-
             if not isinstance(out_tokens, torch.Tensor):
                 raise TypeError(
                     f"Task '{name}' must return a torch.Tensor tokens (B,N,D); got {type(out_tokens)}"
                 )
-
             sm = self._user_submodels.get(str(name))
             if sm is not None:
                 out_tokens = sm(out_tokens)
@@ -1306,32 +1250,25 @@ class Fuser(nn.Module):
                     raise TypeError(
                         f"BYOM for task '{name}' must return torch.Tensor; got {type(out_tokens)}"
                     )
-
             if out_tokens.dim() != 3 or out_tokens.size(-1) != self.d_model:
                 raise ValueError(
                     f"Task '{name}' must return tokens shaped (B,N,{self.d_model}); got {tuple(out_tokens.shape)}"
                 )
             token_sets.append(out_tokens)
-
         graph_break()
-
         if len(token_sets) < 1:
             raise RuntimeError("No tasks produced tokens")
-
         if len(token_sets) == 1:
             all_tokens = token_sets[0]
         else:
             all_tokens = torch.cat(token_sets, dim=1)
-
         graph_break()
-
         attn_bias = self._build_attn_bias(
             names,
             token_sets,
             device=all_tokens.device,
             dtype=all_tokens.dtype,
         )
-
         bg = getattr(self, "_backbone_graph", None)
         if isinstance(bg, nn.Module):
             fused_tokens, context = cast(
@@ -1347,10 +1284,8 @@ class Fuser(nn.Module):
                 cudagraph_mark_step_end()
             else:
                 fused_tokens = self.perceiver(all_tokens, attn_bias=attn_bias)
-
             graph_break()
             context = self.decode(fused_tokens, apply_norm=True)
-
         if return_temporal_state:
             if state_is_map:
                 return fused_tokens, context, next_state_map
@@ -1370,7 +1305,6 @@ class Fuser(nn.Module):
             dg = getattr(self, "_decode_graph", None)
             if isinstance(dg, nn.Module):
                 return cast(torch.Tensor, dg(tokens))
-
         x = tokens
         if apply_norm:
             x = self.norm(x)
@@ -1539,7 +1473,6 @@ class Model(nn.Module):
                 else:
                     tile_shape = tuple(int(v) for v in raw_tile_shape)
                 tile_shape = tuple(max(1, int(v)) for v in tile_shape)
-
                 out_ndim = int(len(self.out_shape))
                 if out_ndim > 0:
                     if len(tile_shape) == 1:
@@ -1747,7 +1680,6 @@ class Model(nn.Module):
             pass
         raw_mode = getattr(config, "compile_mode", "disabled")
         compile_mode_canonical = canonicalize_compile_mode(raw_mode)
-
         set_runtime_cfg("compile_mode", compile_mode_canonical)
         compile_mode_arg = (
             None if compile_mode_canonical == "disabled" else compile_mode_canonical
@@ -1768,7 +1700,6 @@ class Model(nn.Module):
                 "torch.compile requested (compile_mode=%r) but torch.compile is unavailable; running eagerly",
                 raw_mode,
             )
-
         compile_dynamic = bool(
             getattr(
                 config,
@@ -1913,7 +1844,6 @@ class Model(nn.Module):
                         exc_info=True,
                     )
                 _empty_cache()
-
                 try:
                     perceiver = getattr(self.fuser, "perceiver", None)
                     if isinstance(perceiver, nn.Module):
@@ -1931,7 +1861,6 @@ class Model(nn.Module):
                         exc_info=True,
                     )
                 _empty_cache()
-
         self._compiled_submodules = {
             "decode": bool(compiled_decode),
             "perceiver": bool(compiled_perceiver),
@@ -2000,10 +1929,8 @@ class Model(nn.Module):
         if proc is None:
             yield self
             return
-
         swaps: list[tuple[object, str, Any]] = []
         list_swaps: list[tuple[nn.ModuleList, list[nn.Module]]] = []
-
         with contextlib.suppress(Exception):
             eager_perceiver = getattr(self, "_eager_fuser_perceiver", None)
             if isinstance(eager_perceiver, nn.Module):
@@ -2011,7 +1938,6 @@ class Model(nn.Module):
                 if cur is not None and cur is not eager_perceiver:
                     swaps.append((proc, "perceiver", cur))
                     proc.perceiver = eager_perceiver
-
         with contextlib.suppress(Exception):
             perceiver = getattr(proc, "perceiver", None)
             cross = getattr(perceiver, "cross", None) if perceiver is not None else None
@@ -2025,7 +1951,6 @@ class Model(nn.Module):
                         list_swaps.append((cross, cur_items))
                         for i, item in enumerate(eager_cross):
                             cross[i] = item
-
         with contextlib.suppress(Exception):
             perceiver = getattr(proc, "perceiver", None)
             self_blocks = (
@@ -2044,13 +1969,11 @@ class Model(nn.Module):
                         list_swaps.append((self_blocks, cur_items))
                         for i, item in enumerate(eager_self):
                             self_blocks[i] = item
-
         with contextlib.suppress(Exception):
             dc = getattr(self, "_decode_compiled", None)
             if isinstance(dc, nn.Module):
                 swaps.append((self, "_decode_compiled", dc))
                 self._decode_compiled = None
-
         try:
             yield self
         finally:
