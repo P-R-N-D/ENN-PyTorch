@@ -36,6 +36,8 @@ import torch
 from tensordict import MemoryMappedTensor, TensorDictBase
 from torchdata.nodes import BaseNode
 
+import ..schema
+import .collate
 from ..core.concurrency import Disposable, Mutex, new_affinity
 from ..core.datatypes import (
     PathLike,
@@ -63,8 +65,7 @@ from ..core.system import (
     new_accelerator_event,
     sync_accelerator,
 )
-from .. import schema
-from . import collate
+
 
 _NODES_IMPORTED = False
 _NODES_LOCK = Mutex()
