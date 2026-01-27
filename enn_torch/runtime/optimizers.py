@@ -33,6 +33,7 @@ from ..core.precision import Autocast, is_scale_safe
 from ..core.system import get_device, optimal_optimizer_params
 from ..data.pipeline import Dataset
 
+
 _LOGGER = logging.getLogger(__name__)
 _OPT_LOGGED_KEYS: "OrderedDict[object, None]" = OrderedDict()
 _OPT_LOGGED_LOCK = Mutex()
