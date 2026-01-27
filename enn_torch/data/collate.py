@@ -495,6 +495,21 @@ def _index_copy_rows(
     dst.index_copy_(0, rows_t, preds_t)
 
 
+def _h5_filter_kwargs(
+    h5_compression: str | None,
+    h5_compression_opts: int | None,
+    h5_shuffle: bool,
+) -> dict[str, Any]:
+    kwargs: dict[str, Any] = {}
+    if h5_compression:
+        kwargs["compression"] = str(h5_compression)
+        if h5_compression_opts is not None:
+            kwargs["compression_opts"] = int(h5_compression_opts)
+    if h5_shuffle:
+        kwargs["shuffle"] = True
+    return kwargs
+
+
 def _h5_write_rows(
     dset_Y: object,
     rows_t: torch.Tensor,
@@ -1773,21 +1788,6 @@ def concat_tensor(
         preds_t = _load_prediction(pred_file, dtype=dtype)
         _index_copy_rows(y_out, rows_t, preds_t, count=int(count))
     return y_out
-
-
-def _h5_filter_kwargs(
-    h5_compression: str | None,
-    h5_compression_opts: int | None,
-    h5_shuffle: bool,
-) -> dict[str, Any]:
-    kwargs: dict[str, Any] = {}
-    if h5_compression:
-        kwargs["compression"] = str(h5_compression)
-        if h5_compression_opts is not None:
-            kwargs["compression_opts"] = int(h5_compression_opts)
-    if h5_shuffle:
-        kwargs["shuffle"] = True
-    return kwargs
 
 
 def concat_segment_h5(
