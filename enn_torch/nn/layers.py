@@ -49,7 +49,6 @@ except ImportError:
     create_block_mask = None
     _HAS_FLEX_ATTENTION_LIB = False
 
-
 _DILATED_MASK_CACHE_MAX = 32
 _DILATED_MASK_CACHE_MAX_L = env_int("ENN_DILATED_MASK_CACHE_MAX_L", 4096)
 _DILATED_MASK_CACHE_ENTRY_MAX_BYTES = env_int(
@@ -386,7 +385,6 @@ class DilatedAttention(nn.Module):
         drop_path: float = 0.0,
     ) -> None:
         super().__init__()
-
         self.embed_dim = int(embed_dim)
         self.nhead = int(num_heads)
         if self.embed_dim % self.nhead != 0:
@@ -394,21 +392,17 @@ class DilatedAttention(nn.Module):
                 f"embed_dim ({self.embed_dim}) must be divisible by num_heads ({self.nhead})"
             )
         self.head_dim = self.embed_dim // self.nhead
-
         self.batch_first = bool(batch_first)
         self.causal = bool(causal)
         self.window_size = int(window_size) if window_size is not None else None
         self.dilation = int(dilation) if dilation is not None else 1
         if self.dilation < 1:
             raise ValueError("dilation must be >= 1")
-
         self.dropout_p = float(dropout)
-
         self.norm1 = _Norm(self.embed_dim)
         self.norm2 = _Norm(self.embed_dim)
         self.dropout = nn.Dropout(self.dropout_p)
         self.drop_path = StochasticDepth(drop_path) if drop_path > 0 else nn.Identity()
-
         self.mha = MultiHeadAttention(
             self.embed_dim,
             self.nhead,
@@ -416,7 +410,6 @@ class DilatedAttention(nn.Module):
             bias=bias,
             batch_first=self.batch_first,
         )
-
         if mlp_ratio is not None:
             ffn_ratio = mlp_ratio
         hidden = int(self.embed_dim * float(ffn_ratio))
@@ -428,18 +421,15 @@ class DilatedAttention(nn.Module):
             act = nn.ReLU()
         else:
             raise ValueError(f"Unsupported activation: {activation}")
-
         self.ffn = nn.Sequential(
             nn.Linear(self.embed_dim, hidden, bias=bias),
             act,
             nn.Dropout(self.dropout_p),
             nn.Linear(hidden, self.embed_dim, bias=bias),
         )
-
         self._mask_cache_len: int = 0
         self._mask_cache: Optional[torch.Tensor] = None
         self._mask_cache_device: Optional[torch.device] = None
-
         self._flex_cache_len: int = 0
         self._flex_cache_device: Optional[torch.device] = None
         self._flex_block_mask = None
@@ -455,7 +445,6 @@ class DilatedAttention(nn.Module):
         torch_mha = self._get_torch_mha()
         if torch_mha is None:
             raise RuntimeError("Flex path requires torch MultiheadAttention backend")
-
         qkv = F.linear(x_bld, torch_mha.in_proj_weight, torch_mha.in_proj_bias)
         B, L, _ = qkv.shape
         qkv = qkv.view(B, L, 3, self.nhead, self.head_dim).transpose(1, 3)
@@ -532,17 +521,13 @@ class DilatedAttention(nn.Module):
             if context is not None:
                 context = context.transpose(0, 1)
             transposed = True
-
         B, L, _ = x.shape
         device = x.device
-
         x_norm = self.norm1(x)
         kv = x_norm if context is None else self.norm1(context)
-
         q_pad = key_padding_mask
         if context is not None:
             q_pad = None
-
         use_flex = (
             context is None
             and (not need_weights)
@@ -554,15 +539,12 @@ class DilatedAttention(nn.Module):
             and (not is_export_or_trace())
             and (not is_compiling())
         )
-
         attn_mask_keep: Optional[torch.Tensor] = None
         attn_weights = None
-
         if use_flex:
             block_mask = self._get_flex_block_mask(L, device)
             if block_mask is None:
                 use_flex = False
-
         if use_flex:
             q, k, v, out_proj = self._project_qkv_for_flex(x_norm)
             a = _FLEX_KERNEL(
@@ -584,7 +566,6 @@ class DilatedAttention(nn.Module):
             else:
                 attn_mask_keep = self._get_mask(L, device)
                 attn_mask = ~attn_mask_keep
-
             attn_out, attn_weights = self.mha(
                 x_norm,
                 kv,
@@ -595,20 +576,16 @@ class DilatedAttention(nn.Module):
                 average_attn_weights=average_attn_weights,
                 is_causal=use_is_causal,
             )
-
         if q_pad is not None:
             attn_out = attn_out.masked_fill(q_pad.unsqueeze(-1), 0.0)
-
         x = x + self.drop_path(self.dropout(attn_out))
         x = x + self.drop_path(self.ffn(self.norm2(x)))
         if transposed:
             x = x.transpose(0, 1)
-
         if return_attn_mask:
             if attn_mask_keep is None:
                 attn_mask_keep = self._get_mask(L, device)
             return x, attn_weights, attn_mask_keep
-
         return x, attn_weights
 
 
@@ -681,7 +658,6 @@ class Resampler(nn.Module):
 
         self.norm_q = _norm()
         self.norm_kv = _norm()
-
         self.q_proj = nn.Linear(self.d_model, self.d_model, bias=bias)
         self.k_proj = nn.Linear(self.d_model, self.d_model, bias=bias)
         self.v_proj = nn.Linear(self.d_model, self.d_model, bias=bias)
@@ -689,7 +665,6 @@ class Resampler(nn.Module):
         self.out_proj = nn.Linear(self.d_model, self.d_model, bias=bias)
         self.dropout = nn.Dropout(self.dropout_p)
         self.drop_path = StochasticDepth(p=float(drop_path), mode="row")
-
         self.norm_ffn = _norm()
         hid = int(self.d_model * float(mlp_ratio) * (2.0 / 3.0))
         self.ffn = GeGLU(self.d_model, hid, out_dim=self.d_model, dropout=dropout)
@@ -711,16 +686,13 @@ class Resampler(nn.Module):
             raise ValueError(
                 f"Resampler expects last dim D={self.d_model}, got latents D={D} tokens D={Dk}"
             )
-
         q_in = self.norm_q(latents)
         kv_in = self.norm_kv(tokens)
-
         H = int(self.nhead)
         Dh = int(self.head_dim)
         q = self.q_proj(q_in).view(B, Lq, H, Dh).transpose(1, 2)
         k = self.k_proj(kv_in).view(B, Lk, H, Dh).transpose(1, 2)
         v = self.v_proj(kv_in).view(B, Lk, H, Dh).transpose(1, 2)
-
         attn_out = self.attn(
             q,
             k,
@@ -735,7 +707,6 @@ class Resampler(nn.Module):
             raise RuntimeError(
                 f"Resampler attention returned unexpected shape {tuple(attn_out.shape)}"
             )
-
         latents = latents + self.drop_path(self.dropout(self.out_proj(attn_out)))
         latents = latents + self.drop_path(
             self.dropout(self.ffn(self.norm_ffn(latents)))
@@ -988,7 +959,6 @@ class SigmoidGate(nn.Module):
             er_h = pen_high.sum() / denom
         except Exception:
             er_l, er_h = None, None
-
         out_dtype = out_full.dtype
         if return_edge_reg_lr:
             return (
@@ -1044,7 +1014,6 @@ class SigmoidGate(nn.Module):
         pads = []
         for orig, padded in reversed(list(zip(event_shape_t, pad_shape))):
             pads.extend([0, int(padded - orig)])
-
         pad_needed = any(int(p) > int(o) for p, o in zip(pad_shape, event_shape_t))
         b_nd, r_nd = (
             b32.reshape(B, *event_shape_t),
@@ -1052,7 +1021,6 @@ class SigmoidGate(nn.Module):
         )
         if pad_needed:
             b_nd, r_nd = F.pad(b_nd, tuple(pads)), F.pad(r_nd, tuple(pads))
-
         mask_bool = None
         if pad_needed:
             for i, (orig, padded) in enumerate(zip(event_shape_t, pad_shape)):
@@ -1066,14 +1034,12 @@ class SigmoidGate(nn.Module):
                 mask_bool = v if mask_bool is None else (mask_bool & v)
             if mask_bool is None:
                 mask_bool = torch.ones(pad_shape, device=b_nd.device, dtype=torch.bool)
-
         view_shape, interleaved = [B], []
         for g, t in zip(grid_shape, tile_shape_t):
             view_shape.extend([int(g), int(t)])
             interleaved.extend([int(g), int(t)])
         b_tile, r_tile = b_nd.reshape(*view_shape), r_nd.reshape(*view_shape)
         tile_dims = tuple(range(2, 1 + 2 * len(event_shape_t), 2))
-
         mask = (
             mask_bool.reshape(*interleaved).unsqueeze(0).to(dtype=torch.float32)
             if mask_bool is not None
@@ -1090,7 +1056,6 @@ class SigmoidGate(nn.Module):
             r_rms_t = torch.sqrt(
                 ((r_tile * r_tile) * mask).sum(dim=tile_dims) / denom + eps
             )
-
         tile_feats = torch.stack(
             [b_rms_t, r_rms_t, r_rms_t / (b_rms_t + eps)], dim=-1
         ).to(dtype=tokens_dtype)
@@ -1102,7 +1067,6 @@ class SigmoidGate(nn.Module):
             sig.new_full(sig.shape, float(p_floor)),
             sig.new_full(sig.shape, float(p_ceil)),
         )
-
         if z_min is not None and z_max is not None:
             try:
                 zmin_t = z_min.reshape(1, *interleaved) if z_min.numel() > 1 else z_min
@@ -1151,7 +1115,6 @@ class SigmoidGate(nn.Module):
                 )
             except Exception:
                 pass
-
         p_tile = p_low + (p_high - p_low) * sig.to(dtype=p_low.dtype)
         clip = float(max(self.clip_eps, eps))
         p_tile = torch.clamp(
@@ -1163,7 +1126,6 @@ class SigmoidGate(nn.Module):
             ),
             max=float(p_ceil) - clip,
         )
-
         if (
             bool(fallback_bounds)
             and self.training
@@ -1389,7 +1351,6 @@ class SigmoidGate(nn.Module):
                     self.stat_edge_frac,
                 )
             out_full = p.unsqueeze(-1)
-
         return self._calc_edge_reg(
             out_full if use_tile_nd else p,
             p_low,
@@ -1547,13 +1508,11 @@ class Scaler(nn.Module):
 
         if t.dim() == 0:
             return t
-
         orig_shape = t.shape
         if t.dim() == 1:
             t2 = t.unsqueeze(0)
         else:
             t2 = t.reshape(-1, orig_shape[-1])
-
         c = t2.shape[-1]
         w = weight.reshape(-1)
         b = bias.reshape(-1)
@@ -1561,7 +1520,6 @@ class Scaler(nn.Module):
             w = w.expand((c,))
         if b.numel() == 1 and c != 1:
             b = b.expand((c,))
-
         running_mean = t2.new_zeros((c,))
         running_var = t2.new_ones((c,))
         out2 = F.batch_norm(
@@ -1574,7 +1532,6 @@ class Scaler(nn.Module):
             momentum=0.0,
             eps=max(float(self.eps), 1e-6),
         )
-
         if t.dim() == 1:
             return out2.squeeze(0)
         return out2.reshape(orig_shape)
@@ -1589,7 +1546,6 @@ class Scaler(nn.Module):
         if t.numel() == 0:
             return t
         feature_dim = t.shape[-1]
-
         if is_symbolic() or is_export_or_trace() or is_compiling():
             mean_b = mean_buf.to(device=t.device, dtype=t.dtype)
             std_b = std_buf.to(device=t.device, dtype=t.dtype)
@@ -1606,13 +1562,11 @@ class Scaler(nn.Module):
                     cache[key] = (mean_b, std_b)
                 else:
                     mean_b, std_b = cached
-
         if not is_symbolic() and mean_b.numel() not in (1, int(feature_dim)):
             raise RuntimeError(
                 f"Scaler feature dimension mismatch: t.shape={tuple(t.shape)} "
                 f"mean.shape={tuple(mean_b.shape)} std.shape={tuple(std_b.shape)}"
             )
-
         denom = std_b + self.eps
         inv = denom.reciprocal()
         bias = -mean_b * inv
@@ -1631,7 +1585,6 @@ class Scaler(nn.Module):
         if t.numel() == 0:
             return t
         feature_dim = t.shape[-1]
-
         if is_symbolic() or is_export_or_trace() or is_compiling():
             mean_b = mean_buf.to(device=t.device, dtype=t.dtype)
             std_b = std_buf.to(device=t.device, dtype=t.dtype)
@@ -1648,13 +1601,11 @@ class Scaler(nn.Module):
                     cache[key] = (mean_b, std_b)
                 else:
                     mean_b, std_b = cached
-
         if not is_symbolic() and mean_b.numel() not in (1, int(feature_dim)):
             raise RuntimeError(
                 f"Scaler feature dimension mismatch: t.shape={tuple(t.shape)} "
                 f"mean.shape={tuple(mean_b.shape)} std.shape={tuple(std_b.shape)}"
             )
-
         scale = std_b + self.eps
         return self._apply_affine_no_broadcast(t, weight=scale, bias=mean_b)
 
