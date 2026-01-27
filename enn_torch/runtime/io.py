@@ -23,8 +23,14 @@ from ..core.concurrency import Mutex
 from ..core.datatypes import PathLike, coerce_json, save_temp, write_json, env_bool
 from ..core.distributed import distributed_barrier, is_rank0
 
+try:
+    from torch.serialization import add_safe_globals
+except ImportError:
+    add_safe_globals = None
+
 if TYPE_CHECKING:
     from .wrappers import Format
+
 
 _IGNORED_WARNINGS = (
     "torch.distributed is disabled",
@@ -36,20 +42,18 @@ _IGNORED_RE = (
 _SAVE_LOCK_GUARD = Mutex()
 _SAVE_PATH_LOCKS = weakref.WeakValueDictionary()
 _WARNINGS_FILTER_LOCK = Mutex()
-
 _OPENZL_MAGIC = "enn-openzl-ckpt-v1"
 _OPENZL_TENSOR_MARKER = "__ozl_tensor__"
 _OPENZL_DICT_MARKER = "__ozl_dict__"
 _OPENZL_TUPLE_MARKER = "__ozl_tuple__"
 _OPENZL_PICKLE_MARKER = "__ozl_pickle__"
-
 _OPENZL_COMPRESSOR: object | None = None
 _OPENZL_FALLBACK_COMPRESSOR: object | None = None
 _OPENZL_LOCK = Mutex()
-
-_LOGGER = logging.getLogger(__name__)
 _OPENZL_DEFAULT_BUILD_LOGGED = False
 _OPENZL_FALLBACK_LOGGED = False
+_LOGGER = logging.getLogger(__name__)
+
 
 def _is_openzl_temporarily_unavailable(exc: BaseException) -> bool:
     msg = str(exc)
@@ -58,6 +62,7 @@ def _is_openzl_temporarily_unavailable(exc: BaseException) -> bool:
         or "Temporary OpenZL library limitation" in msg
         or "temporary library limitation" in msg.lower()
     )
+
 
 def _register_safe_globals() -> None:
     with contextlib.suppress(Exception):
@@ -176,6 +181,7 @@ def is_required(module: str, pip_hint: str | None = None) -> None:
             f"{module} is required for this operation{hint}"
         ) from err
 
+
 def _openzl_import() -> Any:
 
     is_required("openzl.ext", "pip install openzl")
@@ -195,12 +201,10 @@ def _openzl_get_default_compressor() -> Any:
             return cached
         zl = _openzl_import()
         compressor = zl.Compressor()
-
         compress_graph = zl.graphs.Compress()
         entropy_graph = zl.graphs.Entropy()
         compress_id = compress_graph(compressor)
         entropy_id = entropy_graph(compressor)
-
         f16_graph: Any | None = None
         bf16_graph: Any | None = None
         f32_graph: Any | None = None
@@ -216,8 +220,6 @@ def _openzl_get_default_compressor() -> Any:
             f32_graph = zl.nodes.Float32Deconstruct()(
                 compressor, sign_frac=compress_id, exponent=entropy_id
             )
-
-
         f64_graph: Any | None = None
         with contextlib.suppress(Exception):
             f64_graph = zl.nodes.ConvertNumToStructLE()(
@@ -227,8 +229,6 @@ def _openzl_get_default_compressor() -> Any:
                     successor=compress_id,
                 ),
             )
-
-
         int_fieldlz_id: Any = compress_id
         int_rangepack_fieldlz_id: Any | None = None
         int_zigzag_rangepack_fieldlz_id: Any | None = None
@@ -246,7 +246,7 @@ def _openzl_get_default_compressor() -> Any:
         class _OpenZLGraph(zl.Selector):
             def __init__(
                 self,
-                *,
+                *args: Any,
                 serial_graph: Any,
                 default_numeric_graph: Any,
                 f16_graph: Any | None,
@@ -291,6 +291,7 @@ def _openzl_get_default_compressor() -> Any:
 
             def _pick_int_graph(self, t: torch.Tensor) -> Any:
                 base = self._int_fieldlz_graph
+                
                 def _env_int(name: str, default: int) -> int:
                     with contextlib.suppress(Exception):
                         v = os.environ.get(name, '')
@@ -301,17 +302,16 @@ def _openzl_get_default_compressor() -> Any:
                             return default
                         return int(v)
                     return default
+                    
                 try:
                     n = int(t.numel())
                 except Exception:
                     return base
-
                 min_n = _env_int('ENN_OPENZL_INT_AUTO_MIN_N', 128)
                 if min_n < 0:
                     min_n = 0
                 if n < min_n:
                     return base
-
                 try:
                     flat = t.reshape(-1)
                     max_sample = _env_int('ENN_OPENZL_INT_AUTO_SAMPLE_N', 4096)
@@ -323,14 +323,12 @@ def _openzl_get_default_compressor() -> Any:
                     max_v = int(sample.max().item())
                 except Exception:
                     return base
-
                 try:
                     elem_bytes = int(t.element_size())
                 except Exception:
                     elem_bytes = 0
                 if elem_bytes <= 1:
                     return base
-
                 has_neg = min_v < 0
                 if has_neg and self._int_zigzag_rangepack_graph is not None:
                     absmax = max(abs(min_v), abs(max_v))
@@ -338,7 +336,6 @@ def _openzl_get_default_compressor() -> Any:
                     need = self._min_width_bytes_unsigned(int(max_map))
                     if need < elem_bytes:
                         return self._int_zigzag_rangepack_graph
-
                 if self._int_rangepack_graph is not None:
                     rng = max_v - min_v
                     if rng < 0:
@@ -346,9 +343,7 @@ def _openzl_get_default_compressor() -> Any:
                     need = self._min_width_bytes_unsigned(int(rng))
                     if need < elem_bytes:
                         return self._int_rangepack_graph
-
                 return base
-
 
             @staticmethod
             def _dominant_byte_ratio_u8(x: torch.Tensor) -> float:
@@ -393,18 +388,15 @@ def _openzl_get_default_compressor() -> Any:
                     return self._default_numeric_graph
                 if strat in ('transpose', 'on', '1', 'true'):
                     return g
-
                 try:
                     n = int(t.numel())
                 except Exception:
                     return g
-
                 min_n = _env_int('ENN_OPENZL_FP64_AUTO_MIN_N', 256)
                 if min_n < 0:
                     min_n = 0
                 if n < min_n:
                     return self._default_numeric_graph
-
                 try:
                     flat = t.reshape(-1)
                     max_sample = _env_int('ENN_OPENZL_FP64_AUTO_SAMPLE_N', 4096)
@@ -415,10 +407,8 @@ def _openzl_get_default_compressor() -> Any:
                     b = sample.view(torch.uint8).view(sample_n, 8)
                     lane7 = b[:, 7]
                     lane6 = b[:, 6]
-
                     u7 = int(torch.unique(lane7).numel())
                     u6 = int(torch.unique(lane6).numel())
-
                     u7_thr = _env_int('ENN_OPENZL_FP64_AUTO_UNIQUE_LANE7', 64)
                     u6_thr = _env_int('ENN_OPENZL_FP64_AUTO_UNIQUE_LANE6', 128)
                     if u7_thr < 1:
@@ -427,7 +417,6 @@ def _openzl_get_default_compressor() -> Any:
                         u6_thr = 1
                     if u7 <= u7_thr or u6 <= u6_thr:
                         return g
-
                     dom_thr = _env_float('ENN_OPENZL_FP64_AUTO_DOMINANT_RATIO', 0.55)
                     if dom_thr < 0.0:
                         dom_thr = 0.0
@@ -437,8 +426,8 @@ def _openzl_get_default_compressor() -> Any:
                         return g
                 except Exception:
                     return self._default_numeric_graph
-
                 return self._default_numeric_graph
+                
             def select(self, state: Any, input: Any) -> Any:
                 if input.type == zl.Type.Serial:
                     return self._serial_graph
@@ -514,8 +503,7 @@ def _torch_dtype_from_str(dtype_str: str) -> torch.dtype:
     return dt
 
 
-def _openzl_jsonify(obj: object, *, tensors: list[torch.Tensor], tensor_table: list[dict[str, Any]]) -> object:
-
+def _openzl_jsonify(obj: object, *args: Any, tensors: list[torch.Tensor], tensor_table: list[dict[str, Any]]) -> object:
     from ..core.tensor import coerce_tensor
 
     if torch.is_tensor(obj):
@@ -546,7 +534,6 @@ def _openzl_jsonify(obj: object, *, tensors: list[torch.Tensor], tensor_table: l
             for k, v in obj.items()
         ]
         return {_OPENZL_DICT_MARKER: items}
-
     try:
         return coerce_json(obj)
     except Exception:
@@ -558,7 +545,7 @@ def _openzl_jsonify(obj: object, *, tensors: list[torch.Tensor], tensor_table: l
 
 def _openzl_unjsonify(
     obj: object,
-    *,
+    *args: Any,
     tensors: list[torch.Tensor],
     tensor_table: Sequence[Mapping[str, Any]],
     allow_pickle: bool = True,
@@ -634,7 +621,6 @@ def _openzl_pack_tensors_by_dtype(
     groups: dict[torch.dtype, list[tuple[int, torch.Tensor]]] = {}
     for tid, t in enumerate(tensors):
         groups.setdefault(t.dtype, []).append((tid, t))
-
     dtype_order = sorted(groups.keys(), key=lambda d: str(d))
     dtype_buffers: list[torch.Tensor] = []
     dtype_names: list[str] = []
@@ -659,7 +645,7 @@ def _openzl_pack_tensors_by_dtype(
 
 def _openzl_compress_payload(
     payload: object,
-    *,
+    *args: Any,
     openzl_level: int | None = None,
     openzl_format_version: int | None = None,
     openzl_min_stream_size: int | None = None,
@@ -672,13 +658,10 @@ def _openzl_compress_payload(
     zl = _openzl_import()
     if openzl_permissive is None:
         openzl_permissive = not env_bool('ENN_OPENZL_STRICT', False)
-
     compat_only = env_bool('ENN_OPENZL_COMPAT_ONLY', False)
     no_compat_fallback = env_bool('ENN_OPENZL_NO_COMPAT_FALLBACK', False)
-
     compressors: list[Any] = []
     default_build_exc: Exception | None = None
-
     if not compat_only:
         try:
             compressors.append(_openzl_get_default_compressor())
@@ -694,7 +677,6 @@ def _openzl_compress_payload(
                     exc,
                 )
                 _OPENZL_DEFAULT_BUILD_LOGGED = True
-
     if compat_only or (not no_compat_fallback):
         with contextlib.suppress(Exception):
             fallback = _openzl_compat_compressor()
@@ -703,7 +685,6 @@ def _openzl_compress_payload(
                     compressors = [fallback]
                 elif fallback not in compressors:
                     compressors.append(fallback)
-
     if not compressors:
         if default_build_exc is not None:
             raise default_build_exc
@@ -712,7 +693,6 @@ def _openzl_compress_payload(
     tensors: list[torch.Tensor] = []
     tensor_table: list[dict[str, Any]] = []
     payload_meta = _openzl_jsonify(payload, tensors=tensors, tensor_table=tensor_table)
-
     if openzl_pack_by_dtype:
         dtype_names, dtype_buffers = _openzl_pack_tensors_by_dtype(
             tensors, tensor_table
@@ -723,7 +703,6 @@ def _openzl_compress_payload(
         for tid, t in enumerate(tensors):
             tensor_table[tid]['buffer'] = int(tid)
             tensor_table[tid]['offset'] = 0
-
     meta = {
         'magic': _OPENZL_MAGIC,
         'payload': payload_meta,
@@ -731,16 +710,13 @@ def _openzl_compress_payload(
         'dtype_buffers': dtype_names,
     }
     meta_bytes = json.dumps(meta, separators=(',', ':')).encode('utf-8')
-
     inputs: list[Any] = [zl.Input(zl.Type.Serial, meta_bytes)]
     for buf in dtype_buffers:
         inputs.append(zl.Input(zl.Type.Numeric, buf))
-
     last_exc: Exception | None = None
     for idx, compressor in enumerate(compressors):
         cctx = zl.CCtx()
         cctx.ref_compressor(compressor)
-
         fmt = (
             int(openzl_format_version)
             if openzl_format_version is not None
@@ -748,32 +724,26 @@ def _openzl_compress_payload(
         )
         with contextlib.suppress(Exception):
             cctx.set_parameter(zl.CParam.FormatVersion, fmt)
-
         if openzl_level is not None:
             with contextlib.suppress(Exception):
                 cctx.set_parameter(zl.CParam.CompressionLevel, int(openzl_level))
-
         if openzl_min_stream_size is not None:
             with contextlib.suppress(Exception):
                 cctx.set_parameter(zl.CParam.MinStreamSize, int(openzl_min_stream_size))
-
         if openzl_content_checksum is not None:
             with contextlib.suppress(Exception):
                 cctx.set_parameter(
                     zl.CParam.ContentChecksum, int(bool(openzl_content_checksum))
                 )
-
         if openzl_compressed_checksum is not None:
             with contextlib.suppress(Exception):
                 cctx.set_parameter(
                     zl.CParam.CompressedChecksum, int(bool(openzl_compressed_checksum))
                 )
-
         with contextlib.suppress(Exception):
             cctx.set_parameter(
                 zl.CParam.PermissiveCompression, int(bool(openzl_permissive))
             )
-
         try:
             out = bytes(cctx.compress(inputs))
             if idx > 0:
@@ -787,7 +757,6 @@ def _openzl_compress_payload(
             return out
         except Exception as exc:
             last_exc = exc
-
     if last_exc is not None:
         raise last_exc
     raise RuntimeError('OpenZL compression failed without an error')
@@ -795,7 +764,7 @@ def _openzl_compress_payload(
 
 def _openzl_decompress_payload(
     blob: object,
-    *,
+    *args: Any,
     openzl_lazy_tensors: bool = True,
     openzl_check_content_checksum: bool | None = None,
     openzl_check_compressed_checksum: bool | None = None,
@@ -816,19 +785,15 @@ def _openzl_decompress_payload(
                 zl.DParam.CheckCompressedChecksum,
                 int(bool(openzl_check_compressed_checksum)),
             )
-
-    outs = dctx.decompress(blob)  # bytes-like
+    outs = dctx.decompress(blob)
     if not outs:
         raise RuntimeError("OpenZL decompression returned no outputs")
-
     meta_bytes = outs[0].content.as_bytes()
     meta = json.loads(meta_bytes.decode("utf-8"))
     if meta.get("magic") != _OPENZL_MAGIC:
         raise ValueError("Not an ENN OpenZL checkpoint")
-
     tensor_table = meta.get("tensor_table") or []
     dtype_names = meta.get("dtype_buffers") or []
-
     dtype_bufs: list[torch.Tensor] = []
     for i, dt_name in enumerate(dtype_names):
         target = _torch_dtype_from_str(dt_name)
@@ -838,7 +803,6 @@ def _openzl_decompress_payload(
             raw = out.as_pytensor()
         except Exception:
             raw = None
-
         if raw is not None and getattr(raw, "dtype", None) != target:
             with contextlib.suppress(Exception):
                 raw = raw.view(target)
@@ -846,10 +810,8 @@ def _openzl_decompress_payload(
             b = out.as_bytes()
             raw = torch.frombuffer(b, dtype=target)
         dtype_bufs.append(raw.reshape(-1))
-
     if not openzl_lazy_tensors:
         dtype_bufs = [b.clone() for b in dtype_bufs]
-
     tensors: list[torch.Tensor] = [torch.empty(0)] * int(len(tensor_table))
     for tid, entry in enumerate(tensor_table):
         dt_name = entry.get("dtype")
@@ -857,7 +819,6 @@ def _openzl_decompress_payload(
         numel = int(entry.get("numel") or 0)
         buf_idx = int(entry.get("buffer") or 0)
         offset = int(entry.get("offset") or 0)
-
         if numel <= 0:
             tensors[tid] = torch.empty(shape, dtype=_torch_dtype_from_str(dt_name))
             continue
@@ -868,7 +829,6 @@ def _openzl_decompress_payload(
             with contextlib.suppress(Exception):
                 view = view.view(target)
         tensors[tid] = view.view(shape) if shape else view.reshape(())
-
     payload_meta = meta.get("payload")
     return _openzl_unjsonify(
         payload_meta,
@@ -880,7 +840,7 @@ def _openzl_decompress_payload(
 
 def _openzl_load_checkpoint(
     path: PathLike,
-    *,
+    *args: Any,
     openzl_memmap: bool = True,
     openzl_lazy_tensors: bool = True,
     openzl_check_content_checksum: bool | None = None,
@@ -891,7 +851,6 @@ def _openzl_load_checkpoint(
     p = Path(path)
     if not p.is_file():
         raise FileNotFoundError(str(p))
-
     if not openzl_memmap:
         data = p.read_bytes()
         return _openzl_decompress_payload(
@@ -901,7 +860,7 @@ def _openzl_load_checkpoint(
             openzl_check_compressed_checksum=openzl_check_compressed_checksum,
             weights_only=weights_only,
         )
-
+        
     import mmap
 
     with p.open("rb") as f:
@@ -932,7 +891,7 @@ def _openzl_load_checkpoint(
 def _openzl_save_checkpoint(
     path: PathLike,
     payload: object,
-    *,
+    *args: Any,
     openzl_level: int | None = None,
     openzl_format_version: int | None = None,
     openzl_min_stream_size: int | None = None,
@@ -953,7 +912,6 @@ def _openzl_save_checkpoint(
         openzl_permissive=openzl_permissive,
         openzl_pack_by_dtype=openzl_pack_by_dtype,
     )
-
     fd, tmp_name = tempfile.mkstemp(
         prefix=p.name + ".",
         suffix=p.suffix + ".tmp",
@@ -1013,7 +971,6 @@ class Builder:
                 StateDictOptions,
                 get_model_state_dict,
             )
-
             with _save_sync(p, barrier=True):
                 dcp_save(
                     state_dict={
@@ -1043,7 +1000,6 @@ class Builder:
                 if optimizer is not None:
                     with contextlib.suppress(Exception):
                         payload["optimizer_state_dict"] = optimizer.state_dict()
-
                 try:
                     _openzl_save_checkpoint(
                         p,
@@ -1097,7 +1053,6 @@ class Builder:
                                 "optimizer_state_dict"
                             ] = optimizer.state_dict()
                     save_temp(pt_path, pt_payload, **opts)
-
                     meta = _make_meta()
                     meta["format"] = "torch-ckpt-v1"
                     write_json(
@@ -1223,10 +1178,8 @@ class Exporter:
                     "Exporter backends live in enn_torch.runtime.wrappers, but it could not be imported. "
                     "Install the optional export dependencies (e.g. tensordict) or avoid calling Exporter.for_export()."
                 ) from exc
-
             cls._ONNXExporter = getattr(_w, "_ONNXExporter", None)
             cls._ORTBuilder = getattr(_w, "_ORTBuilder", None)
-
             cls._register_unlocked("onnx", (".onnx",), _w.ONNX())
             cls._register_unlocked("ort", (".ort",), _w.ORT())
             cls._register_unlocked(
@@ -1254,8 +1207,4 @@ class Exporter:
             return cls._by_name.get(name) if name else None
 
 
-try:
-    from torch.serialization import add_safe_globals
-except ImportError:
-    add_safe_globals = None
 _register_safe_globals()
