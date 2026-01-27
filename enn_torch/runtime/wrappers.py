@@ -2600,17 +2600,14 @@ class GraphSequential(nn.Module):
                 elif kind == "path":
                     mod = self._resolve_path(str(payload))
                 elif kind == "ref":
+                    path = meta.get("path") if isinstance(meta, dict) else None
                     mod = (
                         payload()
                         if isinstance(payload, weakref.ReferenceType)
                         else None
                     )
-                    if (
-                        mod is None
-                        and isinstance(meta, dict)
-                        and isinstance(meta.get("path"), str)
-                    ):
-                        mod = self._resolve_path(str(meta.get("path")))
+                    if mod is None and isinstance(path, str):
+                        mod = self._resolve_path(str(path))
                 else:
                     raise TypeError(
                         f"Unknown GraphSequential step kind: {kind!r}"
