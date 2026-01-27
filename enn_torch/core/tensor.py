@@ -153,7 +153,6 @@ def extract_tensor(out: object) -> torch.Tensor:
     def _to_plain(t: torch.Tensor) -> torch.Tensor:
         if _dynamo_is_compiling():
             return t
-
         try:
             if hasattr(t, "to_local"):
                 tl = t.to_local()
@@ -161,7 +160,6 @@ def extract_tensor(out: object) -> torch.Tensor:
                     t = tl
         except Exception:
             pass
-
         fn_disable = _disable_functional_mode
         fn_unwrap = _mb_unwrap_functional_tensor
         if callable(fn_disable) and callable(fn_unwrap):
@@ -261,17 +259,13 @@ def symint_safe_expand(
     target = tuple(target_shape)
     if tuple(t.shape) == target:
         return t
-
     src = tuple(t.shape)
     if len(target) < len(src):
         return t.expand(target)
-
     src_aligned = (1,) * (len(target) - len(src)) + src
-
     sizes: list[object] = []
     for s_dim, t_dim in zip(src_aligned, target):
         sizes.append(-1 if s_dim == t_dim else t_dim)
-
     return t.expand(tuple(sizes))
 
 
