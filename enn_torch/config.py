@@ -24,6 +24,12 @@ import torch
 
 from .core.graph import canonicalize_compile_mode
 
+if TYPE_CHECKING:
+    from .data.pipeline import Source
+else:
+    Source = Dict[str, Any]
+
+
 OpsMode = Literal["train", "predict", "infer"]
 
 
@@ -1036,9 +1042,3 @@ class RuntimeConfig:
                 else None
             ),
         )
-
-
-if TYPE_CHECKING:
-    from .data.pipeline import Source
-else:
-    Source = Dict[str, Any]
