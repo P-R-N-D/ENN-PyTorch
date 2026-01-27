@@ -1931,6 +1931,7 @@ class GraphSequential(nn.Module):
         del args
         self._name = str(name or "subgraph")
         self._owned = nn.ModuleList()
+        self._refs_materialized = False
 
         self._root_ref: weakref.ReferenceType[nn.Module] | None = (
             weakref.ref(root) if root is not None else None
@@ -2201,6 +2202,7 @@ class GraphSequential(nn.Module):
     ) -> "GraphSequential":
         if root is not None:
             self.set_root(root)
+        self._refs_materialized = True
 
         rebound: list[tuple[object, ...]] = []
         for item in list(self._steps):
@@ -2214,7 +2216,7 @@ class GraphSequential(nn.Module):
                 m = dict(meta) if isinstance(meta, dict) else {}
                 m["path"] = path
                 rebound.append(
-                    ("ref", weakref.ref(mod), extra_args, extra_kwargs, m)
+                    ("ref", mod, extra_args, extra_kwargs, m)
                 )
                 continue
 
@@ -2225,7 +2227,7 @@ class GraphSequential(nn.Module):
                     rebound.append(
                         (
                             "ref",
-                            weakref.ref(mod),
+                            mod,
                             extra_args,
                             extra_kwargs,
                             meta,
@@ -2236,6 +2238,15 @@ class GraphSequential(nn.Module):
                     raise RuntimeError(
                         "GraphSequential.bind() encountered an unresolved ref without a path hint."
                     )
+
+            if kind == "ref" and isinstance(payload, weakref.ReferenceType):
+                with contextlib.suppress(Exception):
+                    mod = payload()
+                    if isinstance(mod, nn.Module):
+                        rebound.append(
+                            ("ref", mod, extra_args, extra_kwargs, meta)
+                        )
+                        continue
 
             rebound.append((kind, payload, extra_args, extra_kwargs, meta))
 
@@ -2480,7 +2491,9 @@ class GraphSequential(nn.Module):
         if kind == "ref":
             mod: nn.Module | None = None
             path = meta.get("path") if isinstance(meta, dict) else None
-            if isinstance(payload, weakref.ReferenceType) and (
+            if isinstance(payload, nn.Module):
+                mod = payload
+            elif isinstance(payload, weakref.ReferenceType) and (
                 (not _dynamo_is_compiling()) or not isinstance(path, str)
             ):
                 mod = payload()
@@ -2495,10 +2508,6 @@ class GraphSequential(nn.Module):
                     raise RuntimeError(
                         "A shared submodule reference was cleared (or not bound) before GraphSequential.forward()."
                     )
-            if not isinstance(mod, nn.Module):
-                raise TypeError(
-                    f"GraphSequential ref step did not resolve to nn.Module: {type(mod)!r}"
-                )
             return mod(*args, **kwargs)
         if kind == "owned":
             return self._owned[int(payload)](*args, **kwargs)
@@ -2601,11 +2610,12 @@ class GraphSequential(nn.Module):
                     mod = self._resolve_path(str(payload))
                 elif kind == "ref":
                     path = meta.get("path") if isinstance(meta, dict) else None
-                    mod = (
-                        payload()
-                        if isinstance(payload, weakref.ReferenceType)
-                        else None
-                    )
+                    if isinstance(payload, nn.Module):
+                        mod = payload
+                    elif isinstance(payload, weakref.ReferenceType):
+                        mod = payload()
+                    else:
+                        mod = None
                     if mod is None and isinstance(path, str):
                         mod = self._resolve_path(str(path))
                 else:
