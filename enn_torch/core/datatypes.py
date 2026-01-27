@@ -12,6 +12,7 @@ from typing import Any, TypeAlias
 import numpy
 import torch
 
+
 _CANONICAL_DTYPES: dict[str, dict[str, Any]] = {
     "float64": {
         "torch": torch.float64,
@@ -96,7 +97,6 @@ _DTYPE_ALIASES: dict[str, str] = {
     "i64": "int64",
     "u8": "uint8",
 }
-_FALSE = frozenset({"0", "false", "no", "n", "off", "disable", "disabled"})
 _PLATFORM_ALIASES: dict[str, str] = {
     "torch": "torch",
     "pytorch": "torch",
@@ -107,6 +107,7 @@ _PLATFORM_ALIASES: dict[str, str] = {
     "name": "name",
     "canonical": "name",
 }
+_FALSE = frozenset({"0", "false", "no", "n", "off", "disable", "disabled"})
 _TRUE = frozenset({"1", "true", "yes", "y", "on", "enable", "enabled"})
 JsonPrimitive: TypeAlias = str | int | float | bool | None
 JsonValue: TypeAlias = (
