@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 from __future__ import annotations
 
 from contextlib import suppress
@@ -5,6 +6,7 @@ from typing import Any, Mapping, Optional
 
 import torch
 from tensordict import TensorDictBase
+
 
 _FEATURE_KEY_ALIASES = frozenset(
     {"x", "feature", "features", "input", "inputs", "in"}
