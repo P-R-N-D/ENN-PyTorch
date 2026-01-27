@@ -881,8 +881,17 @@ class _ONNXExporter:
             training = torch.onnx.TrainingMode.EVAL
         sig_keys = _export_sig_keys()
         has_dynamo = "dynamo" in sig_keys
+        allow_dynamo_fallback = False
+        with contextlib.suppress(Exception):
+            v = os.environ.get("ENN_ONNX_TRY_DYNAMO", "").strip().lower()
+            allow_dynamo_fallback = v in ("1", "true", "yes", "on")
         if has_dynamo:
-            exporters = [True, False] if prefer_dynamo else [False, True]
+            if prefer_dynamo:
+                exporters = [True, False]
+            elif allow_dynamo_fallback:
+                exporters = [False, True]
+            else:
+                exporters = [False]
         else:
             exporters = [False]
         errors: list[str] = []

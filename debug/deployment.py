@@ -130,9 +130,9 @@ def _run_isolated_export(
     env.setdefault("ENN_EXPORT_FAULTHANDLER", "1")
     env.setdefault("ENN_EXPORT_TRACEBACK_AFTER_SEC", "30")
     timeout_s = 120
-    if str(fmt_name).strip().lower() in {"onnx", "ort"}:
-        env.setdefault("ENN_ONNX_PREFER_DYNAMO", "0")
-        timeout_s = 300
+    if str(fmt_name).strip().lower() in ("onnx", "ort"):
+        timeout_s = 600
+        env.setdefault("ENN_ONNX_TRY_DYNAMO", "0")
     with contextlib.suppress(Exception):
         timeout_s = int(
             os.environ.get("ENN_EXPORT_SUBPROCESS_TIMEOUT", str(timeout_s)).strip()

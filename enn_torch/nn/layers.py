@@ -497,6 +497,8 @@ class DilatedAttention(nn.Module):
         return self._mask_cache
 
     def _get_flex_block_mask(self, L: int, device: torch.device):
+        if is_export_or_trace() or is_compiling():
+            return None
         if not _HAS_FLEX_ATTENTION or create_block_mask is None:
             return None
         if (
@@ -562,6 +564,8 @@ class DilatedAttention(nn.Module):
             and _HAS_FLEX_ATTENTION
             and getattr(_FLEX_KERNEL, "has_torch_backend", False)
             and (self._get_torch_mha() is not None)
+            and (not is_export_or_trace())
+            and (not is_compiling())
         )
 
         attn_mask_keep: Optional[torch.Tensor] = None
