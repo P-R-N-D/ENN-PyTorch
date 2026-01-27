@@ -38,6 +38,32 @@ def _optional_attr(
     return val
 
 
+try:
+    import torch._dynamo as _dynamo
+except Exception:
+    _dynamo = None
+
+
+def _dynamo_is_compiling() -> bool:
+    try:
+        return bool(_dynamo is not None and _dynamo.is_compiling())
+    except Exception:
+        return False
+
+
+_disable_functional_mode = _optional_attr(
+    "torch._subclasses.functional_tensor",
+    "disable_functional_mode",
+    None,
+    predicate=callable,
+)
+_mb_unwrap_functional_tensor = _optional_attr(
+    "torch._subclasses.functional_tensor",
+    "mb_unwrap_functional_tensor",
+    None,
+    predicate=callable,
+)
+
 _tdx_is_fake = _optional_attr(
     "torchdistx.fake", "is_fake", None, predicate=callable
 )
@@ -156,6 +182,9 @@ def coerce_tensor(
 
 def extract_tensor(out: object) -> torch.Tensor:
     def _to_plain(t: torch.Tensor) -> torch.Tensor:
+        if _dynamo_is_compiling():
+            return t
+
         try:
             if hasattr(t, "to_local"):
                 tl = t.to_local()
@@ -163,18 +192,15 @@ def extract_tensor(out: object) -> torch.Tensor:
                     t = tl
         except Exception:
             pass
-        try:
-            from torch._subclasses.functional_tensor import (
-                disable_functional_mode,
-                mb_unwrap_functional_tensor,
-            )
 
-            with disable_functional_mode():
-                u = mb_unwrap_functional_tensor(t)
-                if isinstance(u, torch.Tensor):
-                    t = u
-        except Exception:
-            pass
+        fn_disable = _disable_functional_mode
+        fn_unwrap = _mb_unwrap_functional_tensor
+        if callable(fn_disable) and callable(fn_unwrap):
+            with contextlib.suppress(Exception):
+                with fn_disable():
+                    u = fn_unwrap(t)
+                    if isinstance(u, torch.Tensor):
+                        t = u
         return t
 
     if isinstance(out, TensorDictBase):
