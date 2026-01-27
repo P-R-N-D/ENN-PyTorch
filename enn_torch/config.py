@@ -29,7 +29,6 @@ if TYPE_CHECKING:
 else:
     Source = Dict[str, Any]
 
-
 OpsMode = Literal["train", "predict", "infer"]
 
 
@@ -390,7 +389,6 @@ def coerce_model_config(
     _i("temporal_depth", 1)
     _i("spatial_latents", 1)
     _i("temporal_latents", 1)
-
     raw_fd = get("fuser_depth", getattr(_MODEL_DEFAULTS, "fuser_depth", None))
     if raw_fd is None:
         params["fuser_depth"] = None
@@ -417,7 +415,6 @@ def coerce_model_config(
         alias = str(stream_task_name).strip()
         if alias:
             params["stream_task_id"] = alias
-
     _b("use_linear_branch")
     _i("safety_margin_pow2", 0)
     _i("delta_gate_hidden_dim", 1)
@@ -433,7 +430,6 @@ def coerce_model_config(
     _f("delta_gate_p_ceil", max=100.0)
     if params["delta_gate_p_ceil"] < params["delta_gate_p_floor"]:
         params["delta_gate_p_ceil"] = params["delta_gate_p_floor"]
-
     normalization_method = _coerce_str(
         get("normalization_method", _MODEL_DEFAULTS.normalization_method),
         "normalization_method",
@@ -447,7 +443,6 @@ def coerce_model_config(
         normalization_method = "batchnorm"
     elif norm_key in ("rms", "rmsnorm"):
         normalization_method = "rmsnorm"
-
     modeling_type = _coerce_str(
         get("modeling_type", _MODEL_DEFAULTS.modeling_type),
         "modeling_type",
@@ -461,7 +456,6 @@ def coerce_model_config(
         modeling_type = "tt"
     elif any(x in mt_key for x in ("st", "ts", "spatial", "temporal")):
         modeling_type = "st"
-
     compile_mode = canonicalize_compile_mode(
         _coerce_str(
             get("compile_mode", _MODEL_DEFAULTS.compile_mode),
@@ -470,7 +464,6 @@ def coerce_model_config(
             lower=True,
         )
     )
-
     raw_tile_shape = get("delta_gate_tile_shape", None)
     delta_gate_tile_shape = None
     if isinstance(raw_tile_shape, int) and not isinstance(raw_tile_shape, bool):
@@ -494,7 +487,6 @@ def coerce_model_config(
             delta_gate_tile_shape = tuple(
                 _coerce_int(p, name="delta_gate_tile_shape", minimum=1) for p in parts
             )
-
     _f("delta_gate_fallback_k")
     _f("delta_gate_fallback_k_low", allow_none=True)
     _f("delta_gate_fallback_k_high", allow_none=True)
@@ -516,7 +508,6 @@ def coerce_model_config(
     _f("delta_gate_auto_k_max")
     if params["delta_gate_auto_k_max"] < params["delta_gate_auto_k_min"]:
         params["delta_gate_auto_k_max"] = params["delta_gate_auto_k_min"]
-
     _f("delta_gate_auto_k_width_frac", max=1.0)
     _f("delta_gate_auto_k_edge_frac", max=1.0)
     _i("delta_gate_auto_k_log_interval")
@@ -542,7 +533,6 @@ def coerce_model_config(
     _f("p_prior_weight")
     _f("p_prior_alpha")
     _f("p_prior_beta")
-
     params.update(
         {
             "device": device,
@@ -770,7 +760,7 @@ class RuntimeConfig:
     weight_decay: float = 1e-4
     warmup_ratio: float = 0.0
     eta_min: float = 0.0
-    seed: int = 42
+    seed: int = 7
     shuffle: bool = True
     deterministic: bool = False
     train_weights: Optional[Mapping[str, float] | Sequence[float]] = None
@@ -782,21 +772,6 @@ class RuntimeConfig:
     model_ckpt_dir: Optional[str] = None
     keys: Optional[Sequence[Any]] = None
     loss_skew: bool = True
-    TRAIN_POS_ORDER: ClassVar[Tuple[str, ...]] = (
-        "epochs",
-        "val_frac",
-        "base_lr",
-        "weight_decay",
-        "warmup_ratio",
-        "eta_min",
-        "seed",
-        "loss_tile_dim",
-        "loss_tile_size",
-        "loss_mask_mode",
-        "loss_mask_value",
-        "loss_skew",
-    )
-    PRED_POS_ORDER: ClassVar[Tuple[str, ...]] = ("seed",)
     _COMMON_KEYS: ClassVar[frozenset[str]] = frozenset(
         {"in_dim", "out_shape", "cfg_dict"}
     )
@@ -836,7 +811,22 @@ class RuntimeConfig:
             "val_weights",
         }
     )
-
+    TRAIN_POS_ORDER: ClassVar[Tuple[str, ...]] = (
+        "epochs",
+        "val_frac",
+        "base_lr",
+        "weight_decay",
+        "warmup_ratio",
+        "eta_min",
+        "seed",
+        "loss_tile_dim",
+        "loss_tile_size",
+        "loss_mask_mode",
+        "loss_mask_value",
+        "loss_skew",
+    )
+    PRED_POS_ORDER: ClassVar[Tuple[str, ...]] = ("seed",)
+    
     @staticmethod
     def from_partial(mode: OpsMode, *args: Any, **kwargs: Any) -> "RuntimeConfig":
         if "mode" in kwargs:
@@ -886,7 +876,6 @@ class RuntimeConfig:
                     raise ValueError(f"Missing {k}")
             if u := (set(data) - RuntimeConfig._TRAIN_KEYS):
                 raise ValueError(f"Unsupported {u}")
-
             loss_mode = (
                 _coerce_str(
                     data.get("loss_mask_mode", "none"),
@@ -905,7 +894,6 @@ class RuntimeConfig:
                 loss_mode = "neq"
             else:
                 raise ValueError(f"Invalid loss_mask_mode: {loss_mode}")
-
             src_n = _effective_source_count(data.get("sources"))
             return RuntimeConfig(
                 mode="train",
