@@ -2479,12 +2479,12 @@ class GraphSequential(nn.Module):
 
         if kind == "ref":
             mod: nn.Module | None = None
-            if (not _dynamo_is_compiling()) and isinstance(
-                payload, weakref.ReferenceType
+            path = meta.get("path") if isinstance(meta, dict) else None
+            if isinstance(payload, weakref.ReferenceType) and (
+                (not _dynamo_is_compiling()) or not isinstance(path, str)
             ):
                 mod = payload()
             if mod is None:
-                path = meta.get("path") if isinstance(meta, dict) else None
                 if isinstance(path, str):
                     mod = (
                         self._resolve_path_nocache(path)
