@@ -13,6 +13,14 @@ from .datatypes import env_bool, env_first
 from .distributed import broadcast_scalar, is_dtensor_active
 from .graph import is_export_or_trace, to_submodule
 
+try:
+    import torch.utils.checkpoint
+except Exception:
+    _TORCH_CHECKPOINT = None
+else:
+    _TORCH_CHECKPOINT = torch.utils.checkpoint.checkpoint
+
+
 _CKPT_TL = threading.local()
 
 
@@ -256,11 +264,3 @@ def checkpoint(fn: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
             setattr(tl, "depth", depth)
 
     return _TORCH_CHECKPOINT(_state, *args, **kwargs)
-
-
-try:
-    import torch.utils.checkpoint
-except Exception:
-    _TORCH_CHECKPOINT = None
-else:
-    _TORCH_CHECKPOINT = torch.utils.checkpoint.checkpoint
