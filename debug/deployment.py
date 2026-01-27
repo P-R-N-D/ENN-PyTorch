@@ -91,9 +91,16 @@ def _build_model_and_sample(
         in_dim=td_train["X"].shape[1], out_shape=(S, T), config=cfg
     ).to(device)
 
-    with contextlib.suppress(Exception):
-        model.add_task('debug_extra', mode='spatial', weight=0.25)
-        print('[debug] tasks:', model.list_tasks())
+    if os.environ.get("ENN_DEPLOYMENT_DEBUG_EXTRA", "0").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "y",
+        "on",
+    ):
+        with contextlib.suppress(Exception):
+            model.add_task('debug_extra', mode='spatial', weight=0.25)
+    print('[debug] tasks:', model.list_tasks())
     sample = td_train["X"][:4].to(device)
     return data, td_train, model, sample
 
@@ -122,7 +129,7 @@ def _run_isolated_export(
     env.setdefault("ENN_EXPORT_FAULTHANDLER", "1")
     env.setdefault("ENN_EXPORT_TRACEBACK_AFTER_SEC", "30")
     if fmt_name.strip().lower() in ("onnx", "ort"):
-        env.setdefault("ENN_ONNX_PREFER_DYNAMO", "1")
+        env["ENN_ONNX_PREFER_DYNAMO"] = "0"
     timeout_s = 120
     with contextlib.suppress(Exception):
         timeout_s = int(
@@ -465,7 +472,14 @@ def _export_only_main(fmt_name: str, out_path: str, state_path: str) -> int:
     sd = torch.load(state_path, map_location="cpu")
     with contextlib.suppress(Exception):
         _ensure_state_shapes_for_scaler(model, sd)
-    model.load_state_dict(sd, strict=True)
+    try:
+        model.load_state_dict(sd, strict=True)
+    except RuntimeError as exc:
+        msg = str(exc)
+        if "Unexpected key(s) in state_dict" in msg:
+            model.load_state_dict(sd, strict=False)
+        else:
+            raise
     model.eval()
     fmt = Exporter.for_export(
         Path(out_path).suffix if Path(out_path).suffix else out_path
@@ -541,17 +555,15 @@ def export_and_validate(
         state_path = None
         results["_state_save_error"] = repr(exc)
     with _temp_env("ENN_DISABLE_PIECEWISE_CALIB", "1"):
+        isolate = {
+            s.strip().lower()
+            for s in os.environ.get(
+                "ENN_DEPLOYMENT_ISOLATE_EXPORTS", "pt2,onnx,ort"
+            ).split(",")
+            if s.strip()
+        }
         for name, path in targets.items():
-            if state_path is not None and name in (
-                "pt2",
-                "onnx",
-                "ort",
-                "tensorrt",
-                "executorch",
-                "tensorflow",
-                "litert",
-                "coreml",
-            ):
+            if state_path is not None and name.strip().lower() in isolate:
                 results[name] = _run_isolated_export(
                     name, str(path), str(state_path)
                 )

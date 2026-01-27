@@ -260,22 +260,17 @@ def _decorate_compiler_disable(
 
 
 def _dispatch_mode_stack() -> list[Any]:
-    try:
-        from torch.utils._python_dispatch import (
-            _get_current_dispatch_mode_stack,
-        )
-
-        stack = _get_current_dispatch_mode_stack()
+    utils = getattr(torch, "utils", None)
+    pd = getattr(utils, "_python_dispatch", None) if utils is not None else None
+    fn_stack = getattr(pd, "_get_current_dispatch_mode_stack", None)
+    if callable(fn_stack):
+        stack = fn_stack()
         return list(stack) if stack is not None else []
-    except Exception:
-        pass
-    try:
-        from torch.utils._python_dispatch import _get_current_dispatch_mode
-
-        mode = _get_current_dispatch_mode()
+    fn_mode = getattr(pd, "_get_current_dispatch_mode", None)
+    if callable(fn_mode):
+        mode = fn_mode()
         return [mode] if mode is not None else []
-    except Exception:
-        return []
+    return []
 
 
 @contextlib.contextmanager
@@ -334,60 +329,55 @@ def is_dynamo_compiling() -> bool:
 
 
 def is_compiling() -> bool:
-    with suppress(Exception):
-        dyn = getattr(torch, "_dynamo", None)
-        if dyn is not None and callable(getattr(dyn, "is_compiling", None)):
-            if bool(dyn.is_compiling()):
-                return True
-        if dyn is not None and callable(
-            getattr(dyn, "is_dynamo_compiling", None)
-        ):
-            if bool(dyn.is_dynamo_compiling()):
-                return True
-    with suppress(Exception):
-        comp = getattr(torch, "compiler", None)
-        fn = getattr(comp, "is_compiling", None)
-        if callable(fn) and bool(fn()):
-            return True
+    dyn = getattr(torch, "_dynamo", None)
+    fn = getattr(dyn, "is_compiling", None)
+    if callable(fn) and bool(fn()):
+        return True
+    fn = getattr(dyn, "is_dynamo_compiling", None)
+    if callable(fn) and bool(fn()):
+        return True
+
+    comp = getattr(torch, "compiler", None)
+    fn = getattr(comp, "is_compiling", None)
+    if callable(fn) and bool(fn()):
+        return True
     return False
 
 
 def is_fake_tensor_mode_active() -> bool:
-    try:
-        from torch._subclasses.fake_tensor import FakeTensorMode
-    except Exception:
+    subclasses = getattr(torch, "_subclasses", None)
+    ft_mod = getattr(subclasses, "fake_tensor", None) if subclasses is not None else None
+    FakeTensorMode = getattr(ft_mod, "FakeTensorMode", None)
+    if FakeTensorMode is None:
         return False
     for mode in _dispatch_mode_stack():
-        if mode is None:
-            continue
-        try:
-            if isinstance(mode, FakeTensorMode):
-                return True
-        except Exception:
-            continue
+        if mode is not None and isinstance(mode, FakeTensorMode):
+            return True
     return False
 
 
 def is_tracing_or_exporting() -> bool:
-    with suppress(Exception):
-        jit = getattr(torch, "jit", None)
-        if jit is not None and (
-            torch.jit.is_tracing() or torch.jit.is_scripting()
-        ):
-            return True
-    with suppress(Exception):
-        comp = getattr(torch, "compiler", None)
-        fn = getattr(comp, "is_exporting", None)
+    jit = getattr(torch, "jit", None)
+    if jit is not None:
+        fn = getattr(jit, "is_tracing", None)
         if callable(fn) and bool(fn()):
             return True
-    with suppress(Exception):
-        onnx = getattr(torch, "onnx", None)
-        fn = getattr(onnx, "is_in_onnx_export", None)
+        fn = getattr(jit, "is_scripting", None)
         if callable(fn) and bool(fn()):
             return True
-    with suppress(Exception):
-        if is_fake_tensor_mode_active():
-            return True
+
+    comp = getattr(torch, "compiler", None)
+    fn = getattr(comp, "is_exporting", None)
+    if callable(fn) and bool(fn()):
+        return True
+
+    onnx = getattr(torch, "onnx", None)
+    fn = getattr(onnx, "is_in_onnx_export", None)
+    if callable(fn) and bool(fn()):
+        return True
+
+    if is_fake_tensor_mode_active():
+        return True
     return False
 
 

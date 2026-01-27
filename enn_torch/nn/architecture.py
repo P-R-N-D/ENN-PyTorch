@@ -1183,9 +1183,7 @@ class Fuser(nn.Module):
     ) -> Optional[torch.Tensor]:
         if len(token_sets) <= 1:
             return None
-        exporting = False
-        with contextlib.suppress(Exception):
-            exporting = bool(is_export_or_trace())
+        exporting = bool(is_export_or_trace())
 
         w_list: list[torch.Tensor] = []
         e_list: list[torch.Tensor] = []
@@ -2742,11 +2740,7 @@ class Model(nn.Module):
                 raise ValueError(
                     f"Expected features shaped (B, {self.in_dim}), got {tuple(features_t.shape)}"
                 )
-            exporting = False
-            try:
-                exporting = bool(is_export_or_trace())
-            except Exception:
-                exporting = False
+            exporting = bool(is_export_or_trace())
 
             b = features_t.shape[0] if exporting else int(features_t.shape[0])
 
