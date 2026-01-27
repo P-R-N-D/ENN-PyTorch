@@ -20,6 +20,7 @@ from enn_torch.config import ModelConfig, PatchConfig
 from enn_torch.core.system import get_device
 from enn_torch.runtime.workflow import new_model, predict, train
 
+
 COL_DIR = "방향"
 COL_ROUTE = "노선"
 COL_SECTION = "구간"
@@ -257,7 +258,6 @@ def main() -> None:
     print("PYTHON_GIL env:", os.environ.get("PYTHON_GIL"))
     print("sys._is_gil_enabled available:", hasattr(sys, "_is_gil_enabled"))
     print("GIL enabled?:", getattr(sys, "_is_gil_enabled", lambda: None)())
-
     os.environ.setdefault("ENN_PREBATCH", "1")
     excel_path = os.path.abspath("raw_data.xlsx")
     if not os.path.isfile(excel_path):
@@ -274,7 +274,6 @@ def main() -> None:
     print(
         f"td_train batch_size={td_train.batch_size}, X shape={tuple(td_train['X'].shape)}, Y shape={tuple(td_train['Y'].shape)}"
     )
-
     device = get_device()
     print("Device:", device)
     patch = PatchConfig(
@@ -302,7 +301,6 @@ def main() -> None:
     model = new_model(
         in_dim=td_train["X"].shape[1], out_shape=(S, T), config=config
     ).to(device)
-
     with contextlib.suppress(Exception):
         model.add_task("extra_spatial", mode="spatial", weight=0.25)
         model.update_task("extra_spatial", weight=0.5)
@@ -327,7 +325,6 @@ def main() -> None:
     print("train CPU avg per core:", train_metrics["cpu_avg"])
     print("train CPU peak per core:", train_metrics["cpu_peak"])
     print("train peak RSS MB:", round(train_metrics["mem_peak"] / (1024**2), 2))
-
     hist = []
     with contextlib.suppress(Exception):
         hist = trained_model.history()
@@ -336,7 +333,6 @@ def main() -> None:
         print("last history entry:", hist[-1])
     else:
         print("no train history recorded")
-
     infer_td = TensorDict({"X": td_train["X"]}, batch_size=td_train.batch_size)
     pred_path = os.path.abspath("predictions.h5")
     if os.path.exists(pred_path):
@@ -358,7 +354,6 @@ def main() -> None:
     print("predict CPU avg per core:", pred_metrics["cpu_avg"])
     print("predict CPU peak per core:", pred_metrics["cpu_peak"])
     print("predict peak RSS MB:", round(pred_metrics["mem_peak"] / (1024**2), 2))
-
     Y_pred = pred_result["Y"]
     if hasattr(Y_pred, "detach"):
         Y_pred_t = Y_pred.detach().cpu()
