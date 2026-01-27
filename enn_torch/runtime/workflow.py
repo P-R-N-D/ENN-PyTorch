@@ -253,7 +253,6 @@ def _save_model_checkpoint(
             _coerce_dcp_keys(pt_state)
         else:
             pt_state = model.state_dict()
-
             if any(
                 torch.is_tensor(v)
                 and getattr(v, "device", None) is not None
@@ -263,7 +262,6 @@ def _save_model_checkpoint(
                 raise NotImplementedError(
                     "Cannot save checkpoint with meta tensors (no data)."
                 )
-
             pt_state = {
                 k: (v.detach() if torch.is_tensor(v) else v)
                 for k, v in pt_state.items()
@@ -564,7 +562,6 @@ def _update_history(
             records = raw if isinstance(raw, list) else []
             meta = {}
         run_stats = _reduce_batch_stats(records)
-
         epochs_val = (
             int(meta.get("epochs", epochs)) if isinstance(meta, dict) else int(epochs)
         )
@@ -574,7 +571,6 @@ def _update_history(
             else float(val_frac)
         )
         sampled_n = int(meta.get("sampled_n", 0)) if isinstance(meta, dict) else 0
-
         train_split_n_est = int(round(num_samples_dataset * max(0.0, 1.0 - frac_val)))
         sampled_n_est = int(round(train_split_n_est * max(1, epochs_val)))
         if sampled_n <= 0:
@@ -601,7 +597,6 @@ def _update_history(
         if cum_stats:
             setattr(model, "_history_cum_stats", cum_stats)
         history = getattr(model, "_train_history", []) or []
-
         model_dev_str: str | None = None
         with contextlib.suppress(Exception):
             import torch as _torch
@@ -613,7 +608,6 @@ def _update_history(
                 bufs = list(getattr(model, "buffers", lambda: [])())
                 if bufs:
                     model_dev_str = str(bufs[0].device)
-
         train_dev_str: str | None = None
         if train_device is not None:
             with contextlib.suppress(Exception):
@@ -625,11 +619,9 @@ def _update_history(
                 train_dev_str = str(_get_device())
         if not train_dev_str:
             train_dev_str = model_dev_str
-
         posix_time = None
         with contextlib.suppress(Exception):
             posix_time = float(time.time())
-
         record = {
             "run_index": len(history),
             "posix_time": posix_time,
@@ -644,10 +636,8 @@ def _update_history(
             **(run_stats or {}),
             **(cum_stats or {}),
         }
-
         if model_dev_str and train_dev_str and str(model_dev_str) != str(train_dev_str):
             record["model_device"] = model_dev_str
-
         env_meta: Dict[str, Any] = dict(meta) if isinstance(meta, dict) else {}
         for k in (
             "epochs",
@@ -661,7 +651,7 @@ def _update_history(
             env_meta.pop(k, None)
         with contextlib.suppress(Exception):
             import sys as _sys
-
+            
             env_meta.setdefault("python", _sys.version.split()[0])
         with contextlib.suppress(Exception):
             import torch as _torch
@@ -768,7 +758,6 @@ def load_model(
     load_dev = (
         torch.device(map_location) if map_location is not None else torch.device("cpu")
     )
-
     if p.is_dir():
         meta = _parse_meta(p)
         use_in_dim = int(in_dim if in_dim is not None else meta.get("in_dim") or 0)
@@ -874,7 +863,6 @@ def load_model(
         meta_in_dim = obj.get("in_dim")
         meta_out_shape = obj.get("out_shape")
         meta_cfg = obj.get("config")
-
         sd = None
         for k in (
             "state_dict",
@@ -888,7 +876,6 @@ def load_model(
             if isinstance(v, dict):
                 sd = v
                 break
-
         if sd is None:
             try:
                 if obj and all(
@@ -897,7 +884,6 @@ def load_model(
                     sd = obj
             except Exception:
                 sd = None
-
         if sd is None:
             raise RuntimeError(
                 f"Checkpoint did not contain a recognizable state_dict: {str(p)!r}"
@@ -958,7 +944,6 @@ def save_model(
             raise TypeError(
                 "Positional args are only supported for export converters; use keyword arguments for TorchIO.save()."
             )
-
         if openzl_level is not None:
             kwargs["openzl_level"] = openzl_level
         if openzl_format_version is not None:
@@ -972,7 +957,6 @@ def save_model(
         if openzl_permissive is not None:
             kwargs["openzl_permissive"] = openzl_permissive
         kwargs.setdefault("openzl_pack_by_dtype", openzl_pack_by_dtype)
-
         merged_extra = dict(extra or {})
         if ema_averager is not None and hasattr(ema_averager, "state_dict"):
             with contextlib.suppress(Exception):
@@ -1074,9 +1058,7 @@ def train(
             init_dir = tempfile.mkdtemp(prefix=f"enn_init_ckpt_{run_id}_")
         else:
             init_dir = new_dir("init_ckpt")
-
         init_ckpt_path = os.path.join(init_dir, "model.pt")
-
         _save_model_checkpoint(
             model,
             init_dir,
@@ -1084,14 +1066,12 @@ def train(
             save_pt=True,
             overwrite=True,
         )
-
         cfg_raw = _extract_model_config_dict(model)
         cfg_dict = (
             coerce_model_config(cfg_raw).to_dict()
             if cfg_raw
             else ModelConfig().to_dict()
         )
-
         parent_to_meta = False
         if isinstance(model, torch.nn.Module) and env_bool(
             "ENN_PARENT_MODEL_TO_META", default=True
@@ -1183,7 +1163,6 @@ def train(
             if os.path.isfile(fp):
                 fallback = fp
                 break
-
         if fallback is not None:
             loaded = load_model(
                 fallback,
@@ -1193,7 +1172,6 @@ def train(
                 openzl_memmap=True,
             )
             cpu_state = coerce_tensor(loaded.state_dict())
-
             if isinstance(model, torch.nn.Module) and _has_meta_tensors(model):
                 with contextlib.suppress(Exception):
                     _materialize_to_cpu(model)
@@ -1219,7 +1197,6 @@ def train(
         return model
     finally:
         restore_path: str | None = None
-
         with contextlib.suppress(Exception):
             for _name in ("model.ozl", "model.pt"):
                 fp = os.path.join(str(ckpt_dir or ""), _name)
@@ -1228,7 +1205,6 @@ def train(
                     break
         if restore_path is None and init_ckpt_path and os.path.isfile(init_ckpt_path):
             restore_path = init_ckpt_path
-
         if isinstance(model, torch.nn.Module) and restore_path:
             try:
                 _meta = False
