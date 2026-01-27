@@ -14,6 +14,7 @@ from torch.nn import functional as F
 from ..core.graph import is_compiling
 from ..core.tensor import to_tensor_like
 
+
 Number = Union[float, int]
 TensorLike = Union[Number, torch.Tensor]
 
