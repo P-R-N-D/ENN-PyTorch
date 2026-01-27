@@ -277,13 +277,10 @@ class Perceiver(nn.Module):
         self.depth = max(1, int(depth))
         self.self_attn_layers = max(0, int(self_attn_layers))
         self.norm_type = str(norm_type)
-
         self.latents = nn.Parameter(torch.randn(self.num_latents, self.d_model) * 0.02)
-
         total_layers = int(self.depth) * (1 + int(self.self_attn_layers))
         drops = stochastic_depth_schedule(float(drop_path), total_layers)
         dp_it = iter(drops)
-
         self.cross = nn.ModuleList(
             [
                 Resampler(
@@ -323,7 +320,6 @@ class Perceiver(nn.Module):
             )
         B = tokens.size(0)
         latents = self.latents.unsqueeze(0).expand(B, -1, -1)
-
         j = 0
         for i in range(int(self.depth)):
             latents = self.cross[i](latents, tokens, attn_bias=attn_bias)
