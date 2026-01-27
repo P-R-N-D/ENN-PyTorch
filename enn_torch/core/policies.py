@@ -44,6 +44,7 @@ from .system import (
 if TYPE_CHECKING:
     from ..data.pipeline import Dataset
 
+
 _TORCH_INTEROP_LOCKED: bool = False
 _TORCH_INTEROP_THREADS_SET: Optional[int] = None
 _TORCH_NUM_THREADS_SET: Optional[int] = None
@@ -438,7 +439,6 @@ class LoaderPolicy:
         from .concurrency import new_prefetcher
 
         max_batches = self.hard_inflight_batches(device)
-
         with contextlib.suppress(Exception):
             dev = (
                 torch.device(device)
@@ -1246,23 +1246,22 @@ class PrecisionPolicy:
             )
             else torch.float64
         )
-
-        if dev.type == "cuda":
-            if is_negotiable and is_scale_safe(
-                torch.float32, meta, safety_margin=safety
-            ):
-                master_float = torch.float32
-            if is_cuda_bf16_supported(dev) and is_scale_safe(
-                torch.bfloat16, meta, safety_margin=safety
-            ):
+        match dev.type:
+            case "cuda":
+                if is_negotiable and is_scale_safe(
+                    torch.float32, meta, safety_margin=safety
+                ):
+                    master_float = torch.float32
+                if is_cuda_bf16_supported(dev) and is_scale_safe(
+                    torch.bfloat16, meta, safety_margin=safety
+                ):
+                    amp_dtype = torch.bfloat16
+                elif is_scale_safe(torch.float16, meta, safety_margin=safety):
+                    amp_dtype = torch.float16
+            case "xpu":
                 amp_dtype = torch.bfloat16
-            elif is_scale_safe(torch.float16, meta, safety_margin=safety):
+            case "mps":
                 amp_dtype = torch.float16
-        elif dev.type == "xpu":
-            amp_dtype = torch.bfloat16
-        elif dev.type == "mps":
-            amp_dtype = torch.float16
-
         fsdp_dt = (
             amp_dtype
             if master_float == torch.float32 and amp_dtype
@@ -1292,19 +1291,14 @@ class PrecisionPolicy:
 @dataclass
 class CollectivePolicy:
     backend: str = "c10d"
-
     include_parameters: bool = True
     include_buffers: bool = True
     max_buffer_size_mb: int = 25
-
     coalesce_mb: int = 64
     max_tensor_mb_for_coalesce: int = 8
-
     inter_stream_mb: int = 16
     intra_stream_mb: int = 64
-
     max_inflight_mb: int = 64
-
     debug_collectives: bool = False
     verbose: bool = False
 
@@ -1339,7 +1333,6 @@ class CollectivePolicy:
             .strip()
             .lower()
         )
-
         include_parameters = getenv_bool_any(
             "ENN_COLLECTIVE_INCLUDE_PARAMETERS",
             "ENN_BCAST_INCLUDE_PARAMETERS",
@@ -1350,13 +1343,11 @@ class CollectivePolicy:
             "ENN_BCAST_INCLUDE_BUFFERS",
             True,
         )
-
         max_buffer_size_mb = getenv_int_any(
             "ENN_COLLECTIVE_MAX_BUFFER_SIZE_MB",
             "ENN_BCAST_MAX_BUFFER_SIZE_MB",
             25,
         )
-
         coalesce_mb = getenv_int_any(
             "ENN_COLLECTIVE_COALESCE_MB", "ENN_BCAST_COALESCE_MB", 64
         )
@@ -1365,7 +1356,6 @@ class CollectivePolicy:
             "ENN_BCAST_MAX_TENSOR_MB_FOR_COALESCE",
             8,
         )
-
         inter_stream_mb = getenv_int_any(
             "ENN_COLLECTIVE_INTER_STREAM_MB",
             "ENN_BCAST_INTER_STREAM_MB",
@@ -1376,20 +1366,17 @@ class CollectivePolicy:
             "ENN_BCAST_INTRA_STREAM_MB",
             64,
         )
-
         max_inflight_mb = getenv_int_any(
             "ENN_COLLECTIVE_MAX_INFLIGHT_MB",
             "ENN_BCAST_MAX_INFLIGHT_MB",
             64,
         )
-
         debug_collectives = getenv_bool_any(
             "ENN_COLLECTIVE_DEBUG", "ENN_BCAST_DEBUG", False
         )
         verbose = getenv_bool_any(
             "ENN_COLLECTIVE_VERBOSE", "ENN_BCAST_VERBOSE", False
         )
-
         return cls(
             backend=backend,
             include_parameters=include_parameters,
@@ -1409,9 +1396,7 @@ class CollectivePolicy:
 class DistributedPolicy:
     prefer_hsdp: bool = True
     prefer_ddp: bool = True
-
     sync_state: bool = True
-
     collective: CollectivePolicy = field(default_factory=CollectivePolicy)
 
     @classmethod
@@ -1427,7 +1412,6 @@ class DistributedPolicy:
         prefer_hsdp = getenv_bool("ENN_DISTRIBUTED_PREFER_HSDP", True)
         prefer_ddp = getenv_bool("ENN_DISTRIBUTED_PREFER_DDP", True)
         sync_state = getenv_bool("ENN_DISTRIBUTED_SYNC_STATE", True)
-
         return cls(
             prefer_hsdp=prefer_hsdp,
             prefer_ddp=prefer_ddp,
