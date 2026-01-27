@@ -91,7 +91,6 @@ def _build_model_and_sample(
     model = new_model(in_dim=td_train["X"].shape[1], out_shape=(S, T), config=cfg).to(
         device
     )
-
     if os.environ.get("ENN_DEPLOYMENT_DEBUG_EXTRA", "0").strip().lower() in (
         "1",
         "true",
@@ -240,7 +239,6 @@ def _ensure_state_shapes_for_scaler(
             continue
         if not torch.is_tensor(val):
             continue
-
         parts = full_key.split(".")
         mod = model
         ok = True
@@ -254,10 +252,8 @@ def _ensure_state_shapes_for_scaler(
                 break
         if not ok:
             continue
-
         name = parts[-1]
         tgt = val.detach()
-
         if hasattr(mod, "_buffers") and name in getattr(mod, "_buffers", {}):
             buf = mod._buffers.get(name)
             if torch.is_tensor(buf) and tuple(buf.shape) != tuple(tgt.shape):
@@ -268,7 +264,6 @@ def _ensure_state_shapes_for_scaler(
                 )
                 setattr(mod, name, mod._buffers[name])
             continue
-
         if hasattr(mod, "_parameters") and name in getattr(mod, "_parameters", {}):
             prm = mod._parameters.get(name)
             if (
@@ -351,13 +346,11 @@ def _draft_export_diagnostics(
     except Exception as exc:
         info["error"] = f"torch.export import failed: {exc!r}"
         return info
-
     try:
         from enn_torch.runtime.wrappers import _onnx_model, _TensorOutputModule
     except Exception as exc:
         info["error"] = f"could not import ONNX wrapper helpers: {exc!r}"
         return info
-
     Dim = getattr(tex, "Dim", None)
     dyn_candidates: list[Any] = [None]
     if Dim is not None:
@@ -374,7 +367,6 @@ def _draft_export_diagnostics(
                 {"x": {0: bdim}},
                 ({0: bdim},),
             ] + dyn_candidates
-
     try:
         with _onnx_model(model) as serving_model:
             wrapper = _TensorOutputModule(serving_model).eval()
@@ -600,7 +592,6 @@ def export_and_validate(
             except Exception as exc:
                 err_s = repr(exc)
                 results[name] = {"status": "error", "error": err_s}
-
     validation: Dict[str, Any] = {}
     try:
         y = td_train["Y"].detach().cpu().numpy()
@@ -688,7 +679,6 @@ def export_and_validate(
                 )
             except Exception as exc:
                 validation["pt2_mae_alt_error"] = repr(exc)
-
     onnx_res = results.get("onnx", {})
     if isinstance(onnx_res, dict) and onnx_res.get("status") == "error":
         err = str(onnx_res.get("error", ""))
@@ -697,7 +687,6 @@ def export_and_validate(
                 validation["onnx_draft_export"] = _draft_export_diagnostics(
                     model, sample
                 )
-
     for name in ("onnx", "ort"):
         path = targets[name]
         if path.exists():
@@ -727,7 +716,6 @@ def main() -> None:
     args, _ = ap.parse_known_args()
     if args.export_only:
         raise SystemExit(_export_only_main(args.export_only, args.out, args.state))
-
     os.environ.setdefault("ENN_PREBATCH", "1")
     os.environ.setdefault("ENN_PREFETCH_FACTOR", "1")
     data, td_train, model, sample = _build_model_and_sample(torch.device("cpu"))
