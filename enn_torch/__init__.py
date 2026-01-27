@@ -2,11 +2,11 @@
 from __future__ import annotations
 
 import importlib
-import importlib.abc
-import importlib.util
 import sys
 from types import ModuleType
 from typing import TYPE_CHECKING, Any
+
+from .core import config as _config
 
 if TYPE_CHECKING:
     from tensordict import TensorDictBase
@@ -26,51 +26,13 @@ __all__ = [
     "train",
 ]
 
-
-class _ConfigModuleLoader(importlib.abc.Loader):
-    def create_module(self, spec: importlib.machinery.ModuleSpec) -> ModuleType:
-        module = ModuleType(spec.name)
-        module.__spec__ = spec
-        module.__loader__ = self
-        return module
-
-    def exec_module(self, module: ModuleType) -> None:
-        core_module = importlib.import_module("enn_torch.core.config")
-        module.__dict__.update(core_module.__dict__)
-        module.__dict__["__name__"] = module.__spec__.name if module.__spec__ else module.__name__
-        module.__dict__["__package__"] = "enn_torch"
-
-
-class _ConfigModuleFinder(importlib.abc.MetaPathFinder):
-    _TARGET = "enn_torch.config"
-
-    def find_spec(
-        self,
-        fullname: str,
-        path: list[str] | None,
-        target: ModuleType | None = None,
-    ) -> importlib.machinery.ModuleSpec | None:
-        if fullname != self._TARGET:
-            return None
-        return importlib.util.spec_from_loader(fullname, _ConfigModuleLoader())
-
-
-def _install_config_alias() -> None:
-    if "enn_torch.config" in sys.modules:
-        return
-    for finder in sys.meta_path:
-        if isinstance(finder, _ConfigModuleFinder):
-            return
-    sys.meta_path.insert(0, _ConfigModuleFinder())
+sys.modules[f"{__name__}.config"] = _config
+config = _config
 
 
 def __getattr__(name: str) -> ModuleType:
     if name == "config":
-        _install_config_alias()
-        module = importlib.import_module("enn_torch.core.config")
-        sys.modules.setdefault(f"{__name__}.config", module)
-        globals()["config"] = module
-        return module
+        return config
     if name in {"core", "data", "nn", "runtime"}:
         return importlib.import_module(f"enn_torch.{name}")
     raise AttributeError(f"module 'enn_torch' has no attribute {name!r}")
@@ -104,6 +66,3 @@ def predict(*args: Any, **kwargs: Any) -> TensorDictBase | dict[str, TensorDictB
     from .runtime import workflow
 
     return workflow.predict(*args, **kwargs)
-
-
-_install_config_alias()
