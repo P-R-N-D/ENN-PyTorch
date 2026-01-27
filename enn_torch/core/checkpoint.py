@@ -20,7 +20,6 @@ except Exception:
 else:
     _TORCH_CHECKPOINT = torch.utils.checkpoint.checkpoint
 
-
 _CKPT_TL = threading.local()
 
 
@@ -175,18 +174,15 @@ def coerce_checkpoint(
         if force_reentrant is not None
         else bool(is_dtensor_active())
     )
-
     use_reentrant = ckpt_kwargs.pop("use_reentrant", None)
     preserve_rng_state = ckpt_kwargs.pop("preserve_rng_state", None)
     determinism_check = ckpt_kwargs.pop("determinism_check", None)
-
     if use_reentrant is None:
         use_reentrant = True
     if require_reentrant:
         use_reentrant = True
     if preserve_rng_state is None:
         preserve_rng_state = True
-
     ck_opts = {
         k: v
         for k, v in [
@@ -196,10 +192,8 @@ def coerce_checkpoint(
         ]
         if v is not None
     }
-
     tried: set[tuple[tuple[str, object], ...]] = set()
     last_type_error: TypeError | None = None
-
     opts_list: list[dict[str, object]] = [
         ck_opts,
         {k: v for k, v in ck_opts.items() if k != "determinism_check"},
@@ -218,7 +212,6 @@ def coerce_checkpoint(
                 {},
             ]
         )
-
     for opts in opts_list:
         key = tuple(sorted(opts.items()))
         if key in tried:
@@ -231,7 +224,6 @@ def coerce_checkpoint(
                 raise
             last_type_error = e
             continue
-
     if require_reentrant:
         raise TypeError(
             "DTensor/FSDP2 checkpointing requires `use_reentrant=True`, but torch.utils.checkpoint.checkpoint did not accept a compatible signature in this runtime. Upgrade PyTorch or set ENN_CKPT_REQUIRE_REENTRANT=0 to override."
