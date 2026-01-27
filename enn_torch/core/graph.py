@@ -16,7 +16,6 @@ from .datatypes import env_bool, env_first, env_first_int
 from .system import CPU, is_accelerator_available
 from .tensor import is_meta_or_fake_tensor
 
-
 _COLLECTIVE_NAMES: tuple[str, ...] = (
     "all_gather",
     "all_gather_into_tensor",
@@ -331,9 +330,7 @@ def is_compiling() -> bool:
     fn = getattr(dyn, "is_compiling", None) if dyn is not None else None
     if callable(fn) and bool(fn()):
         return True
-    fn = (
-        getattr(dyn, "is_dynamo_compiling", None) if dyn is not None else None
-    )
+    fn = getattr(dyn, "is_dynamo_compiling", None) if dyn is not None else None
     if callable(fn) and bool(fn()):
         return True
 
@@ -346,7 +343,9 @@ def is_compiling() -> bool:
 
 def is_fake_tensor_mode_active() -> bool:
     subclasses = getattr(torch, "_subclasses", None)
-    ft_mod = getattr(subclasses, "fake_tensor", None) if subclasses is not None else None
+    ft_mod = (
+        getattr(subclasses, "fake_tensor", None) if subclasses is not None else None
+    )
     FakeTensorMode = getattr(ft_mod, "FakeTensorMode", None)
     if FakeTensorMode is None:
         return False
@@ -378,17 +377,13 @@ def is_tracing_or_exporting() -> bool:
 
 def is_export_or_trace() -> bool:
     return bool(
-        is_tracing_or_exporting()
-        or is_compiling()
-        or is_fake_tensor_mode_active()
+        is_tracing_or_exporting() or is_compiling() or is_fake_tensor_mode_active()
     )
 
 
 def is_symbolic() -> bool:
     return bool(
-        is_tracing_or_exporting()
-        or is_compiling()
-        or is_fake_tensor_mode_active()
+        is_tracing_or_exporting() or is_compiling() or is_fake_tensor_mode_active()
     )
 
 
@@ -417,9 +412,7 @@ def assert_trace(condition: object, message: str = "") -> None:
 def canonicalize_compile_mode(mode: object | None) -> str:
     if not isinstance(mode, str):
         return "disabled"
-    compact_mode = (
-        mode.lower().replace("_", "").replace("-", "").replace(" ", "")
-    )
+    compact_mode = mode.lower().replace("_", "").replace("-", "").replace(" ", "")
     mode_map = {
         "default": "default",
         "aoteager": "aot-eager",
@@ -462,9 +455,7 @@ def is_nvidia_te_available(model: torch.nn.Module) -> bool:
         return True
     for module in model.modules():
         mod_name = getattr(module.__class__, "__module__", "")
-        if isinstance(mod_name, str) and mod_name.startswith(
-            "transformer_engine"
-        ):
+        if isinstance(mod_name, str) and mod_name.startswith("transformer_engine"):
             try:
                 setattr(model, "__enn_cached_is_nvidia_te_available__", True)
             except Exception:
@@ -526,10 +517,7 @@ def compile(
     if _inductor_config is not None:
         with _INDUCTOR_CONFIG_LOCK:
             try:
-                if (
-                    getattr(_inductor_config, "compile_threads", None)
-                    is not None
-                ):
+                if getattr(_inductor_config, "compile_threads", None) is not None:
                     override = env_first(
                         (
                             "ENN_INDUCTOR_COMPILE_THREADS",
@@ -538,13 +526,9 @@ def compile(
                         None,
                     )
                     if override is None:
-                        override = env_first(
-                            ("TORCHINDUCTOR_COMPILE_THREADS",), None
-                        )
+                        override = env_first(("TORCHINDUCTOR_COMPILE_THREADS",), None)
                     if override is not None:
-                        _inductor_config.compile_threads = max(
-                            1, int(override)
-                        )
+                        _inductor_config.compile_threads = max(1, int(override))
                     else:
                         local_world = env_first_int(
                             (
@@ -574,9 +558,7 @@ def compile(
                 def _snapshot(attr: str) -> None:
                     if hasattr(_inductor_config, attr):
                         with suppress(Exception):
-                            _restore_inductor[attr] = getattr(
-                                _inductor_config, attr
-                            )
+                            _restore_inductor[attr] = getattr(_inductor_config, attr)
 
                 for _attr in (
                     "autotune_in_subproc",
@@ -620,31 +602,21 @@ def compile(
                         )
                         is not None
                     ):
-                        _inductor_config.max_autotune_gemm_search_space = (
-                            "DEFAULT"
-                        )
+                        _inductor_config.max_autotune_gemm_search_space = "DEFAULT"
                         _want("max_autotune_gemm_search_space", "DEFAULT")
                 with suppress(Exception):
                     if (
-                        getattr(
-                            _inductor_config, "max_autotune_pointwise", None
-                        )
+                        getattr(_inductor_config, "max_autotune_pointwise", None)
                         is not None
                     ):
                         _inductor_config.max_autotune_pointwise = False
                         _want("max_autotune_pointwise", False)
                 with suppress(Exception):
-                    if (
-                        getattr(_inductor_config, "max_autotune_gemm", None)
-                        is not None
-                    ):
+                    if getattr(_inductor_config, "max_autotune_gemm", None) is not None:
                         _inductor_config.max_autotune_gemm = True
                         _want("max_autotune_gemm", True)
                 with suppress(Exception):
-                    if (
-                        getattr(_inductor_config, "compile_threads", None)
-                        is not None
-                    ):
+                    if getattr(_inductor_config, "compile_threads", None) is not None:
                         override_raw = env_first(
                             (
                                 "ENN_INDUCTOR_COMPILE_THREADS",
@@ -698,9 +670,7 @@ def compile(
             compile_kwargs["options"] = options_merged
         inductor_cfg = _get_inductor_config()
         patch = (
-            getattr(inductor_cfg, "patch", None)
-            if inductor_cfg is not None
-            else None
+            getattr(inductor_cfg, "patch", None) if inductor_cfg is not None else None
         )
         patchable: Dict[str, Any] = {}
 
@@ -712,9 +682,7 @@ def compile(
                 obj = getattr(obj, part)
             return True
 
-        if isinstance(compile_kwargs.get("options", None), dict) and callable(
-            patch
-        ):
+        if isinstance(compile_kwargs.get("options", None), dict) and callable(patch):
             options_dict = dict(compile_kwargs.get("options") or {})
             if options_dict:
                 patchable = {
@@ -754,9 +722,7 @@ def compile(
                 self._enn_patch_fn = patch_fn
                 self._enn_patch_dict = dict(patch_dict or {})
 
-            def forward(
-                self, *f_args: Any, **f_kwargs: Any
-            ) -> Any:
+            def forward(self, *f_args: Any, **f_kwargs: Any) -> Any:
                 cfg = self._enn_cfg
                 if cfg is None or (
                     not self._enn_overrides and not self._enn_patch_dict
@@ -770,8 +736,7 @@ def compile(
 
                     cm = (
                         self._enn_patch_fn(self._enn_patch_dict)
-                        if callable(self._enn_patch_fn)
-                        and self._enn_patch_dict
+                        if callable(self._enn_patch_fn) and self._enn_patch_dict
                         else nullcontext()
                     )
                     try:
@@ -788,14 +753,10 @@ def compile(
                 except AttributeError:
                     return getattr(self._enn_inner, name)
 
-            def state_dict(
-                self, *sd_args: Any, **sd_kwargs: Any
-            ) -> Any:
+            def state_dict(self, *sd_args: Any, **sd_kwargs: Any) -> Any:
                 return self._enn_inner.state_dict(*sd_args, **sd_kwargs)
 
-            def load_state_dict(
-                self, *ls_args: Any, **ls_kwargs: Any
-            ) -> Any:
+            def load_state_dict(self, *ls_args: Any, **ls_kwargs: Any) -> Any:
                 return self._enn_inner.load_state_dict(*ls_args, **ls_kwargs)
 
         return _ScopedInductorCompiled(
@@ -828,9 +789,7 @@ def torch_compiler_supported() -> bool:
         pass
     try:
         comp = getattr(torch, "compiler", None)
-        is_exporting = (
-            getattr(comp, "is_exporting", None) if comp is not None else None
-        )
+        is_exporting = getattr(comp, "is_exporting", None) if comp is not None else None
         if callable(is_exporting) and bool(is_exporting()):
             return False
     except Exception:
@@ -961,9 +920,7 @@ def torch_compiler_disable(
 def compile_distributed_safe(
     *args: Any, collectives: tuple[str, ...] = _COLLECTIVE_NAMES
 ) -> bool:
-    if _TORCH_DYNAMO is None or not hasattr(
-        _TORCH_DYNAMO, "disallow_in_graph"
-    ):
+    if _TORCH_DYNAMO is None or not hasattr(_TORCH_DYNAMO, "disallow_in_graph"):
         return False
     try:
         import torch.distributed as dist
@@ -1006,9 +963,7 @@ def compile_safe(
                 layers_module = importlib.import_module(mod_name)
                 break
     scaler_cls = (
-        getattr(layers_module, "Scaler", None)
-        if layers_module is not None
-        else None
+        getattr(layers_module, "Scaler", None) if layers_module is not None else None
     )
     if scaler_cls is None:
         for mod_name in ("enn_torch.nn.layers", "enn_torch.nn.blocks"):
@@ -1033,9 +988,7 @@ def compile_safe(
                 recursive=False,
             )
     history_cls = (
-        getattr(layers_module, "Recorder", None)
-        if layers_module is not None
-        else None
+        getattr(layers_module, "Recorder", None) if layers_module is not None else None
     )
     if history_cls is None:
         for mod_name in ("enn_torch.nn.layers", "enn_torch.nn.blocks"):

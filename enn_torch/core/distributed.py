@@ -47,10 +47,7 @@ def _set_dtensor_active() -> None:
 
 
 def _from_hsdp_module(module: torch.nn.Module) -> None:
-    if not (
-        is_distributed()
-        and callable(unshard := getattr(module, "unshard", None))
-    ):
+    if not (is_distributed() and callable(unshard := getattr(module, "unshard", None))):
         return
     try:
         if (p0 := next(module.parameters(recurse=False), None)) is not None:
@@ -117,8 +114,7 @@ def _format_endpoint(host: str, port: int) -> str:
     try:
         h = (
             f"[{h}]"
-            if ipaddress.ip_address(_coerce_ip_addr(h)).version == 6
-            and ":" in h
+            if ipaddress.ip_address(_coerce_ip_addr(h)).version == 6 and ":" in h
             else h
         )
     except:
@@ -147,9 +143,9 @@ def _canonize_host(ep: str, default: str, link_local: bool) -> tuple[str, int]:
     if not ep:
         return default, 0
     host, port = _parse_endpoint(ep)
-    host = _canonize_ip(
-        host or default, loopback=True, link_local=link_local
-    ) or (default if _is_ip_addr(host) else host)
+    host = _canonize_ip(host or default, loopback=True, link_local=link_local) or (
+        default if _is_ip_addr(host) else host
+    )
     return host, port if 0 < port <= 65535 else 0
 
 
@@ -160,9 +156,7 @@ def _has_join_hook(obj: Any | None) -> bool:
 def _get_device_id(device: Optional[torch.device]) -> Optional[Iterable[int]]:
     return (
         [int(device.index)]
-        if device
-        and device.type in {"cuda", "xpu"}
-        and device.index is not None
+        if device and device.type in {"cuda", "xpu"} and device.index is not None
         else None
     )
 
@@ -208,9 +202,7 @@ def _get_preferred_ip_cached(
                 score == 2 and not allow_link_local
             ):
                 continue
-            found.append(
-                (score, ip.version == (6 if prefer_ipv6 else 4), canon)
-            )
+            found.append((score, ip.version == (6 if prefer_ipv6 else 4), canon))
     found.sort(key=lambda x: x[:2], reverse=True)
     if found:
         return found[0][2]
@@ -351,9 +343,7 @@ def _broadcast_large_tensor_gloox(
         else:
             cpu_chunk = torch.empty((n,), dtype=flat.dtype, device="cpu")
 
-        work = dist.broadcast(
-            cpu_chunk, src=src_rank, group=group, async_op=use_async
-        )
+        work = dist.broadcast(cpu_chunk, src=src_rank, group=group, async_op=use_async)
 
         if use_async:
             pending.append((work, cpu_chunk, offset, n))
@@ -411,9 +401,7 @@ def _broadcast_large_tensor(
         n = min(chunk_elems, total - offset)
         view = flat[offset : offset + n]
 
-        work = dist.broadcast(
-            view, src=src_rank, group=group, async_op=use_async
-        )
+        work = dist.broadcast(view, src=src_rank, group=group, async_op=use_async)
 
         if use_async:
             pending.append(work)
@@ -529,9 +517,7 @@ def resolve_ip_expr(
         if allow_link_local is not None
         else env_bool("ENN_ALLOW_LINK_LOCAL", False)
     )
-    if lit := _canonize_ip(
-        host_text, loopback=allow_loopback, link_local=link_local
-    ):
+    if lit := _canonize_ip(host_text, loopback=allow_loopback, link_local=link_local):
         return lit
     addrs = _safe_getaddrinfo(_coerce_ip_addr(host_text))
     if not addrs:
@@ -544,9 +530,7 @@ def resolve_ip_expr(
             )
         ):
             with contextlib.suppress(Exception):
-                res[
-                    ipaddress.ip_address(_coerce_ip_addr(canon)).version
-                ].append(canon)
+                res[ipaddress.ip_address(_coerce_ip_addr(canon)).version].append(canon)
     vers = (6, 4) if (prefer_ipv6 is None or prefer_ipv6) else (4, 6)
     for v in vers:
         if res[v]:
@@ -554,10 +538,7 @@ def resolve_ip_expr(
     if "%" in host_text and link_local:
         for v in vers:
             for ip in res[v]:
-                if (
-                    v == 6
-                    and ipaddress.ip_address(_coerce_ip_addr(ip)).is_link_local
-                ):
+                if v == 6 and ipaddress.ip_address(_coerce_ip_addr(ip)).is_link_local:
                     return f"{ip}%{host_text.partition('%')[2]}"
     return None
 
@@ -614,9 +595,7 @@ def is_port_available(
         ver = ipaddress.ip_address(_coerce_ip_addr(host_ip)).version
         family = socket.AF_INET6 if ver == 6 else socket.AF_INET
         addr = (host_ip, port, 0, 0) if ver == 6 else (host_ip, port)
-        with contextlib.closing(
-            socket.socket(family, socket.SOCK_STREAM)
-        ) as sock:
+        with contextlib.closing(socket.socket(family, socket.SOCK_STREAM)) as sock:
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             if ver == 6 and hasattr(socket, "IPV6_V6ONLY"):
                 with contextlib.suppress(OSError):
@@ -666,9 +645,7 @@ def get_available_host(
             if ver == 6
             else (socket.AF_INET, (host, 0))
         )
-        with contextlib.closing(
-            socket.socket(family, socket.SOCK_STREAM)
-        ) as sock:
+        with contextlib.closing(socket.socket(family, socket.SOCK_STREAM)) as sock:
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             if ver == 6 and hasattr(socket, "IPV6_V6ONLY"):
                 with contextlib.suppress(OSError):
@@ -700,13 +677,9 @@ def supported_ip_ver(
             with contextlib.closing(
                 socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
             ) as sock6:
-                if hasattr(socket, "IPPROTO_IPV6") and hasattr(
-                    socket, "IPV6_V6ONLY"
-                ):
+                if hasattr(socket, "IPPROTO_IPV6") and hasattr(socket, "IPV6_V6ONLY"):
                     with contextlib.suppress(OSError):
-                        sock6.setsockopt(
-                            socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1
-                        )
+                        sock6.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
                 sock6.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
                 sock6.bind((ipv6_host, 0, 0, 0))
                 ipv6_ok = True
@@ -782,9 +755,7 @@ def get_world_size(device: Optional[torch.device] = None) -> int:
         case "cuda" | "xpu" | "mps":
             with contextlib.suppress(Exception):
                 count = int(
-                    get_num_accelerators(
-                        str(getattr(dev, "type", "cpu") or "cpu")
-                    )
+                    get_num_accelerators(str(getattr(dev, "type", "cpu") or "cpu"))
                 )
                 if count > 0:
                     return count
@@ -821,9 +792,7 @@ def joining(
     return Join(joinables, throw_on_early_termination=True)
 
 
-def broadcast_scalar(
-    value: int | float, device: torch.device, src: int = 0
-) -> int:
+def broadcast_scalar(value: int | float, device: torch.device, src: int = 0) -> int:
     if not is_distributed():
         return int(value)
     try:
@@ -861,11 +830,7 @@ def distributed_barrier(
     if not is_distributed():
         return
 
-    if (
-        group is None
-        and device is not None
-        and not isinstance(device, torch.device)
-    ):
+    if group is None and device is not None and not isinstance(device, torch.device):
         with contextlib.suppress(Exception):
             from torch.distributed.distributed_c10d import ProcessGroup as _PG
 
@@ -925,9 +890,7 @@ def distributed_broadcast(
         return
 
     coalesce_bytes = max(1, int(policy.coalesce_mb)) * 1024 * 1024
-    max_tensor_bytes = (
-        max(1, int(policy.max_tensor_mb_for_coalesce)) * 1024 * 1024
-    )
+    max_tensor_bytes = max(1, int(policy.max_tensor_mb_for_coalesce)) * 1024 * 1024
 
     def _is_small(t: Tensor) -> bool:
         return (t.numel() * t.element_size()) <= max_tensor_bytes
@@ -941,9 +904,7 @@ def distributed_broadcast(
     )
     multi_node = bool(world_size > local_world_size)
 
-    chunk_mb = int(
-        policy.inter_stream_mb if multi_node else policy.intra_stream_mb
-    )
+    chunk_mb = int(policy.inter_stream_mb if multi_node else policy.intra_stream_mb)
     max_inflight_mb = int(policy.max_inflight_mb)
 
     backend = (policy.backend or "c10d").strip().lower()
@@ -965,9 +926,7 @@ def distributed_broadcast(
         for bucket in _iter_buckets_by_bytes(
             small_tensors, max_bucket_bytes=coalesce_bytes
         ):
-            _broadcast_bucket_gloox(
-                bucket, src_rank=src_rank, group=gloo_group
-            )
+            _broadcast_bucket_gloox(bucket, src_rank=src_rank, group=gloo_group)
 
         for t in large_tensors:
             _broadcast_large_tensor_gloox(
@@ -1221,9 +1180,7 @@ def get_distributed_mesh(
     is_consistent = True
     if dist.is_initialized():
         try:
-            my_size = torch.tensor(
-                [local_world_size], device=dev, dtype=torch.long
-            )
+            my_size = torch.tensor([local_world_size], device=dev, dtype=torch.long)
             gathered = [torch.zeros_like(my_size) for _ in range(world)]
             dist.all_gather(gathered, my_size)
             all_sizes = [t.item() for t in gathered]
@@ -1236,11 +1193,7 @@ def get_distributed_mesh(
     init_device_mesh = getattr(device_mesh, "init_device_mesh", None)
     if init_device_mesh is None:
         return (None, "none")
-    if (
-        is_consistent
-        and world > local_world_size
-        and world % local_world_size == 0
-    ):
+    if is_consistent and world > local_world_size and world % local_world_size == 0:
         dp_replicate = world // local_world_size
         dp_shard = local_world_size
         try:

@@ -43,9 +43,7 @@ def iter_checkpoint(root: nn.Module) -> Iterator[nn.Module]:
 
         if isinstance(root, nn.Module):
             for mod in root.modules():
-                if hasattr(mod, "_ckpt_min_bytes") and hasattr(
-                    mod, "_ckpt_enabled"
-                ):
+                if hasattr(mod, "_ckpt_min_bytes") and hasattr(mod, "_ckpt_enabled"):
                     yield mod
     except Exception:
         return
@@ -59,9 +57,7 @@ def to_checkpoint(
     ttl_steps: int,
     min_bytes: int,
 ) -> bool:
-    inst = to_submodule(model) or (
-        model.module if hasattr(model, "module") else model
-    )
+    inst = to_submodule(model) or (model.module if hasattr(model, "module") else model)
     if inst is None:
         return False
     try:
@@ -79,8 +75,7 @@ def to_checkpoint(
     cur_until = int(getattr(inst, "_enn_ckpt_pressure_until", 0) or 0)
     if (
         cur_until >= until
-        and int(getattr(inst, "_enn_ckpt_pressure_min_bytes", 0) or 0)
-        <= min_bytes
+        and int(getattr(inst, "_enn_ckpt_pressure_min_bytes", 0) or 0) <= min_bytes
     ):
         return False
     changed = False
@@ -122,9 +117,7 @@ def to_checkpoint(
 
 
 def from_checkpoint(model: nn.Module, *args: Any, step_total: int) -> None:
-    inst = to_submodule(model) or (
-        model.module if hasattr(model, "module") else model
-    )
+    inst = to_submodule(model) or (model.module if hasattr(model, "module") else model)
     if inst is None:
         return
     try:
@@ -176,9 +169,7 @@ def coerce_checkpoint(
         isinstance(a, torch.Tensor) and a.requires_grad for a in args
     ):
         return fn(*args)
-    force_reentrant = env_first(
-        ("ENN_CKPT_REQUIRE_REENTRANT",), default=None
-    )
+    force_reentrant = env_first(("ENN_CKPT_REQUIRE_REENTRANT",), default=None)
     require_reentrant = (
         env_bool("ENN_CKPT_REQUIRE_REENTRANT", default=False)
         if force_reentrant is not None
@@ -214,9 +205,7 @@ def coerce_checkpoint(
         {k: v for k, v in ck_opts.items() if k != "determinism_check"},
     ]
     if require_reentrant:
-        opts_list.extend(
-            [{k: v for k, v in ck_opts.items() if k == "use_reentrant"}]
-        )
+        opts_list.extend([{k: v for k, v in ck_opts.items() if k == "use_reentrant"}])
     else:
         opts_list.extend(
             [

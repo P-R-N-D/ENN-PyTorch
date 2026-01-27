@@ -16,10 +16,9 @@ import psutil
 import torch
 from tensordict import TensorDict
 
-from enn_torch.runtime.workflow import new_model, predict, train
 from enn_torch.config import ModelConfig, PatchConfig
 from enn_torch.core.system import get_device
-
+from enn_torch.runtime.workflow import new_model, predict, train
 
 COL_DIR = "방향"
 COL_ROUTE = "노선"
@@ -127,16 +126,10 @@ def build_dataset(xlsx_path: str) -> Dict[str, Any]:
     )
     long_df["지표"] = long_df["지표"].astype(float)
     long_df["요일타입_id"] = long_df["일종"].map(DAY_MAP).astype(int)
-    long_df["방향_id"] = (
-        long_df[COL_DIR].map({DIR_UP: 0, DIR_DOWN: 1}).astype(int)
-    )
-    long_df["canonical_section"] = long_df[COL_SECTION].apply(
-        _canonical_section
-    )
+    long_df["방향_id"] = long_df[COL_DIR].map({DIR_UP: 0, DIR_DOWN: 1}).astype(int)
+    long_df["canonical_section"] = long_df[COL_SECTION].apply(_canonical_section)
     long_df["seg_key"] = (
-        long_df[COL_ROUTE].astype(str).str.strip()
-        + "|"
-        + long_df["canonical_section"]
+        long_df[COL_ROUTE].astype(str).str.strip() + "|" + long_df["canonical_section"]
     )
     seg_meta = (
         long_df[["seg_key", COL_ROUTE, "canonical_section"]]
@@ -145,9 +138,7 @@ def build_dataset(xlsx_path: str) -> Dict[str, Any]:
         .reset_index(drop=True)
     )
     seg_meta["seg_idx"] = np.arange(len(seg_meta), dtype=np.int64)
-    long_df = long_df.merge(
-        seg_meta[["seg_key", "seg_idx"]], on="seg_key", how="left"
-    )
+    long_df = long_df.merge(seg_meta[["seg_key", "seg_idx"]], on="seg_key", how="left")
     S_orig = int(seg_meta.shape[0])
     T_orig = 24
     group_cols = ["월", "요일타입_id", "방향_id"]
@@ -181,18 +172,14 @@ def build_dataset(xlsx_path: str) -> Dict[str, Any]:
     y_vals = y_full[list(range(T_orig))].to_numpy(dtype=np.float32)
     Y_np = y_vals.reshape(B, S_orig, T_orig)
     row_map = (
-        long_df.groupby(group_cols + ["seg_idx"])["row_in_sheet"]
-        .min()
-        .reset_index()
+        long_df.groupby(group_cols + ["seg_idx"])["row_in_sheet"].min().reset_index()
     )
     row_full = (
         full_grid.merge(row_map, on=group_cols + ["seg_idx"], how="left")
         .fillna(-1)
         .sort_values(group_cols + ["seg_idx"])
     )
-    row_ids_np = (
-        row_full["row_in_sheet"].to_numpy(dtype=np.int64).reshape(B, S_orig)
-    )
+    row_ids_np = row_full["row_in_sheet"].to_numpy(dtype=np.int64).reshape(B, S_orig)
     grid_dim = max(S_orig, T_orig)
     Y_pad = np.zeros((B, grid_dim, grid_dim), dtype=np.float32)
     Y_pad[:, :S_orig, :T_orig] = Y_np
@@ -321,7 +308,9 @@ def main() -> None:
         model.update_task("extra_spatial", weight=0.5)
         print("[lifecycle] tasks:", model.list_tasks())
     train_epochs = 6
-    print("[train] starting... (elastic_launch inside enn_torch.runtime.workflow.train)")
+    print(
+        "[train] starting... (elastic_launch inside enn_torch.runtime.workflow.train)"
+    )
     trained_model, train_metrics = monitor_run(
         lambda: train(
             model,
@@ -337,9 +326,7 @@ def main() -> None:
     print("train duration (s):", train_metrics["duration_s"])
     print("train CPU avg per core:", train_metrics["cpu_avg"])
     print("train CPU peak per core:", train_metrics["cpu_peak"])
-    print(
-        "train peak RSS MB:", round(train_metrics["mem_peak"] / (1024**2), 2)
-    )
+    print("train peak RSS MB:", round(train_metrics["mem_peak"] / (1024**2), 2))
 
     hist = []
     with contextlib.suppress(Exception):
@@ -370,9 +357,7 @@ def main() -> None:
     print("predict duration (s):", pred_metrics["duration_s"])
     print("predict CPU avg per core:", pred_metrics["cpu_avg"])
     print("predict CPU peak per core:", pred_metrics["cpu_peak"])
-    print(
-        "predict peak RSS MB:", round(pred_metrics["mem_peak"] / (1024**2), 2)
-    )
+    print("predict peak RSS MB:", round(pred_metrics["mem_peak"] / (1024**2), 2))
 
     Y_pred = pred_result["Y"]
     if hasattr(Y_pred, "detach"):

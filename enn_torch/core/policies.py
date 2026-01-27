@@ -12,9 +12,9 @@ from typing import (
     List,
     Optional,
     Protocol,
+    Self,
     Tuple,
     Union,
-    Self,
 )
 
 import torch
@@ -139,9 +139,7 @@ class WorkerPolicy:
                         mps_backend = getattr(torch.backends, "mps", None)
                         if (
                             mps_backend is not None
-                            and callable(
-                                getattr(mps_backend, "is_available", None)
-                            )
+                            and callable(getattr(mps_backend, "is_available", None))
                             and mps_backend.is_available()
                         ):
                             dev_type = "mps"
@@ -184,14 +182,10 @@ class WorkerPolicy:
             if not allow_over and int(local_world_guess) > int(nacc):
                 local_world_guess = int(nacc)
         _nogil = bool(CPU.is_optimized_for_no_gil())
-        cap_mult = _default_thread_limit(
-            ncpu_raw, is_accel=is_accel, nogil=_nogil
-        )
+        cap_mult = _default_thread_limit(ncpu_raw, is_accel=is_accel, nogil=_nogil)
         distribute_default = int(local_world_guess) > 1
         distribute = bool(
-            env_first_int(
-                ("ENN_DISTRIBUTE_THREAD_CAP",), int(distribute_default)
-            )
+            env_first_int(("ENN_DISTRIBUTE_THREAD_CAP",), int(distribute_default))
         )
         thread_cap = _optimal_threads(
             ncpu=ncpu_raw,
@@ -204,20 +198,14 @@ class WorkerPolicy:
         with contextlib.suppress(Exception):
             lp = LoaderPolicy()
             hard = int(lp.hard_inflight_batches(dev_type))
-            soft_inflight = max(
-                1, int(hard * max(1, int(lp.soft_cap_multiplier)))
-            )
-        soft_auto_enabled = bool(
-            env_first_int(("ENN_SOFT_INFLIGHT_AUTO",), 1)
-        )
+            soft_inflight = max(1, int(hard * max(1, int(lp.soft_cap_multiplier))))
+        soft_auto_enabled = bool(env_first_int(("ENN_SOFT_INFLIGHT_AUTO",), 1))
         soft_inflight_max_default = (
             (32 if is_accel else 24) if _nogil else (16 if is_accel else 12)
         )
         soft_inflight_max = max(
             8,
-            env_first_int(
-                ("ENN_SOFT_INFLIGHT_MAX",), soft_inflight_max_default
-            ),
+            env_first_int(("ENN_SOFT_INFLIGHT_MAX",), soft_inflight_max_default),
         )
         soft_inflight_explicit = env_first_int(("ENN_SOFT_INFLIGHT_CAP",), 0)
         if soft_inflight_explicit > 0:
@@ -225,9 +213,7 @@ class WorkerPolicy:
         elif soft_auto_enabled:
             soft_base = max(0, env_first_int(("ENN_SOFT_INFLIGHT_BASE",), 2))
             soft_div = max(1, env_first_int(("ENN_SOFT_INFLIGHT_DIV",), 4))
-            auto_soft = int(soft_base) + max(
-                0, int(eff_cores) // int(soft_div)
-            )
+            auto_soft = int(soft_base) + max(0, int(eff_cores) // int(soft_div))
             soft_inflight = max(
                 int(soft_inflight), min(int(auto_soft), int(soft_inflight_max))
             )
@@ -254,9 +240,7 @@ class WorkerPolicy:
                 model_ratio = 0.85
         with contextlib.suppress(Exception):
             env_key = (
-                "ENN_MODEL_CORE_RATIO_ACCEL"
-                if is_accel
-                else "ENN_MODEL_CORE_RATIO"
+                "ENN_MODEL_CORE_RATIO_ACCEL" if is_accel else "ENN_MODEL_CORE_RATIO"
             )
             model_ratio = float(env_float(env_key, float(model_ratio)))
         model_ratio = float(max(0.25, min(1.0, model_ratio)))
@@ -269,9 +253,7 @@ class WorkerPolicy:
             inter_ops = max(2, min(8, model_budget // 6))
         inter_ops = max(1, min(int(inter_ops), max(1, int(model_budget) - 1)))
         intra_ops = max(1, int(model_budget) - int(inter_ops))
-        data_budget = max(
-            1, int(thread_cap) - (int(intra_ops) + int(inter_ops))
-        )
+        data_budget = max(1, int(thread_cap) - (int(intra_ops) + int(inter_ops)))
         prebatch = 1
         prefetch_factor = 1
         env_pre = env_str("ENN_PREBATCH")
@@ -289,15 +271,10 @@ class WorkerPolicy:
         prebatch = max(1, int(prebatch))
         prefetch_factor = max(1, int(prefetch_factor))
         base_workers = max(1, int(data_budget))
-        base_workers = min(
-            int(base_workers), int(thread_cap), int(soft_inflight)
-        )
+        base_workers = min(int(base_workers), int(thread_cap), int(soft_inflight))
         max_workers = max(
             1,
-            int(
-                (int(soft_inflight) - int(prebatch))
-                // max(1, int(prefetch_factor))
-            ),
+            int((int(soft_inflight) - int(prebatch)) // max(1, int(prefetch_factor))),
         )
         num_workers = max(
             1, min(int(base_workers), int(max_workers), int(soft_inflight))
@@ -311,12 +288,8 @@ class WorkerPolicy:
             else:
                 intra_ops = max(1, int(intra_ops) - int(overflow))
 
-            intra_ops = max(
-                1, int(thread_cap) - int(inter_ops) - int(num_workers)
-            )
-            max_concurrency = max(
-                1, min(int(max_concurrency), int(num_workers))
-            )
+            intra_ops = max(1, int(thread_cap) - int(inter_ops) - int(num_workers))
+            max_concurrency = max(1, min(int(max_concurrency), int(num_workers)))
         local_world = int(local_world_guess)
         return cls(
             nproc_per_node=local_world,
@@ -348,10 +321,7 @@ class WorkerPolicy:
         }
 
     def set_thread_setting(self: Self) -> None:
-        global \
-            _TORCH_NUM_THREADS_SET, \
-            _TORCH_INTEROP_THREADS_SET, \
-            _TORCH_INTEROP_LOCKED
+        global _TORCH_NUM_THREADS_SET, _TORCH_INTEROP_THREADS_SET, _TORCH_INTEROP_LOCKED
         intra = max(1, int(self.intra_ops))
         inter = max(1, int(self.inter_ops))
         with _TORCH_THREAD_CFG_LOCK:
@@ -378,11 +348,7 @@ class LoaderPolicy:
     soft_cap_multiplier: int = 2
 
     def hard_inflight_batches(self: Self, device: torch.device | str) -> int:
-        dev = (
-            torch.device(device)
-            if not isinstance(device, torch.device)
-            else device
-        )
+        dev = torch.device(device) if not isinstance(device, torch.device) else device
         if dev.type in ("cuda", "xpu", "mps"):
             return max(1, int(self.max_batches_accel))
         return max(1, int(self.max_batches_cpu))
@@ -404,9 +370,7 @@ class LoaderPolicy:
         if inflight > int(soft_cap) and num_workers > 0:
             prefetch_factor = max(
                 1,
-                int(
-                    (int(soft_cap) - int(prebatch)) // max(1, int(num_workers))
-                ),
+                int((int(soft_cap) - int(prebatch)) // max(1, int(num_workers))),
             )
             max_workers_inflight = max(
                 0, int((soft_cap - prebatch) // max(1, prefetch_factor))
@@ -441,18 +405,14 @@ class LoaderPolicy:
         max_batches = self.hard_inflight_batches(device)
         with contextlib.suppress(Exception):
             dev = (
-                torch.device(device)
-                if not isinstance(device, torch.device)
-                else device
+                torch.device(device) if not isinstance(device, torch.device) else device
             )
             if dev.type in {"cuda", "xpu", "mps"}:
                 if bool(getattr(loader, "_non_blocking", False)) and hasattr(
                     loader, "_base_iterable"
                 ):
                     with contextlib.suppress(Exception):
-                        setattr(
-                            loader, "_depth", int(max(1, int(max_batches)))
-                        )
+                        setattr(loader, "_depth", int(max(1, int(max_batches))))
                     return loader
         return new_prefetcher(loader, max_batches=max_batches, name=name)
 
@@ -498,20 +458,12 @@ class BatchPolicy:
         self.host_budget_ratio = max(
             0.0, min(1.0, float(self.host_budget_ratio or 0.0))
         )
-        self.device_budget_min_bytes = max(
-            int(self.device_budget_min_bytes or 0), 0
-        )
-        self.host_budget_min_bytes = max(
-            int(self.host_budget_min_bytes or 0), 0
-        )
+        self.device_budget_min_bytes = max(int(self.device_budget_min_bytes or 0), 0)
+        self.host_budget_min_bytes = max(int(self.host_budget_min_bytes or 0), 0)
         if self.device_budget_max_bytes is not None:
-            self.device_budget_max_bytes = max(
-                int(self.device_budget_max_bytes), 0
-            )
+            self.device_budget_max_bytes = max(int(self.device_budget_max_bytes), 0)
         if self.host_budget_max_bytes is not None:
-            self.host_budget_max_bytes = max(
-                int(self.host_budget_max_bytes), 0
-            )
+            self.host_budget_max_bytes = max(int(self.host_budget_max_bytes), 0)
 
     def host_inflight_batches_per_proc(self: Self) -> int:
         return (
@@ -587,9 +539,7 @@ class BatchPolicy:
         ):
             inflight = self.host_inflight_batches_per_proc()
             denom = (
-                max(1, int(self.host_sample_bytes or 0))
-                * max(1, inflight)
-                * max(1, lw)
+                max(1, int(self.host_sample_bytes or 0)) * max(1, inflight) * max(1, lw)
             )
             usable = int(float(host_free) * float(self.host_margin))
             if use_host_budget:
@@ -602,15 +552,9 @@ class BatchPolicy:
                 if budget > 0:
                     usable = min(int(usable), int(budget))
             host_cap = int(max(0, usable) // denom)
-        candidates = [
-            c for c in (dev_cap, host_cap) if isinstance(c, int) and c >= 0
-        ]
+        candidates = [c for c in (dev_cap, host_cap) if isinstance(c, int) and c >= 0]
         if not candidates:
-            b = (
-                self.max_batch
-                if self.max_batch is not None
-                else self.min_batch
-            )
+            b = self.max_batch if self.max_batch is not None else self.min_batch
         else:
             b = min(candidates)
             if self.max_batch is not None:
@@ -654,9 +598,7 @@ class ModelPolicy:
             if is_scale_safe(dtype, metadata):
                 return dtype
         return (
-            torch.float64
-            if is_scale_safe(torch.float64, metadata)
-            else candidates[-1]
+            torch.float64 if is_scale_safe(torch.float64, metadata) else candidates[-1]
         )
 
     @staticmethod
@@ -996,9 +938,7 @@ class ModelPolicy:
             if n > 0:
                 setattr(swapped, "__fp8_inference_te__", True)
                 if logger:
-                    logger(
-                        f"[FP8][TE] swapped {n} modules; using te.fp8_autocast"
-                    )
+                    logger(f"[FP8][TE] swapped {n} modules; using te.fp8_autocast")
                 return (swapped, True, f"TE swap ({n})")
             return (model, False, "no eligible Linear (dims%16)")
         except Exception as exc:
@@ -1067,8 +1007,7 @@ class ModelPolicy:
         if getattr(meta, "has_scale", False):
             float8_dtypes = Autocast.float8_formats()
             if not any(
-                is_scale_safe(dtype, meta, safety_margin=2.0)
-                for dtype in float8_dtypes
+                is_scale_safe(dtype, meta, safety_margin=2.0) for dtype in float8_dtypes
             ):
                 _log_info(
                     logger,
@@ -1083,13 +1022,9 @@ class ModelPolicy:
                     model, params_dtype, logger
                 )
             else:
-                m2, ok2, why = ModelPolicy._enable_torchao_training(
-                    model, logger
-                )
+                m2, ok2, why = ModelPolicy._enable_torchao_training(model, logger)
             if ok2:
-                _log_info(
-                    logger, f"[FP8] training enabled via {why} ({reason})"
-                )
+                _log_info(logger, f"[FP8] training enabled via {why} ({reason})")
                 Autocast.configure(m2, metadata=meta)
                 return (m2, True, why)
             else:
@@ -1114,8 +1049,7 @@ class ModelPolicy:
         if getattr(meta, "has_scale", False):
             float8_dtypes = Autocast.float8_formats()
             if not any(
-                is_scale_safe(dtype, meta, safety_margin=2.0)
-                for dtype in float8_dtypes
+                is_scale_safe(dtype, meta, safety_margin=2.0) for dtype in float8_dtypes
             ):
                 _log_info(
                     logger,
@@ -1141,9 +1075,7 @@ class ModelPolicy:
                     model, dynamic_activations, logger
                 )
             if ok2:
-                _log_info(
-                    logger, f"[FP8] inference enabled via {why} ({reason})"
-                )
+                _log_info(logger, f"[FP8] inference enabled via {why} ({reason})")
                 Autocast.configure(m2, metadata=meta)
                 return (m2, True, why)
             else:
@@ -1263,9 +1195,7 @@ class PrecisionPolicy:
             case "mps":
                 amp_dtype = torch.float16
         fsdp_dt = (
-            amp_dtype
-            if master_float == torch.float32 and amp_dtype
-            else master_float
+            amp_dtype if master_float == torch.float32 and amp_dtype else master_float
         )
         return cls(
             master_float=master_float,
@@ -1374,9 +1304,7 @@ class CollectivePolicy:
         debug_collectives = getenv_bool_any(
             "ENN_COLLECTIVE_DEBUG", "ENN_BCAST_DEBUG", False
         )
-        verbose = getenv_bool_any(
-            "ENN_COLLECTIVE_VERBOSE", "ENN_BCAST_VERBOSE", False
-        )
+        verbose = getenv_bool_any("ENN_COLLECTIVE_VERBOSE", "ENN_BCAST_VERBOSE", False)
         return cls(
             backend=backend,
             include_parameters=include_parameters,

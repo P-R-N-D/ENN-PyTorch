@@ -35,9 +35,9 @@ from torch.distributed.checkpoint.state_dict import (
 )
 from tqdm.auto import tqdm
 
-import ..schema
-from ..config import RuntimeConfig, coerce_model_config
 from .. import schema
+from ..config import RuntimeConfig, coerce_model_config
+from ..core.checkpoint import from_checkpoint, to_checkpoint
 from ..core.concurrency import Mutex, TensorPagePool, TensorSpooler, new_affinity
 from ..core.datatypes import (
     env_bool,
@@ -60,7 +60,6 @@ from ..core.distributed import (
     no_sync,
     to_hsdp_module,
 )
-from ..core.checkpoint import from_checkpoint, to_checkpoint
 from ..core.graph import (
     canonicalize_compile_mode,
     compile_distributed_safe,
@@ -73,7 +72,6 @@ from ..core.graph import (
 from ..core.policies import DistributedPolicy, ModelPolicy, PrecisionPolicy
 from ..core.precision import Autocast
 from ..core.profiler import FlopCounter
-from ..core.tensor import is_meta_or_fake_tensor, to_torch_tensor
 from ..core.system import (
     CPU,
     Memory,
@@ -100,6 +98,7 @@ from ..core.system import (
     set_float32_precision,
     sync_accelerator,
 )
+from ..core.tensor import is_meta_or_fake_tensor, to_torch_tensor
 from ..data import collate
 from ..data.collate import Unsharder
 from ..data.pipeline import Dataset
@@ -150,9 +149,7 @@ _IGNORED_WARNING_PATTERNS: tuple[str, ...] = (
     "Either mode or options can be specified, but both can't be specified at the same time\\.",
 )
 _IGNORED_WARNING_MESSAGE_RE = re.compile(
-    r".*(?:"
-    + "|".join((f"(?:{p})" for p in _IGNORED_WARNING_PATTERNS))
-    + r").*"
+    r".*(?:" + "|".join((f"(?:{p})" for p in _IGNORED_WARNING_PATTERNS)) + r").*"
 )
 _LOGGER = logging.getLogger(__name__)
 _NVML_BACKOFF_UNTIL = 0.0
@@ -171,9 +168,7 @@ _TIMING_EVENTS_UNSUPPORTED = object()
 _TIMING_EVENT_TLS = threading.local()
 _nvml = None
 JsonPrimitive: TypeAlias = str | int | float | bool | None
-JsonValue: TypeAlias = (
-    JsonPrimitive | list["JsonValue"] | dict[str, "JsonValue"]
-)
+JsonValue: TypeAlias = JsonPrimitive | list["JsonValue"] | dict[str, "JsonValue"]
 MB_DIV = 1024.0 * 1024.0
 PathLike: TypeAlias = str | os.PathLike[str] | Path
 ReturnSink: TypeAlias = MutableMapping[str, object]
@@ -181,17 +176,11 @@ TorchDeviceLike: TypeAlias = torch.device | str | int
 
 
 def _is_nvml_disabled() -> bool:
-    return env_bool("ENN_NVML_DISABLE", False) or not env_bool(
-        "ENN_NVML", True
-    )
+    return env_bool("ENN_NVML_DISABLE", False) or not env_bool("ENN_NVML", True)
 
 
 def _nvml_cfg(key: str, default: object, cast_fn: type = int) -> object:
-    return cast_fn(
-        env_first(
-            (f"ENN_NVML_{key}", f"ENN_NVML_{key}_S"), default=default
-        )
-    )
+    return cast_fn(env_first((f"ENN_NVML_{key}", f"ENN_NVML_{key}_S"), default=default))
 
 
 def _is_nvml_blocked(now: object | None = None) -> object:
@@ -268,9 +257,7 @@ def _is_clock_synchronized(dev_type: str) -> bool:
 
 def _is_event_timer_available(device: torch.device) -> bool:
     try:
-        return bool(
-            is_accelerator_timer_supported(str(getattr(device, "type", "cpu")))
-        )
+        return bool(is_accelerator_timer_supported(str(getattr(device, "type", "cpu"))))
     except Exception:
         return False
 
@@ -366,14 +353,10 @@ def _get_torch_profiler(
     )
     repeat = max(1, int(_env_int("ENN_TORCH_PROFILE_REPEAT", 1)))
     record_shapes = bool(_env_flag("ENN_TORCH_PROFILE_RECORD_SHAPES", False))
-    profile_memory = bool(
-        _env_flag("ENN_TORCH_PROFILE_PROFILE_MEMORY", True)
-    )
+    profile_memory = bool(_env_flag("ENN_TORCH_PROFILE_PROFILE_MEMORY", True))
     with_stack = bool(_env_flag("ENN_TORCH_PROFILE_WITH_STACK", False))
     with_flops = bool(_env_flag("ENN_TORCH_PROFILE_WITH_FLOPS", False))
-    group_by_shape = bool(
-        _env_flag("ENN_TORCH_PROFILE_GROUP_BY_SHAPE", False)
-    )
+    group_by_shape = bool(_env_flag("ENN_TORCH_PROFILE_GROUP_BY_SHAPE", False))
     row_limit = max(5, int(_env_int("ENN_TORCH_PROFILE_TOPK", 40)))
     if not out_dir:
         out_dir = os.path.join(os.getcwd(), "torch_profiler")
@@ -382,12 +365,8 @@ def _get_torch_profiler(
         os.makedirs(out_dir, exist_ok=True)
     worker_name = f"{str(tag)}-rank{int(rank)}"
     try:
-        schedule = tp.schedule(
-            wait=wait, warmup=warmup, active=active, repeat=repeat
-        )
-        on_trace = tp.tensorboard_trace_handler(
-            out_dir, worker_name=worker_name
-        )
+        schedule = tp.schedule(wait=wait, warmup=warmup, active=active, repeat=repeat)
+        on_trace = tp.tensorboard_trace_handler(out_dir, worker_name=worker_name)
         prof = tp.profile(
             activities=activities,
             schedule=schedule,
@@ -480,13 +459,9 @@ def _oom_max_retries(phase: object) -> object:
 def _is_batch_skippable(phase: object) -> bool:
     phase = str(phase).strip().lower()
     if phase == "train":
-        return _env_flag(
-            "ENN_OOM_SKIP_TRAIN", _env_flag("ENN_OOM_SKIP_BATCH", True)
-        )
+        return _env_flag("ENN_OOM_SKIP_TRAIN", _env_flag("ENN_OOM_SKIP_BATCH", True))
     elif phase in {"val", "valid", "validation"}:
-        return _env_flag(
-            "ENN_OOM_SKIP_VAL", _env_flag("ENN_OOM_SKIP_BATCH", True)
-        )
+        return _env_flag("ENN_OOM_SKIP_VAL", _env_flag("ENN_OOM_SKIP_BATCH", True))
     return _env_flag("ENN_OOM_SKIP_BATCH", True)
 
 
@@ -506,9 +481,7 @@ def _is_scale_rate_logged(
     min_interval_s: float | None = None,
 ) -> None:
     if min_interval_s is None:
-        min_interval_s = _env_float(
-            "ENN_SAMPLER_SCALE_LOG_MIN_INTERVAL_S", 5.0
-        )
+        min_interval_s = _env_float("ENN_SAMPLER_SCALE_LOG_MIN_INTERVAL_S", 5.0)
     try:
         min_interval_s = float(min_interval_s)
     except Exception:
@@ -531,9 +504,7 @@ def _is_scale_rate_logged(
         pass
 
 
-def _get_sampler_scaler(
-    loader: object, *args: Any, max_depth: int = 4
-) -> object:
+def _get_sampler_scaler(loader: object, *args: Any, max_depth: int = 4) -> object:
     obj = loader
     try:
         depth = max(1, int(max_depth))
@@ -582,9 +553,7 @@ def _recover_oom(
     max_tries = _oom_max_retries(ph)
     log_fn = _LOGGER.error if oom_try <= 1 else _LOGGER.warning
     context = "Reducing MB/GA" if oom_try <= 1 else "Retrying"
-    gs_info = (
-        f" (global_step={global_step})" if global_step is not None else ""
-    )
+    gs_info = f" (global_step={global_step})" if global_step is not None else ""
     log_fn(
         "[epochs] OOM in %s step %d%s. %s. (try=%d/%d)",
         str(ph),
@@ -604,9 +573,7 @@ def _recover_oom(
             with contextlib.suppress(Exception):
                 _clear_oom_retries(loader, ph, int(step_idx))
             with contextlib.suppress(Exception):
-                empty_device_cache(
-                    device=device, do_gc=False, min_interval_s=0.0
-                )
+                empty_device_cache(device=device, do_gc=False, min_interval_s=0.0)
             if optimizer is not None:
                 with contextlib.suppress(Exception):
                     optimizer.zero_grad(set_to_none=True)
@@ -637,9 +604,7 @@ def _recover_oom(
         model.module if hasattr(model, "module") else model
     )
     if inst_pressure is not None and int(oom_try) <= 1:
-        cur_step_total = int(
-            getattr(inst_pressure, "_enn_step_total", 0) or 0
-        )
+        cur_step_total = int(getattr(inst_pressure, "_enn_step_total", 0) or 0)
         if to_checkpoint(
             model,
             device=device,
@@ -699,9 +664,7 @@ def _recover_oom(
             with contextlib.suppress(Exception):
                 _clear_oom_retries(loader, ph, int(step_idx))
             with contextlib.suppress(Exception):
-                empty_device_cache(
-                    device=device, do_gc=False, min_interval_s=0.0
-                )
+                empty_device_cache(device=device, do_gc=False, min_interval_s=0.0)
             if optimizer is not None:
                 with contextlib.suppress(Exception):
                     optimizer.zero_grad(set_to_none=True)
@@ -768,9 +731,7 @@ def _validate_no_meta_tensors(module: object) -> None:
         raise RuntimeError("Found meta tensors in model:\n" + "\n".join(hits))
 
 
-def _hook_meta_monitor(
-    module: object, inputs: object, warn_only: object
-) -> None:
+def _hook_meta_monitor(module: object, inputs: object, warn_only: object) -> None:
     for arg in inputs:
         if isinstance(arg, torch.Tensor) and is_meta_or_fake_tensor(arg):
             message = f"[META] {module.__class__.__name__} got meta input"
@@ -782,10 +743,7 @@ def _hook_meta_monitor(
 
 def _enable_meta_monitor(model: object) -> None:
     hook_mode = (
-        str(
-            env_first(("ENN_META_MONITOR", "ENN_META_HOOK"), default="off")
-            or "off"
-        )
+        str(env_first(("ENN_META_MONITOR", "ENN_META_HOOK"), default="off") or "off")
         .strip()
         .lower()
     )
@@ -798,9 +756,7 @@ def _enable_meta_monitor(model: object) -> None:
         )
 
 
-def _validate_no_fake_dtensor(
-    root: nn.Module, *args: Any, **kwargs: Any
-) -> None:
+def _validate_no_fake_dtensor(root: nn.Module, *args: Any, **kwargs: Any) -> None:
     bad = []
     for name, module in root.named_modules():
         if not isinstance(module, nn.LayerNorm):
@@ -906,9 +862,7 @@ def _touch_tensors(obj: object) -> None:
         return
 
 
-def _cast_batchnorm_buffers_dtype(
-    module: object, dtype: torch.dtype | None
-) -> None:
+def _cast_batchnorm_buffers_dtype(module: object, dtype: torch.dtype | None) -> None:
     if dtype is None:
         return
     if not isinstance(dtype, torch.dtype):
@@ -938,11 +892,7 @@ def _cast_batchnorm_buffers_dtype(
 def _get_layernorm_dtype(device: TorchDeviceLike) -> object:
     try:
         meta = Autocast.coerce_metadata(device)
-        cands = (
-            tuple(getattr(meta, "float_dtypes", ()))
-            if meta is not None
-            else ()
-        )
+        cands = tuple(getattr(meta, "float_dtypes", ())) if meta is not None else ()
         if not cands:
             cands = (torch.float32,)
         chosen = Autocast.negotiate(
@@ -970,19 +920,14 @@ def _preload_layers(model: object, device: TorchDeviceLike) -> None:
         else:
             target_dtype = None
             for tensor in (weight, bias):
-                if (
-                    isinstance(tensor, torch.Tensor)
-                    and tensor.is_floating_point()
-                ):
+                if isinstance(tensor, torch.Tensor) and tensor.is_floating_point():
                     if not is_meta_or_fake_tensor(tensor):
                         target_dtype = tensor.dtype
                         break
             if target_dtype is None:
                 target_dtype = torch.get_default_dtype()
         if module.elementwise_affine:
-            if not isinstance(weight, torch.Tensor) or is_meta_or_fake_tensor(
-                weight
-            ):
+            if not isinstance(weight, torch.Tensor) or is_meta_or_fake_tensor(weight):
                 data = torch.ones(
                     module.normalized_shape, device=device, dtype=target_dtype
                 )
@@ -990,21 +935,14 @@ def _preload_layers(model: object, device: TorchDeviceLike) -> None:
                     module, "weight", data, requires_grad=requires_grad_w
                 )
                 weight = module.weight
-            if not isinstance(bias, torch.Tensor) or is_meta_or_fake_tensor(
-                bias
-            ):
+            if not isinstance(bias, torch.Tensor) or is_meta_or_fake_tensor(bias):
                 data = torch.zeros(
                     module.normalized_shape, device=device, dtype=target_dtype
                 )
-                _set_requires_grad(
-                    module, "bias", data, requires_grad=requires_grad_b
-                )
+                _set_requires_grad(module, "bias", data, requires_grad=requires_grad_b)
                 bias = module.bias
         if device.type == "cpu":
-            if (
-                isinstance(weight, torch.Tensor)
-                and weight.dtype != target_dtype
-            ):
+            if isinstance(weight, torch.Tensor) and weight.dtype != target_dtype:
                 data = weight.to(device=device, dtype=target_dtype)
                 _set_requires_grad(
                     module, "weight", data, requires_grad=requires_grad_w
@@ -1012,9 +950,7 @@ def _preload_layers(model: object, device: TorchDeviceLike) -> None:
                 weight = module.weight
             if isinstance(bias, torch.Tensor) and bias.dtype != target_dtype:
                 data = bias.to(device=device, dtype=target_dtype)
-                _set_requires_grad(
-                    module, "bias", data, requires_grad=requires_grad_b
-                )
+                _set_requires_grad(module, "bias", data, requires_grad=requires_grad_b)
                 bias = module.bias
         elif (
             isinstance(weight, torch.Tensor)
@@ -1024,15 +960,11 @@ def _preload_layers(model: object, device: TorchDeviceLike) -> None:
             and (bias.dtype != weight.dtype)
         ):
             data = bias.to(device=device, dtype=weight.dtype)
-            _set_requires_grad(
-                module, "bias", data, requires_grad=requires_grad_b
-            )
+            _set_requires_grad(module, "bias", data, requires_grad=requires_grad_b)
             bias = module.bias
 
 
-def _validate_model_dtype_unity(
-    model: object, device: TorchDeviceLike
-) -> None:
+def _validate_model_dtype_unity(model: object, device: TorchDeviceLike) -> None:
     mismatches = []
     for name, module in model.named_modules():
         if not isinstance(module, nn.LayerNorm):
@@ -1047,10 +979,7 @@ def _validate_model_dtype_unity(
         else:
             expected = None
         for label, tensor in tensors:
-            if (
-                not isinstance(tensor, torch.Tensor)
-                or not tensor.is_floating_point()
-            ):
+            if not isinstance(tensor, torch.Tensor) or not tensor.is_floating_point():
                 continue
             if expected is None:
                 expected = tensor.dtype
@@ -1063,8 +992,7 @@ def _validate_model_dtype_unity(
             dtypes = {
                 tensor.dtype
                 for _, tensor in tensors
-                if isinstance(tensor, torch.Tensor)
-                and tensor.is_floating_point()
+                if isinstance(tensor, torch.Tensor) and tensor.is_floating_point()
             }
             if len(dtypes) > 1:
                 module_name = name or module.__class__.__name__
@@ -1073,8 +1001,7 @@ def _validate_model_dtype_unity(
                 )
     if mismatches:
         raise RuntimeError(
-            "LayerNorm parameter dtype mismatch detected:\n"
-            + "\n".join(mismatches)
+            "LayerNorm parameter dtype mismatch detected:\n" + "\n".join(mismatches)
         )
 
 
@@ -1307,9 +1234,7 @@ def _get_sample_size(
         out_dim = 1
     elem_size = torch.empty((), dtype=torch.float64).element_size()
     floor_bytes = (
-        int((in_dim + out_dim) * elem_size * 10240)
-        if in_dim + out_dim > 0
-        else 0
+        int((in_dim + out_dim) * elem_size * 10240) if in_dim + out_dim > 0 else 0
     )
     dev_type = getattr(device, "type", "")
     if dev_type not in {"cuda", "xpu", "mps"}:
@@ -1338,11 +1263,7 @@ def _get_sample_size(
         batch = ds.get(0, B0)
         forward_ran = False
         training_mode = bool(model.training)
-        meta = (
-            dataset
-            if isinstance(dataset, Dataset)
-            else Dataset.for_device(device)
-        )
+        meta = dataset if isinstance(dataset, Dataset) else Dataset.for_device(device)
         try:
             from ..core.graph import inference_mode
             from ..core.precision import Autocast
@@ -1353,9 +1274,7 @@ def _get_sample_size(
             if X.dim() == 2 and int(X.shape[1]) == int(
                 getattr(ops, "in_dim", X.shape[1])
             ):
-                X = X.to(
-                    device=device, non_blocking=is_pin_supported(device.type)
-                )
+                X = X.to(device=device, non_blocking=is_pin_supported(device.type))
                 if with_backward:
                     model.train()
                     with Autocast.float(device):
@@ -1386,23 +1305,15 @@ def _get_sample_size(
                         forward_ran = True
                 else:
                     with inference_mode(model), Autocast.float(device):
-                        warmup_iters = int(
-                            _env_int("ENN_SERVE_WARMUP_ITERS", 0) or 0
-                        )
+                        warmup_iters = int(_env_int("ENN_SERVE_WARMUP_ITERS", 0) or 0)
                         if (
                             warmup_iters <= 0
                             and str(getattr(ops, "mode", "") or "")
                             in ("predict", "infer")
                             and _env_flag("ENN_MAX_PERF", True)
                         ):
-                            m_eval = (
-                                model.module
-                                if hasattr(model, "module")
-                                else model
-                            )
-                            compiled = getattr(
-                                m_eval, "_compiled_submodules", None
-                            )
+                            m_eval = model.module if hasattr(model, "module") else model
+                            compiled = getattr(m_eval, "_compiled_submodules", None)
                             warmup_iters = (
                                 3
                                 if (
@@ -1453,16 +1364,9 @@ def _get_sample_size(
         if per_sample <= 0:
             return
         with contextlib.suppress(Exception):
-            if (
-                torch.distributed.is_available()
-                and torch.distributed.is_initialized()
-            ):
-                t = torch.tensor(
-                    [int(per_sample)], device=device, dtype=torch.long
-                )
-                torch.distributed.all_reduce(
-                    t, op=torch.distributed.ReduceOp.MAX
-                )
+            if torch.distributed.is_available() and torch.distributed.is_initialized():
+                t = torch.tensor([int(per_sample)], device=device, dtype=torch.long)
+                torch.distributed.all_reduce(t, op=torch.distributed.ReduceOp.MAX)
                 per_sample = int(t.item())
         try:
             Sampler._per_sample_mem_bytes = int(per_sample)
@@ -1482,12 +1386,8 @@ def _init_tensor(
     fused: bool,
     **kwargs: Any,
 ) -> torch.Tensor:
-    desired_device = (
-        param.device if capturable or fused else torch.device("cpu")
-    )
-    desired_dtype = (
-        param.dtype if torch.is_floating_point(param) else torch.float32
-    )
+    desired_device = param.device if capturable or fused else torch.device("cpu")
+    desired_dtype = param.dtype if torch.is_floating_point(param) else torch.float32
     if isinstance(value, torch.Tensor):
         step_tensor = value.detach()
         if step_tensor.ndim != 0:
@@ -1498,9 +1398,7 @@ def _init_tensor(
             step_tensor = step_tensor.to(desired_dtype)
     else:
         base = float(value) if value is not None else 0.0
-        step_tensor = torch.tensor(
-            base, dtype=desired_dtype, device=desired_device
-        )
+        step_tensor = torch.tensor(base, dtype=desired_dtype, device=desired_device)
     return step_tensor
 
 
@@ -1538,9 +1436,7 @@ def _schedule(
     **kwargs: Any,
 ) -> float:
     if warmup_steps > 0 and step < warmup_steps:
-        return start_factor + (1.0 - start_factor) * (
-            step / max(1, warmup_steps)
-        )
+        return start_factor + (1.0 - start_factor) * (step / max(1, warmup_steps))
     t = step - warmup_steps
     frac_min = emin / base if base > 0.0 else 0.0
     return frac_min + (1.0 - frac_min) * 0.5 * (
@@ -1594,11 +1490,7 @@ def _init_distributed_group(
 def _gpu_nvml_utils(device: TorchDeviceLike) -> object:
     if getattr(device, "type", "") != "cuda":
         return (None, None)
-    idx = (
-        device.index
-        if device.index is not None
-        else get_accelerator_index("cuda")
-    )
+    idx = device.index if device.index is not None else get_accelerator_index("cuda")
     idx_i = int(idx)
     gpu_util = None
     mem_util = None
@@ -1657,12 +1549,10 @@ def _gpu_nvml_utils(device: TorchDeviceLike) -> object:
                 trigger_backoff = False
                 with _NVML_LOCK:
                     _NVML_FAIL_COUNT = int(_NVML_FAIL_COUNT) + 1
-                    if backoff_s > 0.0 and int(_NVML_FAIL_COUNT) >= int(
-                        fail_max
-                    ):
-                        _NVML_BACKOFF_UNTIL = float(
-                            time.perf_counter()
-                        ) + float(backoff_s)
+                    if backoff_s > 0.0 and int(_NVML_FAIL_COUNT) >= int(fail_max):
+                        _NVML_BACKOFF_UNTIL = float(time.perf_counter()) + float(
+                            backoff_s
+                        )
                         _NVML_FAIL_COUNT = 0
                         trigger_backoff = True
                 if trigger_backoff:
@@ -1671,9 +1561,7 @@ def _gpu_nvml_utils(device: TorchDeviceLike) -> object:
                     with contextlib.suppress(Exception):
                         _NVML_UTIL_CACHE.clear()
                     with contextlib.suppress(Exception):
-                        _LOGGER.warning(
-                            "[NVML] backing off %.1fs", float(backoff_s)
-                        )
+                        _LOGGER.warning("[NVML] backing off %.1fs", float(backoff_s))
                 gpu_util = None
                 mem_util = None
             if gpu_util is not None or mem_util is not None:
@@ -1719,9 +1607,7 @@ def _pool_tensor(
     pinned_ok: bool | None = None,
 ) -> tuple[torch.Tensor, TensorPagePool.Token | None, bool]:
     if not torch.is_tensor(tensor):
-        raise TypeError(
-            f"stage_tensor expects a torch.Tensor, got {type(tensor)}"
-        )
+        raise TypeError(f"stage_tensor expects a torch.Tensor, got {type(tensor)}")
     if dev_type is None:
         dev_type = str(getattr(device, "type", "cpu"))
     if pinned_ok is None:
@@ -1736,9 +1622,7 @@ def _pool_tensor(
         if callable(is_pinned) and bool(is_pinned()) and tensor.dtype == dtype:
             return tensor, None, True
     if cpu_pool is not None and bool(pinned_ok):
-        buf, token = cpu_pool.get(
-            tuple(tensor.shape), dtype, return_handle=True
-        )
+        buf, token = cpu_pool.get(tuple(tensor.shape), dtype, return_handle=True)
         buf.copy_(tensor, non_blocking=False)
         pinned = False
         with contextlib.suppress(Exception):
@@ -1803,10 +1687,7 @@ def _stream_tensor(
         Event = getattr(backend, "Event", None)
     if can_stream_release is None:
         can_stream_release = bool(
-            pinned
-            and pinned_ok
-            and callable(stream_fn)
-            and (Event is not None)
+            pinned and pinned_ok and callable(stream_fn) and (Event is not None)
         )
     if (not bool(pinned)) or (not bool(can_stream_release)):
         out = tensor.to(device, non_blocking=False)
@@ -2052,9 +1933,7 @@ def _reduce_sum(t: object, pg: object) -> None:
     if pg is None or (not _is_process_group(pg)):
         torch.distributed.all_reduce(t, op=torch.distributed.ReduceOp.SUM)
     else:
-        torch.distributed.all_reduce(
-            t, op=torch.distributed.ReduceOp.SUM, group=pg
-        )
+        torch.distributed.all_reduce(t, op=torch.distributed.ReduceOp.SUM, group=pg)
 
 
 def _set_gate_factor(
@@ -2105,14 +1984,10 @@ def _set_gate_factor(
     ema_low_buf = getattr(target_module, "delta_gate_auto_k_ema_low_buf", None)
     ema_high_buf = getattr(target_module, "delta_gate_auto_k_ema_high_buf", None)
     ema_low_prev = (
-        float(ema_low_buf.item())
-        if isinstance(ema_low_buf, torch.Tensor)
-        else 0.0
+        float(ema_low_buf.item()) if isinstance(ema_low_buf, torch.Tensor) else 0.0
     )
     ema_high_prev = (
-        float(ema_high_buf.item())
-        if isinstance(ema_high_buf, torch.Tensor)
-        else 0.0
+        float(ema_high_buf.item()) if isinstance(ema_high_buf, torch.Tensor) else 0.0
     )
     ema_low_new = (1.0 - alpha) * ema_low_prev + alpha * active_low_rate
     ema_high_new = (1.0 - alpha) * ema_high_prev + alpha * active_high_rate
@@ -2127,9 +2002,7 @@ def _set_gate_factor(
     if isinstance(ema_buf, torch.Tensor):
         with contextlib.suppress(Exception):
             ema_buf.fill_(float(ema_overall))
-    edge_enabled = bool(
-        getattr(target_module, "delta_gate_auto_k_edge_enabled", False)
-    )
+    edge_enabled = bool(getattr(target_module, "delta_gate_auto_k_edge_enabled", False))
     edge_alpha = float(
         getattr(target_module, "delta_gate_auto_k_edge_ema_alpha", alpha)
     )
@@ -2165,28 +2038,21 @@ def _set_gate_factor(
             edge_ema_high_buf.fill_(float(edge_ema_high_new))
     if isinstance(edge_ema_buf, torch.Tensor):
         with contextlib.suppress(Exception):
-            edge_ema_buf.fill_(
-                float(0.5 * (edge_ema_low_new + edge_ema_high_new))
-            )
+            edge_ema_buf.fill_(float(0.5 * (edge_ema_low_new + edge_ema_high_new)))
     k_low_buf = getattr(target_module, "delta_gate_fallback_k_low_buf", None)
     k_high_buf = getattr(target_module, "delta_gate_fallback_k_high_buf", None)
     k_legacy_buf = getattr(target_module, "delta_gate_fallback_k_buf", None)
     use_legacy = not (
-        isinstance(k_low_buf, torch.Tensor)
-        and isinstance(k_high_buf, torch.Tensor)
+        isinstance(k_low_buf, torch.Tensor) and isinstance(k_high_buf, torch.Tensor)
     )
     if use_legacy:
         if not isinstance(k_legacy_buf, torch.Tensor):
             return
         k_low_buf = k_legacy_buf
         k_high_buf = k_legacy_buf
-    k_low_prev = (
-        float(k_low_buf.item()) if isinstance(k_low_buf, torch.Tensor) else 0.0
-    )
+    k_low_prev = float(k_low_buf.item()) if isinstance(k_low_buf, torch.Tensor) else 0.0
     k_high_prev = (
-        float(k_high_buf.item())
-        if isinstance(k_high_buf, torch.Tensor)
-        else 0.0
+        float(k_high_buf.item()) if isinstance(k_high_buf, torch.Tensor) else 0.0
     )
     k_low_new = k_low_prev
     k_high_new = k_high_prev
@@ -2208,12 +2074,8 @@ def _set_gate_factor(
     step_down_high = float(
         getattr(target_module, "delta_gate_auto_k_step_down_high", step_down)
     )
-    edge_target = float(
-        getattr(target_module, "delta_gate_auto_k_target_edge", 0.05)
-    )
-    edge_tol = float(
-        getattr(target_module, "delta_gate_auto_k_edge_tolerance", 0.5)
-    )
+    edge_target = float(getattr(target_module, "delta_gate_auto_k_target_edge", 0.05))
+    edge_tol = float(getattr(target_module, "delta_gate_auto_k_edge_tolerance", 0.5))
     edge_hi = edge_target * (1.0 + edge_tol)
     edge_step_down_low = float(
         getattr(target_module, "delta_gate_auto_k_edge_step_down_low", 0.01)
@@ -2289,9 +2151,7 @@ def _set_gate_factor(
         if isinstance(upd_buf, torch.Tensor):
             with contextlib.suppress(Exception):
                 upd_buf.add_(1)
-    log_interval = int(
-        getattr(target_module, "delta_gate_auto_k_log_interval", 0) or 0
-    )
+    log_interval = int(getattr(target_module, "delta_gate_auto_k_log_interval", 0) or 0)
     log_due = (
         bool(k_changed)
         if log_interval <= 0
@@ -2346,9 +2206,7 @@ def _compute_batch_bytes_per_sample(obj: object) -> tuple[int | None, int]:
     return (batch_dim, bytes_per_sample)
 
 
-def _warmup_scaler_stats(
-    model: object, train_loader: object, ops: object
-) -> None:
+def _warmup_scaler_stats(model: object, train_loader: object, ops: object) -> None:
     model_for_scaler = model.module if hasattr(model, "module") else model
     dev_x = model_for_scaler.scaler.x_mean.device
     dev_y = model_for_scaler.scaler.y_mean.device
@@ -2407,9 +2265,7 @@ def _warmup_scaler_stats(
         if is_distributed():
             for tensor in (x_sum, x_ss, y_sum, y_ss):
                 if tensor is not None:
-                    torch.distributed.all_reduce(
-                        tensor, torch.distributed.ReduceOp.SUM
-                    )
+                    torch.distributed.all_reduce(tensor, torch.distributed.ReduceOp.SUM)
             for tensor, op in (
                 (y_min, torch.distributed.ReduceOp.MIN),
                 (y_max, torch.distributed.ReduceOp.MAX),
@@ -2417,9 +2273,7 @@ def _warmup_scaler_stats(
                 if tensor is not None:
                     torch.distributed.all_reduce(tensor, op)
             counts = torch.tensor([x_cnt, y_cnt], device=dev_x)
-            torch.distributed.all_reduce(
-                counts, torch.distributed.ReduceOp.SUM
-            )
+            torch.distributed.all_reduce(counts, torch.distributed.ReduceOp.SUM)
             x_cnt = int(counts[0])
             y_cnt = int(counts[1])
 
@@ -2465,10 +2319,7 @@ def get_progress_bar(
     **kwargs: Any,
 ) -> object:
     try:
-        if (
-            torch.distributed.is_initialized()
-            and torch.distributed.get_rank() != 0
-        ):
+        if torch.distributed.is_initialized() and torch.distributed.get_rank() != 0:
             return None
     except Exception:
         pass
@@ -2508,13 +2359,9 @@ def update_progress_bar(
         tflops_val = float(tflops) if tflops is not None else 0.0
     except Exception:
         tflops_val = 0.0
-    io_expr = (
-        f"I/O = {mbps_val:.2f} MB/s" if mbps_val >= 0.01 else "I/O < 0.01 MB/s"
-    )
+    io_expr = f"I/O = {mbps_val:.2f} MB/s" if mbps_val >= 0.01 else "I/O < 0.01 MB/s"
     com_expr = (
-        f"COM = {tflops_val:.2f} TFLOPS"
-        if tflops_val >= 0.01
-        else "COM < 0.01 TFLOPS"
+        f"COM = {tflops_val:.2f} TFLOPS" if tflops_val >= 0.01 else "COM < 0.01 TFLOPS"
     )
     bar.unit = io_expr + ", " + com_expr
     try:
@@ -2533,10 +2380,7 @@ def get_checkpoint_bar(
     **kwargs: Any,
 ) -> object:
     try:
-        if (
-            torch.distributed.is_initialized()
-            and torch.distributed.get_rank() != 0
-        ):
+        if torch.distributed.is_initialized() and torch.distributed.get_rank() != 0:
             return None
     except Exception:
         pass
@@ -2546,9 +2390,7 @@ def get_checkpoint_bar(
         total=int(total),
         desc=f"{title} ({device.type.upper()}) ",
         unit=f"(Total = {int(total)}, Finished = 0) Checkpoint in Progress",
-        bar_format="{desc}"
-        + "{bar} {percentage:3.2f} % "
-        + "{unit}",
+        bar_format="{desc}" + "{bar} {percentage:3.2f} % " + "{unit}",
         colour="green",
         ascii=True,
         position=0,
@@ -2574,9 +2416,13 @@ def update_checkpoint_bar(
         inc = 1
     finished = int(position) + (1 if inc > 0 else 0)
     if inc == 0:
-        chpt_expr = f"(Total = {int(total)}, Finished = {finished}) Checkpoint in Progress"
+        chpt_expr = (
+            f"(Total = {int(total)}, Finished = {finished}) Checkpoint in Progress"
+        )
     elif inc > 0:
-        chpt_expr = f"(Total = {int(total)}, Finished = {finished}) Checkpoint Completed"
+        chpt_expr = (
+            f"(Total = {int(total)}, Finished = {finished}) Checkpoint Completed"
+        )
     bar.unit = chpt_expr
     bar.update(inc)
 
@@ -2611,9 +2457,7 @@ def epochs(
 
     if train_loader is None:
         raise RuntimeError("epochs requires a training dataloader")
-    meta = (
-        dataset if isinstance(dataset, Dataset) else Dataset.for_device(device)
-    )
+    meta = dataset if isinstance(dataset, Dataset) else Dataset.for_device(device)
     autocast_dtype = None
     with contextlib.suppress(Exception):
         import inspect
@@ -2629,18 +2473,14 @@ def epochs(
             except Exception:
                 autocast_dtype = f(device)
     with contextlib.suppress(Exception):
-        set_float32_precision(
-            device, dtype=param_dtype, autocast_dtype=autocast_dtype
-        )
+        set_float32_precision(device, dtype=param_dtype, autocast_dtype=autocast_dtype)
     cpu_pool = None
     pool_capacity = 0
     if is_pin_supported(str(getattr(device, "type", "cpu"))):
         with contextlib.suppress(Exception):
             Memory.prefer_local_numa()
         try:
-            cpu_pool_cap = max(
-                2, int(_env_int("ENN_RUNTIME_PIN_POOL_CAPACITY", 8))
-            )
+            cpu_pool_cap = max(2, int(_env_int("ENN_RUNTIME_PIN_POOL_CAPACITY", 8)))
             cpu_pool = TensorPagePool(capacity=cpu_pool_cap)
             pool_capacity = int(getattr(cpu_pool, "capacity", 8))
         except Exception:
@@ -2652,11 +2492,7 @@ def epochs(
         v = getattr(Sampler, "_per_sample_mem_bytes", 0)
         if isinstance(v, int) and v > 0:
             est_bytes_per_sample = int(v)
-    if (
-        per_batch is None
-        or int(per_batch) <= 0
-        or est_bytes_per_sample is None
-    ):
+    if per_batch is None or int(per_batch) <= 0 or est_bytes_per_sample is None:
         try:
             it = iter(train_loader)
             sample = next(it)
@@ -2705,14 +2541,10 @@ def epochs(
     dev_budget_min_bytes = max(0, int(dev_budget_min_bytes))
     host_budget_min_bytes = max(0, int(host_budget_min_bytes))
     dev_budget_max_bytes = (
-        None
-        if dev_budget_max_bytes is None
-        else max(0, int(dev_budget_max_bytes))
+        None if dev_budget_max_bytes is None else max(0, int(dev_budget_max_bytes))
     )
     host_budget_max_bytes = (
-        None
-        if host_budget_max_bytes is None
-        else max(0, int(host_budget_max_bytes))
+        None if host_budget_max_bytes is None else max(0, int(host_budget_max_bytes))
     )
     if dev_budget_max_bytes is not None and int(dev_budget_max_bytes) <= 0:
         dev_budget_max_bytes = None
@@ -2748,9 +2580,7 @@ def epochs(
                 device_budget_ratio=float(dev_budget_ratio),
                 device_budget_min_bytes=int(dev_budget_min_bytes),
                 device_budget_max_bytes=(
-                    None
-                    if dev_budget_max_bytes is None
-                    else int(dev_budget_max_bytes)
+                    None if dev_budget_max_bytes is None else int(dev_budget_max_bytes)
                 ),
             )
         except Exception:
@@ -2770,10 +2600,7 @@ def epochs(
                 if host_total is not None and host_total > 0:
                     safe_host_total = int(host_total)
             safe_dev_bytes, safe_dev_total = _device_mem_get_info(device)
-            if (
-                tpl.device_budget_max_bytes is None
-                or tpl.host_budget_max_bytes is None
-            ):
+            if tpl.device_budget_max_bytes is None or tpl.host_budget_max_bytes is None:
                 try:
                     target_total_samples = max(1, int(per_batch or 1)) * max(
                         1, int(min_grad_accum)
@@ -2781,25 +2608,15 @@ def epochs(
                     new_dev_cap = tpl.device_budget_max_bytes
                     new_host_cap = tpl.host_budget_max_bytes
                     if new_dev_cap is None and int(tpl.sample_bytes or 0) > 0:
-                        base_dev = int(tpl.sample_bytes) * int(
-                            target_total_samples
-                        )
+                        base_dev = int(tpl.sample_bytes) * int(target_total_samples)
                         cap_dev = int(float(base_dev) * float(budget_slack))
-                        if (
-                            safe_dev_total is not None
-                            and int(safe_dev_total) > 0
-                        ):
+                        if safe_dev_total is not None and int(safe_dev_total) > 0:
                             cap_dev = min(int(cap_dev), int(safe_dev_total))
                         cap_dev = max(0, int(cap_dev))
                         new_dev_cap = None if cap_dev <= 0 else cap_dev
-                    if (
-                        new_host_cap is None
-                        and int(tpl.host_sample_bytes or 0) > 0
-                    ):
+                    if new_host_cap is None and int(tpl.host_sample_bytes or 0) > 0:
                         inflight = int(tpl.host_inflight_batches_per_proc())
-                        lw = max(
-                            1, int(getattr(tpl, "local_world_size", 1) or 1)
-                        )
+                        lw = max(1, int(getattr(tpl, "local_world_size", 1) or 1))
                         base_host = (
                             int(tpl.host_sample_bytes)
                             * max(1, inflight)
@@ -2807,10 +2624,7 @@ def epochs(
                             * int(target_total_samples)
                         )
                         cap_host = int(float(base_host) * float(budget_slack))
-                        if (
-                            safe_host_total is not None
-                            and int(safe_host_total) > 0
-                        ):
+                        if safe_host_total is not None and int(safe_host_total) > 0:
                             cap_host = min(int(cap_host), int(safe_host_total))
                         cap_host = max(0, int(cap_host))
                         new_host_cap = None if cap_host <= 0 else cap_host
@@ -2833,9 +2647,7 @@ def epochs(
                     host_total=safe_host_total,
                 )
                 if total_samples_cap > 0:
-                    max_from_mem = max(
-                        1, int(total_samples_cap) // int(per_batch or 1)
-                    )
+                    max_from_mem = max(1, int(total_samples_cap) // int(per_batch or 1))
         except Exception:
             safe_host_bytes = None
             safe_host_total = None
@@ -2866,9 +2678,7 @@ def epochs(
     util_adjust_interval = 0
     util_warmup_steps = 0
     if buffers_dtype is not None:
-        target_for_buffers = (
-            model.module if hasattr(model, "module") else model
-        )
+        target_for_buffers = model.module if hasattr(model, "module") else model
         _cast_batchnorm_buffers_dtype(target_for_buffers, buffers_dtype)
     model_for_hist = model.module if hasattr(model, "module") else model
     hist = None
@@ -2896,16 +2706,11 @@ def epochs(
                 pretty = None
                 with contextlib.suppress(Exception):
                     if os.path.exists("/etc/os-release"):
-                        with open(
-                            "/etc/os-release", "r", encoding="utf-8"
-                        ) as f:
+                        with open("/etc/os-release", "r", encoding="utf-8") as f:
                             for line in f:
                                 if line.startswith("PRETTY_NAME="):
                                     pretty = (
-                                        line.strip()
-                                        .split("=", 1)[1]
-                                        .strip()
-                                        .strip('"')
+                                        line.strip().split("=", 1)[1].strip().strip('"')
                                     )
                                     break
                 os_full = pretty or f"{os_name} {platform.release()}"
@@ -2955,20 +2760,13 @@ def epochs(
     pinned_ok = bool(is_pin_supported(dev_type))
     backend = accelerator_type(dev_type)
     stream_fn = (
-        getattr(backend, "current_stream", None)
-        if backend is not None
-        else None
+        getattr(backend, "current_stream", None) if backend is not None else None
     )
     Event = getattr(backend, "Event", None) if backend is not None else None
     can_stream_release = bool(
-        pinned_ok
-        and non_blocking_ok
-        and callable(stream_fn)
-        and (Event is not None)
+        pinned_ok and non_blocking_ok and callable(stream_fn) and (Event is not None)
     )
-    make_fence_event = partial(
-        new_accelerator_event, device, enable_timing=False
-    )
+    make_fence_event = partial(new_accelerator_event, device, enable_timing=False)
     use_timer = _is_event_timer_available(device)
     timer_sync = (not use_timer) and bool(_is_clock_synchronized(dev_type))
     train_steps = _get_batch_length(train_loader)
@@ -3032,15 +2830,11 @@ def epochs(
             _env_flag("ENN_TORCH_PROFILE", False),
         )
         prof_all_ranks = _env_flag("ENN_TORCH_PROFILE_ALL_RANKS", False)
-        prof_rank = (
-            int(torch.distributed.get_rank()) if is_distributed() else 0
-        )
+        prof_rank = int(torch.distributed.get_rank()) if is_distributed() else 0
         if prof_enabled and (prof_all_ranks or prof_rank == 0):
             prof_dir = env_str("ENN_TORCH_PROFILE_DIR")
             if not prof_dir:
-                prof_dir = os.path.join(
-                    str(ops.ckpt_dir or "."), "torch_profiler"
-                )
+                prof_dir = os.path.join(str(ops.ckpt_dir or "."), "torch_profiler")
             torch_prof = _get_torch_profiler(
                 enabled=True,
                 tag=f"train-{str(run_id)}",
@@ -3078,9 +2872,7 @@ def epochs(
                         fn(int(epoch_idx))
 
             if is_distributed() and _env_flag("ENN_DIST_SYNC_EPOCH", False):
-                target_module = (
-                    model.module if hasattr(model, "module") else model
-                )
+                target_module = model.module if hasattr(model, "module") else model
                 distributed_sync(target_module, device=device)
             flop_breakdown_epoch = {}
             io_time = 0.0
@@ -3112,11 +2904,7 @@ def epochs(
                     dl_len = None
                     with contextlib.suppress(Exception):
                         dl_len = len(train_loader)
-                    r = (
-                        int(torch.distributed.get_rank())
-                        if is_distributed()
-                        else 0
-                    )
+                    r = int(torch.distributed.get_rank()) if is_distributed() else 0
                     w = int(get_world_size(device)) if is_distributed() else 1
                     with contextlib.suppress(Exception):
                         chain = []
@@ -3233,18 +3021,13 @@ def epochs(
                                 t_comp_s = time.perf_counter_ns()
                             with no_sync(
                                 model,
-                                enable=grad_accum_steps > 1
-                                and (not should_sync),
+                                enable=grad_accum_steps > 1 and (not should_sync),
                             ):
                                 with flop_counter_train.step(
                                     display=False
                                 ) as train_counter:
-                                    if getattr(
-                                        device, "type", None
-                                    ) == "cuda" and bool(
-                                        getattr(
-                                            model, "_compile_cudagraphs", False
-                                        )
+                                    if getattr(device, "type", None) == "cuda" and bool(
+                                        getattr(model, "_compile_cudagraphs", False)
                                     ):
                                         cudagraph_mark_step_begin()
                                         mark_cudagraph = True
@@ -3284,14 +3067,10 @@ def epochs(
                                     ):
                                         loss_top_val = loss_top_val.mean()
                                     if (
-                                        isinstance(
-                                            loss_bottom_val, torch.Tensor
-                                        )
+                                        isinstance(loss_bottom_val, torch.Tensor)
                                         and loss_bottom_val.ndim > 0
                                     ):
-                                        loss_bottom_val = (
-                                            loss_bottom_val.mean()
-                                        )
+                                        loss_bottom_val = loss_bottom_val.mean()
                                     if loss_val is None:
                                         raise RuntimeError(
                                             "Model returned no loss value during training. Ensure loss functions are provided and returning valid outputs."
@@ -3307,27 +3086,21 @@ def epochs(
                                             device=device, dtype=param_dtype
                                         )
                                     accum_scale = max(1, grad_accum_steps)
-                                    loss_for_backprop = loss_val / float(
-                                        accum_scale
-                                    )
+                                    loss_for_backprop = loss_val / float(accum_scale)
                                     scaler.scale(loss_for_backprop).backward()
                                     if (
                                         loss_top_val is not None
                                         or loss_bottom_val is not None
                                     ):
                                         lw_count += 1
-                                        if isinstance(
-                                            loss_top_val, torch.Tensor
-                                        ):
+                                        if isinstance(loss_top_val, torch.Tensor):
                                             v = loss_top_val.detach()
                                             lw_top_sum = (
                                                 v
                                                 if lw_top_sum is None
                                                 else lw_top_sum + v
                                             )
-                                        if isinstance(
-                                            loss_bottom_val, torch.Tensor
-                                        ):
+                                        if isinstance(loss_bottom_val, torch.Tensor):
                                             v = loss_bottom_val.detach()
                                             lw_bottom_sum = (
                                                 v
@@ -3374,14 +3147,10 @@ def epochs(
                                         total = None
                                         with contextlib.suppress(Exception):
                                             peak = int(
-                                                accelerator_max_allocated_memory(
-                                                    device
-                                                )
+                                                accelerator_max_allocated_memory(device)
                                             )
                                         with contextlib.suppress(Exception):
-                                            free, total = _device_mem_get_info(
-                                                device
-                                            )
+                                            free, total = _device_mem_get_info(device)
                                         if (
                                             isinstance(peak, int)
                                             and peak > 0
@@ -3401,22 +3170,16 @@ def epochs(
                                             ema = (
                                                 frac
                                                 if prev_ema <= 0.0
-                                                else (
-                                                    0.9 * prev_ema + 0.1 * frac
-                                                )
+                                                else (0.9 * prev_ema + 0.1 * frac)
                                             )
-                                            with contextlib.suppress(
-                                                Exception
-                                            ):
+                                            with contextlib.suppress(Exception):
                                                 setattr(
                                                     inst_step,
                                                     "_enn_peak_ema",
                                                     float(ema),
                                                 )
-                                            spike = (
-                                                prev_ema > 0.0
-                                                and frac
-                                                > max(0.92, prev_ema * 1.25)
+                                            spike = prev_ema > 0.0 and frac > max(
+                                                0.92, prev_ema * 1.25
                                             )
                                             if frac > 0.92 or spike:
                                                 to_checkpoint(
@@ -3430,14 +3193,10 @@ def epochs(
                                                 )
                                         from_checkpoint(
                                             model,
-                                            step_total=int(
-                                                delta_gate_auto_step_total
-                                            ),
+                                            step_total=int(delta_gate_auto_step_total),
                                         )
                                         if scheduler_step_per_batch:
-                                            with contextlib.suppress(
-                                                Exception
-                                            ):
+                                            with contextlib.suppress(Exception):
                                                 sched.step()
                                         if lw_count > 0:
                                             top_avg_t = (
@@ -3453,19 +3212,12 @@ def epochs(
                                             if is_distributed():
                                                 ws = _get_world_size(train_pg)
                                                 if top_avg_t is not None:
-                                                    _reduce_sum(
-                                                        top_avg_t, train_pg
-                                                    )
-                                                    top_avg_t = (
-                                                        top_avg_t / float(ws)
-                                                    )
+                                                    _reduce_sum(top_avg_t, train_pg)
+                                                    top_avg_t = top_avg_t / float(ws)
                                                 if bottom_avg_t is not None:
-                                                    _reduce_sum(
-                                                        bottom_avg_t, train_pg
-                                                    )
-                                                    bottom_avg_t = (
-                                                        bottom_avg_t
-                                                        / float(ws)
+                                                    _reduce_sum(bottom_avg_t, train_pg)
+                                                    bottom_avg_t = bottom_avg_t / float(
+                                                        ws
                                                     )
                                             loss_controller.update(
                                                 top_avg_t, bottom_avg_t
@@ -3476,9 +3228,7 @@ def epochs(
                                     with contextlib.suppress(Exception):
                                         flops += max(
                                             0.0,
-                                            float(
-                                                train_counter.get_total_flops()
-                                            ),
+                                            float(train_counter.get_total_flops()),
                                         )
                                     breakdown_getter = getattr(
                                         train_counter,
@@ -3490,13 +3240,9 @@ def epochs(
                                             name,
                                             value,
                                         ) in breakdown_getter().items():
-                                            with contextlib.suppress(
-                                                Exception
-                                            ):
+                                            with contextlib.suppress(Exception):
                                                 flop_breakdown_epoch[name] = (
-                                                    flop_breakdown_epoch.get(
-                                                        name, 0.0
-                                                    )
+                                                    flop_breakdown_epoch.get(name, 0.0)
                                                     + float(value)
                                                 )
                             if should_sync:
@@ -3516,9 +3262,7 @@ def epochs(
                                     )
                                 match device.type:
                                     case "cuda":
-                                        util_now, mem_now = _gpu_nvml_utils(
-                                            device
-                                        )
+                                        util_now, mem_now = _gpu_nvml_utils(device)
                                     case "xpu":
                                         util_now, mem_now = (
                                             None,
@@ -3537,9 +3281,8 @@ def epochs(
                                         gpu_util_ema = util_now
                                     else:
                                         gpu_util_ema = (
-                                            (1.0 - util_alpha) * gpu_util_ema
-                                            + util_alpha * util_now
-                                        )
+                                            1.0 - util_alpha
+                                        ) * gpu_util_ema + util_alpha * util_now
                                 if mem_now is not None:
                                     mem_now = float(mem_now)
                                     if mem_util_ema is None:
@@ -3551,9 +3294,7 @@ def epochs(
                                 if (
                                     util_adjust_interval > 0
                                     and global_step >= util_warmup_steps
-                                    and (
-                                        global_step % util_adjust_interval == 0
-                                    )
+                                    and (global_step % util_adjust_interval == 0)
                                 ):
                                     new_grad_accum = grad_accum_steps
                                     util_frac = None
@@ -3567,34 +3308,25 @@ def epochs(
                                             0.0, min(1.0, mem_util_ema / 100.0)
                                         )
                                     if util_frac is None:
-                                        total_t_local = float(
-                                            io_time + comp_time
-                                        )
+                                        total_t_local = float(io_time + comp_time)
                                         if total_t_local > 0.0:
                                             util_frac = max(
                                                 0.0,
                                                 min(
                                                     1.0,
-                                                    float(comp_time)
-                                                    / total_t_local,
+                                                    float(comp_time) / total_t_local,
                                                 ),
                                             )
                                         else:
                                             util_frac = 0.0
                                     if util_frac is not None:
                                         if mem_frac is not None:
-                                            if (
-                                                util_frac < 0.88
-                                                and mem_frac < 0.9
-                                            ):
+                                            if util_frac < 0.88 and mem_frac < 0.9:
                                                 new_grad_accum = min(
                                                     max_grad_accum,
                                                     grad_accum_steps + 1,
                                                 )
-                                            elif (
-                                                util_frac > 0.97
-                                                or mem_frac > 0.92
-                                            ):
+                                            elif util_frac > 0.97 or mem_frac > 0.92:
                                                 new_grad_accum = max(
                                                     min_grad_accum,
                                                     grad_accum_steps - 1,
@@ -3659,8 +3391,7 @@ def epochs(
                                 comp_ev_e.record()
                                 comp_ev_e.synchronize()
                                 comp_time += (
-                                    float(comp_ev_s.elapsed_time(comp_ev_e))
-                                    / 1000.0
+                                    float(comp_ev_s.elapsed_time(comp_ev_e)) / 1000.0
                                 )
                             else:
                                 if timer_sync:
@@ -3670,17 +3401,11 @@ def epochs(
                                 ) / 1000000000.0
                             if local_rank == 0 and should_sync:
                                 io_elapsed = prev_io_time + float(io_time)
-                                io_transferred = prev_io_bytes + float(
-                                    io_bytes
-                                )
-                                comp_elapsed = prev_comp_time + float(
-                                    comp_time
-                                )
+                                io_transferred = prev_io_bytes + float(io_bytes)
+                                comp_elapsed = prev_comp_time + float(comp_time)
                                 flop_total = prev_flops + float(flops)
                                 mbps_cur = (
-                                    io_transferred
-                                    / max(io_elapsed, 1e-06)
-                                    / MB_DIV
+                                    io_transferred / max(io_elapsed, 1e-06) / MB_DIV
                                 )
                                 tflops_cur = (
                                     flop_total
@@ -3698,8 +3423,7 @@ def epochs(
                                 try:
                                     if (
                                         train_steps <= 0
-                                        or step_idx
-                                        % max(1, int(train_steps * 0.01))
+                                        or step_idx % max(1, int(train_steps * 0.01))
                                         == 0
                                     ):
                                         x_rec = X
@@ -3730,13 +3454,9 @@ def epochs(
                                                         )
                                                         and y_flat.ndim != 2
                                                     ):
-                                                        y_flat = (
-                                                            y_flat.reshape(
-                                                                y_flat.shape[
-                                                                    0
-                                                                ],
-                                                                -1,
-                                                            )
+                                                        y_flat = y_flat.reshape(
+                                                            y_flat.shape[0],
+                                                            -1,
                                                         )
                                                     need_denorm = True
                                                     scale_max = getattr(
@@ -3753,8 +3473,7 @@ def epochs(
                                                             y_flat,
                                                             torch.Tensor,
                                                         )
-                                                        and scale_max
-                                                        is not None
+                                                        and scale_max is not None
                                                     ):
                                                         with contextlib.suppress(
                                                             Exception
@@ -3767,34 +3486,25 @@ def epochs(
                                                             )
                                                             if (
                                                                 max_obs
-                                                                >= float(
-                                                                    scale_max
-                                                                )
+                                                                >= float(scale_max)
                                                                 * 0.5
                                                             ):
-                                                                need_denorm = (
-                                                                    False
-                                                                )
+                                                                need_denorm = False
                                                     if need_denorm:
-                                                        y_rec = dy(
-                                                            y_flat
-                                                        ).view_as(y_rec)
+                                                        y_rec = dy(y_flat).view_as(
+                                                            y_rec
+                                                        )
                                         hist.record_batch(x_rec, y_rec)
                                 except Exception:
                                     pass
                             if torch_prof is not None:
                                 torch_prof.step()
                             t_fetch_start = time.perf_counter_ns()
-                            if (
-                                cpu_pool is not None
-                                and step_idx + 1 & 255 == 0
-                            ):
+                            if cpu_pool is not None and step_idx + 1 & 255 == 0:
                                 with contextlib.suppress(Exception):
                                     cpu_pool.collect()
                             with contextlib.suppress(Exception):
-                                _clear_oom_retries(
-                                    train_loader, "train", step_idx
-                                )
+                                _clear_oom_retries(train_loader, "train", step_idx)
                             break
                         except RuntimeError as e:
                             if is_oom_error(e):
@@ -3819,9 +3529,7 @@ def epochs(
                                 cudagraph_mark_step_end()
             if lw_count > 0:
                 top_avg_t = (
-                    lw_top_sum / float(lw_count)
-                    if lw_top_sum is not None
-                    else None
+                    lw_top_sum / float(lw_count) if lw_top_sum is not None else None
                 )
                 bottom_avg_t = (
                     lw_bottom_sum / float(lw_count)
@@ -3878,9 +3586,7 @@ def epochs(
                                         raise RuntimeError(
                                             f"labels.ndim={Y.ndim} (expect >= 1). got shape={tuple(Y.shape)}"
                                         )
-                                    wait_s = (
-                                        t_ready - t_fetch_start
-                                    ) / 1000000000.0
+                                    wait_s = (t_ready - t_fetch_start) / 1000000000.0
                                     io_time += float(wait_s + h2d_s)
                                     with contextlib.suppress(Exception):
                                         io_bytes += float(
@@ -3910,9 +3616,7 @@ def epochs(
                                             cudagraph_mark_step_begin()
                                             mark_cudagraph = True
                                         with Autocast.float(device):
-                                            Yv_flat = Y.reshape(
-                                                Y.shape[0], -1
-                                            ).to(
+                                            Yv_flat = Y.reshape(Y.shape[0], -1).to(
                                                 device,
                                                 dtype=param_dtype,
                                                 non_blocking=non_blocking_ok,
@@ -3952,11 +3656,7 @@ def epochs(
                                         comp_ev_e.record()
                                         comp_ev_e.synchronize()
                                         comp_time += (
-                                            float(
-                                                comp_ev_s.elapsed_time(
-                                                    comp_ev_e
-                                                )
-                                            )
+                                            float(comp_ev_s.elapsed_time(comp_ev_e))
                                             / 1000.0
                                         )
                                     else:
@@ -3968,9 +3668,7 @@ def epochs(
                                     with contextlib.suppress(Exception):
                                         flops += max(
                                             0.0,
-                                            float(
-                                                val_counter.get_total_flops()
-                                            ),
+                                            float(val_counter.get_total_flops()),
                                         )
                                     breakdown_getter = getattr(
                                         val_counter,
@@ -3982,25 +3680,15 @@ def epochs(
                                             name,
                                             value,
                                         ) in breakdown_getter().items():
-                                            with contextlib.suppress(
-                                                Exception
-                                            ):
+                                            with contextlib.suppress(Exception):
                                                 flop_breakdown_epoch[name] = (
-                                                    flop_breakdown_epoch.get(
-                                                        name, 0.0
-                                                    )
+                                                    flop_breakdown_epoch.get(name, 0.0)
                                                     + float(value)
                                                 )
                                     if local_rank == 0:
-                                        io_elapsed = prev_io_time + float(
-                                            io_time
-                                        )
-                                        io_transferred = prev_io_bytes + float(
-                                            io_bytes
-                                        )
-                                        comp_elapsed = prev_comp_time + float(
-                                            comp_time
-                                        )
+                                        io_elapsed = prev_io_time + float(io_time)
+                                        io_transferred = prev_io_bytes + float(io_bytes)
+                                        comp_elapsed = prev_comp_time + float(comp_time)
                                         flop_total = prev_flops + float(flops)
                                         mbps_cur = (
                                             io_transferred
@@ -4021,16 +3709,11 @@ def epochs(
                                     if torch_prof is not None:
                                         torch_prof.step()
                                     t_fetch_start = time.perf_counter_ns()
-                                    if (
-                                        cpu_pool is not None
-                                        and _vstep + 1 & 255 == 0
-                                    ):
+                                    if cpu_pool is not None and _vstep + 1 & 255 == 0:
                                         with contextlib.suppress(Exception):
                                             cpu_pool.collect()
                                     with contextlib.suppress(Exception):
-                                        _clear_oom_retries(
-                                            val_loader, "val", _vstep
-                                        )
+                                        _clear_oom_retries(val_loader, "val", _vstep)
                                     break
                                 except RuntimeError as e:
                                     if is_oom_error(e):
@@ -4065,9 +3748,7 @@ def epochs(
                     device=device,
                     dtype=stats_dtype,
                 )
-                torch.distributed.all_reduce(
-                    stats, op=torch.distributed.ReduceOp.SUM
-                )
+                torch.distributed.all_reduce(stats, op=torch.distributed.ReduceOp.SUM)
                 world = max(1, get_world_size(device))
                 stats /= world
                 stats_cpu = stats.detach().cpu()
@@ -4087,14 +3768,10 @@ def epochs(
                 and epoch_idx >= swa_start_epoch
                 and float(train_samples_epoch or 0.0) > 0.0
             ):
-                _LOGGER.info(
-                    "[swa] epoch %d: update+ckpt (CPU shadow)", epoch_idx + 1
-                )
+                _LOGGER.info("[swa] epoch %d: update+ckpt (CPU shadow)", epoch_idx + 1)
                 swa_target = (
                     model.module
-                    if isinstance(
-                        model, torch.nn.parallel.DistributedDataParallel
-                    )
+                    if isinstance(model, torch.nn.parallel.DistributedDataParallel)
                     else model
                 )
                 swa_helper.update(swa_target)
@@ -4127,10 +3804,13 @@ def epochs(
                     _coerce_dcp_keys(model_sd)
                     ckpt_percentage = 100 * float(int(epoch_idx + 1) / int(ops.epochs))
                     update_checkpoint_bar(
-                        checkpoint_bar, finish=False, total=int(ops.epochs), position=int(epoch_idx)
+                        checkpoint_bar,
+                        finish=False,
+                        total=int(ops.epochs),
+                        position=int(epoch_idx),
                     )
                     from .workflow import save_model as _api_save_model
-                    
+
                     _ozl_kwargs: dict[str, object] = {}
                     if str(ckpt_path).lower().endswith(".ozl"):
                         _lvl = os.environ.get("ENN_OPENZL_LEVEL")
@@ -4169,7 +3849,10 @@ def epochs(
                         **_ozl_kwargs,
                     )
                     update_checkpoint_bar(
-                        checkpoint_bar, finish=True, total=int(ops.epochs), position=int(epoch_idx)
+                        checkpoint_bar,
+                        finish=True,
+                        total=int(ops.epochs),
+                        position=int(epoch_idx),
                     )
                     try:
                         del model_sd
@@ -4177,6 +3860,7 @@ def epochs(
                         pass
                     with contextlib.suppress(Exception):
                         import gc
+
                         gc.collect()
             if is_distributed():
                 distributed_barrier(device)
@@ -4198,9 +3882,7 @@ def epochs(
             x_b, y_b = schema.get_row(batch, labels_required=True)
             x_raw = x_b.to(device)
             y_raw = y_b.to(scaler_y_device)
-            y_flat = (
-                y_raw.reshape(y_raw.shape[0], -1) if y_raw.ndim >= 2 else y_raw
-            )
+            y_flat = y_raw.reshape(y_raw.shape[0], -1) if y_raw.ndim >= 2 else y_raw
             out = model(
                 x_raw,
                 labels_flat=None,
@@ -4234,9 +3916,7 @@ def epochs(
                 f_true = z_true.shape[-1]
                 if f_true % f_pred == 0:
                     group = f_true // f_pred
-                    z_true = z_true.view(z_true.shape[0], group, f_pred).mean(
-                        dim=1
-                    )
+                    z_true = z_true.view(z_true.shape[0], group, f_pred).mean(dim=1)
                 elif f_pred % f_true == 0:
                     group = f_pred // f_true
                     z_true = z_true.repeat_interleave(group, dim=1)
@@ -4284,29 +3964,17 @@ def epochs(
                     sum_x2[j:j2] += (zp * zp).sum(dim=0, dtype=torch.float64)
                     sum_xy[j:j2] += (zp * zt).sum(dim=0, dtype=torch.float64)
         if is_distributed():
-            n_t = torch.tensor(
-                int(total_n), device=scaler_y_device, dtype=torch.int64
-            )
-            torch.distributed.all_reduce(
-                n_t, op=torch.distributed.ReduceOp.SUM
-            )
+            n_t = torch.tensor(int(total_n), device=scaler_y_device, dtype=torch.int64)
+            torch.distributed.all_reduce(n_t, op=torch.distributed.ReduceOp.SUM)
             total_n = int(n_t.item())
             if sum_x is not None:
-                torch.distributed.all_reduce(
-                    sum_x, op=torch.distributed.ReduceOp.SUM
-                )
+                torch.distributed.all_reduce(sum_x, op=torch.distributed.ReduceOp.SUM)
             if sum_y is not None:
-                torch.distributed.all_reduce(
-                    sum_y, op=torch.distributed.ReduceOp.SUM
-                )
+                torch.distributed.all_reduce(sum_y, op=torch.distributed.ReduceOp.SUM)
             if sum_x2 is not None:
-                torch.distributed.all_reduce(
-                    sum_x2, op=torch.distributed.ReduceOp.SUM
-                )
+                torch.distributed.all_reduce(sum_x2, op=torch.distributed.ReduceOp.SUM)
             if sum_xy is not None:
-                torch.distributed.all_reduce(
-                    sum_xy, op=torch.distributed.ReduceOp.SUM
-                )
+                torch.distributed.all_reduce(sum_xy, op=torch.distributed.ReduceOp.SUM)
         if (
             total_n > 0
             and sum_x is not None
@@ -4327,9 +3995,7 @@ def epochs(
             denom[tiny_mask] = 1.0
             affine_dtype = model_for_scaler.scaler.affine_a.dtype
             a = (cov_xy / denom).to(dtype=affine_dtype)
-            b = (mean_y - a.to(dtype=affine_dtype) * mean_x).to(
-                dtype=affine_dtype
-            )
+            b = (mean_y - a.to(dtype=affine_dtype) * mean_x).to(dtype=affine_dtype)
             a[tiny_mask] = 1.0
             b[tiny_mask] = 0.0
             model_for_scaler.scaler.set_affine(a, b)
@@ -4360,9 +4026,7 @@ def epochs(
         util_fallback = (
             util_from_sps
             if util_from_sps > 0.0
-            else prev_comp_time / total_t
-            if total_t > 0.0
-            else 0.0
+            else prev_comp_time / total_t if total_t > 0.0 else 0.0
         )
         gpu_util_frac = None
         mem_util_frac = None
@@ -4371,9 +4035,7 @@ def epochs(
         if mem_util_ema is not None:
             mem_util_frac = max(0.0, min(1.0, mem_util_ema / 100.0))
         if dev_t != "cpu":
-            util_for_cap = (
-                gpu_util_frac if gpu_util_frac is not None else util_fallback
-            )
+            util_for_cap = gpu_util_frac if gpu_util_frac is not None else util_fallback
             util_for_cap = max(0.0, min(1.0, util_for_cap))
             try:
                 if train_loader is not None:
@@ -4435,19 +4097,14 @@ def epochs(
         if isinstance(hist, Recorder):
             try:
                 end_sec = round(float(end_kst_ns) / 1000000000.0, 6)
-                world = (
-                    max(1, get_world_size(device)) if is_distributed() else 1
-                )
+                world = max(1, get_world_size(device)) if is_distributed() else 1
                 hist.end_session(end_sec, peers=world)
 
                 try:
                     if ops.ckpt_dir and (
-                        not is_distributed()
-                        or int(torch.distributed.get_rank()) == 0
+                        not is_distributed() or int(torch.distributed.get_rank()) == 0
                     ):
-                        hist_path = os.path.join(
-                            str(ops.ckpt_dir), "history.json"
-                        )
+                        hist_path = os.path.join(str(ops.ckpt_dir), "history.json")
                         collate.write_json(hist_path, hist.save(), indent=2)
                 except Exception:
                     pass
@@ -4521,16 +4178,10 @@ def infer(
     )
     dev_type = str(getattr(device, "type", "cpu"))
     use_async_write = bool(_env_flag("ENN_PRED_ASYNC_WRITE", True))
-    use_mmt_pred_parts = bool(
-        _env_flag("ENN_PRED_MMT_PARTS", dev_type != "cpu")
-    )
+    use_mmt_pred_parts = bool(_env_flag("ENN_PRED_MMT_PARTS", dev_type != "cpu"))
     if not use_async_write:
         use_mmt_pred_parts = False
-    cache = (
-        TensorSpooler(chunk_dir, max_queue=cache_q)
-        if use_async_write
-        else None
-    )
+    cache = TensorSpooler(chunk_dir, max_queue=cache_q) if use_async_write else None
     target_rows = int(_env_int("ENN_PRED_CHUNK_ROWS", 0))
     if target_rows <= 0:
         out_shape = tuple((int(x) for x in ops.out_shape or ()))
@@ -4538,13 +4189,9 @@ def infer(
         for d in out_shape:
             out_numel *= max(1, int(d))
         est_row_bytes = max(1, out_numel * 4)
-        target_bytes = int(
-            _env_int("ENN_PRED_CHUNK_BYTES", 64 * 1024 * 1024)
-        )
+        target_bytes = int(_env_int("ENN_PRED_CHUNK_BYTES", 64 * 1024 * 1024))
         target_rows = max(256, min(65536, target_bytes // est_row_bytes))
-    dev_obj = (
-        device if isinstance(device, torch.device) else torch.device(device)
-    )
+    dev_obj = device if isinstance(device, torch.device) else torch.device(device)
     run_model: torch.nn.Module = model
     if (
         is_distributed()
@@ -4564,13 +4211,10 @@ def infer(
             sync_module_states=True,
         )
     run_model.eval()
-    module_eval = (
-        run_model.module if hasattr(run_model, "module") else run_model
-    )
+    module_eval = run_model.module if hasattr(run_model, "module") else run_model
     distributed_sync(module_eval, device=dev_obj)
     cg_enabled = bool(
-        dev_type == "cuda"
-        and getattr(module_eval, "_compile_cudagraphs", False)
+        dev_type == "cuda" and getattr(module_eval, "_compile_cudagraphs", False)
     )
     td_cg_candidate = bool(
         (not cg_enabled)
@@ -4583,20 +4227,13 @@ def infer(
     pinned_ok = bool(is_pin_supported(dev_type))
     backend = accelerator_type(dev_type)
     stream_fn = (
-        getattr(backend, "current_stream", None)
-        if backend is not None
-        else None
+        getattr(backend, "current_stream", None) if backend is not None else None
     )
     Event = getattr(backend, "Event", None) if backend is not None else None
     can_stream_release = bool(
-        pinned_ok
-        and non_blocking_ok
-        and callable(stream_fn)
-        and (Event is not None)
+        pinned_ok and non_blocking_ok and callable(stream_fn) and (Event is not None)
     )
-    make_fence_event = partial(
-        new_accelerator_event, device, enable_timing=False
-    )
+    make_fence_event = partial(new_accelerator_event, device, enable_timing=False)
     cpu_pool = None
     if pinned_ok and TensorPagePool is not None:
         with contextlib.suppress(Exception):
@@ -4700,12 +4337,7 @@ def infer(
 
             def _td_cudagraph(bs_now: int, X_now: torch.Tensor) -> None:
                 nonlocal td_cg_active, td_cg_disabled, td_cg_mb, td_cg_mod
-                nonlocal \
-                    td_cg_pad_buf, \
-                    td_cg_seen, \
-                    td_cg_max_bs, \
-                    td_cg_target, \
-                    td_cg_x_inner_shape
+                nonlocal td_cg_pad_buf, td_cg_seen, td_cg_max_bs, td_cg_target, td_cg_x_inner_shape
                 if (
                     td_cg_disabled
                     or td_cg_active
@@ -4725,16 +4357,12 @@ def infer(
                 if mb_cap is None:
                     return
                 mb_cap = int(max(1, int(mb_cap)))
-                td_cg_x_inner_shape = tuple(
-                    int(d) for d in tuple(X_now.shape[1:])
-                )
+                td_cg_x_inner_shape = tuple(int(d) for d in tuple(X_now.shape[1:]))
                 td_cg_mb = int(mb_cap)
                 td_cg_pad_buf = X_now.new_empty(
                     (int(td_cg_mb),) + tuple(td_cg_x_inner_shape)
                 )
-                td_cg_mod = TD_CudaGraphModule(
-                    _td_predict, warmup=2, device=device
-                )
+                td_cg_mod = TD_CudaGraphModule(_td_predict, warmup=2, device=device)
                 n0 = int(min(int(bs_now), int(td_cg_mb)))
                 td_cg_pad_buf[:n0].copy_(X_now[:n0])
                 if n0 < int(td_cg_mb):
@@ -4773,11 +4401,7 @@ def infer(
             try:
                 _first_batch = next(data_iter)
             except StopIteration:
-                r = (
-                    int(torch.distributed.get_rank())
-                    if is_distributed()
-                    else 0
-                )
+                r = int(torch.distributed.get_rank()) if is_distributed() else 0
                 w = int(get_world_size(device)) if is_distributed() else 1
                 with contextlib.suppress(Exception):
                     chain = []
@@ -4798,9 +4422,7 @@ def infer(
                         if nxt is None or nxt is cur:
                             break
                         cur = nxt
-                    _LOGGER.error(
-                        "[DIAG] infer: loader chain: %s", " -> ".join(chain)
-                    )
+                    _LOGGER.error("[DIAG] infer: loader chain: %s", " -> ".join(chain))
 
                     base = getattr(data_loader, "_base_iterable", None)
                     if base is not None:
@@ -4868,23 +4490,15 @@ def infer(
                 except Exception:
                     raise
                 X = torch.atleast_2d(X)
-                bs = (
-                    int(getattr(X, "shape", [0])[0])
-                    if hasattr(X, "shape")
-                    else 0
-                )
+                bs = int(getattr(X, "shape", [0])[0]) if hasattr(X, "shape") else 0
                 if (not first_batch_info) and seen_batches == 1:
                     with contextlib.suppress(Exception):
                         first_batch_info["batch_type"] = type(batch).__name__
                         first_batch_info["X_shape"] = [
                             int(x) for x in getattr(X, "shape", ())
                         ]
-                        first_batch_info["X_dtype"] = str(
-                            getattr(X, "dtype", None)
-                        )
-                        first_batch_info["X_device"] = str(
-                            getattr(X, "device", None)
-                        )
+                        first_batch_info["X_dtype"] = str(getattr(X, "dtype", None))
+                        first_batch_info["X_device"] = str(getattr(X, "device", None))
                         if row_ids is not None and hasattr(row_ids, "shape"):
                             first_batch_info["row_ids_shape"] = [
                                 int(x) for x in getattr(row_ids, "shape", ())
@@ -4933,9 +4547,7 @@ def infer(
                 mb_eager = max(1, int(mb_eager))
 
                 use_td_cg = bool(
-                    td_cg_active
-                    and (td_cg_mod is not None)
-                    and (td_cg_mb is not None)
+                    td_cg_active and (td_cg_mod is not None) and (td_cg_mb is not None)
                 )
                 if use_td_cg and (td_cg_x_inner_shape is not None):
                     if tuple(int(d) for d in tuple(X.shape[1:])) != tuple(
@@ -4968,9 +4580,9 @@ def infer(
                                 and (td_cg_pad_buf is not None)
                                 and (td_cg_x_inner_shape is not None)
                             ):
-                                if tuple(
-                                    int(d) for d in tuple(Xi.shape[1:])
-                                ) != tuple(td_cg_x_inner_shape):
+                                if tuple(int(d) for d in tuple(Xi.shape[1:])) != tuple(
+                                    td_cg_x_inner_shape
+                                ):
                                     raise RuntimeError(
                                         "infer: input shape changed during td-cudagraph run"
                                     )
@@ -5034,9 +4646,7 @@ def infer(
                             cudagraph_mark_step_end()
                     preds = out
                     if not isinstance(preds, torch.Tensor):
-                        raise RuntimeError(
-                            "infer: unexpected model output type"
-                        )
+                        raise RuntimeError("infer: unexpected model output type")
                     if pad_n > 0:
                         preds = preds[:n_i]
                     rows_cpu = (
@@ -5045,9 +4655,7 @@ def infer(
                         else rows_i.to(device="cpu")
                     )
                     writer.append(rows_cpu, preds)
-                    appended_rows_total += int(
-                        getattr(preds, "shape", (0,))[0]
-                    )
+                    appended_rows_total += int(getattr(preds, "shape", (0,))[0])
                     del Xi, Xi_pad, rows_i, out, preds, rows_cpu
                     start = end
                 if torch_prof is not None:
@@ -5078,9 +4686,7 @@ def infer(
                     raise RuntimeError(
                         f"infer: prediction writer encountered an error: {type(err).__name__}: {err}"
                     ) from err
-                raise RuntimeError(
-                    "infer: prediction writer encountered an error"
-                )
+                raise RuntimeError("infer: prediction writer encountered an error")
         if status_bar is not None:
             status_bar.close()
         with contextlib.suppress(Exception):
@@ -5142,9 +4748,7 @@ def infer(
     return None
 
 
-def process(
-    ops: RuntimeConfig, ret_sink: ReturnSink | None = None
-) -> object: ...
+def process(ops: RuntimeConfig, ret_sink: ReturnSink | None = None) -> object: ...
 
 
 def process(
@@ -5221,7 +4825,12 @@ def process(*args: Any, **kwargs: Any) -> object:
 
             init_path = str(ops.init_ckpt_dir)
             if os.path.isdir(init_path):
-                for _name in ("model.ozl", "model.pt", "model.pth", "model.safetensors"):
+                for _name in (
+                    "model.ozl",
+                    "model.pt",
+                    "model.pth",
+                    "model.safetensors",
+                ):
                     fp = os.path.join(init_path, _name)
                     if os.path.isfile(fp):
                         init_path = fp
@@ -5319,10 +4928,8 @@ def process(*args: Any, **kwargs: Any) -> object:
         if param_dtype is torch.float64:
             disable_note = "master dtype is float64"
         elif fp8_ok:
-            model, fp8_enabled, fp8_backend = (
-                ModelPolicy.enable_float8_training(
-                    model, metadata=metadata, logger=_float8_log
-                )
+            model, fp8_enabled, fp8_backend = ModelPolicy.enable_float8_training(
+                model, metadata=metadata, logger=_float8_log
             )
             if not fp8_enabled:
                 disable_note = fp8_backend or fp8_reason
@@ -5408,9 +5015,7 @@ def process(*args: Any, **kwargs: Any) -> object:
                     sync_module_states=True,
                 )
             except Exception as e:
-                _LOGGER.warning(
-                    f"HSDP2 wrapping fallback to root-only FSDP: {e}"
-                )
+                _LOGGER.warning(f"HSDP2 wrapping fallback to root-only FSDP: {e}")
                 model = to_hsdp_module(
                     model,
                     mesh=mesh,
@@ -5435,9 +5040,7 @@ def process(*args: Any, **kwargs: Any) -> object:
         )
 
         if dist_policy.sync_state:
-            distributed_sync(
-                _m_post, device=device, policy=dist_policy.collective
-            )
+            distributed_sync(_m_post, device=device, policy=dist_policy.collective)
         net_params = [p for p in model.parameters()]
         optimizer = AdamW.float(
             net_params,
@@ -5592,13 +5195,9 @@ def process(*args: Any, **kwargs: Any) -> object:
                 main_steps=main_steps,
                 emin=emin,
             )
-            sched = torch.optim.lr_scheduler.LambdaLR(
-                optimizer, lr_lambda=lr_lambda
-            )
+            sched = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
             scheduler_step_per_batch = True
-            tracked_module = (
-                model.module if hasattr(model, "module") else model
-            )
+            tracked_module = model.module if hasattr(model, "module") else model
             ema_helper = None
             swa_helper = None
             swa_start_epoch = int(total_epochs)
@@ -5619,9 +5218,7 @@ def process(*args: Any, **kwargs: Any) -> object:
                     _swa_env = os.environ.get("ENN_SWA_START_EPOCH")
                     if _swa_env is not None and str(_swa_env).strip() != "":
                         try:
-                            swa_start_epoch = max(
-                                0, int(str(_swa_env).strip())
-                            )
+                            swa_start_epoch = max(0, int(str(_swa_env).strip()))
                         except Exception:
                             swa_start_epoch = 0
                     swa_helper = StochasticWeightAverage(
@@ -5635,9 +5232,7 @@ def process(*args: Any, **kwargs: Any) -> object:
             amp_dtype = getattr(precision, "amp_float", None)
             compute_dtype = amp_dtype or param_dtype
             scaler = torch.amp.GradScaler(
-                enabled=bool(
-                    device.type == "cuda" and compute_dtype == torch.float16
-                )
+                enabled=bool(device.type == "cuda" and compute_dtype == torch.float16)
             )
             try:
                 new_affinity().pin_thread()
@@ -5674,15 +5269,10 @@ def process(*args: Any, **kwargs: Any) -> object:
         if local_rank == 0:
             avg_tag = None
             avg_helper = None
-            if (
-                swa_helper is not None
-                and getattr(swa_helper, "n_averaged", 0) > 0
-            ):
+            if swa_helper is not None and getattr(swa_helper, "n_averaged", 0) > 0:
                 avg_tag = "swa"
                 avg_helper = swa_helper
-            elif ema_helper is not None and getattr(
-                ema_helper, "shadow", None
-            ):
+            elif ema_helper is not None and getattr(ema_helper, "shadow", None):
                 avg_tag = "ema"
                 avg_helper = ema_helper
 
@@ -5708,9 +5298,7 @@ def process(*args: Any, **kwargs: Any) -> object:
                             os.path.join(ops.ckpt_dir, "model" + _alt)
                         ):
                             return
-                    src_mod = (
-                        tracked_module if tracked_module is not None else model
-                    )
+                    src_mod = tracked_module if tracked_module is not None else model
                     shadow = (
                         getattr(avg_helper, "shadow", None)
                         if avg_helper is not None
@@ -5760,8 +5348,7 @@ def process(*args: Any, **kwargs: Any) -> object:
                                 try:
                                     if (
                                         max_bytes
-                                        and (b.numel() * b.element_size())
-                                        > max_bytes
+                                        and (b.numel() * b.element_size()) > max_bytes
                                     ):
                                         continue
                                 except Exception:
@@ -5776,9 +5363,7 @@ def process(*args: Any, **kwargs: Any) -> object:
                     from .workflow import save_model as _api_save_model
 
                     save_target = (
-                        src_mod.module
-                        if hasattr(src_mod, "module")
-                        else src_mod
+                        src_mod.module if hasattr(src_mod, "module") else src_mod
                     )
                     _ozl_kwargs: dict[str, object] = {}
                     if str(ckpt_path).lower().endswith(".ozl"):
@@ -5789,9 +5374,7 @@ def process(*args: Any, **kwargs: Any) -> object:
                         _mss = os.environ.get("ENN_OPENZL_MIN_STREAM_SIZE")
                         if _mss:
                             with contextlib.suppress(Exception):
-                                _ozl_kwargs["openzl_min_stream_size"] = int(
-                                    _mss
-                                )
+                                _ozl_kwargs["openzl_min_stream_size"] = int(_mss)
 
                     _api_save_model(
                         save_target,
@@ -5834,7 +5417,10 @@ def process(*args: Any, **kwargs: Any) -> object:
         cfg = replace(cfg, device=device)
         if _env_flag("ENN_MAX_PERF", True):
             cm = canonicalize_compile_mode(getattr(cfg, "compile_mode", None))
-            if cm == "reduce-overhead" and getattr(cfg, "compile_dynamic", None) is None:
+            if (
+                cm == "reduce-overhead"
+                and getattr(cfg, "compile_dynamic", None) is None
+            ):
                 with contextlib.suppress(Exception):
                     setattr(cfg, "compile_dynamic", False)
             if "ENN_COMPILE_DYNAMIC" in os.environ:
@@ -5963,9 +5549,7 @@ def process(*args: Any, **kwargs: Any) -> object:
         ).open()
         data_loader = session.training_loader
         chunk_dir = (
-            os.path.join(ops.ckpt_dir, "pred_chunks")
-            if ops.ckpt_dir or ""
-            else None
+            os.path.join(ops.ckpt_dir, "pred_chunks") if ops.ckpt_dir or "" else None
         )
         if chunk_dir and torch.distributed.get_rank() == 0:
             with contextlib.suppress(Exception):

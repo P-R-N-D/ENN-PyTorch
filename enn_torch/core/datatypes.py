@@ -12,7 +12,6 @@ from typing import Any, TypeAlias
 import numpy
 import torch
 
-
 _CANONICAL_DTYPES: dict[str, dict[str, Any]] = {
     "float64": {
         "torch": torch.float64,
@@ -110,9 +109,7 @@ _PLATFORM_ALIASES: dict[str, str] = {
 _FALSE = frozenset({"0", "false", "no", "n", "off", "disable", "disabled"})
 _TRUE = frozenset({"1", "true", "yes", "y", "on", "enable", "enabled"})
 JsonPrimitive: TypeAlias = str | int | float | bool | None
-JsonValue: TypeAlias = (
-    JsonPrimitive | list["JsonValue"] | dict[str, "JsonValue"]
-)
+JsonValue: TypeAlias = JsonPrimitive | list["JsonValue"] | dict[str, "JsonValue"]
 PathLike: TypeAlias = str | os.PathLike[str] | Path
 
 
@@ -204,9 +201,7 @@ def env_str(name: str, default: str | None = None) -> str | None:
 
 def env_bool(name: str | Sequence[str], default: bool = False) -> bool:
     raw: object | None
-    if isinstance(name, Sequence) and not isinstance(
-        name, (str, bytes, bytearray)
-    ):
+    if isinstance(name, Sequence) and not isinstance(name, (str, bytes, bytearray)):
         raw = env_first(list(name), default=None)
     else:
         raw = os.environ.get(str(name))
@@ -281,15 +276,11 @@ def to_platform_dtype(src: Any, platform: str) -> Any:
         return canonical
     mapping = _CANONICAL_DTYPES.get(canonical)
     if mapping is None:
-        raise TypeError(
-            f"unsupported dtype conversion: {src!r} -> {platform!r}"
-        )
+        raise TypeError(f"unsupported dtype conversion: {src!r} -> {platform!r}")
     try:
         return mapping[normalized]
     except KeyError as e:
-        raise TypeError(
-            f"unsupported dtype conversion: {src!r} -> {platform!r}"
-        ) from e
+        raise TypeError(f"unsupported dtype conversion: {src!r} -> {platform!r}") from e
 
 
 def parse_torch_dtype(src: Any) -> torch.dtype | None:
@@ -376,9 +367,7 @@ def default_underflow_action() -> str:
     return raw if raw in _DEF_UNDERFLOW_ACTIONS else "warn"
 
 
-def normalize_underflow_action(
-    value: object, *args: Any, default: str = "warn"
-) -> str:
+def normalize_underflow_action(value: object, *args: Any, default: str = "warn") -> str:
     r = str(value if value is not None else default).strip().lower()
     if r in _DEF_UNDERFLOW_ACTIONS:
         return r
