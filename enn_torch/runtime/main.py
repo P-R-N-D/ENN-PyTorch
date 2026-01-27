@@ -27,10 +27,7 @@ import torch
 import torch.distributed
 import torch.nn as nn
 from tensordict import TensorDictBase
-from torch.distributed.checkpoint import (
-    FileSystemReader,
-    load,
-)
+from torch.distributed.checkpoint import FileSystemReader, load
 from torch.distributed.checkpoint.state_dict import (
     StateDictOptions,
     get_model_state_dict,
@@ -38,13 +35,10 @@ from torch.distributed.checkpoint.state_dict import (
 )
 from tqdm.auto import tqdm
 
+import ..schema
 from ..config import RuntimeConfig, coerce_model_config
-from ..core.concurrency import (
-    Mutex,
-    TensorPagePool,
-    TensorSpooler,
-    new_affinity,
-)
+from .. import schema
+from ..core.concurrency import Mutex, TensorPagePool, TensorSpooler, new_affinity
 from ..core.datatypes import (
     env_bool,
     env_first,
@@ -79,6 +73,7 @@ from ..core.graph import (
 from ..core.policies import DistributedPolicy, ModelPolicy, PrecisionPolicy
 from ..core.precision import Autocast
 from ..core.profiler import FlopCounter
+from ..core.tensor import is_meta_or_fake_tensor, to_torch_tensor
 from ..core.system import (
     CPU,
     Memory,
@@ -105,8 +100,6 @@ from ..core.system import (
     set_float32_precision,
     sync_accelerator,
 )
-from ..core.tensor import is_meta_or_fake_tensor, to_torch_tensor
-from .. import schema
 from ..data import collate
 from ..data.collate import Unsharder
 from ..data.pipeline import Dataset
@@ -122,11 +115,26 @@ from .losses import (
     StudentsTLoss,
     TiledLoss,
 )
-from .optimizers import (
-    AdamW,
-    ExponentialMovingAverage,
-    StochasticWeightAverage,
-)
+from .optimizers import AdamW, ExponentialMovingAverage, StochasticWeightAverage
+
+try:
+    import psutil
+except Exception:
+    psutil = None
+
+try:
+    from torch.distributed._composable.fsdp import MixedPrecisionPolicy
+except Exception:
+    try:
+        from torch.distributed.fsdp import MixedPrecisionPolicy
+    except Exception:
+        MixedPrecisionPolicy = None
+
+try:
+    from tensordict.nn import CudaGraphModule as TD_CudaGraphModule
+except Exception:
+    TD_CudaGraphModule = None
+
 
 _COMPILE_SAFE_DONE = False
 _COMPILE_SAFE_LOCK = Mutex()
@@ -5990,19 +5998,4 @@ def process(*args: Any, **kwargs: Any) -> object:
     raise ValueError(f"unsupported ops mode: {ops.mode}")
 
 
-try:
-    import psutil
-except Exception:
-    psutil = None
-try:
-    from torch.distributed._composable.fsdp import MixedPrecisionPolicy
-except Exception:
-    try:
-        from torch.distributed.fsdp import MixedPrecisionPolicy
-    except Exception:
-        MixedPrecisionPolicy = None
-try:
-    from tensordict.nn import CudaGraphModule as TD_CudaGraphModule
-except Exception:
-    TD_CudaGraphModule = None
 compile_distributed_safe()
