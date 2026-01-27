@@ -289,7 +289,7 @@ def _iter_buckets_by_bytes(
 
 
 def _broadcast_bucket_gloox(
-    tensors: list[Tensor], *, src_rank: int, group: ProcessGroup
+    tensors: list[Tensor], *args: Any, src_rank: int, group: ProcessGroup
 ) -> None:
     if not tensors:
         return
@@ -317,7 +317,7 @@ def _broadcast_bucket_gloox(
 
 def _broadcast_large_tensor_gloox(
     tensor: Tensor,
-    *,
+    *args: Any,
     src_rank: int,
     group: ProcessGroup,
     chunk_mb: int,
@@ -381,7 +381,7 @@ def _broadcast_large_tensor_gloox(
 
 def _broadcast_large_tensor(
     tensor: Tensor,
-    *,
+    *args: Any,
     group: ProcessGroup,
     src_rank: int,
     chunk_mb: int,
@@ -434,7 +434,7 @@ def _broadcast_large_tensor(
 
 def _all_reduce_tensor_gloox(
     tensor: Tensor,
-    *,
+    *args: Any,
     group: ProcessGroup,
     chunk_mb: int,
     max_inflight_mb: int,
@@ -882,7 +882,7 @@ def distributed_barrier(
 
 def distributed_broadcast(
     target_module: torch.nn.Module,
-    *,
+    *args: Any,
     src_rank: int = 0,
     group: ProcessGroup | None = None,
     include_buffers: bool = True,
@@ -1003,7 +1003,7 @@ def distributed_sync(
     group: ProcessGroup | None = None,
     include_buffers: bool = True,
     max_buffer_size_mb: int = 25,
-    *,
+    *args: Any,
     policy: "CollectivePolicy | None" = None,
 ) -> None:
     if not is_distributed():
@@ -1032,7 +1032,7 @@ def distributed_sync(
 
 def distributed_all_reduce_grads(
     module: nn.Module,
-    *,
+    *args: Any,
     group: ProcessGroup | None = None,
     average: bool = True,
     policy: "CollectivePolicy | None" = None,
