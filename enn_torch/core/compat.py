@@ -12,6 +12,7 @@ from torch import nn
 from .concurrency import Mutex
 from .graph import compile_distributed_safe
 
+
 _PATCH_LOCK = Mutex(reentrant=True)
 _TORCH_COMPAT: TorchCompat | None = None
 RMSNorm = getattr(nn, "RMSNorm", None)
@@ -152,11 +153,6 @@ class _SDPBackendFallback:
     MATH = FLASH_ATTENTION = EFFICIENT_ATTENTION = CUDNN_ATTENTION = object()
 
 
-StochasticDepth = (
-    getattr(nn, "StochasticDepth", None) or _StochasticDepthFallback
-)
-
-
 class TorchCompat:
     def __init__(
         self: Self, module: Any | None = None, nn_module: Any | None = None
@@ -186,6 +182,10 @@ class TorchCompat:
                     setattr(self.module, name, partial(impl, self.module))
             compile_distributed_safe()
 
+
+StochasticDepth = (
+    getattr(nn, "StochasticDepth", None) or _StochasticDepthFallback
+)
 
 try:
     from torch.nn.attention import SDPBackend, sdpa_kernel
