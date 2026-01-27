@@ -21,7 +21,7 @@ global-exclude *.log *.orig *.rej
 
 # Exclude ML / export / checkpoint / data artifacts
 # Exclude heavy weights to keep the package lightweight
-global-exclude *.onnx *.ort *.pt *.pt2 *.pth  *.pte *.aoti *.tf *.tflite *.tfrecord *.keras *.pb *.ckpt *.mlmodel *.mlpackage *.coreml *.bin
+global-exclude *.onnx *.ort *.pt *.pt2 *.pth *.pte *.aoti *.tf *.tflite *.tfrecord *.keras *.pb *.ckpt *.mlmodel *.mlpackage *.coreml *.bin
 global-exclude *.h5 *.hdf5 *.npz *.mmt *.td *.tensordict *.ozl *.tar *.bz *.zip *.zipx *.7z
 
 # Exclude Excel spreadsheets
