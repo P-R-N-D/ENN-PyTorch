@@ -18,6 +18,19 @@ try:
 except Exception:
     TorchDispatchMode = None
 
+try:
+    from torch._ops import OpOverload, OpOverloadPacket
+except Exception:
+    OpOverload = tuple()
+    OpOverloadPacket = tuple()
+    
+try:
+    from torch._higher_order_ops.higher_order_operator import (
+        HigherOrderOperator,
+    )
+except Exception:
+    HigherOrderOperator = tuple()
+
 _ACT_COEFF: Dict[type, float] = {
     nn.ReLU: 1.0,
     nn.ReLU6: 1.0,
@@ -32,7 +45,6 @@ _ACT_COEFF: Dict[type, float] = {
 }
 _ACT_CLASSES: Tuple[type, ...] = tuple(_ACT_COEFF.keys())
 _LOGGER = logging.getLogger(__name__)
-FLOP_PROFILER: "_FlopProfiler" | None = None
 
 
 def _float_safe(x: Any, default: float = 0.0) -> float:
@@ -2349,9 +2361,6 @@ class _FlopProfiler:
         return float(total)
 
 
-FLOP_PROFILER = _FlopProfiler()
-
-
 class _NvtxFlops(contextlib.AbstractContextManager[Any]):
     def __init__(
         self: Self, dev: Optional[torch.device], getter: Callable[[], float]
@@ -2945,14 +2954,4 @@ class FlopCounter:
         )
 
 
-try:
-    from torch._ops import OpOverload, OpOverloadPacket
-except Exception:
-    OpOverload = tuple()
-    OpOverloadPacket = tuple()
-try:
-    from torch._higher_order_ops.higher_order_operator import (
-        HigherOrderOperator,
-    )
-except Exception:
-    HigherOrderOperator = tuple()
+FLOP_PROFILER = _FlopProfiler()
