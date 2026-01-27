@@ -14,14 +14,6 @@ import threading
 import types
 import warnings
 import weakref
-
-if "_dynamo_is_compiling" not in globals():
-    try:
-        from torch._dynamo import is_compiling as _dynamo_is_compiling  # type: ignore
-    except Exception:
-        def _dynamo_is_compiling() -> bool:  # type: ignore
-            return False
-
 from dataclasses import dataclass
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -36,6 +28,14 @@ from ..core.datatypes import PathLike, write_json
 from ..core.tensor import extract_tensor, from_buffer
 from ..nn.layers import Recorder
 from .io import _load_model_config, _temp_environ, is_required
+
+if "_dynamo_is_compiling" not in globals():
+    try:
+        from torch._dynamo import is_compiling as _dynamo_is_compiling 
+    except Exception:
+        def _dynamo_is_compiling() -> bool:
+            return False
+
 
 _EXPORT_SIG_CACHE: object | None = None
 _EXPORT_SIG_LOCK = Mutex()
@@ -754,7 +754,7 @@ def _sanitize_exported_program(exported: object) -> object:
     return exported
 
 
-def _in_console(cmd: object, desc: object, *, cwd: object = None) -> None:
+def _in_console(cmd: object, desc: object, *args: Any, cwd: object = None) -> None:
     try:
         subprocess.run(list(cmd), check=True, cwd=cwd)
     except (OSError, subprocess.CalledProcessError) as exc:
