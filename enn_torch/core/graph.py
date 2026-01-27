@@ -16,6 +16,7 @@ from .datatypes import env_bool, env_first, env_first_int
 from .system import CPU, is_accelerator_available
 from .tensor import is_meta_or_fake_tensor
 
+
 _COLLECTIVE_NAMES: tuple[str, ...] = (
     "all_gather",
     "all_gather_into_tensor",
@@ -27,14 +28,13 @@ _COLLECTIVE_NAMES: tuple[str, ...] = (
 _GRAPH_BREAK_FN: Callable[[], None] | None = None
 _GRAPH_BREAK_LOCK = Mutex()
 _INDUCTOR_CONFIG_LOCK = Mutex(reentrant=True)
-_NO_COMPILE_SENTINEL = "__enn_no_compile_wrapped__"
+_INDUCTOR_WARN_FILTER_LOCK = Mutex(reentrant=True)
+_INDUCTOR_MAX_AUTOTUNE_SMS_FILTERED = False
 _SAFE_DIST_LOCK = Mutex()
 _SAFE_DIST_PATCHED: set[str] = set()
 _TORCH_COMPILER = getattr(torch, "compiler", None)
 _TORCH_COMPILE_LOCK = Mutex(reentrant=True)
-
-_INDUCTOR_WARN_FILTER_LOCK = Mutex(reentrant=True)
-_INDUCTOR_MAX_AUTOTUNE_SMS_FILTERED = False
+_NO_COMPILE_SENTINEL = "__enn_no_compile_wrapped__"
 
 
 def _is_in_jupyter() -> bool:
@@ -754,7 +754,7 @@ def compile(
                 self._enn_patch_fn = patch_fn
                 self._enn_patch_dict = dict(patch_dict or {})
 
-            def forward(  # type: ignore[override]
+            def forward(
                 self, *f_args: Any, **f_kwargs: Any
             ) -> Any:
                 cfg = self._enn_cfg
@@ -788,12 +788,12 @@ def compile(
                 except AttributeError:
                     return getattr(self._enn_inner, name)
 
-            def state_dict(  # type: ignore[override]
+            def state_dict(
                 self, *sd_args: Any, **sd_kwargs: Any
             ) -> Any:
                 return self._enn_inner.state_dict(*sd_args, **sd_kwargs)
 
-            def load_state_dict(  # type: ignore[override]
+            def load_state_dict(
                 self, *ls_args: Any, **ls_kwargs: Any
             ) -> Any:
                 return self._enn_inner.load_state_dict(*ls_args, **ls_kwargs)
