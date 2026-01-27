@@ -11,20 +11,20 @@ from typing import (
     List,
     Mapping,
     Optional,
+    Self,
     Sequence,
     Tuple,
     TypeVar,
-    Self,
 )
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from ..core.checkpoint import coerce_checkpoint, is_checkpoint
 from ..core.compat import StochasticDepth
 from ..core.concurrency import Mutex
 from ..core.datatypes import env_bool, env_int
-from ..core.checkpoint import coerce_checkpoint, is_checkpoint
 from ..core.graph import (
     is_compiling,
     is_export_or_trace,
@@ -33,39 +33,43 @@ from ..core.graph import (
     torch_compiler_disable,
 )
 from ..core.system import empty_device_cache, is_oom_error
+from .activations import GeGLU
 from .kernels import (
     DotProductAttention,
     FlexAttention,
     MultiHeadAttention,
     MultiScaleRetention,
 )
-from .activations import GeGLU
 
-_DILATED_MASK_CACHE_ENTRY_MAX_BYTES = env_int(
-    "ENN_DILATED_MASK_CACHE_ENTRY_MAX_BYTES", 64 * 1024 * 1024
-)
-_DILATED_MASK_CACHE_MAX = 32
-_DILATED_MASK_CACHE_MAX_L = env_int("ENN_DILATED_MASK_CACHE_MAX_L", 4096)
-_FLEX_BLOCK_MASK_CACHE_EST_MAX_BYTES = env_int(
-    "ENN_FLEX_BLOCK_MASK_CACHE_EST_MAX_BYTES", 128 * 1024 * 1024
-)
-_FLEX_BLOCK_MASK_CACHE_MAX = 16
-TCache = TypeVar("TCache")
 try:
     from torch.nn.attention.flex_attention import create_block_mask
 
-    _HAS_FLEX_ATTENTION = True
-except Exception:
+    _HAS_FLEX_ATTENTION_LIB = True
+except ImportError:
     create_block_mask = None
-    _HAS_FLEX_ATTENTION = False
+    _HAS_FLEX_ATTENTION_LIB = False
+
+
+_DILATED_MASK_CACHE_MAX = 32
+_DILATED_MASK_CACHE_MAX_L = env_int("ENN_DILATED_MASK_CACHE_MAX_L", 4096)
+_DILATED_MASK_CACHE_ENTRY_MAX_BYTES = env_int(
+    "ENN_DILATED_MASK_CACHE_ENTRY_MAX_BYTES", 64 * 1024 * 1024
+)
+_FLEX_KERNEL = FlexAttention(prefer_torch=True)
+_FLEX_BLOCK_MASK_CACHE_MAX = 16
+_FLEX_BLOCK_MASK_CACHE_EST_MAX_BYTES = env_int(
+    "ENN_FLEX_BLOCK_MASK_CACHE_EST_MAX_BYTES", 128 * 1024 * 1024
+)
+_GATE_STATS_CKPT_FWD = env_bool("ENN_GATE_STATS_CKPT_FWD", False)
+_Norm = nn.LayerNorm
+TCache = TypeVar("TCache")
+
 if env_bool("ENN_DISABLE_FLEX_ATTENTION", False):
     _HAS_FLEX_ATTENTION = False
-_FLEX_KERNEL = FlexAttention(prefer_torch=True)
-_GATE_STATS_CKPT_FWD = env_bool("ENN_GATE_STATS_CKPT_FWD", False)
-_HAS_FLEX_ATTENTION = bool(
-    _HAS_FLEX_ATTENTION and _FLEX_KERNEL.has_torch_backend
-)
-_Norm = nn.LayerNorm
+else:
+    _HAS_FLEX_ATTENTION = (
+        _HAS_FLEX_ATTENTION_LIB and _FLEX_KERNEL.has_torch_backend
+    )
 
 
 def _device_key(device: torch.device) -> Tuple[str, int]:
@@ -471,7 +475,7 @@ class DilatedAttention(nn.Module):
 
         qkv = F.linear(x_bld, torch_mha.in_proj_weight, torch_mha.in_proj_bias)
         B, L, _ = qkv.shape
-        qkv = qkv.view(B, L, 3, self.nhead, self.head_dim).transpose(1, 3)  # (B, H, 3, L, Dh)
+        qkv = qkv.view(B, L, 3, self.nhead, self.head_dim).transpose(1, 3)
         q = qkv[:, :, 0]
         k = qkv[:, :, 1]
         v = qkv[:, :, 2]
@@ -596,7 +600,7 @@ class DilatedAttention(nn.Module):
                 use_is_causal = bool(self.causal)
             else:
                 attn_mask_keep = self._get_mask(L, device)
-                attn_mask = (~attn_mask_keep)  # bool mask, True => masked
+                attn_mask = (~attn_mask_keep)
 
             attn_out, attn_weights = self.mha(
                 x_norm,
@@ -689,7 +693,7 @@ class Resampler(nn.Module):
         def _norm() -> nn.Module:
             nt = str(norm_type or "layernorm").strip().lower()
             if nt in {"rms", "rmsnorm"} and hasattr(nn, "RMSNorm"):
-                return nn.RMSNorm(self.d_model)  # type: ignore[attr-defined]
+                return nn.RMSNorm(self.d_model)
             return nn.LayerNorm(self.d_model)
 
         self.norm_q = _norm()
@@ -732,9 +736,9 @@ class Resampler(nn.Module):
 
         H = int(self.nhead)
         Dh = int(self.head_dim)
-        q = self.q_proj(q_in).view(B, Lq, H, Dh).transpose(1, 2)  # (B,H,Lq,Dh)
-        k = self.k_proj(kv_in).view(B, Lk, H, Dh).transpose(1, 2)  # (B,H,Lk,Dh)
-        v = self.v_proj(kv_in).view(B, Lk, H, Dh).transpose(1, 2)  # (B,H,Lk,Dh)
+        q = self.q_proj(q_in).view(B, Lq, H, Dh).transpose(1, 2)
+        k = self.k_proj(kv_in).view(B, Lk, H, Dh).transpose(1, 2)
+        v = self.v_proj(kv_in).view(B, Lk, H, Dh).transpose(1, 2)
 
         attn_out = self.attn(
             q,
