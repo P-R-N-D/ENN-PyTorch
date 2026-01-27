@@ -565,7 +565,6 @@ def new_executor(
     mw = max(1, int(max_workers))
     wl = str(workload or "io").strip().lower()
     prefix = str(name or "enn_torch").strip() or "enn_torch"
-
     executor_kind = "thread"
     if wl in {"cpu", "compute"}:
         if not is_gil_enabled():
@@ -579,20 +578,17 @@ def new_executor(
                 executor_kind = "interpreter"
             else:
                 executor_kind = "process"
-
     if executor_kind == "process":
         thread_prefix = f"{prefix}-proc"
     elif executor_kind == "interpreter":
         thread_prefix = f"{prefix}-interp"
     else:
         thread_prefix = f"{prefix}-thr" if wl in {"cpu", "compute"} else f"{prefix}-io"
-
     init_fn: Callable[..., Any] | None = None
     init_args: tuple[Any, ...] = ()
     nlogical_for_limit = 0
     nphysical_for_limit = 0
     mw_eff = int(mw)
-
     if _is_affinity_enabled():
         try:
             allowed = _executor_allowed_cpus()
@@ -647,7 +643,6 @@ def new_executor(
                         int(cpw),
                         11,
                     )
-
                 elif executor_kind == "interpreter":
                     cpus_pref = _executor_prefer_smt_lane(
                         cpus_scatter, prefer_primary=True
@@ -672,7 +667,6 @@ def new_executor(
                         1,
                         23,
                     )
-
                 else:
                     cpus_pref = _executor_prefer_smt_lane(
                         cpus_scatter, prefer_primary=False
@@ -697,7 +691,6 @@ def new_executor(
                         1,
                         37,
                     )
-
         except Exception:
             if _is_affinity_strict():
                 raise
@@ -706,16 +699,13 @@ def new_executor(
             nlogical_for_limit = 0
             nphysical_for_limit = 0
             mw_eff = int(mw)
-
     if executor_kind in {"thread", "interpreter"} and _is_inner_thread_limited(wl):
         _limit_inner_threads(1)
-
     if nlogical_for_limit <= 0:
         with contextlib.suppress(Exception):
             nlogical_for_limit = int(len(_executor_allowed_cpus()))
     if nphysical_for_limit <= 0:
         nphysical_for_limit = int(nlogical_for_limit or mw)
-
     outer_limit = _outer_concurrency_limit(
         wl,
         executor_kind,
@@ -723,7 +713,6 @@ def new_executor(
         int(nphysical_for_limit or (nlogical_for_limit or mw)),
         int(mw),
     )
-
     mw_outer = int(mw)
     if (
         executor_kind in {"thread", "interpreter"}
@@ -737,7 +726,6 @@ def new_executor(
             and len(init_args) >= 5
         ):
             init_args = (*init_args[:4], int(mw_outer), *init_args[5:])
-
     if executor_kind == "thread":
         ex = futures.ThreadPoolExecutor(
             max_workers=mw_outer,
@@ -750,7 +738,6 @@ def new_executor(
             if (outer_limit and outer_limit < mw)
             else ex
         )
-
     if executor_kind == "interpreter":
         cls = getattr(futures, "InterpreterPoolExecutor", None)
         if cls is None:
@@ -765,7 +752,6 @@ def new_executor(
                 if (outer_limit and outer_limit < mw)
                 else ex
             )
-
         try:
             ex = cls(
                 max_workers=mw_outer,
@@ -780,7 +766,6 @@ def new_executor(
             if (outer_limit and outer_limit < mw)
             else ex
         )
-
     try:
         return futures.ProcessPoolExecutor(
             max_workers=int(mw_eff),
@@ -1047,7 +1032,6 @@ class Prefetcher:
         buf = BufferQueue(max_batches=int(self._max_batches))
         sentinel = object()
         ex = new_executor(1, workload="io", name=f"{self._name}-producer")
-
         fut = ex.submit(self._producer_loop, self._src, buf, sentinel)
         try:
             while True:
@@ -1179,7 +1163,6 @@ class TensorPagePool:
         need = _prod_int(shape_t)
         deadline = (time.monotonic() + float(timeout)) if timeout is not None else None
         check_interval = 0.01
-
         while True:
             idx, need_new, grow = None, False, False
             with self._cv:
@@ -1218,7 +1201,6 @@ class TensorPagePool:
                         continue
                     else:
                         break
-
             if idx is not None:
                 new_page = (
                     TensorPage(numel=need, dtype=dtype, pin_memory=self._pin)
@@ -1234,7 +1216,6 @@ class TensorPagePool:
                         TensorPagePool.Token(int(idx), int(e.gen)),
                     )
                 return (view, token) if return_handle else view
-
             if grow:
                 entry = TensorPagePool._Entry(
                     page=TensorPage(numel=need, dtype=dtype, pin_memory=self._pin),
@@ -1253,7 +1234,6 @@ class TensorPagePool:
                         return (view, token) if return_handle else view
                 continue
             break
-
         view = torch.empty(need, dtype=dtype, device="cpu", pin_memory=False).view(
             *shape_t
         )
@@ -1293,14 +1273,12 @@ class TensorPagePool:
                 and self._pages[i].fence_evt
             ):
                 return self._pages[i].fence_evt
-
         try:
             ev_new = factory()
         except:
             return None
         if not ev_new:
             return None
-
         with self._cv:
             if 0 <= i < len(self._pages) and self._pages[i].gen == g:
                 if not self._pages[i].fence_evt:
@@ -1387,16 +1365,13 @@ class TensorSpooler:
         if not torch.is_tensor(tensor):
             tensor = torch.as_tensor(tensor)
         buf = tensor.detach()
-
         if hasattr(buf, "to_local"):
             buf = buf.to_local()
         if buf.device.type != "cpu":
             buf = buf.to(device="cpu", non_blocking=False)
-
         early = early_release if early_release is not None else self._early_release
         unpin = force_unpin if force_unpin is not None else self._force_unpin
         released = False
-
         if TensorSpooler._is_cpu_pinned(buf) and (
             unpin or (early and callable(release_cb))
         ):
@@ -1409,7 +1384,6 @@ class TensorSpooler:
                         release_cb()
             except Exception:
                 released = False
-
         if not buf.is_contiguous():
             buf = buf.contiguous()
         return buf, released
@@ -1418,14 +1392,12 @@ class TensorSpooler:
         if not torch.is_tensor(tensor):
             tensor = torch.as_tensor(tensor)
         buf = tensor.detach()
-
         if hasattr(buf, "to_local"):
             buf = buf.to_local()
         if buf.device.type != "cpu":
             buf = buf.to(device="cpu", non_blocking=False)
         if not buf.is_contiguous():
             buf = buf.contiguous()
-
         if str(path).endswith(".mmt"):
             from tensordict import MemoryMappedTensor
 
@@ -1450,7 +1422,6 @@ class TensorSpooler:
                 indent=None,
             )
             return
-
         if str(path).endswith((".pt", ".pth")):
             save_temp(path, buf)
         else:
@@ -1473,7 +1444,6 @@ class TensorSpooler:
             item = self._q.get()
             if item[0] is None:
                 break
-
             tensor, path, evt, rel = item
             rel_cb = rel if callable(rel) else None
             try:
@@ -1502,7 +1472,6 @@ class TensorSpooler:
             raise RuntimeError(f"Async writer error: {self._err!r}")
         if self._closed.is_set():
             raise RuntimeError("TensorSpooler is closed")
-
         path = (
             os.path.join(self._root, f"chunk_{int(idx):06d}.pt")
             if path is None and idx is not None
@@ -1677,7 +1646,6 @@ class Thread:
         self._total_time = 0
         self._total_cpu = 0
         self._omp_ok = bool(allow_omp_bind) and bool(self.spread_threads())
-
         self._flush_every = max(1, int(env_first_int(("ENN_TLB_FLUSH_EVERY",), 256)))
         self._sample_every = max(1, int(env_first_int(("ENN_TLB_SAMPLE_EVERY",), 8)))
 
