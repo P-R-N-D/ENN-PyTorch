@@ -120,6 +120,16 @@ def _temp_environ(
                 os.environ[key] = val
 
 
+def _torch_dtype_from_str(dtype_str: str) -> torch.dtype:
+    s = str(dtype_str)
+    if s.startswith("torch."):
+        s = s.split(".", 1)[1]
+    dt = getattr(torch, s, None)
+    if not isinstance(dt, torch.dtype):
+        raise ValueError(f"Unsupported dtype string: {dtype_str!r}")
+    return dt
+
+
 def _save_lock(path: PathLike | None = None) -> Mutex:
     try:
         key = str(Path(path).expanduser().resolve()) if path else "__global__"
@@ -170,16 +180,6 @@ def _torch_load_checkpoint(
         if weights_only:
             raise RuntimeError("weights_only=True failed") from exc
         raise
-
-
-def is_required(module: str, pip_hint: str | None = None) -> None:
-    try:
-        __import__(module)
-    except ImportError as err:
-        hint = f" (try: {pip_hint})" if pip_hint else ""
-        raise ImportError(
-            f"{module} is required for this operation{hint}"
-        ) from err
 
 
 def _openzl_import() -> Any:
@@ -491,16 +491,6 @@ def _openzl_compat_compressor() -> Any:
         compressor.select_starting_graph(compress_id)
         _OPENZL_FALLBACK_COMPRESSOR = compressor
         return compressor
-
-
-def _torch_dtype_from_str(dtype_str: str) -> torch.dtype:
-    s = str(dtype_str)
-    if s.startswith("torch."):
-        s = s.split(".", 1)[1]
-    dt = getattr(torch, s, None)
-    if not isinstance(dt, torch.dtype):
-        raise ValueError(f"Unsupported dtype string: {dtype_str!r}")
-    return dt
 
 
 def _openzl_jsonify(obj: object, *args: Any, tensors: list[torch.Tensor], tensor_table: list[dict[str, Any]]) -> object:
@@ -926,6 +916,16 @@ def _openzl_save_checkpoint(
     finally:
         with contextlib.suppress(Exception):
             tmp_path.unlink() if tmp_path.exists() else None
+
+
+def is_required(module: str, pip_hint: str | None = None) -> None:
+    try:
+        __import__(module)
+    except ImportError as err:
+        hint = f" (try: {pip_hint})" if pip_hint else ""
+        raise ImportError(
+            f"{module} is required for this operation{hint}"
+        ) from err
 
 
 class Builder:
