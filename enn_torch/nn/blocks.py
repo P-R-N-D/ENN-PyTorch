@@ -18,6 +18,7 @@ from .activations import GeGLU
 from .layers import CrossAttention, DilatedAttention, Retention, Resampler, norm_layer
 from .kernels import DotProductAttention
 
+
 _LOGGER = logging.getLogger(__name__)
 _MODELING_TYPE_ALIASES: dict[str, str] = {
     "ss": "ss",
@@ -209,7 +210,7 @@ def stochastic_depth_schedule(drop_path: float, depth: int) -> List[float]:
 class _LatentSelfBlock(nn.Module):
     def __init__(
         self,
-        *,
+        *args: Any,
         d_model: int,
         nhead: int,
         mlp_ratio: float,
