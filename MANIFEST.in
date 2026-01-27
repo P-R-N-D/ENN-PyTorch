@@ -3,22 +3,29 @@ include pyproject.toml
 include requirements.txt
 include README.md
 
-# Source + lightweight human-readable config/docs only
+# Exclude repository patch / storage files
+recursive-exclude *.diff *.patch *.git
+
+# Include Source + lightweight human-readable config/docs only
 # (Ensure 'enn_torch' matches your actual package directory name)
+# Exclude debug scripts
 recursive-include enn_torch *.py *.json *.yaml *.yml *.ini *.cfg *.md *.txt
 recursive-exclude debug *
 
-# Generic junk / build outputs
+# Exclude junk / build outputs
 # Note: Re-typed spaces to ensure no non-breaking space characters
 global-exclude __pycache__ .DS_Store *.py[cod] *.so *.dylib *.whl *.metadata *.meta
 
-# Logs / patch rejects / backups
+# Exclude Logs / patch rejects / backups
 global-exclude *.log *.orig *.rej
 
-# ML / export / checkpoint / data artifacts
+# Exclude ML / export / checkpoint / data artifacts
 # Exclude heavy weights to keep the package lightweight
-global-exclude *.onnx *.pt2 *.aoti *.pte *.tflite *.mlmodel *.pt *.pth *.bin
-global-exclude *.h5 *.hdf5 *.npz *.mmt *.td *.tensordict
+global-exclude *.onnx *.ort *.pt *.pt2 *.pth  *.pte *.aoti *.tf *.tflite *.tfrecord *.keras *.pb *.ckpt *.mlmodel *.mlpackage *.coreml *.bin
+global-exclude *.h5 *.hdf5 *.npz *.mmt *.td *.tensordict *.ozl *.tar *.bz *.zip *.zipx *.7z
 
-# Sample spreadsheets (do not ship)
+# Exclude Excel spreadsheets
 global-exclude *.xlsx *.xls *.xlsm *.xlsb
+
+# Exclude Jupyter Notebook / Google Colaboratory demonstrations
+global-exclude *.ipynb
