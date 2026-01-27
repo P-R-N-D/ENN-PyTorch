@@ -39,8 +39,6 @@ from ..core.graph import (
     is_symbolic,
     torch_compiler_disable,
     torch_compiler_supported,
-)
-from ..core.graph import (
     compile as compile_module,
 )
 from ..core.policies import LossWeightPolicy
@@ -71,12 +69,11 @@ from .layers import (
     SigmoidGate,
 )
 
+
 _LOGGER = logging.getLogger(__name__)
-TConfig = TypeVar("TConfig")
-
 _SUBMODEL_UNSET: object = object()
-
 _META_UNSET: object = object()
+TConfig = TypeVar("TConfig")
 
 
 def _prod_int(shape: Sequence[int]) -> int:
@@ -518,7 +515,7 @@ class Template(nn.Module):
     def _forward_temporal(
         self: Self,
         tokens: torch.Tensor,
-        *,
+        *args: Any,
         state: Optional[torch.Tensor],
         return_state: bool,
         causal_mask: Optional[torch.Tensor] = None,
@@ -869,7 +866,7 @@ class Fuser(nn.Module):
             s = s.replace(".", "_")
         return s
 
-    def _generate_unique_uuid_name(self: Self, *, exclude: Optional[str] = None) -> str:
+    def _generate_unique_uuid_name(self: Self, *args: Any, exclude: Optional[str] = None) -> str:
         exclude = str(exclude) if exclude is not None else None
         while True:
             candidate = uuid.uuid4().hex
@@ -878,7 +875,7 @@ class Fuser(nn.Module):
             if candidate not in self.tasks:
                 return candidate
 
-    def _ensure_unique_task_name(self: Self, preferred: object, *, exclude: Optional[str] = None) -> str:
+    def _ensure_unique_task_name(self: Self, preferred: object, *args: Any, exclude: Optional[str] = None) -> str:
         candidate = self._normalize_task_name(preferred)
         if not candidate:
             return self._generate_unique_uuid_name(exclude=exclude)
@@ -1008,7 +1005,7 @@ class Fuser(nn.Module):
     def add_task(
         self: Self,
         name: Optional[str] = None,
-        *,
+        *args: Any,
         mode: str = "spatial",
         description: Optional[str] = None,
         tags: Optional[Sequence[str]] = None,
@@ -1072,7 +1069,7 @@ class Fuser(nn.Module):
     def update_task(
         self: Self,
         task_name: str,
-        *,
+        *args: Any,
         mode: object = _META_UNSET,
         name: object = _META_UNSET,
         description: object = _META_UNSET,
@@ -1082,25 +1079,19 @@ class Fuser(nn.Module):
         eps: object = _META_UNSET,
     ) -> str:
         key = self.resolve_task_name(task_name)
-
         tmpl = self.tasks[key]
         meta = self._task_meta.get(key)
         if meta is None:
             meta = {"description": "", "tags": []}
             self._task_meta[key] = meta
-
         if mode is not _META_UNSET:
             tmpl.set_mode(str(mode))
-
         if weight is not _META_UNSET:
             tmpl.set_weight(float(weight))
-
         if eps is not _META_UNSET:
             tmpl.set_eps(float(eps))
-
         if description is not _META_UNSET:
             meta["description"] = "" if description is None else str(description)
-
         if tags is not _META_UNSET:
             tags_list: list[str] = []
             if tags is not None:
@@ -1110,13 +1101,11 @@ class Fuser(nn.Module):
                     if s and s not in tags_list:
                         tags_list.append(s)
             meta["tags"] = tags_list
-
         if submodel is not _SUBMODEL_UNSET:
             if submodel is None:
                 self._user_submodels.pop(key, None)
             else:
                 self._user_submodels[key] = submodel
-
         if name is not _META_UNSET:
             new_key = self._ensure_unique_task_name(name, exclude=key)
             if new_key != key:
@@ -1134,33 +1123,26 @@ class Fuser(nn.Module):
                 if getattr(self, "stream_task_id", "") == key:
                     self.stream_task_id = new_key
                 key = new_key
-
         self._resolve_stream_task_id()
         return key
 
-    def remove_task(self: Self, task_name: str, *, strict: bool = False) -> None:
+    def remove_task(self: Self, task_name: str, *args: Any, strict: bool = False) -> None:
         if strict and not self.tasks:
             raise KeyError("No tasks are configured")
-
         key = self.resolve_task_name(task_name)
         if strict and key not in self.tasks:
             raise KeyError(f"Unknown task '{task_name}'.")
-
         if key in self.tasks:
             del self.tasks[key]
-
         self._task_meta.pop(key, None)
         self._user_submodels.pop(key, None)
-
         for lid, mapped in list(self._legacy_task_id_to_name.items()):
             if mapped == key:
                 del self._legacy_task_id_to_name[lid]
-
         if getattr(self, "stream_task_name", "") == key:
             self.stream_task_name = ""
         if getattr(self, "stream_task_id", "") == key:
             self.stream_task_id = ""
-
         self._resolve_stream_task_id()
 
     def _select_tasks_for_modeling_type(self: Self) -> list[str]:
@@ -1177,7 +1159,7 @@ class Fuser(nn.Module):
         self: Self,
         names: Sequence[str],
         token_sets: Sequence[torch.Tensor],
-        *,
+        *args: Any,
         device: torch.device,
         dtype: torch.dtype,
     ) -> Optional[torch.Tensor]:
@@ -1364,7 +1346,7 @@ class Fuser(nn.Module):
         tokens, ctx = self.forward(x, temporal_state=None, return_temporal_state=False)
         return cast(torch.Tensor, tokens), cast(torch.Tensor, ctx)
 
-    def decode(self: Self, tokens: torch.Tensor, *, apply_norm: bool = True) -> torch.Tensor:
+    def decode(self: Self, tokens: torch.Tensor, *args: Any, apply_norm: bool = True) -> torch.Tensor:
         if apply_norm:
             dg = getattr(self, "_decode_graph", None)
             if isinstance(dg, nn.Module):
@@ -1823,7 +1805,7 @@ class Model(nn.Module):
 
         def _compile_one(
             mod: nn.Module,
-            *,
+            *args: Any,
             label: str,
             options: dict[str, Any] | None = None,
         ) -> nn.Module:
@@ -1855,7 +1837,7 @@ class Model(nn.Module):
             return old_items
 
         def _compile_modulelist_inplace(
-            modlist: nn.ModuleList, *, label: str
+            modlist: nn.ModuleList, *args: Any, label: str
         ) -> tuple[bool, list[nn.Module], list[nn.Module]]:
             eager_items = list(modlist)
             compiled_items: list[nn.Module] = []
@@ -3282,7 +3264,7 @@ class Model(nn.Module):
                 return torch.device("cpu")
 
             def _alloc_replacement(
-                *,
+                *args: Any,
                 existing: Optional[torch.Tensor],
                 shape: torch.Size,
                 fallback_mod: torch.nn.Module,
@@ -3362,7 +3344,7 @@ class Model(nn.Module):
             pass
         return super().load_state_dict(state_dict, *args, **kwargs)
 
-    def list_tasks(self: Self, *, by: str = "name") -> list[str]:
+    def list_tasks(self: Self, *args: Any, by: str = "name") -> list[str]:
         return self.fuser.list_tasks(by=by)
 
     def resolve_task_id(self: Self, task_id_or_name: str) -> str:
@@ -3382,7 +3364,7 @@ class Model(nn.Module):
     def add_task(
         self: Self,
         name: Optional[str] = None,
-        *,
+        *args: Any,
         mode: str = "spatial",
         description: Optional[str] = None,
         tags: Optional[Sequence[str]] = None,
@@ -3409,7 +3391,7 @@ class Model(nn.Module):
     def update_task(
         self: Self,
         task_name: str,
-        *,
+        *args: Any,
         mode: object = _META_UNSET,
         name: object = _META_UNSET,
         description: object = _META_UNSET,
@@ -3429,7 +3411,7 @@ class Model(nn.Module):
             eps=eps,
         )
 
-    def remove_task(self: Self, task_name: str, *, strict: bool = False) -> None:
+    def remove_task(self: Self, task_name: str, *args: Any, strict: bool = False) -> None:
         self.fuser.remove_task(task_name, strict=strict)
 
     def predict(
