@@ -181,8 +181,8 @@ def _torch_load_checkpoint(
 
 
 def _openzl_import() -> Any:
-
     is_required("openzl.ext", "pip install openzl")
+    
     import openzl.ext as zl
 
     return zl
@@ -266,7 +266,6 @@ def _openzl_get_default_compressor() -> Any:
                 if f32_graph is not None:
                     self._float_graphs[torch.float32] = f32_graph
                 self._f64_graph = f64_graph
-
                 self._int_fieldlz_graph = int_fieldlz_graph
                 self._int_rangepack_graph = int_rangepack_graph
                 self._int_zigzag_rangepack_graph = int_zigzag_rangepack_graph
@@ -547,7 +546,6 @@ def _openzl_unjsonify(
     tensor_table: Sequence[Mapping[str, Any]],
     allow_pickle: bool = True,
 ) -> object:
-
     if isinstance(obj, list):
         return [
             _openzl_unjsonify(
@@ -614,14 +612,12 @@ def _openzl_unjsonify(
 def _openzl_pack_tensors_by_dtype(
     tensors: Sequence[torch.Tensor], tensor_table: list[dict[str, Any]]
 ) -> tuple[list[str], list[torch.Tensor]]:
-
     groups: dict[torch.dtype, list[tuple[int, torch.Tensor]]] = {}
     for tid, t in enumerate(tensors):
         groups.setdefault(t.dtype, []).append((tid, t))
     dtype_order = sorted(groups.keys(), key=lambda d: str(d))
     dtype_buffers: list[torch.Tensor] = []
     dtype_names: list[str] = []
-
     for buf_idx, dt in enumerate(dtype_order):
         items = groups[dt]
         total = int(sum(int(t.numel()) for _, t in items))
@@ -636,7 +632,6 @@ def _openzl_pack_tensors_by_dtype(
             offset += n
         dtype_names.append(str(dt))
         dtype_buffers.append(buf)
-
     return dtype_names, dtype_buffers
 
 
@@ -651,7 +646,6 @@ def _openzl_compress_payload(
     openzl_permissive: bool | None = None,
     openzl_pack_by_dtype: bool = True,
 ) -> bytes:
-
     zl = _openzl_import()
     if openzl_permissive is None:
         openzl_permissive = not env_bool("ENN_OPENZL_STRICT", False)
@@ -686,7 +680,6 @@ def _openzl_compress_payload(
         if default_build_exc is not None:
             raise default_build_exc
         raise RuntimeError("OpenZL compressor initialization failed")
-
     tensors: list[torch.Tensor] = []
     tensor_table: list[dict[str, Any]] = []
     payload_meta = _openzl_jsonify(payload, tensors=tensors, tensor_table=tensor_table)
@@ -770,7 +763,6 @@ def _openzl_decompress_payload(
     openzl_check_compressed_checksum: bool | None = None,
     weights_only: bool = True,
 ) -> object:
-
     zl = _openzl_import()
     dctx = zl.DCtx()
     if openzl_check_content_checksum is not None:
@@ -847,7 +839,6 @@ def _openzl_load_checkpoint(
     openzl_check_compressed_checksum: bool | None = None,
     weights_only: bool = True,
 ) -> object:
-
     p = Path(path)
     if not p.is_file():
         raise FileNotFoundError(str(p))
@@ -977,7 +968,6 @@ class Builder:
                 StateDictOptions,
                 get_model_state_dict,
             )
-
             with _save_sync(p, barrier=True):
                 dcp_save(
                     state_dict={
@@ -1049,7 +1039,6 @@ class Builder:
                             and "ENN_CKPT_EXT" not in os.environ
                         ):
                             os.environ["ENN_CKPT_EXT"] = ".pt"
-
                     pt_path = p.with_suffix(".pt")
                     pt_payload = {
                         **_make_meta(),
@@ -1072,8 +1061,8 @@ class Builder:
                     return pt_path
             if p.suffix == ".safetensors":
                 is_required("safetensors", "pip install safetensors")
+                
                 from safetensors.torch import save_file as save_tensors
-
                 from ..core.tensor import coerce_tensor
 
                 fd, tmp_name = tempfile.mkstemp(
