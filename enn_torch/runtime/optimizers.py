@@ -371,14 +371,12 @@ class AdamW:
             "weight_decay": weight_decay,
             **kwargs,
         }
-
         if dev.type == "cuda":
             selected_opt = _attempt_load(
                 "transformer_engine.pytorch.optimizers", "FusedAdam", attempts
             )
             if selected_opt:
                 selected_name = "te.FusedAdam"
-
         if not selected_opt and mode == "float" and dev.type == "cuda":
             float8_dtypes = Autocast.float8_formats()
             safe_fp8 = not getattr(meta, "has_scale", False) or any(
@@ -391,7 +389,6 @@ class AdamW:
                     if selected_opt:
                         selected_name = "torchao.AdamWFp8"
                         break
-
         if not selected_opt:
             quant_bits = getattr(meta, "int_quant_bits", None)
             use_int = quant_bits in (4, 8) or (
@@ -452,7 +449,6 @@ class AdamW:
                         if selected_opt:
                             selected_name = f"torchao.{cls_name}"
                             break
-
         if not selected_opt:
             flags = optimal_optimizer_params(dev, use_foreach=None, use_fused=False)
             selected_opt = optim.AdamW(
@@ -460,7 +456,6 @@ class AdamW:
                 **_coerce_kwargs(optim.AdamW, {**common_kwargs, **flags}),
             )
             selected_name = "torch.optim.AdamW"
-
         scale_info = {
             k: _to_immutable(getattr(meta, k, None))
             for k in (
@@ -576,15 +571,12 @@ class ExponentialMovingAverage(nn.Module):
         self._step += 1
         if self.update_every > 1 and (self._step % self.update_every) != 0:
             return
-
         decay = float(self.decay)
         if not (0.0 <= decay < 1.0):
             raise ValueError(f"EMA decay must be in [0, 1). got decay={decay}")
         weight = 1.0 - decay
-
         shadow = self.shadow
         pin_memory = bool(self.pin_memory)
-
         for name, p in self._iter_named_params(model):
             dt = self._target_dtype(p)
             cur = shadow.get(name, None)
@@ -601,7 +593,6 @@ class ExponentialMovingAverage(nn.Module):
                     non_blocking=False,
                 )
                 continue
-
             try:
                 tmp = self._scratch_view(p.numel(), p.shape, dt)
                 tmp.copy_(p.detach(), non_blocking=False)
@@ -612,7 +603,6 @@ class ExponentialMovingAverage(nn.Module):
                     pin_memory=pin_memory,
                     non_blocking=False,
                 )
-
             if cur.is_floating_point() or cur.is_complex():
                 cur.lerp_(tmp, weight)
             else:
@@ -687,7 +677,6 @@ class StochasticWeightAverage(nn.Module):
         super().__init__()
         self._model = model
         self._has_bn = _has_batchnorm_modules(model)
-
         meta = metadata if isinstance(metadata, Dataset) else None
         dev = torch.device(Autocast.coerce_metadata(get_device(), metadata=meta).device)
         self._model_device = dev
@@ -695,29 +684,22 @@ class StochasticWeightAverage(nn.Module):
         self._master_complex = (
             torch.complex128 if self._master_float == torch.float64 else torch.complex64
         )
-
         self._avg_dtype = avg_dtype
         self._pin_memory = bool(pin_memory) if pin_memory is not None else False
-
         self._non_blocking = (
             bool(non_blocking) if non_blocking is not None else bool(self._pin_memory)
         )
         self._update_every = max(1, int(update_every))
         self._step: int = 0
         self._n_averaged: int = 0
-
         self._shadow: Dict[str, torch.Tensor] = {}
-
         self._scratch: Dict[torch.dtype, torch.Tensor] = {}
-
         self._stream_chunk_bytes = max(1 << 20, int(stream_chunk_mb) * 1024 * 1024)
         self._stream_max_inflight_bytes = max(
             int(self._stream_chunk_bytes),
             int(stream_max_inflight_mb) * 1024 * 1024,
         )
-
         self._lock = Mutex()
-
         self._use_mmap = bool(use_mmap) if use_mmap is not None else True
         self._mmap_dir: str | None = None
         self._mmap_prefix = str(mmap_prefix or "enn_swa_shadow")
@@ -726,7 +708,6 @@ class StochasticWeightAverage(nn.Module):
         self._mmap_files: Dict[torch.dtype, str] = {}
         self._mmap_base: Dict[torch.dtype, torch.Tensor] = {}
         self._mmap_layout: Dict[str, tuple[torch.dtype, int, int, tuple[int, ...]]] = {}
-
         if self._use_mmap:
             try:
                 self._init_mmap_shadow(model, mmap_dir=mmap_dir)
@@ -763,7 +744,6 @@ class StochasticWeightAverage(nn.Module):
     def _target_dtype(self: Self, t: torch.Tensor) -> torch.dtype:
         if self._avg_dtype is not None:
             return self._avg_dtype
-
         if t.is_floating_point():
             return self._master_float
         if t.is_complex():
@@ -777,7 +757,6 @@ class StochasticWeightAverage(nn.Module):
         s = str(dt)
         if s.startswith("torch."):
             s = s.split("torch.", 1)[1]
-
         return (
             s.replace("bfloat16", "bf16")
             .replace("float16", "f16")
@@ -794,8 +773,9 @@ class StochasticWeightAverage(nn.Module):
         )
 
     def _init_mmap_shadow(
-        self: Self, model: nn.Module, *, mmap_dir: str | None
+        self: Self, model: nn.Module, *args: Any, mmap_dir: str | None
     ) -> None:
+        items: list[tuple[str, torch.dtype, tuple[int, ...], int]] = []
         if mmap_dir:
             d = str(mmap_dir)
             os.makedirs(d, exist_ok=True)
@@ -804,24 +784,18 @@ class StochasticWeightAverage(nn.Module):
         else:
             self._mmap_dir = tempfile.mkdtemp(prefix=f"{self._mmap_prefix}_")
             self._mmap_created_temp = True
-
-        items: list[tuple[str, torch.dtype, tuple[int, ...], int]] = []
         for name, p in self._iter_named_params(model):
             dt = self._target_dtype(p.detach())
             shape = tuple(int(x) for x in p.shape)
             numel = int(p.numel())
             items.append((name, dt, shape, numel))
-
         if not items:
             self._use_mmap = False
             return
-
         items.sort(key=lambda x: x[0])
-
         totals: Dict[torch.dtype, int] = {}
         for _, dt, _, n in items:
             totals[dt] = int(totals.get(dt, 0)) + int(n)
-
         for dt, total in totals.items():
             if int(total) <= 0:
                 continue
@@ -829,7 +803,6 @@ class StochasticWeightAverage(nn.Module):
             base_path = os.path.join(
                 str(self._mmap_dir), f"{self._mmap_prefix}.{tag}.bin"
             )
-
             if os.path.exists(base_path):
                 base_path = os.path.join(
                     str(self._mmap_dir),
@@ -857,7 +830,6 @@ class StochasticWeightAverage(nn.Module):
             shadow[name] = view
             layout[name] = (dt, off, int(numel), shape)
             offsets[dt] = off + int(numel)
-
         self._shadow = shadow
         self._mmap_layout = layout
 
@@ -888,7 +860,7 @@ class StochasticWeightAverage(nn.Module):
             pass
 
     def _stream_copy_(
-        self: Self, dst: torch.Tensor, src: torch.Tensor, *, dtype: torch.dtype
+        self: Self, dst: torch.Tensor, src: torch.Tensor, *args: Any, dtype: torch.dtype
     ) -> None:
         v = src.detach()
         if getattr(v, "is_meta", False) or v.device.type == "meta":
@@ -903,10 +875,8 @@ class StochasticWeightAverage(nn.Module):
         total = int(v_flat.numel())
         if total <= 0:
             return
-
         dt_size = int(torch.empty((), dtype=dtype, device="cpu").element_size())
         chunk_elems = max(1, int(self._stream_chunk_bytes // max(1, dt_size)))
-
         for off in range(0, total, chunk_elems):
             n = min(chunk_elems, total - off)
             buf = self._scratch_view(n, dtype)
@@ -919,7 +889,7 @@ class StochasticWeightAverage(nn.Module):
         self: Self,
         dst: torch.Tensor,
         src: torch.Tensor,
-        *,
+        *args: Any,
         n_averaged: int,
         dtype: torch.dtype,
     ) -> None:
@@ -936,13 +906,10 @@ class StochasticWeightAverage(nn.Module):
         total = int(v_flat.numel())
         if total <= 0:
             return
-
         inv_n1 = 1.0 / float(int(n_averaged) + 1)
         one_m = 1.0 - inv_n1
-
         dt_size = int(torch.empty((), dtype=dtype, device="cpu").element_size())
         chunk_elems = max(1, int(self._stream_chunk_bytes // max(1, dt_size)))
-
         for off in range(0, total, chunk_elems):
             n = min(chunk_elems, total - off)
             buf = self._scratch_view(n, dtype)
@@ -950,7 +917,6 @@ class StochasticWeightAverage(nn.Module):
             if bool(self._non_blocking) and v.device.type != "cpu":
                 self._sync_device(v.device.type)
             dst_chunk = dst_flat[off : off + n]
-
             dst_chunk.mul_(one_m).add_(buf, alpha=inv_n1)
 
     def update(self: Self, model: nn.Module | None = None) -> None:
@@ -962,7 +928,6 @@ class StochasticWeightAverage(nn.Module):
                 return
             n = int(self._n_averaged)
             shadow = self._shadow
-
             for name, p in self._iter_named_params(model):
                 v = p.detach()
                 dt = self._target_dtype(v)
@@ -981,7 +946,6 @@ class StochasticWeightAverage(nn.Module):
                         pin_memory=False,
                     )
                     shadow[name] = cur
-
                 if n == 0:
                     self._stream_copy_(cur, v, dtype=dt)
                     continue
@@ -990,7 +954,6 @@ class StochasticWeightAverage(nn.Module):
                     self._stream_avg_(cur, v, n_averaged=n, dtype=dt)
                 else:
                     self._stream_copy_(cur, v, dtype=dt)
-
             self._n_averaged = int(n + 1)
 
     @contextlib.contextmanager
@@ -1031,7 +994,7 @@ class StochasticWeightAverage(nn.Module):
     def checkpoint_state_dict(
         self: Self,
         model: nn.Module,
-        *,
+        *args: Any,
         include_buffers: bool = True,
         max_buffer_mb: int = 25,
     ) -> Dict[str, torch.Tensor]:
@@ -1049,7 +1012,6 @@ class StochasticWeightAverage(nn.Module):
                 if t.device.type != "cpu":
                     t = t.to("cpu")
                 out[name] = t
-
             if include_buffers:
                 max_bytes = int(max(0, int(max_buffer_mb)) * 1024 * 1024)
                 for name, b in model.named_buffers(recurse=True):
@@ -1090,7 +1052,6 @@ class StochasticWeightAverage(nn.Module):
                 self._scratch.clear()
             except Exception:
                 pass
-
             try:
                 self._mmap_base.clear()
             except Exception:
@@ -1103,7 +1064,6 @@ class StochasticWeightAverage(nn.Module):
                 self._mmap_layout.clear()
             except Exception:
                 pass
-
             if self._mmap_dir and bool(self._mmap_cleanup):
                 try:
                     import gc
