@@ -9,7 +9,6 @@ __all__ = [
     "tensor",
     "compat",
     "precision",
-    "profiler",
     "concurrency",
     "system",
     "policies",

@@ -26,7 +26,7 @@ from .graph import (
     torch_compiler_disable,
     torch_compiler_supported,
 )
-from ..core.profiler import FLOP_PROFILER, capture
+from .profiler import FLOP_PROFILER, capture
 from ..core.system import (
     get_device,
     get_dpa_backends,

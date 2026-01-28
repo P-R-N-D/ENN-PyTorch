@@ -71,7 +71,7 @@ from ..nn.graph import (
 )
 from ..core.policies import DistributedPolicy, ModelPolicy, PrecisionPolicy
 from ..core.precision import Autocast
-from ..core.profiler import FlopCounter
+from ..nn.profiler import FlopCounter
 from ..core.system import (
     CPU,
     Memory,

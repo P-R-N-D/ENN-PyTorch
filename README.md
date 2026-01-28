@@ -243,7 +243,6 @@ enn_torch/
     workflow.py           # build/load models, elastic train/predict entrypoints
     policies.py           # thread/data policy heuristics
     precision.py          # dtype/precision helpers
-    profiler.py           # lightweight FLOP/IO timers
     system.py             # thread/NUMA tuning, device detection, temp dirs
     tensor.py             # tensor helpers + from_buffer context manager
   data/
@@ -269,6 +268,7 @@ enn_torch/
     graph.py              # torch.compile helpers, graph break utilities
     kernels.py
     layers.py
+    profiler.py           # lightweight FLOP/IO timers
     wrappers.py           # export/runtime wrappers
 ```
 
