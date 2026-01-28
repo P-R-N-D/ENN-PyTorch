@@ -5,7 +5,7 @@ import importlib
 from types import ModuleType
 
 __all__ = [
-    "architecture",
+    "wrappers",
     "activations",
     "kernels",
     "layers",

@@ -42,7 +42,7 @@ This repository also includes a worked example notebook (`notebook.ipynb`) and a
 
 ## Model layout (current)
 
-High-level flow used by `enn_torch.nn.architecture.Model`:
+High-level flow used by `enn_torch.nn.wrappers.Model`:
 
 ```
 Input features (B x C_in)
@@ -262,7 +262,7 @@ enn_torch/
   nn/
     __init__.py
     activations.py
-    architecture.py
+    wrappers.py
     blocks.py
     checkpoint.py         # activation checkpoint helpers
     graph.py              # torch.compile helpers, graph break utilities, GraphSequential wrapper

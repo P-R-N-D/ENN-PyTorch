@@ -71,7 +71,7 @@ from ..data.pipeline import (
     normalize_underflow_action,
     preload_memmap,
 )
-from ..nn.architecture import Model
+from ..nn.wrappers import Model
 from ..nn.layers import Recorder, resize_scaler_buffer
 from .io import _filtered_warnings, _torch_load_checkpoint, is_required
 from .main import _coerce_dcp_keys, process
@@ -1494,4 +1494,3 @@ def predict(
                 shutil.rmtree(tmp_dir, ignore_errors=True)
             else:
                 logger.info("predict debug: preserving tmp_dir=%s", tmp_dir)
-
