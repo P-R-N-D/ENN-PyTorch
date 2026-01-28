@@ -15,7 +15,7 @@ import torch
 import torch.distributed as dist
 from torch.optim import Optimizer
 
-from ..data.datatypes import env_bool
+from ..core.datatypes import env_bool
 from ..core.system import CPU, get_device, get_num_accelerators
 
 try:

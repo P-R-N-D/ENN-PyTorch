@@ -45,7 +45,7 @@ from ..core.concurrency import (
     new_affinity,
     new_thread,
 )
-from .datatypes import dtype_from_name, env_bool, env_first_int, read_json
+from ..core.datatypes import dtype_from_name, env_bool, env_first_int, read_json
 from ..nn.graph import inference_mode
 from ..core.policies import WorkerPolicy
 from ..core.system import (

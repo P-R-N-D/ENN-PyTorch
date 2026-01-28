@@ -239,6 +239,7 @@ enn_torch/
     config.py
     compat.py             # accelerator/memory helpers, meta/fake tensor guards
     concurrency.py        # threading/affinity helpers
+    datatypes.py          # env parsing + small type utilities
   runtime/
     workflow.py           # build/load models, elastic train/predict entrypoints
     policies.py           # thread/data policy heuristics
@@ -247,7 +248,6 @@ enn_torch/
     tensor.py             # tensor helpers + from_buffer context manager
   data/
     __init__.py
-    datatypes.py          # env parsing + small type utilities
     nodes.py              # torchdata nodes, Sampler/Loader, memmap writer/reader
     pipeline.py           # dataset fetch, collate, session orchestration
     schema.py             # feature/label key helpers, input schema utilities

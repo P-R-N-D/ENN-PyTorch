@@ -39,7 +39,7 @@ from ..data import schema
 from ..core.config import RuntimeConfig, coerce_model_config
 from ..nn.checkpoint import from_checkpoint, to_checkpoint
 from ..core.concurrency import Mutex, TensorPagePool, TensorSpooler, new_affinity
-from ..data.datatypes import (
+from ..core.datatypes import (
     env_bool,
     env_first,
     env_first_int,

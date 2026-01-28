@@ -26,7 +26,7 @@ from torch import nn
 
 from ..core.concurrency import Mutex
 from ..core.tensor import extract_tensor, from_buffer
-from ..data.datatypes import PathLike, coerce_json, env_bool, save_temp, write_json
+from ..core.datatypes import PathLike, coerce_json, env_bool, save_temp, write_json
 from .distributed import distributed_barrier, is_rank0
 
 try:

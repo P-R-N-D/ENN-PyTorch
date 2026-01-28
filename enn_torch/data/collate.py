@@ -35,7 +35,7 @@ from tensordict import (
 )
 
 from ..core.concurrency import TensorPagePool, TensorSpooler
-from .datatypes import (
+from ..core.datatypes import (
     PathLike,
     dtype_from_name,
     env_first_int,

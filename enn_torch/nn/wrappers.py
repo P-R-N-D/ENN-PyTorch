@@ -27,7 +27,7 @@ from tensordict import TensorDictBase
 from ..core.config import ModelConfig
 from .checkpoint import coerce_checkpoint
 from ..core.concurrency import Mutex, is_gil_enabled
-from ..data.datatypes import env_bool, env_first_int, env_int
+from ..core.datatypes import env_bool, env_first_int, env_int
 from ..runtime.distributed import _from_hsdp_module
 from .graph import canonicalize_compile_mode
 from .graph import compile as compile_module
