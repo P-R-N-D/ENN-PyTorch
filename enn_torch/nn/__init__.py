@@ -13,6 +13,7 @@ __all__ = [
     "checkpoint",
     "graph",
     "wrappers",
+    "profiler",
 ]
 
 
