@@ -809,7 +809,7 @@ class ModelPolicy:
         **kwargs: Any,
     ) -> Tuple[nn.Module, int]:
         swapped = 0
-        from ..nn.architecture import _dot_product_attention_cls
+        from ..nn.wrappers import _dot_product_attention_cls
 
         dot_cls = _dot_product_attention_cls()
         for module in model.modules():

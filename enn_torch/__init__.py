@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from tensordict import TensorDictBase
-    from .nn.architecture import Model
+    from .nn.wrappers import Model
 
 __all__ = [
     "config",

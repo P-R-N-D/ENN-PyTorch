@@ -102,7 +102,7 @@ from ..core.tensor import is_meta_or_fake_tensor, to_torch_tensor
 from ..data import collate
 from ..data.collate import Unsharder
 from ..data.pipeline import Dataset
-from ..nn.architecture import Model
+from ..nn.wrappers import Model
 from ..nn.layers import Recorder, resize_scaler_buffer
 from .io import _filtered_warnings, _torch_load_checkpoint
 from .losses import (

@@ -961,7 +961,7 @@ def compile_safe(
         for mod_name in (
             "enn_torch.nn.layers",
             "enn_torch.nn.blocks",
-            "enn_torch.nn.architecture",
+            "enn_torch.nn.wrappers",
         ):
             with suppress(Exception):
                 layers_module = importlib.import_module(mod_name)
