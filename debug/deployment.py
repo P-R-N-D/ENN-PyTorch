@@ -347,7 +347,7 @@ def _draft_export_diagnostics(
         info["error"] = f"torch.export import failed: {exc!r}"
         return info
     try:
-        from enn_torch.nn.wrappers import _onnx_model, _TensorOutputModule
+        from enn_torch.runtime.io import _onnx_model, _TensorOutputModule
     except Exception as exc:
         info["error"] = f"could not import ONNX wrapper helpers: {exc!r}"
         return info
