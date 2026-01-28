@@ -16,7 +16,7 @@ import torch
 from torch import nn
 
 from ..core.concurrency import Mutex
-from ..data.datatypes import env_bool, env_first, env_first_int
+from ..core.datatypes import env_bool, env_first, env_first_int
 from ..core.system import CPU, is_accelerator_available
 from ..core.tensor import is_meta_or_fake_tensor
 

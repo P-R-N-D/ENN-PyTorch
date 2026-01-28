@@ -38,7 +38,7 @@ from torchdata.nodes import BaseNode
 
 from . import schema
 from ..core.concurrency import Disposable, Mutex, new_affinity
-from .datatypes import (
+from ..core.datatypes import (
     PathLike,
     default_underflow_action,
     env_first,

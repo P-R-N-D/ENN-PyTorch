@@ -50,7 +50,7 @@ from ..core.config import (
     coerce_model_config,
     runtime_config,
 )
-from ..data.datatypes import env_bool, read_json
+from ..core.datatypes import env_bool, read_json
 from .distributed import get_available_host, get_preferred_ip, init_master_addr
 from ..nn.graph import inference_mode
 from ..core.policies import WorkerPolicy

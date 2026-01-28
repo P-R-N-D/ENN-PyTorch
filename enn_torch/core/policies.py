@@ -21,7 +21,7 @@ import torch
 import torch.nn as nn
 
 from .concurrency import Mutex
-from ..data.datatypes import (
+from ..core.datatypes import (
     default_underflow_action,
     env_first_int,
     env_float,

@@ -24,7 +24,7 @@ import torch.nn.functional as F
 from .checkpoint import coerce_checkpoint, is_checkpoint
 from ..core.compat import StochasticDepth
 from ..core.concurrency import Mutex
-from ..data.datatypes import env_bool, env_int
+from ..core.datatypes import env_bool, env_int
 from .graph import (
     is_compiling,
     is_export_or_trace,
