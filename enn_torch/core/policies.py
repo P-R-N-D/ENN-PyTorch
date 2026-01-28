@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import contextlib
 import logging
+import os
 from dataclasses import dataclass, field, replace
 from typing import (
     TYPE_CHECKING,
@@ -23,6 +24,7 @@ import torch.nn as nn
 from .concurrency import Mutex
 from ..core.datatypes import (
     default_underflow_action,
+    env_bool,
     env_first_int,
     env_float,
     env_str,
@@ -90,6 +92,7 @@ class WorkerPolicy:
     local_world_size: int = 1
     intra_ops: int = 1
     inter_ops: int = 1
+    compile_threads: int = 0
     num_workers: int = 1
     prebatch: int = 1
     prefetch_factor: int = 1
@@ -187,12 +190,40 @@ class WorkerPolicy:
         distribute = bool(
             env_first_int(("ENN_DISTRIBUTE_THREAD_CAP",), int(distribute_default))
         )
-        thread_cap = _optimal_threads(
+        thread_cap_total = _optimal_threads(
             ncpu=ncpu_raw,
             cap_mult=cap_mult,
             local_world=int(local_world_guess),
             distribute=bool(distribute),
         )
+        compile_threads = 0
+        if env_bool("ENN_TORCH_COMPILE", default=True):
+            requested = int(
+                env_first_int(
+                    (
+                        "ENN_INDUCTOR_COMPILE_THREADS",
+                        "ENN_COMPILE_THREADS",
+                    ),
+                    0,
+                )
+            )
+            if requested <= 0:
+                requested = int(env_first_int(("TORCHINDUCTOR_COMPILE_THREADS",), 0))
+            if requested > 0:
+                compile_threads = int(requested)
+            else:
+                compile_threads = 1 if CPU.is_free_threaded_build() else 2
+                if int(thread_cap_total) <= 6:
+                    compile_threads = 1
+
+        min_non_compile = 3
+        max_compile = max(0, int(thread_cap_total) - int(min_non_compile))
+        if max_compile <= 0:
+            compile_threads = 0
+        else:
+            compile_threads = max(0, min(int(compile_threads), int(max_compile)))
+
+        thread_cap = max(2, int(thread_cap_total) - int(compile_threads))
         eff_cores = max(1, int(thread_cap) // max(1, int(cap_mult)))
         soft_inflight = 8 if is_accel else 4
         with contextlib.suppress(Exception):
@@ -297,6 +328,7 @@ class WorkerPolicy:
             local_world_size=local_world,
             intra_ops=int(intra_ops),
             inter_ops=int(inter_ops),
+            compile_threads=int(compile_threads),
             num_workers=int(num_workers),
             prebatch=int(prebatch),
             prefetch_factor=int(prefetch_factor),
@@ -308,6 +340,7 @@ class WorkerPolicy:
         return {
             "intra_ops": int(self.intra_ops),
             "inter_ops": int(self.inter_ops),
+            "compile_threads": int(getattr(self, "compile_threads", 0) or 0),
             "num_workers": int(self.num_workers),
             "max_concurrency": int(self.max_concurrency),
             "prebatch": int(self.prebatch),
@@ -339,6 +372,19 @@ class WorkerPolicy:
                         _TORCH_INTEROP_LOCKED = True
                 elif int(_TORCH_INTEROP_THREADS_SET) != int(inter):
                     pass
+        try:
+            ct = int(getattr(self, "compile_threads", 0) or 0)
+        except Exception:
+            ct = 0
+        if ct > 0:
+            explicit = env_str("ENN_INDUCTOR_COMPILE_THREADS") or env_str(
+                "ENN_COMPILE_THREADS"
+            )
+            if explicit is None:
+                val = str(max(1, int(ct)))
+                os.environ["ENN_INDUCTOR_COMPILE_THREADS"] = val
+                if env_str("TORCHINDUCTOR_COMPILE_THREADS") is None:
+                    os.environ["TORCHINDUCTOR_COMPILE_THREADS"] = val
 
 
 @dataclass

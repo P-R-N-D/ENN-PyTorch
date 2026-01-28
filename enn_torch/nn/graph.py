@@ -548,7 +548,7 @@ def compile(
                                 1, int(cpu_count) // max(1, int(local_world))
                             )
                             _inductor_config.compile_threads = max(
-                                1, min(4, int(per_rank) // 2)
+                                1, min(2, int(per_rank) // 2)
                             )
             except Exception:
                 pass
@@ -645,7 +645,7 @@ def compile(
                             threads = 1
                             if int(local_world) <= 1 and _is_in_jupyter():
                                 cpu_count = int(CPU.count() or 1)
-                                threads = max(1, min(4, int(cpu_count) // 2))
+                                threads = max(1, min(2, int(cpu_count) // 2))
                             _inductor_config.compile_threads = int(threads)
                             _want("compile_threads", int(threads))
     try:
