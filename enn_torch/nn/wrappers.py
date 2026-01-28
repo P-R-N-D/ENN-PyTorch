@@ -854,6 +854,11 @@ class Fuser(nn.Module):
     def get_task_name(self: Self, task_spec: str) -> str:
         return self.resolve_task_name(task_spec)
 
+    def get_submodel(self: Self, task_spec: str) -> Optional[nn.Module]:
+        key = self.resolve_task_name(task_spec)
+        sm = self._user_submodels.get(key)
+        return sm if isinstance(sm, nn.Module) else None
+
     def resolve_task_name(self: Self, task_spec: str) -> str:
         raw = self._normalize_task_name(task_spec)
         lowered = raw.lower()
@@ -3213,6 +3218,9 @@ class Model(nn.Module):
 
     def get_task_name(self: Self, task_id: str) -> str:
         return self.fuser.get_task_name(task_id)
+
+    def get_submodel(self: Self, task_id_or_name: str) -> Optional[nn.Module]:
+        return self.fuser.get_submodel(task_id_or_name)
 
     def task_specs(self: Self) -> list[dict[str, Any]]:
         return self.fuser.task_specs()
