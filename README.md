@@ -265,11 +265,10 @@ enn_torch/
     architecture.py
     blocks.py
     checkpoint.py         # activation checkpoint helpers
-    graph.py              # torch.compile helpers, graph break utilities
+    graph.py              # torch.compile helpers, graph break utilities, GraphSequential wrapper
     kernels.py
     layers.py
     profiler.py           # lightweight FLOP/IO timers
-    wrappers.py           # export/runtime wrappers
 ```
 
 ## Configuration notes

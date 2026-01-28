@@ -660,7 +660,7 @@ class Fuser(nn.Module):
         self._decode_graph: nn.Module | None = None
         self._backbone_graph: nn.Module | None = None
         try:
-            from .wrappers import CallArguments, GraphSequential
+            from .graph import CallArguments, GraphSequential
 
             class _PackPerceiverArgs(nn.Module):
                 def forward(
@@ -1818,7 +1818,7 @@ class Model(nn.Module):
         if compile_enabled:
             with compile_patch_ctx:
                 try:
-                    from .wrappers import GraphSequential
+                    from .graph import GraphSequential
 
                     _decode_mod = (
                         GraphSequential(
