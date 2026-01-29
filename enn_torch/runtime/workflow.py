@@ -74,7 +74,7 @@ from ..data.pipeline import (
 from ..nn.wrappers import Model
 from ..nn.layers import Recorder, Scaler, resize_scaler_buffer
 from .io import _filtered_warnings, _torch_load_checkpoint, is_required
-from .io import _coerce_dcp_keys
+from .distributed import _coerce_dcp_keys
 from .main import process
 
 _IGNORED_WARNING_PATTERNS: tuple[str, ...] = (

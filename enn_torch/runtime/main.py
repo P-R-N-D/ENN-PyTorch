@@ -60,7 +60,7 @@ from .distributed import (
     no_sync,
     to_hsdp_module,
 )
-from .io import Checkpointer
+from .distributed import Checkpointer
 from ..nn.graph import (
     canonicalize_compile_mode,
     compile_distributed_safe,
