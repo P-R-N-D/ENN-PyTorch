@@ -8,7 +8,6 @@ __all__ = [
     "collate",
     "nodes",
     "pipeline",
-    "schema",
 ]
 
 

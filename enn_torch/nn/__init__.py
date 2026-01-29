@@ -10,7 +10,6 @@ __all__ = [
     "kernels",
     "layers",
     "blocks",
-    "checkpoint",
     "graph",
     "profiler",
 ]

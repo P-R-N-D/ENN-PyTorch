@@ -42,7 +42,7 @@ from torch.distributed.checkpoint.state_dict import (
 )
 from torch.distributed.launcher.api import LaunchConfig, elastic_launch
 
-from ..data import schema
+from ..data import collate as schema
 from ..core.config import (
     ModelConfig,
     RuntimeConfig,
@@ -74,7 +74,8 @@ from ..data.pipeline import (
 from ..nn.wrappers import Model
 from ..nn.layers import Recorder, resize_scaler_buffer
 from .io import _filtered_warnings, _torch_load_checkpoint, is_required
-from .main import _coerce_dcp_keys, process
+from .io import _coerce_dcp_keys
+from .main import process
 
 _IGNORED_WARNING_PATTERNS: tuple[str, ...] = (
     "torch.distributed is disabled, unavailable or uninitialized",
@@ -132,6 +133,14 @@ def _coerce_state_dict(sd: Mapping[str, Any]) -> Mapping[str, Any]:
     if not any(_rewrite_state_dict_key(k) != k for k in sd):
         return sd
     return {_rewrite_state_dict_key(k): v for k, v in sd.items()}
+
+
+def _normalize_windows_paste(value: PathLike) -> PathLike:
+    if isinstance(value, str):
+        value = value.replace("\\r\\n", "\n").replace("\\n", "\n").replace("\\r", "\n")
+        value = value.replace("\r\n", "\n").replace("\r", "\n")
+        value = value.strip()
+    return value
 
 
 def _parse_meta(p: PathLike) -> Mapping[str, Any]:
@@ -753,7 +762,7 @@ def load_model(
     openzl_check_content_checksum: bool | None = None,
     openzl_check_compressed_checksum: bool | None = None,
 ) -> Model:
-    p = Path(checkpoint_path)
+    p = Path(_normalize_windows_paste(checkpoint_path))
     load_dev = (
         torch.device(map_location) if map_location is not None else torch.device("cpu")
     )
@@ -856,7 +865,7 @@ def load_model(
         )
     else:
         obj = _torch_load_checkpoint(
-            p, map_location=map_location or "cpu", weights_only=weights_only
+            p, map_location=map_location or "cpu", weights_only=weights_only, mmap=True
         )
     if isinstance(obj, dict):
         meta_in_dim = obj.get("in_dim")
@@ -924,38 +933,18 @@ def save_model(
     extra: Mapping[str, object] | None = None,
     *args: Any,
     state_dict: Mapping[str, torch.Tensor] | None = None,
-    openzl_level: int | None = None,
-    openzl_format_version: int | None = None,
-    openzl_min_stream_size: int | None = None,
-    openzl_content_checksum: bool | None = None,
-    openzl_compressed_checksum: bool | None = None,
-    openzl_permissive: bool | None = None,
-    openzl_pack_by_dtype: bool = True,
     ema_averager: object | None = None,
     swa_averager: object | None = None,
     **kwargs: Any,
 ) -> str:
     from .io import Builder, Exporter
 
-    p = Path(path)
+    p = Path(_normalize_windows_paste(path))
     if Builder.is_target_native(p):
         if args:
             raise TypeError(
                 "Positional args are only supported for export converters; use keyword arguments for TorchIO.save()."
             )
-        if openzl_level is not None:
-            kwargs["openzl_level"] = openzl_level
-        if openzl_format_version is not None:
-            kwargs["openzl_format_version"] = openzl_format_version
-        if openzl_min_stream_size is not None:
-            kwargs["openzl_min_stream_size"] = openzl_min_stream_size
-        if openzl_content_checksum is not None:
-            kwargs["openzl_content_checksum"] = openzl_content_checksum
-        if openzl_compressed_checksum is not None:
-            kwargs["openzl_compressed_checksum"] = openzl_compressed_checksum
-        if openzl_permissive is not None:
-            kwargs["openzl_permissive"] = openzl_permissive
-        kwargs.setdefault("openzl_pack_by_dtype", openzl_pack_by_dtype)
         merged_extra = dict(extra or {})
         if ema_averager is not None and hasattr(ema_averager, "state_dict"):
             with contextlib.suppress(Exception):
@@ -1157,7 +1146,7 @@ def train(
         with _start_context():
             elastic_launch(lc, process)(ops)
         fallback: str | None = None
-        for fname in ("model.ozl", "model.pt"):
+        for fname in ("model.pt",):
             fp = os.path.join(ckpt_dir, fname)
             if os.path.isfile(fp):
                 fallback = fp
@@ -1197,7 +1186,7 @@ def train(
     finally:
         restore_path: str | None = None
         with contextlib.suppress(Exception):
-            for _name in ("model.ozl", "model.pt"):
+            for _name in ("model.pt",):
                 fp = os.path.join(str(ckpt_dir or ""), _name)
                 if fp and os.path.isfile(fp):
                     restore_path = fp

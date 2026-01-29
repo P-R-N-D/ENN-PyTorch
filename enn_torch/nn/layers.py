@@ -21,7 +21,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .checkpoint import coerce_checkpoint, is_checkpoint
+from .graph import coerce_checkpoint, is_checkpoint
 from ..core.compat import StochasticDepth
 from ..core.concurrency import Mutex
 from ..core.datatypes import env_bool, env_int

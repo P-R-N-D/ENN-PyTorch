@@ -36,7 +36,7 @@ import torch
 from tensordict import MemoryMappedTensor, TensorDictBase
 from torchdata.nodes import BaseNode
 
-from . import schema
+from . import collate as schema
 from ..core.concurrency import Disposable, Mutex, new_affinity
 from ..core.datatypes import (
     PathLike,

@@ -10,7 +10,7 @@ from typing import Any, Callable, List, Optional, Self, Sequence, Tuple
 import torch
 import torch.nn as nn
 
-from .checkpoint import coerce_checkpoint
+from .graph import coerce_checkpoint
 from ..core.compat import StochasticDepth
 from ..runtime.distributed import _from_hsdp_module
 from .graph import is_export_or_trace, is_symbolic
