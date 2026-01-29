@@ -72,7 +72,7 @@ from ..data.pipeline import (
     preload_memmap,
 )
 from ..nn.wrappers import Model
-from ..nn.layers import Recorder, resize_scaler_buffer
+from ..nn.layers import Recorder, Scaler, resize_scaler_buffer
 from .io import _filtered_warnings, _torch_load_checkpoint, is_required
 from .io import _coerce_dcp_keys
 from .main import process
@@ -140,7 +140,123 @@ def _normalize_windows_paste(value: PathLike) -> PathLike:
         value = value.replace("\\r\\n", "\n").replace("\\n", "\n").replace("\\r", "\n")
         value = value.replace("\r\n", "\n").replace("\r", "\n")
         value = value.strip()
+        if "\n" in value:
+            lines = [line.strip() for line in value.split("\n") if line.strip()]
+            value = lines[0] if lines else ""
     return value
+
+
+def _find_latest_dcp_epoch_dir(ckpt_dir: str | None) -> str | None:
+    if not ckpt_dir:
+        return None
+    dcp_root = os.path.join(ckpt_dir, "dcp_epochs")
+    if not os.path.isdir(dcp_root):
+        return None
+    epoch_dirs: list[str] = []
+    for entry in os.scandir(dcp_root):
+        if not entry.is_dir():
+            continue
+        if not entry.name.startswith("epoch_"):
+            continue
+        if os.path.isfile(os.path.join(entry.path, "done.json")):
+            epoch_dirs.append(entry.path)
+    if not epoch_dirs:
+        return None
+    epoch_dirs.sort()
+    return epoch_dirs[-1]
+
+
+def _resize_scaler_buffers_for_shape(
+    model: torch.nn.Module,
+    in_dim: int | None,
+    label_shape: Sequence[int] | tuple[int, ...],
+) -> None:
+    if in_dim is None and not label_shape:
+        return
+    x_numel = int(in_dim) if in_dim is not None else None
+    y_numel = int(numpy.prod(label_shape)) if label_shape else None
+
+    def _resize_buffer(module: Scaler, name: str, shape: tuple[int, ...]) -> None:
+        buf = getattr(module, name, None)
+        if not isinstance(buf, torch.Tensor):
+            return
+        if tuple(buf.shape) == tuple(shape):
+            return
+        try:
+            buf.resize_(shape)
+        except Exception:
+            module._buffers[name] = buf.detach().new_zeros(shape)
+
+    for module in model.modules():
+        if not isinstance(module, Scaler):
+            continue
+        if x_numel and x_numel > 0:
+            _resize_buffer(module, "x_mean", (x_numel,))
+            _resize_buffer(module, "x_std", (x_numel,))
+        if y_numel and y_numel > 0:
+            for name in (
+                "y_mean",
+                "y_std",
+                "y_min",
+                "y_max",
+                "y_q_low",
+                "y_q_high",
+                "affine_a",
+                "affine_b",
+            ):
+                _resize_buffer(module, name, (y_numel,))
+        return
+
+
+def _resize_scaler_buffers_from_metadata(
+    model: torch.nn.Module,
+    metadata: object | None,
+) -> bool:
+    if metadata is None:
+        return False
+    state_meta = getattr(metadata, "state_dict_metadata", None)
+    if not isinstance(state_meta, dict):
+        return False
+    suffix_map = {
+        "scaler.x_mean": "x_mean",
+        "scaler.x_std": "x_std",
+        "scaler.y_mean": "y_mean",
+        "scaler.y_std": "y_std",
+        "scaler.y_min": "y_min",
+        "scaler.y_max": "y_max",
+        "scaler.y_q_low": "y_q_low",
+        "scaler.y_q_high": "y_q_high",
+        "scaler.affine_a": "affine_a",
+        "scaler.affine_b": "affine_b",
+    }
+
+    def _resize_buffer(module: Scaler, name: str, shape: tuple[int, ...]) -> None:
+        buf = getattr(module, name, None)
+        if not isinstance(buf, torch.Tensor):
+            return
+        if tuple(buf.shape) == tuple(shape):
+            return
+        try:
+            buf.resize_(shape)
+        except Exception:
+            module._buffers[name] = buf.detach().new_zeros(shape)
+
+    resized = False
+    for module in model.modules():
+        if not isinstance(module, Scaler):
+            continue
+        for key, value in state_meta.items():
+            for suffix, buf_name in suffix_map.items():
+                if not key.endswith(suffix):
+                    continue
+                size = getattr(value, "size", None)
+                if size is None:
+                    continue
+                shape = tuple(int(dim) for dim in size)
+                _resize_buffer(module, buf_name, shape)
+                resized = True
+        return resized
+    return False
 
 
 def _parse_meta(p: PathLike) -> Mapping[str, Any]:
@@ -1169,15 +1285,32 @@ def train(
             if isinstance(model, torch.nn.Module) and _has_meta_tensors(model):
                 with contextlib.suppress(Exception):
                     _materialize_to_cpu(model)
+            dcp_dir = _find_latest_dcp_epoch_dir(ckpt_dir) or ckpt_dir
+            reader = FileSystemReader(dcp_dir)
+            meta = None
+            with contextlib.suppress(Exception):
+                meta = reader.read_metadata()
+            if not _resize_scaler_buffers_from_metadata(model, meta):
+                _resize_scaler_buffers_for_shape(model, first_in_dim, label_shape)
             m_sd = _coerce_dcp_keys(
                 get_model_state_dict(
                     model,
                     options=StateDictOptions(full_state_dict=True, cpu_offload=True),
                 )
             )
+            state_meta = getattr(meta, "state_dict_metadata", None)
+            if isinstance(state_meta, dict) and state_meta:
+                allowed_keys: set[str] = set()
+                for key in state_meta.keys():
+                    if key.startswith("model."):
+                        allowed_keys.add(key[len("model.") :])
+                    else:
+                        allowed_keys.add(key)
+                if allowed_keys:
+                    m_sd = {k: v for k, v in m_sd.items() if k in allowed_keys}
             load(
                 state_dict={"model": m_sd},
-                storage_reader=FileSystemReader(ckpt_dir),
+                storage_reader=reader,
             )
             resize_scaler_buffer(model, m_sd)
             set_model_state_dict(model, m_sd, options=StateDictOptions(strict=False))

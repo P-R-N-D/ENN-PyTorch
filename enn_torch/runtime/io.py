@@ -1351,6 +1351,38 @@ class Checkpointer:
         except Exception:
             return
 
+    def _save_avg_epoch(self, epoch: int, avg_state_dict: Mapping[str, Any]) -> Path:
+        node_rank = int(self._node_rank)
+        d = self._avg_node_dir(node_rank)
+        d.mkdir(parents=True, exist_ok=True)
+        payload = _coerce_dcp_keys(avg_state_dict)
+        path = self._avg_epoch_path(epoch, node_rank)
+        save_temp(path, payload)
+        meta = {
+            "format": "enn-avg-state-v1",
+            "epoch": int(epoch),
+            "created_time": time.time(),
+            "rank": int(self._rank),
+            "local_rank": int(self._local_rank),
+            "node_rank": int(node_rank),
+            "world_size": int(self._world),
+            "local_world_size": int(self._local_world),
+        }
+        write_json(self._avg_latest_file(node_rank), meta, indent=2)
+        with contextlib.suppress(Exception):
+            self._prune_avg(node_rank)
+        return path
+
+    def _schedule_avg_save(self, epoch: int, avg_state_dict: Mapping[str, Any]) -> None:
+        try:
+            future = self._avg_executor.submit(
+                self._save_avg_epoch, int(epoch), avg_state_dict
+            )
+        except Exception as exc:
+            _LOGGER.exception("Average checkpoint scheduling failed: %s", exc)
+            return
+        self._register_pending("avg", int(epoch), future)
+
     def request_save_epoch(
         self,
         *,
