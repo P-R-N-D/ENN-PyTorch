@@ -4544,41 +4544,44 @@ def infer(
                     Xi_pad = None
                     pad_n = 0
                     Xi_run = Xi
-                    if (cg_enabled or use_td_cg) and n_i < mb:
+                    if use_td_cg:
+                        if (
+                            (td_cg_pad_buf is not None)
+                            and (td_cg_x_inner_shape is not None)
+                            and tuple(int(d) for d in tuple(Xi.shape[1:]))
+                            != tuple(td_cg_x_inner_shape)
+                        ):
+                            raise RuntimeError(
+                                "infer: input shape changed during td-cudagraph run"
+                            )
+                        if n_i < mb:
+                            pad_n = int(mb - n_i)
+                        try:
+                            td_cg_pad_buf[:n_i].copy_(Xi, non_blocking=True)
+                            if n_i < mb:
+                                td_cg_pad_buf[n_i:].zero_()
+                            Xi_run = td_cg_pad_buf
+                        except Exception:
+                            Xi_pad = None
+                            pad_n = 0
+                            Xi_run = Xi
+                    elif cg_enabled and n_i < mb:
                         pad_n = int(mb - n_i)
                         try:
+                            want_shape = (int(mb),) + tuple(Xi.shape[1:])
                             if (
-                                use_td_cg
-                                and (td_cg_pad_buf is not None)
-                                and (td_cg_x_inner_shape is not None)
+                                pad_buf is None
+                                or pad_buf.shape != want_shape
+                                or pad_buf.dtype != Xi.dtype
+                                or pad_buf.device != Xi.device
                             ):
-                                if tuple(int(d) for d in tuple(Xi.shape[1:])) != tuple(
-                                    td_cg_x_inner_shape
-                                ):
-                                    raise RuntimeError(
-                                        "infer: input shape changed during td-cudagraph run"
-                                    )
-                                Xi_pad = td_cg_pad_buf
-                                Xi_pad[:n_i].copy_(Xi)
-                                Xi_pad[n_i:].copy_(
-                                    Xi[-1:].expand(pad_n, *tuple(Xi.shape[1:]))
-                                )
-                                Xi_run = Xi_pad
-                            else:
-                                want_shape = (int(mb),) + tuple(Xi.shape[1:])
-                                if (
-                                    pad_buf is None
-                                    or pad_buf.shape != want_shape
-                                    or pad_buf.dtype != Xi.dtype
-                                    or pad_buf.device != Xi.device
-                                ):
-                                    pad_buf = Xi.new_empty(want_shape)
-                                Xi_pad = pad_buf
-                                Xi_pad[:n_i].copy_(Xi)
-                                Xi_pad[n_i:].copy_(
-                                    Xi[-1:].expand(pad_n, *tuple(Xi.shape[1:]))
-                                )
-                                Xi_run = Xi_pad
+                                pad_buf = Xi.new_empty(want_shape)
+                            Xi_pad = pad_buf
+                            Xi_pad[:n_i].copy_(Xi)
+                            Xi_pad[n_i:].copy_(
+                                Xi[-1:].expand(pad_n, *tuple(Xi.shape[1:]))
+                            )
+                            Xi_run = Xi_pad
                         except Exception:
                             Xi_pad = None
                             pad_n = 0
