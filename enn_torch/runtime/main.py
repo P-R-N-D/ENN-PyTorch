@@ -146,6 +146,7 @@ _IGNORED_WARNING_PATTERNS: tuple[str, ...] = (
     "distributed_broadcast: coalesced broadcast failed",
     "distributed_broadcast: per-tensor broadcast failed",
     "found no DeviceMesh from dtensor args",
+    "Ignoring pin_memory flag for checkpoint staging as pinning memoryrequires CUDA, but CUDA is not available\\.",
     "mixed precision.*may be unavailable",
     "Either mode or options can be specified, but both can't be specified at the same time\\.",
 )
