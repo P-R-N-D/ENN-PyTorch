@@ -25,7 +25,7 @@ import torch.nn.functional as F
 from tensordict import TensorDictBase
 
 from ..core.config import ModelConfig
-from .checkpoint import coerce_checkpoint
+from .graph import coerce_checkpoint
 from ..core.concurrency import Mutex, is_gil_enabled
 from ..core.datatypes import env_bool, env_first_int, env_int
 from ..runtime.distributed import _from_hsdp_module
@@ -45,7 +45,7 @@ from ..core.policies import LossWeightPolicy
 from ..core.precision import Autocast
 from ..core.system import CPU, empty_device_cache, get_device, set_runtime_cfg
 from ..core.tensor import is_meta_or_fake_tensor, symint_safe_expand_as
-from ..data.schema import get_feature_key, get_label_key
+from ..data.collate import get_feature_key, get_label_key
 from .blocks import (
     LongNet,
     Perceiver,

@@ -14,6 +14,8 @@ import sys
 import tempfile
 import shutil
 import subprocess
+import threading
+import time
 import types
 import warnings
 import weakref
@@ -169,15 +171,23 @@ def _torch_load_checkpoint(
     *args: Any,
     map_location: object = None,
     weights_only: bool = True,
+    mmap: bool | None = None,
 ) -> object:
+    load_args = args
+    load_kwargs: dict[str, Any] = {"map_location": map_location or "cpu"}
+    if mmap is not None:
+        load_kwargs["mmap"] = bool(mmap)
+    if weights_only is not None:
+        load_kwargs["weights_only"] = bool(weights_only)
     try:
-        return torch.load(
-            str(path),
-            map_location=map_location or "cpu",
-            weights_only=weights_only,
-        )
+        return torch.load(str(path), *load_args, **load_kwargs)
     except TypeError:
-        return torch.load(str(path), map_location=map_location or "cpu")
+        load_kwargs.pop("weights_only", None)
+        try:
+            return torch.load(str(path), *load_args, **load_kwargs)
+        except TypeError:
+            load_kwargs.pop("mmap", None)
+            return torch.load(str(path), *load_args, **load_kwargs)
     except Exception as exc:
         if weights_only:
             raise RuntimeError("weights_only=True failed") from exc
@@ -932,7 +942,7 @@ def is_required(module: str, pip_hint: str | None = None) -> None:
 
 
 class Builder:
-    NATIVE_EXTS = {".pt", ".pth", ".safetensors", ".ozl"}
+    NATIVE_EXTS = {".pt", ".pth", ".safetensors"}
 
     @staticmethod
     def is_target_native(path: PathLike) -> bool:
@@ -997,72 +1007,9 @@ class Builder:
                 return p
             sd = state_dict if state_dict is not None else model.state_dict()
             if p.suffix == ".ozl":
-                payload = {**_make_meta(), "state_dict": sd, "format": "openzl-ckpt-v1"}
-                if optimizer is not None:
-                    with contextlib.suppress(Exception):
-                        payload["optimizer_state_dict"] = optimizer.state_dict()
-                try:
-                    _openzl_save_checkpoint(
-                        p,
-                        payload,
-                        openzl_level=opts.pop("openzl_level", None),
-                        openzl_format_version=opts.pop("openzl_format_version", None),
-                        openzl_min_stream_size=opts.pop("openzl_min_stream_size", None),
-                        openzl_content_checksum=opts.pop(
-                            "openzl_content_checksum", None
-                        ),
-                        openzl_compressed_checksum=opts.pop(
-                            "openzl_compressed_checksum", None
-                        ),
-                        openzl_permissive=opts.pop("openzl_permissive", None),
-                        openzl_pack_by_dtype=bool(
-                            opts.pop("openzl_pack_by_dtype", True)
-                        ),
-                    )
-                    meta = _make_meta()
-                    meta["format"] = "openzl-ckpt-v1"
-                    write_json(p.with_name(p.name + ".json"), meta, indent=2)
-                    with contextlib.suppress(Exception):
-                        legacy = p.with_suffix(".json")
-                        if legacy != p.with_name(p.name + ".json"):
-                            write_json(legacy, meta, indent=2)
-                    return p
-                except Exception as exc:
-                    if env_bool("ENN_OPENZL_STRICT", False) or env_bool(
-                        "ENN_OPENZL_NO_TORCH_FALLBACK", False
-                    ):
-                        raise
-                    if env_bool("ENN_OPENZL_LOG_FALLBACK", True):
-                        _LOGGER.warning(
-                            "OpenZL checkpoint write failed; falling back to torch.save (.pt). Error: %s",
-                            exc,
-                        )
-                    with contextlib.suppress(Exception):
-                        if (
-                            _is_openzl_temporarily_unavailable(exc)
-                            and "ENN_CKPT_EXT" not in os.environ
-                        ):
-                            os.environ["ENN_CKPT_EXT"] = ".pt"
-                    pt_path = p.with_suffix(".pt")
-                    pt_payload = {
-                        **_make_meta(),
-                        "state_dict": sd,
-                        "format": "torch-ckpt-v1",
-                    }
-                    if optimizer is not None:
-                        with contextlib.suppress(Exception):
-                            pt_payload["optimizer_state_dict"] = optimizer.state_dict()
-                    save_temp(pt_path, pt_payload, **opts)
-                    meta = _make_meta()
-                    meta["format"] = "torch-ckpt-v1"
-                    write_json(
-                        pt_path.with_name(pt_path.name + ".json"), meta, indent=2
-                    )
-                    with contextlib.suppress(Exception):
-                        legacy = pt_path.with_suffix(".json")
-                        if legacy != pt_path.with_name(pt_path.name + ".json"):
-                            write_json(legacy, meta, indent=2)
-                    return pt_path
+                raise ValueError(
+                    "OpenZL checkpoint writing has been removed. Use .pt/.pth/.safetensors instead."
+                )
             if p.suffix == ".safetensors":
                 is_required("safetensors", "pip install safetensors")
                 

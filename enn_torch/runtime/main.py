@@ -35,9 +35,9 @@ from torch.distributed.checkpoint.state_dict import (
 )
 from tqdm.auto import tqdm
 
-from ..data import schema
+from ..data import collate as schema
 from ..core.config import RuntimeConfig, coerce_model_config
-from ..nn.checkpoint import from_checkpoint, to_checkpoint
+from ..nn.graph import from_checkpoint, to_checkpoint
 from ..core.concurrency import Mutex, TensorPagePool, TensorSpooler, new_affinity
 from ..core.datatypes import (
     env_bool,
@@ -60,6 +60,7 @@ from .distributed import (
     no_sync,
     to_hsdp_module,
 )
+from .distributed import Checkpointer
 from ..nn.graph import (
     canonicalize_compile_mode,
     compile_distributed_safe,
@@ -145,6 +146,7 @@ _IGNORED_WARNING_PATTERNS: tuple[str, ...] = (
     "distributed_broadcast: coalesced broadcast failed",
     "distributed_broadcast: per-tensor broadcast failed",
     "found no DeviceMesh from dtensor args",
+    "Ignoring pin_memory flag for checkpoint staging as pinning memoryrequires CUDA, but CUDA is not available\\.",
     "mixed precision.*may be unavailable",
     "Either mode or options can be specified, but both can't be specified at the same time\\.",
 )
@@ -999,26 +1001,6 @@ def _validate_model_dtype_unity(model: object, device: TorchDeviceLike) -> None:
         raise RuntimeError(
             "LayerNorm parameter dtype mismatch detected:\n" + "\n".join(mismatches)
         )
-
-
-def _coerce_dcp_keys(state: object) -> object:
-    if isinstance(state, dict):
-        keys = []
-        for key, value in state.items():
-            key_str = str(key)
-            if (
-                key_str.endswith("._extra_state")
-                or key_str.endswith("_extra_state")
-                or key_str.endswith("output_baked_flag")
-            ):
-                keys.append(key)
-                continue
-            state[key] = _coerce_dcp_keys(value)
-        for key in keys:
-            state.pop(key, None)
-    return state
-
-
 def _get_backend_type(device: "TorchDeviceLike") -> str:
     dev_type = str(getattr(device, "type", "cpu")).lower()
     match dev_type:
@@ -2432,6 +2414,7 @@ def epochs(
     swa_helper: object | None = None,
     swa_start_epoch: int = 0,
     ema_helper: object | None = None,
+    checkpointer: Checkpointer | None = None,
     buffers_dtype: torch.dtype | None = None,
     dataset: object | None = None,
     **kwargs: Any,
@@ -3741,103 +3724,66 @@ def epochs(
                     sched.step()
                 except Exception:
                     pass
-            if (
-                swa_helper is not None
-                and epoch_idx >= swa_start_epoch
-                and float(train_samples_epoch or 0.0) > 0.0
-            ):
-                _LOGGER.info("[swa] epoch %d: update+ckpt (CPU shadow)", epoch_idx + 1)
-                swa_target = (
+            avg_sd = None
+            avg_tag = None
+            if float(train_samples_epoch or 0.0) > 0.0 and local_rank == 0:
+                avg_target = (
                     model.module
                     if isinstance(model, torch.nn.parallel.DistributedDataParallel)
                     else model
                 )
-                swa_helper.update(swa_target)
-                ckpt_dir = getattr(ops, "ckpt_dir", None)
-                if ckpt_dir:
-                    try:
-                        os.makedirs(ckpt_dir, exist_ok=True)
-                    except Exception:
-                        ckpt_dir = None
-                if ckpt_dir:
-                    ckpt_ext = os.environ.get("ENN_CKPT_EXT")
-                    if ckpt_ext:
-                        if not ckpt_ext.startswith("."):
-                            ckpt_ext = "." + ckpt_ext
-                        ckpt_ext = ckpt_ext.lower()
-                    else:
-                        try:
-                            import openzl.ext
-
-                            ckpt_ext = ".ozl"
-                        except Exception:
-                            ckpt_ext = ".pt"
-                    ckpt_path = os.path.join(ckpt_dir, "model" + ckpt_ext)
-                    model_sd = swa_helper.checkpoint_state_dict(
-                        swa_target,
-                        include_buffers=True,
-                        max_buffer_mb=25,
+                if swa_helper is not None and epoch_idx >= swa_start_epoch:
+                    _LOGGER.info(
+                        "[swa] epoch %d: update+snapshot (CPU shadow)", epoch_idx + 1
                     )
-                    _coerce_dcp_keys(model_sd)
-                    ckpt_percentage = 100 * float(int(epoch_idx + 1) / int(ops.epochs))
-                    update_checkpoint_bar(
-                        checkpoint_bar,
-                        finish=False,
-                        total=int(ops.epochs),
-                        position=int(epoch_idx),
-                    )
-                    from .workflow import save_model as _api_save_model
-
-                    _ozl_kwargs: dict[str, object] = {}
-                    if str(ckpt_path).lower().endswith(".ozl"):
-                        _lvl = os.environ.get("ENN_OPENZL_LEVEL")
-                        if _lvl:
-                            with contextlib.suppress(Exception):
-                                _ozl_kwargs["openzl_level"] = int(_lvl)
-                        _mss = os.environ.get("ENN_OPENZL_MIN_STREAM_SIZE")
-                        if _mss:
-                            with contextlib.suppress(Exception):
-                                _ozl_kwargs["openzl_min_stream_size"] = int(_mss)
-                        if "ENN_OPENZL_PACK_BY_DTYPE" in os.environ:
-                            with contextlib.suppress(Exception):
-                                _ozl_kwargs["openzl_pack_by_dtype"] = bool(
-                                    _env_flag("ENN_OPENZL_PACK_BY_DTYPE", True)
-                                )
-                        if "ENN_OPENZL_CONTENT_CHECKSUM" in os.environ:
-                            with contextlib.suppress(Exception):
-                                _ozl_kwargs["openzl_content_checksum"] = bool(
-                                    _env_flag("ENN_OPENZL_CONTENT_CHECKSUM", True)
-                                )
-                        if "ENN_OPENZL_COMPRESSED_CHECKSUM" in os.environ:
-                            with contextlib.suppress(Exception):
-                                _ozl_kwargs["openzl_compressed_checksum"] = bool(
-                                    _env_flag("ENN_OPENZL_COMPRESSED_CHECKSUM", True)
-                                )
-                        if "ENN_OPENZL_PERMISSIVE" in os.environ:
-                            with contextlib.suppress(Exception):
-                                _ozl_kwargs["openzl_permissive"] = bool(
-                                    _env_flag("ENN_OPENZL_PERMISSIVE", True)
-                                )
-                    _api_save_model(
-                        swa_target,
-                        ckpt_path,
-                        state_dict=model_sd,
-                        **_ozl_kwargs,
-                    )
-                    update_checkpoint_bar(
-                        checkpoint_bar,
-                        finish=True,
-                        total=int(ops.epochs),
-                        position=int(epoch_idx),
-                    )
-                    try:
-                        del model_sd
-                    except Exception:
-                        pass
+                    swa_helper.update(avg_target)
+                    avg_tag = "swa"
                     with contextlib.suppress(Exception):
-                        import gc
+                        avg_sd = swa_helper.checkpoint_state_dict(
+                            avg_target,
+                            include_buffers=True,
+                            max_buffer_mb=25,
+                        )
+                elif ema_helper is not None and getattr(ema_helper, "shadow", None):
+                    _LOGGER.info(
+                        "[ema] epoch %d: snapshot (CPU shadow)", epoch_idx + 1
+                    )
+                    avg_tag = "ema"
+                    with contextlib.suppress(Exception):
+                        avg_sd = ema_helper.checkpoint_state_dict(
+                            avg_target,
+                            include_buffers=True,
+                            max_buffer_mb=25,
+                        )
 
-                        gc.collect()
+            if checkpointer is not None:
+                update_checkpoint_bar(
+                    checkpoint_bar,
+                    finish=False,
+                    total=int(ops.epochs),
+                    position=int(epoch_idx),
+                )
+                checkpointer.request_save_epoch(
+                    epoch=int(epoch_idx + 1),
+                    model=model,
+                    optimizer=optimizer,
+                    avg_state_dict=avg_sd,
+                    extra_state={
+                        "epoch": int(epoch_idx + 1),
+                        "avg": avg_tag,
+                    },
+                )
+                update_checkpoint_bar(
+                    checkpoint_bar,
+                    finish=True,
+                    total=int(ops.epochs),
+                    position=int(epoch_idx),
+                )
+                with contextlib.suppress(Exception):
+                    del avg_sd
+                    import gc
+
+                    gc.collect()
             if is_distributed():
                 distributed_barrier(device)
             prev_comp_time += float(comp_time)
@@ -5198,6 +5144,41 @@ def process(*args: Any, **kwargs: Any) -> object:
             scaler = torch.amp.GradScaler(
                 enabled=bool(device.type == "cuda" and compute_dtype == torch.float16)
             )
+            checkpointer: Checkpointer | None = None
+            if ops.ckpt_dir:
+                keep_last = max(
+                    1,
+                    int(
+                        env_first_int(
+                            ("ENN_DCP_KEEP_LAST", "ENN_CKPT_KEEP_LAST"), default=3
+                        )
+                    ),
+                )
+                max_in_flight = max(
+                    1,
+                    int(
+                        env_first_int(
+                            ("ENN_DCP_MAX_INFLIGHT", "ENN_CKPT_MAX_INFLIGHT"),
+                            default=1,
+                        )
+                    ),
+                )
+                use_async = bool(
+                    env_bool(("ENN_DCP_ASYNC", "ENN_CKPT_ASYNC"), default=True)
+                )
+                mmap_load = (
+                    bool(env_bool("ENN_DCP_MMAP_LOAD", default=False))
+                    if "ENN_DCP_MMAP_LOAD" in os.environ
+                    else None
+                )
+                checkpointer = Checkpointer(
+                    ops.ckpt_dir,
+                    keep_last=keep_last,
+                    max_in_flight=max_in_flight,
+                    use_async=use_async,
+                    mmap_load=mmap_load,
+                    device=device,
+                )
             try:
                 new_affinity().pin_thread()
                 with contextlib.suppress(Exception):
@@ -5223,6 +5204,7 @@ def process(*args: Any, **kwargs: Any) -> object:
                 swa_helper=swa_helper,
                 ema_helper=ema_helper,
                 swa_start_epoch=swa_start_epoch,
+                checkpointer=checkpointer,
                 buffers_dtype=amp_buffers_dtype,
                 dataset=metadata,
                 ddp_fallback=ddp_fallback,
@@ -5230,119 +5212,9 @@ def process(*args: Any, **kwargs: Any) -> object:
         finally:
             if session is not None:
                 session.close()
-        if local_rank == 0:
-            avg_tag = None
-            avg_helper = None
-            if swa_helper is not None and getattr(swa_helper, "n_averaged", 0) > 0:
-                avg_tag = "swa"
-                avg_helper = swa_helper
-            elif ema_helper is not None and getattr(ema_helper, "shadow", None):
-                avg_tag = "ema"
-                avg_helper = ema_helper
-            if ops.ckpt_dir:
-                ckpt_ext = os.environ.get("ENN_CKPT_EXT")
-                if ckpt_ext:
-                    if not ckpt_ext.startswith("."):
-                        ckpt_ext = "." + ckpt_ext
-                    ckpt_ext = ckpt_ext.lower()
-                else:
-                    try:
-                        import openzl.ext
-
-                        ckpt_ext = ".ozl"
-                    except Exception:
-                        ckpt_ext = ".pt"
-                ckpt_path = os.path.join(ops.ckpt_dir, "model" + ckpt_ext)
-                if not os.path.isfile(ckpt_path):
-                    for _alt in (".ozl", ".pt"):
-                        if _alt != ckpt_ext and os.path.isfile(
-                            os.path.join(ops.ckpt_dir, "model" + _alt)
-                        ):
-                            return
-                    src_mod = tracked_module if tracked_module is not None else model
-                    shadow = (
-                        getattr(avg_helper, "shadow", None)
-                        if avg_helper is not None
-                        else None
-                    )
-                    if avg_helper is not None and hasattr(
-                        avg_helper, "checkpoint_state_dict"
-                    ):
-                        model_sd = avg_helper.checkpoint_state_dict(
-                            src_mod,
-                            include_buffers=True,
-                            max_buffer_mb=25,
-                        )
-                    else:
-                        model_sd = {}
-                        if src_mod is not None:
-                            for k, p in src_mod.named_parameters(recurse=True):
-                                sv = (
-                                    shadow.get(k, None)
-                                    if isinstance(shadow, dict)
-                                    else None
-                                )
-                                tv = sv if torch.is_tensor(sv) else p
-                                if not torch.is_tensor(tv):
-                                    continue
-                                if (
-                                    getattr(tv, "is_meta", False)
-                                    or tv.device.type == "meta"
-                                ):
-                                    continue
-                                tv = tv.detach()
-                                if tv.device.type != "cpu":
-                                    tv = tv.to("cpu")
-                                model_sd[k] = tv
-                        max_bytes = 25 * 1024 * 1024
-                        if src_mod is not None:
-                            for k, b in src_mod.named_buffers(recurse=True):
-                                if not torch.is_tensor(b) or b.numel() <= 0:
-                                    continue
-                                if (
-                                    getattr(b, "is_meta", False)
-                                    or b.device.type == "meta"
-                                ):
-                                    continue
-                                try:
-                                    if (
-                                        max_bytes
-                                        and (b.numel() * b.element_size()) > max_bytes
-                                    ):
-                                        continue
-                                except Exception:
-                                    pass
-                                tb = b.detach()
-                                if tb.device.type != "cpu":
-                                    tb = tb.to("cpu")
-                                model_sd[k] = tb
-                    _coerce_dcp_keys(model_sd)
-
-                    from .workflow import save_model as _api_save_model
-
-                    save_target = (
-                        src_mod.module if hasattr(src_mod, "module") else src_mod
-                    )
-                    _ozl_kwargs: dict[str, object] = {}
-                    if str(ckpt_path).lower().endswith(".ozl"):
-                        _lvl = os.environ.get("ENN_OPENZL_LEVEL")
-                        if _lvl:
-                            with contextlib.suppress(Exception):
-                                _ozl_kwargs["openzl_level"] = int(_lvl)
-                        _mss = os.environ.get("ENN_OPENZL_MIN_STREAM_SIZE")
-                        if _mss:
-                            with contextlib.suppress(Exception):
-                                _ozl_kwargs["openzl_min_stream_size"] = int(_mss)
-                    _api_save_model(
-                        save_target,
-                        ckpt_path,
-                        state_dict=model_sd,
-                        **_ozl_kwargs,
-                    )
-                    try:
-                        del model_sd
-                    except Exception:
-                        pass
+        with contextlib.suppress(Exception):
+            if checkpointer is not None:
+                checkpointer.close()
         with contextlib.suppress(Exception):
             if swa_helper is not None and hasattr(swa_helper, "close"):
                 swa_helper.close()

@@ -250,8 +250,7 @@ enn_torch/
     __init__.py
     nodes.py              # torchdata nodes, Sampler/Loader, memmap writer/reader
     pipeline.py           # dataset fetch, collate, session orchestration
-    schema.py             # feature/label key helpers, input schema utilities
-    collate.py            # dataset storage helpers
+    collate.py            # dataset storage helpers + feature/label key utilities
   runtime/
     __init__.py
     distributed.py        # elastic launch + process group utilities
@@ -264,8 +263,7 @@ enn_torch/
     activations.py
     wrappers.py
     blocks.py
-    checkpoint.py         # activation checkpoint helpers
-    graph.py              # torch.compile helpers, graph break utilities, GraphSequential wrapper
+    graph.py              # torch.compile helpers, graph break utilities, activation checkpoint helpers
     kernels.py
     layers.py
     profiler.py           # lightweight FLOP/IO timers
