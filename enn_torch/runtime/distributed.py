@@ -426,9 +426,7 @@ class Checkpointer:
             with contextlib.suppress(Exception):
                 from torch.distributed.checkpoint import DefaultSavePlanner
 
-                planner = DefaultSavePlanner(
-                    dedup_replicated_tensors=True, dedup_save_to_lowest_rank=True
-                )
+                planner = DefaultSavePlanner(dedup_save_to_lowest_rank=True)
 
             if self.use_async and hasattr(dcp, "async_save"):
                 stager = self._ensure_stager()
