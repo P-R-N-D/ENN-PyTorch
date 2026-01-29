@@ -133,6 +133,7 @@ class Checkpointer:
         mmap_load: bool | None = None,
         device: torch.device | None = None,
     ) -> None:
+        self._device = device
         self.root = Path(ckpt_dir)
         self.dcp_root = self.root / dcp_subdir
         self.avg_root = self.root / avg_subdir
@@ -240,8 +241,11 @@ class Checkpointer:
             try:
                 from torch.distributed.checkpoint.staging import DefaultStager, StagingOptions
 
+                use_pinned_memory = bool(
+                    self._device is not None and self._device.type == "cuda"
+                )
                 opts = StagingOptions(
-                    use_pinned_memory=True,
+                    use_pinned_memory=use_pinned_memory,
                     use_shared_memory=True,
                     use_async_staging=True,
                     use_non_blocking_copy=True,
