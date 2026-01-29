@@ -1207,6 +1207,9 @@ class Checkpointer:
     def _is_global_rank0(self) -> bool:
         return (not self._is_distributed()) or self._rank == 0
 
+    def _is_local_rank0(self) -> bool:
+        return (not self._is_distributed()) or self._local_rank == 0
+
     def _epoch_dir(self, epoch: int) -> Path:
         return self.dcp_root / f"epoch_{epoch:06d}"
 
