@@ -8,18 +8,20 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:
     from tensordict import TensorDictBase
     from .nn.wrappers import Model
+    from .core.config import ModelConfig, RuntimeConfig
 
 __all__ = [
-    "config",
     "core",
     "data",
     "nn",
     "runtime",
     "load_model",
     "new_model",
-    "predict",
     "save_model",
     "train",
+    "predict",
+    "ModelConfig",
+    "RuntimeConfig",
 ]
 
 
