@@ -14,33 +14,18 @@ import subprocess
 import sys
 import tempfile
 import threading
-import time
 import types
 import warnings
 import weakref
 from pathlib import Path
-from typing import Any
-from typing import Callable
-from typing import Iterator
-from typing import Mapping
-from typing import Protocol
-from typing import Self
-from typing import Sequence
+from typing import Any, Callable, Iterator, Protocol, Self, Sequence
 
 import torch
-from torch import nn
-
 from ..core.concurrency import Mutex
-from ..core.datatypes import PathLike
-from ..core.datatypes import coerce_json
-from ..core.datatypes import env_bool
-from ..core.datatypes import save_temp
-from ..core.datatypes import write_json
-from ..core.tensor import extract_tensor
-from ..core.tensor import from_buffer
-from .distributed import distributed_barrier
-from .distributed import is_rank0
-
+from ..core.datatypes import PathLike, coerce_json, save_temp, write_json
+from ..core.tensor import extract_tensor, from_buffer
+from .distributed import distributed_barrier, is_rank0
+from torch import nn
 try:
     from torch.serialization import add_safe_globals
 except ImportError:

@@ -9,63 +9,60 @@ import math
 import os
 import random
 import time
-from dataclasses import dataclass
-from dataclasses import field
-from dataclasses import replace
+from dataclasses import dataclass, field, replace
 from functools import partial
 from itertools import chain
-from typing import Any
-from typing import Callable
-from typing import Dict
-from typing import Generic
-from typing import Literal
-from typing import Mapping
-from typing import MutableMapping
-from typing import NotRequired
-from typing import Optional
-from typing import Required
-from typing import Self
-from typing import Sequence
-from typing import Tuple
-from typing import TypedDict
-from typing import TypeVar
-from typing import Union
-from typing import cast
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    Generic,
+    Literal,
+    Mapping,
+    MutableMapping,
+    NotRequired,
+    Optional,
+    Required,
+    Self,
+    Sequence,
+    Tuple,
+    TypeVar,
+    TypedDict,
+    Union,
+    cast,
+)
 
 import torch
-from tensordict import MemoryMappedTensor
-from tensordict import TensorDictBase
-from torchdata.nodes import BaseNode
-
-from ..core.concurrency import Disposable
-from ..core.concurrency import Mutex
-from ..core.concurrency import new_affinity
-from ..core.datatypes import PathLike
-from ..core.datatypes import default_underflow_action
-from ..core.datatypes import env_first
-from ..core.datatypes import env_first_float
-from ..core.datatypes import env_first_int
-from ..core.datatypes import normalize_underflow_action
-from ..core.policies import BatchPolicy
-from ..core.policies import LoaderPolicy
-from ..core.policies import WorkerPolicy
-from ..core.system import Memory
-from ..core.system import accelerator
-from ..core.system import cuda_compute_capability
-from ..core.system import get_device
-from ..core.system import get_device_stats
-from ..core.system import is_accelerator_available
-from ..core.system import is_accelerator_timer_supported
-from ..core.system import is_cpu_bf16_supported
-from ..core.system import is_cuda_bf16_supported
-from ..core.system import is_float8_supported
-from ..core.system import is_int4_supported
-from ..core.system import is_int8_supported
-from ..core.system import is_pin_supported
-from ..core.system import new_accelerator_event
-from ..core.system import sync_accelerator
 from . import collate
-
+from ..core.concurrency import Disposable, Mutex, new_affinity
+from ..core.datatypes import (
+    PathLike,
+    default_underflow_action,
+    env_first,
+    env_first_float,
+    env_first_int,
+    normalize_underflow_action,
+)
+from ..core.policies import BatchPolicy, LoaderPolicy, WorkerPolicy
+from ..core.system import (
+    Memory,
+    accelerator,
+    cuda_compute_capability,
+    get_device,
+    get_device_stats,
+    is_accelerator_available,
+    is_accelerator_timer_supported,
+    is_cpu_bf16_supported,
+    is_cuda_bf16_supported,
+    is_float8_supported,
+    is_int4_supported,
+    is_int8_supported,
+    is_pin_supported,
+    new_accelerator_event,
+    sync_accelerator,
+)
+from tensordict import MemoryMappedTensor, TensorDictBase
+from torchdata.nodes import BaseNode
 _NODES_IMPORTED = False
 _NODES_LOCK = Mutex()
 _device_mem_get_info = Memory.mem_get_info

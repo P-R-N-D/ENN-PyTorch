@@ -9,26 +9,16 @@ import sys
 import threading
 import time
 from types import ModuleType
-from typing import Any
-from typing import Callable
-from typing import Dict
-from typing import List
-from typing import Sequence
-from typing import Tuple
-from typing import TypeVar
+from typing import Any, Callable, Dict, List, Sequence, Tuple, TypeVar
 
 import numpy as np
 import psutil
 import torch
 from tensordict import TensorDict
 
-from enn_torch.core.config import ModelConfig
-from enn_torch.core.config import PatchConfig
+from enn_torch.core.config import ModelConfig, PatchConfig
 from enn_torch.core.system import get_device
-from enn_torch.runtime.workflows import new_model
-from enn_torch.runtime.workflows import predict
-from enn_torch.runtime.workflows import train
-
+from enn_torch.runtime.workflows import new_model, predict, train
 COL_DIR = "방향"
 COL_ROUTE = "노선"
 COL_SECTION = "구간"

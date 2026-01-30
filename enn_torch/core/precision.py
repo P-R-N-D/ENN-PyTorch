@@ -11,30 +11,21 @@ import threading
 from collections import OrderedDict
 from contextlib import AbstractContextManager
 from dataclasses import dataclass
-from typing import Any
-from typing import Callable
-from typing import Dict
-from typing import List
-from typing import Optional
-from typing import Self
-from typing import Tuple
-from typing import Union
+from typing import Any, Callable, Dict, List, Optional, Self, Tuple, Union
 
 import torch
-from torch import nn
-
-from ..core.datatypes import default_underflow_action
-from ..core.datatypes import normalize_underflow_action
+from ..core.datatypes import default_underflow_action, normalize_underflow_action
 from ..nn.graph import clear_model_cache
 from .concurrency import Mutex
-from .system import _log_debug
-from .system import _log_info
-from .system import get_device
-from .system import get_device_stats
-from .system import is_cuda_bf16_supported
-from .system import is_float8_supported
-from .system import is_int8_supported
-
+from .system import (
+    _log_info,
+    get_device,
+    get_device_stats,
+    is_cuda_bf16_supported,
+    is_float8_supported,
+    is_int8_supported,
+)
+from torch import nn
 _Int8DynamicActivationInt8WeightConfig = None
 _Int8WeightOnlyConfig = None
 _LOGGER = logging.getLogger(__name__)

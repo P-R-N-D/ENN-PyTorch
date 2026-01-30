@@ -6,25 +6,14 @@ import contextvars
 import logging
 import math
 import os
-from dataclasses import dataclass
-from dataclasses import field
+from dataclasses import dataclass, field
 from functools import partial
 from types import TracebackType
-from typing import Any
-from typing import Callable
-from typing import Dict
-from typing import List
-from typing import Optional
-from typing import Self
-from typing import Sequence
-from typing import Tuple
+from typing import Any, Callable, Dict, List, Optional, Self, Sequence, Tuple
 
 import torch
+from ..core.datatypes import env_bool, env_int
 from torch import nn
-
-from ..core.datatypes import env_bool
-from ..core.datatypes import env_int
-
 try:
     from torch.utils._python_dispatch import TorchDispatchMode
 except Exception:

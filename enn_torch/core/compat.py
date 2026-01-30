@@ -1,20 +1,15 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
-from contextlib import contextmanager
-from contextlib import suppress
+from contextlib import contextmanager, suppress
 from functools import partial
 from types import ModuleType
-from typing import Any
-from typing import Iterator
-from typing import Self
+from typing import Any, Iterator, Self
 
 import torch
-from torch import nn
-
 from ..nn.graph import compile_distributed_safe
 from .concurrency import Mutex
-
+from torch import nn
 _PATCH_LOCK = Mutex(reentrant=True)
 _TORCH_COMPAT: TorchCompat | None = None
 RMSNorm = getattr(nn, "RMSNorm", None)

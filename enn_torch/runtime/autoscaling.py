@@ -4,26 +4,21 @@ import contextlib
 import logging
 import os
 import time
-from typing import Any
-from typing import Dict
+from typing import Any, Dict
 
 import torch
-
 from ..core.concurrency import Mutex
-from ..core.datatypes import env_bool
-from ..core.datatypes import env_float
-from ..core.datatypes import env_int
+from ..core.datatypes import env_bool, env_float, env_int
 from ..core.precision import Autocast
-from ..core.system import accelerator_max_allocated_memory
-from ..core.system import allocated_accelerator_memory
-from ..core.system import flush_accelerator_memory_stats
-from ..core.system import is_pin_supported
-from ..core.system import sync_accelerator
-from ..core.tensor import to_device_recursive
-from ..core.tensor import to_torch_tensor
-from ..core.tensor import touch_tensors
+from ..core.system import (
+    accelerator_max_allocated_memory,
+    allocated_accelerator_memory,
+    flush_accelerator_memory_stats,
+    is_pin_supported,
+    sync_accelerator,
+)
+from ..core.tensor import to_device_recursive, to_torch_tensor, touch_tensors
 from ..data.pipeline import Dataset
-
 _LOGGER = logging.getLogger(__name__)
 
 

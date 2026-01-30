@@ -5,15 +5,12 @@ import contextlib
 import json
 import os
 import tempfile
-from collections.abc import Callable
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from pathlib import Path
-from typing import Any
-from typing import TypeAlias
+from typing import Any, TypeAlias
 
 import numpy
 import torch
-
 _CANONICAL_DTYPES: dict[str, dict[str, Any]] = {
     "float64": {
         "torch": torch.float64,
