@@ -16,6 +16,7 @@ import sys
 import sysconfig
 import threading
 import time
+import warnings
 from dataclasses import dataclass
 from datetime import timezone, tzinfo
 from pathlib import Path
@@ -2147,3 +2148,283 @@ class Memory:
         except Exception:
             return False
         return False
+
+
+class Monitor:
+    _LOGGER = logging.getLogger(__name__)
+
+    _nvml: object | None = None
+    _NVML_BACKOFF_UNTIL: float = 0.0
+    _NVML_FAIL_COUNT: int = 0
+    _NVML_HANDLE_CACHE: dict[int, object] = {}
+    _NVML_UTIL_CACHE: dict[int, tuple[float, float | None, float | None]] = {}
+    _NVML_READY: bool = False
+    _NVML_TRIED: bool = False
+    _NVML_LOCK = threading.Lock()
+    _NVML_QUERY_LOCK = threading.Lock()
+
+    _PSUTIL: object | None = None
+    _PSUTIL_TRIED: bool = False
+
+    _TIMING_EVENTS_UNSUPPORTED = object()
+    _TIMING_EVENT_TLS = threading.local()
+
+    @classmethod
+    def is_nvml_disabled(cls) -> bool:
+        return env_bool("ENN_NVML_DISABLE", False) or not env_bool("ENN_NVML", True)
+
+    @classmethod
+    def nvml_cfg(cls, key: str, default: object, cast_fn: type = int) -> object:
+        return cast_fn(
+            env_first((f"ENN_NVML_{key}", f"ENN_NVML_{key}_S"), default=default)
+        )
+
+    @classmethod
+    def is_nvml_blocked(cls, now: object | None = None) -> bool:
+        now_f = float(now or time.perf_counter())
+        with cls._NVML_LOCK:
+            until = float(cls._NVML_BACKOFF_UNTIL or 0.0)
+        return bool(until > 0.0 and now_f < until)
+
+    @classmethod
+    def is_nvml_available(cls) -> bool:
+        nogil = bool(CPU.is_optimized_for_no_gil())
+        if cls.is_nvml_blocked():
+            if nogil:
+                with cls._NVML_LOCK:
+                    return bool(cls._NVML_READY)
+            return bool(cls._NVML_READY)
+
+        if nogil:
+            with cls._NVML_LOCK:
+                if cls._NVML_TRIED:
+                    return bool(cls._NVML_READY)
+        else:
+            if cls._NVML_TRIED:
+                return bool(cls._NVML_READY)
+
+        if cls.is_nvml_disabled():
+            with cls._NVML_LOCK:
+                cls._NVML_TRIED = True
+                cls._NVML_READY = False
+                cls._nvml = None
+            return False
+
+        with cls._NVML_LOCK:
+            now = float(time.perf_counter())
+            until = float(cls._NVML_BACKOFF_UNTIL or 0.0)
+            if (until > 0.0 and now < until) or cls._NVML_TRIED:
+                return bool(cls._NVML_READY)
+            cls._NVML_TRIED = True
+            try:
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore", category=FutureWarning)
+                    import pynvml
+
+                cls._nvml = pynvml
+                getattr(pynvml, "nvmlInit")()
+                cls._NVML_READY = True
+            except Exception as exc:
+                cls._nvml = None
+                cls._NVML_READY = False
+                if env_bool("ENN_DEBUG", False):
+                    cls._LOGGER.debug("NVML init failed: %s", exc, exc_info=True)
+        return bool(cls._NVML_READY)
+
+    @classmethod
+    def gpu_nvml_utils(
+        cls, device: Union[torch.device, str, int]
+    ) -> tuple[float | None, float | None]:
+        try:
+            dev = device if isinstance(device, torch.device) else torch.device(device)
+        except Exception:
+            return (None, None)
+        if getattr(dev, "type", "") != "cuda":
+            return (None, None)
+        idx = dev.index if dev.index is not None else get_accelerator_index("cuda")
+        idx_i = int(idx)
+
+        gpu_util: float | None = None
+        mem_util: float | None = None
+
+        nvml = cls._nvml
+        if cls.is_nvml_available() and nvml is not None:
+            now = time.perf_counter()
+            if cls.is_nvml_blocked(now):
+                return (None, None)
+            nogil = bool(CPU.is_optimized_for_no_gil())
+            try:
+                min_interval = float(cls.nvml_cfg("MIN_INTERVAL", 0.0, float))
+            except Exception:
+                min_interval = 0.0
+
+            if min_interval > 0.0 and not nogil:
+                cached = cls._NVML_UTIL_CACHE.get(idx_i)
+                if cached is not None:
+                    ts, cg, cm = cached
+                    if now - float(ts) < min_interval:
+                        return (cg, cm)
+
+            with cls._NVML_QUERY_LOCK:
+                if cls.is_nvml_blocked(now):
+                    return (None, None)
+                if min_interval > 0.0:
+                    cached = cls._NVML_UTIL_CACHE.get(idx_i)
+                    if cached is not None:
+                        ts, cg, cm = cached
+                        if now - float(ts) < min_interval:
+                            return (cg, cm)
+                try:
+                    h = cls._NVML_HANDLE_CACHE.setdefault(
+                        idx_i, getattr(nvml, "nvmlDeviceGetHandleByIndex")(idx_i)
+                    )
+                    u = getattr(nvml, "nvmlDeviceGetUtilizationRates")(h)
+                    mi = getattr(nvml, "nvmlDeviceGetMemoryInfo")(h)
+                    gpu_util = float(getattr(u, "gpu", 0.0))
+                    if getattr(mi, "total", 0):
+                        mem_util = 100.0 * float(mi.used) / float(mi.total)
+                    with cls._NVML_LOCK:
+                        cls._NVML_FAIL_COUNT = 0
+                        cls._NVML_BACKOFF_UNTIL = 0.0
+                except Exception:
+                    with contextlib.suppress(Exception):
+                        cls._NVML_HANDLE_CACHE.pop(idx_i, None)
+                    with contextlib.suppress(Exception):
+                        cls._NVML_UTIL_CACHE.pop(idx_i, None)
+                    try:
+                        fail_max = int(cls.nvml_cfg("FAIL_MAX", 3))
+                    except Exception:
+                        fail_max = 3
+                    try:
+                        backoff_s = float(
+                            cls.nvml_cfg(
+                                "BACKOFF",
+                                30.0 if nogil else 10.0,
+                                float,
+                            )
+                        )
+                    except Exception:
+                        backoff_s = 0.0
+
+                    trigger_backoff = False
+                    with cls._NVML_LOCK:
+                        cls._NVML_FAIL_COUNT = int(cls._NVML_FAIL_COUNT) + 1
+                        if backoff_s > 0.0 and int(cls._NVML_FAIL_COUNT) >= int(
+                            fail_max
+                        ):
+                            cls._NVML_BACKOFF_UNTIL = float(time.perf_counter()) + float(
+                                backoff_s
+                            )
+                            cls._NVML_FAIL_COUNT = 0
+                            trigger_backoff = True
+                    if trigger_backoff:
+                        with contextlib.suppress(Exception):
+                            cls._NVML_HANDLE_CACHE.clear()
+                        with contextlib.suppress(Exception):
+                            cls._NVML_UTIL_CACHE.clear()
+                        with contextlib.suppress(Exception):
+                            cls._LOGGER.warning(
+                                "[NVML] backing off %.1fs", float(backoff_s)
+                            )
+                    gpu_util = None
+                    mem_util = None
+                if gpu_util is not None or mem_util is not None:
+                    cls._NVML_UTIL_CACHE[idx_i] = (float(now), gpu_util, mem_util)
+
+        if mem_util is None:
+            with contextlib.suppress(Exception):
+                mem_util = available_device_memory(torch.device("cuda", idx_i))
+        return (gpu_util, mem_util)
+
+    @staticmethod
+    def xpu_mem_util(device: Union[torch.device, str, int]) -> float | None:
+        try:
+            dev = device if isinstance(device, torch.device) else torch.device(device)
+        except Exception:
+            return None
+        if getattr(dev, "type", "") != "xpu":
+            return None
+        with contextlib.suppress(Exception):
+            return available_device_memory(dev)
+        return None
+
+    @staticmethod
+    def mps_mem_util(device: Union[torch.device, str, int]) -> float | None:
+        try:
+            dev = device if isinstance(device, torch.device) else torch.device(device)
+        except Exception:
+            return None
+        if getattr(dev, "type", "") != "mps":
+            return None
+        with contextlib.suppress(Exception):
+            return available_device_memory(dev)
+        return None
+
+    @classmethod
+    def cpu_load(cls) -> float | None:
+        if not cls._PSUTIL_TRIED:
+            cls._PSUTIL_TRIED = True
+            with contextlib.suppress(Exception):
+                import psutil
+
+                cls._PSUTIL = psutil
+        psutil_mod = cls._PSUTIL
+        if psutil_mod is None:
+            return None
+        try:
+            return float(getattr(psutil_mod, "cpu_percent")(interval=0.0))
+        except Exception:
+            return None
+
+    @staticmethod
+    def is_clock_synchronized(dev_type: str) -> bool:
+        if env_bool("ENN_TIMER_SYNC", False) or env_bool("ENN_WALLCLOCK_TIMER_SYNC", False):
+            return True
+        dt = str(dev_type or "cpu")
+        return env_bool(f"ENN_{dt.upper()}_TIMER_SYNC", False)
+
+    @staticmethod
+    def is_event_timer_available(device: torch.device) -> bool:
+        try:
+            return bool(is_accelerator_timer_supported(str(getattr(device, "type", "cpu"))))
+        except Exception:
+            return False
+
+    @staticmethod
+    def new_event_timer(device: torch.device) -> object:
+        try:
+            dev_type = str(getattr(device, "type", "cpu"))
+        except Exception:
+            dev_type = "cpu"
+        if not is_accelerator_timer_supported(dev_type):
+            return None
+        return new_accelerator_event(device, enable_timing=True)
+
+    @classmethod
+    def get_thread_events(cls, device: torch.device, slot: str) -> object:
+        try:
+            dev_type = str(getattr(device, "type", "cpu"))
+        except Exception:
+            dev_type = "cpu"
+        if not is_accelerator_timer_supported(dev_type):
+            return None
+        tls = cls._TIMING_EVENT_TLS
+        d = getattr(tls, "events", None)
+        if d is None:
+            d = {}
+            setattr(tls, "events", d)
+        try:
+            dev_idx = int(device.index) if device.index is not None else -1
+        except Exception:
+            dev_idx = -1
+        key = (str(slot), str(dev_type), int(dev_idx))
+        cached = d.get(key, cls._TIMING_EVENTS_UNSUPPORTED)
+        if cached is cls._TIMING_EVENTS_UNSUPPORTED:
+            ev_s = cls.new_event_timer(device)
+            ev_e = cls.new_event_timer(device)
+            if ev_s is None or ev_e is None:
+                d[key] = None
+                return None
+            cached = (ev_s, ev_e)
+            d[key] = cached
+        return cached

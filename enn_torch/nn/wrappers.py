@@ -62,6 +62,253 @@ from .blocks import (
 from .layers import Recorder, Scaler, SigmoidGate
 
 _LOGGER = logging.getLogger(__name__)
+
+
+
+def _is_process_group(obj: object) -> bool:
+    if obj is None:
+        return False
+    with contextlib.suppress(Exception):
+        from torch.distributed.distributed_c10d import ProcessGroup
+
+        return isinstance(obj, ProcessGroup)
+    return False
+
+
+def _all_reduce_sum(t: torch.Tensor, pg: object | None) -> None:
+    try:
+        dist = torch.distributed
+        if not (dist.is_available() and dist.is_initialized()):
+            return
+    except Exception:
+        return
+
+    if pg is None or (not _is_process_group(pg)):
+        dist.all_reduce(t, op=dist.ReduceOp.SUM)
+    else:
+        dist.all_reduce(t, op=dist.ReduceOp.SUM, group=pg)
+
+
+def update_delta_gate_auto_k(
+    target_module: object,
+    *args: Any,
+    step: int,
+    pg: object | None = None,
+    local_rank: int = 0,
+) -> None:
+    if target_module is None:
+        return
+    if not bool(getattr(target_module, "delta_gate_auto_k_enabled", False)):
+        return
+
+    gate = getattr(target_module, "delta_gate", None)
+    if gate is None or not hasattr(gate, "consume_fallback_stats"):
+        return
+
+    interval = int(getattr(target_module, "delta_gate_auto_k_interval", 0) or 0)
+    if interval <= 0:
+        return
+
+    warmup = int(getattr(target_module, "delta_gate_auto_k_warmup", 0) or 0)
+    if int(step) < int(warmup):
+        if int(step) % max(1, int(interval)) == 0:
+            with contextlib.suppress(Exception):
+                gate.consume_fallback_stats()
+        return
+
+    if int(step) % int(interval) != 0:
+        return
+
+    step_buf = getattr(target_module, "delta_gate_auto_k_step_buf", None)
+    if isinstance(step_buf, torch.Tensor):
+        with contextlib.suppress(Exception):
+            step_buf.fill_(int(step))
+
+    stats = gate.consume_fallback_stats()
+    if not isinstance(stats, torch.Tensor) or stats.numel() < 6:
+        return
+
+    if pg is not None or (torch.distributed.is_available() and torch.distributed.is_initialized()):
+        with contextlib.suppress(Exception):
+            _all_reduce_sum(stats, pg)
+
+    count = float(stats[0].item())
+    if not math.isfinite(count) or count <= 0.0:
+        return
+
+    active_low_rate = float((stats[1] / stats[0]).item())
+    active_high_rate = float((stats[2] / stats[0]).item())
+    width_mean = float((stats[3] / stats[0]).item())
+    edge_low_rate = float((stats[4] / stats[0]).item())
+    edge_high_rate = float((stats[5] / stats[0]).item())
+
+    alpha = float(getattr(target_module, "delta_gate_auto_k_ema_alpha", 0.1))
+    alpha = max(0.0, min(1.0, alpha))
+
+    ema_low_buf = getattr(target_module, "delta_gate_auto_k_ema_low_buf", None)
+    ema_high_buf = getattr(target_module, "delta_gate_auto_k_ema_high_buf", None)
+    ema_low_prev = float(ema_low_buf.item()) if isinstance(ema_low_buf, torch.Tensor) else 0.0
+    ema_high_prev = float(ema_high_buf.item()) if isinstance(ema_high_buf, torch.Tensor) else 0.0
+    ema_low_new = (1.0 - alpha) * ema_low_prev + alpha * active_low_rate
+    ema_high_new = (1.0 - alpha) * ema_high_prev + alpha * active_high_rate
+
+    if isinstance(ema_low_buf, torch.Tensor):
+        with contextlib.suppress(Exception):
+            ema_low_buf.fill_(float(ema_low_new))
+    if isinstance(ema_high_buf, torch.Tensor):
+        with contextlib.suppress(Exception):
+            ema_high_buf.fill_(float(ema_high_new))
+
+    ema_overall = 0.5 * (float(ema_low_new) + float(ema_high_new))
+    ema_buf = getattr(target_module, "delta_gate_auto_k_ema_buf", None)
+    if isinstance(ema_buf, torch.Tensor):
+        with contextlib.suppress(Exception):
+            ema_buf.fill_(float(ema_overall))
+
+    edge_enabled = bool(getattr(target_module, "delta_gate_auto_k_edge_enabled", False))
+    edge_alpha = float(getattr(target_module, "delta_gate_auto_k_edge_ema_alpha", alpha))
+    edge_alpha = max(0.0, min(1.0, edge_alpha))
+
+    edge_ema_low_buf = getattr(target_module, "delta_gate_auto_k_edge_ema_low_buf", None)
+    edge_ema_high_buf = getattr(target_module, "delta_gate_auto_k_edge_ema_high_buf", None)
+    edge_ema_buf = getattr(target_module, "delta_gate_auto_k_edge_ema_buf", None)
+
+    edge_ema_low_prev = float(edge_ema_low_buf.item()) if isinstance(edge_ema_low_buf, torch.Tensor) else 0.0
+    edge_ema_high_prev = float(edge_ema_high_buf.item()) if isinstance(edge_ema_high_buf, torch.Tensor) else 0.0
+    edge_ema_low_new = (1.0 - edge_alpha) * edge_ema_low_prev + edge_alpha * edge_low_rate
+    edge_ema_high_new = (1.0 - edge_alpha) * edge_ema_high_prev + edge_alpha * edge_high_rate
+
+    if isinstance(edge_ema_low_buf, torch.Tensor):
+        with contextlib.suppress(Exception):
+            edge_ema_low_buf.fill_(float(edge_ema_low_new))
+    if isinstance(edge_ema_high_buf, torch.Tensor):
+        with contextlib.suppress(Exception):
+            edge_ema_high_buf.fill_(float(edge_ema_high_new))
+    if isinstance(edge_ema_buf, torch.Tensor):
+        with contextlib.suppress(Exception):
+            edge_ema_buf.fill_(float(0.5 * (edge_ema_low_new + edge_ema_high_new)))
+
+    k_low_buf = getattr(target_module, "delta_gate_fallback_k_low_buf", None)
+    k_high_buf = getattr(target_module, "delta_gate_fallback_k_high_buf", None)
+    k_legacy_buf = getattr(target_module, "delta_gate_fallback_k_buf", None)
+
+    use_legacy = not (isinstance(k_low_buf, torch.Tensor) and isinstance(k_high_buf, torch.Tensor))
+    if use_legacy:
+        if not isinstance(k_legacy_buf, torch.Tensor):
+            return
+        k_low_buf = k_legacy_buf
+        k_high_buf = k_legacy_buf
+
+    k_low_prev = float(k_low_buf.item()) if isinstance(k_low_buf, torch.Tensor) else 0.0
+    k_high_prev = float(k_high_buf.item()) if isinstance(k_high_buf, torch.Tensor) else 0.0
+    k_low_new = k_low_prev
+    k_high_new = k_high_prev
+
+    target = float(getattr(target_module, "delta_gate_auto_k_target_tight", 0.02))
+    tol = float(getattr(target_module, "delta_gate_auto_k_tolerance", 0.5))
+    hi = target * (1.0 + tol)
+    lo = max(0.0, target * (1.0 - tol))
+
+    step_up_low = float(getattr(target_module, "delta_gate_auto_k_step_up_low", 0.1))
+    step_down_low = float(getattr(target_module, "delta_gate_auto_k_step_down_low", 0.02))
+    step_up_high = float(getattr(target_module, "delta_gate_auto_k_step_up_high", 0.1))
+    step_down_high = float(getattr(target_module, "delta_gate_auto_k_step_down_high", 0.02))
+
+    edge_target = float(getattr(target_module, "delta_gate_auto_k_target_edge", 0.05))
+    edge_tol = float(getattr(target_module, "delta_gate_auto_k_edge_tolerance", 0.5))
+    edge_hi = edge_target * (1.0 + edge_tol)
+
+    edge_step_down_low = float(getattr(target_module, "delta_gate_auto_k_edge_step_down_low", 0.01))
+    edge_step_down_high = float(getattr(target_module, "delta_gate_auto_k_edge_step_down_high", 0.01))
+
+    k_min = float(getattr(target_module, "delta_gate_auto_k_min", 1.0))
+    k_max = float(getattr(target_module, "delta_gate_auto_k_max", 16.0))
+    if k_max < k_min:
+        k_max = k_min
+
+    edge_low_eff = float(edge_ema_low_new) if math.isfinite(edge_ema_low_new) else float(edge_low_rate)
+    edge_high_eff = float(edge_ema_high_new) if math.isfinite(edge_ema_high_new) else float(edge_high_rate)
+
+    if math.isfinite(ema_low_new):
+        if ema_low_new > hi and step_up_low > 0.0:
+            k_low_new = k_low_prev * (1.0 + step_up_low)
+        elif ema_low_new < lo and step_down_low > 0.0:
+            k_low_new = k_low_prev * max(0.0, (1.0 - step_down_low))
+        elif (
+            edge_enabled
+            and math.isfinite(edge_low_eff)
+            and edge_low_eff > edge_hi
+            and edge_step_down_low > 0.0
+        ):
+            k_low_new = k_low_prev * max(0.0, (1.0 - edge_step_down_low))
+
+    if math.isfinite(ema_high_new):
+        if ema_high_new > hi and step_up_high > 0.0:
+            k_high_new = k_high_prev * (1.0 + step_up_high)
+        elif ema_high_new < lo and step_down_high > 0.0:
+            k_high_new = k_high_prev * max(0.0, (1.0 - step_down_high))
+        elif (
+            edge_enabled
+            and math.isfinite(edge_high_eff)
+            and edge_high_eff > edge_hi
+            and edge_step_down_high > 0.0
+        ):
+            k_high_new = k_high_prev * max(0.0, (1.0 - edge_step_down_high))
+
+    if math.isfinite(k_low_new):
+        k_low_new = max(k_min, min(k_max, k_low_new))
+    if math.isfinite(k_high_new):
+        k_high_new = max(k_min, min(k_max, k_high_new))
+
+    k_low_changed = bool(math.isfinite(k_low_new) and abs(k_low_new - k_low_prev) > 1e-12)
+    k_high_changed = bool(math.isfinite(k_high_new) and abs(k_high_new - k_high_prev) > 1e-12)
+    k_changed = bool(k_low_changed or k_high_changed)
+
+    if k_changed:
+        with contextlib.suppress(Exception):
+            if isinstance(k_low_buf, torch.Tensor):
+                k_low_buf.fill_(float(k_low_new))
+            if isinstance(k_high_buf, torch.Tensor):
+                k_high_buf.fill_(float(k_high_new))
+
+        if isinstance(k_legacy_buf, torch.Tensor) and not use_legacy:
+            with contextlib.suppress(Exception):
+                k_legacy_buf.fill_(float(0.5 * (k_low_new + k_high_new)))
+
+        with contextlib.suppress(Exception):
+            setattr(
+                target_module,
+                "delta_gate_fallback_enabled",
+                bool(k_low_new > 0.0 and k_high_new > 0.0),
+            )
+
+        upd_buf = getattr(target_module, "delta_gate_auto_k_updates_buf", None)
+        if isinstance(upd_buf, torch.Tensor):
+            with contextlib.suppress(Exception):
+                upd_buf.add_(1)
+
+    log_interval = int(getattr(target_module, "delta_gate_auto_k_log_interval", 0) or 0)
+    log_due = bool(k_changed) if log_interval <= 0 else bool(int(step) % int(log_interval) == 0)
+
+    if int(local_rank) == 0 and log_due:
+        _LOGGER.info(
+            "[delta_gate] auto_k step=%d seen=%d activeL_sma=%.4f activeH_sma=%.4f width_mean=%.4f edgeL_sma=%.4f edgeH_sma=%.4f activeL_ema=%.4f activeH_ema=%.4f edgeL_ema=%.4f edgeH_ema=%.4f kL=%.4f -> %.4f kH=%.4f -> %.4f",
+            int(step),
+            int(count),
+            float(active_low_rate),
+            float(active_high_rate),
+            float(width_mean),
+            float(edge_low_rate),
+            float(edge_high_rate),
+            float(ema_low_new),
+            float(ema_high_new),
+            float(edge_ema_low_new),
+            float(edge_ema_high_new),
+            float(k_low_prev),
+            float(k_low_new),
+            float(k_high_prev),
+            float(k_high_new),
+        )
 _SUBMODEL_UNSET: object = object()
 _META_UNSET: object = object()
 TConfig = TypeVar("TConfig")

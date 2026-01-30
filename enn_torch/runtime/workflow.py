@@ -4,12 +4,9 @@ from __future__ import annotations
 import contextlib
 import logging
 import os
-import random
-import re
 import shutil
 import tempfile
 import time
-import warnings
 from functools import partial, update_wrapper
 from pathlib import Path
 from typing import (
@@ -51,13 +48,11 @@ from ..core.config import (
     runtime_config,
 )
 from ..core.datatypes import env_bool, read_json
-from .distributed import get_available_host, get_preferred_ip, init_master_addr
+from .distributed import Broker, get_available_host, get_preferred_ip, init_master_addr
 from ..nn.graph import inference_mode
 from ..core.policies import WorkerPolicy
 from ..core.system import (
     _start_context,
-    init_python_path,
-    init_start_method,
     new_dir,
     optimal_start_method,
 )
@@ -77,50 +72,6 @@ from .io import _filtered_warnings, _torch_load_checkpoint, is_required
 from .distributed import _coerce_dcp_keys
 from .main import process
 
-_IGNORED_WARNING_PATTERNS: tuple[str, ...] = (
-    "torch.distributed is disabled, unavailable or uninitialized",
-    "TypedStorage is deprecated",
-    "Found a non-scalar tensor with numel=1 and ndim!=0",
-    "distributed_broadcast: coalesced broadcast failed",
-    "distributed_broadcast: per-tensor broadcast failed",
-    "found no DeviceMesh from dtensor args",
-    "mixed precision.*may be unavailable",
-    "Either mode or options can be specified, but both can't be specified at the same time\\.",
-)
-_IGNORED_WARNING_MESSAGE_RE = re.compile(
-    r".*(?:" + "|".join((f"(?:{p})" for p in _IGNORED_WARNING_PATTERNS)) + r").*"
-)
-P = ParamSpec("P")
-PathLike: TypeAlias = str | os.PathLike[str] | Path
-TrainData: TypeAlias = (
-    TensorDictBase
-    | Mapping[str, object]
-    | Sequence[Mapping[str, object]]
-    | Mapping[str, Mapping[str, object]]
-    | object
-)
-PredictData: TypeAlias = TrainData
-PredictionOutput: TypeAlias = (
-    TensorDictBase
-    | PersistentTensorDict
-    | Mapping[str, TensorDictBase]
-    | Mapping[str, torch.Tensor]
-)
-R = TypeVar("R")
-TensorLike: TypeAlias = torch.Tensor | MemoryMappedTensor
-TorchDeviceLike: TypeAlias = torch.device | str | int
-logger = logging.getLogger(__name__)
-
-
-def _apply_warning_filters() -> None:
-    with contextlib.suppress(Exception):
-        warnings.filterwarnings(
-            "ignore",
-            message=_IGNORED_WARNING_MESSAGE_RE.pattern,
-            category=UserWarning,
-        )
-
-
 def _rewrite_state_dict_key(k: str) -> str:
     if k.startswith("m.") and ".module." in k:
         parts = k.split(".")
@@ -128,12 +79,10 @@ def _rewrite_state_dict_key(k: str) -> str:
             return ".".join(parts[3:])
     return k
 
-
 def _coerce_state_dict(sd: Mapping[str, Any]) -> Mapping[str, Any]:
     if not any(_rewrite_state_dict_key(k) != k for k in sd):
         return sd
     return {_rewrite_state_dict_key(k): v for k, v in sd.items()}
-
 
 def _normalize_windows_paste(value: PathLike) -> PathLike:
     if isinstance(value, str):
@@ -144,7 +93,6 @@ def _normalize_windows_paste(value: PathLike) -> PathLike:
             lines = [line.strip() for line in value.split("\n") if line.strip()]
             value = lines[0] if lines else ""
     return value
-
 
 def _find_latest_dcp_epoch_dir(ckpt_dir: str | None) -> str | None:
     if not ckpt_dir:
@@ -164,7 +112,6 @@ def _find_latest_dcp_epoch_dir(ckpt_dir: str | None) -> str | None:
         return None
     epoch_dirs.sort()
     return epoch_dirs[-1]
-
 
 def _resize_scaler_buffers_for_shape(
     model: torch.nn.Module,
@@ -206,7 +153,6 @@ def _resize_scaler_buffers_for_shape(
             ):
                 _resize_buffer(module, name, (y_numel,))
         return
-
 
 def _resize_scaler_buffers_from_metadata(
     model: torch.nn.Module,
@@ -258,7 +204,6 @@ def _resize_scaler_buffers_from_metadata(
         return resized
     return False
 
-
 def _parse_meta(p: PathLike) -> Mapping[str, Any]:
     meta_path = p / "meta.json"
     try:
@@ -266,13 +211,11 @@ def _parse_meta(p: PathLike) -> Mapping[str, Any]:
     except Exception as exc:
         raise RuntimeError(f"Metadata parse failed: {p}") from exc
 
-
 def _is_execution_time_logged() -> bool:
     return env_bool(
         ("ENN_LOG_TIMINGS", "ENN_TIMINGS", "ENN_DEBUG_TIMINGS"),
         default=False,
     )
-
 
 def _timed_invoke(
     fn: Callable[P, R],
@@ -290,62 +233,22 @@ def _timed_invoke(
         dt = time.perf_counter() - t0
         log.info("%s executed in %.3f seconds", fn_name, dt)
 
-
-def _clear_process_group() -> None:
-    try:
-        import torch.distributed
-
-        if torch.distributed.is_available() and torch.distributed.is_initialized():
-            with contextlib.suppress(Exception):
-                torch.distributed.barrier()
-            with contextlib.suppress(Exception):
-                torch.distributed.destroy_process_group()
-    except Exception:
-        pass
-
-
-def _init_distributed() -> None:
-    _apply_warning_filters()
-    _clear_process_group()
-    init_python_path()
-    with contextlib.suppress(Exception):
-        torch.multiprocessing.allow_connection_pickling()
-    init_start_method()
-
-
 def _clear_device_caches() -> None:
     with contextlib.suppress(Exception):
         import gc
 
         gc.collect()
     with contextlib.suppress(Exception):
-        from .core.system import collect_accelerator_ipc, empty_device_cache, get_device
+        from ..core.system import collect_accelerator_ipc, empty_device_cache, get_device
 
         empty_device_cache(device=get_device(), do_gc=False, min_interval_s=0.0)
         collect_accelerator_ipc()
-
 
 def _coerce_seed(seed: int) -> Optional[int]:
     try:
         return int(seed) if seed is not None else None
     except (TypeError, ValueError):
         return None
-
-
-def _set_seed(seed_value: int) -> None:
-    if seed_value is None:
-        return
-    with contextlib.suppress(Exception):
-        torch.manual_seed(seed_value)
-    with contextlib.suppress(Exception):
-        from .core.system import set_accelerator_seed
-
-        set_accelerator_seed(int(seed_value))
-    with contextlib.suppress(Exception):
-        random.seed(seed_value)
-    with contextlib.suppress(Exception):
-        numpy.random.seed(seed_value)
-
 
 def _save_model_checkpoint(
     model: Model,
@@ -393,7 +296,6 @@ def _save_model_checkpoint(
         torch.save(pt_state, os.path.join(out_dir, "model.pt"))
     return m_sd
 
-
 def _get_label_shape(
     first_in_dim: int,
     in_dim: int,
@@ -407,7 +309,6 @@ def _get_label_shape(
             f"Shape mismatch: {first_in_dim}/{first_label_shape} vs {in_dim}/{lshape}"
         )
     return (first_in_dim, first_label_shape)
-
 
 def _adapt_source(
     d: Any, allow_columns: bool = True
@@ -459,7 +360,6 @@ def _adapt_source(
     if isinstance(d, (list, tuple)):
         return len(d), (lambda s, e: {"features": d[int(s) : int(e)]}), False
     return 0, None, True
-
 
 def _save_dataset(
     d: object,
@@ -550,7 +450,6 @@ def _save_dataset(
     in_dim = int(fx.reshape(count, -1).shape[1])
     return (int(in_dim), tuple(lshape), int(count))
 
-
 def _reduce_batch_stats(recs: object) -> Optional[Mapping[str, Any]]:
     if not isinstance(recs, list) or not recs:
         return None
@@ -615,7 +514,6 @@ def _reduce_batch_stats(recs: object) -> Optional[Mapping[str, Any]]:
         )
     return out
 
-
 def _update_batch_stats(
     prev: object, n_prev: object, inc: object, n_inc: object
 ) -> Any:
@@ -662,7 +560,6 @@ def _update_batch_stats(
             }
         )
     return out
-
 
 def _update_history(
     model: object,
@@ -738,7 +635,7 @@ def _update_history(
                 train_dev_str = str(train_device)
         if not train_dev_str:
             with contextlib.suppress(Exception):
-                from .core.system import get_device as _get_device
+                from ..core.system import get_device as _get_device
 
                 train_dev_str = str(_get_device())
         if not train_dev_str:
@@ -793,7 +690,6 @@ def _update_history(
     except Exception:
         pass
 
-
 def _to_torch_dtype(dt: object) -> Optional[torch.dtype]:
     try:
         if isinstance(dt, torch.dtype):
@@ -810,7 +706,6 @@ def _to_torch_dtype(dt: object) -> Optional[torch.dtype]:
     except Exception:
         return None
     return None
-
 
 def _get_float_precision(obj: object) -> torch.dtype:
     try:
@@ -842,7 +737,6 @@ def _get_float_precision(obj: object) -> torch.dtype:
         pass
     return torch.float32
 
-
 def get_execution_time(
     log: logging.Logger,
     fn_name: str = "",
@@ -855,7 +749,6 @@ def get_execution_time(
 
     return _decorator
 
-
 def new_model(
     in_dim: int,
     out_shape: Sequence[int],
@@ -865,7 +758,6 @@ def new_model(
     core = Model(in_dim, tuple((int(x) for x in out_shape)), config=cfg)
     return core
 
-
 def load_model(
     checkpoint_path: PathLike,
     in_dim: int | None = None,
@@ -873,10 +765,7 @@ def load_model(
     config: ModelConfig | Mapping[str, object] | None = None,
     map_location: TorchDeviceLike | None = None,
     weights_only: bool = True,
-    openzl_memmap: bool = True,
-    openzl_lazy_tensors: bool = True,
-    openzl_check_content_checksum: bool | None = None,
-    openzl_check_compressed_checksum: bool | None = None,
+    mmap: bool | None = True,
 ) -> Model:
     p = Path(_normalize_windows_paste(checkpoint_path))
     load_dev = (
@@ -968,21 +857,19 @@ def load_model(
         resize_scaler_buffer(model, sd)
         model.load_state_dict(sd, strict=False)
         return model
-    if suffix == ".ozl":
-        from .io import _openzl_load_checkpoint
 
-        obj = _openzl_load_checkpoint(
-            p,
-            openzl_memmap=openzl_memmap,
-            openzl_lazy_tensors=openzl_lazy_tensors,
-            openzl_check_content_checksum=openzl_check_content_checksum,
-            openzl_check_compressed_checksum=openzl_check_compressed_checksum,
-            weights_only=weights_only,
+    if suffix and suffix not in (".pt", ".pth"):
+        raise ValueError(
+            f"Unsupported checkpoint extension {suffix!r}. Use .pt/.pth/.safetensors or a directory checkpoint instead."
         )
-    else:
-        obj = _torch_load_checkpoint(
-            p, map_location=map_location or "cpu", weights_only=weights_only, mmap=True
-        )
+
+
+    obj = _torch_load_checkpoint(
+        p,
+        map_location=map_location or "cpu",
+        weights_only=weights_only,
+        mmap=mmap,
+    )
     if isinstance(obj, dict):
         meta_in_dim = obj.get("in_dim")
         meta_out_shape = obj.get("out_shape")
@@ -1041,7 +928,6 @@ def load_model(
     model.load_state_dict(sd, strict=False)
     return model
 
-
 def save_model(
     model: torch.nn.Module,
     path: PathLike,
@@ -1083,7 +969,6 @@ def save_model(
     conv.save(model, p, *args, **kwargs)
     return str(p)
 
-
 def train(
     model: torch.nn.Module | PathLike,
     data: TrainData,
@@ -1107,10 +992,10 @@ def train(
     loss_mask_value: float | None = None,
     **kwargs: Any,
 ) -> Model:
-    _init_distributed()
+    Broker.bootstrap()
     val_frac = max(0.0, min(1.0, float(val_frac)))
     seed_value = _coerce_seed(seed)
-    _set_seed(seed_value)
+    Broker.set_seed(seed_value)
     underflow_action = normalize_underflow_action(
         kwargs.pop("underflow_action", None),
         default=default_underflow_action(),
@@ -1273,7 +1158,6 @@ def train(
                 in_dim=getattr(model, "in_dim", None),
                 out_shape=getattr(model, "out_shape", None),
                 map_location="cpu",
-                openzl_memmap=True,
             )
             cpu_state = coerce_tensor(loaded.state_dict())
             if isinstance(model, torch.nn.Module) and _has_meta_tensors(model):
@@ -1339,13 +1223,13 @@ def train(
                             _meta = True
                             break
                 if _meta:
-                    if str(restore_path).lower().endswith(".ozl"):
+                    if str(restore_path).lower().endswith(".safetensors"):
                         loaded = load_model(
                             restore_path,
                             in_dim=getattr(model, "in_dim", None),
                             out_shape=getattr(model, "out_shape", None),
                             map_location="cpu",
-                            openzl_memmap=True,
+                            weights_only=True,
                         )
                         cpu_state = coerce_tensor(loaded.state_dict())
                     else:
@@ -1369,7 +1253,6 @@ def train(
         if init_dir is not None:
             shutil.rmtree(init_dir, ignore_errors=True)
 
-
 def predict(
     model: torch.nn.Module | PathLike,
     data: PredictData,
@@ -1390,7 +1273,7 @@ def predict(
 ) -> PredictionOutput:
     if model is None:
         raise ValueError("predict: model must not be None")
-    _init_distributed()
+    Broker.bootstrap()
     out_shape = tuple(
         int(x)
         for x in (kwargs.pop("out_shape", getattr(model, "out_shape", None)) or ())

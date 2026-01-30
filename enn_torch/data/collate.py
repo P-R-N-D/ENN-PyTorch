@@ -1545,6 +1545,124 @@ def load_scaler_stats(sources: Any) -> Optional[Dict[str, Any]]:
     return out
 
 
+
+
+def warmup_scaler_stats(model: Any, train_loader: Any, ops_or_sources: Any) -> None:
+    model_for_scaler = model.module if hasattr(model, "module") else model
+    scaler = getattr(model_for_scaler, "scaler", None)
+    if scaler is None:
+        return
+
+    sources = getattr(ops_or_sources, "sources", ops_or_sources)
+
+    try:
+        dev_x = scaler.x_mean.device
+        dev_y = scaler.y_mean.device
+        dt_x = scaler.x_mean.dtype
+        dt_y = scaler.y_mean.dtype
+    except Exception:
+        return
+
+    try:
+        stats = load_scaler_stats(sources)
+    except Exception:
+        stats = None
+
+    if stats:
+        x_cnt = int(stats.get("train_count") or 0)
+        y_cnt = int(stats.get("train_count") or 0)
+        x_sum = stats["x_sum"].to(dev_x)
+        x_ss = stats["x_sum_sq"].to(dev_x)
+        y_sum = stats["y_sum"].to(dev_y)
+        y_ss = stats["y_sum_sq"].to(dev_y)
+        y_min = stats.get("y_min")
+        y_max = stats.get("y_max")
+        if y_min is not None:
+            y_min = y_min.to(dev_y)
+        if y_max is not None:
+            y_max = y_max.to(dev_y)
+    else:
+        x_cnt = 0
+        y_cnt = 0
+        x_sum = None
+        x_ss = None
+        y_sum = None
+        y_ss = None
+        y_min = None
+        y_max = None
+
+        with torch.inference_mode():
+            for batch in train_loader:
+                fx, ly = get_row(batch, labels_required=True)
+                xf = fx.reshape(-1, fx.shape[-1]).to(dev_x, dt_x)
+                yf = ly.reshape(-1, ly.shape[-1]).to(dev_y, dt_y)
+
+                if xf.shape[0] > 0:
+                    x_cnt += int(xf.shape[0])
+                    s = xf.sum(0)
+                    s2 = (xf**2).sum(0)
+                    x_sum = s if x_sum is None else x_sum + s
+                    x_ss = s2 if x_ss is None else x_ss + s2
+
+                if yf.shape[0] > 0:
+                    y_cnt += int(yf.shape[0])
+                    s = yf.sum(0)
+                    s2 = (yf**2).sum(0)
+                    y_sum = s if y_sum is None else y_sum + s
+                    y_ss = s2 if y_ss is None else y_ss + s2
+                    mn = yf.amin(0)
+                    mx = yf.amax(0)
+                    y_min = mn if y_min is None else torch.minimum(y_min, mn)
+                    y_max = mx if y_max is None else torch.maximum(y_max, mx)
+
+        try:
+            dist = torch.distributed
+            do_dist = bool(dist.is_available() and dist.is_initialized())
+        except Exception:
+            do_dist = False
+
+        if do_dist:
+            for tensor in (x_sum, x_ss, y_sum, y_ss):
+                if tensor is not None:
+                    dist.all_reduce(tensor, dist.ReduceOp.SUM)
+            for tensor, op in ((y_min, dist.ReduceOp.MIN), (y_max, dist.ReduceOp.MAX)):
+                if tensor is not None:
+                    dist.all_reduce(tensor, op)
+            counts = torch.tensor([x_cnt, y_cnt], device=dev_x)
+            dist.all_reduce(counts, dist.ReduceOp.SUM)
+            x_cnt = int(counts[0].item())
+            y_cnt = int(counts[1].item())
+
+    eps = float(getattr(scaler, "eps", 1e-6))
+
+    for cnt, sm, ss, mean_buf, std_buf in (
+        (x_cnt, x_sum, x_ss, getattr(scaler, "x_mean", None), getattr(scaler, "x_std", None)),
+        (y_cnt, y_sum, y_ss, getattr(scaler, "y_mean", None), getattr(scaler, "y_std", None)),
+    ):
+        if (
+            int(cnt) > 0
+            and sm is not None
+            and ss is not None
+            and isinstance(mean_buf, torch.Tensor)
+            and isinstance(std_buf, torch.Tensor)
+        ):
+            mean = sm / int(cnt)
+            if mean_buf.shape != mean.shape:
+                mean_buf.resize_(mean.shape)
+            mean_buf.copy_(mean)
+            std = (ss / int(cnt) - mean**2).clamp_min(eps).sqrt()
+            if std_buf.shape != mean.shape:
+                std_buf.resize_(mean.shape)
+            std_buf.copy_(std)
+
+    if y_min is not None and isinstance(getattr(scaler, "y_min", None), torch.Tensor):
+        with contextlib.suppress(Exception):
+            scaler.y_min.resize_(y_min.shape).copy_(y_min)
+    if y_max is not None and isinstance(getattr(scaler, "y_max", None), torch.Tensor):
+        with contextlib.suppress(Exception):
+            scaler.y_max.resize_(y_max.shape).copy_(y_max)
+
+
 def expand_source(sources: Any) -> Any:
     expanded, ok = _expand_multinode_sources(sources)
     if ok:

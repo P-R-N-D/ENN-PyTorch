@@ -34,7 +34,16 @@ from ..core.datatypes import (
     save_temp,
     write_json,
 )
-from .system import CPU, _default_thread_limit, _optimal_local_worlds, _optimal_threads
+from .system import (
+    CPU,
+    accelerator_stream,
+    accelerator_type,
+    is_pin_supported,
+    sync_accelerator,
+    _default_thread_limit,
+    _optimal_local_worlds,
+    _optimal_threads,
+)
 
 _ENV_INNER_BOOL_VARS: dict[str, str] = {
     "OMP_DYNAMIC": "FALSE",
@@ -1314,6 +1323,204 @@ class TensorPagePool:
         with self._cv:
             if self._scavenge_lock():
                 self._cv.notify_all()
+
+
+def pool_tensor(
+    tensor: torch.Tensor,
+    *args: Any,
+    dtype: torch.dtype,
+    device: torch.device,
+    cpu_pool: "TensorPagePool | None",
+    dev_type: str | None = None,
+    pinned_ok: bool | None = None,
+) -> tuple[torch.Tensor, "TensorPagePool.Token | None", bool]:
+    _ = args
+    if not torch.is_tensor(tensor):
+        raise TypeError(f"pool_tensor expects a torch.Tensor, got {type(tensor)}")
+    if dev_type is None:
+        dev_type = str(getattr(device, "type", "cpu"))
+    if pinned_ok is None:
+        pinned_ok = bool(is_pin_supported(str(dev_type)))
+
+    if tensor.device.type != "cpu":
+        if tensor.dtype != dtype:
+            with contextlib.suppress(Exception):
+                tensor = tensor.to(dtype=dtype, copy=False)
+        return tensor, None, False
+
+    with contextlib.suppress(Exception):
+        is_pinned = getattr(tensor, "is_pinned", None)
+        if callable(is_pinned) and bool(is_pinned()) and tensor.dtype == dtype:
+            return tensor, None, True
+
+    if cpu_pool is not None and bool(pinned_ok):
+        buf, token = cpu_pool.get(tuple(tensor.shape), dtype, return_handle=True)
+        buf.copy_(tensor, non_blocking=False)
+        pinned = False
+        with contextlib.suppress(Exception):
+            is_pinned = getattr(buf, "is_pinned", None)
+            if callable(is_pinned):
+                pinned = bool(is_pinned())
+        return buf, token, pinned
+
+    out = tensor
+    if out.dtype != dtype:
+        out = out.to(dtype=dtype, copy=False)
+    pinned = False
+    with contextlib.suppress(Exception):
+        is_pinned = getattr(out, "is_pinned", None)
+        if callable(is_pinned):
+            pinned = bool(is_pinned())
+    return out, None, pinned
+
+
+def stream_tensor(
+    tensor: object,
+    *args: Any,
+    device: torch.device | str | int,
+    cpu_pool: object,
+    handle: "TensorPagePool.Token | None" = None,
+    pinned: bool | None = None,
+    dev_type: object | None = None,
+    non_blocking_ok: object | None = None,
+    backend: object | None = None,
+    stream_fn: object | None = None,
+    Event: object | None = None,
+    fence_event_factory: object | None = None,
+    can_stream_release: object | None = None,
+) -> object:
+    _ = args
+    if not torch.is_tensor(tensor):
+        return tensor
+    device = torch.device(device) if not isinstance(device, torch.device) else device
+    if dev_type is None:
+        dev_type = str(getattr(device, "type", "cpu"))
+    if non_blocking_ok is None:
+        non_blocking_ok = bool(dev_type in ("cuda", "xpu"))
+    pinned_ok = bool(is_pin_supported(str(dev_type)))
+
+    if pinned is None:
+        pinned = False
+        with contextlib.suppress(Exception):
+            is_pinned = getattr(tensor, "is_pinned", None)
+            if callable(is_pinned):
+                pinned = bool(is_pinned())
+
+    if tensor.device.type != "cpu" or (not bool(non_blocking_ok)):
+        out = tensor.to(device, non_blocking=bool(non_blocking_ok))
+        if handle is not None and cpu_pool is not None:
+            with contextlib.suppress(Exception):
+                cpu_pool.release(handle)
+        return out
+
+    if handle is None:
+        return tensor.to(device, non_blocking=bool(non_blocking_ok and pinned and pinned_ok))
+
+    if backend is None:
+        backend = accelerator_type(str(dev_type))
+    if stream_fn is None and backend is not None:
+        stream_fn = getattr(backend, "current_stream", None)
+    if Event is None and backend is not None:
+        Event = getattr(backend, "Event", None)
+    if can_stream_release is None:
+        can_stream_release = bool(
+            pinned and pinned_ok and callable(stream_fn) and (Event is not None)
+        )
+
+    if (not bool(pinned)) or (not bool(can_stream_release)):
+        out = tensor.to(device, non_blocking=False)
+        if cpu_pool is not None:
+            with contextlib.suppress(Exception):
+                cpu_pool.release(handle)
+        return out
+
+    stream = None
+    if callable(stream_fn):
+        with contextlib.suppress(Exception):
+            try:
+                stream = stream_fn(device=device)
+            except TypeError:
+                try:
+                    stream = stream_fn(device)
+                except TypeError:
+                    stream = stream_fn()
+
+    try:
+        if stream is not None:
+            with accelerator_stream(stream, str(dev_type)):
+                out = tensor.to(device, non_blocking=True)
+        else:
+            out = tensor.to(device, non_blocking=True)
+
+        if stream is not None:
+            rec = getattr(tensor, "record_stream", None)
+            if callable(rec):
+                with contextlib.suppress(Exception):
+                    rec(stream)
+
+        if cpu_pool is not None:
+            try:
+                evt = None
+                fe = getattr(cpu_pool, "fence_event", None)
+                if callable(fe) and fence_event_factory is not None:
+                    with contextlib.suppress(Exception):
+                        evt = fe(handle, fence_event_factory)
+                if evt is None:
+                    if fence_event_factory is not None:
+                        with contextlib.suppress(Exception):
+                            evt = fence_event_factory()
+                    elif Event is not None:
+                        with contextlib.suppress(Exception):
+                            evt = Event()
+                if evt is not None:
+                    if stream is not None:
+                        try:
+                            evt.record(stream)
+                        except TypeError:
+                            evt.record()
+                    else:
+                        evt.record()
+                    cpu_pool.release_after(handle, evt)
+                else:
+                    with contextlib.suppress(Exception):
+                        sync_accelerator(device)
+                    with contextlib.suppress(Exception):
+                        cpu_pool.release(handle)
+            except Exception:
+                with contextlib.suppress(Exception):
+                    sync_accelerator(device)
+                with contextlib.suppress(Exception):
+                    cpu_pool.release(handle)
+        return out
+    except Exception:
+        out = tensor.to(device, non_blocking=False)
+        if cpu_pool is not None:
+            with contextlib.suppress(Exception):
+                cpu_pool.release(handle)
+        return out
+
+
+def move_staged_pair_to_device(
+    X_st: object,
+    x_tok: "TensorPagePool.Token | None",
+    x_pinned: bool,
+    Y_st: object | None,
+    y_tok: "TensorPagePool.Token | None",
+    y_pinned: bool,
+    to_device: Callable[..., object],
+) -> tuple[
+    object,
+    object | None,
+    "TensorPagePool.Token | None",
+    "TensorPagePool.Token | None",
+]:
+    X_dev = to_device(X_st, handle=x_tok, pinned=x_pinned)
+    x_tok = None
+    Y_dev = None
+    if Y_st is not None:
+        Y_dev = to_device(Y_st, handle=y_tok, pinned=y_pinned)
+        y_tok = None
+    return X_dev, Y_dev, x_tok, y_tok
 
 
 class TensorSpooler:

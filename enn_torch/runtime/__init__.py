@@ -5,6 +5,7 @@ import importlib
 from types import ModuleType
 
 __all__ = [
+    "autotune",
     "distributed",
     "io",
     "main",

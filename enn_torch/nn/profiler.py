@@ -5,6 +5,7 @@ import contextlib
 import contextvars
 import logging
 import os
+import math
 from dataclasses import dataclass, field
 from functools import partial
 from types import TracebackType
@@ -12,6 +13,8 @@ from typing import Any, Callable, Dict, List, Optional, Self, Sequence, Tuple
 
 import torch
 from torch import nn
+
+from ..core.datatypes import env_bool, env_int
 
 try:
     from torch.utils._python_dispatch import TorchDispatchMode
@@ -43,6 +46,124 @@ _ACT_COEFF: Dict[type, float] = {
 }
 _ACT_CLASSES: Tuple[type, ...] = tuple(_ACT_COEFF.keys())
 _LOGGER = logging.getLogger(__name__)
+def get_torch_profiler(
+    *args: Any,
+    enabled: object,
+    tag: object,
+    device: torch.device,
+    out_dir: object,
+    rank: int = 0,
+    **kwargs: Any,
+) -> object:
+    if not bool(enabled):
+        return None
+    try:
+        import torch.profiler
+    except Exception:
+        return None
+    tp = torch.profiler
+    try:
+        dev = device if isinstance(device, torch.device) else torch.device(device)
+    except Exception:
+        dev = torch.device("cpu")
+    activities = [tp.ProfilerActivity.CPU]
+    if dev.type == "cuda":
+        with contextlib.suppress(Exception):
+            activities.append(tp.ProfilerActivity.CUDA)
+    elif dev.type == "xpu":
+        with contextlib.suppress(Exception):
+            activities.append(getattr(tp.ProfilerActivity, "XPU"))
+    elif dev.type == "mps":
+        with contextlib.suppress(Exception):
+            mps_act = getattr(tp.ProfilerActivity, "MPS", None)
+            if mps_act is not None:
+                activities.append(mps_act)
+
+    wait = max(0, int(env_int("ENN_TORCH_PROFILE_WAIT", 0)))
+    warmup = max(0, int(env_int("ENN_TORCH_PROFILE_WARMUP", 2)))
+    active = max(
+        1,
+        int(
+            env_int(
+                "ENN_TORCH_PROFILE_ACTIVE",
+                env_int("ENN_TORCH_PROFILE_STEPS", 8),
+            )
+        ),
+    )
+    repeat = max(1, int(env_int("ENN_TORCH_PROFILE_REPEAT", 1)))
+    record_shapes = bool(env_bool("ENN_TORCH_PROFILE_RECORD_SHAPES", False))
+    profile_memory = bool(env_bool("ENN_TORCH_PROFILE_PROFILE_MEMORY", True))
+    with_stack = bool(env_bool("ENN_TORCH_PROFILE_WITH_STACK", False))
+    with_flops = bool(env_bool("ENN_TORCH_PROFILE_WITH_FLOPS", False))
+    group_by_shape = bool(env_bool("ENN_TORCH_PROFILE_GROUP_BY_SHAPE", False))
+    row_limit = max(5, int(env_int("ENN_TORCH_PROFILE_TOPK", 40)))
+
+    out_dir_s = os.fspath(out_dir) if out_dir else os.path.join(os.getcwd(), "torch_profiler")
+    out_dir_s = os.path.abspath(str(out_dir_s))
+    with contextlib.suppress(Exception):
+        os.makedirs(out_dir_s, exist_ok=True)
+    worker_name = f"{str(tag)}-rank{int(rank)}"
+    try:
+        schedule = tp.schedule(wait=wait, warmup=warmup, active=active, repeat=repeat)
+        on_trace = tp.tensorboard_trace_handler(out_dir_s, worker_name=worker_name)
+        prof = tp.profile(
+            activities=activities,
+            schedule=schedule,
+            on_trace_ready=on_trace,
+            record_shapes=record_shapes,
+            profile_memory=profile_memory,
+            with_stack=with_stack,
+            with_flops=with_flops,
+        )
+        setattr(prof, "_enn_row_limit", int(row_limit))
+        setattr(prof, "_enn_group_by_shape", bool(group_by_shape))
+        setattr(prof, "_enn_out_dir", str(out_dir_s))
+        setattr(prof, "_enn_tag", str(tag))
+        return prof
+    except Exception:
+        return None
+
+
+def log_profiler_summary(
+    prof: object,
+    *args: Any,
+    device: torch.device,
+    logger: logging.Logger,
+    header: object,
+    **kwargs: Any,
+) -> None:
+    if prof is None:
+        return
+    row_limit = int(getattr(prof, "_enn_row_limit", 40) or 40)
+    group_by_shape = bool(getattr(prof, "_enn_group_by_shape", False))
+    out_dir = str(getattr(prof, "_enn_out_dir", ""))
+    tag = str(getattr(prof, "_enn_tag", header))
+    try:
+        ka = prof.key_averages(group_by_input_shape=group_by_shape)
+    except Exception:
+        with contextlib.suppress(Exception):
+            ka = prof.key_averages()
+        if "ka" not in locals():
+            return
+    table = None
+    for sk in (
+        "self_cuda_time_total",
+        "self_xpu_time_total",
+        "self_cpu_time_total",
+    ):
+        with contextlib.suppress(Exception):
+            table = ka.table(sort_by=str(sk), row_limit=row_limit)
+            if table:
+                break
+    if table:
+        logger.info(
+            "[torch.profiler] %s (trace dir: %s, tag: %s)\n%s",
+            str(header),
+            str(out_dir),
+            str(tag),
+            str(table),
+        )
+
 
 
 def _float_safe(x: Any, default: float = 0.0) -> float:

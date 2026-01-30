@@ -5,10 +5,13 @@ import contextlib
 import importlib
 import inspect
 import warnings
+from functools import partial
 from collections.abc import Callable, Mapping
 from typing import Any, Iterator, TypeVar
 
 import torch
+
+from .system import is_pin_supported
 
 try:
     import torch._dynamo as _dynamo
@@ -106,6 +109,87 @@ def is_meta_tensor(value: Any) -> bool:
 
 def is_meta_or_fake_tensor(value: Any) -> bool:
     return is_meta_tensor(value) or is_fake_tensor(value)
+
+
+def validate_no_meta_tensors(module: object) -> None:
+    hits: list[str] = []
+    for name, param in getattr(module, "named_parameters", lambda **_: [])(recurse=True):
+        if is_meta_or_fake_tensor(param):
+            hits.append(f"param {name} shape={tuple(param.shape)}")
+    for name, buffer in getattr(module, "named_buffers", lambda **_: [])(recurse=True):
+        if is_meta_or_fake_tensor(buffer):
+            hits.append(f"buffer {name} shape={tuple(buffer.shape)}")
+    if hits:
+        raise RuntimeError("Found meta tensors in model:\n" + "\n".join(hits))
+
+
+def hook_meta_monitor(module: object, inputs: object, warn_only: object) -> None:
+    try:
+        iterator = iter(inputs)
+    except Exception:
+        iterator = iter(())
+    for arg in iterator:
+        if isinstance(arg, torch.Tensor) and is_meta_or_fake_tensor(arg):
+            message = f"[META] {module.__class__.__name__} got meta input"
+            if warn_only:
+                warnings.warn(message, stacklevel=3)
+                return
+            raise RuntimeError(message)
+
+
+def enable_meta_monitor(model: object) -> None:
+    try:
+        from .datatypes import env_first
+    except Exception:
+        env_first = None
+
+    mode = "off"
+    if callable(env_first):
+        mode = str(
+            env_first(("ENN_META_MONITOR", "ENN_META_HOOK"), default="off") or "off"
+        )
+    mode = mode.strip().lower()
+    if mode in {"0", "", "false", "off"}:
+        return
+    warn_only = mode in {"warn", "warning"}
+    try:
+        mods = model.modules()
+    except Exception:
+        mods = ()
+    for submodule in mods:
+        try:
+            submodule.register_forward_pre_hook(
+                partial(hook_meta_monitor, warn_only=warn_only), with_kwargs=False
+            )
+        except TypeError:
+            submodule.register_forward_pre_hook(partial(hook_meta_monitor, warn_only=warn_only))
+
+
+def validate_no_fake_dtensor(root: object, *args: object, **kwargs: object) -> None:
+    del args, kwargs
+    try:
+        import torch.nn as nn
+    except Exception:
+        nn = None
+
+    bad: list[str] = []
+    for name, module in getattr(root, "named_modules", lambda: [])():
+        if nn is not None and not isinstance(module, nn.LayerNorm):
+            continue
+        if nn is None and module.__class__.__name__ != "LayerNorm":
+            continue
+        for attr in ("weight", "bias"):
+            tensor = getattr(module, attr, None)
+            if tensor is None:
+                continue
+            if is_meta_or_fake_tensor(tensor):
+                module_name = name or module.__class__.__name__
+                bad.append(f"{module_name}.{attr}{tuple(tensor.shape)}")
+    if bad:
+        raise RuntimeError(
+            "LayerNorm parameters must be materialized as a real Tensor: "
+            + ", ".join(bad)
+        )
 
 
 def coerce_tensor(
@@ -295,3 +379,70 @@ FakeTensor = _optional_attr(
 TensorDictBase = _optional_attr(
     "tensordict", "TensorDictBase", (), predicate=inspect.isclass
 )
+
+
+def to_device_recursive(obj: object, dev: object) -> object:
+    if isinstance(obj, torch.Tensor):
+        dev_type = getattr(dev, "type", None)
+        non_blocking = bool(dev_type and is_pin_supported(str(dev_type)))
+        try:
+            return obj.to(device=dev, non_blocking=non_blocking)
+        except TypeError:
+            return obj.to(device=dev)
+    if isinstance(obj, TensorDictBase):
+        return obj.to(device=dev)
+    if isinstance(obj, Mapping):
+        return {k: to_device_recursive(v, dev) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        seq = [to_device_recursive(v, dev) for v in obj]
+        return type(obj)(seq)
+    return obj
+
+
+def touch_tensors(obj: object) -> None:
+    if isinstance(obj, torch.Tensor):
+        _ = obj.sum()
+        return
+    if isinstance(obj, TensorDictBase):
+        for v in obj.values():
+            touch_tensors(v)
+        return
+    if isinstance(obj, Mapping):
+        for v in obj.values():
+            touch_tensors(v)
+        return
+    if isinstance(obj, (list, tuple)):
+        for v in obj:
+            touch_tensors(v)
+        return
+
+
+
+def compute_batch_bytes_per_sample(obj: object) -> tuple[int | None, int]:
+    batch_dim: int | None = None
+    bytes_per_sample = 0
+    stack: list[object] = [obj]
+
+    while stack:
+        o = stack.pop()
+        if isinstance(o, torch.Tensor):
+            if o.numel() <= 0:
+                continue
+            b = int(o.shape[0]) if o.ndim >= 1 else 1
+            if batch_dim is None:
+                batch_dim = b
+            if o.ndim >= 1 and b > 0:
+                one = o[:1]
+            else:
+                one = o.reshape(1, -1)
+            bytes_per_sample += int(one.nelement()) * int(one.element_size())
+        elif isinstance(o, TensorDictBase):
+            stack.extend(list(o.values()))
+        elif isinstance(o, Mapping):
+            stack.extend(list(o.values()))
+        elif isinstance(o, (list, tuple)):
+            stack.extend(list(o))
+
+    if bytes_per_sample <= 0:
+        return (None, 0)
+    return (batch_dim, bytes_per_sample)
