@@ -14,9 +14,10 @@ import torch._dynamo
 from torch import nn
 
 from ..core.datatypes import env_bool, env_str
-from .graph import assert_trace, canonicalize_compile_mode
-from .graph import compile as _model_compile
 from .graph import (
+    assert_trace,
+    canonicalize_compile_mode,
+    compile as _model_compile,
     is_compiling,
     is_dynamo_compiling,
     is_export_or_trace,

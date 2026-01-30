@@ -24,14 +24,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 from tensordict import TensorDictBase
 
-from ..core.config import ModelConfig
-from .graph import coerce_checkpoint
-from ..core.concurrency import Mutex, is_gil_enabled
-from ..core.datatypes import env_bool, env_first_int, env_int
-from ..runtime.distributed import _from_hsdp_module
-from .graph import canonicalize_compile_mode
-from .graph import compile as compile_module
 from .graph import (
+    canonicalize_compile_mode,
+    coerce_checkpoint,
+    compile as compile_module,
     cudagraph_mark_step_begin,
     cudagraph_mark_step_end,
     graph_break,
@@ -41,6 +37,10 @@ from .graph import (
     torch_compiler_disable,
     torch_compiler_supported,
 )
+from ..core.config import ModelConfig
+from ..core.concurrency import Mutex, is_gil_enabled
+from ..core.datatypes import env_bool, env_first_int, env_int
+from ..runtime.distributed import _from_hsdp_module
 from ..core.policies import LossWeightPolicy
 from ..core.precision import Autocast
 from ..core.system import CPU, empty_device_cache, get_device, set_runtime_cfg

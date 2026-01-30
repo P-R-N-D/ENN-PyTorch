@@ -36,7 +36,7 @@ def _get_source_path(obj: object) -> str:
     raise RuntimeError("sources is empty or invalid")
 
 
-class Throttler:
+class BatchThrottler:
 
     def __init__(self) -> None:
         self._oom_retry_count: Dict[tuple[int, str, int], int] = {}
@@ -127,7 +127,7 @@ class Throttler:
             pass
 
 
-class Tuner:
+class BatchScaler:
 
     def __init__(self, *, logger: logging.Logger | None = None) -> None:
         self._logger = logger or _LOGGER
@@ -345,12 +345,12 @@ class OOMHandler:
     def __init__(
         self,
         *,
-        tuner: Tuner | None = None,
-        throttler: Throttler | None = None,
+        tuner: BatchScaler | None = None,
+        throttler: BatchThrottler | None = None,
         logger: logging.Logger | None = None,
     ) -> None:
-        self.tuner = tuner or Tuner(logger=logger)
-        self.throttler = throttler or Throttler()
+        self.tuner = tuner or BatchScaler(logger=logger)
+        self.throttler = throttler or BatchThrottler()
         self.logger = logger or _LOGGER
 
     @staticmethod
@@ -526,8 +526,8 @@ class OOMHandler:
 
 
 
-_DEFAULT_THROTTLER = Throttler()
-_DEFAULT_TUNER = Tuner(logger=_LOGGER)
+_DEFAULT_THROTTLER = BatchThrottler()
+_DEFAULT_TUNER = BatchScaler(logger=_LOGGER)
 _DEFAULT_OOM_HANDLER = OOMHandler(tuner=_DEFAULT_TUNER, throttler=_DEFAULT_THROTTLER, logger=_LOGGER)
 
 
