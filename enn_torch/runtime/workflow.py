@@ -48,7 +48,12 @@ from ..core.config import (
     runtime_config,
 )
 from ..core.datatypes import env_bool, read_json
-from .distributed import Broker, get_available_host, get_preferred_ip, init_master_addr
+from .distributed import (
+    ProcessBroker,
+    get_available_host,
+    get_preferred_ip,
+    init_master_addr,
+)
 from ..nn.graph import inference_mode
 from ..core.policies import WorkerPolicy
 from ..core.system import (
@@ -992,10 +997,10 @@ def train(
     loss_mask_value: float | None = None,
     **kwargs: Any,
 ) -> Model:
-    Broker.bootstrap()
+    ProcessBroker.bootstrap()
     val_frac = max(0.0, min(1.0, float(val_frac)))
     seed_value = _coerce_seed(seed)
-    Broker.set_seed(seed_value)
+    ProcessBroker.set_seed(seed_value)
     underflow_action = normalize_underflow_action(
         kwargs.pop("underflow_action", None),
         default=default_underflow_action(),
@@ -1273,7 +1278,7 @@ def predict(
 ) -> PredictionOutput:
     if model is None:
         raise ValueError("predict: model must not be None")
-    Broker.bootstrap()
+    ProcessBroker.bootstrap()
     out_shape = tuple(
         int(x)
         for x in (kwargs.pop("out_shape", getattr(model, "out_shape", None)) or ())

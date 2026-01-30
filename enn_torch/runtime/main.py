@@ -56,7 +56,7 @@ from ..core.datatypes import (
     read_json,
 )
 from .distributed import (
-    Broker,
+    ProcessBroker,
     broadcast_scalar,
     distributed_all_reduce_grads,
     distributed_all_reduce_sum as _reduce_sum,
@@ -147,7 +147,7 @@ from .losses import (
     StudentsTLoss,
     TiledLoss,
 )
-from .autotune import (
+from .autoscaling import (
     clear_oom_retries as _clear_oom_retries,
     get_sampler_scaler as _get_sampler_scaler,
     log_scale_rate_throttled as _is_scale_rate_logged,
@@ -191,7 +191,7 @@ _IGNORED_WARNING_MESSAGE_RE = re.compile(
     r".*(?:" + "|".join((f"(?:{p})" for p in _IGNORED_WARNING_PATTERNS)) + r").*"
 )
 _LOGGER = logging.getLogger(__name__)
-_float8_log = Broker.rank0_logger(_LOGGER)
+_float8_log = ProcessBroker.rank0_logger(_LOGGER)
 JsonPrimitive: TypeAlias = str | int | float | bool | None
 JsonValue: TypeAlias = JsonPrimitive | list["JsonValue"] | dict[str, "JsonValue"]
 MB_DIV = 1024.0 * 1024.0
@@ -2667,11 +2667,11 @@ def process(*args: Any, **kwargs: Any) -> object:
                 n = max(1, int(get_num_accelerators("xpu") or 1))
                 set_accelerator_index("xpu", int(local_rank) % int(n))
         device = get_device()
-        Broker.init_backend(device)
-        backend = Broker.get_backend_type(device)
-        Broker.configure_backend_env(backend, device)
+        ProcessBroker.init_backend(device)
+        backend = ProcessBroker.get_backend_type(device)
+        ProcessBroker.configure_backend_env(backend, device)
         enable_tf32 = bool(getattr(ops, "enable_tf32", True))
-        Broker.init_process_group(backend, device, local_rank=int(local_rank))
+        ProcessBroker.init_process_group(backend, device, local_rank=int(local_rank))
         cfg = coerce_model_config(
             ops.cfg_dict if isinstance(ops.cfg_dict, dict) else ops.cfg_dict
         )
@@ -2789,7 +2789,6 @@ def process(*args: Any, **kwargs: Any) -> object:
             Autocast.configure(model, metadata=metadata)
         if disable_note:
             _float8_log(f"[FP8] disabled: {disable_note}")
-        _cast_float_dtype(model, param_dtype)
         model.train()
         fsdp_mp_dtype = precision.fsdp_reduce_dtype
         if device.type == "cpu" and fsdp_mp_dtype is not torch.float64:
@@ -2810,6 +2809,7 @@ def process(*args: Any, **kwargs: Any) -> object:
             )
         _m_pre = model.module if hasattr(model, "module") else model
         _preload_layers(_m_pre, device)
+        _cast_float_dtype(model, param_dtype)
         _validate_model_dtype_unity(_m_pre, device)
         _validate_no_meta_tensors(_m_pre)
         _validate_no_fake_dtensor(_m_pre)
@@ -3161,11 +3161,11 @@ def process(*args: Any, **kwargs: Any) -> object:
                 n = max(1, int(get_num_accelerators("xpu") or 1))
                 set_accelerator_index("xpu", int(local_rank) % int(n))
         device = get_device()
-        Broker.init_backend(device)
-        backend = Broker.get_backend_type(device)
-        Broker.configure_backend_env(backend, device)
+        ProcessBroker.init_backend(device)
+        backend = ProcessBroker.get_backend_type(device)
+        ProcessBroker.configure_backend_env(backend, device)
         if not torch.distributed.is_initialized():
-            Broker.init_process_group(backend, device, local_rank=int(local_rank))
+            ProcessBroker.init_process_group(backend, device, local_rank=int(local_rank))
         cfg = coerce_model_config(
             ops.cfg_dict if isinstance(ops.cfg_dict, dict) else ops.cfg_dict
         )
