@@ -10,12 +10,14 @@ import inspect
 import ipaddress
 import logging
 import os
+import random
 import re
 import shutil
 import socket
 import tempfile
 import threading
 import time
+import warnings
 from contextlib import AbstractContextManager
 from collections import deque
 from pathlib import Path
@@ -27,8 +29,16 @@ from torch import nn
 from torch.optim import Optimizer
 
 from ..core.concurrency import Mutex
-from ..core.datatypes import PathLike, env_bool, save_temp, write_json
-from ..core.system import CPU, get_device, get_num_accelerators
+from ..core.datatypes import PathLike, env_bool, env_first, env_int, save_temp, write_json
+from ..core.system import (
+    CPU,
+    get_device,
+    get_num_accelerators,
+    init_python_path,
+    init_start_method,
+    set_accelerator_index,
+    set_accelerator_seed,
+)
 
 try:
     from torch.distributed._composable.fsdp import fully_shard
@@ -52,6 +62,482 @@ except ImportError:
 _DTENSOR_ACTIVE: bool = False
 _GLOOX_GLOO_PG_CACHE: dict[tuple[int, ...], ProcessGroup] = {}
 _LOGGER = logging.getLogger(__name__)
+
+
+class Broker:
+    DL_STATE_FILE: str = "dataloader.json"
+
+    _IGNORED_WARNING_PATTERNS: tuple[str, ...] = (
+        "torch.distributed is disabled, unavailable or uninitialized",
+        "torch.distributed is disabled",
+        "TypedStorage is deprecated",
+        "Found a non-scalar tensor with numel=1 and ndim!=0",
+        "distributed_broadcast: coalesced broadcast failed",
+        "distributed_broadcast: per-tensor broadcast failed",
+        "found no DeviceMesh from dtensor args",
+        "mixed precision.*may be unavailable",
+        "Either mode or options can be specified, but both can't be specified at the same time\\.",
+    )
+    _IGNORED_WARNING_MESSAGE_RE = re.compile(
+        r".*(?:" + "|".join((f"(?:{p})" for p in _IGNORED_WARNING_PATTERNS)) + r").*"
+    )
+
+    @classmethod
+    def apply_warning_filters(cls) -> None:
+        with contextlib.suppress(Exception):
+            warnings.filterwarnings(
+                "ignore",
+                message=cls._IGNORED_WARNING_MESSAGE_RE.pattern,
+                category=UserWarning,
+            )
+
+    @classmethod
+    def clear_process_group(cls) -> None:
+        try:
+            if dist.is_available() and dist.is_initialized():
+                with contextlib.suppress(Exception):
+                    dist.barrier()
+                with contextlib.suppress(Exception):
+                    dist.destroy_process_group()
+        except Exception:
+            pass
+
+    @classmethod
+    def set_seed(cls, seed_value: int | None) -> None:
+        if seed_value is None:
+            return
+        try:
+            seed_i = int(seed_value)
+        except Exception:
+            return
+        with contextlib.suppress(Exception):
+            torch.manual_seed(seed_i)
+        with contextlib.suppress(Exception):
+            set_accelerator_seed(seed_i)
+        with contextlib.suppress(Exception):
+            random.seed(seed_i)
+        with contextlib.suppress(Exception):
+            import numpy
+
+            numpy.random.seed(seed_i)
+
+    @classmethod
+    def bootstrap(
+        cls,
+        *args: Any,
+        seed: int | None = None,
+        clear_pg: bool = True,
+        apply_warning_filters: bool = True,
+        **kwargs: Any,
+    ) -> None:
+        if apply_warning_filters:
+            cls.apply_warning_filters()
+        if clear_pg:
+            cls.clear_process_group()
+
+        init_python_path()
+        with contextlib.suppress(Exception):
+            torch.multiprocessing.allow_connection_pickling()
+        with contextlib.suppress(Exception):
+            init_start_method()
+        if seed is not None:
+            cls.set_seed(seed)
+
+    @classmethod
+    def get_backend_type(cls, device: torch.device) -> str:
+        dev_type = str(getattr(device, "type", "cpu")).lower()
+        if dev_type == "cuda":
+            return "nccl"
+        if dev_type == "xpu":
+            return "xccl"
+        if dev_type in ("cpu", "mps", "dml", "privateuseone"):
+            return "gloo"
+        if dev_type in ("hpu", "npu"):
+            return "hccl"
+        if dev_type == "xla":
+            return "xla"
+        get_default = getattr(torch.distributed, "get_default_backend_for_device", None)
+        if callable(get_default):
+            with contextlib.suppress(Exception):
+                return str(get_default(device)).lower()
+            with contextlib.suppress(Exception):
+                return str(get_default(dev_type)).lower()
+        return "gloo"
+
+    @classmethod
+    def ensure_default_socket_ifname(cls) -> None:
+        iface = None
+        gloo_if = os.environ.get("GLOO_SOCKET_IFNAME")
+        tp_if = os.environ.get("TP_SOCKET_IFNAME")
+        if gloo_if or tp_if:
+            if gloo_if and (not tp_if):
+                os.environ.setdefault("TP_SOCKET_IFNAME", str(gloo_if))
+            elif tp_if and (not gloo_if):
+                os.environ.setdefault("GLOO_SOCKET_IFNAME", str(tp_if))
+            return
+
+        try:
+            with open("/proc/net/route", "r", encoding="utf-8") as f:
+                for line in f.readlines()[1:]:
+                    fields = line.strip().split()
+                    if len(fields) >= 2 and fields[1] == "00000000":
+                        iface = fields[0]
+                        if iface:
+                            break
+        except Exception:
+            iface = None
+
+        if iface is None:
+            try:
+                import psutil
+
+                s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                try:
+                    s.connect(("8.8.8.8", 80))
+                    ip = s.getsockname()[0]
+                finally:
+                    s.close()
+                if ip:
+                    for name, addrs in psutil.net_if_addrs().items():
+                        for a in addrs:
+                            if (
+                                getattr(a, "family", None) == socket.AF_INET
+                                and getattr(a, "address", None) == ip
+                            ):
+                                iface = str(name)
+                                break
+                        if iface:
+                            break
+            except Exception:
+                iface = None
+
+        if iface:
+            os.environ.setdefault("GLOO_SOCKET_IFNAME", iface)
+            os.environ.setdefault("TP_SOCKET_IFNAME", iface)
+
+    @classmethod
+    def _configure_torch_nccl_env(cls, device: torch.device) -> None:
+        if str(getattr(device, "type", "cpu")) != "cuda":
+            return
+        world = 1
+        with contextlib.suppress(Exception):
+            world = int(env_int("WORLD_SIZE", 1) or 1)
+        if "TORCH_NCCL_ENABLE_MONITORING" not in os.environ:
+            default_mon = 0 if int(world) <= 1 else 1
+            mon = int(env_int("ENN_TORCH_NCCL_ENABLE_MONITORING", default_mon))
+            os.environ["TORCH_NCCL_ENABLE_MONITORING"] = str(int(mon))
+        if "TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC" not in os.environ:
+            default_hb = 3600 if int(world) <= 1 else 600
+            hb = int(env_int("ENN_TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC", default_hb))
+            os.environ["TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC"] = str(int(hb))
+        if "TORCH_NCCL_DUMP_ON_TIMEOUT" not in os.environ:
+            default_dump = 0 if int(world) <= 1 else 1
+            dump = int(env_int("ENN_TORCH_NCCL_DUMP_ON_TIMEOUT", default_dump))
+            os.environ["TORCH_NCCL_DUMP_ON_TIMEOUT"] = str(int(dump))
+        if "TORCH_NCCL_ASYNC_ERROR_HANDLING" not in os.environ:
+            default_ae = 0 if int(world) <= 1 else 3
+            ae = int(env_int("ENN_TORCH_NCCL_ASYNC_ERROR_HANDLING", default_ae))
+            os.environ["TORCH_NCCL_ASYNC_ERROR_HANDLING"] = str(int(ae))
+        if "TORCH_NCCL_BLOCKING_WAIT" not in os.environ:
+            default_bw = 1 if int(world) <= 1 else 0
+            bw = int(env_int("ENN_TORCH_NCCL_BLOCKING_WAIT", default_bw))
+            os.environ["TORCH_NCCL_BLOCKING_WAIT"] = str(int(bw))
+
+
+    @classmethod
+    def configure_torch_nccl_env(cls, device: torch.device) -> None:
+        cls._configure_torch_nccl_env(device)
+
+    @classmethod
+    def _configure_torch_gloo_env(cls, device: torch.device) -> None:
+        cls.ensure_default_socket_ifname()
+
+    @classmethod
+    def configure_torch_gloo_env(cls, device: torch.device) -> None:
+        cls._configure_torch_gloo_env(device)
+
+    @classmethod
+    def _configure_torch_xccl_env(cls, device: torch.device) -> None:
+        return
+
+    @classmethod
+    def configure_torch_xccl_env(cls, device: torch.device) -> None:
+        cls._configure_torch_xccl_env(device)
+
+    @classmethod
+    def configure_backend_env(cls, backend: object, device: torch.device) -> None:
+        b = str(backend).lower() if backend is not None else ""
+        if b == "nccl":
+            cls._configure_torch_nccl_env(device)
+        elif b == "xccl":
+            cls._configure_torch_xccl_env(device)
+        elif b == "gloo":
+            cls._configure_torch_gloo_env(device)
+
+    @classmethod
+    def init_backend(cls, device: torch.device, local_rank: int | None = None) -> None:
+        with contextlib.suppress(Exception):
+            if device.type == "cuda" and hasattr(torch.backends, "cudnn"):
+                torch.backends.cudnn.benchmark = True
+        rank = int(os.environ.get("LOCAL_RANK", "0") or 0)
+        if local_rank is not None:
+            with contextlib.suppress(Exception):
+                rank = int(local_rank)
+        if device.type in {"cuda", "xpu"}:
+            n = max(1, int(get_num_accelerators(device.type) or 1))
+            set_accelerator_index(device.type, int(rank) % int(n))
+        else:
+            cls.ensure_default_socket_ifname()
+
+    @classmethod
+    def init_process_group(
+        cls, backend: object, device: torch.device, local_rank: int
+    ) -> None:
+        if torch.distributed.is_initialized():
+            return
+        dev_id = None
+        dev_type = getattr(device, "type", "cpu")
+        backend_name = str(backend).lower() if backend is not None else ""
+        if backend_name in ("nccl", "xccl") and dev_type in ("cuda", "xpu"):
+            index = (
+                device.index
+                if getattr(device, "index", None) is not None
+                else env_int("LOCAL_RANK", int(local_rank))
+            )
+            try:
+                dev_id = torch.device(dev_type, index)
+            except Exception:
+                dev_id = index
+
+        timeout = None
+        try:
+            import datetime
+
+            to_s = int(env_int("ENN_PROCESS_GROUP_TIMEOUT_SEC", 0) or 0)
+            if to_s <= 0 and backend_name in ("nccl", "xccl"):
+                ws = int(env_int("WORLD_SIZE", 1) or 1)
+                if ws <= 1:
+                    to_s = 3600
+            if int(to_s) > 0:
+                timeout = datetime.timedelta(seconds=int(to_s))
+        except Exception:
+            timeout = None
+
+        try:
+            kwargs: dict[str, Any] = {"backend": backend}
+            if dev_id is not None:
+                kwargs["device_id"] = dev_id
+            if timeout is not None:
+                kwargs["timeout"] = timeout
+            torch.distributed.init_process_group(**kwargs)
+        except TypeError:
+            try:
+                kwargs.pop("device_id", None)
+                torch.distributed.init_process_group(**kwargs)
+            except TypeError:
+                kwargs.pop("timeout", None)
+                torch.distributed.init_process_group(**kwargs)
+
+    @classmethod
+    def loader_state_path(cls, directory: PathLike) -> str:
+        return os.path.join(os.fspath(directory), cls.DL_STATE_FILE)
+
+    @classmethod
+    def get_loader_state(cls, directory: PathLike) -> str:
+        return cls.loader_state_path(directory)
+
+    @classmethod
+    def _rank0_only(cls) -> bool:
+        return is_rank0()
+
+    @classmethod
+    def log_rank0(
+        cls,
+        logger: logging.Logger,
+        msg: str,
+        *args: Any,
+        only_rank0: bool = True,
+        level: str = "info",
+        **kwargs: Any,
+    ) -> None:
+        if only_rank0 and not is_rank0():
+            return
+        try:
+            log_fn = getattr(logger, str(level).lower(), logger.info)
+        except Exception:
+            log_fn = logger.info
+        with contextlib.suppress(Exception):
+            log_fn(msg, *args)
+
+    @classmethod
+    def rank0_logger(
+        cls,
+        logger: logging.Logger,
+        *,
+        only_rank0: bool = True,
+        level: str = "info",
+    ) -> Callable[..., None]:
+        def _fn(
+            msg: str,
+            *args: Any,
+            only_main_rank: bool = True,
+            **kwargs: Any,
+        ) -> None:
+            cls.log_rank0(
+                logger,
+                msg,
+                *args,
+                only_rank0=bool(only_main_rank) and bool(only_rank0),
+                level=level,
+            )
+
+        return _fn
+
+    @classmethod
+    def make_progress_bar(
+        cls,
+        *args: Any,
+        title: str,
+        total: int,
+        device: torch.device,
+        **kwargs: Any,
+    ) -> object:
+        if not cls._rank0_only():
+            return None
+        if int(total) <= 0:
+            return None
+        try:
+            from tqdm.auto import tqdm
+            import sys
+
+            return tqdm(
+                total=int(total),
+                desc=f"{title} ({device.type.upper()}) ",
+                unit="I/O < 0.01 MB/s, COM < 0.01 TFLOPS",
+                bar_format="{desc}"
+                + "{bar} {percentage:3.2f} % "
+                + "({unit}) Elapsed: {elapsed}, Remaining: {remaining}",
+                colour="green",
+                ascii=True,
+                position=int(kwargs.get("position", 0) or 0),
+                leave=bool(kwargs.get("leave", False)),
+                file=sys.stdout,
+            )
+        except Exception:
+            return None
+
+    @classmethod
+    def get_progress_bar(
+        cls, title: str, total: int, device: torch.device, **kwargs: Any
+    ) -> object:
+        return cls.make_progress_bar(title=title, total=total, device=device, **kwargs)
+
+    @classmethod
+    def update_progress_bar(
+        cls,
+        bar: object,
+        finish: bool,
+        *args: Any,
+        mbps: float | None = None,
+        tflops: float | None = None,
+        **kwargs: Any,
+    ) -> None:
+        if bar is None:
+            return
+        try:
+            mbps_val = float(mbps) if mbps is not None else 0.0
+        except Exception:
+            mbps_val = 0.0
+        try:
+            tflops_val = float(tflops) if tflops is not None else 0.0
+        except Exception:
+            tflops_val = 0.0
+        io_expr = (
+            f"I/O = {mbps_val:.2f} MB/s" if mbps_val >= 0.01 else "I/O < 0.01 MB/s"
+        )
+        com_expr = (
+            f"COM = {tflops_val:.2f} TFLOPS"
+            if tflops_val >= 0.01
+            else "COM < 0.01 TFLOPS"
+        )
+        with contextlib.suppress(Exception):
+            bar.unit = io_expr + ", " + com_expr
+        try:
+            inc = int(finish)
+        except Exception:
+            inc = 1
+        if inc > 0:
+            with contextlib.suppress(Exception):
+                bar.update(inc)
+
+    @classmethod
+    def make_checkpoint_bar(
+        cls,
+        *args: Any,
+        title: str,
+        total: int,
+        device: torch.device,
+        **kwargs: Any,
+    ) -> object:
+        if not cls._rank0_only():
+            return None
+        if int(total) <= 0:
+            return None
+        try:
+            from tqdm.auto import tqdm
+            import sys
+
+            return tqdm(
+                total=int(total),
+                desc=f"{title} ({device.type.upper()}) ",
+                unit=f"(Total = {int(total)}, Finished = 0) Checkpoint in Progress",
+                bar_format="{desc}" + "{bar} {percentage:3.2f} % " + "{unit}",
+                colour="green",
+                ascii=True,
+                position=int(kwargs.get("position", 0) or 0),
+                leave=bool(kwargs.get("leave", False)),
+                file=sys.stdout,
+            )
+        except Exception:
+            return None
+
+    @classmethod
+    def get_checkpoint_bar(
+        cls, title: str, total: int, device: torch.device, **kwargs: Any
+    ) -> object:
+        return cls.make_checkpoint_bar(
+            title=title, total=total, device=device, **kwargs
+        )
+
+    @classmethod
+    def update_checkpoint_bar(
+        cls,
+        bar: object,
+        finish: bool,
+        total: int,
+        position: int,
+        *args: Any,
+        **kwargs: Any,
+    ) -> None:
+        if bar is None:
+            return
+        try:
+            inc = int(finish)
+        except Exception:
+            inc = 1
+        finished = int(position) + (1 if inc > 0 else 0)
+        if inc == 0:
+            chpt_expr = (
+                f"(Total = {int(total)}, Finished = {finished}) Checkpoint in Progress"
+            )
+        else:
+            chpt_expr = (
+                f"(Total = {int(total)}, Finished = {finished}) Checkpoint Completed"
+            )
+        with contextlib.suppress(Exception):
+            bar.unit = chpt_expr
+        with contextlib.suppress(Exception):
+            bar.update(inc)
 
 
 def _coerce_dcp_keys(state: object) -> object:
@@ -1338,6 +1824,70 @@ def get_world_size(device: Optional[torch.device] = None) -> int:
         case _:
             ncpu = CPU.count()
             return max(1, min(int(ncpu), 4))
+
+
+
+def is_process_group(obj: object) -> bool:
+    if obj is None:
+        return False
+    with contextlib.suppress(Exception):
+        from torch.distributed.distributed_c10d import ProcessGroup
+
+        return isinstance(obj, ProcessGroup)
+    return False
+
+
+def resolve_process_group(meta: object, model: object) -> object | None:
+    candidates: list[tuple[object, str]] = [
+        (meta, "process_group"),
+        (meta, "distributed_process_group"),
+    ]
+    tm = model.module if hasattr(model, "module") else model
+    candidates.extend(
+        [
+            (tm, "process_group"),
+            (tm, "distributed_process_group"),
+        ]
+    )
+    for obj, attr in candidates:
+        try:
+            pg = getattr(obj, attr, None)
+        except Exception:
+            pg = None
+        if is_process_group(pg):
+            return pg
+    return None
+
+
+def get_group_world_size(group: object | None) -> int:
+    try:
+        if group is None or not is_process_group(group):
+            if dist.is_available() and dist.is_initialized():
+                return int(dist.get_world_size())
+            return int(get_world_size())
+        return int(dist.get_world_size(group=group))
+    except Exception:
+        return int(get_world_size())
+
+
+def distributed_all_reduce_sum(t: torch.Tensor, group: object | None = None) -> None:
+    if not isinstance(t, torch.Tensor):
+        return
+    try:
+        if not (dist.is_available() and dist.is_initialized()):
+            return
+    except Exception:
+        return
+
+    try:
+        if group is None or not is_process_group(group):
+            dist.all_reduce(t, op=dist.ReduceOp.SUM)
+        else:
+            dist.all_reduce(t, op=dist.ReduceOp.SUM, group=group)
+    except Exception:
+        with contextlib.suppress(Exception):
+            dist.all_reduce(t, op=dist.ReduceOp.SUM)
+
 
 
 @contextlib.contextmanager

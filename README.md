@@ -19,7 +19,6 @@ This repository also includes a worked example notebook (`notebook.ipynb`) and a
 - **onnxruntime**: >= 1.23.2
 - **onnxscript**: >= 0.5.7
 - **onnx_ir**: >= 0.1.14
-- **openzl**: >= 0.1.0 (If error happens when building wheel, install this using the official GitHub repository by Meta Platforms, Inc. (e.g., `pip install "openzl @ git+https://github.com/facebook/openzl.git#subdirectory=py"`)
 - **ml_dtypes**: >= 0.5.4
 - **psutil**: >= 7.2.1
 - **py-cpuinfo**: >= 9.0.0
@@ -37,7 +36,7 @@ This repository also includes a worked example notebook (`notebook.ipynb`) and a
 - **Templated configurations** (`enn_torch.core.config`): dataclass configs with coercion/validation and string canonicalizers for modeling type, normalization, and compile options.
 - **Neural network stacks** (`enn_torch.nn`): spatio-temporal Fuser/Collector blocks (Template tasks + Perceiver resampler), attention variants, scaler + recorder modules, AMP negotiation guard band (`ModelConfig.safety_margin_pow2`).
 - **Data pipeline** (`enn_torch.data`): `torchdata.nodes`-driven memmap pipeline with TensorDict support, prefetch/pin/pool options, and scale-aware dataset metadata.
-- **Runnable tasks** (`enn_torch.runtime`): thread/NUMA tuning, free-threaded/no-GIL optimizations, mixed-precision helpers, history recorder, and OOM recovery hooks. ONNX/ORT/onnxscript/onnx_ir/torch.export (PT2) out of the box; optional platform-dependent backends (TensorRT/CoreML/ExecuTorch/onnx-tf) via extras. elastic launch wiring and group setup for multi-process CPU/GPU runs.
+- **Runnable tasks** (`enn_torch.runtime`): thread/NUMA tuning, free-threaded/no-GIL optimizations, mixed-precision helpers, history recorder, and OOM recovery hooks (see `enn_torch.runtime.autotune`). ONNX/ORT/onnxscript/onnx_ir/torch.export (PT2) out of the box; optional platform-dependent backends (TensorRT/CoreML/ExecuTorch/onnx-tf) via extras. elastic launch wiring and group setup for multi-process CPU/GPU runs.
 - **Losses/optimizers/profiling** (`enn_torch.core`): Student’s t losses, SWA helpers, FLOP/IO timing.
 
 ## Model layout (current)

@@ -75,6 +75,32 @@ TMerge = TypeVar("TMerge")
 logger = logging.getLogger(__name__)
 
 
+def get_batch_length(loader: object) -> int:
+    if loader is None:
+        return 0
+    try:
+        n = len(loader)
+        if isinstance(n, int) and n >= 0:
+            return int(n)
+    except Exception:
+        pass
+    if hasattr(loader, "state_dict") and hasattr(loader, "load_state_dict"):
+        state = None
+        with contextlib.suppress(Exception):
+            state = loader.state_dict()
+        if state is not None:
+            count = 0
+            try:
+                for _ in loader:
+                    count += 1
+            finally:
+                with contextlib.suppress(Exception):
+                    loader.load_state_dict(state)
+            return int(count)
+    return 0
+
+
+
 def _require_nodes() -> None:
     global _NODES_IMPORTED
     if _NODES_IMPORTED:

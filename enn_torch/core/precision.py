@@ -1041,10 +1041,7 @@ class Quantization:
         _import_torchao_quantization()
         if _qp is None:
             raise RuntimeError("torchao.quantization.quant_primitives unavailable")
-        _log_debug(
-            logger,
-            f"[INT8][QAT] prepare(dynamic_activations={dynamic_activations}, group={group_size})",
-        )
+
         try:
             from torchao.quantization.fake_quant import (
                 FakeQuantizeConfig,
@@ -1182,3 +1179,214 @@ class Quantization:
             setattr(m2, "__int8_training_ptq__", True)
             return (m2, True, f"PTQ({why})")
         return (model, False, f"PTQ failed: {why}")
+
+
+def is_precision_exempted(module: object) -> bool:
+    return bool(getattr(module, "__enn_precision_exempt__", False))
+
+
+def _set_requires_grad(module: nn.Module, name: str, data: torch.Tensor, *, requires_grad: bool) -> None:
+    setattr(module, name, nn.Parameter(data, requires_grad=requires_grad))
+
+
+def cast_float_dtype(model: object, dtype: torch.dtype) -> None:
+    if not isinstance(dtype, torch.dtype):
+        return
+    try:
+        if not torch.is_floating_point(torch.empty((), dtype=dtype)):
+            return
+    except Exception:
+        return
+
+    with torch.no_grad():
+        for mod in getattr(model, "modules", lambda: [])():
+            if is_precision_exempted(mod):
+                continue
+            params = getattr(mod, "_parameters", None)
+            if params:
+                for name, p in list(params.items()):
+                    if p is None or not isinstance(p, torch.Tensor):
+                        continue
+                    if (not p.is_floating_point()) or p.dtype == dtype:
+                        continue
+                    params[name] = torch.nn.Parameter(
+                        p.detach().to(dtype),
+                        requires_grad=bool(getattr(p, "requires_grad", True)),
+                    )
+            bufs = getattr(mod, "_buffers", None)
+            if bufs:
+                for name, b in list(bufs.items()):
+                    if b is None or not isinstance(b, torch.Tensor):
+                        continue
+                    if (not b.is_floating_point()) or b.dtype == dtype:
+                        continue
+                    if b.dtype is torch.float64 and dtype is not torch.float64:
+                        continue
+                    bufs[name] = b.detach().to(dtype)
+
+
+def cast_batchnorm_buffers_dtype(module: object, dtype: torch.dtype | None) -> None:
+    if dtype is None or not isinstance(dtype, torch.dtype):
+        return
+    with torch.no_grad():
+        for mod in getattr(module, "modules", lambda: [])():
+            if is_precision_exempted(mod):
+                continue
+            if isinstance(
+                mod,
+                (
+                    torch.nn.BatchNorm1d,
+                    torch.nn.BatchNorm2d,
+                    torch.nn.BatchNorm3d,
+                    torch.nn.SyncBatchNorm,
+                ),
+            ):
+                for name, buf in getattr(mod, "_buffers", {}).items():
+                    if buf is None or not isinstance(buf, torch.Tensor):
+                        continue
+                    if (not buf.is_floating_point()) or buf.dtype == dtype:
+                        continue
+                    with contextlib.suppress(Exception):
+                        mod._buffers[name] = buf.to(dtype=dtype)
+
+
+def get_layernorm_dtype(device: torch.device | str) -> torch.dtype:
+    device = torch.device(device) if not isinstance(device, torch.device) else device
+    try:
+        meta = Autocast.coerce_metadata(device)
+        cands = tuple(getattr(meta, "float_dtypes", ())) if meta is not None else ()
+        if not cands:
+            cands = (torch.float32,)
+        chosen = Autocast.negotiate(
+            tuple(cands),
+            fallback=torch.float64,
+            context="cpu.layernorm",
+            device=device,
+            meta=meta,
+        )
+        return torch.float64 if chosen == torch.float64 else torch.float32
+    except Exception:
+        return torch.float32
+
+
+def preload_layers(model: nn.Module, device: torch.device | str) -> None:
+    device = torch.device(device) if not isinstance(device, torch.device) else device
+    from .tensor import is_meta_or_fake_tensor
+
+    for module in model.modules():
+        if not isinstance(module, nn.LayerNorm):
+            continue
+        weight = getattr(module, "weight", None)
+        bias = getattr(module, "bias", None)
+        requires_grad_w = bool(getattr(weight, "requires_grad", True))
+        requires_grad_b = bool(getattr(bias, "requires_grad", True))
+
+        if device.type == "cpu":
+            target_dtype = get_layernorm_dtype(device)
+        else:
+            target_dtype = None
+            for tensor in (weight, bias):
+                if isinstance(tensor, torch.Tensor) and tensor.is_floating_point():
+                    if not is_meta_or_fake_tensor(tensor):
+                        target_dtype = tensor.dtype
+                        break
+            if target_dtype is None:
+                target_dtype = torch.get_default_dtype()
+
+        if module.elementwise_affine:
+            if not isinstance(weight, torch.Tensor) or is_meta_or_fake_tensor(weight):
+                data = torch.ones(module.normalized_shape, device=device, dtype=target_dtype)
+                _set_requires_grad(module, "weight", data, requires_grad=requires_grad_w)
+                weight = module.weight
+            if not isinstance(bias, torch.Tensor) or is_meta_or_fake_tensor(bias):
+                data = torch.zeros(module.normalized_shape, device=device, dtype=target_dtype)
+                _set_requires_grad(module, "bias", data, requires_grad=requires_grad_b)
+                bias = module.bias
+
+        if device.type == "cpu":
+            if isinstance(weight, torch.Tensor) and weight.dtype != target_dtype:
+                data = weight.to(device=device, dtype=target_dtype)
+                _set_requires_grad(module, "weight", data, requires_grad=requires_grad_w)
+                weight = module.weight
+            if isinstance(bias, torch.Tensor) and bias.dtype != target_dtype:
+                data = bias.to(device=device, dtype=target_dtype)
+                _set_requires_grad(module, "bias", data, requires_grad=requires_grad_b)
+                bias = module.bias
+        elif (
+            isinstance(weight, torch.Tensor)
+            and isinstance(bias, torch.Tensor)
+            and weight.is_floating_point()
+            and bias.is_floating_point()
+            and (bias.dtype != weight.dtype)
+        ):
+            data = bias.to(device=device, dtype=weight.dtype)
+            _set_requires_grad(module, "bias", data, requires_grad=requires_grad_b)
+
+
+def validate_model_dtype_unity(model: nn.Module, device: torch.device | str) -> None:
+    device = torch.device(device) if not isinstance(device, torch.device) else device
+    mismatches: list[str] = []
+    for name, module in model.named_modules():
+        if not isinstance(module, nn.LayerNorm):
+            continue
+        tensors = [
+            ("weight", getattr(module, "weight", None)),
+            ("bias", getattr(module, "bias", None)),
+        ]
+        expected: torch.dtype | None = (
+            get_layernorm_dtype(device) if device.type == "cpu" else None
+        )
+
+        for label, tensor in tensors:
+            if not isinstance(tensor, torch.Tensor) or not tensor.is_floating_point():
+                continue
+            if expected is None:
+                expected = tensor.dtype
+            elif tensor.dtype != expected:
+                module_name = name or module.__class__.__name__
+                mismatches.append(
+                    f"{module_name}.{label} has dtype {tensor.dtype} (expected {expected})"
+                )
+
+        if expected is not None and device.type != "cpu":
+            dtypes = {
+                tensor.dtype
+                for _, tensor in tensors
+                if isinstance(tensor, torch.Tensor) and tensor.is_floating_point()
+            }
+            if len(dtypes) > 1:
+                module_name = name or module.__class__.__name__
+                mismatches.append(
+                    f"{module_name} parameters disagree on dtype: {sorted(str(d) for d in dtypes)}"
+                )
+
+    if mismatches:
+        raise RuntimeError(
+            "LayerNorm parameter dtype mismatch detected:\n" + "\n".join(mismatches)
+        )
+
+
+def unify_model_dtype(model: nn.Module, prefer: torch.dtype | None = None) -> torch.dtype | None:
+    dtypes = {p.dtype for p in model.parameters() if p is not None}
+    if len(dtypes) <= 1:
+        return None
+
+    if prefer is not None:
+        tgt = prefer
+    elif torch.bfloat16 in dtypes:
+        tgt = torch.bfloat16
+    elif torch.float16 in dtypes:
+        tgt = torch.float16
+    else:
+        tgt = torch.float32
+
+    for mod in model.modules():
+        params = getattr(mod, "_parameters", None)
+        if not params:
+            continue
+        for name, p in list(params.items()):
+            if p is None or p.dtype == tgt:
+                continue
+            params[name] = torch.nn.Parameter(p.detach().to(tgt), requires_grad=p.requires_grad)
+
+    return tgt
