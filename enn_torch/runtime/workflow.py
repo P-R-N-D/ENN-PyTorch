@@ -31,7 +31,12 @@ from tensordict import (
     TensorDict,
     TensorDictBase,
 )
-from torch.distributed.checkpoint import FileSystemReader, FileSystemWriter, load, save
+from torch.distributed.checkpoint import (
+    FileSystemReader,
+    FileSystemWriter,
+    load,
+    save,
+)
 from torch.distributed.checkpoint.state_dict import (
     StateDictOptions,
     get_model_state_dict,
@@ -39,7 +44,6 @@ from torch.distributed.checkpoint.state_dict import (
 )
 from torch.distributed.launcher.api import LaunchConfig, elastic_launch
 
-from ..data import collate as schema
 from ..core.config import (
     ModelConfig,
     RuntimeConfig,
@@ -48,19 +52,8 @@ from ..core.config import (
     runtime_config,
 )
 from ..core.datatypes import env_bool, read_json
-from .distributed import (
-    ProcessBroker,
-    get_available_host,
-    get_preferred_ip,
-    init_master_addr,
-)
-from ..nn.graph import inference_mode
 from ..core.policies import WorkerPolicy
-from ..core.system import (
-    _start_context,
-    new_dir,
-    optimal_start_method,
-)
+from ..core.system import _start_context, new_dir, optimal_start_method
 from ..core.tensor import coerce_tensor
 from ..data import collate
 from ..data.collate import MappingSlicer, TensorDictSlicer
@@ -71,11 +64,19 @@ from ..data.pipeline import (
     normalize_underflow_action,
     preload_memmap,
 )
-from ..nn.wrappers import Model
+from ..nn.graph import inference_mode
 from ..nn.layers import Recorder, Scaler, resize_scaler_buffer
+from ..nn.wrappers import Model
+from .distributed import (
+    ProcessBroker,
+    _coerce_dcp_keys,
+    get_available_host,
+    get_preferred_ip,
+    init_master_addr,
+)
 from .io import _filtered_warnings, _torch_load_checkpoint, is_required
-from .distributed import _coerce_dcp_keys
 from .main import process
+
 
 def _rewrite_state_dict_key(k: str) -> str:
     if k.startswith("m.") and ".module." in k:
@@ -338,12 +339,12 @@ def _adapt_source(
         allow_columns
         and isinstance(d, Mapping)
         and all(not isinstance(v, Mapping) for v in d.values())
-        and not schema.is_feature_label_batch_mapping(d)
+        and not collate.is_feature_label_batch_mapping(d)
     ):
         count, getter = collate.column_cursor(d)
         return count, getter, False
-    if isinstance(d, Mapping) and schema.is_feature_label_batch_mapping(d):
-        f_key = schema.get_feature_key(d)
+    if isinstance(d, Mapping) and collate.is_feature_label_batch_mapping(d):
+        f_key = collate.get_feature_key(d)
         if f_key is None:
             return 0, None, True
         count = _value_len(d.get(f_key))
@@ -715,15 +716,15 @@ def _to_torch_dtype(dt: object) -> Optional[torch.dtype]:
 def _get_float_precision(obj: object) -> torch.dtype:
     try:
         if TensorDictBase is not None and isinstance(obj, TensorDictBase):
-            X_td, _ = schema.get_row(obj, labels_required=False)
+            X_td, _ = collate.get_row(obj, labels_required=False)
             if X_td is None:
                 return torch.float32
             if not bool(torch.is_tensor(X_td)):
                 X_td = torch.as_tensor(X_td)
             dt = _to_torch_dtype(getattr(X_td, "dtype", None))
             return torch.float64 if dt == torch.float64 else torch.float32
-        if isinstance(obj, Mapping) and schema.is_feature_label_batch_mapping(obj):
-            f_key = schema.get_feature_key(obj)
+        if isinstance(obj, Mapping) and collate.is_feature_label_batch_mapping(obj):
+            f_key = collate.get_feature_key(obj)
             if f_key is not None and f_key in obj:
                 X_all = obj.get(f_key)
                 dt = _to_torch_dtype(getattr(X_all, "dtype", None))
