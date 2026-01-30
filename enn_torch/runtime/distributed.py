@@ -64,482 +64,6 @@ _GLOOX_GLOO_PG_CACHE: dict[tuple[int, ...], ProcessGroup] = {}
 _LOGGER = logging.getLogger(__name__)
 
 
-class Broker:
-    DL_STATE_FILE: str = "dataloader.json"
-
-    _IGNORED_WARNING_PATTERNS: tuple[str, ...] = (
-        "torch.distributed is disabled, unavailable or uninitialized",
-        "torch.distributed is disabled",
-        "TypedStorage is deprecated",
-        "Found a non-scalar tensor with numel=1 and ndim!=0",
-        "distributed_broadcast: coalesced broadcast failed",
-        "distributed_broadcast: per-tensor broadcast failed",
-        "found no DeviceMesh from dtensor args",
-        "mixed precision.*may be unavailable",
-        "Either mode or options can be specified, but both can't be specified at the same time\\.",
-    )
-    _IGNORED_WARNING_MESSAGE_RE = re.compile(
-        r".*(?:" + "|".join((f"(?:{p})" for p in _IGNORED_WARNING_PATTERNS)) + r").*"
-    )
-
-    @classmethod
-    def apply_warning_filters(cls) -> None:
-        with contextlib.suppress(Exception):
-            warnings.filterwarnings(
-                "ignore",
-                message=cls._IGNORED_WARNING_MESSAGE_RE.pattern,
-                category=UserWarning,
-            )
-
-    @classmethod
-    def clear_process_group(cls) -> None:
-        try:
-            if dist.is_available() and dist.is_initialized():
-                with contextlib.suppress(Exception):
-                    dist.barrier()
-                with contextlib.suppress(Exception):
-                    dist.destroy_process_group()
-        except Exception:
-            pass
-
-    @classmethod
-    def set_seed(cls, seed_value: int | None) -> None:
-        if seed_value is None:
-            return
-        try:
-            seed_i = int(seed_value)
-        except Exception:
-            return
-        with contextlib.suppress(Exception):
-            torch.manual_seed(seed_i)
-        with contextlib.suppress(Exception):
-            set_accelerator_seed(seed_i)
-        with contextlib.suppress(Exception):
-            random.seed(seed_i)
-        with contextlib.suppress(Exception):
-            import numpy
-
-            numpy.random.seed(seed_i)
-
-    @classmethod
-    def bootstrap(
-        cls,
-        *args: Any,
-        seed: int | None = None,
-        clear_pg: bool = True,
-        apply_warning_filters: bool = True,
-        **kwargs: Any,
-    ) -> None:
-        if apply_warning_filters:
-            cls.apply_warning_filters()
-        if clear_pg:
-            cls.clear_process_group()
-
-        init_python_path()
-        with contextlib.suppress(Exception):
-            torch.multiprocessing.allow_connection_pickling()
-        with contextlib.suppress(Exception):
-            init_start_method()
-        if seed is not None:
-            cls.set_seed(seed)
-
-    @classmethod
-    def get_backend_type(cls, device: torch.device) -> str:
-        dev_type = str(getattr(device, "type", "cpu")).lower()
-        if dev_type == "cuda":
-            return "nccl"
-        if dev_type == "xpu":
-            return "xccl"
-        if dev_type in ("cpu", "mps", "dml", "privateuseone"):
-            return "gloo"
-        if dev_type in ("hpu", "npu"):
-            return "hccl"
-        if dev_type == "xla":
-            return "xla"
-        get_default = getattr(torch.distributed, "get_default_backend_for_device", None)
-        if callable(get_default):
-            with contextlib.suppress(Exception):
-                return str(get_default(device)).lower()
-            with contextlib.suppress(Exception):
-                return str(get_default(dev_type)).lower()
-        return "gloo"
-
-    @classmethod
-    def ensure_default_socket_ifname(cls) -> None:
-        iface = None
-        gloo_if = os.environ.get("GLOO_SOCKET_IFNAME")
-        tp_if = os.environ.get("TP_SOCKET_IFNAME")
-        if gloo_if or tp_if:
-            if gloo_if and (not tp_if):
-                os.environ.setdefault("TP_SOCKET_IFNAME", str(gloo_if))
-            elif tp_if and (not gloo_if):
-                os.environ.setdefault("GLOO_SOCKET_IFNAME", str(tp_if))
-            return
-
-        try:
-            with open("/proc/net/route", "r", encoding="utf-8") as f:
-                for line in f.readlines()[1:]:
-                    fields = line.strip().split()
-                    if len(fields) >= 2 and fields[1] == "00000000":
-                        iface = fields[0]
-                        if iface:
-                            break
-        except Exception:
-            iface = None
-
-        if iface is None:
-            try:
-                import psutil
-
-                s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-                try:
-                    s.connect(("8.8.8.8", 80))
-                    ip = s.getsockname()[0]
-                finally:
-                    s.close()
-                if ip:
-                    for name, addrs in psutil.net_if_addrs().items():
-                        for a in addrs:
-                            if (
-                                getattr(a, "family", None) == socket.AF_INET
-                                and getattr(a, "address", None) == ip
-                            ):
-                                iface = str(name)
-                                break
-                        if iface:
-                            break
-            except Exception:
-                iface = None
-
-        if iface:
-            os.environ.setdefault("GLOO_SOCKET_IFNAME", iface)
-            os.environ.setdefault("TP_SOCKET_IFNAME", iface)
-
-    @classmethod
-    def _configure_torch_nccl_env(cls, device: torch.device) -> None:
-        if str(getattr(device, "type", "cpu")) != "cuda":
-            return
-        world = 1
-        with contextlib.suppress(Exception):
-            world = int(env_int("WORLD_SIZE", 1) or 1)
-        if "TORCH_NCCL_ENABLE_MONITORING" not in os.environ:
-            default_mon = 0 if int(world) <= 1 else 1
-            mon = int(env_int("ENN_TORCH_NCCL_ENABLE_MONITORING", default_mon))
-            os.environ["TORCH_NCCL_ENABLE_MONITORING"] = str(int(mon))
-        if "TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC" not in os.environ:
-            default_hb = 3600 if int(world) <= 1 else 600
-            hb = int(env_int("ENN_TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC", default_hb))
-            os.environ["TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC"] = str(int(hb))
-        if "TORCH_NCCL_DUMP_ON_TIMEOUT" not in os.environ:
-            default_dump = 0 if int(world) <= 1 else 1
-            dump = int(env_int("ENN_TORCH_NCCL_DUMP_ON_TIMEOUT", default_dump))
-            os.environ["TORCH_NCCL_DUMP_ON_TIMEOUT"] = str(int(dump))
-        if "TORCH_NCCL_ASYNC_ERROR_HANDLING" not in os.environ:
-            default_ae = 0 if int(world) <= 1 else 3
-            ae = int(env_int("ENN_TORCH_NCCL_ASYNC_ERROR_HANDLING", default_ae))
-            os.environ["TORCH_NCCL_ASYNC_ERROR_HANDLING"] = str(int(ae))
-        if "TORCH_NCCL_BLOCKING_WAIT" not in os.environ:
-            default_bw = 1 if int(world) <= 1 else 0
-            bw = int(env_int("ENN_TORCH_NCCL_BLOCKING_WAIT", default_bw))
-            os.environ["TORCH_NCCL_BLOCKING_WAIT"] = str(int(bw))
-
-
-    @classmethod
-    def configure_torch_nccl_env(cls, device: torch.device) -> None:
-        cls._configure_torch_nccl_env(device)
-
-    @classmethod
-    def _configure_torch_gloo_env(cls, device: torch.device) -> None:
-        cls.ensure_default_socket_ifname()
-
-    @classmethod
-    def configure_torch_gloo_env(cls, device: torch.device) -> None:
-        cls._configure_torch_gloo_env(device)
-
-    @classmethod
-    def _configure_torch_xccl_env(cls, device: torch.device) -> None:
-        return
-
-    @classmethod
-    def configure_torch_xccl_env(cls, device: torch.device) -> None:
-        cls._configure_torch_xccl_env(device)
-
-    @classmethod
-    def configure_backend_env(cls, backend: object, device: torch.device) -> None:
-        b = str(backend).lower() if backend is not None else ""
-        if b == "nccl":
-            cls._configure_torch_nccl_env(device)
-        elif b == "xccl":
-            cls._configure_torch_xccl_env(device)
-        elif b == "gloo":
-            cls._configure_torch_gloo_env(device)
-
-    @classmethod
-    def init_backend(cls, device: torch.device, local_rank: int | None = None) -> None:
-        with contextlib.suppress(Exception):
-            if device.type == "cuda" and hasattr(torch.backends, "cudnn"):
-                torch.backends.cudnn.benchmark = True
-        rank = int(os.environ.get("LOCAL_RANK", "0") or 0)
-        if local_rank is not None:
-            with contextlib.suppress(Exception):
-                rank = int(local_rank)
-        if device.type in {"cuda", "xpu"}:
-            n = max(1, int(get_num_accelerators(device.type) or 1))
-            set_accelerator_index(device.type, int(rank) % int(n))
-        else:
-            cls.ensure_default_socket_ifname()
-
-    @classmethod
-    def init_process_group(
-        cls, backend: object, device: torch.device, local_rank: int
-    ) -> None:
-        if torch.distributed.is_initialized():
-            return
-        dev_id = None
-        dev_type = getattr(device, "type", "cpu")
-        backend_name = str(backend).lower() if backend is not None else ""
-        if backend_name in ("nccl", "xccl") and dev_type in ("cuda", "xpu"):
-            index = (
-                device.index
-                if getattr(device, "index", None) is not None
-                else env_int("LOCAL_RANK", int(local_rank))
-            )
-            try:
-                dev_id = torch.device(dev_type, index)
-            except Exception:
-                dev_id = index
-
-        timeout = None
-        try:
-            import datetime
-
-            to_s = int(env_int("ENN_PROCESS_GROUP_TIMEOUT_SEC", 0) or 0)
-            if to_s <= 0 and backend_name in ("nccl", "xccl"):
-                ws = int(env_int("WORLD_SIZE", 1) or 1)
-                if ws <= 1:
-                    to_s = 3600
-            if int(to_s) > 0:
-                timeout = datetime.timedelta(seconds=int(to_s))
-        except Exception:
-            timeout = None
-
-        try:
-            kwargs: dict[str, Any] = {"backend": backend}
-            if dev_id is not None:
-                kwargs["device_id"] = dev_id
-            if timeout is not None:
-                kwargs["timeout"] = timeout
-            torch.distributed.init_process_group(**kwargs)
-        except TypeError:
-            try:
-                kwargs.pop("device_id", None)
-                torch.distributed.init_process_group(**kwargs)
-            except TypeError:
-                kwargs.pop("timeout", None)
-                torch.distributed.init_process_group(**kwargs)
-
-    @classmethod
-    def loader_state_path(cls, directory: PathLike) -> str:
-        return os.path.join(os.fspath(directory), cls.DL_STATE_FILE)
-
-    @classmethod
-    def get_loader_state(cls, directory: PathLike) -> str:
-        return cls.loader_state_path(directory)
-
-    @classmethod
-    def _rank0_only(cls) -> bool:
-        return is_rank0()
-
-    @classmethod
-    def log_rank0(
-        cls,
-        logger: logging.Logger,
-        msg: str,
-        *args: Any,
-        only_rank0: bool = True,
-        level: str = "info",
-        **kwargs: Any,
-    ) -> None:
-        if only_rank0 and not is_rank0():
-            return
-        try:
-            log_fn = getattr(logger, str(level).lower(), logger.info)
-        except Exception:
-            log_fn = logger.info
-        with contextlib.suppress(Exception):
-            log_fn(msg, *args)
-
-    @classmethod
-    def rank0_logger(
-        cls,
-        logger: logging.Logger,
-        *,
-        only_rank0: bool = True,
-        level: str = "info",
-    ) -> Callable[..., None]:
-        def _fn(
-            msg: str,
-            *args: Any,
-            only_main_rank: bool = True,
-            **kwargs: Any,
-        ) -> None:
-            cls.log_rank0(
-                logger,
-                msg,
-                *args,
-                only_rank0=bool(only_main_rank) and bool(only_rank0),
-                level=level,
-            )
-
-        return _fn
-
-    @classmethod
-    def make_progress_bar(
-        cls,
-        *args: Any,
-        title: str,
-        total: int,
-        device: torch.device,
-        **kwargs: Any,
-    ) -> object:
-        if not cls._rank0_only():
-            return None
-        if int(total) <= 0:
-            return None
-        try:
-            from tqdm.auto import tqdm
-            import sys
-
-            return tqdm(
-                total=int(total),
-                desc=f"{title} ({device.type.upper()}) ",
-                unit="I/O < 0.01 MB/s, COM < 0.01 TFLOPS",
-                bar_format="{desc}"
-                + "{bar} {percentage:3.2f} % "
-                + "({unit}) Elapsed: {elapsed}, Remaining: {remaining}",
-                colour="green",
-                ascii=True,
-                position=int(kwargs.get("position", 0) or 0),
-                leave=bool(kwargs.get("leave", False)),
-                file=sys.stdout,
-            )
-        except Exception:
-            return None
-
-    @classmethod
-    def get_progress_bar(
-        cls, title: str, total: int, device: torch.device, **kwargs: Any
-    ) -> object:
-        return cls.make_progress_bar(title=title, total=total, device=device, **kwargs)
-
-    @classmethod
-    def update_progress_bar(
-        cls,
-        bar: object,
-        finish: bool,
-        *args: Any,
-        mbps: float | None = None,
-        tflops: float | None = None,
-        **kwargs: Any,
-    ) -> None:
-        if bar is None:
-            return
-        try:
-            mbps_val = float(mbps) if mbps is not None else 0.0
-        except Exception:
-            mbps_val = 0.0
-        try:
-            tflops_val = float(tflops) if tflops is not None else 0.0
-        except Exception:
-            tflops_val = 0.0
-        io_expr = (
-            f"I/O = {mbps_val:.2f} MB/s" if mbps_val >= 0.01 else "I/O < 0.01 MB/s"
-        )
-        com_expr = (
-            f"COM = {tflops_val:.2f} TFLOPS"
-            if tflops_val >= 0.01
-            else "COM < 0.01 TFLOPS"
-        )
-        with contextlib.suppress(Exception):
-            bar.unit = io_expr + ", " + com_expr
-        try:
-            inc = int(finish)
-        except Exception:
-            inc = 1
-        if inc > 0:
-            with contextlib.suppress(Exception):
-                bar.update(inc)
-
-    @classmethod
-    def make_checkpoint_bar(
-        cls,
-        *args: Any,
-        title: str,
-        total: int,
-        device: torch.device,
-        **kwargs: Any,
-    ) -> object:
-        if not cls._rank0_only():
-            return None
-        if int(total) <= 0:
-            return None
-        try:
-            from tqdm.auto import tqdm
-            import sys
-
-            return tqdm(
-                total=int(total),
-                desc=f"{title} ({device.type.upper()}) ",
-                unit=f"(Total = {int(total)}, Finished = 0) Checkpoint in Progress",
-                bar_format="{desc}" + "{bar} {percentage:3.2f} % " + "{unit}",
-                colour="green",
-                ascii=True,
-                position=int(kwargs.get("position", 0) or 0),
-                leave=bool(kwargs.get("leave", False)),
-                file=sys.stdout,
-            )
-        except Exception:
-            return None
-
-    @classmethod
-    def get_checkpoint_bar(
-        cls, title: str, total: int, device: torch.device, **kwargs: Any
-    ) -> object:
-        return cls.make_checkpoint_bar(
-            title=title, total=total, device=device, **kwargs
-        )
-
-    @classmethod
-    def update_checkpoint_bar(
-        cls,
-        bar: object,
-        finish: bool,
-        total: int,
-        position: int,
-        *args: Any,
-        **kwargs: Any,
-    ) -> None:
-        if bar is None:
-            return
-        try:
-            inc = int(finish)
-        except Exception:
-            inc = 1
-        finished = int(position) + (1 if inc > 0 else 0)
-        if inc == 0:
-            chpt_expr = (
-                f"(Total = {int(total)}, Finished = {finished}) Checkpoint in Progress"
-            )
-        else:
-            chpt_expr = (
-                f"(Total = {int(total)}, Finished = {finished}) Checkpoint Completed"
-            )
-        with contextlib.suppress(Exception):
-            bar.unit = chpt_expr
-        with contextlib.suppress(Exception):
-            bar.update(inc)
-
-
 def _coerce_dcp_keys(state: object) -> object:
     if isinstance(state, dict):
         keys_to_drop: list[object] = []
@@ -557,14 +81,6 @@ def _coerce_dcp_keys(state: object) -> object:
             with contextlib.suppress(Exception):
                 state.pop(key, None)
     return state
-
-
-@dataclasses.dataclass
-class _PendingOp:
-    kind: str
-    epoch: int
-    future: object
-    started_monotonic: float
 
 
 def _future_result(fut: object) -> object:
@@ -603,503 +119,6 @@ def _add_future_callback(fut: object, fn: Callable[[], None]) -> None:
     if callable(add_done):
         with contextlib.suppress(Exception):
             add_done(lambda _: fn())
-
-
-class Checkpointer:
-    def __init__(
-        self,
-        ckpt_dir: PathLike,
-        *,
-        keep_last: int = 3,
-        max_in_flight: int = 1,
-        use_async: bool = True,
-        dcp_subdir: str = "dcp_epochs",
-        avg_subdir: str = "avg",
-        avg_ext: str = ".pt",
-        mmap_load: bool | None = None,
-        device: torch.device | None = None,
-    ) -> None:
-        self._device = device
-        self.root = Path(ckpt_dir)
-        self.dcp_root = self.root / dcp_subdir
-        self.avg_root = self.root / avg_subdir
-        self.avg_ext = avg_ext if str(avg_ext).startswith(".") else f".{avg_ext}"
-        self.keep_last = max(1, int(keep_last))
-        self.max_in_flight = max(1, int(max_in_flight))
-        self.use_async = bool(use_async)
-        self.mmap_load = mmap_load
-
-        self._pending_dcp: deque[_PendingOp] = deque()
-        self._pending_avg: deque[_PendingOp] = deque()
-        self._pending_lock = Mutex(reentrant=True)
-
-        self._avg_executor = concurrent.futures.ThreadPoolExecutor(
-            max_workers=1, thread_name_prefix="enn-avg-ckpt"
-        )
-
-        self._stager: object | None = None
-        self._stager_lock = Mutex(reentrant=True)
-        self._stager_owner_thread: int | None = None
-        self._stager_closed = False
-
-        try:
-            import torch.distributed as dist
-
-            self._dist = dist
-            self._rank = dist.get_rank() if dist.is_initialized() else 0
-            self._world = dist.get_world_size() if dist.is_initialized() else 1
-        except Exception:
-            self._dist = None
-            self._rank = 0
-            self._world = 1
-
-        self._local_rank = int(os.environ.get("LOCAL_RANK", "0") or 0)
-        self._local_world = int(os.environ.get("LOCAL_WORLD_SIZE", "1") or 1)
-        if self._local_world < 1:
-            self._local_world = 1
-        self._node_rank = self._rank // self._local_world if self._local_world else 0
-
-        self._dcp_process_group: object | None = None
-        self._dcp_should_participate: bool = True
-        if device is not None and self._is_distributed():
-            try:
-                mesh, kind = get_distributed_mesh(device)
-                if kind == "hsdp2" and mesh is not None:
-                    coord = None
-                    with contextlib.suppress(Exception):
-                        coord = mesh.get_coordinate()
-                    if isinstance(coord, tuple) and len(coord) >= 1:
-                        self._dcp_should_participate = int(coord[0]) == 0
-
-                    pg = None
-                    with contextlib.suppress(Exception):
-                        pg = mesh.get_group("dp_shard")
-                    if pg is not None:
-                        self._dcp_process_group = pg
-            except Exception:
-                self._dcp_process_group = None
-                self._dcp_should_participate = True
-
-        self.dcp_root.mkdir(parents=True, exist_ok=True)
-        self.avg_root.mkdir(parents=True, exist_ok=True)
-
-    def _is_distributed(self) -> bool:
-        return bool(self._dist is not None and self._dist.is_initialized())
-
-    def _is_global_rank0(self) -> bool:
-        return (not self._is_distributed()) or self._rank == 0
-
-    def _is_local_rank0(self) -> bool:
-        return (not self._is_distributed()) or self._local_rank == 0
-
-    def _epoch_dir(self, epoch: int) -> Path:
-        return self.dcp_root / f"epoch_{epoch:06d}"
-
-    def _epoch_done_file(self, epoch_dir: Path) -> Path:
-        return epoch_dir / "done.json"
-
-    def _avg_node_dir(self, node_rank: int | None = None) -> Path:
-        nr = self._node_rank if node_rank is None else int(node_rank)
-        return self.avg_root / f"node_{nr:04d}"
-
-    def _avg_epoch_path(self, epoch: int, node_rank: int | None = None) -> Path:
-        d = self._avg_node_dir(node_rank)
-        return d / f"epoch_{epoch:06d}{self.avg_ext}"
-
-    def _avg_latest_file(self, node_rank: int | None = None) -> Path:
-        return self._avg_node_dir(node_rank) / "latest.json"
-
-    def _ensure_stager(self) -> object | None:
-        if self._stager_closed:
-            return None
-        tid = threading.get_ident()
-        with self._stager_lock:
-            if self._stager is not None and self._stager_owner_thread == tid:
-                return self._stager
-            if self._stager is not None:
-                with contextlib.suppress(Exception):
-                    close = getattr(self._stager, "close", None)
-                    if callable(close):
-                        close()
-                self._stager = None
-                self._stager_owner_thread = None
-
-            try:
-                from torch.distributed.checkpoint.staging import DefaultStager, StagingOptions
-
-                use_pinned_memory = bool(
-                    self._device is not None and self._device.type == "cuda"
-                )
-                opts = StagingOptions(
-                    use_pinned_memory=use_pinned_memory,
-                    use_shared_memory=True,
-                    use_async_staging=True,
-                    use_non_blocking_copy=True,
-                )
-                self._stager = DefaultStager(config=opts)
-                self._stager_owner_thread = tid
-            except Exception:
-                self._stager = None
-                self._stager_owner_thread = None
-            return self._stager
-
-    def _maybe_wait_for_budget(self) -> None:
-        with self._pending_lock:
-            while self._pending_dcp and _future_done(self._pending_dcp[0].future):
-                self._pending_dcp.popleft()
-            while self._pending_avg and _future_done(self._pending_avg[0].future):
-                self._pending_avg.popleft()
-
-            while len(self._pending_dcp) >= self.max_in_flight:
-                op = self._pending_dcp[0]
-                fut = op.future
-                self._pending_lock.release()
-                try:
-                    _future_result(fut)
-                finally:
-                    self._pending_lock.acquire()
-                while self._pending_dcp and _future_done(self._pending_dcp[0].future):
-                    self._pending_dcp.popleft()
-
-            while len(self._pending_avg) >= 1:
-                op = self._pending_avg[0]
-                fut = op.future
-                self._pending_lock.release()
-                try:
-                    _future_result(fut)
-                finally:
-                    self._pending_lock.acquire()
-                while self._pending_avg and _future_done(self._pending_avg[0].future):
-                    self._pending_avg.popleft()
-
-    def _register_pending(self, kind: str, epoch: int, fut: object) -> None:
-        with self._pending_lock:
-            q = self._pending_dcp if kind == "dcp" else self._pending_avg
-            q.append(
-                _PendingOp(
-                    kind=kind,
-                    epoch=int(epoch),
-                    future=fut,
-                    started_monotonic=time.monotonic(),
-                )
-            )
-
-    def _finalize_dcp_epoch(
-        self, epoch: int, epoch_dir: Path, extra_meta: dict[str, Any]
-    ) -> None:
-        if not self._is_global_rank0():
-            return
-        try:
-            done_file = self._epoch_done_file(epoch_dir)
-            payload = {
-                "format": "enn-dcp-epoch-v1",
-                "epoch": int(epoch),
-                "created_time": time.time(),
-                "rank": int(self._rank),
-                "world_size": int(self._world),
-                "node_rank": int(self._node_rank),
-                **(extra_meta or {}),
-            }
-            write_json(done_file, payload, indent=2)
-        finally:
-            with contextlib.suppress(Exception):
-                self._prune_dcp()
-
-    def _prune_dcp(self) -> None:
-        if not self._is_global_rank0():
-            return
-        try:
-            epoch_dirs: list[Path] = []
-            for p in self.dcp_root.glob("epoch_*"):
-                if not p.is_dir():
-                    continue
-                if self._epoch_done_file(p).is_file():
-                    epoch_dirs.append(p)
-            epoch_dirs.sort(key=lambda x: x.name)
-            if len(epoch_dirs) <= self.keep_last:
-                return
-            for p in epoch_dirs[: max(0, len(epoch_dirs) - self.keep_last)]:
-                with contextlib.suppress(Exception):
-                    shutil.rmtree(p)
-        except Exception:
-            return
-
-    def _prune_avg(self, node_rank: int | None = None) -> None:
-        d = self._avg_node_dir(node_rank)
-        if not d.is_dir():
-            return
-        try:
-            files = sorted(d.glob(f"epoch_*{self.avg_ext}"), key=lambda x: x.name)
-            if len(files) <= self.keep_last:
-                return
-            for p in files[: max(0, len(files) - self.keep_last)]:
-                with contextlib.suppress(Exception):
-                    p.unlink()
-        except Exception:
-            return
-
-    def _save_avg_epoch(self, epoch: int, avg_state_dict: Mapping[str, Any]) -> Path:
-        node_rank = int(self._node_rank)
-        d = self._avg_node_dir(node_rank)
-        d.mkdir(parents=True, exist_ok=True)
-        payload = _coerce_dcp_keys(avg_state_dict)
-        path = self._avg_epoch_path(epoch, node_rank)
-        save_temp(path, payload)
-        meta = {
-            "format": "enn-avg-state-v1",
-            "epoch": int(epoch),
-            "created_time": time.time(),
-            "rank": int(self._rank),
-            "local_rank": int(self._local_rank),
-            "node_rank": int(node_rank),
-            "world_size": int(self._world),
-            "local_world_size": int(self._local_world),
-        }
-        write_json(self._avg_latest_file(node_rank), meta, indent=2)
-        with contextlib.suppress(Exception):
-            self._prune_avg(node_rank)
-        return path
-
-    def _schedule_avg_save(self, epoch: int, avg_state_dict: Mapping[str, Any]) -> None:
-        try:
-            future = self._avg_executor.submit(
-                self._save_avg_epoch, int(epoch), avg_state_dict
-            )
-        except Exception as exc:
-            _LOGGER.exception("Average checkpoint scheduling failed: %s", exc)
-            return
-        self._register_pending("avg", int(epoch), future)
-
-    def request_save_epoch(
-        self,
-        *,
-        epoch: int,
-        model: nn.Module,
-        optimizer: object | None = None,
-        avg_state_dict: Mapping[str, Any] | None = None,
-        extra_state: dict[str, Any] | None = None,
-        force_sync: bool = False,
-    ) -> None:
-        epoch_i = int(epoch)
-
-        self._maybe_wait_for_budget()
-
-        if avg_state_dict is not None and self._is_local_rank0():
-            self._schedule_avg_save(epoch_i, avg_state_dict)
-
-        if not self._dcp_should_participate:
-            return
-
-        dcp_future: object | None = None
-        try:
-            import torch.distributed.checkpoint as dcp
-            from torch.distributed.checkpoint import FileSystemWriter
-            from torch.distributed.checkpoint.state_dict import StateDictOptions, get_state_dict
-
-            epoch_dir = self._epoch_dir(epoch_i)
-            epoch_dir.mkdir(parents=True, exist_ok=True)
-
-            opts = StateDictOptions(full_state_dict=False)
-            model_sd, optim_sd = get_state_dict(model, optimizer or [], options=opts)
-            dcp_state: dict[str, Any] = {"model": _coerce_dcp_keys(model_sd)}
-            if optimizer is not None:
-                dcp_state["optimizer"] = _coerce_dcp_keys(optim_sd)
-            if extra_state is not None:
-                dcp_state["extra"] = _coerce_dcp_keys(extra_state)
-
-            writer = FileSystemWriter(str(epoch_dir))
-            planner: object | None = None
-            with contextlib.suppress(Exception):
-                from torch.distributed.checkpoint import DefaultSavePlanner
-
-                planner = DefaultSavePlanner(dedup_save_to_lowest_rank=True)
-
-            if self.use_async and hasattr(dcp, "async_save"):
-                stager = self._ensure_stager()
-                kwargs: dict[str, Any] = {
-                    "state_dict": dcp_state,
-                    "checkpoint_id": str(epoch_dir),
-                    "storage_writer": writer,
-                    "planner": planner,
-                    "process_group": self._dcp_process_group,
-                }
-                if stager is not None:
-                    kwargs["async_stager"] = stager
-
-                with contextlib.suppress(Exception):
-                    from torch.distributed.checkpoint.state_dict_saver import (
-                        AsyncCheckpointerType,
-                    )
-
-                    async_type = (
-                        os.environ.get("ENN_DCP_ASYNC_TYPE", "thread").strip().lower()
-                    )
-                    if async_type == "process":
-                        kwargs["async_checkpointer_type"] = AsyncCheckpointerType.PROCESS
-                    elif async_type == "thread":
-                        kwargs["async_checkpointer_type"] = AsyncCheckpointerType.THREAD
-
-                try:
-                    sig = inspect.signature(dcp.async_save)
-                    supported = set(sig.parameters.keys())
-                    kwargs = {
-                        k: v for k, v in kwargs.items() if k in supported and v is not None
-                    }
-                except Exception:
-                    kwargs = {k: v for k, v in kwargs.items() if v is not None}
-
-                dcp_future = dcp.async_save(**kwargs)
-            else:
-                dcp.save(
-                    state_dict=dcp_state,
-                    checkpoint_id=str(epoch_dir),
-                    storage_writer=writer,
-                    planner=planner,
-                    process_group=self._dcp_process_group,
-                )
-                dcp_future = None
-
-            if dcp_future is not None:
-                if self._is_global_rank0():
-                    _add_future_callback(
-                        dcp_future,
-                        lambda: self._finalize_dcp_epoch(
-                            epoch_i,
-                            epoch_dir,
-                            extra_meta={"has_optimizer": optimizer is not None},
-                        ),
-                    )
-                self._register_pending("dcp", epoch_i, dcp_future)
-            else:
-                self._finalize_dcp_epoch(
-                    epoch_i,
-                    epoch_dir,
-                    extra_meta={"has_optimizer": optimizer is not None},
-                )
-        except Exception as exc:
-            _LOGGER.exception("DCP epoch checkpoint failed: %s", exc)
-            if force_sync:
-                raise
-
-    def wait(self) -> None:
-        pending: list[_PendingOp]
-        with self._pending_lock:
-            pending = list(self._pending_dcp) + list(self._pending_avg)
-        for op in pending:
-            with contextlib.suppress(Exception):
-                _future_result(op.future)
-        with self._pending_lock:
-            self._pending_dcp.clear()
-            self._pending_avg.clear()
-
-    def close(self) -> None:
-        self.wait()
-        with contextlib.suppress(Exception):
-            import torch.distributed.checkpoint.state_dict_saver as sds
-
-            close_fn = getattr(sds, "close", None)
-            if callable(close_fn):
-                close_fn()
-        with self._stager_lock:
-            self._stager_closed = True
-            if self._stager is not None:
-                with contextlib.suppress(Exception):
-                    close = getattr(self._stager, "close", None)
-                    if callable(close):
-                        close()
-                self._stager = None
-                self._stager_owner_thread = None
-        with contextlib.suppress(Exception):
-            self._avg_executor.shutdown(wait=True)
-
-    def find_latest_dcp_epoch(self) -> int | None:
-        try:
-            completed: list[int] = []
-            for p in self.dcp_root.glob("epoch_*"):
-                if not p.is_dir():
-                    continue
-                if self._epoch_done_file(p).is_file():
-                    m = re.match(r"epoch_(\\d+)", p.name)
-                    if m:
-                        completed.append(int(m.group(1)))
-            return max(completed) if completed else None
-        except Exception:
-            return None
-
-    def load_latest_dcp(
-        self,
-        *,
-        model: nn.Module,
-        optimizer: object | None = None,
-        strict: bool = False,
-    ) -> int | None:
-        latest = self.find_latest_dcp_epoch()
-        if latest is None:
-            return None
-        epoch_dir = self._epoch_dir(latest)
-        if not self._epoch_done_file(epoch_dir).is_file():
-            return None
-        try:
-            import torch.distributed.checkpoint as dcp
-            from torch.distributed.checkpoint import FileSystemReader
-            from torch.distributed.checkpoint.state_dict import (
-                StateDictOptions,
-                get_model_state_dict,
-                get_optimizer_state_dict,
-                set_model_state_dict,
-                set_optimizer_state_dict,
-            )
-
-            opts = StateDictOptions(full_state_dict=False, strict=bool(strict))
-            model_sd = get_model_state_dict(model, options=opts)
-            state: dict[str, Any] = {"model": model_sd}
-            optim_sd: Any | None = None
-            if optimizer is not None:
-                optim_sd = get_optimizer_state_dict(model, optimizer, options=opts)
-                state["optimizer"] = optim_sd
-            dcp.load(state_dict=state, storage_reader=FileSystemReader(str(epoch_dir)))
-            set_model_state_dict(model, model_sd, options=opts)
-            if optimizer is not None and optim_sd is not None:
-                set_optimizer_state_dict(model, optimizer, optim_sd, options=opts)
-            return latest
-        except Exception as exc:
-            _LOGGER.exception("DCP load failed: %s", exc)
-            if strict:
-                raise
-            return None
-
-    def load_model_from_torchsave_broadcast(
-        self,
-        *,
-        model: nn.Module,
-        torch_save_path: PathLike,
-        strict: bool = False,
-    ) -> None:
-        try:
-            import torch.distributed.checkpoint as dcp
-            from torch.distributed.checkpoint.format_utils import (
-                BroadcastingTorchSaveReader,
-                DynamicMetaLoadPlanner,
-            )
-            from torch.distributed.checkpoint.state_dict import (
-                StateDictOptions,
-                get_model_state_dict,
-                set_model_state_dict,
-            )
-
-            opts = StateDictOptions(full_state_dict=False, strict=bool(strict))
-            model_sd = get_model_state_dict(model, options=opts)
-            dcp.load(
-                state_dict={"model": model_sd},
-                storage_reader=BroadcastingTorchSaveReader(),
-                planner=DynamicMetaLoadPlanner(),
-                checkpoint_id=str(torch_save_path),
-            )
-            set_model_state_dict(model, model_sd, options=opts)
-        except Exception as exc:
-            _LOGGER.exception("Broadcasting TorchSave load failed: %s", exc)
-            if strict:
-                raise
 
 
 def _set_dtensor_active() -> None:
@@ -2339,3 +1358,984 @@ def get_distributed_mesh(
         return (mesh, "fsdp2")
     except Exception:
         return (None, "none")
+
+
+class ProcessBroker:
+    DL_STATE_FILE: str = "dataloader.json"
+
+    _IGNORED_WARNING_PATTERNS: tuple[str, ...] = (
+        "torch.distributed is disabled, unavailable or uninitialized",
+        "torch.distributed is disabled",
+        "TypedStorage is deprecated",
+        "Found a non-scalar tensor with numel=1 and ndim!=0",
+        "distributed_broadcast: coalesced broadcast failed",
+        "distributed_broadcast: per-tensor broadcast failed",
+        "found no DeviceMesh from dtensor args",
+        "mixed precision.*may be unavailable",
+        "Either mode or options can be specified, but both can't be specified at the same time\\.",
+    )
+    _IGNORED_WARNING_MESSAGE_RE = re.compile(
+        r".*(?:" + "|".join((f"(?:{p})" for p in _IGNORED_WARNING_PATTERNS)) + r").*"
+    )
+
+    @classmethod
+    def apply_warning_filters(cls) -> None:
+        with contextlib.suppress(Exception):
+            warnings.filterwarnings(
+                "ignore",
+                message=cls._IGNORED_WARNING_MESSAGE_RE.pattern,
+                category=UserWarning,
+            )
+
+    @classmethod
+    def clear_process_group(cls) -> None:
+        try:
+            if dist.is_available() and dist.is_initialized():
+                with contextlib.suppress(Exception):
+                    dist.barrier()
+                with contextlib.suppress(Exception):
+                    dist.destroy_process_group()
+        except Exception:
+            pass
+
+    @classmethod
+    def set_seed(cls, seed_value: int | None) -> None:
+        if seed_value is None:
+            return
+        try:
+            seed_i = int(seed_value)
+        except Exception:
+            return
+        with contextlib.suppress(Exception):
+            torch.manual_seed(seed_i)
+        with contextlib.suppress(Exception):
+            set_accelerator_seed(seed_i)
+        with contextlib.suppress(Exception):
+            random.seed(seed_i)
+        with contextlib.suppress(Exception):
+            import numpy
+
+            numpy.random.seed(seed_i)
+
+    @classmethod
+    def bootstrap(
+        cls,
+        *args: Any,
+        seed: int | None = None,
+        clear_pg: bool = True,
+        apply_warning_filters: bool = True,
+        **kwargs: Any,
+    ) -> None:
+        if apply_warning_filters:
+            cls.apply_warning_filters()
+        if clear_pg:
+            cls.clear_process_group()
+
+        init_python_path()
+        with contextlib.suppress(Exception):
+            torch.multiprocessing.allow_connection_pickling()
+        with contextlib.suppress(Exception):
+            init_start_method()
+        if seed is not None:
+            cls.set_seed(seed)
+
+    @classmethod
+    def get_backend_type(cls, device: torch.device) -> str:
+        dev_type = str(getattr(device, "type", "cpu")).lower()
+        if dev_type == "cuda":
+            return "nccl"
+        if dev_type == "xpu":
+            return "xccl"
+        if dev_type in ("cpu", "mps", "dml", "privateuseone"):
+            return "gloo"
+        if dev_type in ("hpu", "npu"):
+            return "hccl"
+        if dev_type == "xla":
+            return "xla"
+        get_default = getattr(torch.distributed, "get_default_backend_for_device", None)
+        if callable(get_default):
+            with contextlib.suppress(Exception):
+                return str(get_default(device)).lower()
+            with contextlib.suppress(Exception):
+                return str(get_default(dev_type)).lower()
+        return "gloo"
+
+    @classmethod
+    def ensure_default_socket_ifname(cls) -> None:
+        iface = None
+        gloo_if = os.environ.get("GLOO_SOCKET_IFNAME")
+        tp_if = os.environ.get("TP_SOCKET_IFNAME")
+        if gloo_if or tp_if:
+            if gloo_if and (not tp_if):
+                os.environ.setdefault("TP_SOCKET_IFNAME", str(gloo_if))
+            elif tp_if and (not gloo_if):
+                os.environ.setdefault("GLOO_SOCKET_IFNAME", str(tp_if))
+            return
+
+        try:
+            with open("/proc/net/route", "r", encoding="utf-8") as f:
+                for line in f.readlines()[1:]:
+                    fields = line.strip().split()
+                    if len(fields) >= 2 and fields[1] == "00000000":
+                        iface = fields[0]
+                        if iface:
+                            break
+        except Exception:
+            iface = None
+
+        if iface is None:
+            try:
+                import psutil
+
+                s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                try:
+                    s.connect(("8.8.8.8", 80))
+                    ip = s.getsockname()[0]
+                finally:
+                    s.close()
+                if ip:
+                    for name, addrs in psutil.net_if_addrs().items():
+                        for a in addrs:
+                            if (
+                                getattr(a, "family", None) == socket.AF_INET
+                                and getattr(a, "address", None) == ip
+                            ):
+                                iface = str(name)
+                                break
+                        if iface:
+                            break
+            except Exception:
+                iface = None
+
+        if iface:
+            os.environ.setdefault("GLOO_SOCKET_IFNAME", iface)
+            os.environ.setdefault("TP_SOCKET_IFNAME", iface)
+
+    @classmethod
+    def _configure_torch_nccl_env(cls, device: torch.device) -> None:
+        if str(getattr(device, "type", "cpu")) != "cuda":
+            return
+        world = 1
+        with contextlib.suppress(Exception):
+            world = int(env_int("WORLD_SIZE", 1) or 1)
+        if "TORCH_NCCL_ENABLE_MONITORING" not in os.environ:
+            default_mon = 0 if int(world) <= 1 else 1
+            mon = int(env_int("ENN_TORCH_NCCL_ENABLE_MONITORING", default_mon))
+            os.environ["TORCH_NCCL_ENABLE_MONITORING"] = str(int(mon))
+        if "TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC" not in os.environ:
+            default_hb = 3600 if int(world) <= 1 else 600
+            hb = int(env_int("ENN_TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC", default_hb))
+            os.environ["TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC"] = str(int(hb))
+        if "TORCH_NCCL_DUMP_ON_TIMEOUT" not in os.environ:
+            default_dump = 0 if int(world) <= 1 else 1
+            dump = int(env_int("ENN_TORCH_NCCL_DUMP_ON_TIMEOUT", default_dump))
+            os.environ["TORCH_NCCL_DUMP_ON_TIMEOUT"] = str(int(dump))
+        if "TORCH_NCCL_ASYNC_ERROR_HANDLING" not in os.environ:
+            default_ae = 0 if int(world) <= 1 else 3
+            ae = int(env_int("ENN_TORCH_NCCL_ASYNC_ERROR_HANDLING", default_ae))
+            os.environ["TORCH_NCCL_ASYNC_ERROR_HANDLING"] = str(int(ae))
+        if "TORCH_NCCL_BLOCKING_WAIT" not in os.environ:
+            default_bw = 1 if int(world) <= 1 else 0
+            bw = int(env_int("ENN_TORCH_NCCL_BLOCKING_WAIT", default_bw))
+            os.environ["TORCH_NCCL_BLOCKING_WAIT"] = str(int(bw))
+
+
+    @classmethod
+    def configure_torch_nccl_env(cls, device: torch.device) -> None:
+        cls._configure_torch_nccl_env(device)
+
+    @classmethod
+    def _configure_torch_gloo_env(cls, device: torch.device) -> None:
+        cls.ensure_default_socket_ifname()
+
+    @classmethod
+    def configure_torch_gloo_env(cls, device: torch.device) -> None:
+        cls._configure_torch_gloo_env(device)
+
+    @classmethod
+    def _configure_torch_xccl_env(cls, device: torch.device) -> None:
+        return
+
+    @classmethod
+    def configure_torch_xccl_env(cls, device: torch.device) -> None:
+        cls._configure_torch_xccl_env(device)
+
+    @classmethod
+    def configure_backend_env(cls, backend: object, device: torch.device) -> None:
+        b = str(backend).lower() if backend is not None else ""
+        if b == "nccl":
+            cls._configure_torch_nccl_env(device)
+        elif b == "xccl":
+            cls._configure_torch_xccl_env(device)
+        elif b == "gloo":
+            cls._configure_torch_gloo_env(device)
+
+    @classmethod
+    def init_backend(cls, device: torch.device, local_rank: int | None = None) -> None:
+        with contextlib.suppress(Exception):
+            if device.type == "cuda" and hasattr(torch.backends, "cudnn"):
+                torch.backends.cudnn.benchmark = True
+        rank = int(os.environ.get("LOCAL_RANK", "0") or 0)
+        if local_rank is not None:
+            with contextlib.suppress(Exception):
+                rank = int(local_rank)
+        if device.type in {"cuda", "xpu"}:
+            n = max(1, int(get_num_accelerators(device.type) or 1))
+            set_accelerator_index(device.type, int(rank) % int(n))
+        else:
+            cls.ensure_default_socket_ifname()
+
+    @classmethod
+    def init_process_group(
+        cls, backend: object, device: torch.device, local_rank: int
+    ) -> None:
+        if torch.distributed.is_initialized():
+            return
+        dev_id = None
+        dev_type = getattr(device, "type", "cpu")
+        backend_name = str(backend).lower() if backend is not None else ""
+        if backend_name in ("nccl", "xccl") and dev_type in ("cuda", "xpu"):
+            index = (
+                device.index
+                if getattr(device, "index", None) is not None
+                else env_int("LOCAL_RANK", int(local_rank))
+            )
+            try:
+                dev_id = torch.device(dev_type, index)
+            except Exception:
+                dev_id = index
+
+        timeout = None
+        try:
+            import datetime
+
+            to_s = int(env_int("ENN_PROCESS_GROUP_TIMEOUT_SEC", 0) or 0)
+            if to_s <= 0 and backend_name in ("nccl", "xccl"):
+                ws = int(env_int("WORLD_SIZE", 1) or 1)
+                if ws <= 1:
+                    to_s = 3600
+            if int(to_s) > 0:
+                timeout = datetime.timedelta(seconds=int(to_s))
+        except Exception:
+            timeout = None
+
+        try:
+            kwargs: dict[str, Any] = {"backend": backend}
+            if dev_id is not None:
+                kwargs["device_id"] = dev_id
+            if timeout is not None:
+                kwargs["timeout"] = timeout
+            torch.distributed.init_process_group(**kwargs)
+        except TypeError:
+            try:
+                kwargs.pop("device_id", None)
+                torch.distributed.init_process_group(**kwargs)
+            except TypeError:
+                kwargs.pop("timeout", None)
+                torch.distributed.init_process_group(**kwargs)
+
+    @classmethod
+    def loader_state_path(cls, directory: PathLike) -> str:
+        return os.path.join(os.fspath(directory), cls.DL_STATE_FILE)
+
+    @classmethod
+    def get_loader_state(cls, directory: PathLike) -> str:
+        return cls.loader_state_path(directory)
+
+    @classmethod
+    def _rank0_only(cls) -> bool:
+        return is_rank0()
+
+    @classmethod
+    def log_rank0(
+        cls,
+        logger: logging.Logger,
+        msg: str,
+        *args: Any,
+        only_rank0: bool = True,
+        level: str = "info",
+        **kwargs: Any,
+    ) -> None:
+        if only_rank0 and not is_rank0():
+            return
+        try:
+            log_fn = getattr(logger, str(level).lower(), logger.info)
+        except Exception:
+            log_fn = logger.info
+        with contextlib.suppress(Exception):
+            log_fn(msg, *args)
+
+    @classmethod
+    def rank0_logger(
+        cls,
+        logger: logging.Logger,
+        *,
+        only_rank0: bool = True,
+        level: str = "info",
+    ) -> Callable[..., None]:
+        def _fn(
+            msg: str,
+            *args: Any,
+            only_main_rank: bool = True,
+            **kwargs: Any,
+        ) -> None:
+            cls.log_rank0(
+                logger,
+                msg,
+                *args,
+                only_rank0=bool(only_main_rank) and bool(only_rank0),
+                level=level,
+            )
+
+        return _fn
+
+    @classmethod
+    def make_progress_bar(
+        cls,
+        *args: Any,
+        title: str,
+        total: int,
+        device: torch.device,
+        **kwargs: Any,
+    ) -> object:
+        if not cls._rank0_only():
+            return None
+        if int(total) <= 0:
+            return None
+        try:
+            from tqdm.auto import tqdm
+            import sys
+
+            return tqdm(
+                total=int(total),
+                desc=f"{title} ({device.type.upper()}) ",
+                unit="I/O < 0.01 MB/s, COM < 0.01 TFLOPS",
+                bar_format="{desc}"
+                + "{bar} {percentage:3.2f} % "
+                + "({unit}) Elapsed: {elapsed}, Remaining: {remaining}",
+                colour="green",
+                ascii=True,
+                position=int(kwargs.get("position", 0) or 0),
+                leave=bool(kwargs.get("leave", False)),
+                file=sys.stdout,
+            )
+        except Exception:
+            return None
+
+    @classmethod
+    def get_progress_bar(
+        cls, title: str, total: int, device: torch.device, **kwargs: Any
+    ) -> object:
+        return cls.make_progress_bar(title=title, total=total, device=device, **kwargs)
+
+    @classmethod
+    def update_progress_bar(
+        cls,
+        bar: object,
+        finish: bool,
+        *args: Any,
+        mbps: float | None = None,
+        tflops: float | None = None,
+        **kwargs: Any,
+    ) -> None:
+        if bar is None:
+            return
+        try:
+            mbps_val = float(mbps) if mbps is not None else 0.0
+        except Exception:
+            mbps_val = 0.0
+        try:
+            tflops_val = float(tflops) if tflops is not None else 0.0
+        except Exception:
+            tflops_val = 0.0
+        io_expr = (
+            f"I/O = {mbps_val:.2f} MB/s" if mbps_val >= 0.01 else "I/O < 0.01 MB/s"
+        )
+        com_expr = (
+            f"COM = {tflops_val:.2f} TFLOPS"
+            if tflops_val >= 0.01
+            else "COM < 0.01 TFLOPS"
+        )
+        with contextlib.suppress(Exception):
+            bar.unit = io_expr + ", " + com_expr
+        try:
+            inc = int(finish)
+        except Exception:
+            inc = 1
+        if inc > 0:
+            with contextlib.suppress(Exception):
+                bar.update(inc)
+
+    @classmethod
+    def make_checkpoint_bar(
+        cls,
+        *args: Any,
+        title: str,
+        total: int,
+        device: torch.device,
+        **kwargs: Any,
+    ) -> object:
+        if not cls._rank0_only():
+            return None
+        if int(total) <= 0:
+            return None
+        try:
+            from tqdm.auto import tqdm
+            import sys
+
+            return tqdm(
+                total=int(total),
+                desc=f"{title} ({device.type.upper()}) ",
+                unit=f"(Total = {int(total)}, Finished = 0) Checkpoint in Progress",
+                bar_format="{desc}" + "{bar} {percentage:3.2f} % " + "{unit}",
+                colour="green",
+                ascii=True,
+                position=int(kwargs.get("position", 0) or 0),
+                leave=bool(kwargs.get("leave", False)),
+                file=sys.stdout,
+            )
+        except Exception:
+            return None
+
+    @classmethod
+    def get_checkpoint_bar(
+        cls, title: str, total: int, device: torch.device, **kwargs: Any
+    ) -> object:
+        return cls.make_checkpoint_bar(
+            title=title, total=total, device=device, **kwargs
+        )
+
+    @classmethod
+    def update_checkpoint_bar(
+        cls,
+        bar: object,
+        finish: bool,
+        total: int,
+        position: int,
+        *args: Any,
+        **kwargs: Any,
+    ) -> None:
+        if bar is None:
+            return
+        try:
+            inc = int(finish)
+        except Exception:
+            inc = 1
+        finished = int(position) + (1 if inc > 0 else 0)
+        if inc == 0:
+            chpt_expr = (
+                f"(Total = {int(total)}, Finished = {finished}) Checkpoint in Progress"
+            )
+        else:
+            chpt_expr = (
+                f"(Total = {int(total)}, Finished = {finished}) Checkpoint Completed"
+            )
+        with contextlib.suppress(Exception):
+            bar.unit = chpt_expr
+        with contextlib.suppress(Exception):
+            bar.update(inc)
+
+
+@dataclasses.dataclass
+class _PendingOp:
+    kind: str
+    epoch: int
+    future: object
+    started_monotonic: float
+
+
+class Checkpointer:
+    def __init__(
+        self,
+        ckpt_dir: PathLike,
+        *,
+        keep_last: int = 3,
+        max_in_flight: int = 1,
+        use_async: bool = True,
+        dcp_subdir: str = "dcp_epochs",
+        avg_subdir: str = "avg",
+        avg_ext: str = ".pt",
+        mmap_load: bool | None = None,
+        device: torch.device | None = None,
+    ) -> None:
+        self._device = device
+        self.root = Path(ckpt_dir)
+        self.dcp_root = self.root / dcp_subdir
+        self.avg_root = self.root / avg_subdir
+        self.avg_ext = avg_ext if str(avg_ext).startswith(".") else f".{avg_ext}"
+        self.keep_last = max(1, int(keep_last))
+        self.max_in_flight = max(1, int(max_in_flight))
+        self.use_async = bool(use_async)
+        self.mmap_load = mmap_load
+
+        self._pending_dcp: deque[_PendingOp] = deque()
+        self._pending_avg: deque[_PendingOp] = deque()
+        self._pending_lock = Mutex(reentrant=True)
+
+        self._avg_executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="enn-avg-ckpt"
+        )
+
+        self._stager: object | None = None
+        self._stager_lock = Mutex(reentrant=True)
+        self._stager_owner_thread: int | None = None
+        self._stager_closed = False
+
+        try:
+            import torch.distributed as dist
+
+            self._dist = dist
+            self._rank = dist.get_rank() if dist.is_initialized() else 0
+            self._world = dist.get_world_size() if dist.is_initialized() else 1
+        except Exception:
+            self._dist = None
+            self._rank = 0
+            self._world = 1
+
+        self._local_rank = int(os.environ.get("LOCAL_RANK", "0") or 0)
+        self._local_world = int(os.environ.get("LOCAL_WORLD_SIZE", "1") or 1)
+        if self._local_world < 1:
+            self._local_world = 1
+        self._node_rank = self._rank // self._local_world if self._local_world else 0
+
+        self._dcp_process_group: object | None = None
+        self._dcp_should_participate: bool = True
+        if device is not None and self._is_distributed():
+            try:
+                mesh, kind = get_distributed_mesh(device)
+                if kind == "hsdp2" and mesh is not None:
+                    coord = None
+                    with contextlib.suppress(Exception):
+                        coord = mesh.get_coordinate()
+                    if isinstance(coord, tuple) and len(coord) >= 1:
+                        self._dcp_should_participate = int(coord[0]) == 0
+
+                    pg = None
+                    with contextlib.suppress(Exception):
+                        pg = mesh.get_group("dp_shard")
+                    if pg is not None:
+                        self._dcp_process_group = pg
+            except Exception:
+                self._dcp_process_group = None
+                self._dcp_should_participate = True
+
+        self.dcp_root.mkdir(parents=True, exist_ok=True)
+        self.avg_root.mkdir(parents=True, exist_ok=True)
+
+    def _is_distributed(self) -> bool:
+        return bool(self._dist is not None and self._dist.is_initialized())
+
+    def _is_global_rank0(self) -> bool:
+        return (not self._is_distributed()) or self._rank == 0
+
+    def _is_local_rank0(self) -> bool:
+        return (not self._is_distributed()) or self._local_rank == 0
+
+    def _epoch_dir(self, epoch: int) -> Path:
+        return self.dcp_root / f"epoch_{epoch:06d}"
+
+    def _epoch_done_file(self, epoch_dir: Path) -> Path:
+        return epoch_dir / "done.json"
+
+    def _avg_node_dir(self, node_rank: int | None = None) -> Path:
+        nr = self._node_rank if node_rank is None else int(node_rank)
+        return self.avg_root / f"node_{nr:04d}"
+
+    def _avg_epoch_path(self, epoch: int, node_rank: int | None = None) -> Path:
+        d = self._avg_node_dir(node_rank)
+        return d / f"epoch_{epoch:06d}{self.avg_ext}"
+
+    def _avg_latest_file(self, node_rank: int | None = None) -> Path:
+        return self._avg_node_dir(node_rank) / "latest.json"
+
+    def _ensure_stager(self) -> object | None:
+        if self._stager_closed:
+            return None
+        tid = threading.get_ident()
+        with self._stager_lock:
+            if self._stager is not None and self._stager_owner_thread == tid:
+                return self._stager
+            if self._stager is not None:
+                with contextlib.suppress(Exception):
+                    close = getattr(self._stager, "close", None)
+                    if callable(close):
+                        close()
+                self._stager = None
+                self._stager_owner_thread = None
+
+            try:
+                from torch.distributed.checkpoint.staging import DefaultStager, StagingOptions
+
+                use_pinned_memory = bool(
+                    self._device is not None and self._device.type == "cuda"
+                )
+                opts = StagingOptions(
+                    use_pinned_memory=use_pinned_memory,
+                    use_shared_memory=True,
+                    use_async_staging=True,
+                    use_non_blocking_copy=True,
+                )
+                self._stager = DefaultStager(config=opts)
+                self._stager_owner_thread = tid
+            except Exception:
+                self._stager = None
+                self._stager_owner_thread = None
+            return self._stager
+
+    def _maybe_wait_for_budget(self) -> None:
+        with self._pending_lock:
+            while self._pending_dcp and _future_done(self._pending_dcp[0].future):
+                self._pending_dcp.popleft()
+            while self._pending_avg and _future_done(self._pending_avg[0].future):
+                self._pending_avg.popleft()
+
+            while len(self._pending_dcp) >= self.max_in_flight:
+                op = self._pending_dcp[0]
+                fut = op.future
+                self._pending_lock.release()
+                try:
+                    _future_result(fut)
+                finally:
+                    self._pending_lock.acquire()
+                while self._pending_dcp and _future_done(self._pending_dcp[0].future):
+                    self._pending_dcp.popleft()
+
+            while len(self._pending_avg) >= 1:
+                op = self._pending_avg[0]
+                fut = op.future
+                self._pending_lock.release()
+                try:
+                    _future_result(fut)
+                finally:
+                    self._pending_lock.acquire()
+                while self._pending_avg and _future_done(self._pending_avg[0].future):
+                    self._pending_avg.popleft()
+
+    def _register_pending(self, kind: str, epoch: int, fut: object) -> None:
+        with self._pending_lock:
+            q = self._pending_dcp if kind == "dcp" else self._pending_avg
+            q.append(
+                _PendingOp(
+                    kind=kind,
+                    epoch=int(epoch),
+                    future=fut,
+                    started_monotonic=time.monotonic(),
+                )
+            )
+
+    def _finalize_dcp_epoch(
+        self, epoch: int, epoch_dir: Path, extra_meta: dict[str, Any]
+    ) -> None:
+        if not self._is_global_rank0():
+            return
+        try:
+            done_file = self._epoch_done_file(epoch_dir)
+            payload = {
+                "format": "enn-dcp-epoch-v1",
+                "epoch": int(epoch),
+                "created_time": time.time(),
+                "rank": int(self._rank),
+                "world_size": int(self._world),
+                "node_rank": int(self._node_rank),
+                **(extra_meta or {}),
+            }
+            write_json(done_file, payload, indent=2)
+        finally:
+            with contextlib.suppress(Exception):
+                self._prune_dcp()
+
+    def _prune_dcp(self) -> None:
+        if not self._is_global_rank0():
+            return
+        try:
+            epoch_dirs: list[Path] = []
+            for p in self.dcp_root.glob("epoch_*"):
+                if not p.is_dir():
+                    continue
+                if self._epoch_done_file(p).is_file():
+                    epoch_dirs.append(p)
+            epoch_dirs.sort(key=lambda x: x.name)
+            if len(epoch_dirs) <= self.keep_last:
+                return
+            for p in epoch_dirs[: max(0, len(epoch_dirs) - self.keep_last)]:
+                with contextlib.suppress(Exception):
+                    shutil.rmtree(p)
+        except Exception:
+            return
+
+    def _prune_avg(self, node_rank: int | None = None) -> None:
+        d = self._avg_node_dir(node_rank)
+        if not d.is_dir():
+            return
+        try:
+            files = sorted(d.glob(f"epoch_*{self.avg_ext}"), key=lambda x: x.name)
+            if len(files) <= self.keep_last:
+                return
+            for p in files[: max(0, len(files) - self.keep_last)]:
+                with contextlib.suppress(Exception):
+                    p.unlink()
+        except Exception:
+            return
+
+    def _save_avg_epoch(self, epoch: int, avg_state_dict: Mapping[str, Any]) -> Path:
+        node_rank = int(self._node_rank)
+        d = self._avg_node_dir(node_rank)
+        d.mkdir(parents=True, exist_ok=True)
+        payload = _coerce_dcp_keys(avg_state_dict)
+        path = self._avg_epoch_path(epoch, node_rank)
+        save_temp(path, payload)
+        meta = {
+            "format": "enn-avg-state-v1",
+            "epoch": int(epoch),
+            "created_time": time.time(),
+            "rank": int(self._rank),
+            "local_rank": int(self._local_rank),
+            "node_rank": int(node_rank),
+            "world_size": int(self._world),
+            "local_world_size": int(self._local_world),
+        }
+        write_json(self._avg_latest_file(node_rank), meta, indent=2)
+        with contextlib.suppress(Exception):
+            self._prune_avg(node_rank)
+        return path
+
+    def _schedule_avg_save(self, epoch: int, avg_state_dict: Mapping[str, Any]) -> None:
+        try:
+            future = self._avg_executor.submit(
+                self._save_avg_epoch, int(epoch), avg_state_dict
+            )
+        except Exception as exc:
+            _LOGGER.exception("Average checkpoint scheduling failed: %s", exc)
+            return
+        self._register_pending("avg", int(epoch), future)
+
+    def request_save_epoch(
+        self,
+        *,
+        epoch: int,
+        model: nn.Module,
+        optimizer: object | None = None,
+        avg_state_dict: Mapping[str, Any] | None = None,
+        extra_state: dict[str, Any] | None = None,
+        force_sync: bool = False,
+    ) -> None:
+        epoch_i = int(epoch)
+
+        self._maybe_wait_for_budget()
+
+        if avg_state_dict is not None and self._is_local_rank0():
+            self._schedule_avg_save(epoch_i, avg_state_dict)
+
+        if not self._dcp_should_participate:
+            return
+
+        dcp_future: object | None = None
+        try:
+            import torch.distributed.checkpoint as dcp
+            from torch.distributed.checkpoint import FileSystemWriter
+            from torch.distributed.checkpoint.state_dict import StateDictOptions, get_state_dict
+
+            epoch_dir = self._epoch_dir(epoch_i)
+            epoch_dir.mkdir(parents=True, exist_ok=True)
+
+            opts = StateDictOptions(full_state_dict=False)
+            model_sd, optim_sd = get_state_dict(model, optimizer or [], options=opts)
+            dcp_state: dict[str, Any] = {"model": _coerce_dcp_keys(model_sd)}
+            if optimizer is not None:
+                dcp_state["optimizer"] = _coerce_dcp_keys(optim_sd)
+            if extra_state is not None:
+                dcp_state["extra"] = _coerce_dcp_keys(extra_state)
+
+            writer = FileSystemWriter(str(epoch_dir))
+            planner: object | None = None
+            with contextlib.suppress(Exception):
+                from torch.distributed.checkpoint import DefaultSavePlanner
+
+                planner = DefaultSavePlanner(dedup_save_to_lowest_rank=True)
+
+            if self.use_async and hasattr(dcp, "async_save"):
+                stager = self._ensure_stager()
+                kwargs: dict[str, Any] = {
+                    "state_dict": dcp_state,
+                    "checkpoint_id": str(epoch_dir),
+                    "storage_writer": writer,
+                    "planner": planner,
+                    "process_group": self._dcp_process_group,
+                }
+                if stager is not None:
+                    kwargs["async_stager"] = stager
+
+                with contextlib.suppress(Exception):
+                    from torch.distributed.checkpoint.state_dict_saver import (
+                        AsyncCheckpointerType,
+                    )
+
+                    async_type = (
+                        os.environ.get("ENN_DCP_ASYNC_TYPE", "thread").strip().lower()
+                    )
+                    if async_type == "process":
+                        kwargs["async_checkpointer_type"] = AsyncCheckpointerType.PROCESS
+                    elif async_type == "thread":
+                        kwargs["async_checkpointer_type"] = AsyncCheckpointerType.THREAD
+
+                try:
+                    sig = inspect.signature(dcp.async_save)
+                    supported = set(sig.parameters.keys())
+                    kwargs = {
+                        k: v for k, v in kwargs.items() if k in supported and v is not None
+                    }
+                except Exception:
+                    kwargs = {k: v for k, v in kwargs.items() if v is not None}
+
+                dcp_future = dcp.async_save(**kwargs)
+            else:
+                dcp.save(
+                    state_dict=dcp_state,
+                    checkpoint_id=str(epoch_dir),
+                    storage_writer=writer,
+                    planner=planner,
+                    process_group=self._dcp_process_group,
+                )
+                dcp_future = None
+
+            if dcp_future is not None:
+                if self._is_global_rank0():
+                    _add_future_callback(
+                        dcp_future,
+                        lambda: self._finalize_dcp_epoch(
+                            epoch_i,
+                            epoch_dir,
+                            extra_meta={"has_optimizer": optimizer is not None},
+                        ),
+                    )
+                self._register_pending("dcp", epoch_i, dcp_future)
+            else:
+                self._finalize_dcp_epoch(
+                    epoch_i,
+                    epoch_dir,
+                    extra_meta={"has_optimizer": optimizer is not None},
+                )
+        except Exception as exc:
+            _LOGGER.exception("DCP epoch checkpoint failed: %s", exc)
+            if force_sync:
+                raise
+
+    def wait(self) -> None:
+        pending: list[_PendingOp]
+        with self._pending_lock:
+            pending = list(self._pending_dcp) + list(self._pending_avg)
+        for op in pending:
+            with contextlib.suppress(Exception):
+                _future_result(op.future)
+        with self._pending_lock:
+            self._pending_dcp.clear()
+            self._pending_avg.clear()
+
+    def close(self) -> None:
+        self.wait()
+        with contextlib.suppress(Exception):
+            import torch.distributed.checkpoint.state_dict_saver as sds
+
+            close_fn = getattr(sds, "close", None)
+            if callable(close_fn):
+                close_fn()
+        with self._stager_lock:
+            self._stager_closed = True
+            if self._stager is not None:
+                with contextlib.suppress(Exception):
+                    close = getattr(self._stager, "close", None)
+                    if callable(close):
+                        close()
+                self._stager = None
+                self._stager_owner_thread = None
+        with contextlib.suppress(Exception):
+            self._avg_executor.shutdown(wait=True)
+
+    def find_latest_dcp_epoch(self) -> int | None:
+        try:
+            completed: list[int] = []
+            for p in self.dcp_root.glob("epoch_*"):
+                if not p.is_dir():
+                    continue
+                if self._epoch_done_file(p).is_file():
+                    m = re.match(r"epoch_(\\d+)", p.name)
+                    if m:
+                        completed.append(int(m.group(1)))
+            return max(completed) if completed else None
+        except Exception:
+            return None
+
+    def load_latest_dcp(
+        self,
+        *,
+        model: nn.Module,
+        optimizer: object | None = None,
+        strict: bool = False,
+    ) -> int | None:
+        latest = self.find_latest_dcp_epoch()
+        if latest is None:
+            return None
+        epoch_dir = self._epoch_dir(latest)
+        if not self._epoch_done_file(epoch_dir).is_file():
+            return None
+        try:
+            import torch.distributed.checkpoint as dcp
+            from torch.distributed.checkpoint import FileSystemReader
+            from torch.distributed.checkpoint.state_dict import (
+                StateDictOptions,
+                get_model_state_dict,
+                get_optimizer_state_dict,
+                set_model_state_dict,
+                set_optimizer_state_dict,
+            )
+
+            opts = StateDictOptions(full_state_dict=False, strict=bool(strict))
+            model_sd = get_model_state_dict(model, options=opts)
+            state: dict[str, Any] = {"model": model_sd}
+            optim_sd: Any | None = None
+            if optimizer is not None:
+                optim_sd = get_optimizer_state_dict(model, optimizer, options=opts)
+                state["optimizer"] = optim_sd
+            dcp.load(state_dict=state, storage_reader=FileSystemReader(str(epoch_dir)))
+            set_model_state_dict(model, model_sd, options=opts)
+            if optimizer is not None and optim_sd is not None:
+                set_optimizer_state_dict(model, optimizer, optim_sd, options=opts)
+            return latest
+        except Exception as exc:
+            _LOGGER.exception("DCP load failed: %s", exc)
+            if strict:
+                raise
+            return None
+
+    def load_model_from_torchsave_broadcast(
+        self,
+        *,
+        model: nn.Module,
+        torch_save_path: PathLike,
+        strict: bool = False,
+    ) -> None:
+        try:
+            import torch.distributed.checkpoint as dcp
+            from torch.distributed.checkpoint.format_utils import (
+                BroadcastingTorchSaveReader,
+                DynamicMetaLoadPlanner,
+            )
+            from torch.distributed.checkpoint.state_dict import (
+                StateDictOptions,
+                get_model_state_dict,
+                set_model_state_dict,
+            )
+
+            opts = StateDictOptions(full_state_dict=False, strict=bool(strict))
+            model_sd = get_model_state_dict(model, options=opts)
+            dcp.load(
+                state_dict={"model": model_sd},
+                storage_reader=BroadcastingTorchSaveReader(),
+                planner=DynamicMetaLoadPlanner(),
+                checkpoint_id=str(torch_save_path),
+            )
+            set_model_state_dict(model, model_sd, options=opts)
+        except Exception as exc:
+            _LOGGER.exception("Broadcasting TorchSave load failed: %s", exc)
+            if strict:
+                raise

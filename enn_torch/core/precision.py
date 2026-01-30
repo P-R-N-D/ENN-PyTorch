@@ -1198,31 +1198,40 @@ def cast_float_dtype(model: object, dtype: torch.dtype) -> None:
     except Exception:
         return
 
+    from .tensor import is_meta_or_fake_tensor
+
     with torch.no_grad():
         for mod in getattr(model, "modules", lambda: [])():
             if is_precision_exempted(mod):
                 continue
             params = getattr(mod, "_parameters", None)
             if params:
-                for name, p in list(params.items()):
+                for _name, p in list(params.items()):
                     if p is None or not isinstance(p, torch.Tensor):
+                        continue
+                    if is_meta_or_fake_tensor(p):
                         continue
                     if (not p.is_floating_point()) or p.dtype == dtype:
                         continue
-                    params[name] = torch.nn.Parameter(
-                        p.detach().to(dtype),
-                        requires_grad=bool(getattr(p, "requires_grad", True)),
-                    )
+                    try:
+                        p.data = p.data.to(dtype=dtype)
+                    except Exception:
+                        continue
             bufs = getattr(mod, "_buffers", None)
             if bufs:
-                for name, b in list(bufs.items()):
+                for _name, b in list(bufs.items()):
                     if b is None or not isinstance(b, torch.Tensor):
+                        continue
+                    if is_meta_or_fake_tensor(b):
                         continue
                     if (not b.is_floating_point()) or b.dtype == dtype:
                         continue
                     if b.dtype is torch.float64 and dtype is not torch.float64:
                         continue
-                    bufs[name] = b.detach().to(dtype)
+                    try:
+                        b.data = b.data.to(dtype=dtype)
+                    except Exception:
+                        continue
 
 
 def cast_batchnorm_buffers_dtype(module: object, dtype: torch.dtype | None) -> None:
