@@ -34,9 +34,7 @@ from torch.distributed.checkpoint.state_dict import (
     set_model_state_dict,
 )
 
-from ..data import collate as schema
 from ..core.config import RuntimeConfig, coerce_model_config
-from ..nn.graph import from_checkpoint, to_checkpoint
 from ..core.concurrency import (
     Mutex,
     TensorPagePool,
@@ -55,32 +53,6 @@ from ..core.datatypes import (
     env_str,
     read_json,
 )
-from .distributed import (
-    ProcessBroker,
-    broadcast_scalar,
-    distributed_all_reduce_grads,
-    distributed_all_reduce_sum as _reduce_sum,
-    distributed_barrier,
-    distributed_sync,
-    get_distributed_mesh,
-    get_group_world_size as _get_world_size,
-    get_world_size,
-    is_distributed,
-    joining,
-    no_sync,
-    resolve_process_group as _validate_distributed_group,
-    to_hsdp_module,
-)
-from .distributed import Checkpointer
-from ..nn.graph import (
-    canonicalize_compile_mode,
-    compile_distributed_safe,
-    compile_safe,
-    cudagraph_mark_step_begin,
-    cudagraph_mark_step_end,
-    inference_mode,
-    to_submodule,
-)
 from ..core.policies import DistributedPolicy, ModelPolicy, PrecisionPolicy
 from ..core.precision import (
     Autocast,
@@ -89,11 +61,6 @@ from ..core.precision import (
     preload_layers as _preload_layers,
     unify_model_dtype as _unify_model_dtype,
     validate_model_dtype_unity as _validate_model_dtype_unity,
-)
-from ..nn.profiler import (
-    FlopCounter,
-    get_torch_profiler as _get_torch_profiler,
-    log_profiler_summary as _get_profiler_summary,
 )
 from ..core.system import (
     CPU,
@@ -133,10 +100,51 @@ from ..core.tensor import (
     validate_no_meta_tensors as _validate_no_meta_tensors,
 )
 from ..data import collate
+from ..data import collate as schema
 from ..data.collate import Unsharder, warmup_scaler_stats as _warmup_scaler_stats
 from ..data.pipeline import Dataset, get_batch_length as _get_batch_length
-from ..nn.wrappers import Model, update_delta_gate_auto_k as _set_gate_factor
+from ..nn.graph import (
+    canonicalize_compile_mode,
+    compile_distributed_safe,
+    compile_safe,
+    cudagraph_mark_step_begin,
+    cudagraph_mark_step_end,
+    from_checkpoint,
+    inference_mode,
+    to_checkpoint,
+    to_submodule,
+)
 from ..nn.layers import Recorder, resize_scaler_buffer
+from ..nn.profiler import (
+    FlopCounter,
+    get_torch_profiler as _get_torch_profiler,
+    log_profiler_summary as _get_profiler_summary,
+)
+from ..nn.wrappers import Model, update_delta_gate_auto_k as _set_gate_factor
+from .autoscaling import (
+    clear_oom_retries as _clear_oom_retries,
+    get_sampler_scaler as _get_sampler_scaler,
+    log_scale_rate_throttled as _is_scale_rate_logged,
+    probe_per_sample_mem_bytes as _get_sample_size,
+    recover_oom as _recover_oom,
+)
+from .distributed import (
+    Checkpointer,
+    ProcessBroker,
+    broadcast_scalar,
+    distributed_all_reduce_grads,
+    distributed_all_reduce_sum as _reduce_sum,
+    distributed_barrier,
+    distributed_sync,
+    get_distributed_mesh,
+    get_group_world_size as _get_world_size,
+    get_world_size,
+    is_distributed,
+    joining,
+    no_sync,
+    resolve_process_group as _validate_distributed_group,
+    to_hsdp_module,
+)
 from .io import _filtered_warnings, _torch_load_checkpoint
 from .losses import (
     CRPSLoss,
@@ -146,13 +154,6 @@ from .losses import (
     StandardNormalLoss,
     StudentsTLoss,
     TiledLoss,
-)
-from .autoscaling import (
-    clear_oom_retries as _clear_oom_retries,
-    get_sampler_scaler as _get_sampler_scaler,
-    log_scale_rate_throttled as _is_scale_rate_logged,
-    probe_per_sample_mem_bytes as _get_sample_size,
-    recover_oom as _recover_oom,
 )
 from .optimizers import (
     AdamW,
@@ -173,7 +174,6 @@ try:
     from tensordict.nn import CudaGraphModule as TD_CudaGraphModule
 except Exception:
     TD_CudaGraphModule = None
-
 
 _COMPILE_SAFE_DONE = False
 _COMPILE_SAFE_LOCK = Mutex()
