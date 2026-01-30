@@ -7,70 +7,69 @@ import os
 import shutil
 import tempfile
 import time
-from functools import partial
-from functools import update_wrapper
+from functools import partial, update_wrapper
 from pathlib import Path
-from typing import Any
-from typing import Callable
-from typing import Mapping
-from typing import Optional
-from typing import ParamSpec
-from typing import Sequence
-from typing import Tuple
-from typing import TypeAlias
-from typing import TypeVar
-from typing import cast
+from typing import (
+    Any,
+    Callable,
+    Mapping,
+    Optional,
+    ParamSpec,
+    Sequence,
+    Tuple,
+    TypeAlias,
+    TypeVar,
+    cast,
+)
 
 import numpy
 import torch
 import torch.multiprocessing
-from tensordict import MemoryMappedTensor
-from tensordict import PersistentTensorDict
-from tensordict import TensorDict
-from tensordict import TensorDictBase
-from torch.distributed.checkpoint import FileSystemReader
-from torch.distributed.checkpoint import FileSystemWriter
-from torch.distributed.checkpoint import load
-from torch.distributed.checkpoint import save
-from torch.distributed.checkpoint.state_dict import StateDictOptions
-from torch.distributed.checkpoint.state_dict import get_model_state_dict
-from torch.distributed.checkpoint.state_dict import set_model_state_dict
-from torch.distributed.launcher.api import LaunchConfig
-from torch.distributed.launcher.api import elastic_launch
+from tensordict import (
+    MemoryMappedTensor,
+    PersistentTensorDict,
+    TensorDict,
+    TensorDictBase,
+)
+from torch.distributed.checkpoint import FileSystemReader, FileSystemWriter, load, save
+from torch.distributed.checkpoint.state_dict import (
+    StateDictOptions,
+    get_model_state_dict,
+    set_model_state_dict,
+)
+from torch.distributed.launcher.api import LaunchConfig, elastic_launch
 
-from ..core.config import ModelConfig
-from ..core.config import RuntimeConfig
-from ..core.config import _extract_model_config_dict
-from ..core.config import coerce_model_config
-from ..core.config import runtime_config
-from ..core.datatypes import env_bool
-from ..core.datatypes import read_json
+from ..core.config import (
+    ModelConfig,
+    RuntimeConfig,
+    _extract_model_config_dict,
+    coerce_model_config,
+    runtime_config,
+)
+from ..core.datatypes import env_bool, read_json
 from ..core.policies import WorkerPolicy
-from ..core.system import _start_context
-from ..core.system import new_dir
-from ..core.system import optimal_start_method
+from ..core.system import _start_context, new_dir, optimal_start_method
 from ..core.tensor import coerce_tensor
 from ..data import collate
-from ..data.collate import MappingSlicer
-from ..data.collate import TensorDictSlicer
-from ..data.pipeline import Dataset
-from ..data.pipeline import default_underflow_action
-from ..data.pipeline import iter_dataset
-from ..data.pipeline import normalize_underflow_action
-from ..data.pipeline import preload_memmap
+from ..data.collate import MappingSlicer, TensorDictSlicer
+from ..data.pipeline import (
+    Dataset,
+    default_underflow_action,
+    iter_dataset,
+    normalize_underflow_action,
+    preload_memmap,
+)
 from ..nn.graph import inference_mode
-from ..nn.layers import Recorder
-from ..nn.layers import Scaler
-from ..nn.layers import resize_scaler_buffer
+from ..nn.layers import Recorder, Scaler, resize_scaler_buffer
 from ..nn.wrappers import Model
-from .distributed import ProcessBroker
-from .distributed import _coerce_dcp_keys
-from .distributed import get_available_host
-from .distributed import get_preferred_ip
-from .distributed import init_master_addr
-from .io import _filtered_warnings
-from .io import _torch_load_checkpoint
-from .io import is_required
+from .distributed import (
+    ProcessBroker,
+    _coerce_dcp_keys,
+    get_available_host,
+    get_preferred_ip,
+    init_master_addr,
+)
+from .io import _filtered_warnings, _torch_load_checkpoint, is_required
 from .main import process
 
 
