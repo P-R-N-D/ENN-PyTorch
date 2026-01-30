@@ -18,32 +18,35 @@ import tempfile
 import threading
 import time
 import traceback
-from collections.abc import Iterator, Sequence
+from collections.abc import Iterator
+from collections.abc import Sequence
 from dataclasses import dataclass
-from types import ModuleType, TracebackType
-from typing import Any, Callable, Optional, Protocol, Self, Tuple
+from types import ModuleType
+from types import TracebackType
+from typing import Any
+from typing import Callable
+from typing import Optional
+from typing import Protocol
+from typing import Self
+from typing import Tuple
 
 import torch
 
-from ..core.datatypes import (
-    env_first,
-    env_first_float,
-    env_first_int,
-    env_flag,
-    get_meta_path,
-    save_temp,
-    write_json,
-)
-from .system import (
-    CPU,
-    accelerator_stream,
-    accelerator_type,
-    is_pin_supported,
-    sync_accelerator,
-    _default_thread_limit,
-    _optimal_local_worlds,
-    _optimal_threads,
-)
+from ..core.datatypes import env_first
+from ..core.datatypes import env_first_float
+from ..core.datatypes import env_first_int
+from ..core.datatypes import env_flag
+from ..core.datatypes import get_meta_path
+from ..core.datatypes import save_temp
+from ..core.datatypes import write_json
+from .system import CPU
+from .system import _default_thread_limit
+from .system import _optimal_local_worlds
+from .system import _optimal_threads
+from .system import accelerator_stream
+from .system import accelerator_type
+from .system import is_pin_supported
+from .system import sync_accelerator
 
 _ENV_INNER_BOOL_VARS: dict[str, str] = {
     "OMP_DYNAMIC": "FALSE",
@@ -125,7 +128,9 @@ def _is_early_release_enabled() -> bool:
 
 
 def _is_force_unpin_enabled() -> bool:
-    return bool(env_flag("ENN_CACHE_FORCE_UNPIN", "ENN_CACHE_UNPIN", default=False))
+    return bool(
+        env_flag("ENN_CACHE_FORCE_UNPIN", "ENN_CACHE_UNPIN", default=False)
+    )
 
 
 def _prod_int(shape: Sequence[int]) -> int:
@@ -133,7 +138,9 @@ def _prod_int(shape: Sequence[int]) -> int:
 
 
 def _is_affinity_enabled() -> bool:
-    return bool(env_flag("ENN_EXECUTOR_AFFINITY", "ENN_AFFINITY", default=True))
+    return bool(
+        env_flag("ENN_EXECUTOR_AFFINITY", "ENN_AFFINITY", default=True)
+    )
 
 
 def _is_affinity_strict() -> bool:
@@ -159,7 +166,9 @@ def _is_inner_thread_limited(wl: str) -> bool:
         return False
     if not bool(env_flag("ENN_EXECUTOR_LIMIT_INNER_THREADS", default=True)):
         return False
-    if not bool(env_flag("ENN_EXECUTOR_TORCH_OUTER_PARALLELISM", default=True)):
+    if not bool(
+        env_flag("ENN_EXECUTOR_TORCH_OUTER_PARALLELISM", default=True)
+    ):
         return False
     return True
 
@@ -210,7 +219,9 @@ def _limit_inner_threads(threads: int, *args: Any, force: bool = False) -> int:
     force = bool(force) or bool(
         env_flag("ENN_EXECUTOR_FORCE_INNER_THREADS", default=False)
     )
-    cap_down = bool(env_flag("ENN_EXECUTOR_CAP_DOWN_INNER_THREADS", default=True))
+    cap_down = bool(
+        env_flag("ENN_EXECUTOR_CAP_DOWN_INNER_THREADS", default=True)
+    )
     for k in _ENV_INNER_THREAD_VARS:
         _set_concurrency_env(k, str(t), force=force, cap_down=cap_down)
     for k, v in _ENV_INNER_BOOL_VARS.items():
@@ -253,7 +264,9 @@ def _are_processes_limited() -> bool:
 
 
 def _target_process_workers() -> int:
-    return int(env_first_int(("ENN_EXECUTOR_PROCESS_TARGET_WORKERS",), default=0) or 0)
+    return int(
+        env_first_int(("ENN_EXECUTOR_PROCESS_TARGET_WORKERS",), default=0) or 0
+    )
 
 
 def _outer_concurrency_limit(
@@ -338,7 +351,9 @@ def _executor_scatter_cpus(cpus: Sequence[int]) -> list[int]:
             if int(x) not in primary:
                 secondary.append(int(x))
     allowed = set(base)
-    out = [c for c in primary if c in allowed] + [c for c in secondary if c in allowed]
+    out = [c for c in primary if c in allowed] + [
+        c for c in secondary if c in allowed
+    ]
     return out if out else base
 
 
@@ -395,7 +410,9 @@ def _pick_coprime_stride(n: int, hint: int, salt: int) -> int:
 def _executor_scope_start(
     role: str, wl: str, prefix: str, mw: int, cpw: int, ordinal: int, ncpu: int
 ) -> int:
-    seed = env_first(("ENN_EXECUTOR_AFFINITY_SEED", "ENN_AFFINITY_SEED"), default="0")
+    seed = env_first(
+        ("ENN_EXECUTOR_AFFINITY_SEED", "ENN_AFFINITY_SEED"), default="0"
+    )
     key = f"{seed}|pid={os.getpid()}|role={role}|wl={wl}|pfx={prefix}|mw={mw}|cpw={cpw}|ord={ordinal}"
     h = _hash32(key)
     return int(h % max(1, int(ncpu)))
@@ -417,7 +434,9 @@ def _pick_cores_balanced(
     cpw_i = max(1, min(int(cpw), n))
     if cpw_i == 1:
         return [int(base[(int(start) + i) % n])]
-    stride1 = _pick_coprime_stride(n, hint=max(1, n // max(1, int(mw))), salt=salt)
+    stride1 = _pick_coprime_stride(
+        n, hint=max(1, n // max(1, int(mw))), salt=salt
+    )
     base_pos = (int(start) + i * stride1) % n
     stride2 = _pick_coprime_stride(n, hint=max(1, n // cpw_i), salt=salt + 7)
     out: list[int] = []
@@ -561,7 +580,9 @@ def new_prefetcher(
     name: str = "buffer",
     daemon: bool = True,
 ) -> Prefetcher:
-    return Prefetcher(iterable, max_batches=max_batches, name=name, daemon=daemon)
+    return Prefetcher(
+        iterable, max_batches=max_batches, name=name, daemon=daemon
+    )
 
 
 def new_executor(
@@ -592,7 +613,9 @@ def new_executor(
     elif executor_kind == "interpreter":
         thread_prefix = f"{prefix}-interp"
     else:
-        thread_prefix = f"{prefix}-thr" if wl in {"cpu", "compute"} else f"{prefix}-io"
+        thread_prefix = (
+            f"{prefix}-thr" if wl in {"cpu", "compute"} else f"{prefix}-io"
+        )
     init_fn: Callable[..., Any] | None = None
     init_args: tuple[Any, ...] = ()
     nlogical_for_limit = 0
@@ -604,7 +627,9 @@ def new_executor(
             cpus_scatter = _executor_scatter_cpus(allowed)
             if cpus_scatter:
                 groups = _linux_thread_sibling_groups(tuple(cpus_scatter))
-                nphysical_for_limit = int(len(groups) if groups else len(cpus_scatter))
+                nphysical_for_limit = int(
+                    len(groups) if groups else len(cpus_scatter)
+                )
                 ordinal = _next_ordinal()
                 if executor_kind == "process" and wl in {"cpu", "compute"}:
                     mw_eff = int(mw)
@@ -617,12 +642,17 @@ def new_executor(
                                 int(mw_eff),
                                 max(
                                     1,
-                                    int(nphysical_for_limit or len(cpus_scatter)),
+                                    int(
+                                        nphysical_for_limit
+                                        or len(cpus_scatter)
+                                    ),
                                 ),
                             )
                     mw_eff = max(1, int(mw_eff))
                 if executor_kind == "process":
-                    default_cpw = max(1, int(len(cpus_scatter) // max(1, mw_eff)))
+                    default_cpw = max(
+                        1, int(len(cpus_scatter) // max(1, mw_eff))
+                    )
                     cpw = int(
                         env_first_int(
                             (
@@ -708,7 +738,9 @@ def new_executor(
             nlogical_for_limit = 0
             nphysical_for_limit = 0
             mw_eff = int(mw)
-    if executor_kind in {"thread", "interpreter"} and _is_inner_thread_limited(wl):
+    if executor_kind in {"thread", "interpreter"} and _is_inner_thread_limited(
+        wl
+    ):
         _limit_inner_threads(1)
     if nlogical_for_limit <= 0:
         with contextlib.suppress(Exception):
@@ -915,7 +947,11 @@ class Affinity:
         out = self._fn(*args, **kwargs)
         if do_sample:
             t1 = self._perf_counter_ns()
-            c1 = self._thread_time_ns() if callable(self._thread_time_ns) else None
+            c1 = (
+                self._thread_time_ns()
+                if callable(self._thread_time_ns)
+                else None
+            )
             try:
                 with self._lock:
                     self._parent._total_time += max(0, int(t1) - int(t0))
@@ -980,7 +1016,8 @@ class Prefetcher:
         self._join_timeout_s = 0.5
         with contextlib.suppress(Exception):
             jt_ms = int(
-                env_first_int(("ENN_THREAD_JOIN_TIMEOUT_MS",), default=500) or 500
+                env_first_int(("ENN_THREAD_JOIN_TIMEOUT_MS",), default=500)
+                or 500
             )
             self._join_timeout_s = max(0.0, float(jt_ms) / 1000.0)
 
@@ -1149,7 +1186,11 @@ class TensorPagePool:
     def _scavenge_lock(self: Self) -> int:
         freed = 0
         for e in self._pages:
-            if e.busy and e.fence is not None and self._event_finished(e.fence):
+            if (
+                e.busy
+                and e.fence is not None
+                and self._event_finished(e.fence)
+            ):
                 e.busy = False
                 e.fence = None
                 freed += 1
@@ -1170,7 +1211,11 @@ class TensorPagePool:
     ) -> torch.Tensor | tuple[torch.Tensor, TensorPagePool.Token | None]:
         shape_t = tuple(int(s) for s in shape)
         need = _prod_int(shape_t)
-        deadline = (time.monotonic() + float(timeout)) if timeout is not None else None
+        deadline = (
+            (time.monotonic() + float(timeout))
+            if timeout is not None
+            else None
+        )
         check_interval = 0.01
         while True:
             idx, need_new, grow = None, False, False
@@ -1198,7 +1243,10 @@ class TensorPagePool:
                     if n < self._cap:
                         grow = True
                     elif block:
-                        if deadline and (wait := deadline - time.monotonic()) <= 0:
+                        if (
+                            deadline
+                            and (wait := deadline - time.monotonic()) <= 0
+                        ):
                             break
                         self._cv.wait(
                             timeout=(
@@ -1227,7 +1275,9 @@ class TensorPagePool:
                 return (view, token) if return_handle else view
             if grow:
                 entry = TensorPagePool._Entry(
-                    page=TensorPage(numel=need, dtype=dtype, pin_memory=self._pin),
+                    page=TensorPage(
+                        numel=need, dtype=dtype, pin_memory=self._pin
+                    ),
                     busy=True,
                     fence=None,
                     gen=0,
@@ -1243,9 +1293,9 @@ class TensorPagePool:
                         return (view, token) if return_handle else view
                 continue
             break
-        view = torch.empty(need, dtype=dtype, device="cpu", pin_memory=False).view(
-            *shape_t
-        )
+        view = torch.empty(
+            need, dtype=dtype, device="cpu", pin_memory=False
+        ).view(*shape_t)
         return (view, None) if return_handle else view
 
     def get_like(
@@ -1336,7 +1386,9 @@ def pool_tensor(
 ) -> tuple[torch.Tensor, "TensorPagePool.Token | None", bool]:
     _ = args
     if not torch.is_tensor(tensor):
-        raise TypeError(f"pool_tensor expects a torch.Tensor, got {type(tensor)}")
+        raise TypeError(
+            f"pool_tensor expects a torch.Tensor, got {type(tensor)}"
+        )
     if dev_type is None:
         dev_type = str(getattr(device, "type", "cpu"))
     if pinned_ok is None:
@@ -1354,7 +1406,9 @@ def pool_tensor(
             return tensor, None, True
 
     if cpu_pool is not None and bool(pinned_ok):
-        buf, token = cpu_pool.get(tuple(tensor.shape), dtype, return_handle=True)
+        buf, token = cpu_pool.get(
+            tuple(tensor.shape), dtype, return_handle=True
+        )
         buf.copy_(tensor, non_blocking=False)
         pinned = False
         with contextlib.suppress(Exception):
@@ -1392,7 +1446,11 @@ def stream_tensor(
     _ = args
     if not torch.is_tensor(tensor):
         return tensor
-    device = torch.device(device) if not isinstance(device, torch.device) else device
+    device = (
+        torch.device(device)
+        if not isinstance(device, torch.device)
+        else device
+    )
     if dev_type is None:
         dev_type = str(getattr(device, "type", "cpu"))
     if non_blocking_ok is None:
@@ -1414,7 +1472,9 @@ def stream_tensor(
         return out
 
     if handle is None:
-        return tensor.to(device, non_blocking=bool(non_blocking_ok and pinned and pinned_ok))
+        return tensor.to(
+            device, non_blocking=bool(non_blocking_ok and pinned and pinned_ok)
+        )
 
     if backend is None:
         backend = accelerator_type(str(dev_type))
@@ -1424,7 +1484,10 @@ def stream_tensor(
         Event = getattr(backend, "Event", None)
     if can_stream_release is None:
         can_stream_release = bool(
-            pinned and pinned_ok and callable(stream_fn) and (Event is not None)
+            pinned
+            and pinned_ok
+            and callable(stream_fn)
+            and (Event is not None)
         )
 
     if (not bool(pinned)) or (not bool(can_stream_release)):
@@ -1529,7 +1592,9 @@ class TensorSpooler:
         os.makedirs(self._root, exist_ok=True)
         max_q = max(1, int(max_queue))
         self._sem = threading.Semaphore(max_q)
-        self._q: "queue.SimpleQueue[tuple[Any, Any, Any, Any]]" = queue.SimpleQueue()
+        self._q: "queue.SimpleQueue[tuple[Any, Any, Any, Any]]" = (
+            queue.SimpleQueue()
+        )
         self._bp_mode = str(_get_throttle_state() or "block")
         self._bp_timeout_s = float(_get_throttle_timeout() or 0.0)
         self._early_release = bool(_is_early_release_enabled())
@@ -1576,7 +1641,9 @@ class TensorSpooler:
             buf = buf.to_local()
         if buf.device.type != "cpu":
             buf = buf.to(device="cpu", non_blocking=False)
-        early = early_release if early_release is not None else self._early_release
+        early = (
+            early_release if early_release is not None else self._early_release
+        )
         unpin = force_unpin if force_unpin is not None else self._force_unpin
         released = False
         if TensorSpooler._is_cpu_pinned(buf) and (
@@ -1615,7 +1682,9 @@ class TensorSpooler:
             )
             os.close(fd)
             try:
-                MemoryMappedTensor.from_tensor(buf, filename=tmp_name, existsok=True)
+                MemoryMappedTensor.from_tensor(
+                    buf, filename=tmp_name, existsok=True
+                )
                 os.replace(tmp_name, path)
             finally:
                 with contextlib.suppress(Exception):
@@ -1655,7 +1724,9 @@ class TensorSpooler:
             rel_cb = rel if callable(rel) else None
             try:
                 self._wait(evt)
-                buf, released_early = self._init_tensor(tensor, release_cb=rel_cb)
+                buf, released_early = self._init_tensor(
+                    tensor, release_cb=rel_cb
+                )
                 self._save_tensor(buf, path)
                 if rel_cb is not None and not released_early:
                     with contextlib.suppress(Exception):
@@ -1702,7 +1773,11 @@ class TensorSpooler:
                             release_cb()
                     return
             else:
-                acquired = self._sem.acquire(timeout=timeout) if timeout > 0 else False
+                acquired = (
+                    self._sem.acquire(timeout=timeout)
+                    if timeout > 0
+                    else False
+                )
                 while not acquired:
                     if self._err_event.is_set() or self._closed.is_set():
                         raise RuntimeError("TensorSpooler unavailable")
@@ -1739,7 +1814,9 @@ class BufferQueue:
             "ENN_BUFFER_WARN_BLOCKING", "ENN_DEBUG", default=False
         )
 
-    def put(self: Self, item: Any, *args: Any, timeout: float | None = None) -> bool:
+    def put(
+        self: Self, item: Any, *args: Any, timeout: float | None = None
+    ) -> bool:
         if self._stop.is_set():
             return False
         t0 = time.monotonic()
@@ -1747,7 +1824,9 @@ class BufferQueue:
         with self._cv:
             if self._stop.is_set():
                 return False
-            while len(self._buf) >= self.max_batches and not self._stop.is_set():
+            while (
+                len(self._buf) >= self.max_batches and not self._stop.is_set()
+            ):
                 if deadline is None:
                     self._cv.wait()
                 else:
@@ -1771,7 +1850,9 @@ class BufferQueue:
     def __len__(self: Self) -> int:
         return self.size()
 
-    def get(self: Self, block: bool = True, timeout: float | None = None) -> Any:
+    def get(
+        self: Self, block: bool = True, timeout: float | None = None
+    ) -> Any:
         if not bool(block):
             with self._cv:
                 if not self._buf:
@@ -1810,7 +1891,9 @@ class BufferQueue:
         t0 = time.monotonic()
         deadline = None if timeout is None else (t0 + float(timeout))
         with self._cv:
-            while len(self._buf) >= self.max_batches and not self._stop.is_set():
+            while (
+                len(self._buf) >= self.max_batches and not self._stop.is_set()
+            ):
                 if deadline is None:
                     self._cv.wait()
                 else:
@@ -1845,7 +1928,9 @@ class Thread:
         self._proc_cycle = itertools.cycle(list(self._allowed_cpus))
         self._enabled = bool(enabled) and bool(self._allowed_cpus)
         self._nogil = bool(CPU.is_optimized_for_no_gil())
-        self._io_workers = max(1, min(int(io_workers), max(1, len(self._allowed_cpus))))
+        self._io_workers = max(
+            1, min(int(io_workers), max(1, len(self._allowed_cpus)))
+        )
         self._pin_attempts = 0
         self._pin_success = 0
         self._tls = threading.local()
@@ -1853,8 +1938,12 @@ class Thread:
         self._total_time = 0
         self._total_cpu = 0
         self._omp_ok = bool(allow_omp_bind) and bool(self.spread_threads())
-        self._flush_every = max(1, int(env_first_int(("ENN_TLB_FLUSH_EVERY",), 256)))
-        self._sample_every = max(1, int(env_first_int(("ENN_TLB_SAMPLE_EVERY",), 8)))
+        self._flush_every = max(
+            1, int(env_first_int(("ENN_TLB_FLUSH_EVERY",), 256))
+        )
+        self._sample_every = max(
+            1, int(env_first_int(("ENN_TLB_SAMPLE_EVERY",), 8))
+        )
 
     @staticmethod
     def _import_psutil() -> Optional[ModuleType]:
@@ -1908,7 +1997,8 @@ class Thread:
             return
         self._tls.in_retune = True
         try:
-            from .policies import WorkerPolicy, optimize_threads
+            from .policies import WorkerPolicy
+            from .policies import optimize_threads
 
             dev_type, nacc = WorkerPolicy._available_accelerator()
             is_accel = bool(nacc and int(nacc) > 0)
@@ -1919,7 +2009,9 @@ class Thread:
             local_world = _optimal_local_worlds(1)
             distribute_default = local_world > 1
             distribute = bool(
-                env_first_int(("ENN_DISTRIBUTE_THREAD_CAP",), int(distribute_default))
+                env_first_int(
+                    ("ENN_DISTRIBUTE_THREAD_CAP",), int(distribute_default)
+                )
             )
             thread_cap = _optimal_threads(
                 ncpu=cpus,
@@ -2054,7 +2146,11 @@ class Thread:
             self._pin_attempts += 1
             if ok:
                 self._pin_success += 1
-            if self._pin_attempts >= 16 and self._pin_success == 0 and not self._omp_ok:
+            if (
+                self._pin_attempts >= 16
+                and self._pin_success == 0
+                and not self._omp_ok
+            ):
                 self._enabled = False
 
     def tune_threads(
@@ -2071,12 +2167,17 @@ class Thread:
             tuned_workers = max(
                 1,
                 min(
-                    int(io_workers if io_workers is not None else self._io_workers),
+                    int(
+                        io_workers
+                        if io_workers is not None
+                        else self._io_workers
+                    ),
                     cpus,
                 ),
             )
             self._io_workers = tuned_workers
-            from .policies import WorkerPolicy, optimize_threads
+            from .policies import WorkerPolicy
+            from .policies import optimize_threads
 
             dev_type, nacc = WorkerPolicy._available_accelerator()
             is_accel = bool(nacc and int(nacc) > 0)
@@ -2086,7 +2187,9 @@ class Thread:
             local_world = _optimal_local_worlds(1)
             distribute_default = local_world > 1
             distribute = bool(
-                env_first_int(("ENN_DISTRIBUTE_THREAD_CAP",), int(distribute_default))
+                env_first_int(
+                    ("ENN_DISTRIBUTE_THREAD_CAP",), int(distribute_default)
+                )
             )
             thread_cap = _optimal_threads(
                 ncpu=cpus,
@@ -2117,11 +2220,17 @@ class Thread:
             return
         self._retune_threads()
 
-    def new_thread(self: Self, fn: Callable[[Any], Any]) -> Callable[[Any], Any]:
+    def new_thread(
+        self: Self, fn: Callable[[Any], Any]
+    ) -> Callable[[Any], Any]:
         if not self._enabled:
             return fn
-        sample_every = int(self._sample_every) if int(self._sample_every) > 0 else 1
-        flush_every = int(self._flush_every) if int(self._flush_every) > 0 else 1
+        sample_every = (
+            int(self._sample_every) if int(self._sample_every) > 0 else 1
+        )
+        flush_every = (
+            int(self._flush_every) if int(self._flush_every) > 0 else 1
+        )
         return Affinity(
             parent=self,
             fn=fn,

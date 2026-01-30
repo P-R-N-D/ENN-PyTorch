@@ -5,17 +5,29 @@ import contextlib
 import logging
 import os
 from importlib import import_module
-from typing import Any, Callable, List, Optional, Self, Sequence, Tuple
+from typing import Any
+from typing import Callable
+from typing import List
+from typing import Optional
+from typing import Self
+from typing import Sequence
+from typing import Tuple
 
 import torch
 import torch.nn as nn
 
-from .graph import coerce_checkpoint, is_export_or_trace, is_symbolic
 from ..core.compat import StochasticDepth
 from ..runtime.distributed import _from_hsdp_module
 from .activations import GeGLU
+from .graph import coerce_checkpoint
+from .graph import is_export_or_trace
+from .graph import is_symbolic
 from .kernels import DotProductAttention
-from .layers import CrossAttention, DilatedAttention, Resampler, Retention, norm_layer
+from .layers import CrossAttention
+from .layers import DilatedAttention
+from .layers import Resampler
+from .layers import Retention
+from .layers import norm_layer
 
 _LOGGER = logging.getLogger(__name__)
 _MODELING_TYPE_ALIASES: dict[str, str] = {
@@ -43,7 +55,9 @@ _ENN_HAS_FLEX_ATTENTION = getattr(
 )
 
 
-def _size_of_retnet(x: torch.Tensor, blk0: nn.Module, *args: Any, mode: str) -> int:
+def _size_of_retnet(
+    x: torch.Tensor, blk0: nn.Module, *args: Any, mode: str
+) -> int:
     if not isinstance(x, torch.Tensor) or x.dim() != 3:
         return 0
     B, L, D = map(int, x.shape)
@@ -51,7 +65,9 @@ def _size_of_retnet(x: torch.Tensor, blk0: nn.Module, *args: Any, mode: str) -> 
         return 0
     bytes_e = int(x.element_size())
     base_bytes = int(B) * int(L) * int(D) * int(bytes_e)
-    ret_factor = 8 if str(mode or "temporal").strip().lower() == "spatial" else 6
+    ret_factor = (
+        8 if str(mode or "temporal").strip().lower() == "spatial" else 6
+    )
     ffn = getattr(blk0, "ffn", None)
     hid = (
         getattr(ffn, "hidden_dim", 0)
@@ -62,7 +78,9 @@ def _size_of_retnet(x: torch.Tensor, blk0: nn.Module, *args: Any, mode: str) -> 
     return int(base_bytes * ret_factor + ffn_bytes + base_bytes * 2)
 
 
-def _infer_module_device(module: nn.Module, fallback: torch.device) -> torch.device:
+def _infer_module_device(
+    module: nn.Module, fallback: torch.device
+) -> torch.device:
     p = next(module.parameters(), None)
     if p is not None:
         return p.device
@@ -163,7 +181,9 @@ def _prealloc_microbatch(
                 y = y.to(dtype=out_dtype)
             processed.append(y)
         if out_bufs is None:
-            out_bufs = [y.new_empty((total_b, *y.shape[1:])) for y in processed]
+            out_bufs = [
+                y.new_empty((total_b, *y.shape[1:])) for y in processed
+            ]
         else:
             if len(out_bufs) != len(processed):
                 raise RuntimeError(f"{stage}: arity mismatch")
@@ -190,7 +210,9 @@ def stochastic_depth_schedule(drop_path: float, depth: int) -> List[float]:
         return []
     if drop_path <= 0.0 or depth == 1:
         return [float(drop_path) if depth == 1 else 0.0] * depth
-    return [float(i * float(drop_path) / float(depth - 1)) for i in range(depth)]
+    return [
+        float(i * float(drop_path) / float(depth - 1)) for i in range(depth)
+    ]
 
 
 class LatentTransformer(nn.Module):
@@ -216,7 +238,9 @@ class LatentTransformer(nn.Module):
         self.norm1 = norm_layer(norm_type=norm_type, dim=self.d_model, eps=eps)
         self.qkv = nn.Linear(self.d_model, 3 * self.d_model, bias=True)
         self.out_proj = nn.Linear(self.d_model, self.d_model, bias=True)
-        self.attn = DotProductAttention(num_heads=self.nhead, head_dim=self.head_dim)
+        self.attn = DotProductAttention(
+            num_heads=self.nhead, head_dim=self.head_dim
+        )
         self.dropout = nn.Dropout(dropout)
         self.drop_path = (
             StochasticDepth(drop_path) if drop_path > 0.0 else nn.Identity()
@@ -276,7 +300,9 @@ class Perceiver(nn.Module):
         self.depth = max(1, int(depth))
         self.self_attn_layers = max(0, int(self_attn_layers))
         self.norm_type = str(norm_type)
-        self.latents = nn.Parameter(torch.randn(self.num_latents, self.d_model) * 0.02)
+        self.latents = nn.Parameter(
+            torch.randn(self.num_latents, self.d_model) * 0.02
+        )
         total_layers = int(self.depth) * (1 + int(self.self_attn_layers))
         drops = stochastic_depth_schedule(float(drop_path), total_layers)
         dp_it = iter(drops)
@@ -354,7 +380,9 @@ class RetNet(nn.Module):
         hid = int(self.d_model * mlp_ratio * (2.0 / 3.0))
         from .activations import SwiGLU
 
-        self.ffn = SwiGLU(self.d_model, hid, out_dim=self.d_model, dropout=dropout)
+        self.ffn = SwiGLU(
+            self.d_model, hid, out_dim=self.d_model, dropout=dropout
+        )
 
     def forward(
         self: Self,
@@ -474,7 +502,9 @@ class LongNet(nn.Module):
             )
             H, bytes_e = int(self.nhead), int(out.element_size())
             base = int(B) * int(L) * int(D) * bytes_e
-            score_b = 4 if out.dtype in (torch.float16, torch.bfloat16) else bytes_e
+            score_b = (
+                4 if out.dtype in (torch.float16, torch.bfloat16) else bytes_e
+            )
             peak = 0
             flex = _ENN_HAS_FLEX_ATTENTION and out.is_cuda and not need_weights
             for lyr in self.layers:
@@ -489,7 +519,11 @@ class LongNet(nn.Module):
                         )
                     )
                 )
-                scores = (int(B) * int(H) * int(L) * int(L) * score_b) if dense else 0
+                scores = (
+                    (int(B) * int(H) * int(L) * int(L) * score_b)
+                    if dense
+                    else 0
+                )
                 hid = 0
                 if (
                     (ffn := getattr(lyr, "ffn", None))
@@ -535,7 +569,11 @@ class LongNet(nn.Module):
         attn_w: Optional[torch.Tensor] = None
         out, need_transpose_fallback = x, False
         layout_batch_first = self.batch_first
-        if out.dim() == 3 and not self.batch_first and out.shape[0] != out.shape[1]:
+        if (
+            out.dim() == 3
+            and not self.batch_first
+            and out.shape[0] != out.shape[1]
+        ):
             out, layout_batch_first, need_transpose_fallback = (
                 out.transpose(0, 1),
                 True,
@@ -563,6 +601,10 @@ class LongNet(nn.Module):
                     average_attn_weights=average_attn_weights,
                 )
         out = self.norm(out)
-        if need_transpose_fallback and out.dim() == 3 and out.shape[0] != out.shape[1]:
+        if (
+            need_transpose_fallback
+            and out.dim() == 3
+            and out.shape[0] != out.shape[1]
+        ):
             out = out.transpose(0, 1)
         return out, attn_w

@@ -11,23 +11,29 @@ import threading
 from collections import OrderedDict
 from contextlib import AbstractContextManager
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, List, Optional, Self, Tuple, Union
+from typing import Any
+from typing import Callable
+from typing import Dict
+from typing import List
+from typing import Optional
+from typing import Self
+from typing import Tuple
+from typing import Union
 
 import torch
 from torch import nn
 
-from .concurrency import Mutex
-from ..core.datatypes import default_underflow_action, normalize_underflow_action
+from ..core.datatypes import default_underflow_action
+from ..core.datatypes import normalize_underflow_action
 from ..nn.graph import clear_model_cache
-from .system import (
-    _log_debug,
-    _log_info,
-    get_device,
-    get_device_stats,
-    is_cuda_bf16_supported,
-    is_float8_supported,
-    is_int8_supported,
-)
+from .concurrency import Mutex
+from .system import _log_debug
+from .system import _log_info
+from .system import get_device
+from .system import get_device_stats
+from .system import is_cuda_bf16_supported
+from .system import is_float8_supported
+from .system import is_int8_supported
 
 _Int8DynamicActivationInt8WeightConfig = None
 _Int8WeightOnlyConfig = None
@@ -74,7 +80,9 @@ def _import_torchao_quantization() -> None:
                 from torchao.quantization.quant_api import (
                     Int8WeightOnlyConfig as _Int8WeightOnlyConfig,
                 )
-                from torchao.quantization.quant_api import quantize_ as _quantize_
+                from torchao.quantization.quant_api import (
+                    quantize_ as _quantize_,
+                )
 
                 try:
                     from torchao.quantization import (
@@ -126,14 +134,20 @@ def _log_negotiation(
             _NEGO_LOGGED_KEYS.popitem(last=False)
 
     try:
-        msg = "[AMP][NEGOTIATE] " + json.dumps(payload, sort_keys=True, default=str)
+        msg = "[AMP][NEGOTIATE] " + json.dumps(
+            payload, sort_keys=True, default=str
+        )
     except Exception:
         msg = f"[AMP][NEGOTIATE] {payload}"
     lg.log(lvl, msg)
 
 
 def _parse_dtype(dtype: Any) -> str:
-    return str(dtype).split(".")[-1] if isinstance(dtype, torch.dtype) else str(dtype)
+    return (
+        str(dtype).split(".")[-1]
+        if isinstance(dtype, torch.dtype)
+        else str(dtype)
+    )
 
 
 def _to_serializable(x: Any) -> Any:
@@ -233,7 +247,9 @@ def _validate_dtype_safety(
 
     if getattr(dtype, "is_floating_point", False):
         info = torch.finfo(dtype)
-        if max_abs_f > (ov_limit := float(info.max) / max(1.0, float(safety_margin))):
+        if max_abs_f > (
+            ov_limit := float(info.max) / max(1.0, float(safety_margin))
+        ):
             return False, f"overflow({max_abs_f:.6g}>{ov_limit:.6g})"
         if (
             action == "forbid"
@@ -247,7 +263,10 @@ def _validate_dtype_safety(
                 math.isfinite(mp_f)
                 and mp_f > 0.0
                 and mp_f
-                < (uf_limit := float(info.tiny) * max(1.0, float(safety_margin)))
+                < (
+                    uf_limit := float(info.tiny)
+                    * max(1.0, float(safety_margin))
+                )
             ):
                 return False, f"underflow({mp_f:.6g}<{uf_limit:.6g})"
         return True, "ok"
@@ -349,7 +368,9 @@ class DeviceMeta:
         return False
 
     @classmethod
-    def for_device(cls: type[Self], device: Union[torch.device, str]) -> "DeviceMeta":
+    def for_device(
+        cls: type[Self], device: Union[torch.device, str]
+    ) -> "DeviceMeta":
         ds = get_device_stats(device)
         return cls(
             device=ds.device,
@@ -418,7 +439,9 @@ class Autocast:
         kind: str,
     ) -> Optional[str]:
         order = ("ao", "te") if preferred == "ao" else ("te", "ao")
-        is_supported = is_float8_supported if kind == "fp8" else is_int8_supported
+        is_supported = (
+            is_float8_supported if kind == "fp8" else is_int8_supported
+        )
 
         for backend in order:
             if backend == "te":
@@ -492,7 +515,9 @@ class Autocast:
     def _torchao_float8(
         cls: type[Self], enabled: bool
     ) -> List[AbstractContextManager[None]]:
-        return cls._get_backend_context("torchao.float8", "fp8_autocast", enabled)
+        return cls._get_backend_context(
+            "torchao.float8", "fp8_autocast", enabled
+        )
 
     @classmethod
     def _torchao_int8_backend(
@@ -695,7 +720,11 @@ class Autocast:
             if p2 is not None:
                 return float(2 ** max(0, min(30, int(p2 or 3)))), int(p2 or 3)
             margin = float(kwargs.pop("safety_margin", 8.0))
-            return (margin, int(round(math.log2(margin)))) if margin > 0 else (8.0, 3)
+            return (
+                (margin, int(round(math.log2(margin))))
+                if margin > 0
+                else (8.0, 3)
+            )
 
         safety_margin, safety_margin_pow2 = _parse_margin()
         underflow_override = normalize_underflow_action(
@@ -703,7 +732,8 @@ class Autocast:
             default=default_underflow_action(),
         )
         collect_checks = logger and (
-            logger.isEnabledFor(logging.DEBUG) or logger.isEnabledFor(logging.INFO)
+            logger.isEnabledFor(logging.DEBUG)
+            or logger.isEnabledFor(logging.INFO)
         )
         checks, selected, selected_from = [], None, "candidate"
 
@@ -757,7 +787,9 @@ class Autocast:
 
         if logger is not None:
             level = "info" if selected_from != "candidate" else "debug"
-            if logger.isEnabledFor(logging.INFO if level == "info" else logging.DEBUG):
+            if logger.isEnabledFor(
+                logging.INFO if level == "info" else logging.DEBUG
+            ):
                 scale_key = (
                     getattr(meta, "has_scale", False),
                     getattr(meta, "has_nonfinite", False),
@@ -809,7 +841,9 @@ class Autocast:
             requested_dtype,
             cls._last_float_dtype,
         )
-        extra = getattr(meta, "float_dtypes", None) if meta is not None else None
+        extra = (
+            getattr(meta, "float_dtypes", None) if meta is not None else None
+        )
         if extra:
             with contextlib.suppress(Exception):
                 candidates = tuple(
@@ -960,7 +994,9 @@ class Autocast:
     ) -> contextlib.AbstractContextManager[None]:
         dev = cls._device(device)
         meta = cls.coerce_metadata(dev, metadata=metadata)
-        int_candidates = tuple(getattr(meta, "int_dtypes", ())) or (torch.int64,)
+        int_candidates = tuple(getattr(meta, "int_dtypes", ())) or (
+            torch.int64,
+        )
         int_dtype = cls.negotiate(
             int_candidates,
             fallback=torch.int64,
@@ -986,7 +1022,9 @@ class Autocast:
             contexts = cls._torchao_int8(dev, True) if backend else []
             if contexts:
                 int_backend_used = backend
-            elif backend == "te" and cls._int_backend("ao", device=dev) == "ao":
+            elif (
+                backend == "te" and cls._int_backend("ao", device=dev) == "ao"
+            ):
                 if contexts := cls._torchao_int8(dev, True):
                     int_backend_used = "ao"
 
@@ -1025,7 +1063,8 @@ class Quantization:
     def is_ptq_available() -> bool:
         _import_torchao_quantization()
         return bool(
-            _PTQ_IMPL is not None and _Int8DynamicActivationInt8WeightConfig is not None
+            _PTQ_IMPL is not None
+            and _Int8DynamicActivationInt8WeightConfig is not None
         )
 
     @staticmethod
@@ -1040,25 +1079,31 @@ class Quantization:
         _ = args, kwargs
         _import_torchao_quantization()
         if _qp is None:
-            raise RuntimeError("torchao.quantization.quant_primitives unavailable")
+            raise RuntimeError(
+                "torchao.quantization.quant_primitives unavailable"
+            )
 
         try:
+            from torchao.quantization.fake_quant import FakeQuantizeConfig
+            from torchao.quantization.fake_quant import Int8ActivationConfig
+            from torchao.quantization.fake_quant import Int8WeightConfig
             from torchao.quantization.fake_quant import (
-                FakeQuantizeConfig,
-                Int8ActivationConfig,
-                Int8WeightConfig,
+                prepare_qat_ as _prepare_qat,
             )
-            from torchao.quantization.fake_quant import prepare_qat_ as _prepare_qat
 
             cfg = FakeQuantizeConfig(
-                activation=Int8ActivationConfig(dynamic=bool(dynamic_activations)),
+                activation=Int8ActivationConfig(
+                    dynamic=bool(dynamic_activations)
+                ),
                 weight=Int8WeightConfig(group_size=int(group_size)),
             )
             _prepare_qat(model, cfg)
             clear_model_cache(model)
             return cfg
         except Exception as exc:
-            raise RuntimeError(f"torchao QAT prepare unavailable: {exc}") from exc
+            raise RuntimeError(
+                f"torchao QAT prepare unavailable: {exc}"
+            ) from exc
 
     @staticmethod
     def _apply_ptq(
@@ -1078,7 +1123,9 @@ class Quantization:
         cfg: Any
         why: str
         if bool(dynamic_activations):
-            cfg = _Int8DynamicActivationInt8WeightConfig(group_size=int(group_size))
+            cfg = _Int8DynamicActivationInt8WeightConfig(
+                group_size=int(group_size)
+            )
             why = "int8_dynamic_act_int8_weight"
         else:
             if _Int8WeightOnlyConfig is None:
@@ -1086,7 +1133,9 @@ class Quantization:
             cfg = _Int8WeightOnlyConfig(group_size=int(group_size))
             why = "int8_weight_only"
         try:
-            _log_info(logger, f"[INT8][PTQ] applying {why} (group={group_size})")
+            _log_info(
+                logger, f"[INT8][PTQ] applying {why} (group={group_size})"
+            )
             _PTQ_IMPL(model, cfg)
             clear_model_cache(model)
             return (model, True, why)
@@ -1185,7 +1234,9 @@ def is_precision_exempted(module: object) -> bool:
     return bool(getattr(module, "__enn_precision_exempt__", False))
 
 
-def _set_requires_grad(module: nn.Module, name: str, data: torch.Tensor, *, requires_grad: bool) -> None:
+def _set_requires_grad(
+    module: nn.Module, name: str, data: torch.Tensor, *, requires_grad: bool
+) -> None:
     setattr(module, name, nn.Parameter(data, requires_grad=requires_grad))
 
 
@@ -1234,7 +1285,9 @@ def cast_float_dtype(model: object, dtype: torch.dtype) -> None:
                         continue
 
 
-def cast_batchnorm_buffers_dtype(module: object, dtype: torch.dtype | None) -> None:
+def cast_batchnorm_buffers_dtype(
+    module: object, dtype: torch.dtype | None
+) -> None:
     if dtype is None or not isinstance(dtype, torch.dtype):
         return
     with torch.no_grad():
@@ -1260,10 +1313,18 @@ def cast_batchnorm_buffers_dtype(module: object, dtype: torch.dtype | None) -> N
 
 
 def get_layernorm_dtype(device: torch.device | str) -> torch.dtype:
-    device = torch.device(device) if not isinstance(device, torch.device) else device
+    device = (
+        torch.device(device)
+        if not isinstance(device, torch.device)
+        else device
+    )
     try:
         meta = Autocast.coerce_metadata(device)
-        cands = tuple(getattr(meta, "float_dtypes", ())) if meta is not None else ()
+        cands = (
+            tuple(getattr(meta, "float_dtypes", ()))
+            if meta is not None
+            else ()
+        )
         if not cands:
             cands = (torch.float32,)
         chosen = Autocast.negotiate(
@@ -1279,7 +1340,11 @@ def get_layernorm_dtype(device: torch.device | str) -> torch.dtype:
 
 
 def preload_layers(model: nn.Module, device: torch.device | str) -> None:
-    device = torch.device(device) if not isinstance(device, torch.device) else device
+    device = (
+        torch.device(device)
+        if not isinstance(device, torch.device)
+        else device
+    )
     from .tensor import is_meta_or_fake_tensor
 
     for module in model.modules():
@@ -1295,7 +1360,10 @@ def preload_layers(model: nn.Module, device: torch.device | str) -> None:
         else:
             target_dtype = None
             for tensor in (weight, bias):
-                if isinstance(tensor, torch.Tensor) and tensor.is_floating_point():
+                if (
+                    isinstance(tensor, torch.Tensor)
+                    and tensor.is_floating_point()
+                ):
                     if not is_meta_or_fake_tensor(tensor):
                         target_dtype = tensor.dtype
                         break
@@ -1303,23 +1371,42 @@ def preload_layers(model: nn.Module, device: torch.device | str) -> None:
                 target_dtype = torch.get_default_dtype()
 
         if module.elementwise_affine:
-            if not isinstance(weight, torch.Tensor) or is_meta_or_fake_tensor(weight):
-                data = torch.ones(module.normalized_shape, device=device, dtype=target_dtype)
-                _set_requires_grad(module, "weight", data, requires_grad=requires_grad_w)
+            if not isinstance(weight, torch.Tensor) or is_meta_or_fake_tensor(
+                weight
+            ):
+                data = torch.ones(
+                    module.normalized_shape, device=device, dtype=target_dtype
+                )
+                _set_requires_grad(
+                    module, "weight", data, requires_grad=requires_grad_w
+                )
                 weight = module.weight
-            if not isinstance(bias, torch.Tensor) or is_meta_or_fake_tensor(bias):
-                data = torch.zeros(module.normalized_shape, device=device, dtype=target_dtype)
-                _set_requires_grad(module, "bias", data, requires_grad=requires_grad_b)
+            if not isinstance(bias, torch.Tensor) or is_meta_or_fake_tensor(
+                bias
+            ):
+                data = torch.zeros(
+                    module.normalized_shape, device=device, dtype=target_dtype
+                )
+                _set_requires_grad(
+                    module, "bias", data, requires_grad=requires_grad_b
+                )
                 bias = module.bias
 
         if device.type == "cpu":
-            if isinstance(weight, torch.Tensor) and weight.dtype != target_dtype:
+            if (
+                isinstance(weight, torch.Tensor)
+                and weight.dtype != target_dtype
+            ):
                 data = weight.to(device=device, dtype=target_dtype)
-                _set_requires_grad(module, "weight", data, requires_grad=requires_grad_w)
+                _set_requires_grad(
+                    module, "weight", data, requires_grad=requires_grad_w
+                )
                 weight = module.weight
             if isinstance(bias, torch.Tensor) and bias.dtype != target_dtype:
                 data = bias.to(device=device, dtype=target_dtype)
-                _set_requires_grad(module, "bias", data, requires_grad=requires_grad_b)
+                _set_requires_grad(
+                    module, "bias", data, requires_grad=requires_grad_b
+                )
                 bias = module.bias
         elif (
             isinstance(weight, torch.Tensor)
@@ -1329,11 +1416,19 @@ def preload_layers(model: nn.Module, device: torch.device | str) -> None:
             and (bias.dtype != weight.dtype)
         ):
             data = bias.to(device=device, dtype=weight.dtype)
-            _set_requires_grad(module, "bias", data, requires_grad=requires_grad_b)
+            _set_requires_grad(
+                module, "bias", data, requires_grad=requires_grad_b
+            )
 
 
-def validate_model_dtype_unity(model: nn.Module, device: torch.device | str) -> None:
-    device = torch.device(device) if not isinstance(device, torch.device) else device
+def validate_model_dtype_unity(
+    model: nn.Module, device: torch.device | str
+) -> None:
+    device = (
+        torch.device(device)
+        if not isinstance(device, torch.device)
+        else device
+    )
     mismatches: list[str] = []
     for name, module in model.named_modules():
         if not isinstance(module, nn.LayerNorm):
@@ -1347,7 +1442,10 @@ def validate_model_dtype_unity(model: nn.Module, device: torch.device | str) -> 
         )
 
         for label, tensor in tensors:
-            if not isinstance(tensor, torch.Tensor) or not tensor.is_floating_point():
+            if (
+                not isinstance(tensor, torch.Tensor)
+                or not tensor.is_floating_point()
+            ):
                 continue
             if expected is None:
                 expected = tensor.dtype
@@ -1361,7 +1459,8 @@ def validate_model_dtype_unity(model: nn.Module, device: torch.device | str) -> 
             dtypes = {
                 tensor.dtype
                 for _, tensor in tensors
-                if isinstance(tensor, torch.Tensor) and tensor.is_floating_point()
+                if isinstance(tensor, torch.Tensor)
+                and tensor.is_floating_point()
             }
             if len(dtypes) > 1:
                 module_name = name or module.__class__.__name__
@@ -1371,11 +1470,14 @@ def validate_model_dtype_unity(model: nn.Module, device: torch.device | str) -> 
 
     if mismatches:
         raise RuntimeError(
-            "LayerNorm parameter dtype mismatch detected:\n" + "\n".join(mismatches)
+            "LayerNorm parameter dtype mismatch detected:\n"
+            + "\n".join(mismatches)
         )
 
 
-def unify_model_dtype(model: nn.Module, prefer: torch.dtype | None = None) -> torch.dtype | None:
+def unify_model_dtype(
+    model: nn.Module, prefer: torch.dtype | None = None
+) -> torch.dtype | None:
     dtypes = {p.dtype for p in model.parameters() if p is not None}
     if len(dtypes) <= 1:
         return None
@@ -1396,6 +1498,8 @@ def unify_model_dtype(model: nn.Module, prefer: torch.dtype | None = None) -> to
         for name, p in list(params.items()):
             if p is None or p.dtype == tgt:
                 continue
-            params[name] = torch.nn.Parameter(p.detach().to(tgt), requires_grad=p.requires_grad)
+            params[name] = torch.nn.Parameter(
+                p.detach().to(tgt), requires_grad=p.requires_grad
+            )
 
     return tgt

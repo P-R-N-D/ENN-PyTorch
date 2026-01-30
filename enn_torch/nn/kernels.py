@@ -7,34 +7,37 @@ import math
 import os
 import threading
 import warnings
-from typing import Any, Callable, Mapping, Optional, Self, Tuple
+from typing import Any
+from typing import Callable
+from typing import Mapping
+from typing import Optional
+from typing import Self
+from typing import Tuple
 
 import torch
 import torch._dynamo
 from torch import nn
 
-from ..core.datatypes import env_bool, env_str
-from .graph import (
-    assert_trace,
-    canonicalize_compile_mode,
-    compile as _model_compile,
-    is_compiling,
-    is_dynamo_compiling,
-    is_export_or_trace,
-    is_symbolic,
-    is_tracing_or_exporting,
-    skip_non_infra_dispatch_mode,
-    torch_compiler_disable,
-    torch_compiler_supported,
-)
-from .profiler import FLOP_PROFILER, capture
-from ..core.system import (
-    get_device,
-    get_dpa_backends,
-    get_runtime_cfg,
-    get_runtime_config,
-)
+from ..core.datatypes import env_bool
+from ..core.datatypes import env_str
+from ..core.system import get_device
+from ..core.system import get_dpa_backends
+from ..core.system import get_runtime_cfg
+from ..core.system import get_runtime_config
 from ..core.tensor import is_meta_or_fake_tensor
+from .graph import assert_trace
+from .graph import canonicalize_compile_mode
+from .graph import compile as _model_compile
+from .graph import is_compiling
+from .graph import is_dynamo_compiling
+from .graph import is_export_or_trace
+from .graph import is_symbolic
+from .graph import is_tracing_or_exporting
+from .graph import skip_non_infra_dispatch_mode
+from .graph import torch_compiler_disable
+from .graph import torch_compiler_supported
+from .profiler import FLOP_PROFILER
+from .profiler import capture
 
 try:
     import triton
@@ -65,14 +68,18 @@ except Exception:
     tl = _TLStub()
 
 try:
-    from torch.nn.attention.flex_attention import create_mask as _torch_create_mask
+    from torch.nn.attention.flex_attention import (
+        create_mask as _torch_create_mask,
+    )
     from torch.nn.attention.flex_attention import (
         flex_attention as _torch_flex_attention,
     )
 
     _HAS_TORCH_FLEX = True
     with contextlib.suppress(Exception):
-        _FLEX_KWARGS = set(inspect.signature(_torch_flex_attention).parameters.keys())
+        _FLEX_KWARGS = set(
+            inspect.signature(_torch_flex_attention).parameters.keys()
+        )
 except Exception:
     _torch_create_mask = None
     _torch_flex_attention = None
@@ -82,7 +89,10 @@ except Exception:
 _HAS_TE = False
 te = None
 
-if torch.cuda.is_available() and getattr(get_device(), "type", "cpu") == "cuda":
+if (
+    torch.cuda.is_available()
+    and getattr(get_device(), "type", "cpu") == "cuda"
+):
     try:
         import transformer_engine.pytorch as te
 
@@ -361,29 +371,6 @@ def _get_compiled_flex_attention_for_kwargs(
             return _torch_flex_attention, key
 
 
-def _get_compiled_flex_attention() -> Any:
-    if not _HAS_TORCH_FLEX or _torch_flex_attention is None:
-        raise RuntimeError("Flex Attention is not available")
-    if is_dynamo_compiling() or is_tracing_or_exporting():
-        return _torch_flex_attention
-    if not torch_compiler_supported():
-        return _torch_flex_attention
-    mode = _flex_attention_compile_mode()
-    cached = _FLEX_ATTN_COMPILED.get(mode)
-    if cached is not None:
-        return cached
-    with _FLEX_ATTN_COMPILE_LOCK:
-        cached = _FLEX_ATTN_COMPILED.get(mode)
-        if cached is not None:
-            return cached
-        try:
-            compiled = _model_compile(_torch_flex_attention, mode=mode)
-        except Exception:
-            compiled = _torch_flex_attention
-        _FLEX_ATTN_COMPILED[mode] = compiled
-        return compiled
-
-
 def _exporting_boundary() -> bool:
     return bool(is_export_or_trace())
 
@@ -461,7 +448,12 @@ def _looks_like_triton_resource_error(exc: BaseException) -> bool:
     msg = str(exc)
     if "No valid triton configs" not in msg:
         return False
-    needles = ("out of resource", "OutOfResources", "Hardware limit", "num_stages")
+    needles = (
+        "out of resource",
+        "OutOfResources",
+        "Hardware limit",
+        "num_stages",
+    )
     return any(n in msg for n in needles)
 
 
@@ -539,7 +531,9 @@ def _blockmask_to_token_mask(
             and isinstance(Lk, int)
         ):
             with contextlib.suppress(Exception):
-                tok = _torch_create_mask(mask_mod, B, H, Lq, Lk, device=str(device))
+                tok = _torch_create_mask(
+                    mask_mod, B, H, Lq, Lk, device=str(device)
+                )
                 if torch.is_tensor(tok):
                     return tok.to(device)
     if _exporting_boundary() and (mask_mod is not None):
@@ -593,10 +587,14 @@ def _blockmask_to_token_mask(
     return expanded[..., :Lq, :Lk]
 
 
-def _apply_allowed_mask(scores: torch.Tensor, allowed: torch.Tensor) -> torch.Tensor:
+def _apply_allowed_mask(
+    scores: torch.Tensor, allowed: torch.Tensor
+) -> torch.Tensor:
     if allowed.dtype != torch.bool:
         allowed = allowed != 0
-    return scores.masked_fill(allowed.logical_not(), torch.finfo(scores.dtype).min)
+    return scores.masked_fill(
+        allowed.logical_not(), torch.finfo(scores.dtype).min
+    )
 
 
 def _flatten_attn_mask(
@@ -622,7 +620,9 @@ def _flatten_attn_mask(
             )
         else:
             if mask.shape[0] != S:
-                raise RuntimeError(f"attn_mask S mismatch: {mask.shape} != {S}")
+                raise RuntimeError(
+                    f"attn_mask S mismatch: {mask.shape} != {S}"
+                )
         return mask.view(1, 1, 1, mask.shape[0]), 1, 1, 1
     if dim == 2:
         a, b = mask.shape
@@ -723,7 +723,11 @@ def _compute_flops_mha(
             or is_meta_or_fake_tensor(key)
         ):
             return
-        if FLOP_PROFILER is None or torch.jit.is_tracing() or torch.jit.is_scripting():
+        if (
+            FLOP_PROFILER is None
+            or torch.jit.is_tracing()
+            or torch.jit.is_scripting()
+        ):
             return
         if torch.compiler.is_compiling():
             return
@@ -745,7 +749,8 @@ def _compute_flops_mha(
         proj = 0.0
         if include_projections:
             tokens = (
-                float(B) * torch.tensor([Lq, Sk, Sk, Lq], dtype=torch.float32).sum()
+                float(B)
+                * torch.tensor([Lq, Sk, Sk, Lq], dtype=torch.float32).sum()
             )
             proj = 2.0 * float(tokens) * E * E
         FLOP_PROFILER.add(label, float(core + proj))
@@ -827,10 +832,14 @@ def _mha_export_safe(
     q = q.reshape(B, Lq, H, Dh).transpose(1, 2)
     k = k.reshape(B, Lk, H, Dh).transpose(1, 2)
     v = v.reshape(B, Lk, H, Dh).transpose(1, 2)
-    scores = torch.matmul(q, k.transpose(-2, -1)) * (1.0 / math.sqrt(float(Dh)))
+    scores = torch.matmul(q, k.transpose(-2, -1)) * (
+        1.0 / math.sqrt(float(Dh))
+    )
     if is_causal:
         try:
-            causal = torch.ones((Lq, Lk), dtype=torch.bool, device=scores.device).tril()
+            causal = torch.ones(
+                (Lq, Lk), dtype=torch.bool, device=scores.device
+            ).tril()
             scores = scores.masked_fill(
                 causal.logical_not(), torch.finfo(scores.dtype).min
             )
@@ -863,7 +872,9 @@ def _mha_export_safe(
                 scores = scores + m
     attn = torch.softmax(scores, dim=-1)
     if training and float(mha.dropout) > 0.0:
-        attn = torch.nn.functional.dropout(attn, p=float(mha.dropout), training=True)
+        attn = torch.nn.functional.dropout(
+            attn, p=float(mha.dropout), training=True
+        )
     out = torch.matmul(attn, v)
     out = out.transpose(1, 2).reshape(B, Lq, E)
     out = mha.out_proj(out)
@@ -947,7 +958,9 @@ def _attention_math_bshd(
             scores = scores + attn_mask
     probs = torch.softmax(scores, dim=-1)
     if training and float(dropout_p) > 0.0:
-        probs = torch.nn.functional.dropout(probs, p=float(dropout_p), training=True)
+        probs = torch.nn.functional.dropout(
+            probs, p=float(dropout_p), training=True
+        )
     return torch.matmul(probs, v_bshd)
 
 
@@ -1084,7 +1097,9 @@ class _MultiHeadAttentionNvidia(nn.Module):
                 getattr(self._te_mha, "__call__", None),
             )
             try:
-                self._te_forward_signature = inspect.signature(_fwd) if _fwd else None
+                self._te_forward_signature = (
+                    inspect.signature(_fwd) if _fwd else None
+                )
             except:
                 self._te_forward_signature = None
             params = (
@@ -1129,7 +1144,9 @@ class _MultiHeadAttentionNvidia(nn.Module):
                     num_heads=num_heads,
                     attention_dropout=dropout,
                 ),
-                dict(embed_dim=embed_dim, num_heads=num_heads, dropout=dropout),
+                dict(
+                    embed_dim=embed_dim, num_heads=num_heads, dropout=dropout
+                ),
             )
             for ckw in ctor_variants:
                 with contextlib.suppress(Exception):
@@ -1208,7 +1225,9 @@ class _MultiHeadAttentionNvidia(nn.Module):
             else:
                 if not self._te_supports_tuple_mask:
                     return _fallback_call()
-                q_mask = torch.zeros((B0, 1, 1, Lq), device=_q.device, dtype=torch.bool)
+                q_mask = torch.zeros(
+                    (B0, 1, 1, Lq), device=_q.device, dtype=torch.bool
+                )
                 te_mask = (q_mask, kv_mask)
             mask_type = "padding_causal" if bool(is_causal) else "padding"
         else:
@@ -1286,7 +1305,9 @@ class _MultiHeadAttentionCompat(nn.Module):
         is_causal: Optional[bool] = None,
         average_attn_weights: bool = False,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        kwargs = dict(key_padding_mask=key_padding_mask, need_weights=need_weights)
+        kwargs = dict(
+            key_padding_mask=key_padding_mask, need_weights=need_weights
+        )
         if need_weights:
             kwargs["average_attn_weights"] = bool(average_attn_weights)
         if _exporting_boundary():
@@ -1335,7 +1356,9 @@ class DotProductAttention(nn.Module):
         self.nh = int(num_heads) if num_heads is not None else None
         self.hd = int(head_dim) if head_dim is not None else None
         cfg = get_runtime_config()
-        self.te_first = bool(cfg.te_first) if te_first is None else bool(te_first)
+        self.te_first = (
+            bool(cfg.te_first) if te_first is None else bool(te_first)
+        )
         self._te_ok = bool(
             _HAS_TE
             and torch.cuda.is_available()
@@ -1386,8 +1409,12 @@ class DotProductAttention(nn.Module):
                 elif "attention_mask_type" in params:
                     self._te_mask_type_param = "attention_mask_type"
                 self._te_supports_mask = self._te_mask_param is not None
-                self._te_supports_mask_type = self._te_mask_type_param is not None
-                self._te_supports_attention_dropout = "attention_dropout" in params
+                self._te_supports_mask_type = (
+                    self._te_mask_type_param is not None
+                )
+                self._te_supports_attention_dropout = (
+                    "attention_dropout" in params
+                )
                 self._te_supports_is_causal = "is_causal" in params
                 self._te_supports_training = "training" in params
 
@@ -1456,7 +1483,11 @@ class DotProductAttention(nn.Module):
         q_bshd, k_bshd, v_bshd = [
             self._negotiate_dtype(t).contiguous() for t in (q, k, v)
         ]
-        if not tracing and _is_bshd_contiguous(q_bshd) and _is_bshd_contiguous(k_bshd):
+        if (
+            not tracing
+            and _is_bshd_contiguous(q_bshd)
+            and _is_bshd_contiguous(k_bshd)
+        ):
             with contextlib.suppress(Exception):
                 capture(
                     q_bshd,
@@ -1523,7 +1554,9 @@ class DotProductAttention(nn.Module):
                     if int(mb) != int(B):
                         te_mask = te_mask.expand(int(B), 1, 1, int(S))
                     te_mask = te_mask.contiguous()
-                    te_mask_type = "padding_causal" if bool(is_causal) else "padding"
+                    te_mask_type = (
+                        "padding_causal" if bool(is_causal) else "padding"
+                    )
             if use_te and te_mask is not None and not self._te_supports_mask:
                 use_te = False
             if (
@@ -1531,11 +1564,15 @@ class DotProductAttention(nn.Module):
                 and te_mask is not None
                 and te_mask_type
                 and te_mask_type.startswith("padding")
-                and not (self._te_supports_mask_type and self._te_mask_type_param)
+                and not (
+                    self._te_supports_mask_type and self._te_mask_type_param
+                )
             ):
                 use_te = False
             if use_te and (te_mask is None) and bool(is_causal):
-                if not (self._te_supports_mask_type or self._te_supports_is_causal):
+                if not (
+                    self._te_supports_mask_type or self._te_supports_is_causal
+                ):
                     use_te = False
         if use_te:
             q_te = q_bshd.transpose(1, 2).contiguous()
@@ -1554,7 +1591,11 @@ class DotProductAttention(nn.Module):
                 te_kwargs["is_causal"] = bool(is_causal)
             if self._te_supports_training:
                 te_kwargs["training"] = training
-            if te_mask is not None and self._te_supports_mask and self._te_mask_param:
+            if (
+                te_mask is not None
+                and self._te_supports_mask
+                and self._te_mask_param
+            ):
                 te_kwargs[self._te_mask_param] = te_mask
             try:
                 out_te = self._te_attn(q_te, k_te, v_te, **te_kwargs)
@@ -1598,12 +1639,18 @@ class DotProductAttention(nn.Module):
         exporting = _exporting_boundary()
         disable_sdpa = env_bool(("ENN_DISABLE_SDPA",), default=False)
         force_sdpa = env_bool(("ENN_FORCE_SDPA",), default=False)
-        if (exporting and not force_sdpa) or disable_sdpa or (not q_bshd.is_cuda):
+        if (
+            (exporting and not force_sdpa)
+            or disable_sdpa
+            or (not q_bshd.is_cuda)
+        ):
             fm = final_mask
             if fm is not None:
                 fm = fm.to(
                     device=q_bshd.device,
-                    dtype=(torch.bool if fm.dtype is torch.bool else q_bshd.dtype),
+                    dtype=(
+                        torch.bool if fm.dtype is torch.bool else q_bshd.dtype
+                    ),
                     non_blocking=True,
                 )
                 if fm.dim() != 4:
@@ -1634,7 +1681,11 @@ class DotProductAttention(nn.Module):
             if fm is not None:
                 fm = fm.to(
                     device=q_bshd.device,
-                    dtype=(q_bshd.dtype if not fm.dtype is torch.bool else torch.bool),
+                    dtype=(
+                        q_bshd.dtype
+                        if not fm.dtype is torch.bool
+                        else torch.bool
+                    ),
                     non_blocking=True,
                 )
                 sdpa_kwargs["attn_mask"], bd, hd, _ = _flatten_attn_mask(
@@ -1655,8 +1706,10 @@ class DotProductAttention(nn.Module):
 
                 if backends:
                     with sdpa_kernel(backends):
-                        sdpa_out = torch.nn.functional.scaled_dot_product_attention(
-                            q_bshd, k_bshd, v_bshd, **sdpa_kwargs
+                        sdpa_out = (
+                            torch.nn.functional.scaled_dot_product_attention(
+                                q_bshd, k_bshd, v_bshd, **sdpa_kwargs
+                            )
                         )
             except Exception:
                 pass
@@ -1712,11 +1765,15 @@ class FlexAttention(nn.Module):
                 "FlexAttention reference path does not support score_mod"
             )
         if q.dim() != 4 or k.dim() != 4 or v.dim() != 4:
-            raise ValueError(f"FlexAttention expects (B,H,L,D), got {tuple(q.shape)}")
+            raise ValueError(
+                f"FlexAttention expects (B,H,L,D), got {tuple(q.shape)}"
+            )
         q_bshd, k_bshd, v_bshd = q, k, v
         _, _, Lq, Dh = q_bshd.shape
         Lk = k_bshd.shape[2]
-        sc = float(scale) if scale is not None else (1.0 / math.sqrt(float(Dh)))
+        sc = (
+            float(scale) if scale is not None else (1.0 / math.sqrt(float(Dh)))
+        )
         scores = torch.matmul(q_bshd, k_bshd.transpose(-2, -1)) * sc
         if is_causal:
             with contextlib.suppress(Exception):
@@ -1745,7 +1802,9 @@ class FlexAttention(nn.Module):
                 scores = scores + dense
         attn = torch.softmax(scores, dim=-1)
         if training and float(dropout_p) > 0.0:
-            attn = torch.nn.functional.dropout(attn, p=float(dropout_p), training=True)
+            attn = torch.nn.functional.dropout(
+                attn, p=float(dropout_p), training=True
+            )
         return torch.matmul(attn, v_bshd)
 
     def forward(
@@ -1814,7 +1873,9 @@ class FlexAttention(nn.Module):
                     flex_kwargs["dropout"] = float(dropout_p)
             if "kernel_options" in _FLEX_KWARGS and kernel_options is not None:
                 flex_kwargs["kernel_options"] = kernel_options
-            flex_fn, flex_key = _get_compiled_flex_attention_for_kwargs(q, flex_kwargs)
+            flex_fn, flex_key = _get_compiled_flex_attention_for_kwargs(
+                q, flex_kwargs
+            )
             try:
                 if flex_fn is _torch_flex_attention:
                     return _call_torch_flex_attention_eager(
@@ -1877,7 +1938,9 @@ class FlexAttention(nn.Module):
             except Exception as exc:
                 if _is_compile_failure(exc):
                     with contextlib.suppress(Exception):
-                        _FLEX_ATTN_FAILED[flex_key] = f"{type(exc).__name__}: {exc}"
+                        _FLEX_ATTN_FAILED[flex_key] = (
+                            f"{type(exc).__name__}: {exc}"
+                        )
                         _FLEX_ATTN_SPECIALIZED.pop(flex_key, None)
                     if _looks_like_triton_resource_error(exc) and (
                         "kernel_options" in _FLEX_KWARGS
@@ -1889,7 +1952,9 @@ class FlexAttention(nn.Module):
                                 _resource_safe_kernel_options(existing)
                             )
                             flex_fn2, flex_key2 = (
-                                _get_compiled_flex_attention_for_kwargs(q, flex_kwargs2)
+                                _get_compiled_flex_attention_for_kwargs(
+                                    q, flex_kwargs2
+                                )
                             )
                             if flex_fn2 is not _torch_flex_attention:
                                 try:
@@ -1900,7 +1965,9 @@ class FlexAttention(nn.Module):
                                             _FLEX_ATTN_FAILED[flex_key2] = (
                                                 f"{type(exc2).__name__}: {exc2}"
                                             )
-                                            _FLEX_ATTN_SPECIALIZED.pop(flex_key2, None)
+                                            _FLEX_ATTN_SPECIALIZED.pop(
+                                                flex_key2, None
+                                            )
                                     else:
                                         raise
                             return _call_torch_flex_attention_eager(
@@ -1931,7 +1998,9 @@ class FlexAttention(nn.Module):
 
 
 class MultiScaleRetention(nn.Module):
-    def __init__(self: Self, d_model: int, nhead: int, use_gate: bool = True) -> None:
+    def __init__(
+        self: Self, d_model: int, nhead: int, use_gate: bool = True
+    ) -> None:
         super().__init__()
         self.d_model = int(d_model)
         self.nhead = int(nhead)
@@ -1945,7 +2014,9 @@ class MultiScaleRetention(nn.Module):
         self.v_proj = nn.Linear(self.d_model, self.d_model, bias=False)
         self.o_proj = nn.Linear(self.d_model, self.d_model, bias=False)
         self.g_proj = (
-            nn.Linear(self.d_model, self.d_model, bias=False) if self.use_gate else None
+            nn.Linear(self.d_model, self.d_model, bias=False)
+            if self.use_gate
+            else None
         )
         self.norm = nn.LayerNorm(self.d_model)
         self._triton_ok = bool(_HAS_TRITON_MSR and torch.cuda.is_available())
@@ -1961,14 +2032,17 @@ class MultiScaleRetention(nn.Module):
         self: Self, device: torch.device, dtype: torch.dtype
     ) -> torch.Tensor:
         H = int(self.nhead)
-        calc_dtype = dtype if dtype in (torch.float32, torch.float64) else torch.float32
+        calc_dtype = (
+            dtype if dtype in (torch.float32, torch.float64) else torch.float32
+        )
         beta = getattr(self, "_beta", None)
         if not (
             isinstance(beta, torch.Tensor)
             and (is_tracing_or_exporting() or beta.numel() == H)
         ):
             beta = float(self._decay_init) + float(self._decay_range) * (
-                torch.arange(H, device=device, dtype=calc_dtype) / float(max(H, 1))
+                torch.arange(H, device=device, dtype=calc_dtype)
+                / float(max(H, 1))
             )
         gammas = (
             1.0 - torch.pow(2.0, -beta.to(device=device, dtype=calc_dtype))
@@ -2000,7 +2074,9 @@ class MultiScaleRetention(nn.Module):
                 "attn_mask length mismatch",
             )
         mask = (
-            attn_mask.to(device=v.device, non_blocking=True).unsqueeze(-1).unsqueeze(-1)
+            attn_mask.to(device=v.device, non_blocking=True)
+            .unsqueeze(-1)
+            .unsqueeze(-1)
         )
         return torch.where(mask, torch.zeros_like(v), v)
 
@@ -2075,14 +2151,20 @@ class MultiScaleRetention(nn.Module):
             else:
                 if tuple(attn_mask.shape) != (B, L):
                     return state_tensor[:, -1]
-            lengths = (~attn_mask).to(dtype=torch.int64).sum(dim=1).clamp(min=1)
+            lengths = (
+                (~attn_mask).to(dtype=torch.int64).sum(dim=1).clamp(min=1)
+            )
             idx = (lengths - 1).clamp(min=0, max=L - 1)
             gather_idx = idx.view(B, 1, 1, 1).expand(-1, -1, H, Dh)
-            return torch.gather(state_tensor, dim=1, index=gather_idx).squeeze(1)
+            return torch.gather(state_tensor, dim=1, index=gather_idx).squeeze(
+                1
+            )
         return state_tensor[:, -1]
 
     @staticmethod
-    def _scan_causal_torch(v: torch.Tensor, lam_h: torch.Tensor) -> torch.Tensor:
+    def _scan_causal_torch(
+        v: torch.Tensor, lam_h: torch.Tensor
+    ) -> torch.Tensor:
         B, L, H, Dh = v.shape
         trace_like = bool(is_symbolic())
         if trace_like:
@@ -2094,7 +2176,9 @@ class MultiScaleRetention(nn.Module):
             if L <= 0:
                 return v.new_zeros(v.shape)
         calc_dtype = (
-            torch.float32 if v.dtype in (torch.float16, torch.bfloat16) else v.dtype
+            torch.float32
+            if v.dtype in (torch.float16, torch.bfloat16)
+            else v.dtype
         )
         lam_calc = lam_h.to(dtype=calc_dtype, device=v.device).view(1, 1, H, 1)
         t = torch.arange(L, device=v.device, dtype=calc_dtype).view(1, L, 1, 1)
@@ -2165,7 +2249,9 @@ class MultiScaleRetention(nn.Module):
         )
         return out
 
-    def _scan_causal(self: Self, v: torch.Tensor, lam_h: torch.Tensor) -> torch.Tensor:
+    def _scan_causal(
+        self: Self, v: torch.Tensor, lam_h: torch.Tensor
+    ) -> torch.Tensor:
         disable_triton = env_bool("ENN_MSR_FORCE_TORCH", default=False)
         use_triton = bool(
             (not disable_triton)
@@ -2214,7 +2300,9 @@ class MultiScaleRetention(nn.Module):
                     out0 = out0.to(restore_dtype)
                     st0 = st0.to(restore_dtype)
                 return out0, st0
-            return out0.to(restore_dtype) if restore_dtype is not None else out0
+            return (
+                out0.to(restore_dtype) if restore_dtype is not None else out0
+            )
         if (not trace_like) and D != int(self.d_model):
             raise ValueError(
                 f"Last dimension {D} must equal d_model={int(self.d_model)}"
@@ -2228,7 +2316,9 @@ class MultiScaleRetention(nn.Module):
         q = self.q_proj(x_in).view(B, L, self.nhead, head_dim)
         v = self.v_proj(x_in).view(B, L, self.nhead, head_dim)
         v = self._apply_kpm_to_v(v, attn_mask)
-        lam_h = self._decay_lambda(v.device, v.dtype).to(dtype=v.dtype, device=v.device)
+        lam_h = self._decay_lambda(v.device, v.dtype).to(
+            dtype=v.dtype, device=v.device
+        )
         if isinstance(decay_arg, torch.Tensor):
             if decay_arg.dim() == 1:
                 if trace_like:
@@ -2251,7 +2341,9 @@ class MultiScaleRetention(nn.Module):
                     if int(decay_arg.shape[0]) != int(self.nhead):
                         decay_arg = None
                 if decay_arg is not None:
-                    lam_h = decay_arg[:, 1, 0].to(dtype=v.dtype, device=v.device)
+                    lam_h = decay_arg[:, 1, 0].to(
+                        dtype=v.dtype, device=v.device
+                    )
         st_bhd = self._extract_state_tensor(state, B=B, H=int(self.nhead))
         if st_bhd is not None:
             v = v.clone()
@@ -2267,7 +2359,9 @@ class MultiScaleRetention(nn.Module):
         out = self.o_proj(y)
         last_state: Optional[torch.Tensor] = None
         if bool(return_state):
-            last_state = self._select_last_state(state_tensor, attn_mask).contiguous()
+            last_state = self._select_last_state(
+                state_tensor, attn_mask
+            ).contiguous()
             if not torch.is_grad_enabled():
                 last_state = last_state.detach()
         if (FLOP_PROFILER is not None) and (not trace_like):
@@ -2279,7 +2373,9 @@ class MultiScaleRetention(nn.Module):
                         L,
                         num_heads=int(self.nhead),
                         head_dim=int(head_dim),
-                        use_gate=bool(self.use_gate and self.g_proj is not None),
+                        use_gate=bool(
+                            self.use_gate and self.g_proj is not None
+                        ),
                     )
                     if fl > 0.0:
                         FLOP_PROFILER.add("MultiScaleRetention", float(fl))

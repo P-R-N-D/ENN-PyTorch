@@ -1,23 +1,28 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
-from contextlib import contextmanager, suppress
+from contextlib import contextmanager
+from contextlib import suppress
 from functools import partial
 from types import ModuleType
-from typing import Any, Iterator, Self
+from typing import Any
+from typing import Iterator
+from typing import Self
 
 import torch
 from torch import nn
 
-from .concurrency import Mutex
 from ..nn.graph import compile_distributed_safe
+from .concurrency import Mutex
 
 _PATCH_LOCK = Mutex(reentrant=True)
 _TORCH_COMPAT: TorchCompat | None = None
 RMSNorm = getattr(nn, "RMSNorm", None)
 
 
-def _fmin_impl(tm: ModuleType, a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+def _fmin_impl(
+    tm: ModuleType, a: torch.Tensor, b: torch.Tensor
+) -> torch.Tensor:
     a, b = tm.broadcast_tensors(a, b)
     an, bn = tm.isnan(a), tm.isnan(b)
     return tm.where(an & ~bn, b, tm.where(bn & ~an, a, tm.minimum(a, b)))
@@ -156,7 +161,9 @@ class TorchCompat:
     ) -> None:
         self.module = module if module is not None else torch
         self.nn_module = (
-            nn_module if nn_module is not None else getattr(self.module, "nn", nn)
+            nn_module
+            if nn_module is not None
+            else getattr(self.module, "nn", nn)
         )
 
     def apply(self: Self) -> None:
@@ -178,10 +185,13 @@ class TorchCompat:
             compile_distributed_safe()
 
 
-StochasticDepth = getattr(nn, "StochasticDepth", None) or _StochasticDepthFallback
+StochasticDepth = (
+    getattr(nn, "StochasticDepth", None) or _StochasticDepthFallback
+)
 
 try:
-    from torch.nn.attention import SDPBackend, sdpa_kernel
+    from torch.nn.attention import SDPBackend
+    from torch.nn.attention import sdpa_kernel
 except Exception:
     SDPBackend = _SDPBackendFallback
 

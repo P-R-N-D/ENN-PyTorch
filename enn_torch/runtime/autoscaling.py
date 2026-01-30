@@ -4,21 +4,24 @@ import contextlib
 import logging
 import os
 import time
-from typing import Any, Dict
+from typing import Any
+from typing import Dict
 
 import torch
 
 from ..core.concurrency import Mutex
-from ..core.datatypes import env_bool, env_float, env_int
+from ..core.datatypes import env_bool
+from ..core.datatypes import env_float
+from ..core.datatypes import env_int
 from ..core.precision import Autocast
-from ..core.system import (
-    accelerator_max_allocated_memory,
-    allocated_accelerator_memory,
-    flush_accelerator_memory_stats,
-    is_pin_supported,
-    sync_accelerator,
-)
-from ..core.tensor import to_device_recursive, to_torch_tensor, touch_tensors
+from ..core.system import accelerator_max_allocated_memory
+from ..core.system import allocated_accelerator_memory
+from ..core.system import flush_accelerator_memory_stats
+from ..core.system import is_pin_supported
+from ..core.system import sync_accelerator
+from ..core.tensor import to_device_recursive
+from ..core.tensor import to_torch_tensor
+from ..core.tensor import touch_tensors
 from ..data.pipeline import Dataset
 
 _LOGGER = logging.getLogger(__name__)
@@ -45,7 +48,9 @@ class BatchThrottler:
         self._scale_log_lock = Mutex()
 
     @staticmethod
-    def _oom_key(loader: object, phase: object, step: int) -> tuple[int, str, int]:
+    def _oom_key(
+        loader: object, phase: object, step: int
+    ) -> tuple[int, str, int]:
         return (int(id(loader)), str(phase), int(step))
 
     def oom_retries(self, loader: object, phase: object, step: int) -> int:
@@ -55,7 +60,9 @@ class BatchThrottler:
             self._oom_retry_count[key] = int(cur)
             return int(cur)
 
-    def clear_oom_retries(self, loader: object, phase: object, step: int) -> None:
+    def clear_oom_retries(
+        self, loader: object, phase: object, step: int
+    ) -> None:
         key = self._oom_key(loader, phase, int(step))
         with self._oom_retry_lock:
             self._oom_retry_count.pop(key, None)
@@ -76,7 +83,9 @@ class BatchThrottler:
             v = env_int("ENN_OOM_MAX_RETRIES_PER_BATCH", 3)
         return max(0, int(v))
 
-    def get_oom_blocking_time(self, oom_try: int, phase: str | None = None) -> float:
+    def get_oom_blocking_time(
+        self, oom_try: int, phase: str | None = None
+    ) -> float:
         del phase
         try:
             base_ms = float(env_float("ENN_OOM_BACKOFF_BASE_MS", 0.0))
@@ -104,7 +113,9 @@ class BatchThrottler:
     ) -> None:
         del args
         if min_interval_s is None:
-            min_interval_s = env_float("ENN_SAMPLER_SCALE_LOG_MIN_INTERVAL_S", 5.0)
+            min_interval_s = env_float(
+                "ENN_SAMPLER_SCALE_LOG_MIN_INTERVAL_S", 5.0
+            )
         try:
             min_interval_s = float(min_interval_s)
         except Exception:
@@ -133,7 +144,9 @@ class BatchScaler:
         self._logger = logger or _LOGGER
 
     @staticmethod
-    def get_sampler_scaler(loader: object, *args: Any, max_depth: int = 4) -> object:
+    def get_sampler_scaler(
+        loader: object, *args: Any, max_depth: int = 4
+    ) -> object:
         del args
         obj = loader
         try:
@@ -186,7 +199,9 @@ class BatchScaler:
             out_dim = 1
         elem_size = torch.empty((), dtype=torch.float64).element_size()
         floor_bytes = (
-            int((in_dim + out_dim) * elem_size * 10240) if in_dim + out_dim > 0 else 0
+            int((in_dim + out_dim) * elem_size * 10240)
+            if in_dim + out_dim > 0
+            else 0
         )
         dev_type = getattr(device, "type", "")
         if dev_type not in {"cuda", "xpu", "mps"}:
@@ -219,18 +234,27 @@ class BatchScaler:
 
             forward_ran = False
             training_mode = bool(getattr(model, "training", False))
-            meta = dataset if isinstance(dataset, Dataset) else Dataset.for_device(device)
+            meta = (
+                dataset
+                if isinstance(dataset, Dataset)
+                else Dataset.for_device(device)
+            )
 
             try:
                 from ..nn.graph import inference_mode
 
-                feats, labels, *_rest = meta.preprocess(batch, return_keys=False)
+                feats, labels, *_rest = meta.preprocess(
+                    batch, return_keys=False
+                )
                 X = to_torch_tensor(feats)
                 X = torch.atleast_2d(X)
                 if X.dim() == 2 and int(X.shape[1]) == int(
                     getattr(ops, "in_dim", X.shape[1])
                 ):
-                    X = X.to(device=device, non_blocking=is_pin_supported(device.type))
+                    X = X.to(
+                        device=device,
+                        non_blocking=is_pin_supported(device.type),
+                    )
                     if with_backward:
                         with contextlib.suppress(Exception):
                             model.train()
@@ -257,25 +281,37 @@ class BatchScaler:
                         elif isinstance(y_hat, torch.Tensor):
                             target = y_hat
                         if target is not None:
-                            loss = target if target.ndim == 0 else target.mean()
+                            loss = (
+                                target if target.ndim == 0 else target.mean()
+                            )
                             loss.backward()
                             forward_ran = True
                     else:
                         with inference_mode(model), Autocast.float(device):
-                            warmup_iters = int(env_int("ENN_SERVE_WARMUP_ITERS", 0) or 0)
+                            warmup_iters = int(
+                                env_int("ENN_SERVE_WARMUP_ITERS", 0) or 0
+                            )
                             if (
                                 warmup_iters <= 0
                                 and str(getattr(ops, "mode", "") or "")
                                 in ("predict", "infer")
                                 and env_bool("ENN_MAX_PERF", True)
                             ):
-                                m_eval = model.module if hasattr(model, "module") else model
-                                compiled = getattr(m_eval, "_compiled_submodules", None)
+                                m_eval = (
+                                    model.module
+                                    if hasattr(model, "module")
+                                    else model
+                                )
+                                compiled = getattr(
+                                    m_eval, "_compiled_submodules", None
+                                )
                                 warmup_iters = (
                                     3
                                     if (
                                         isinstance(compiled, dict)
-                                        and any(bool(v) for v in compiled.values())
+                                        and any(
+                                            bool(v) for v in compiled.values()
+                                        )
                                     )
                                     else 1
                                 )
@@ -326,9 +362,16 @@ class BatchScaler:
                 return
 
             with contextlib.suppress(Exception):
-                if torch.distributed.is_available() and torch.distributed.is_initialized():
-                    t = torch.tensor([int(per_sample)], device=device, dtype=torch.long)
-                    torch.distributed.all_reduce(t, op=torch.distributed.ReduceOp.MAX)
+                if (
+                    torch.distributed.is_available()
+                    and torch.distributed.is_initialized()
+                ):
+                    t = torch.tensor(
+                        [int(per_sample)], device=device, dtype=torch.long
+                    )
+                    torch.distributed.all_reduce(
+                        t, op=torch.distributed.ReduceOp.MAX
+                    )
                     per_sample = int(t.item())
 
             with contextlib.suppress(Exception):
@@ -357,9 +400,13 @@ class OOMHandler:
     def is_batch_skippable(phase: object) -> bool:
         ph = str(phase).strip().lower()
         if ph == "train":
-            return env_bool("ENN_OOM_SKIP_TRAIN", env_bool("ENN_OOM_SKIP_BATCH", True))
+            return env_bool(
+                "ENN_OOM_SKIP_TRAIN", env_bool("ENN_OOM_SKIP_BATCH", True)
+            )
         if ph in {"val", "valid", "validation"}:
-            return env_bool("ENN_OOM_SKIP_VAL", env_bool("ENN_OOM_SKIP_BATCH", True))
+            return env_bool(
+                "ENN_OOM_SKIP_VAL", env_bool("ENN_OOM_SKIP_BATCH", True)
+            )
         return env_bool("ENN_OOM_SKIP_BATCH", True)
 
     def recover_oom(
@@ -385,7 +432,8 @@ class OOMHandler:
         except Exception:
             empty_device_cache = None
         try:
-            from ..nn.graph import to_checkpoint, to_submodule
+            from ..nn.graph import to_checkpoint
+            from ..nn.graph import to_submodule
         except Exception:
             to_checkpoint = None
             to_submodule = None
@@ -395,7 +443,9 @@ class OOMHandler:
         max_tries = self.throttler.oom_max_retries(ph)
         log_fn = self.logger.error if oom_try <= 1 else self.logger.warning
         context = "Reducing MB/GA" if oom_try <= 1 else "Retrying"
-        gs_info = f" (global_step={global_step})" if global_step is not None else ""
+        gs_info = (
+            f" (global_step={global_step})" if global_step is not None else ""
+        )
         log_fn(
             "[epochs] OOM in %s step %d%s. %s. (try=%d/%d)",
             str(ph),
@@ -416,7 +466,9 @@ class OOMHandler:
                     self.throttler.clear_oom_retries(loader, ph, int(step_idx))
                 if callable(empty_device_cache):
                     with contextlib.suppress(Exception):
-                        empty_device_cache(device=device, do_gc=False, min_interval_s=0.0)
+                        empty_device_cache(
+                            device=device, do_gc=False, min_interval_s=0.0
+                        )
                 if optimizer is not None:
                     with contextlib.suppress(Exception):
                         optimizer.zero_grad(set_to_none=True)
@@ -427,7 +479,9 @@ class OOMHandler:
         if scale_ctl is not None:
             with contextlib.suppress(Exception):
                 prev = float(scale_ctl.get())
-                scale_ctl.request_scale_down(self.tuner.get_scale_rate_down(oom_try))
+                scale_ctl.request_scale_down(
+                    self.tuner.get_scale_rate_down(oom_try)
+                )
                 cur = float(scale_ctl.get())
                 if cur < prev:
                     self.throttler.log_scale_rate_throttled(
@@ -441,7 +495,9 @@ class OOMHandler:
         if callable(empty_device_cache):
             with contextlib.suppress(Exception):
                 ec_min = 0.0 if oom_try <= 1 else 0.05
-                empty_device_cache(device=device, do_gc=False, min_interval_s=ec_min)
+                empty_device_cache(
+                    device=device, do_gc=False, min_interval_s=ec_min
+                )
 
         if optimizer is not None:
             with contextlib.suppress(Exception):
@@ -451,8 +507,14 @@ class OOMHandler:
             to_submodule(model) if callable(to_submodule) else None
         ) or (model.module if hasattr(model, "module") else model)
 
-        if inst_pressure is not None and int(oom_try) <= 1 and callable(to_checkpoint):
-            cur_step_total = int(getattr(inst_pressure, "_enn_step_total", 0) or 0)
+        if (
+            inst_pressure is not None
+            and int(oom_try) <= 1
+            and callable(to_checkpoint)
+        ):
+            cur_step_total = int(
+                getattr(inst_pressure, "_enn_step_total", 0) or 0
+            )
             if to_checkpoint(
                 model,
                 device=device,
@@ -481,7 +543,11 @@ class OOMHandler:
                     with contextlib.suppress(Exception):
                         inst.microbatch = int(new_mb)
                         inst._auto_microbatch_pending = False
-                    self.logger.info("[epochs] reduced microbatch %d->%d", int(cur_mb), int(new_mb))
+                    self.logger.info(
+                        "[epochs] reduced microbatch %d->%d",
+                        int(cur_mb),
+                        int(new_mb),
+                    )
                     reduced_any = True
 
         if ph == "train" and grad_accum_steps is not None:
@@ -505,17 +571,23 @@ class OOMHandler:
 
         if not reduced_any:
             if self.is_batch_skippable(ph):
-                self.logger.error("[epochs] OOM in %s, no knobs. Skipping.", str(ph))
+                self.logger.error(
+                    "[epochs] OOM in %s, no knobs. Skipping.", str(ph)
+                )
                 with contextlib.suppress(Exception):
                     self.throttler.clear_oom_retries(loader, ph, int(step_idx))
                 if callable(empty_device_cache):
                     with contextlib.suppress(Exception):
-                        empty_device_cache(device=device, do_gc=False, min_interval_s=0.0)
+                        empty_device_cache(
+                            device=device, do_gc=False, min_interval_s=0.0
+                        )
                 if optimizer is not None:
                     with contextlib.suppress(Exception):
                         optimizer.zero_grad(set_to_none=True)
                 return ("skip", grad_accum_steps)
-            self.logger.error("[epochs] OOM in %s, no knobs. Giving up.", str(ph))
+            self.logger.error(
+                "[epochs] OOM in %s, no knobs. Giving up.", str(ph)
+            )
             return ("raise", grad_accum_steps)
 
         sleep_s = self.throttler.get_oom_blocking_time(oom_try, ph)
@@ -525,10 +597,11 @@ class OOMHandler:
         return ("retry", grad_accum_steps)
 
 
-
 _DEFAULT_THROTTLER = BatchThrottler()
 _DEFAULT_TUNER = BatchScaler(logger=_LOGGER)
-_DEFAULT_OOM_HANDLER = OOMHandler(tuner=_DEFAULT_TUNER, throttler=_DEFAULT_THROTTLER, logger=_LOGGER)
+_DEFAULT_OOM_HANDLER = OOMHandler(
+    tuner=_DEFAULT_TUNER, throttler=_DEFAULT_THROTTLER, logger=_LOGGER
+)
 
 
 def probe_per_sample_mem_bytes(
@@ -556,8 +629,12 @@ def probe_per_sample_mem_bytes(
     )
 
 
-def get_sampler_scaler(loader: object, *args: Any, max_depth: int = 4) -> object:
-    return _DEFAULT_TUNER.get_sampler_scaler(loader, *args, max_depth=max_depth)
+def get_sampler_scaler(
+    loader: object, *args: Any, max_depth: int = 4
+) -> object:
+    return _DEFAULT_TUNER.get_sampler_scaler(
+        loader, *args, max_depth=max_depth
+    )
 
 
 def log_scale_rate_throttled(
