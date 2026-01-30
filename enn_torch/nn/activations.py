@@ -1,14 +1,10 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
-from typing import Any
-from typing import Optional
-from typing import Self
+from typing import Any, Optional, Self
 
 import torch
 from torch import nn
-
-
 class GLU(nn.Module):
     def __init__(
         self: Self,

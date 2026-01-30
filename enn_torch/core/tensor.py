@@ -5,17 +5,12 @@ import contextlib
 import importlib
 import inspect
 import warnings
-from collections.abc import Callable
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from functools import partial
-from typing import Any
-from typing import Iterator
-from typing import TypeVar
+from typing import Any, Iterator, TypeVar
 
 import torch
-
 from .system import is_pin_supported
-
 try:
     import torch._dynamo as _dynamo
 except Exception:

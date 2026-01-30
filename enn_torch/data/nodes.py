@@ -13,50 +13,53 @@ import threading
 import time
 import traceback
 from contextlib import suppress
-from typing import Any
-from typing import Callable
-from typing import Dict
-from typing import Iterator
-from typing import Mapping
-from typing import Optional
-from typing import Self
-from typing import Sequence
-from typing import Tuple
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    Iterator,
+    Mapping,
+    Optional,
+    Self,
+    Sequence,
+    Tuple,
+)
 
 import torch
 import torch.utils.data
 import torchdata.nodes
-from tensordict import MemoryMappedTensor
-from torchdata.nodes import BaseNode
-from torchdata.nodes import MultiNodeWeightedSampler
-from torchdata.nodes import ParallelMapper
-from torchdata.nodes import SamplerWrapper
-
-from ..core.concurrency import BufferQueue
-from ..core.concurrency import Mutex
-from ..core.concurrency import ProducerError
-from ..core.concurrency import TensorPagePool
-from ..core.concurrency import close
-from ..core.concurrency import new_affinity
-from ..core.concurrency import new_thread
-from ..core.datatypes import dtype_from_name
-from ..core.datatypes import env_bool
-from ..core.datatypes import env_first_int
-from ..core.datatypes import read_json
+from ..core.concurrency import (
+    BufferQueue,
+    Mutex,
+    ProducerError,
+    TensorPagePool,
+    close,
+    new_affinity,
+    new_thread,
+)
+from ..core.datatypes import dtype_from_name, env_bool, env_first_int, read_json
 from ..core.policies import WorkerPolicy
-from ..core.system import CPU
-from ..core.system import Memory
-from ..core.system import accelerator_stream
-from ..core.system import accelerator_type
-from ..core.system import current_accelerator_stream
-from ..core.system import get_accelerator_index
-from ..core.system import get_num_accelerators
-from ..core.system import is_accelerator_available
-from ..core.system import is_stream_supported
-from ..core.system import new_accelerator_event
-from ..core.system import new_accelerator_stream
+from ..core.system import (
+    CPU,
+    Memory,
+    accelerator_stream,
+    accelerator_type,
+    current_accelerator_stream,
+    get_accelerator_index,
+    get_num_accelerators,
+    is_accelerator_available,
+    is_stream_supported,
+    new_accelerator_event,
+    new_accelerator_stream,
+)
 from ..nn.graph import inference_mode
-
+from tensordict import MemoryMappedTensor
+from torchdata.nodes import (
+    BaseNode,
+    MultiNodeWeightedSampler,
+    ParallelMapper,
+    SamplerWrapper,
+)
 _LOGGER = logging.getLogger(__name__)
 
 

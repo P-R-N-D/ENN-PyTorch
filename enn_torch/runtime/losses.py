@@ -4,24 +4,14 @@ from __future__ import annotations
 import contextlib
 import math
 from dataclasses import dataclass
-from typing import Any
-from typing import List
-from typing import Optional
-from typing import Self
-from typing import Sequence
-from typing import Tuple
-from typing import Union
+from typing import Any, List, Optional, Self, Sequence, Tuple, Union
 
 import torch
-from torch import Tensor
-from torch import nn
-from torch.distributions import Normal
-from torch.distributions import StudentT
-from torch.nn import functional as F
-
 from ..core.tensor import to_tensor_like
 from ..nn.graph import is_compiling
-
+from torch import Tensor, nn
+from torch.distributions import Normal, StudentT
+from torch.nn import functional as F
 _MAD_SCALE_CACHE = {}
 Number = Union[float, int]
 TensorLike = Union[Number, torch.Tensor]

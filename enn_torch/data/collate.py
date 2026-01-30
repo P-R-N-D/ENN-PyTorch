@@ -11,39 +11,41 @@ import time
 from contextlib import suppress
 from functools import partial
 from pathlib import Path
-from typing import Any
-from typing import Callable
-from typing import Dict
-from typing import Iterator
-from typing import Mapping
-from typing import Optional
-from typing import Self
-from typing import Sequence
-from typing import Tuple
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    Iterator,
+    Mapping,
+    Optional,
+    Self,
+    Sequence,
+    Tuple,
+)
 
 import h5py
 import numpy
 import torch
 import torch.utils.data
-from tensordict import MemoryMappedTensor
-from tensordict import PersistentTensorDict
-from tensordict import TensorDict
-from tensordict import TensorDictBase
-
-from ..core.concurrency import TensorPagePool
-from ..core.concurrency import TensorSpooler
-from ..core.datatypes import PathLike
-from ..core.datatypes import dtype_from_name
-from ..core.datatypes import env_first_int
-from ..core.datatypes import env_str
-from ..core.datatypes import get_meta_path
-from ..core.datatypes import parse_torch_dtype
-from ..core.datatypes import read_json
-from ..core.datatypes import save_temp
-from ..core.datatypes import write_json
-from ..core.system import Memory
-from ..core.system import is_accelerator_available
-
+from ..core.concurrency import TensorPagePool, TensorSpooler
+from ..core.datatypes import (
+    PathLike,
+    dtype_from_name,
+    env_first_int,
+    env_str,
+    get_meta_path,
+    parse_torch_dtype,
+    read_json,
+    save_temp,
+    write_json,
+)
+from ..core.system import Memory, is_accelerator_available
+from tensordict import (
+    MemoryMappedTensor,
+    PersistentTensorDict,
+    TensorDict,
+    TensorDictBase,
+)
 _FEATURE_KEY_ALIASES = frozenset(
     {"x", "feature", "features", "input", "inputs", "in"}
 )

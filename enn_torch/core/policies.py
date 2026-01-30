@@ -4,44 +4,43 @@ from __future__ import annotations
 import contextlib
 import logging
 import os
-from dataclasses import dataclass
-from dataclasses import field
-from dataclasses import replace
-from typing import TYPE_CHECKING
-from typing import Any
-from typing import Callable
-from typing import Dict
-from typing import List
-from typing import Optional
-from typing import Protocol
-from typing import Self
-from typing import Tuple
-from typing import Union
+from dataclasses import dataclass, field, replace
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    List,
+    Optional,
+    Protocol,
+    Self,
+    TYPE_CHECKING,
+    Tuple,
+    Union,
+)
 
 import torch
 import torch.nn as nn
-
-from ..core.datatypes import default_underflow_action
-from ..core.datatypes import env_bool
-from ..core.datatypes import env_first_int
-from ..core.datatypes import env_float
-from ..core.datatypes import env_str
-from ..core.datatypes import normalize_underflow_action
+from ..core.datatypes import (
+    default_underflow_action,
+    env_bool,
+    env_first_int,
+    env_float,
+    env_str,
+    normalize_underflow_action,
+)
 from ..nn.graph import clear_model_cache
 from .concurrency import Mutex
-from .precision import Autocast
-from .precision import DeviceMeta
-from .precision import Quantization
-from .precision import is_scale_safe
-from .system import CPU
-from .system import _call
-from .system import _default_thread_limit
-from .system import _log_debug
-from .system import _log_info
-from .system import _optimal_threads
-from .system import get_device
-from .system import is_cuda_bf16_supported
-
+from .precision import Autocast, DeviceMeta, Quantization, is_scale_safe
+from .system import (
+    CPU,
+    _call,
+    _default_thread_limit,
+    _log_debug,
+    _log_info,
+    _optimal_threads,
+    get_device,
+    is_cuda_bf16_supported,
+)
 if TYPE_CHECKING:
     from ..data.pipeline import Dataset
 

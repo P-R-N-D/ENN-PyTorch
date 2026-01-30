@@ -3,27 +3,25 @@ from __future__ import annotations
 
 import math
 import os
-from dataclasses import dataclass
-from dataclasses import field
-from dataclasses import fields
-from typing import TYPE_CHECKING
-from typing import Any
-from typing import ClassVar
-from typing import Dict
-from typing import List
-from typing import Literal
-from typing import Mapping
-from typing import Optional
-from typing import Self
-from typing import Sequence
-from typing import Set
-from typing import Tuple
-from typing import Union
+from dataclasses import dataclass, field, fields
+from typing import (
+    Any,
+    ClassVar,
+    Dict,
+    List,
+    Literal,
+    Mapping,
+    Optional,
+    Self,
+    Sequence,
+    Set,
+    TYPE_CHECKING,
+    Tuple,
+    Union,
+)
 
 import torch
-
 from ..nn.graph import canonicalize_compile_mode
-
 if TYPE_CHECKING:
     from ..data.pipeline import Source
 else:

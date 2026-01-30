@@ -2,42 +2,40 @@
 from __future__ import annotations
 
 import contextlib
-import math
-from collections import OrderedDict
-from typing import Any
-from typing import Callable
-from typing import Dict
-from typing import List
-from typing import Mapping
-from typing import Optional
-from typing import Self
-from typing import Sequence
-from typing import Tuple
-from typing import TypeVar
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    List,
+    Mapping,
+    Optional,
+    Self,
+    Sequence,
+    Tuple,
+    TypeVar,
+)
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
 from ..core.compat import StochasticDepth
 from ..core.concurrency import Mutex
-from ..core.datatypes import env_bool
-from ..core.datatypes import env_int
-from ..core.system import empty_device_cache
-from ..core.system import is_oom_error
+from ..core.datatypes import env_bool, env_int
 from .activations import GeGLU
-from .graph import coerce_checkpoint
-from .graph import is_checkpoint
-from .graph import is_compiling
-from .graph import is_export_or_trace
-from .graph import is_meta_or_fake_tensor
-from .graph import is_symbolic
-from .graph import torch_compiler_disable
-from .kernels import DotProductAttention
-from .kernels import FlexAttention
-from .kernels import MultiHeadAttention
-from .kernels import MultiScaleRetention
-
+from .graph import (
+    is_checkpoint,
+    is_compiling,
+    is_export_or_trace,
+    is_meta_or_fake_tensor,
+    is_symbolic,
+    torch_compiler_disable,
+)
+from .kernels import (
+    DotProductAttention,
+    FlexAttention,
+    MultiHeadAttention,
+    MultiScaleRetention,
+)
 try:
     from torch.nn.attention.flex_attention import create_block_mask
 

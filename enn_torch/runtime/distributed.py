@@ -14,40 +14,29 @@ import random
 import re
 import shutil
 import socket
-import tempfile
 import threading
 import time
 import warnings
 from collections import deque
 from contextlib import AbstractContextManager
 from pathlib import Path
-from typing import Any
-from typing import Callable
-from typing import Iterable
-from typing import Iterator
-from typing import Mapping
-from typing import Sequence
+from typing import Any, Callable, Iterable, Mapping
 
 import torch
 import torch.distributed as dist
+from ..core.concurrency import Mutex
+from ..core.datatypes import PathLike, env_bool, env_int, save_temp, write_json
+from ..core.system import (
+    CPU,
+    get_device,
+    get_num_accelerators,
+    init_python_path,
+    init_start_method,
+    set_accelerator_index,
+    set_accelerator_seed,
+)
 from torch import nn
 from torch.optim import Optimizer
-
-from ..core.concurrency import Mutex
-from ..core.datatypes import PathLike
-from ..core.datatypes import env_bool
-from ..core.datatypes import env_first
-from ..core.datatypes import env_int
-from ..core.datatypes import save_temp
-from ..core.datatypes import write_json
-from ..core.system import CPU
-from ..core.system import get_device
-from ..core.system import get_num_accelerators
-from ..core.system import init_python_path
-from ..core.system import init_start_method
-from ..core.system import set_accelerator_index
-from ..core.system import set_accelerator_seed
-
 try:
     from torch.distributed._composable.fsdp import fully_shard
 except ImportError:

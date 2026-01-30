@@ -5,66 +5,59 @@ import contextlib
 import logging
 import math
 import uuid
-from typing import Any
-from typing import Callable
-from typing import Dict
-from typing import Mapping
-from typing import Optional
-from typing import Self
-from typing import Sequence
-from typing import Tuple
-from typing import TypeVar
-from typing import Union
-from typing import cast
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    Mapping,
+    Optional,
+    Self,
+    Sequence,
+    Tuple,
+    TypeVar,
+    Union,
+    cast,
+)
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from tensordict import TensorDictBase
-
-from ..core.concurrency import Mutex
-from ..core.concurrency import is_gil_enabled
+from ..core.concurrency import Mutex, is_gil_enabled
 from ..core.config import ModelConfig
-from ..core.datatypes import env_bool
-from ..core.datatypes import env_first_int
-from ..core.datatypes import env_int
+from ..core.datatypes import env_first_int, env_int
 from ..core.policies import LossWeightPolicy
 from ..core.precision import Autocast
-from ..core.system import CPU
-from ..core.system import empty_device_cache
-from ..core.system import get_device
-from ..core.system import set_runtime_cfg
-from ..core.tensor import is_meta_or_fake_tensor
-from ..core.tensor import symint_safe_expand_as
-from ..data.collate import get_feature_key
-from ..data.collate import get_label_key
+from ..core.system import CPU, empty_device_cache, get_device, set_runtime_cfg
+from ..core.tensor import is_meta_or_fake_tensor, symint_safe_expand_as
+from ..data.collate import get_feature_key, get_label_key
 from ..runtime.distributed import _from_hsdp_module
-from .blocks import LongNet
-from .blocks import Perceiver
-from .blocks import RetNet
-from .blocks import _autofit_microbatch
-from .blocks import _coerce_modeling_types
-from .blocks import _coerce_tensor
-from .blocks import _infer_module_device
-from .blocks import _prealloc_microbatch
-from .blocks import _size_of_retnet
-from .blocks import norm_layer
-from .blocks import stochastic_depth_schedule
-from .graph import canonicalize_compile_mode
-from .graph import coerce_checkpoint
-from .graph import compile as compile_module
-from .graph import cudagraph_mark_step_begin
-from .graph import cudagraph_mark_step_end
-from .graph import graph_break
-from .graph import inference_mode
-from .graph import is_export_or_trace
-from .graph import is_symbolic
-from .graph import torch_compiler_disable
-from .graph import torch_compiler_supported
-from .layers import Recorder
-from .layers import Scaler
-from .layers import SigmoidGate
-
+from .blocks import (
+    LongNet,
+    Perceiver,
+    RetNet,
+    _autofit_microbatch,
+    _coerce_modeling_types,
+    _coerce_tensor,
+    _infer_module_device,
+    _prealloc_microbatch,
+    _size_of_retnet,
+    norm_layer,
+    stochastic_depth_schedule,
+)
+from .graph import (
+    canonicalize_compile_mode,
+    coerce_checkpoint,
+    compile as compile_module,
+    cudagraph_mark_step_begin,
+    cudagraph_mark_step_end,
+    graph_break,
+    inference_mode,
+    is_export_or_trace,
+    is_symbolic,
+    torch_compiler_supported,
+)
+from .layers import Recorder, Scaler, SigmoidGate
+from tensordict import TensorDictBase
 _LOGGER = logging.getLogger(__name__)
 
 

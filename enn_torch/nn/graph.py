@@ -9,32 +9,17 @@ import threading
 import traceback
 import warnings
 import weakref
-from contextlib import AbstractContextManager
-from contextlib import nullcontext
-from contextlib import suppress
+from contextlib import AbstractContextManager, nullcontext, suppress
 from dataclasses import dataclass
-from typing import Any
-from typing import Callable
-from typing import Dict
-from typing import Iterator
-from typing import List
-from typing import Optional
-from typing import Self
-from typing import Sequence
+from typing import Any, Callable, Dict, Iterator, List, Optional, Self, Sequence
 
 import torch
-from torch import nn
-
 from ..core.concurrency import Mutex
-from ..core.datatypes import env_bool
-from ..core.datatypes import env_first
-from ..core.datatypes import env_first_int
-from ..core.system import CPU
-from ..core.system import is_accelerator_available
+from ..core.datatypes import env_bool, env_first, env_first_int
+from ..core.system import CPU, is_accelerator_available
 from ..core.tensor import is_meta_or_fake_tensor
-from ..runtime.distributed import broadcast_scalar
-from ..runtime.distributed import is_dtensor_active
-
+from ..runtime.distributed import broadcast_scalar, is_dtensor_active
+from torch import nn
 _COLLECTIVE_NAMES: tuple[str, ...] = (
     "all_gather",
     "all_gather_into_tensor",

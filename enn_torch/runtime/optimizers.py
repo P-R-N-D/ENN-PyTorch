@@ -9,33 +9,28 @@ import math
 import os
 import tempfile
 from collections import OrderedDict
-from typing import Any
-from typing import Callable
-from typing import Dict
-from typing import Iterable
-from typing import Iterator
-from typing import List
-from typing import Optional
-from typing import Self
-from typing import Sequence
-from typing import Tuple
-from typing import Union
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    Iterable,
+    Iterator,
+    List,
+    Optional,
+    Self,
+    Sequence,
+    Tuple,
+    Union,
+)
 
 import torch
-from torch import nn
-from torch import optim
-from torch.optim.swa_utils import update_bn
-
 from ..core.concurrency import Mutex
-from ..core.policies import ModelPolicy
-from ..core.policies import PrecisionPolicy
-from ..core.precision import Autocast
-from ..core.precision import is_scale_safe
-from ..core.system import get_device
-from ..core.system import optimal_optimizer_params
-from ..core.tensor import to_torch_tensor
+from ..core.policies import ModelPolicy, PrecisionPolicy
+from ..core.precision import Autocast, is_scale_safe
+from ..core.system import get_device, optimal_optimizer_params
 from ..data.pipeline import Dataset
-
+from torch import nn, optim
+from torch.optim.swa_utils import update_bn
 _LOGGER = logging.getLogger(__name__)
 _OPT_LOGGED_KEYS: "OrderedDict[object, None]" = OrderedDict()
 _OPT_LOGGED_LOCK = Mutex()
