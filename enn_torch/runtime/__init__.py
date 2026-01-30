@@ -11,7 +11,7 @@ __all__ = [
     "main",
     "losses",
     "optimizers",
-    "workflow",
+    "workflows",
 ]
 
 

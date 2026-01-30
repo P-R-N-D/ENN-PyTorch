@@ -3,12 +3,15 @@ from __future__ import annotations
 
 import importlib
 from types import ModuleType
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
+from typing import Any
 
 if TYPE_CHECKING:
     from tensordict import TensorDictBase
+
+    from .core.config import ModelConfig
+    from .core.config import RuntimeConfig
     from .nn.wrappers import Model
-    from .core.config import ModelConfig, RuntimeConfig
 
 __all__ = [
     "core",
@@ -32,25 +35,32 @@ def __getattr__(name: str) -> ModuleType:
 
 
 def new_model(*args: Any, **kwargs: Any) -> Model:
-    from .runtime import workflow
-    return workflow.new_model(*args, **kwargs)
+    from .runtime import workflows
+
+    return workflows.new_model(*args, **kwargs)
 
 
 def load_model(*args: Any, **kwargs: Any) -> Model:
-    from .runtime import workflow
-    return workflow.load_model(*args, **kwargs)
+    from .runtime import workflows
+
+    return workflows.load_model(*args, **kwargs)
 
 
 def save_model(*args: Any, **kwargs: Any) -> str:
-    from .runtime import workflow
-    return workflow.save_model(*args, **kwargs)
+    from .runtime import workflows
+
+    return workflows.save_model(*args, **kwargs)
 
 
 def train(*args: Any, **kwargs: Any) -> Model:
-    from .runtime import workflow
-    return workflow.train(*args, **kwargs)
+    from .runtime import workflows
+
+    return workflows.train(*args, **kwargs)
 
 
-def predict(*args: Any, **kwargs: Any) -> TensorDictBase | dict[str, TensorDictBase]:
-    from .runtime import workflow
-    return workflow.predict(*args, **kwargs)
+def predict(
+    *args: Any, **kwargs: Any
+) -> TensorDictBase | dict[str, TensorDictBase]:
+    from .runtime import workflows
+
+    return workflows.predict(*args, **kwargs)

@@ -9,60 +9,61 @@ import math
 import os
 import random
 import time
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass
+from dataclasses import field
+from dataclasses import replace
 from functools import partial
 from itertools import chain
-from typing import (
-    Any,
-    Callable,
-    Dict,
-    Generic,
-    Literal,
-    Mapping,
-    MutableMapping,
-    NotRequired,
-    Optional,
-    Required,
-    Self,
-    Sequence,
-    Tuple,
-    TypedDict,
-    TypeVar,
-    Union,
-    cast,
-)
+from typing import Any
+from typing import Callable
+from typing import Dict
+from typing import Generic
+from typing import Literal
+from typing import Mapping
+from typing import MutableMapping
+from typing import NotRequired
+from typing import Optional
+from typing import Required
+from typing import Self
+from typing import Sequence
+from typing import Tuple
+from typing import TypedDict
+from typing import TypeVar
+from typing import Union
+from typing import cast
 
 import torch
-from tensordict import MemoryMappedTensor, TensorDictBase
+from tensordict import MemoryMappedTensor
+from tensordict import TensorDictBase
 from torchdata.nodes import BaseNode
 
-from ..core.concurrency import Disposable, Mutex, new_affinity
-from ..core.datatypes import (
-    PathLike,
-    default_underflow_action,
-    env_first,
-    env_first_float,
-    env_first_int,
-    normalize_underflow_action,
-)
-from ..core.policies import BatchPolicy, LoaderPolicy, WorkerPolicy
-from ..core.system import (
-    Memory,
-    accelerator,
-    cuda_compute_capability,
-    get_device,
-    get_device_stats,
-    is_accelerator_available,
-    is_accelerator_timer_supported,
-    is_cpu_bf16_supported,
-    is_cuda_bf16_supported,
-    is_float8_supported,
-    is_int4_supported,
-    is_int8_supported,
-    is_pin_supported,
-    new_accelerator_event,
-    sync_accelerator,
-)
+from ..core.concurrency import Disposable
+from ..core.concurrency import Mutex
+from ..core.concurrency import new_affinity
+from ..core.datatypes import PathLike
+from ..core.datatypes import default_underflow_action
+from ..core.datatypes import env_first
+from ..core.datatypes import env_first_float
+from ..core.datatypes import env_first_int
+from ..core.datatypes import normalize_underflow_action
+from ..core.policies import BatchPolicy
+from ..core.policies import LoaderPolicy
+from ..core.policies import WorkerPolicy
+from ..core.system import Memory
+from ..core.system import accelerator
+from ..core.system import cuda_compute_capability
+from ..core.system import get_device
+from ..core.system import get_device_stats
+from ..core.system import is_accelerator_available
+from ..core.system import is_accelerator_timer_supported
+from ..core.system import is_cpu_bf16_supported
+from ..core.system import is_cuda_bf16_supported
+from ..core.system import is_float8_supported
+from ..core.system import is_int4_supported
+from ..core.system import is_int8_supported
+from ..core.system import is_pin_supported
+from ..core.system import new_accelerator_event
+from ..core.system import sync_accelerator
 from . import collate
 
 _NODES_IMPORTED = False
@@ -99,7 +100,6 @@ def get_batch_length(loader: object) -> int:
     return 0
 
 
-
 def _require_nodes() -> None:
     global _NODES_IMPORTED
     if _NODES_IMPORTED:
@@ -108,7 +108,9 @@ def _require_nodes() -> None:
         if _NODES_IMPORTED:
             return
         try:
-            mod = importlib.import_module(f"{__package__ or 'enn_torch.data'}.nodes")
+            mod = importlib.import_module(
+                f"{__package__ or 'enn_torch.data'}.nodes"
+            )
         except Exception as e:
             raise RuntimeError("Requires 'torchdata'/'tensordict'") from e
         globals().update(
@@ -171,7 +173,9 @@ def _stack_sequence(
     return out
 
 
-def _get_sample_size(_x_cpu: torch.Tensor, _y_cpu: Optional[torch.Tensor]) -> int:
+def _get_sample_size(
+    _x_cpu: torch.Tensor, _y_cpu: Optional[torch.Tensor]
+) -> int:
     x_one = _x_cpu[0]
     bx = int(x_one.numel()) * int(x_one.element_size())
     by = 0
@@ -197,7 +201,10 @@ def _get_random_batch(
     if effective_free is not None:
         capB = max(
             1,
-            int((max(0, int(effective_free)) * 0.80) // max(_sample_bytes * 4, 1)),
+            int(
+                (max(0, int(effective_free)) * 0.80)
+                // max(_sample_bytes * 4, 1)
+            ),
         )
     capB = max(1, min(capB, int(_N)))
     cands = sorted(
@@ -281,14 +288,22 @@ def _h2d_counter(
             with accelerator(_device):
                 ev0.record()
                 xb.to(_device, non_blocking=bool(pin_batch))
-                yb.to(_device, non_blocking=bool(pin_batch)) if yb is not None else None
+                (
+                    yb.to(_device, non_blocking=bool(pin_batch))
+                    if yb is not None
+                    else None
+                )
                 ev1.record()
             _sync_device(_device)
             ms = float(ev0.elapsed_time(ev1))
         else:
             tns0 = time.perf_counter_ns()
             xb.to(_device, non_blocking=bool(pin_batch))
-            yb.to(_device, non_blocking=bool(pin_batch)) if yb is not None else None
+            (
+                yb.to(_device, non_blocking=bool(pin_batch))
+                if yb is not None
+                else None
+            )
             _sync_device(_device)
             ms = (time.perf_counter_ns() - tns0) / 1e6
         if s >= int(_warmup):
@@ -316,7 +331,9 @@ def _set_batch_interval(
         x_cpu = torch.as_tensor(x_cpu)
     if y_cpu is not None and not isinstance(y_cpu, torch.Tensor):
         y_cpu = torch.as_tensor(y_cpu)
-    sbytes = sbytes_cached if sbytes_cached > 0 else _get_sample_size(x_cpu, y_cpu)
+    sbytes = (
+        sbytes_cached if sbytes_cached > 0 else _get_sample_size(x_cpu, y_cpu)
+    )
     if sbytes > 0 and sbytes_cached <= 0:
         with contextlib.suppress(Exception):
             setattr(_ds, "_S_sample_bytes", int(sbytes))
@@ -358,7 +375,9 @@ def _set_batch_interval(
         1.0,
         min(
             4.0,
-            float(env_first_float(("ENN_BUDGET_SLACK",), default=1.25) or 1.25),
+            float(
+                env_first_float(("ENN_BUDGET_SLACK",), default=1.25) or 1.25
+            ),
         ),
     )
 
@@ -382,7 +401,9 @@ def _set_batch_interval(
         device_margin=float(
             env_first_float(("ENN_DEVICE_MARGIN",), default=0.90) or 0.90
         ),
-        host_margin=float(env_first_float(("ENN_HOST_MARGIN",), default=0.10) or 0.10),
+        host_margin=float(
+            env_first_float(("ENN_HOST_MARGIN",), default=0.10) or 0.10
+        ),
         device_budget_ratio=float(
             env_first_float(("ENN_DEVICE_BUDGET_RATIO",), default=1.0) or 1.0
         ),
@@ -411,7 +432,8 @@ def _set_batch_interval(
     med_probe_cache: Optional[float] = None
     b_init_hint: Optional[int] = None
     if (
-        tpl.device_budget_max_bytes is None or tpl.host_budget_max_bytes is None
+        tpl.device_budget_max_bytes is None
+        or tpl.host_budget_max_bytes is None
     ) and int(tpl.sample_bytes or 0) > 0:
         try:
             inflight = int(tpl.host_inflight_batches_per_proc())
@@ -451,7 +473,9 @@ def _set_batch_interval(
             med_probe = 0.0
             with contextlib.suppress(Exception):
                 med_probe = float(
-                    _h2d_counter(x_cpu, y_cpu, _dev, probe_bs, _steps=4, _warmup=1)
+                    _h2d_counter(
+                        x_cpu, y_cpu, _dev, probe_bs, _steps=4, _warmup=1
+                    )
                 )
             if (
                 isinstance(med_probe, (float, int))
@@ -469,7 +493,9 @@ def _set_batch_interval(
                     1,
                     min(
                         int(B_cap),
-                        int((64 * 1024 * 1024) // max(1, int(tpl.sample_bytes))),
+                        int(
+                            (64 * 1024 * 1024) // max(1, int(tpl.sample_bytes))
+                        ),
                     ),
                 )
             b_init_hint = int(target_batch_samples)
@@ -769,7 +795,9 @@ def _fetch_merge_batches(batches: Sequence[Any]) -> Any:
                     if v is None:
                         continue
                     tensors.append(
-                        v if isinstance(v, torch.Tensor) else torch.as_tensor(v)
+                        v
+                        if isinstance(v, torch.Tensor)
+                        else torch.as_tensor(v)
                     )
                 if tensors:
                     merged[key] = torch.cat(tensors, dim=0)
@@ -795,7 +823,9 @@ def _fetch_merge_batches(batches: Sequence[Any]) -> Any:
             )
         return merged
     return list(
-        chain.from_iterable(b if isinstance(b, (list, tuple)) else [b] for b in batches)
+        chain.from_iterable(
+            b if isinstance(b, (list, tuple)) else [b] for b in batches
+        )
     )
 
 
@@ -884,7 +914,10 @@ def iter_dataset(
         isinstance(data, Sequence)
         and data
         and all(
-            (isinstance(d, (TensorDictBase, collections.abc.Mapping)) for d in data)
+            (
+                isinstance(d, (TensorDictBase, collections.abc.Mapping))
+                for d in data
+            )
         )
     ):
         manifest_list: list[str] = []
@@ -907,7 +940,9 @@ def new_dataset(
 ) -> "Sampler":
     _require_nodes()
     if not isinstance(source, Mapping):
-        raise TypeError(f"dataset expects a Source mapping, got {type(source)}")
+        raise TypeError(
+            f"dataset expects a Source mapping, got {type(source)}"
+        )
     fmt = source.get("format")
     if fmt is None:
         fmt = source.get("kind")
@@ -946,7 +981,9 @@ def compose(
 ) -> Tuple[BaseNode, BaseNode, BaseNode]:
     _require_nodes()
     device_obj = (
-        torch.device(device) if not isinstance(device, torch.device) else device
+        torch.device(device)
+        if not isinstance(device, torch.device)
+        else device
     )
     with contextlib.suppress(Exception):
         new_affinity(io_workers=io_workers)
@@ -989,9 +1026,15 @@ def fetch(
 ) -> Dict[str, Any]:
     _require_nodes()
     device_obj = (
-        torch.device(device) if not isinstance(device, torch.device) else device
+        torch.device(device)
+        if not isinstance(device, torch.device)
+        else device
     )
-    lp = loader_policy if isinstance(loader_policy, LoaderPolicy) else LoaderPolicy()
+    lp = (
+        loader_policy
+        if isinstance(loader_policy, LoaderPolicy)
+        else LoaderPolicy()
+    )
     wp = (
         worker_policy
         if isinstance(worker_policy, WorkerPolicy)
@@ -1000,7 +1043,9 @@ def fetch(
     wp.set_thread_setting()
     io_workers = int(getattr(wp, "num_workers", 0) or 0)
     prebatch = int(getattr(wp, "prebatch", 1) or 1)
-    pf_depth_fixed = max(1, min(8, int(getattr(wp, "prefetch_factor", 1) or 1)))
+    pf_depth_fixed = max(
+        1, min(8, int(getattr(wp, "prefetch_factor", 1) or 1))
+    )
     collate_fn = collate.Collator(
         flatten_features=bool(flatten_features),
         labels_dtype=labels_dtype,
@@ -1071,7 +1116,11 @@ def fetch(
         weights_out = None
         if len(nodes) > 1 and weights:
             w_map = (
-                {str(k): float(v) for k, v in dict(weights).items() if str(k) in nodes}
+                {
+                    str(k): float(v)
+                    for k, v in dict(weights).items()
+                    if str(k) in nodes
+                }
                 if isinstance(weights, Mapping)
                 else None
             )
@@ -1080,7 +1129,9 @@ def fetch(
                     raise ValueError("Weights must be > 0")
                 weights_out = w_map
 
-        iter_fn = partial(_fetch_iterate_sample, datasets=datasets, collate=collate_fn)
+        iter_fn = partial(
+            _fetch_iterate_sample, datasets=datasets, collate=collate_fn
+        )
         _, mapped, _ = compose(
             nodes,
             device=device_obj,
@@ -1142,7 +1193,9 @@ def preload_memmap(
 ) -> None:
     del args
     if not isinstance(data, Mapping):
-        raise TypeError("preload_memmap expects a Mapping with at least 'features'")
+        raise TypeError(
+            "preload_memmap expects a Mapping with at least 'features'"
+        )
     if "features" not in data:
         raise ValueError("preload_memmap expects 'features'")
 
@@ -1151,7 +1204,11 @@ def preload_memmap(
 
     def _len0(obj: Any) -> int:
         if isinstance(obj, torch.Tensor):
-            return int(obj.shape[0]) if int(getattr(obj, "ndim", 0) or 0) > 0 else 1
+            return (
+                int(obj.shape[0])
+                if int(getattr(obj, "ndim", 0) or 0) > 0
+                else 1
+            )
         try:
             return int(len(obj))
         except Exception:
@@ -1169,7 +1226,9 @@ def preload_memmap(
                 )
         else:
             if _len0(raw_Y) != int(count):
-                raise ValueError("features and labels must have the same length")
+                raise ValueError(
+                    "features and labels must have the same length"
+                )
 
     ua = normalize_underflow_action(
         underflow_action, default=default_underflow_action()
@@ -1180,9 +1239,12 @@ def preload_memmap(
     ds.underflow_action = ua
 
     from . import collate
-    from .collate import _BatchIndexGetter, _BatchSliceGetter
+    from .collate import _BatchIndexGetter
+    from .collate import _BatchSliceGetter
 
-    get_batch = _BatchSliceGetter(raw_X, raw_Y, features_only=bool(features_only))
+    get_batch = _BatchSliceGetter(
+        raw_X, raw_Y, features_only=bool(features_only)
+    )
     get_by_indices = (
         _BatchIndexGetter(raw_X, raw_Y, features_only=bool(features_only))
         if bool(shuffle)
@@ -1298,7 +1360,9 @@ class Session:
             with contextlib.suppress(Exception):
                 val_loader.load_state_dict(val_state)
         self.training_loader = (
-            self.loader_policy.wrap_input(train_loader, dev, name="train-input")
+            self.loader_policy.wrap_input(
+                train_loader, dev, name="train-input"
+            )
             if train_loader is not None
             else None
         )
@@ -1325,9 +1389,13 @@ class Session:
                 self.raw_training_loader is not None
                 and self.training_loader is not None
             ):
-                epochables = getattr(self.raw_training_loader, "_enn_epochables", None)
+                epochables = getattr(
+                    self.raw_training_loader, "_enn_epochables", None
+                )
                 if epochables is not None:
-                    setattr(self.training_loader, "_enn_epochables", epochables)
+                    setattr(
+                        self.training_loader, "_enn_epochables", epochables
+                    )
         self._opened = True
         return self
 
@@ -1465,7 +1533,9 @@ class Dataset(Generic[TExtra]):
         *args: Any,
         return_keys: bool = True,
         cast: bool = True,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Sequence[Any], Tuple[int, ...]]:
+    ) -> Tuple[
+        torch.Tensor, Optional[torch.Tensor], Sequence[Any], Tuple[int, ...]
+    ]:
         features: Optional[torch.Tensor] = None
         labels: Optional[torch.Tensor] = None
         keys: Sequence[Any] = ()
@@ -1555,7 +1625,9 @@ class Dataset(Generic[TExtra]):
                                 if len(v) < 2 or v[1] is None:
                                     labels_out = None
                                 else:
-                                    y_i = collate._to_safe_tensor(v[1], label_dtype)
+                                    y_i = collate._to_safe_tensor(
+                                        v[1], label_dtype
+                                    )
                                     if (
                                         y_i is None
                                         or y0 is None
@@ -1572,17 +1644,24 @@ class Dataset(Generic[TExtra]):
                         keys_list: list[Any] = [k0]
                         values_list: list[Any] = [v0]
                         ksize0 = _feature_size_hint(k0)
-                        key_as_feature = ksize0 is not None and 1 < int(ksize0) <= 64
+                        key_as_feature = (
+                            ksize0 is not None and 1 < int(ksize0) <= 64
+                        )
                         for k, v in it:
                             keys_list.append(k)
                             values_list.append(v)
-                            if key_as_feature and _feature_size_hint(k) != ksize0:
+                            if (
+                                key_as_feature
+                                and _feature_size_hint(k) != ksize0
+                            ):
                                 key_as_feature = False
                         if bool(return_keys):
                             keys = keys_list
                         parsed = False
                         if key_as_feature and keys_list and values_list:
-                            has_missing_labels = any((v is None for v in values_list))
+                            has_missing_labels = any(
+                                (v is None for v in values_list)
+                            )
                             try:
                                 features = _stack_sequence(
                                     keys_list,
@@ -1596,20 +1675,29 @@ class Dataset(Generic[TExtra]):
                                     labels = _stack_sequence(
                                         values_list, dtype=label_dtype
                                     )
-                                    parsed = features is not None and labels is not None
+                                    parsed = (
+                                        features is not None
+                                        and labels is not None
+                                    )
                             except Exception:
                                 parsed = False
                         if not parsed:
-                            features = _stack_sequence(values_list, dtype=feat_dtype)
+                            features = _stack_sequence(
+                                values_list, dtype=feat_dtype
+                            )
                             labels = None
         if features is None:
-            raise ValueError("Dataset.preprocess: unable to locate feature tensor(s)")
+            raise ValueError(
+                "Dataset.preprocess: unable to locate feature tensor(s)"
+            )
         features = collate._to_safe_tensor(features, feat_dtype)
         if features.ndim == 0:
             features = features.reshape(1, 1)
         elif features.ndim == 1:
             features = features.reshape(1, -1)
-        if not bool(features.is_contiguous()) and not _is_lazy_tensor(features):
+        if not bool(features.is_contiguous()) and not _is_lazy_tensor(
+            features
+        ):
             features = features.contiguous()
         if labels is not None:
             labels = collate._to_safe_tensor(labels, label_dtype)
@@ -1617,7 +1705,9 @@ class Dataset(Generic[TExtra]):
                 labels = labels.reshape(1, 1)
             if labels.shape[0] != features.shape[0]:
                 labels = labels.reshape(features.shape[0], -1)
-            if not bool(labels.is_contiguous()) and not _is_lazy_tensor(labels):
+            if not bool(labels.is_contiguous()) and not _is_lazy_tensor(
+                labels
+            ):
                 labels = labels.contiguous()
             label_shape = tuple(labels.shape[1:])
         else:
@@ -1727,7 +1817,9 @@ class Dataset(Generic[TExtra]):
                         cand = float(-max_neg)
                         if cand > 0.0:
                             min_pos = (
-                                cand if (min_pos is None or cand < min_pos) else min_pos
+                                cand
+                                if (min_pos is None or cand < min_pos)
+                                else min_pos
                             )
             else:
                 max_abs = float("nan")
@@ -1767,7 +1859,9 @@ class Dataset(Generic[TExtra]):
         }
 
     @staticmethod
-    def merge_scale_stats(a: Mapping[str, Any], b: Mapping[str, Any]) -> Dict[str, Any]:
+    def merge_scale_stats(
+        a: Mapping[str, Any], b: Mapping[str, Any]
+    ) -> Dict[str, Any]:
         out: Dict[str, Any] = {}
         out["has_scale"] = bool(a.get("has_scale")) or bool(b.get("has_scale"))
         out["has_nonfinite"] = bool(a.get("has_nonfinite")) or bool(
@@ -1838,7 +1932,9 @@ class Dataset(Generic[TExtra]):
                 except Exception:
                     return False
                 if math.isfinite(min_pos_f) and min_pos_f > 0.0:
-                    if min_pos_f < float(info.tiny) * max(1.0, float(safety_margin)):
+                    if min_pos_f < float(info.tiny) * max(
+                        1.0, float(safety_margin)
+                    ):
                         return False
         return True
 

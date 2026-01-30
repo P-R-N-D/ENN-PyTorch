@@ -9,18 +9,31 @@ import threading
 import traceback
 import warnings
 import weakref
+from contextlib import AbstractContextManager
+from contextlib import nullcontext
+from contextlib import suppress
 from dataclasses import dataclass
-from contextlib import AbstractContextManager, nullcontext, suppress
-from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence, Self
+from typing import Any
+from typing import Callable
+from typing import Dict
+from typing import Iterator
+from typing import List
+from typing import Optional
+from typing import Self
+from typing import Sequence
 
 import torch
 from torch import nn
 
 from ..core.concurrency import Mutex
-from ..core.datatypes import env_bool, env_first, env_first_int
-from ..core.system import CPU, is_accelerator_available
+from ..core.datatypes import env_bool
+from ..core.datatypes import env_first
+from ..core.datatypes import env_first_int
+from ..core.system import CPU
+from ..core.system import is_accelerator_available
 from ..core.tensor import is_meta_or_fake_tensor
-from ..runtime.distributed import broadcast_scalar, is_dtensor_active
+from ..runtime.distributed import broadcast_scalar
+from ..runtime.distributed import is_dtensor_active
 
 _COLLECTIVE_NAMES: tuple[str, ...] = (
     "all_gather",
@@ -266,7 +279,9 @@ def _decorate_compiler_disable(
 
 def _dispatch_mode_stack() -> list[Any]:
     utils = getattr(torch, "utils", None)
-    pd = getattr(utils, "_python_dispatch", None) if utils is not None else None
+    pd = (
+        getattr(utils, "_python_dispatch", None) if utils is not None else None
+    )
     fn_stack = getattr(pd, "_get_current_dispatch_mode_stack", None)
     if callable(fn_stack):
         stack = fn_stack()
@@ -281,17 +296,17 @@ def _dispatch_mode_stack() -> list[Any]:
 @contextlib.contextmanager
 def skip_non_infra_dispatch_mode() -> Iterator[None]:
     try:
-        from torch.utils._python_dispatch import (
-            _disable_current_modes,
-            is_in_torch_dispatch_mode,
-        )
+        from torch.utils._python_dispatch import _disable_current_modes
+        from torch.utils._python_dispatch import is_in_torch_dispatch_mode
     except Exception:
         yield
         return
 
     active_non_infra = False
     with suppress(Exception):
-        active_non_infra = bool(is_in_torch_dispatch_mode(include_infra_modes=False))
+        active_non_infra = bool(
+            is_in_torch_dispatch_mode(include_infra_modes=False)
+        )
     if not active_non_infra:
         with suppress(Exception):
             active_non_infra = bool(is_in_torch_dispatch_mode(False))
@@ -321,7 +336,11 @@ def skip_non_infra_dispatch_mode() -> Iterator[None]:
 
 def is_dynamo_compiling() -> bool:
     comp = getattr(torch, "compiler", None)
-    fn = getattr(comp, "is_dynamo_compiling", None) if comp is not None else None
+    fn = (
+        getattr(comp, "is_dynamo_compiling", None)
+        if comp is not None
+        else None
+    )
     if callable(fn) and bool(fn()):
         return True
     dyn = getattr(torch, "_dynamo", None)
@@ -350,7 +369,9 @@ def is_compiling() -> bool:
 def is_fake_tensor_mode_active() -> bool:
     subclasses = getattr(torch, "_subclasses", None)
     ft_mod = (
-        getattr(subclasses, "fake_tensor", None) if subclasses is not None else None
+        getattr(subclasses, "fake_tensor", None)
+        if subclasses is not None
+        else None
     )
     FakeTensorMode = getattr(ft_mod, "FakeTensorMode", None)
     if FakeTensorMode is None:
@@ -363,7 +384,9 @@ def is_fake_tensor_mode_active() -> bool:
 
 def is_tracing_or_exporting() -> bool:
     jit = getattr(torch, "jit", None)
-    if jit is not None and (torch.jit.is_tracing() or torch.jit.is_scripting()):
+    if jit is not None and (
+        torch.jit.is_tracing() or torch.jit.is_scripting()
+    ):
         return True
 
     comp = getattr(torch, "compiler", None)
@@ -383,13 +406,17 @@ def is_tracing_or_exporting() -> bool:
 
 def is_export_or_trace() -> bool:
     return bool(
-        is_tracing_or_exporting() or is_compiling() or is_fake_tensor_mode_active()
+        is_tracing_or_exporting()
+        or is_compiling()
+        or is_fake_tensor_mode_active()
     )
 
 
 def is_symbolic() -> bool:
     return bool(
-        is_tracing_or_exporting() or is_compiling() or is_fake_tensor_mode_active()
+        is_tracing_or_exporting()
+        or is_compiling()
+        or is_fake_tensor_mode_active()
     )
 
 
@@ -418,7 +445,9 @@ def assert_trace(condition: object, message: str = "") -> None:
 def canonicalize_compile_mode(mode: object | None) -> str:
     if not isinstance(mode, str):
         return "disabled"
-    compact_mode = mode.lower().replace("_", "").replace("-", "").replace(" ", "")
+    compact_mode = (
+        mode.lower().replace("_", "").replace("-", "").replace(" ", "")
+    )
     mode_map = {
         "default": "default",
         "aoteager": "aot-eager",
@@ -461,7 +490,9 @@ def is_nvidia_te_available(model: torch.nn.Module) -> bool:
         return True
     for module in model.modules():
         mod_name = getattr(module.__class__, "__module__", "")
-        if isinstance(mod_name, str) and mod_name.startswith("transformer_engine"):
+        if isinstance(mod_name, str) and mod_name.startswith(
+            "transformer_engine"
+        ):
             try:
                 setattr(model, "__enn_cached_is_nvidia_te_available__", True)
             except Exception:
@@ -523,7 +554,10 @@ def compile(
     if _inductor_config is not None:
         with _INDUCTOR_CONFIG_LOCK:
             try:
-                if getattr(_inductor_config, "compile_threads", None) is not None:
+                if (
+                    getattr(_inductor_config, "compile_threads", None)
+                    is not None
+                ):
                     override = env_first(
                         (
                             "ENN_INDUCTOR_COMPILE_THREADS",
@@ -532,9 +566,13 @@ def compile(
                         None,
                     )
                     if override is None:
-                        override = env_first(("TORCHINDUCTOR_COMPILE_THREADS",), None)
+                        override = env_first(
+                            ("TORCHINDUCTOR_COMPILE_THREADS",), None
+                        )
                     if override is not None:
-                        _inductor_config.compile_threads = max(1, int(override))
+                        _inductor_config.compile_threads = max(
+                            1, int(override)
+                        )
                     else:
                         local_world = env_first_int(
                             (
@@ -564,7 +602,9 @@ def compile(
                 def _snapshot(attr: str) -> None:
                     if hasattr(_inductor_config, attr):
                         with suppress(Exception):
-                            _restore_inductor[attr] = getattr(_inductor_config, attr)
+                            _restore_inductor[attr] = getattr(
+                                _inductor_config, attr
+                            )
 
                 for _attr in (
                     "autotune_in_subproc",
@@ -608,21 +648,31 @@ def compile(
                         )
                         is not None
                     ):
-                        _inductor_config.max_autotune_gemm_search_space = "DEFAULT"
+                        _inductor_config.max_autotune_gemm_search_space = (
+                            "DEFAULT"
+                        )
                         _want("max_autotune_gemm_search_space", "DEFAULT")
                 with suppress(Exception):
                     if (
-                        getattr(_inductor_config, "max_autotune_pointwise", None)
+                        getattr(
+                            _inductor_config, "max_autotune_pointwise", None
+                        )
                         is not None
                     ):
                         _inductor_config.max_autotune_pointwise = False
                         _want("max_autotune_pointwise", False)
                 with suppress(Exception):
-                    if getattr(_inductor_config, "max_autotune_gemm", None) is not None:
+                    if (
+                        getattr(_inductor_config, "max_autotune_gemm", None)
+                        is not None
+                    ):
                         _inductor_config.max_autotune_gemm = True
                         _want("max_autotune_gemm", True)
                 with suppress(Exception):
-                    if getattr(_inductor_config, "compile_threads", None) is not None:
+                    if (
+                        getattr(_inductor_config, "compile_threads", None)
+                        is not None
+                    ):
                         override_raw = env_first(
                             (
                                 "ENN_INDUCTOR_COMPILE_THREADS",
@@ -656,7 +706,11 @@ def compile(
         match canonical_mode:
             case "aot-eager":
                 backend_value = "aot_eager"
-            case "reduce-overhead" | "max-autotune" | "max-autotune-no-cudagraphs":
+            case (
+                "reduce-overhead"
+                | "max-autotune"
+                | "max-autotune-no-cudagraphs"
+            ):
                 mode_value = canonical_mode
             case _:
                 mode_value = str(mode) if mode is not None else None
@@ -676,7 +730,9 @@ def compile(
             compile_kwargs["options"] = options_merged
         inductor_cfg = _get_inductor_config()
         patch = (
-            getattr(inductor_cfg, "patch", None) if inductor_cfg is not None else None
+            getattr(inductor_cfg, "patch", None)
+            if inductor_cfg is not None
+            else None
         )
         patchable: Dict[str, Any] = {}
 
@@ -688,7 +744,9 @@ def compile(
                 obj = getattr(obj, part)
             return True
 
-        if isinstance(compile_kwargs.get("options", None), dict) and callable(patch):
+        if isinstance(compile_kwargs.get("options", None), dict) and callable(
+            patch
+        ):
             options_dict = dict(compile_kwargs.get("options") or {})
             if options_dict:
                 patchable = {
@@ -742,7 +800,8 @@ def compile(
 
                     cm = (
                         self._enn_patch_fn(self._enn_patch_dict)
-                        if callable(self._enn_patch_fn) and self._enn_patch_dict
+                        if callable(self._enn_patch_fn)
+                        and self._enn_patch_dict
                         else nullcontext()
                     )
                     try:
@@ -795,7 +854,9 @@ def torch_compiler_supported() -> bool:
         pass
     try:
         comp = getattr(torch, "compiler", None)
-        is_exporting = getattr(comp, "is_exporting", None) if comp is not None else None
+        is_exporting = (
+            getattr(comp, "is_exporting", None) if comp is not None else None
+        )
         if callable(is_exporting) and bool(is_exporting()):
             return False
     except Exception:
@@ -881,7 +942,9 @@ def torch_compiler_disable(
         fn = getattr(target, attr)
         if getattr(fn, _NO_COMPILE_SENTINEL, False):
             return True
-        decorator = _decorate_compiler_disable(reason=reason, recursive=recursive)
+        decorator = _decorate_compiler_disable(
+            reason=reason, recursive=recursive
+        )
         try:
             non_export_wrapped = decorator(fn)
         except Exception:
@@ -926,7 +989,9 @@ def torch_compiler_disable(
 def compile_distributed_safe(
     *args: Any, collectives: tuple[str, ...] = _COLLECTIVE_NAMES
 ) -> bool:
-    if _TORCH_DYNAMO is None or not hasattr(_TORCH_DYNAMO, "disallow_in_graph"):
+    if _TORCH_DYNAMO is None or not hasattr(
+        _TORCH_DYNAMO, "disallow_in_graph"
+    ):
         return False
     try:
         import torch.distributed as dist
@@ -969,7 +1034,9 @@ def compile_safe(
                 layers_module = importlib.import_module(mod_name)
                 break
     scaler_cls = (
-        getattr(layers_module, "Scaler", None) if layers_module is not None else None
+        getattr(layers_module, "Scaler", None)
+        if layers_module is not None
+        else None
     )
     if scaler_cls is None:
         for mod_name in ("enn_torch.nn.layers", "enn_torch.nn.blocks"):
@@ -994,7 +1061,9 @@ def compile_safe(
                 recursive=False,
             )
     history_cls = (
-        getattr(layers_module, "Recorder", None) if layers_module is not None else None
+        getattr(layers_module, "Recorder", None)
+        if layers_module is not None
+        else None
     )
     if history_cls is None:
         for mod_name in ("enn_torch.nn.layers", "enn_torch.nn.blocks"):
@@ -1073,7 +1142,9 @@ def to_checkpoint(
     ttl_steps: int,
     min_bytes: int,
 ) -> bool:
-    inst = to_submodule(model) or (model.module if hasattr(model, "module") else model)
+    inst = to_submodule(model) or (
+        model.module if hasattr(model, "module") else model
+    )
     if inst is None:
         return False
     try:
@@ -1091,7 +1162,8 @@ def to_checkpoint(
     cur_until = int(getattr(inst, "_enn_ckpt_pressure_until", 0) or 0)
     if (
         cur_until >= until
-        and int(getattr(inst, "_enn_ckpt_pressure_min_bytes", 0) or 0) <= min_bytes
+        and int(getattr(inst, "_enn_ckpt_pressure_min_bytes", 0) or 0)
+        <= min_bytes
     ):
         return False
     changed = False
@@ -1133,7 +1205,9 @@ def to_checkpoint(
 
 
 def from_checkpoint(model: nn.Module, *args: Any, step_total: int) -> None:
-    inst = to_submodule(model) or (model.module if hasattr(model, "module") else model)
+    inst = to_submodule(model) or (
+        model.module if hasattr(model, "module") else model
+    )
     if inst is None:
         return
     try:
@@ -1216,7 +1290,9 @@ def coerce_checkpoint(
         {k: v for k, v in ck_opts.items() if k != "determinism_check"},
     ]
     if require_reentrant:
-        opts_list.extend([{k: v for k, v in ck_opts.items() if k == "use_reentrant"}])
+        opts_list.extend(
+            [{k: v for k, v in ck_opts.items() if k == "use_reentrant"}]
+        )
     else:
         opts_list.extend(
             [
@@ -1269,6 +1345,7 @@ try:
 except Exception:
     _TORCH_DYNAMO = None
 
+
 @dataclass
 class BorrowedModule:
     module: nn.Module
@@ -1291,6 +1368,7 @@ class ModulePath:
 class CallArguments:
     args: tuple[Any, ...]
     kwargs: dict[str, Any]
+
 
 class ReduceMean(nn.Module):
     def __init__(self: Self, dim: int = 1, keepdim: bool = False) -> None:
@@ -1376,20 +1454,28 @@ class GraphSequential(nn.Module):
                 tag = getattr(step, self._CONTROL_ATTR, None)
                 if tag is not None:
                     meta = {"control": str(tag)}
-                compiled_steps.append(("fn", step, extra_args, extra_kwargs, meta))
+                compiled_steps.append(
+                    ("fn", step, extra_args, extra_kwargs, meta)
+                )
                 continue
-            raise TypeError(f"Unsupported GraphSequential step: {type(step)!r}")
+            raise TypeError(
+                f"Unsupported GraphSequential step: {type(step)!r}"
+            )
         if not compiled_steps:
             raise ValueError("GraphSequential requires at least one step.")
         self._steps: list[tuple[object, ...]] = compiled_steps
 
     @staticmethod
-    def ref(module: nn.Module, *args: Any, name: str | None = None) -> BorrowedModule:
+    def ref(
+        module: nn.Module, *args: Any, name: str | None = None
+    ) -> BorrowedModule:
         del args
         return BorrowedModule(module=module, name=name)
 
     @staticmethod
-    def own(module: nn.Module, *args: Any, name: str | None = None) -> OwnedModule:
+    def own(
+        module: nn.Module, *args: Any, name: str | None = None
+    ) -> OwnedModule:
         del args
         return OwnedModule(module=module, name=name)
 
@@ -1429,7 +1515,9 @@ class GraphSequential(nn.Module):
         return GraphSequential._tag_control(_op, "graph_break")
 
     @staticmethod
-    def cudagraph_begin(*args: Any, disable_compile: bool = True) -> Callable[..., Any]:
+    def cudagraph_begin(
+        *args: Any, disable_compile: bool = True
+    ) -> Callable[..., Any]:
         def _op(*a: Any, **kw: Any) -> Any:
             cudagraph_mark_step_begin()
             if kw:
@@ -1448,7 +1536,9 @@ class GraphSequential(nn.Module):
         )
 
     @staticmethod
-    def cudagraph_end(*args: Any, disable_compile: bool = True) -> Callable[..., Any]:
+    def cudagraph_end(
+        *args: Any, disable_compile: bool = True
+    ) -> Callable[..., Any]:
         def _op(*a: Any, **kw: Any) -> Any:
             cudagraph_mark_step_end()
             if kw:
@@ -1558,7 +1648,9 @@ class GraphSequential(nn.Module):
         self._refs_materialized = True
         rebound: list[tuple[object, ...]] = []
         for item in list(self._steps):
-            kind, payload, extra_args, extra_kwargs, meta = self._split_step(item)
+            kind, payload, extra_args, extra_kwargs, meta = self._split_step(
+                item
+            )
             if kind == "path":
                 path = str(payload)
                 mod = self._resolve_path(path)
@@ -1588,7 +1680,9 @@ class GraphSequential(nn.Module):
                 with contextlib.suppress(Exception):
                     mod = payload()
                     if isinstance(mod, nn.Module):
-                        rebound.append(("ref", mod, extra_args, extra_kwargs, meta))
+                        rebound.append(
+                            ("ref", mod, extra_args, extra_kwargs, meta)
+                        )
                         continue
             rebound.append((kind, payload, extra_args, extra_kwargs, meta))
         self._steps = rebound
@@ -1600,7 +1694,9 @@ class GraphSequential(nn.Module):
         else:
             cur = args[0] if len(args) == 1 else tuple(args)
         for item in self._steps:
-            kind, payload, extra_args, extra_kwargs, meta = self._split_step(item)
+            kind, payload, extra_args, extra_kwargs, meta = self._split_step(
+                item
+            )
             cur = self._apply_step(
                 kind, payload, cur, extra_args, extra_kwargs, meta=meta
             )
@@ -1615,11 +1711,17 @@ class GraphSequential(nn.Module):
         sanitized: list[tuple[object, ...]] = []
         if isinstance(steps, list):
             for item in steps:
-                kind, payload, extra_args, extra_kwargs, meta = self._split_step(item)
+                kind, payload, extra_args, extra_kwargs, meta = (
+                    self._split_step(item)
+                )
                 if kind == "ref":
-                    sanitized.append((kind, None, extra_args, extra_kwargs, meta))
+                    sanitized.append(
+                        (kind, None, extra_args, extra_kwargs, meta)
+                    )
                 else:
-                    sanitized.append((kind, payload, extra_args, extra_kwargs, meta))
+                    sanitized.append(
+                        (kind, payload, extra_args, extra_kwargs, meta)
+                    )
             state["_steps"] = sanitized
         state["_root_ref"] = None
         state["_path_cache"] = {}
@@ -1674,7 +1776,9 @@ class GraphSequential(nn.Module):
         elif isinstance(raw_kwargs, dict):
             extra_kwargs = dict(raw_kwargs)
         else:
-            extra_kwargs = dict(raw_kwargs) if hasattr(raw_kwargs, "items") else {}
+            extra_kwargs = (
+                dict(raw_kwargs) if hasattr(raw_kwargs, "items") else {}
+            )
         meta = item[4] if len(item) >= 5 else None
         return kind, payload, extra_args, extra_kwargs, meta
 
@@ -1751,7 +1855,9 @@ class GraphSequential(nn.Module):
                 cur = nxt
             mod = cur
         if not isinstance(mod, nn.Module):
-            raise TypeError(f"get_submodule({path!r}) did not return an nn.Module")
+            raise TypeError(
+                f"get_submodule({path!r}) did not return an nn.Module"
+            )
         with self._path_cache_lock:
             self._path_cache[path] = weakref.ref(mod)
         return mod
@@ -1783,7 +1889,9 @@ class GraphSequential(nn.Module):
                 cur = nxt
             mod = cur
         if not isinstance(mod, nn.Module):
-            raise TypeError(f"get_submodule({path!r}) did not return an nn.Module")
+            raise TypeError(
+                f"get_submodule({path!r}) did not return an nn.Module"
+            )
         return mod
 
     def _apply_step(
@@ -1836,9 +1944,13 @@ class GraphSequential(nn.Module):
         if kind is None or spec is None:
             return out
 
-        def _reshape_one(t: torch.Tensor, shape: tuple[int, ...]) -> torch.Tensor:
+        def _reshape_one(
+            t: torch.Tensor, shape: tuple[int, ...]
+        ) -> torch.Tensor:
             if t.ndim == 0:
-                raise RuntimeError("Cannot reshape a scalar output in GraphSequential.")
+                raise RuntimeError(
+                    "Cannot reshape a scalar output in GraphSequential."
+                )
             return t.reshape(t.shape[0], *shape)
 
         if kind == "single":
@@ -1876,9 +1988,13 @@ class GraphSequential(nn.Module):
             if sh is None:
                 continue
             if k not in out_dict:
-                raise RuntimeError(f"out_shape missing key in output dict: {k!r}")
+                raise RuntimeError(
+                    f"out_shape missing key in output dict: {k!r}"
+                )
             if not isinstance(out_dict[k], torch.Tensor):
-                raise RuntimeError("out_shape expects Tensor values in dict output.")
+                raise RuntimeError(
+                    "out_shape expects Tensor values in dict output."
+                )
             out_dict[k] = _reshape_one(out_dict[k], sh)
         return out_dict
 
@@ -1896,10 +2012,14 @@ class GraphSequential(nn.Module):
             self.set_root(root)
         steps_out: list[object] = []
         for item in list(self._steps):
-            kind, payload, extra_args, extra_kwargs, meta = self._split_step(item)
+            kind, payload, extra_args, extra_kwargs, meta = self._split_step(
+                item
+            )
             if kind == "fn":
                 fn = payload
-                if strip_control_ops and bool(getattr(fn, self._CONTROL_ATTR, "")):
+                if strip_control_ops and bool(
+                    getattr(fn, self._CONTROL_ATTR, "")
+                ):
                     continue
                 step_obj: object = fn
             else:
@@ -1919,7 +2039,9 @@ class GraphSequential(nn.Module):
                     if mod is None and isinstance(path, str):
                         mod = self._resolve_path(str(path))
                 else:
-                    raise TypeError(f"Unknown GraphSequential step kind: {kind!r}")
+                    raise TypeError(
+                        f"Unknown GraphSequential step kind: {kind!r}"
+                    )
                 if not isinstance(mod, nn.Module):
                     raise RuntimeError(
                         f"extract_for_serving could not resolve module for step kind={kind!r}"
@@ -1945,7 +2067,9 @@ class GraphSequential(nn.Module):
         out = GraphSequential(
             steps=steps_out,
             out_shape=(
-                self._out_shape_spec if self._out_shape_kind is not None else None
+                self._out_shape_spec
+                if self._out_shape_kind is not None
+                else None
             ),
             name=str(name or f"{self._name}_serving"),
             root=None,

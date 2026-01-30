@@ -5,9 +5,12 @@ import contextlib
 import importlib
 import inspect
 import warnings
+from collections.abc import Callable
+from collections.abc import Mapping
 from functools import partial
-from collections.abc import Callable, Mapping
-from typing import Any, Iterator, TypeVar
+from typing import Any
+from typing import Iterator
+from typing import TypeVar
 
 import torch
 
@@ -113,17 +116,23 @@ def is_meta_or_fake_tensor(value: Any) -> bool:
 
 def validate_no_meta_tensors(module: object) -> None:
     hits: list[str] = []
-    for name, param in getattr(module, "named_parameters", lambda **_: [])(recurse=True):
+    for name, param in getattr(module, "named_parameters", lambda **_: [])(
+        recurse=True
+    ):
         if is_meta_or_fake_tensor(param):
             hits.append(f"param {name} shape={tuple(param.shape)}")
-    for name, buffer in getattr(module, "named_buffers", lambda **_: [])(recurse=True):
+    for name, buffer in getattr(module, "named_buffers", lambda **_: [])(
+        recurse=True
+    ):
         if is_meta_or_fake_tensor(buffer):
             hits.append(f"buffer {name} shape={tuple(buffer.shape)}")
     if hits:
         raise RuntimeError("Found meta tensors in model:\n" + "\n".join(hits))
 
 
-def hook_meta_monitor(module: object, inputs: object, warn_only: object) -> None:
+def hook_meta_monitor(
+    module: object, inputs: object, warn_only: object
+) -> None:
     try:
         iterator = iter(inputs)
     except Exception:
@@ -146,7 +155,8 @@ def enable_meta_monitor(model: object) -> None:
     mode = "off"
     if callable(env_first):
         mode = str(
-            env_first(("ENN_META_MONITOR", "ENN_META_HOOK"), default="off") or "off"
+            env_first(("ENN_META_MONITOR", "ENN_META_HOOK"), default="off")
+            or "off"
         )
     mode = mode.strip().lower()
     if mode in {"0", "", "false", "off"}:
@@ -159,13 +169,18 @@ def enable_meta_monitor(model: object) -> None:
     for submodule in mods:
         try:
             submodule.register_forward_pre_hook(
-                partial(hook_meta_monitor, warn_only=warn_only), with_kwargs=False
+                partial(hook_meta_monitor, warn_only=warn_only),
+                with_kwargs=False,
             )
         except TypeError:
-            submodule.register_forward_pre_hook(partial(hook_meta_monitor, warn_only=warn_only))
+            submodule.register_forward_pre_hook(
+                partial(hook_meta_monitor, warn_only=warn_only)
+            )
 
 
-def validate_no_fake_dtensor(root: object, *args: object, **kwargs: object) -> None:
+def validate_no_fake_dtensor(
+    root: object, *args: object, **kwargs: object
+) -> None:
     del args, kwargs
     try:
         import torch.nn as nn
@@ -217,7 +232,11 @@ def coerce_tensor(
             )
             for v in value
         ]
-        return type(value)(*out) if hasattr(value, "_fields") else type(value)(out)
+        return (
+            type(value)(*out)
+            if hasattr(value, "_fields")
+            else type(value)(out)
+        )
     if isinstance(value, Mapping):
         return type(value)(
             (
@@ -257,7 +276,9 @@ def extract_tensor(out: object) -> torch.Tensor:
     if isinstance(out, TensorDictBase):
         y = out.get("pred", None)
         if not isinstance(y, torch.Tensor):
-            y = next((v for v in out.values() if isinstance(v, torch.Tensor)), None)
+            y = next(
+                (v for v in out.values() if isinstance(v, torch.Tensor)), None
+            )
         if isinstance(y, torch.Tensor):
             return _to_plain(y)
         raise RuntimeError("TensorDict output missing tensors")
@@ -282,7 +303,9 @@ def to_tensor_like(x: Any, ref: torch.Tensor) -> torch.Tensor:
 
 
 @contextlib.contextmanager
-def from_buffer(*args: Any, coerce_requires_grad: bool = True) -> Iterator[None]:
+def from_buffer(
+    *args: Any, coerce_requires_grad: bool = True
+) -> Iterator[None]:
     if not hasattr(torch, "frombuffer"):
         yield
         return
@@ -304,14 +327,20 @@ def from_buffer(*args: Any, coerce_requires_grad: bool = True) -> Iterator[None]
             if int(count) == 0:
                 return torch.zeros((0,), dtype=dtype)
             if nbytes <= off:
-                n = int(count) if isinstance(count, int) and int(count) > 0 else 0
+                n = (
+                    int(count)
+                    if isinstance(count, int) and int(count) > 0
+                    else 0
+                )
                 return torch.zeros((n,), dtype=dtype)
             readonly = bool(getattr(mv, "readonly", False))
         except Exception:
             readonly = False
         if readonly:
             with warnings.catch_warnings():
-                warnings.filterwarnings("ignore", message=r".*buffer is not writable.*")
+                warnings.filterwarnings(
+                    "ignore", message=r".*buffer is not writable.*"
+                )
                 return _call_from_buffer(
                     _original,
                     buffer,
@@ -369,7 +398,9 @@ _mb_unwrap_functional_tensor = _optional_attr(
     None,
     predicate=callable,
 )
-_tdx_is_fake = _optional_attr("torchdistx.fake", "is_fake", None, predicate=callable)
+_tdx_is_fake = _optional_attr(
+    "torchdistx.fake", "is_fake", None, predicate=callable
+)
 FakeTensor = _optional_attr(
     "torch._subclasses.fake_tensor",
     "FakeTensor",
@@ -415,7 +446,6 @@ def touch_tensors(obj: object) -> None:
         for v in obj:
             touch_tensors(v)
         return
-
 
 
 def compute_batch_bytes_per_sample(obj: object) -> tuple[int | None, int]:

@@ -18,10 +18,15 @@ import tempfile
 import threading
 import time
 import warnings
-from contextlib import AbstractContextManager
 from collections import deque
+from contextlib import AbstractContextManager
 from pathlib import Path
-from typing import Any, Callable, Iterable, Iterator, Mapping, Sequence
+from typing import Any
+from typing import Callable
+from typing import Iterable
+from typing import Iterator
+from typing import Mapping
+from typing import Sequence
 
 import torch
 import torch.distributed as dist
@@ -29,16 +34,19 @@ from torch import nn
 from torch.optim import Optimizer
 
 from ..core.concurrency import Mutex
-from ..core.datatypes import PathLike, env_bool, env_first, env_int, save_temp, write_json
-from ..core.system import (
-    CPU,
-    get_device,
-    get_num_accelerators,
-    init_python_path,
-    init_start_method,
-    set_accelerator_index,
-    set_accelerator_seed,
-)
+from ..core.datatypes import PathLike
+from ..core.datatypes import env_bool
+from ..core.datatypes import env_first
+from ..core.datatypes import env_int
+from ..core.datatypes import save_temp
+from ..core.datatypes import write_json
+from ..core.system import CPU
+from ..core.system import get_device
+from ..core.system import get_num_accelerators
+from ..core.system import init_python_path
+from ..core.system import init_start_method
+from ..core.system import set_accelerator_index
+from ..core.system import set_accelerator_seed
 
 try:
     from torch.distributed._composable.fsdp import fully_shard
@@ -127,7 +135,10 @@ def _set_dtensor_active() -> None:
 
 
 def _from_hsdp_module(module: torch.nn.Module) -> None:
-    if not (is_distributed() and callable(unshard := getattr(module, "unshard", None))):
+    if not (
+        is_distributed()
+        and callable(unshard := getattr(module, "unshard", None))
+    ):
         return
     try:
         if (p0 := next(module.parameters(recurse=False), None)) is not None:
@@ -194,7 +205,8 @@ def _format_endpoint(host: str, port: int) -> str:
     try:
         h = (
             f"[{h}]"
-            if ipaddress.ip_address(_coerce_ip_addr(h)).version == 6 and ":" in h
+            if ipaddress.ip_address(_coerce_ip_addr(h)).version == 6
+            and ":" in h
             else h
         )
     except:
@@ -223,9 +235,9 @@ def _canonize_host(ep: str, default: str, link_local: bool) -> tuple[str, int]:
     if not ep:
         return default, 0
     host, port = _parse_endpoint(ep)
-    host = _canonize_ip(host or default, loopback=True, link_local=link_local) or (
-        default if _is_ip_addr(host) else host
-    )
+    host = _canonize_ip(
+        host or default, loopback=True, link_local=link_local
+    ) or (default if _is_ip_addr(host) else host)
     return host, port if 0 < port <= 65535 else 0
 
 
@@ -236,7 +248,9 @@ def _has_join_hook(obj: Any | None) -> bool:
 def _get_device_id(device: Optional[torch.device]) -> Optional[Iterable[int]]:
     return (
         [int(device.index)]
-        if device and device.type in {"cuda", "xpu"} and device.index is not None
+        if device
+        and device.type in {"cuda", "xpu"}
+        and device.index is not None
         else None
     )
 
@@ -282,7 +296,9 @@ def _get_preferred_ip_cached(
                 score == 2 and not allow_link_local
             ):
                 continue
-            found.append((score, ip.version == (6 if prefer_ipv6 else 4), canon))
+            found.append(
+                (score, ip.version == (6 if prefer_ipv6 else 4), canon)
+            )
     found.sort(key=lambda x: x[:2], reverse=True)
     if found:
         return found[0][2]
@@ -423,7 +439,9 @@ def _broadcast_large_tensor_gloox(
         else:
             cpu_chunk = torch.empty((n,), dtype=flat.dtype, device="cpu")
 
-        work = dist.broadcast(cpu_chunk, src=src_rank, group=group, async_op=use_async)
+        work = dist.broadcast(
+            cpu_chunk, src=src_rank, group=group, async_op=use_async
+        )
 
         if use_async:
             pending.append((work, cpu_chunk, offset, n))
@@ -481,7 +499,9 @@ def _broadcast_large_tensor(
         n = min(chunk_elems, total - offset)
         view = flat[offset : offset + n]
 
-        work = dist.broadcast(view, src=src_rank, group=group, async_op=use_async)
+        work = dist.broadcast(
+            view, src=src_rank, group=group, async_op=use_async
+        )
 
         if use_async:
             pending.append(work)
@@ -597,7 +617,9 @@ def resolve_ip_expr(
         if allow_link_local is not None
         else env_bool("ENN_ALLOW_LINK_LOCAL", False)
     )
-    if lit := _canonize_ip(host_text, loopback=allow_loopback, link_local=link_local):
+    if lit := _canonize_ip(
+        host_text, loopback=allow_loopback, link_local=link_local
+    ):
         return lit
     addrs = _safe_getaddrinfo(_coerce_ip_addr(host_text))
     if not addrs:
@@ -610,7 +632,9 @@ def resolve_ip_expr(
             )
         ):
             with contextlib.suppress(Exception):
-                res[ipaddress.ip_address(_coerce_ip_addr(canon)).version].append(canon)
+                res[
+                    ipaddress.ip_address(_coerce_ip_addr(canon)).version
+                ].append(canon)
     vers = (6, 4) if (prefer_ipv6 is None or prefer_ipv6) else (4, 6)
     for v in vers:
         if res[v]:
@@ -618,7 +642,10 @@ def resolve_ip_expr(
     if "%" in host_text and link_local:
         for v in vers:
             for ip in res[v]:
-                if v == 6 and ipaddress.ip_address(_coerce_ip_addr(ip)).is_link_local:
+                if (
+                    v == 6
+                    and ipaddress.ip_address(_coerce_ip_addr(ip)).is_link_local
+                ):
                     return f"{ip}%{host_text.partition('%')[2]}"
     return None
 
@@ -675,7 +702,9 @@ def is_port_available(
         ver = ipaddress.ip_address(_coerce_ip_addr(host_ip)).version
         family = socket.AF_INET6 if ver == 6 else socket.AF_INET
         addr = (host_ip, port, 0, 0) if ver == 6 else (host_ip, port)
-        with contextlib.closing(socket.socket(family, socket.SOCK_STREAM)) as sock:
+        with contextlib.closing(
+            socket.socket(family, socket.SOCK_STREAM)
+        ) as sock:
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             if ver == 6 and hasattr(socket, "IPV6_V6ONLY"):
                 with contextlib.suppress(OSError):
@@ -725,7 +754,9 @@ def get_available_host(
             if ver == 6
             else (socket.AF_INET, (host, 0))
         )
-        with contextlib.closing(socket.socket(family, socket.SOCK_STREAM)) as sock:
+        with contextlib.closing(
+            socket.socket(family, socket.SOCK_STREAM)
+        ) as sock:
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             if ver == 6 and hasattr(socket, "IPV6_V6ONLY"):
                 with contextlib.suppress(OSError):
@@ -757,9 +788,13 @@ def supported_ip_ver(
             with contextlib.closing(
                 socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
             ) as sock6:
-                if hasattr(socket, "IPPROTO_IPV6") and hasattr(socket, "IPV6_V6ONLY"):
+                if hasattr(socket, "IPPROTO_IPV6") and hasattr(
+                    socket, "IPV6_V6ONLY"
+                ):
                     with contextlib.suppress(OSError):
-                        sock6.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
+                        sock6.setsockopt(
+                            socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1
+                        )
                 sock6.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
                 sock6.bind((ipv6_host, 0, 0, 0))
                 ipv6_ok = True
@@ -835,7 +870,9 @@ def get_world_size(device: Optional[torch.device] = None) -> int:
         case "cuda" | "xpu" | "mps":
             with contextlib.suppress(Exception):
                 count = int(
-                    get_num_accelerators(str(getattr(dev, "type", "cpu") or "cpu"))
+                    get_num_accelerators(
+                        str(getattr(dev, "type", "cpu") or "cpu")
+                    )
                 )
                 if count > 0:
                     return count
@@ -843,7 +880,6 @@ def get_world_size(device: Optional[torch.device] = None) -> int:
         case _:
             ncpu = CPU.count()
             return max(1, min(int(ncpu), 4))
-
 
 
 def is_process_group(obj: object) -> bool:
@@ -889,7 +925,9 @@ def get_group_world_size(group: object | None) -> int:
         return int(get_world_size())
 
 
-def distributed_all_reduce_sum(t: torch.Tensor, group: object | None = None) -> None:
+def distributed_all_reduce_sum(
+    t: torch.Tensor, group: object | None = None
+) -> None:
     if not isinstance(t, torch.Tensor):
         return
     try:
@@ -906,7 +944,6 @@ def distributed_all_reduce_sum(t: torch.Tensor, group: object | None = None) -> 
     except Exception:
         with contextlib.suppress(Exception):
             dist.all_reduce(t, op=dist.ReduceOp.SUM)
-
 
 
 @contextlib.contextmanager
@@ -936,7 +973,9 @@ def joining(
     return Join(joinables, throw_on_early_termination=True)
 
 
-def broadcast_scalar(value: int | float, device: torch.device, src: int = 0) -> int:
+def broadcast_scalar(
+    value: int | float, device: torch.device, src: int = 0
+) -> int:
     if not is_distributed():
         return int(value)
     try:
@@ -974,7 +1013,11 @@ def distributed_barrier(
     if not is_distributed():
         return
 
-    if group is None and device is not None and not isinstance(device, torch.device):
+    if (
+        group is None
+        and device is not None
+        and not isinstance(device, torch.device)
+    ):
         with contextlib.suppress(Exception):
             from torch.distributed.distributed_c10d import ProcessGroup as _PG
 
@@ -1034,7 +1077,9 @@ def distributed_broadcast(
         return
 
     coalesce_bytes = max(1, int(policy.coalesce_mb)) * 1024 * 1024
-    max_tensor_bytes = max(1, int(policy.max_tensor_mb_for_coalesce)) * 1024 * 1024
+    max_tensor_bytes = (
+        max(1, int(policy.max_tensor_mb_for_coalesce)) * 1024 * 1024
+    )
 
     def _is_small(t: Tensor) -> bool:
         return (t.numel() * t.element_size()) <= max_tensor_bytes
@@ -1048,7 +1093,9 @@ def distributed_broadcast(
     )
     multi_node = bool(world_size > local_world_size)
 
-    chunk_mb = int(policy.inter_stream_mb if multi_node else policy.intra_stream_mb)
+    chunk_mb = int(
+        policy.inter_stream_mb if multi_node else policy.intra_stream_mb
+    )
     max_inflight_mb = int(policy.max_inflight_mb)
 
     backend = (policy.backend or "c10d").strip().lower()
@@ -1070,7 +1117,9 @@ def distributed_broadcast(
         for bucket in _iter_buckets_by_bytes(
             small_tensors, max_bucket_bytes=coalesce_bytes
         ):
-            _broadcast_bucket_gloox(bucket, src_rank=src_rank, group=gloo_group)
+            _broadcast_bucket_gloox(
+                bucket, src_rank=src_rank, group=gloo_group
+            )
 
         for t in large_tensors:
             _broadcast_large_tensor_gloox(
@@ -1324,7 +1373,9 @@ def get_distributed_mesh(
     is_consistent = True
     if dist.is_initialized():
         try:
-            my_size = torch.tensor([local_world_size], device=dev, dtype=torch.long)
+            my_size = torch.tensor(
+                [local_world_size], device=dev, dtype=torch.long
+            )
             gathered = [torch.zeros_like(my_size) for _ in range(world)]
             dist.all_gather(gathered, my_size)
             all_sizes = [t.item() for t in gathered]
@@ -1337,7 +1388,11 @@ def get_distributed_mesh(
     init_device_mesh = getattr(device_mesh, "init_device_mesh", None)
     if init_device_mesh is None:
         return (None, "none")
-    if is_consistent and world > local_world_size and world % local_world_size == 0:
+    if (
+        is_consistent
+        and world > local_world_size
+        and world % local_world_size == 0
+    ):
         dp_replicate = world // local_world_size
         dp_shard = local_world_size
         try:
@@ -1375,7 +1430,9 @@ class ProcessBroker:
         "Either mode or options can be specified, but both can't be specified at the same time\\.",
     )
     _IGNORED_WARNING_MESSAGE_RE = re.compile(
-        r".*(?:" + "|".join((f"(?:{p})" for p in _IGNORED_WARNING_PATTERNS)) + r").*"
+        r".*(?:"
+        + "|".join((f"(?:{p})" for p in _IGNORED_WARNING_PATTERNS))
+        + r").*"
     )
 
     @classmethod
@@ -1452,7 +1509,9 @@ class ProcessBroker:
             return "hccl"
         if dev_type == "xla":
             return "xla"
-        get_default = getattr(torch.distributed, "get_default_backend_for_device", None)
+        get_default = getattr(
+            torch.distributed, "get_default_backend_for_device", None
+        )
         if callable(get_default):
             with contextlib.suppress(Exception):
                 return str(get_default(device)).lower()
@@ -1524,7 +1583,9 @@ class ProcessBroker:
             os.environ["TORCH_NCCL_ENABLE_MONITORING"] = str(int(mon))
         if "TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC" not in os.environ:
             default_hb = 3600 if int(world) <= 1 else 600
-            hb = int(env_int("ENN_TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC", default_hb))
+            hb = int(
+                env_int("ENN_TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC", default_hb)
+            )
             os.environ["TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC"] = str(int(hb))
         if "TORCH_NCCL_DUMP_ON_TIMEOUT" not in os.environ:
             default_dump = 0 if int(world) <= 1 else 1
@@ -1532,13 +1593,14 @@ class ProcessBroker:
             os.environ["TORCH_NCCL_DUMP_ON_TIMEOUT"] = str(int(dump))
         if "TORCH_NCCL_ASYNC_ERROR_HANDLING" not in os.environ:
             default_ae = 0 if int(world) <= 1 else 3
-            ae = int(env_int("ENN_TORCH_NCCL_ASYNC_ERROR_HANDLING", default_ae))
+            ae = int(
+                env_int("ENN_TORCH_NCCL_ASYNC_ERROR_HANDLING", default_ae)
+            )
             os.environ["TORCH_NCCL_ASYNC_ERROR_HANDLING"] = str(int(ae))
         if "TORCH_NCCL_BLOCKING_WAIT" not in os.environ:
             default_bw = 1 if int(world) <= 1 else 0
             bw = int(env_int("ENN_TORCH_NCCL_BLOCKING_WAIT", default_bw))
             os.environ["TORCH_NCCL_BLOCKING_WAIT"] = str(int(bw))
-
 
     @classmethod
     def configure_torch_nccl_env(cls, device: torch.device) -> None:
@@ -1561,7 +1623,9 @@ class ProcessBroker:
         cls._configure_torch_xccl_env(device)
 
     @classmethod
-    def configure_backend_env(cls, backend: object, device: torch.device) -> None:
+    def configure_backend_env(
+        cls, backend: object, device: torch.device
+    ) -> None:
         b = str(backend).lower() if backend is not None else ""
         if b == "nccl":
             cls._configure_torch_nccl_env(device)
@@ -1571,7 +1635,9 @@ class ProcessBroker:
             cls._configure_torch_gloo_env(device)
 
     @classmethod
-    def init_backend(cls, device: torch.device, local_rank: int | None = None) -> None:
+    def init_backend(
+        cls, device: torch.device, local_rank: int | None = None
+    ) -> None:
         with contextlib.suppress(Exception):
             if device.type == "cuda" and hasattr(torch.backends, "cudnn"):
                 torch.backends.cudnn.benchmark = True
@@ -1703,8 +1769,9 @@ class ProcessBroker:
         if int(total) <= 0:
             return None
         try:
-            from tqdm.auto import tqdm
             import sys
+
+            from tqdm.auto import tqdm
 
             return tqdm(
                 total=int(total),
@@ -1726,7 +1793,9 @@ class ProcessBroker:
     def get_progress_bar(
         cls, title: str, total: int, device: torch.device, **kwargs: Any
     ) -> object:
-        return cls.make_progress_bar(title=title, total=total, device=device, **kwargs)
+        return cls.make_progress_bar(
+            title=title, total=total, device=device, **kwargs
+        )
 
     @classmethod
     def update_progress_bar(
@@ -1749,7 +1818,9 @@ class ProcessBroker:
         except Exception:
             tflops_val = 0.0
         io_expr = (
-            f"I/O = {mbps_val:.2f} MB/s" if mbps_val >= 0.01 else "I/O < 0.01 MB/s"
+            f"I/O = {mbps_val:.2f} MB/s"
+            if mbps_val >= 0.01
+            else "I/O < 0.01 MB/s"
         )
         com_expr = (
             f"COM = {tflops_val:.2f} TFLOPS"
@@ -1780,8 +1851,9 @@ class ProcessBroker:
         if int(total) <= 0:
             return None
         try:
-            from tqdm.auto import tqdm
             import sys
+
+            from tqdm.auto import tqdm
 
             return tqdm(
                 total=int(total),
@@ -1823,13 +1895,9 @@ class ProcessBroker:
             inc = 1
         finished = int(position) + (1 if inc > 0 else 0)
         if inc == 0:
-            chpt_expr = (
-                f"(Total = {int(total)}, Finished = {finished}) Checkpoint in Progress"
-            )
+            chpt_expr = f"(Total = {int(total)}, Finished = {finished}) Checkpoint in Progress"
         else:
-            chpt_expr = (
-                f"(Total = {int(total)}, Finished = {finished}) Checkpoint Completed"
-            )
+            chpt_expr = f"(Total = {int(total)}, Finished = {finished}) Checkpoint Completed"
         with contextlib.suppress(Exception):
             bar.unit = chpt_expr
         with contextlib.suppress(Exception):
@@ -1862,7 +1930,9 @@ class Checkpointer:
         self.root = Path(ckpt_dir)
         self.dcp_root = self.root / dcp_subdir
         self.avg_root = self.root / avg_subdir
-        self.avg_ext = avg_ext if str(avg_ext).startswith(".") else f".{avg_ext}"
+        self.avg_ext = (
+            avg_ext if str(avg_ext).startswith(".") else f".{avg_ext}"
+        )
         self.keep_last = max(1, int(keep_last))
         self.max_in_flight = max(1, int(max_in_flight))
         self.use_async = bool(use_async)
@@ -1896,7 +1966,9 @@ class Checkpointer:
         self._local_world = int(os.environ.get("LOCAL_WORLD_SIZE", "1") or 1)
         if self._local_world < 1:
             self._local_world = 1
-        self._node_rank = self._rank // self._local_world if self._local_world else 0
+        self._node_rank = (
+            self._rank // self._local_world if self._local_world else 0
+        )
 
         self._dcp_process_group: object | None = None
         self._dcp_should_participate: bool = True
@@ -1941,7 +2013,9 @@ class Checkpointer:
         nr = self._node_rank if node_rank is None else int(node_rank)
         return self.avg_root / f"node_{nr:04d}"
 
-    def _avg_epoch_path(self, epoch: int, node_rank: int | None = None) -> Path:
+    def _avg_epoch_path(
+        self, epoch: int, node_rank: int | None = None
+    ) -> Path:
         d = self._avg_node_dir(node_rank)
         return d / f"epoch_{epoch:06d}{self.avg_ext}"
 
@@ -1964,7 +2038,8 @@ class Checkpointer:
                 self._stager_owner_thread = None
 
             try:
-                from torch.distributed.checkpoint.staging import DefaultStager, StagingOptions
+                from torch.distributed.checkpoint.staging import DefaultStager
+                from torch.distributed.checkpoint.staging import StagingOptions
 
                 use_pinned_memory = bool(
                     self._device is not None and self._device.type == "cuda"
@@ -1984,9 +2059,13 @@ class Checkpointer:
 
     def _maybe_wait_for_budget(self) -> None:
         with self._pending_lock:
-            while self._pending_dcp and _future_done(self._pending_dcp[0].future):
+            while self._pending_dcp and _future_done(
+                self._pending_dcp[0].future
+            ):
                 self._pending_dcp.popleft()
-            while self._pending_avg and _future_done(self._pending_avg[0].future):
+            while self._pending_avg and _future_done(
+                self._pending_avg[0].future
+            ):
                 self._pending_avg.popleft()
 
             while len(self._pending_dcp) >= self.max_in_flight:
@@ -1997,7 +2076,9 @@ class Checkpointer:
                     _future_result(fut)
                 finally:
                     self._pending_lock.acquire()
-                while self._pending_dcp and _future_done(self._pending_dcp[0].future):
+                while self._pending_dcp and _future_done(
+                    self._pending_dcp[0].future
+                ):
                     self._pending_dcp.popleft()
 
             while len(self._pending_avg) >= 1:
@@ -2008,7 +2089,9 @@ class Checkpointer:
                     _future_result(fut)
                 finally:
                     self._pending_lock.acquire()
-                while self._pending_avg and _future_done(self._pending_avg[0].future):
+                while self._pending_avg and _future_done(
+                    self._pending_avg[0].future
+                ):
                     self._pending_avg.popleft()
 
     def _register_pending(self, kind: str, epoch: int, fut: object) -> None:
@@ -2068,7 +2151,9 @@ class Checkpointer:
         if not d.is_dir():
             return
         try:
-            files = sorted(d.glob(f"epoch_*{self.avg_ext}"), key=lambda x: x.name)
+            files = sorted(
+                d.glob(f"epoch_*{self.avg_ext}"), key=lambda x: x.name
+            )
             if len(files) <= self.keep_last:
                 return
             for p in files[: max(0, len(files) - self.keep_last)]:
@@ -2077,7 +2162,9 @@ class Checkpointer:
         except Exception:
             return
 
-    def _save_avg_epoch(self, epoch: int, avg_state_dict: Mapping[str, Any]) -> Path:
+    def _save_avg_epoch(
+        self, epoch: int, avg_state_dict: Mapping[str, Any]
+    ) -> Path:
         node_rank = int(self._node_rank)
         d = self._avg_node_dir(node_rank)
         d.mkdir(parents=True, exist_ok=True)
@@ -2099,7 +2186,9 @@ class Checkpointer:
             self._prune_avg(node_rank)
         return path
 
-    def _schedule_avg_save(self, epoch: int, avg_state_dict: Mapping[str, Any]) -> None:
+    def _schedule_avg_save(
+        self, epoch: int, avg_state_dict: Mapping[str, Any]
+    ) -> None:
         try:
             future = self._avg_executor.submit(
                 self._save_avg_epoch, int(epoch), avg_state_dict
@@ -2133,13 +2222,18 @@ class Checkpointer:
         try:
             import torch.distributed.checkpoint as dcp
             from torch.distributed.checkpoint import FileSystemWriter
-            from torch.distributed.checkpoint.state_dict import StateDictOptions, get_state_dict
+            from torch.distributed.checkpoint.state_dict import (
+                StateDictOptions,
+            )
+            from torch.distributed.checkpoint.state_dict import get_state_dict
 
             epoch_dir = self._epoch_dir(epoch_i)
             epoch_dir.mkdir(parents=True, exist_ok=True)
 
             opts = StateDictOptions(full_state_dict=False)
-            model_sd, optim_sd = get_state_dict(model, optimizer or [], options=opts)
+            model_sd, optim_sd = get_state_dict(
+                model, optimizer or [], options=opts
+            )
             dcp_state: dict[str, Any] = {"model": _coerce_dcp_keys(model_sd)}
             if optimizer is not None:
                 dcp_state["optimizer"] = _coerce_dcp_keys(optim_sd)
@@ -2171,18 +2265,26 @@ class Checkpointer:
                     )
 
                     async_type = (
-                        os.environ.get("ENN_DCP_ASYNC_TYPE", "thread").strip().lower()
+                        os.environ.get("ENN_DCP_ASYNC_TYPE", "thread")
+                        .strip()
+                        .lower()
                     )
                     if async_type == "process":
-                        kwargs["async_checkpointer_type"] = AsyncCheckpointerType.PROCESS
+                        kwargs["async_checkpointer_type"] = (
+                            AsyncCheckpointerType.PROCESS
+                        )
                     elif async_type == "thread":
-                        kwargs["async_checkpointer_type"] = AsyncCheckpointerType.THREAD
+                        kwargs["async_checkpointer_type"] = (
+                            AsyncCheckpointerType.THREAD
+                        )
 
                 try:
                     sig = inspect.signature(dcp.async_save)
                     supported = set(sig.parameters.keys())
                     kwargs = {
-                        k: v for k, v in kwargs.items() if k in supported and v is not None
+                        k: v
+                        for k, v in kwargs.items()
+                        if k in supported and v is not None
                     }
                 except Exception:
                     kwargs = {k: v for k, v in kwargs.items() if v is not None}
@@ -2205,7 +2307,9 @@ class Checkpointer:
                         lambda: self._finalize_dcp_epoch(
                             epoch_i,
                             epoch_dir,
-                            extra_meta={"has_optimizer": optimizer is not None},
+                            extra_meta={
+                                "has_optimizer": optimizer is not None
+                            },
                         ),
                     )
                 self._register_pending("dcp", epoch_i, dcp_future)
@@ -2283,9 +2387,17 @@ class Checkpointer:
             from torch.distributed.checkpoint import FileSystemReader
             from torch.distributed.checkpoint.state_dict import (
                 StateDictOptions,
+            )
+            from torch.distributed.checkpoint.state_dict import (
                 get_model_state_dict,
+            )
+            from torch.distributed.checkpoint.state_dict import (
                 get_optimizer_state_dict,
+            )
+            from torch.distributed.checkpoint.state_dict import (
                 set_model_state_dict,
+            )
+            from torch.distributed.checkpoint.state_dict import (
                 set_optimizer_state_dict,
             )
 
@@ -2294,12 +2406,19 @@ class Checkpointer:
             state: dict[str, Any] = {"model": model_sd}
             optim_sd: Any | None = None
             if optimizer is not None:
-                optim_sd = get_optimizer_state_dict(model, optimizer, options=opts)
+                optim_sd = get_optimizer_state_dict(
+                    model, optimizer, options=opts
+                )
                 state["optimizer"] = optim_sd
-            dcp.load(state_dict=state, storage_reader=FileSystemReader(str(epoch_dir)))
+            dcp.load(
+                state_dict=state,
+                storage_reader=FileSystemReader(str(epoch_dir)),
+            )
             set_model_state_dict(model, model_sd, options=opts)
             if optimizer is not None and optim_sd is not None:
-                set_optimizer_state_dict(model, optimizer, optim_sd, options=opts)
+                set_optimizer_state_dict(
+                    model, optimizer, optim_sd, options=opts
+                )
             return latest
         except Exception as exc:
             _LOGGER.exception("DCP load failed: %s", exc)
@@ -2318,11 +2437,17 @@ class Checkpointer:
             import torch.distributed.checkpoint as dcp
             from torch.distributed.checkpoint.format_utils import (
                 BroadcastingTorchSaveReader,
+            )
+            from torch.distributed.checkpoint.format_utils import (
                 DynamicMetaLoadPlanner,
             )
             from torch.distributed.checkpoint.state_dict import (
                 StateDictOptions,
+            )
+            from torch.distributed.checkpoint.state_dict import (
                 get_model_state_dict,
+            )
+            from torch.distributed.checkpoint.state_dict import (
                 set_model_state_dict,
             )
 
