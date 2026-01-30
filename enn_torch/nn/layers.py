@@ -21,17 +21,18 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .graph import coerce_checkpoint, is_checkpoint
-from ..core.compat import StochasticDepth
-from ..core.concurrency import Mutex
-from ..core.datatypes import env_bool, env_int
 from .graph import (
+    coerce_checkpoint,
+    is_checkpoint,
     is_compiling,
     is_export_or_trace,
     is_meta_or_fake_tensor,
     is_symbolic,
     torch_compiler_disable,
 )
+from ..core.compat import StochasticDepth
+from ..core.concurrency import Mutex
+from ..core.datatypes import env_bool, env_int
 from ..core.system import empty_device_cache, is_oom_error
 from .activations import GeGLU
 from .kernels import (

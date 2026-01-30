@@ -36,7 +36,6 @@ import torch
 from tensordict import MemoryMappedTensor, TensorDictBase
 from torchdata.nodes import BaseNode
 
-from . import collate as schema
 from ..core.concurrency import Disposable, Mutex, new_affinity
 from ..core.datatypes import (
     PathLike,
@@ -312,7 +311,7 @@ def _set_batch_interval(
         return (1, 0.0)
     sbytes_cached = int(getattr(_ds, "_S_sample_bytes", 0) or 0)
     probe = _ds.get(0, min(8, len(_ds)))
-    x_cpu, y_cpu = schema.get_row(probe, labels_required=False)
+    x_cpu, y_cpu = collate.get_row(probe, labels_required=False)
     if not isinstance(x_cpu, torch.Tensor):
         x_cpu = torch.as_tensor(x_cpu)
     if y_cpu is not None and not isinstance(y_cpu, torch.Tensor):
@@ -1473,9 +1472,9 @@ class Dataset(Generic[TExtra]):
         feat_dtype = self.feature_dtype if bool(cast) else None
         label_dtype = self.label_float_dtype if bool(cast) else None
         if isinstance(data, TensorDictBase):
-            fkey = schema.get_feature_key(data)
+            fkey = collate.get_feature_key(data)
             features = data.get(fkey, None)
-            lkey = schema.get_label_key(data, required=False)
+            lkey = collate.get_label_key(data, required=False)
             labels = data.get(lkey, None) if lkey is not None else None
             if bool(return_keys):
                 row_ids = data.get("row_ids", None)
@@ -1484,14 +1483,18 @@ class Dataset(Generic[TExtra]):
                 keys = row_ids if row_ids is not None else ()
         elif isinstance(data, Mapping):
             if (
-                schema._resolve_key(data, schema._FEATURE_KEY_ALIASES, "feature", False)
+                collate._resolve_key(
+                    data, collate._FEATURE_KEY_ALIASES, "feature", False
+                )
                 is not None
-                or schema._resolve_key(data, schema._LABEL_KEY_ALIASES, "label", False)
+                or collate._resolve_key(
+                    data, collate._LABEL_KEY_ALIASES, "label", False
+                )
                 is not None
             ):
-                fkey = schema.get_feature_key(data)
+                fkey = collate.get_feature_key(data)
                 features = data.get(fkey, None)
-                lkey = schema.get_label_key(data, required=False)
+                lkey = collate.get_label_key(data, required=False)
                 labels = data.get(lkey, None) if lkey is not None else None
                 if bool(return_keys):
                     row_ids = data.get("row_ids", None)

@@ -9,7 +9,6 @@ import logging
 import math
 import os
 import platform
-import random
 import re
 import socket
 import sys
@@ -22,7 +21,6 @@ from functools import partial
 from pathlib import Path
 from typing import Any, MutableMapping, TypeAlias
 
-import numpy
 import torch
 import torch.distributed
 import torch.nn as nn
@@ -85,7 +83,6 @@ from ..core.system import (
     new_accelerator_event,
     posix_time,
     set_accelerator_index,
-    set_accelerator_seed,
     set_float32_precision,
     sync_accelerator,
 )
@@ -100,7 +97,6 @@ from ..core.tensor import (
     validate_no_meta_tensors as _validate_no_meta_tensors,
 )
 from ..data import collate
-from ..data import collate as schema
 from ..data.collate import Unsharder, warmup_scaler_stats as _warmup_scaler_stats
 from ..data.pipeline import Dataset, get_batch_length as _get_batch_length
 from ..nn.graph import (
@@ -177,19 +173,6 @@ except Exception:
 
 _COMPILE_SAFE_DONE = False
 _COMPILE_SAFE_LOCK = Mutex()
-_IGNORED_WARNING_PATTERNS: tuple[str, ...] = (
-    "torch.distributed is disabled, unavailable or uninitialized",
-    "TypedStorage is deprecated",
-    "Found a non-scalar tensor with numel=1 and ndim!=0",
-    "distributed_broadcast: coalesced broadcast failed",
-    "distributed_broadcast: per-tensor broadcast failed",
-    "found no DeviceMesh from dtensor args",
-    "mixed precision.*may be unavailable",
-    "Either mode or options can be specified, but both can't be specified at the same time\\.",
-)
-_IGNORED_WARNING_MESSAGE_RE = re.compile(
-    r".*(?:" + "|".join((f"(?:{p})" for p in _IGNORED_WARNING_PATTERNS)) + r").*"
-)
 _LOGGER = logging.getLogger(__name__)
 _float8_log = ProcessBroker.rank0_logger(_LOGGER)
 JsonPrimitive: TypeAlias = str | int | float | bool | None
@@ -1737,7 +1720,7 @@ def epochs(
         total_n = 0
         target_chunk_bytes = 16 * 1024 * 1024
         for batch in train_loader:
-            x_b, y_b = schema.get_row(batch, labels_required=True)
+            x_b, y_b = collate.get_row(batch, labels_required=True)
             x_raw = x_b.to(device)
             y_raw = y_b.to(scaler_y_device)
             y_flat = y_raw.reshape(y_raw.shape[0], -1) if y_raw.ndim >= 2 else y_raw
@@ -2637,37 +2620,17 @@ def process(*args: Any, **kwargs: Any) -> object:
         )
     verbose = bool(getattr(ops, "verbose", False))
     det = bool(getattr(ops, "deterministic", False))
-    seed_base = int(getattr(ops, "seed", 42))
-    seed_value = int(seed_base) + int(local_rank)
-    with contextlib.suppress(Exception):
-        warnings.filterwarnings(
-            "ignore",
-            message=_IGNORED_WARNING_MESSAGE_RE.pattern,
-            category=UserWarning,
-        )
-    with contextlib.suppress(Exception):
-        random.seed(seed_value)
-    with contextlib.suppress(Exception):
-        numpy.random.seed(seed_value)
-    with contextlib.suppress(Exception):
-        torch.manual_seed(seed_value)
-    with contextlib.suppress(Exception):
-        set_accelerator_seed(seed_value)
+    seed_value = int(getattr(ops, "seed", 42)) + int(local_rank)
+    ProcessBroker.apply_warning_filters()
+    ProcessBroker.set_seed(seed_value)
     with contextlib.suppress(Exception):
         torch.use_deterministic_algorithms(det, warn_only=False)
     with contextlib.suppress(Exception):
         torch.backends.cudnn.deterministic = det
         torch.backends.cudnn.benchmark = not det
     if ops.mode == "train":
-        with contextlib.suppress(Exception):
-            if is_accelerator_available("cuda"):
-                n = max(1, int(get_num_accelerators("cuda") or 1))
-                set_accelerator_index("cuda", int(local_rank) % int(n))
-            elif is_accelerator_available("xpu"):
-                n = max(1, int(get_num_accelerators("xpu") or 1))
-                set_accelerator_index("xpu", int(local_rank) % int(n))
         device = get_device()
-        ProcessBroker.init_backend(device)
+        ProcessBroker.init_backend(device, local_rank=int(local_rank))
         backend = ProcessBroker.get_backend_type(device)
         ProcessBroker.configure_backend_env(backend, device)
         enable_tf32 = bool(getattr(ops, "enable_tf32", True))
@@ -3153,15 +3116,8 @@ def process(*args: Any, **kwargs: Any) -> object:
         torch.distributed.destroy_process_group()
         return None
     if ops.mode in ("predict", "infer"):
-        with contextlib.suppress(Exception):
-            if is_accelerator_available("cuda"):
-                n = max(1, int(get_num_accelerators("cuda") or 1))
-                set_accelerator_index("cuda", int(local_rank) % int(n))
-            elif is_accelerator_available("xpu"):
-                n = max(1, int(get_num_accelerators("xpu") or 1))
-                set_accelerator_index("xpu", int(local_rank) % int(n))
         device = get_device()
-        ProcessBroker.init_backend(device)
+        ProcessBroker.init_backend(device, local_rank=int(local_rank))
         backend = ProcessBroker.get_backend_type(device)
         ProcessBroker.configure_backend_env(backend, device)
         if not torch.distributed.is_initialized():
