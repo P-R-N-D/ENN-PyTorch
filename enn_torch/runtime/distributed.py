@@ -2082,8 +2082,11 @@ class Checkpointer:
         out: list[tuple[int, Path]] = []
         for e, p in self._iter_dcp_epoch_dirs():
             try:
-                if not self._epoch_done_file(p).is_file():
-                    out.append((e, p))
+                if self._epoch_done_file(p).is_file():
+                    continue
+                if self._epoch_failed_file(p).is_file():
+                    continue
+                out.append((e, p))
             except Exception:
                 out.append((e, p))
         out.sort(key=lambda x: x[0])
@@ -2145,6 +2148,9 @@ class Checkpointer:
 
     def _epoch_done_file(self, epoch_dir: Path) -> Path:
         return epoch_dir / "done.json"
+
+    def _epoch_failed_file(self, epoch_dir: Path) -> Path:
+        return epoch_dir / "failed.json"
 
     def _avg_node_dir(self, node_rank: int | None = None) -> Path:
         nr = self._node_rank if node_rank is None else int(node_rank)
