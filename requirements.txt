@@ -33,8 +33,8 @@ ml_dtypes>=0.5.4
 # Install via extras:
 #   pip install -e .[safetensors]
 # Or plain wheel:
-#   pip install safetensors>=0.4.0
-# safetensors>=0.4.0
+#   pip install safetensors>=0.7.0
+# safetensors>=0.7.0
 
 # Optional extras (install via `pip install -e .[extra]`)
 #
