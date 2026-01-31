@@ -1966,6 +1966,9 @@ class _PendingOp:
     epoch: int
     future: object | None
     started_monotonic: float
+    epoch_dir: str | None = None
+    has_optimizer: bool = False
+    ok: bool = False
 
 
 class Checkpointer:
@@ -2113,12 +2116,31 @@ class Checkpointer:
                 self._stager_owner_thread = None
             return self._stager
 
+    def _maybe_finalize_dcp_op(self, op: _PendingOp) -> None:
+        if op.kind != "dcp" or not op.epoch_dir:
+            return
+        try:
+            epoch_dir = Path(op.epoch_dir)
+        except Exception:
+            return
+        try:
+            if self._epoch_done_file(epoch_dir).is_file():
+                return
+        except Exception:
+            pass
+        self._finalize_dcp_epoch(
+            int(op.epoch),
+            epoch_dir,
+            extra_meta={"has_optimizer": bool(op.has_optimizer)},
+        )
+
     def _maybe_wait_for_budget(self) -> None:
+        finalize_ops: list[_PendingOp] = []
         with self._pending_lock:
             while self._pending_dcp and _future_done(
                 self._pending_dcp[0].future
             ):
-                self._pending_dcp.popleft()
+                finalize_ops.append(self._pending_dcp.popleft())
             while self._pending_avg and _future_done(
                 self._pending_avg[0].future
             ):
@@ -2130,14 +2152,24 @@ class Checkpointer:
                 self._pending_lock.release()
                 try:
                     _future_result(fut)
+                    op.ok = True
+                except Exception:
+                    op.ok = False
+                    if self._is_global_rank0():
+                        _LOGGER.exception(
+                            "DCP async_save failed while waiting budget (epoch=%d)",
+                            int(op.epoch),
+                        )
                 finally:
                     self._pending_lock.acquire()
                 with contextlib.suppress(Exception):
                     op.future = None
                 if self._pending_dcp and self._pending_dcp[0] is op:
-                    self._pending_dcp.popleft()
-                while self._pending_dcp and _future_done(self._pending_dcp[0].future):
-                    self._pending_dcp.popleft()
+                    finalize_ops.append(self._pending_dcp.popleft())
+                while self._pending_dcp and _future_done(
+                    self._pending_dcp[0].future
+                ):
+                    finalize_ops.append(self._pending_dcp.popleft())
 
             while len(self._pending_avg) >= 1:
                 op = self._pending_avg[0]
@@ -2151,10 +2183,42 @@ class Checkpointer:
                     op.future = None
                 if self._pending_avg and self._pending_avg[0] is op:
                     self._pending_avg.popleft()
-                while self._pending_avg and _future_done(self._pending_avg[0].future):
+                while self._pending_avg and _future_done(
+                    self._pending_avg[0].future
+                ):
                     self._pending_avg.popleft()
 
-    def _register_pending(self, kind: str, epoch: int, fut: object) -> None:
+        for op in finalize_ops:
+            if op.future is not None and not bool(op.ok):
+                try:
+                    _future_result(op.future)
+                    op.ok = True
+                except Exception:
+                    op.ok = False
+                    if self._is_global_rank0():
+                        _LOGGER.exception(
+                            "DCP async_save failed (epoch=%d)",
+                            int(op.epoch),
+                        )
+                finally:
+                    with contextlib.suppress(Exception):
+                        op.future = None
+            if bool(op.ok):
+                self._maybe_finalize_dcp_op(op)
+            else:
+                if self._is_global_rank0() and op.epoch_dir:
+                    with contextlib.suppress(Exception):
+                        shutil.rmtree(str(op.epoch_dir), ignore_errors=True)
+
+    def _register_pending(
+        self,
+        kind: str,
+        epoch: int,
+        fut: object | None,
+        *,
+        epoch_dir: str | None = None,
+        has_optimizer: bool = False,
+    ) -> None:
         with self._pending_lock:
             q = self._pending_dcp if kind == "dcp" else self._pending_avg
             q.append(
@@ -2163,6 +2227,8 @@ class Checkpointer:
                     epoch=int(epoch),
                     future=fut,
                     started_monotonic=time.monotonic(),
+                    epoch_dir=epoch_dir,
+                    has_optimizer=bool(has_optimizer),
                 )
             )
 
@@ -2362,17 +2428,33 @@ class Checkpointer:
 
             if dcp_future is not None:
                 if self._is_global_rank0():
-                    _add_future_callback(
-                        dcp_future,
-                        lambda: self._finalize_dcp_epoch(
+                    def _finalize_cb() -> None:
+                        try:
+                            _future_result(dcp_future)
+                        except Exception:
+                            _LOGGER.exception(
+                                "DCP async_save failed (epoch=%d)",
+                                int(epoch_i),
+                            )
+                            with contextlib.suppress(Exception):
+                                shutil.rmtree(epoch_dir, ignore_errors=True)
+                            return
+                        self._finalize_dcp_epoch(
                             epoch_i,
                             epoch_dir,
                             extra_meta={
                                 "has_optimizer": optimizer is not None
                             },
-                        ),
-                    )
-                self._register_pending("dcp", epoch_i, dcp_future)
+                        )
+
+                    _add_future_callback(dcp_future, _finalize_cb)
+                self._register_pending(
+                    "dcp",
+                    epoch_i,
+                    dcp_future,
+                    epoch_dir=str(epoch_dir),
+                    has_optimizer=bool(optimizer is not None),
+                )
             else:
                 self._finalize_dcp_epoch(
                     epoch_i,
@@ -2389,8 +2471,29 @@ class Checkpointer:
         with self._pending_lock:
             pending = list(self._pending_dcp) + list(self._pending_avg)
         for op in pending:
-            with contextlib.suppress(Exception):
-                _future_result(op.future)
+            ok = bool(op.ok)
+            if op.future is not None and not ok:
+                try:
+                    _future_result(op.future)
+                    ok = True
+                except Exception:
+                    ok = False
+                    if self._is_global_rank0():
+                        _LOGGER.exception(
+                            "Pending checkpoint failed during wait (epoch=%d)",
+                            int(op.epoch),
+                        )
+                finally:
+                    with contextlib.suppress(Exception):
+                        op.future = None
+            op.ok = bool(ok)
+            if bool(op.ok):
+                with contextlib.suppress(Exception):
+                    self._maybe_finalize_dcp_op(op)
+            else:
+                if self._is_global_rank0() and op.kind == "dcp" and op.epoch_dir:
+                    with contextlib.suppress(Exception):
+                        shutil.rmtree(str(op.epoch_dir), ignore_errors=True)
         with self._pending_lock:
             self._pending_dcp.clear()
             self._pending_avg.clear()
