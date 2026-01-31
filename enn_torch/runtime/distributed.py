@@ -104,6 +104,17 @@ def _overlay_avg_state_dict(dst: object, avg: Mapping[str, Any]) -> object:
     return dst
 
 
+def _clone_state_dict(state: object) -> object:
+    if torch.is_tensor(state):
+        return state.detach().clone()
+    if isinstance(state, dict):
+        return {k: _clone_state_dict(v) for k, v in state.items()}
+    if isinstance(state, (list, tuple)):
+        cloned = (_clone_state_dict(v) for v in state)
+        return type(state)(cloned)
+    return state
+
+
 def _future_result(fut: object) -> object:
     if fut is None:
         return None
@@ -2644,14 +2655,18 @@ class Checkpointer:
             want_kind = self._default_dcp_model_kind()
             want_avg = want_kind in ("avg", "average", "ema", "swa")
 
+            supports_cpu_offload = True
             try:
                 opts = StateDictOptions(full_state_dict=False, cpu_offload=True)
             except TypeError:
+                supports_cpu_offload = False
                 opts = StateDictOptions(full_state_dict=False)
             model_sd, optim_sd = get_state_dict(
                 model, optimizer or [], options=opts
             )
             if want_avg and avg_state_dict is not None:
+                if not supports_cpu_offload:
+                    model_sd = _clone_state_dict(model_sd)
                 _overlay_avg_state_dict(model_sd, avg_state_dict)
             dcp_state: dict[str, Any] = {"model": _coerce_dcp_keys(model_sd)}
             if optimizer is not None:
