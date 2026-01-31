@@ -104,13 +104,17 @@ def _overlay_avg_state_dict(dst: object, avg: Mapping[str, Any]) -> object:
     return dst
 
 
-def _clone_state_dict(state: object) -> object:
+def _clone_state_dict(state: object, *, to_cpu: bool = False) -> object:
     if torch.is_tensor(state):
-        return state.detach().clone()
+        t = state.detach()
+        if to_cpu and getattr(t, "device", None) is not None and t.device.type != "cpu":
+            with contextlib.suppress(Exception):
+                return t.to(device="cpu")
+        return t.clone()
     if isinstance(state, dict):
-        return {k: _clone_state_dict(v) for k, v in state.items()}
+        return {k: _clone_state_dict(v, to_cpu=to_cpu) for k, v in state.items()}
     if isinstance(state, (list, tuple)):
-        cloned = (_clone_state_dict(v) for v in state)
+        cloned = (_clone_state_dict(v, to_cpu=to_cpu) for v in state)
         return type(state)(cloned)
     return state
 
@@ -2666,7 +2670,7 @@ class Checkpointer:
             )
             if want_avg and avg_state_dict is not None:
                 if not supports_cpu_offload:
-                    model_sd = _clone_state_dict(model_sd)
+                    model_sd = _clone_state_dict(model_sd, to_cpu=True)
                 _overlay_avg_state_dict(model_sd, avg_state_dict)
             dcp_state: dict[str, Any] = {"model": _coerce_dcp_keys(model_sd)}
             if optimizer is not None:
