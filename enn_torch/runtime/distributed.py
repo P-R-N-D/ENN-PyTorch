@@ -2121,6 +2121,7 @@ class Checkpointer:
                 shutil.rmtree(p, ignore_errors=True)
 
     def _wait_for_dcp_inprogress_slot(self) -> None:
+        self._cleanup_stale_dcp_inprogress()
         while True:
             inprog = self._list_dcp_inprogress()
             if len(inprog) < int(self.max_in_flight):
