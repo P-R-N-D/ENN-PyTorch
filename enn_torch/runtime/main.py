@@ -3329,7 +3329,7 @@ def process(*args: Any, **kwargs: Any) -> object:
                     int(
                         env_first_int(
                             ("ENN_DCP_MAX_INFLIGHT", "ENN_CKPT_MAX_INFLIGHT"),
-                            default=1,
+                            default=2,
                         )
                     ),
                 )

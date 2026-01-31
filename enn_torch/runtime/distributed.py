@@ -1964,7 +1964,7 @@ class ProcessBroker:
 class _PendingOp:
     kind: str
     epoch: int
-    future: object
+    future: object | None
     started_monotonic: float
 
 
@@ -1974,7 +1974,7 @@ class Checkpointer:
         ckpt_dir: PathLike,
         *,
         keep_last: int = 3,
-        max_in_flight: int = 1,
+        max_in_flight: int = 2,
         use_async: bool = True,
         dcp_subdir: str = "dcp_epochs",
         avg_subdir: str = "avg",
@@ -2132,9 +2132,11 @@ class Checkpointer:
                     _future_result(fut)
                 finally:
                     self._pending_lock.acquire()
-                while self._pending_dcp and _future_done(
-                    self._pending_dcp[0].future
-                ):
+                with contextlib.suppress(Exception):
+                    op.future = None
+                if self._pending_dcp and self._pending_dcp[0] is op:
+                    self._pending_dcp.popleft()
+                while self._pending_dcp and _future_done(self._pending_dcp[0].future):
                     self._pending_dcp.popleft()
 
             while len(self._pending_avg) >= 1:
@@ -2145,9 +2147,11 @@ class Checkpointer:
                     _future_result(fut)
                 finally:
                     self._pending_lock.acquire()
-                while self._pending_avg and _future_done(
-                    self._pending_avg[0].future
-                ):
+                with contextlib.suppress(Exception):
+                    op.future = None
+                if self._pending_avg and self._pending_avg[0] is op:
+                    self._pending_avg.popleft()
+                while self._pending_avg and _future_done(self._pending_avg[0].future):
                     self._pending_avg.popleft()
 
     def _register_pending(self, kind: str, epoch: int, fut: object) -> None:
