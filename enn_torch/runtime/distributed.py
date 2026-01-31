@@ -1974,7 +1974,7 @@ class Checkpointer:
         ckpt_dir: PathLike,
         *args: Any,
         keep_last: int = 1,
-        max_in_flight: int = 2,
+        max_in_flight: int = 1,
         use_async: bool = True,
         dcp_subdir: str = "dcp_epochs",
         avg_subdir: str = "avg",
