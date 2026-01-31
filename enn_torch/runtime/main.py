@@ -117,7 +117,7 @@ from ..nn.profiler import (
     log_profiler_summary as _get_profiler_summary,
 )
 from ..nn.wrappers import Model, update_delta_gate_auto_k as _set_gate_factor
-from .autoscaling import (
+from .autobatch import (
     clear_oom_retries as _clear_oom_retries,
     get_sampler_scaler as _get_sampler_scaler,
     log_scale_rate_throttled as _is_scale_rate_logged,

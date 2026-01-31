@@ -23,7 +23,7 @@ from typing import Any, Callable, Iterator, Protocol, Self, Sequence
 import torch
 from ..core.concurrency import Mutex
 from ..core.datatypes import PathLike, coerce_json, save_temp, write_json
-from ..core.tensor import extract_tensor, from_buffer
+from ..core.tensor import extract_tensor, from_buffer, is_meta_or_fake_tensor
 from .distributed import distributed_barrier, is_rank0
 from torch import nn
 try:
@@ -51,6 +51,19 @@ def _register_safe_globals() -> None:
             from torch.torch_version import TorchVersion
 
             add_safe_globals([TorchVersion])
+
+
+def has_meta_or_fake_tensors(state_dict: object) -> bool:
+    try:
+        items = state_dict.items() if hasattr(state_dict, "items") else None
+    except Exception:
+        items = None
+    if not items:
+        return False
+    for _, v in items:
+        if torch.is_tensor(v) and is_meta_or_fake_tensor(v):
+            return True
+    return False
 
 
 @contextlib.contextmanager
@@ -247,7 +260,10 @@ class Builder:
                     f"Unsupported checkpoint extension {p.suffix!r}. Use .pt/.pth/.safetensors (or a directory checkpoint) instead."
                 )
             if suffix == ".safetensors":
-                is_required("safetensors", "pip install safetensors")
+                is_required(
+                    "safetensors",
+                    "pip install 'enn-torch[safetensors]'  # or: pip install safetensors",
+                )
 
                 from safetensors.torch import save_file as save_tensors
 
@@ -261,6 +277,10 @@ class Builder:
                 os.close(fd)
                 tmp_path = Path(tmp_name)
                 try:
+                    if has_meta_or_fake_tensors(sd):
+                        raise NotImplementedError(
+                            "Cannot save checkpoint with fake/meta tensors (no data)."
+                        )
                     save_tensors(
                         {
                             k: coerce_tensor(v)
@@ -286,6 +306,10 @@ class Builder:
             if optimizer is not None:
                 with contextlib.suppress(Exception):
                     payload["optimizer_state_dict"] = optimizer.state_dict()
+            if has_meta_or_fake_tensors(sd):
+                raise NotImplementedError(
+                    "Cannot save checkpoint with fake/meta tensors (no data)."
+                )
             save_temp(p, payload, **opts)
             return p
 

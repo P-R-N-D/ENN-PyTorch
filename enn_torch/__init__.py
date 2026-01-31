@@ -17,6 +17,7 @@ __all__ = [
     "nn",
     "runtime",
     "load_model",
+    "load_weights",
     "new_model",
     "save_model",
     "train",
@@ -42,6 +43,12 @@ def load_model(*args: Any, **kwargs: Any) -> Model:
     from .runtime import workflows
 
     return workflows.load_model(*args, **kwargs)
+
+
+def load_weights(*args: Any, **kwargs: Any) -> object:
+    from .runtime import workflows
+
+    return workflows.load_weights(*args, **kwargs)
 
 
 def save_model(*args: Any, **kwargs: Any) -> str:

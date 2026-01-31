@@ -49,7 +49,7 @@ from ..core.config import (
 from ..core.datatypes import env_bool, read_json
 from ..core.policies import WorkerPolicy
 from ..core.system import _start_context, new_dir, optimal_start_method
-from ..core.tensor import coerce_tensor
+from ..core.tensor import coerce_tensor, is_meta_or_fake_tensor
 from ..data import collate
 from ..data.collate import MappingSlicer, TensorDictSlicer
 from ..data.pipeline import (
@@ -309,13 +309,11 @@ def _save_model_checkpoint(
         else:
             pt_state = model.state_dict()
             if any(
-                torch.is_tensor(v)
-                and getattr(v, "device", None) is not None
-                and v.device.type == "meta"
+                torch.is_tensor(v) and is_meta_or_fake_tensor(v)
                 for v in pt_state.values()
             ):
                 raise NotImplementedError(
-                    "Cannot save checkpoint with meta tensors (no data)."
+                    "Cannot save checkpoint with fake/meta tensors (no data)."
                 )
             pt_state = {
                 k: (v.detach() if torch.is_tensor(v) else v)
@@ -824,6 +822,108 @@ def new_model(
     return core
 
 
+def load_weights(
+    model: Model,
+    checkpoint_path: PathLike,
+    *,
+    map_location: TorchDeviceLike | None = None,
+    weights_only: bool = True,
+    mmap: bool | None = True,
+    rebuild_tasks: bool = False,
+) -> Mapping[str, Any] | None:
+    p = Path(_normalize_windows_paste(checkpoint_path))
+
+    if p.is_dir():
+        meta = _parse_meta(p)
+        if rebuild_tasks and isinstance(meta, dict):
+            with contextlib.suppress(Exception):
+                tasks = meta.get("tasks")
+                if tasks:
+                    model.rebuild_tasks_from_specs(tasks)
+        opts = StateDictOptions(full_state_dict=True)
+        m_sd = get_model_state_dict(model, options=opts)
+        load(state_dict={"model": m_sd}, storage_reader=FileSystemReader(str(p)))
+        resize_scaler_buffer(model, m_sd)
+        set_model_state_dict(model, m_sd, options=StateDictOptions(strict=False))
+        return meta if isinstance(meta, dict) else None
+
+    if not p.exists():
+        raise FileNotFoundError(f"Checkpoint file not found: {str(p)!r}")
+
+    suffix = p.suffix.lower()
+    if suffix == ".safetensors":
+        meta_path = p.with_name(p.name + ".json")
+        if not meta_path.exists():
+            meta_path = p.with_suffix(".json")
+        if not meta_path.exists():
+            raise RuntimeError("Missing sidecar JSON file for the safetensors checkpoint.")
+        meta = read_json(meta_path)
+        if not isinstance(meta, dict):
+            raise RuntimeError(
+                f"Invalid sidecar JSON file for the safetensors checkpoint: {str(meta_path)!r}"
+            )
+        if rebuild_tasks:
+            with contextlib.suppress(Exception):
+                tasks = meta.get("tasks")
+                if tasks:
+                    model.rebuild_tasks_from_specs(tasks)
+        is_required(
+            "safetensors",
+            "pip install 'enn-torch[safetensors]'  # or: pip install safetensors",
+        )
+        from safetensors.torch import load_file as load_tensors
+        if map_location is None:
+            dev = "cpu"
+        elif isinstance(map_location, torch.device):
+            dev = str(map_location)
+        else:
+            dev = str(map_location)
+        sd = load_tensors(str(p), device=dev)
+        sd = _coerce_state_dict(sd)
+        resize_scaler_buffer(model, sd)
+        model.load_state_dict(sd, strict=False)
+        return meta
+
+    if suffix and suffix not in (".pt", ".pth"):
+        raise ValueError(
+            f"Unsupported checkpoint extension {suffix!r}. Use .pt/.pth/.safetensors or a directory checkpoint instead."
+        )
+    obj = _torch_load_checkpoint(
+        p,
+        map_location=map_location or "cpu",
+        weights_only=weights_only,
+        mmap=mmap,
+    )
+    meta: Mapping[str, Any] | None = obj if isinstance(obj, dict) else None
+    sd = None
+    if isinstance(obj, dict):
+        if rebuild_tasks:
+            with contextlib.suppress(Exception):
+                tasks = obj.get("tasks")
+                if tasks:
+                    model.rebuild_tasks_from_specs(tasks)
+        for k in ("state_dict", "model_state_dict", "model", "model_sd", "weights", "model_weights"):
+            v = obj.get(k)
+            if isinstance(v, dict):
+                sd = v
+                break
+        if sd is None:
+            try:
+                if obj and all(isinstance(k, str) and torch.is_tensor(v) for k, v in obj.items()):
+                    sd = obj
+            except Exception:
+                sd = None
+        if sd is None:
+            raise RuntimeError(f"Checkpoint did not contain a recognizable state_dict: {str(p)!r}")
+    else:
+        sd = obj
+    sd = _coerce_state_dict(sd) if isinstance(sd, dict) else sd
+    with contextlib.suppress(Exception):
+        resize_scaler_buffer(model, sd)
+    model.load_state_dict(sd, strict=False)
+    return meta
+
+
 def load_model(
     checkpoint_path: PathLike,
     in_dim: int | None = None,
@@ -916,7 +1016,10 @@ def load_model(
             tasks = meta.get("tasks") if isinstance(meta, dict) else None
             if tasks:
                 model.rebuild_tasks_from_specs(tasks)
-        is_required("safetensors", "pip install safetensors")
+        is_required(
+            "safetensors",
+            "pip install 'enn-torch[safetensors]'  # or: pip install safetensors",
+        )
         from safetensors.torch import load_file as load_tensors
 
         dev = None
@@ -1219,10 +1322,10 @@ def train(
         def _has_meta_tensors(m: torch.nn.Module) -> bool:
             try:
                 for t in m.parameters(recurse=True):
-                    if getattr(t, "is_meta", False) or t.device.type == "meta":
+                    if is_meta_or_fake_tensor(t):
                         return True
                 for t in m.buffers(recurse=True):
-                    if getattr(t, "is_meta", False) or t.device.type == "meta":
+                    if is_meta_or_fake_tensor(t):
                         return True
             except Exception:
                 return False
@@ -1244,18 +1347,10 @@ def train(
                 fallback = fp
                 break
         if fallback is not None:
-            loaded = load_model(
-                fallback,
-                in_dim=getattr(model, "in_dim", None),
-                out_shape=getattr(model, "out_shape", None),
-                map_location="cpu",
-            )
-            cpu_state = coerce_tensor(loaded.state_dict())
             if isinstance(model, torch.nn.Module) and _has_meta_tensors(model):
                 with contextlib.suppress(Exception):
                     _materialize_to_cpu(model)
-            resize_scaler_buffer(model, cpu_state)
-            model.load_state_dict(cpu_state, strict=False)
+            load_weights(model, fallback, map_location="cpu", rebuild_tasks=False)
         else:
             if isinstance(model, torch.nn.Module) and _has_meta_tensors(model):
                 with contextlib.suppress(Exception):
@@ -1313,42 +1408,11 @@ def train(
             restore_path = init_ckpt_path
         if isinstance(model, torch.nn.Module) and restore_path:
             try:
-                _meta = False
-                for t in model.parameters(recurse=True):
-                    if getattr(t, "is_meta", False) or t.device.type == "meta":
-                        _meta = True
-                        break
-                if not _meta:
-                    for t in model.buffers(recurse=True):
-                        if (
-                            getattr(t, "is_meta", False)
-                            or t.device.type == "meta"
-                        ):
-                            _meta = True
-                            break
-                if _meta:
-                    if str(restore_path).lower().endswith(".safetensors"):
-                        loaded = load_model(
-                            restore_path,
-                            in_dim=getattr(model, "in_dim", None),
-                            out_shape=getattr(model, "out_shape", None),
-                            map_location="cpu",
-                            weights_only=True,
-                        )
-                        cpu_state = coerce_tensor(loaded.state_dict())
-                    else:
-                        cpu_state = coerce_tensor(
-                            _torch_load_checkpoint(
-                                restore_path,
-                                map_location="cpu",
-                                weights_only=True,
-                            )
-                        )
+                if _has_meta_tensors(model):
                     with contextlib.suppress(Exception):
                         if hasattr(model, "to_empty"):
                             model.to_empty(device="cpu")
-                    resize_scaler_buffer(model, cpu_state)
-                    model.load_state_dict(cpu_state, strict=False)
+                    load_weights(model, restore_path, map_location="cpu", weights_only=True, rebuild_tasks=False)
             except Exception:
                 pass
         shutil.rmtree(memmap_dir, ignore_errors=True)
