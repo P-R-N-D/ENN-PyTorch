@@ -2085,6 +2085,24 @@ class Checkpointer:
         out.sort(key=lambda x: x.name)
         return out
 
+    def _dcp_last_activity_time(self, epoch_dir: Path) -> float | None:
+        try:
+            last = float(epoch_dir.stat().st_mtime)
+        except Exception:
+            last = None
+        try:
+            with os.scandir(epoch_dir) as it:
+                for ent in it:
+                    try:
+                        st = ent.stat(follow_symlinks=False)
+                        mt = float(st.st_mtime)
+                        last = mt if last is None else max(last, mt)
+                    except Exception:
+                        continue
+        except Exception:
+            pass
+        return last
+
     def _cleanup_stale_dcp_inprogress(self) -> None:
         if not self._is_global_rank0():
             return
@@ -2094,10 +2112,10 @@ class Checkpointer:
             return
         now = time.time()
         for p in self._list_dcp_inprogress():
-            try:
-                age = now - float(p.stat().st_mtime)
-            except Exception:
+            last = self._dcp_last_activity_time(p)
+            if last is None:
                 continue
+            age = now - float(last)
             if age < max(1, grace):
                 continue
             if age < ttl:
@@ -2121,11 +2139,18 @@ class Checkpointer:
                 shutil.rmtree(p, ignore_errors=True)
 
     def _wait_for_dcp_inprogress_slot(self) -> None:
-        self._cleanup_stale_dcp_inprogress()
+        last_cleanup = 0.0
+        try:
+            self._cleanup_stale_dcp_inprogress()
+        finally:
+            last_cleanup = time.monotonic()
         while True:
             inprog = self._list_dcp_inprogress()
             if len(inprog) < int(self.max_in_flight):
                 return
+            if time.monotonic() - last_cleanup >= 5.0:
+                self._cleanup_stale_dcp_inprogress()
+                last_cleanup = time.monotonic()
             self._maybe_wait_for_budget()
             time.sleep(0.2)
 
