@@ -58,7 +58,7 @@ Repository = "https://github.com/P-R-N-D/ENN-PyTorch"
 Issues = "https://github.com/P-R-N-D/ENN-PyTorch/issues"
 
 [project.optional-dependencies]
-safetensors = ["safetensors>=0.4.0"]
+safetensors = ["safetensors>=0.7.0"]
 pandas = [
   "pandas>=2.2.0",
   "openpyxl>=3.1.5",
