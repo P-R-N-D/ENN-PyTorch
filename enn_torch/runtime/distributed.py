@@ -1615,19 +1615,39 @@ class ProcessBroker:
     def _coerce_process_group_backend(
         cls, backend: object, device: torch.device
     ) -> object:
-        if env_bool("ENN_DISABLE_PG_CPU_BACKEND", False):
-            return backend
+        backend_clean: object = backend
         b = str(backend) if backend is not None else ""
-        b = b.replace("\\n", "").replace("\n", "").replace("\r", "")
-        b = b.strip().lower()
+        if isinstance(backend, str):
+            s = backend.replace("\\n", "").replace("\n", "").replace("\r", "")
+            s = s.strip()
+            parts = [p.strip() for p in s.split(",") if p.strip()]
+            if len(parts) > 1 and all(":" in p for p in parts):
+                norm_parts: list[str] = []
+                for p in parts:
+                    dev_part, _, be_part = p.partition(":")
+                    norm_parts.append(
+                        f"{dev_part.strip().lower()}:{be_part.strip().lower()}"
+                    )
+                s = ",".join(norm_parts)
+            else:
+                s = s.lower()
+            backend_clean = s
+            b = s
+        else:
+            b = b.replace("\\n", "").replace("\n", "").replace("\r", "")
+            b = b.strip().lower()
+
+        if env_bool("ENN_DISABLE_PG_CPU_BACKEND", False):
+            return backend_clean
+
         dev = str(getattr(device, "type", "cpu")).strip().lower()
-        if "," in b and ":" in b:
-            return backend
+        if isinstance(backend_clean, str) and ("," in b and ":" in b):
+            return backend_clean
         if b == "nccl" and dev == "cuda":
             return "cpu:gloo,cuda:nccl"
         if b == "xccl" and dev == "xpu":
             return "cpu:gloo,xpu:xccl"
-        return backend
+        return backend_clean
 
     @classmethod
     def configure_backend_env(
