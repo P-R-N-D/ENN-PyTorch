@@ -60,7 +60,10 @@ _ENV_INNER_THREAD_VARS: tuple[str, ...] = (
 _EXECUTOR_ORDINAL = itertools.count(0)
 _EXECUTOR_ORDINAL_LOCK = threading.Lock()
 _TLB_SINGLETON: Optional["Thread"] = None
-_TLB_SINGLETON_LOCK = None
+_TLB_SINGLETON_LOCK = threading.Lock()
+_TORCH_THREAD_CFG_LOCK = threading.Lock()
+_LAST_TORCH_NUM_THREADS: Optional[int] = None
+_LAST_TORCH_INTEROP_THREADS: Optional[int] = None
 
 
 def _flatten_args(items: Sequence[Any]) -> Iterator[Any]:
@@ -207,6 +210,7 @@ def _init_env(key: str, value: str, *args: Any, force: bool) -> None:
 
 
 def _limit_inner_threads(threads: int, *args: Any, force: bool = False) -> int:
+    global _LAST_TORCH_NUM_THREADS, _LAST_TORCH_INTEROP_THREADS
     t = max(1, int(threads))
     ov = env_first_int(("ENN_EXECUTOR_INNER_THREADS",), default=0) or 0
     if int(ov) > 0:
@@ -221,10 +225,17 @@ def _limit_inner_threads(threads: int, *args: Any, force: bool = False) -> int:
         _set_concurrency_env(k, str(t), force=force, cap_down=cap_down)
     for k, v in _ENV_INNER_BOOL_VARS.items():
         _init_env(k, v, force=force)
-    with contextlib.suppress(Exception):
-        torch.set_num_threads(int(t))
-    with contextlib.suppress(Exception):
-        torch.set_num_interop_threads(1)
+    interop = env_first_int(("ENN_EXECUTOR_INTEROP_THREADS",), default=1) or 1
+    interop = max(1, int(interop))
+    with _TORCH_THREAD_CFG_LOCK:
+        if force or (_LAST_TORCH_NUM_THREADS is None) or int(_LAST_TORCH_NUM_THREADS) != int(t):
+            with contextlib.suppress(Exception):
+                torch.set_num_threads(int(t))
+            _LAST_TORCH_NUM_THREADS = int(t)
+        if force or (_LAST_TORCH_INTEROP_THREADS is None) or int(_LAST_TORCH_INTEROP_THREADS) != int(interop):
+            with contextlib.suppress(Exception):
+                torch.set_num_interop_threads(int(interop))
+            _LAST_TORCH_INTEROP_THREADS = int(interop)
     return int(t)
 
 
@@ -543,6 +554,11 @@ def _executor_process_initializer(
 
 
 def is_free_threading_build() -> bool:
+    with contextlib.suppress(Exception):
+        import sysconfig
+        v = sysconfig.get_config_var("Py_GIL_DISABLED")
+        if v is not None:
+            return bool(int(v))
     with contextlib.suppress(Exception):
         return bool(CPU.is_free_threaded_build())
     tag = getattr(getattr(sys, "implementation", None), "cache_tag", "") or ""
@@ -2371,6 +2387,3 @@ class Mutex:
         tb: TracebackType | None,
     ) -> None:
         self.release()
-
-
-_TLB_SINGLETON_LOCK = Mutex()

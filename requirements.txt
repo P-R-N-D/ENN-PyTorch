@@ -30,6 +30,10 @@ ml_dtypes>=0.5.4
 
 # Checkpoint / IO formats (optional)
 # - safetensors: enables .safetensors checkpoints
+# Install via extras:
+#   pip install -e .[safetensors]
+# Or plain wheel:
+#   pip install safetensors>=0.4.0
 # safetensors>=0.4.0
 
 # Optional extras (install via `pip install -e .[extra]`)

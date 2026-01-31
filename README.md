@@ -36,7 +36,7 @@ This repository also includes a worked example notebook (`notebook.ipynb`) and a
 - **Templated configurations** (`enn_torch.core.config`): dataclass configs with coercion/validation and string canonicalizers for modeling type, normalization, and compile options.
 - **Neural network stacks** (`enn_torch.nn`): spatio-temporal Fuser/Collector blocks (Template tasks + Perceiver resampler), attention variants, scaler + recorder modules, AMP negotiation guard band (`ModelConfig.safety_margin_pow2`).
 - **Data pipeline** (`enn_torch.data`): `torchdata.nodes`-driven memmap pipeline with TensorDict support, prefetch/pin/pool options, and scale-aware dataset metadata.
-- **Runnable tasks** (`enn_torch.runtime`): thread/NUMA tuning, free-threaded/no-GIL optimizations, mixed-precision helpers, history recorder, and OOM recovery hooks (see `enn_torch.runtime.autoscaling`). ONNX/ORT/onnxscript/onnx_ir/torch.export (PT2) out of the box; optional platform-dependent backends (TensorRT/CoreML/ExecuTorch/onnx-tf) via extras. elastic launch wiring and group setup for multi-process CPU/GPU runs.
+- **Runnable tasks** (`enn_torch.runtime`): thread/NUMA tuning, free-threaded/no-GIL optimizations, mixed-precision helpers, history recorder, and OOM recovery hooks (see `enn_torch.runtime.autobatch`). ONNX/ORT/onnxscript/onnx_ir/torch.export (PT2) out of the box; optional platform-dependent backends (TensorRT/CoreML/ExecuTorch/onnx-tf) via extras. elastic launch wiring and group setup for multi-process CPU/GPU runs.
 - **Losses/optimizers/profiling** (`enn_torch.core`): Student’s t losses, SWA helpers, FLOP/IO timing.
 
 ## Model layout (current)
@@ -107,6 +107,10 @@ pip install -e .[dev]
 ```
 
 > **Note**: Triton >= 3.5.1 is required, but a matching build is normally installed alongside PyTorch—avoid overriding it with a mismatched wheel.
+
+> **Checkpoint formats**:
+> - `.safetensors` checkpoints require the `safetensors` extra: `pip install -e .[safetensors]`
+>   (or `pip install 'enn-torch[safetensors]'` when installed from PyPI).
 
 > **Platform note**: many `deployment_full` backends are OS/driver/python dependent (e.g., CoreML on macOS, TensorRT on Linux/CUDA, ExecuTorch often lacks wheels for Python ≥3.12). If you only need ONNX export, the mandatory `onnx`/`onnxruntime`/`onnxscript`/`onnx_ir` set is sufficient.
 
@@ -187,10 +191,13 @@ with torch.no_grad():
 
 Checkpointing:
 ```python
-from enn_torch import load_model, save_model
+from enn_torch import load_model, load_weights, save_model
 
 save_model(model, "ckpt.pth")
 model2 = load_model("ckpt.pth", map_location="cuda")
+
+# Continuous lifecycle: keep the same model object (BYOM hooks stay attached)
+load_weights(model, "ckpt.pth", map_location="cpu")
 
 # Directory checkpoints (torch.distributed.checkpoint + meta.json)
 from pathlib import Path
