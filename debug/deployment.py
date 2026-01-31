@@ -17,7 +17,7 @@ from typing import Any, Dict, Iterator
 
 import numpy as np
 import torch
-from debug.lifecycle import build_dataset
+from lifecycle import build_dataset
 from tensordict import TensorDict
 
 from enn_torch.core.config import ModelConfig, PatchConfig
