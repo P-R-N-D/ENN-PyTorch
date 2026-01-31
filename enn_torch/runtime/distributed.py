@@ -8,6 +8,7 @@ import importlib
 import importlib.util
 import inspect
 import ipaddress
+import json
 import logging
 import os
 import random
@@ -77,6 +78,44 @@ def _coerce_dcp_keys(state: object) -> object:
         for key in keys_to_drop:
             with contextlib.suppress(Exception):
                 state.pop(key, None)
+    return state
+
+
+def _overlay_avg_state_dict(dst: object, avg: Mapping[str, Any]) -> object:
+    if not isinstance(dst, dict) or not isinstance(avg, Mapping):
+        return dst
+    for k, v in avg.items():
+        if not isinstance(k, str) or not torch.is_tensor(v):
+            continue
+        cur = dst.get(k, None)
+        if not torch.is_tensor(cur):
+            continue
+        try:
+            vv = v.detach()
+            if vv.device != cur.device:
+                vv = vv.to(device=cur.device)
+            if vv.dtype != cur.dtype:
+                vv = vv.to(dtype=cur.dtype)
+            if tuple(vv.shape) != tuple(cur.shape):
+                continue
+            cur.copy_(vv, non_blocking=False)
+        except Exception:
+            continue
+    return dst
+
+
+def _clone_state_dict(state: object, *, to_cpu: bool = False) -> object:
+    if torch.is_tensor(state):
+        t = state.detach()
+        if to_cpu and getattr(t, "device", None) is not None and t.device.type != "cpu":
+            with contextlib.suppress(Exception):
+                return t.to(device="cpu")
+        return t.clone()
+    if isinstance(state, dict):
+        return {k: _clone_state_dict(v, to_cpu=to_cpu) for k, v in state.items()}
+    if isinstance(state, (list, tuple)):
+        cloned = (_clone_state_dict(v, to_cpu=to_cpu) for v in state)
+        return type(state)(cloned)
     return state
 
 
@@ -2118,6 +2157,10 @@ class Checkpointer:
             age = now - float(last)
             if age < max(1, grace):
                 continue
+            if env_bool("ENN_DCP_ORPHAN_FINALIZE", True):
+                with contextlib.suppress(Exception):
+                    if self._try_mark_orphan_complete(p):
+                        continue
             if age < ttl:
                 continue
             if env_bool("ENN_DCP_KEEP_FAILED", False):
@@ -2171,6 +2214,70 @@ class Checkpointer:
 
     def _epoch_failed_file(self, epoch_dir: Path) -> Path:
         return epoch_dir / "failed.json"
+
+    def _epoch_inprogress_file(self, epoch_dir: Path) -> Path:
+        return epoch_dir / "inprogress.json"
+
+    def _dcp_has_distcp_file(self, epoch_dir: Path) -> bool:
+        try:
+            with os.scandir(epoch_dir) as it:
+                for ent in it:
+                    try:
+                        if ent.is_file(follow_symlinks=False) and ent.name.endswith(".distcp"):
+                            return True
+                    except Exception:
+                        continue
+        except Exception:
+            return False
+        return False
+
+    def _pending_has_epoch_dir(self, epoch_dir: Path) -> bool:
+        key = str(epoch_dir)
+        with self._pending_lock:
+            for op in self._pending_dcp:
+                if op.epoch_dir and str(op.epoch_dir) == key:
+                    return True
+        return False
+
+    def _default_dcp_model_kind(self) -> str:
+        return os.environ.get("ENN_DCP_MODEL_KIND", "avg").strip().lower()
+
+    def _try_mark_orphan_complete(self, epoch_dir: Path) -> bool:
+        if not self._is_global_rank0():
+            return False
+        try:
+            if self._epoch_done_file(epoch_dir).is_file() or self._epoch_failed_file(epoch_dir).is_file():
+                return False
+        except Exception:
+            pass
+        if not self._dcp_has_distcp_file(epoch_dir):
+            return False
+        if self._pending_has_epoch_dir(epoch_dir):
+            return False
+        m = re.match(r"epoch_(\d+)", epoch_dir.name)
+        if not m:
+            return False
+        epoch_i = int(m.group(1))
+        has_opt = True
+        model_kind = self._default_dcp_model_kind()
+        try:
+            ip = self._epoch_inprogress_file(epoch_dir)
+            if ip.is_file():
+                with open(ip, "r", encoding="utf-8") as fh:
+                    meta = json.load(fh)
+                if isinstance(meta, dict):
+                    has_opt = bool(meta.get("has_optimizer", True))
+                    mk = meta.get("model_kind", None)
+                    if isinstance(mk, str) and mk.strip():
+                        model_kind = mk.strip().lower()
+        except Exception:
+            pass
+        self._finalize_dcp_epoch(
+            epoch_i,
+            epoch_dir,
+            extra_meta={"has_optimizer": bool(has_opt), "model_kind": str(model_kind)},
+        )
+        return True
 
     def _avg_node_dir(self, node_rank: int | None = None) -> Path:
         nr = self._node_rank if node_rank is None else int(node_rank)
@@ -2423,6 +2530,10 @@ class Checkpointer:
         if not self._is_global_rank0():
             return
         try:
+            with contextlib.suppress(Exception):
+                ip = self._epoch_inprogress_file(epoch_dir)
+                if ip.exists():
+                    ip.unlink()
             done_file = self._epoch_done_file(epoch_dir)
             payload = {
                 "format": "enn-dcp-epoch-v1",
@@ -2545,15 +2656,41 @@ class Checkpointer:
             epoch_dir = self._epoch_dir(epoch_i)
             epoch_dir.mkdir(parents=True, exist_ok=True)
 
-            opts = StateDictOptions(full_state_dict=False)
+            want_kind = self._default_dcp_model_kind()
+            want_avg = want_kind in ("avg", "average", "ema", "swa")
+
+            supports_cpu_offload = True
+            try:
+                opts = StateDictOptions(full_state_dict=False, cpu_offload=True)
+            except TypeError:
+                supports_cpu_offload = False
+                opts = StateDictOptions(full_state_dict=False)
             model_sd, optim_sd = get_state_dict(
                 model, optimizer or [], options=opts
             )
+            if want_avg and avg_state_dict is not None:
+                if not supports_cpu_offload:
+                    model_sd = _clone_state_dict(model_sd, to_cpu=True)
+                _overlay_avg_state_dict(model_sd, avg_state_dict)
             dcp_state: dict[str, Any] = {"model": _coerce_dcp_keys(model_sd)}
             if optimizer is not None:
                 dcp_state["optimizer"] = _coerce_dcp_keys(optim_sd)
             if extra_state is not None:
                 dcp_state["extra"] = _coerce_dcp_keys(extra_state)
+
+            if self._is_global_rank0():
+                with contextlib.suppress(Exception):
+                    write_json(
+                        self._epoch_inprogress_file(epoch_dir),
+                        {
+                            "format": "enn-dcp-inprogress-v1",
+                            "epoch": int(epoch_i),
+                            "created_time": time.time(),
+                            "has_optimizer": bool(optimizer is not None),
+                            "model_kind": ("avg" if want_avg else "active"),
+                        },
+                        indent=2,
+                    )
 
             writer = FileSystemWriter(str(epoch_dir))
             planner: object | None = None
@@ -2635,7 +2772,8 @@ class Checkpointer:
                             epoch_i,
                             epoch_dir,
                             extra_meta={
-                                "has_optimizer": optimizer is not None
+                                "has_optimizer": optimizer is not None,
+                                "model_kind": ("avg" if want_avg else "active"),
                             },
                         )
 
@@ -2655,6 +2793,8 @@ class Checkpointer:
                 )
         except Exception as exc:
             _LOGGER.exception("DCP epoch checkpoint failed: %s", exc)
+            with contextlib.suppress(Exception):
+                self._cleanup_failed_epoch_dir(int(epoch_i), reason=f"{type(exc).__name__}: {exc}")
             if force_sync:
                 raise
 
