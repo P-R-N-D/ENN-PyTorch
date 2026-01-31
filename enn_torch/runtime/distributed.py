@@ -104,17 +104,13 @@ def _overlay_avg_state_dict(dst: object, avg: Mapping[str, Any]) -> object:
     return dst
 
 
-def _clone_state_dict(state: object, *, to_cpu: bool = False) -> object:
+def _clone_state_dict(state: object) -> object:
     if torch.is_tensor(state):
-        t = state.detach()
-        if to_cpu and getattr(t, "device", None) is not None and t.device.type != "cpu":
-            with contextlib.suppress(Exception):
-                return t.to(device="cpu")
-        return t.clone()
+        return state.detach().clone()
     if isinstance(state, dict):
-        return {k: _clone_state_dict(v, to_cpu=to_cpu) for k, v in state.items()}
+        return {k: _clone_state_dict(v) for k, v in state.items()}
     if isinstance(state, (list, tuple)):
-        cloned = (_clone_state_dict(v, to_cpu=to_cpu) for v in state)
+        cloned = (_clone_state_dict(v) for v in state)
         return type(state)(cloned)
     return state
 
@@ -2242,6 +2238,9 @@ class Checkpointer:
     def _default_dcp_model_kind(self) -> str:
         return os.environ.get("ENN_DCP_MODEL_KIND", "avg").strip().lower()
 
+    def _cpu_offload_enabled(self) -> bool:
+        return bool(env_bool("ENN_DCP_CPU_OFFLOAD", False))
+
     def _try_mark_orphan_complete(self, epoch_dir: Path) -> bool:
         if not self._is_global_rank0():
             return False
@@ -2660,19 +2659,34 @@ class Checkpointer:
             want_avg = want_kind in ("avg", "average", "ema", "swa")
 
             supports_cpu_offload = True
+            cpu_offload_req = bool(self._cpu_offload_enabled())
             try:
-                opts = StateDictOptions(full_state_dict=False, cpu_offload=True)
+                opts = StateDictOptions(
+                    full_state_dict=False,
+                    cpu_offload=bool(cpu_offload_req),
+                )
             except TypeError:
                 supports_cpu_offload = False
                 opts = StateDictOptions(full_state_dict=False)
             model_sd, optim_sd = get_state_dict(
                 model, optimizer or [], options=opts
             )
+
+            save_model_sd = model_sd
             if want_avg and avg_state_dict is not None:
-                if not supports_cpu_offload:
-                    model_sd = _clone_state_dict(model_sd, to_cpu=True)
-                _overlay_avg_state_dict(model_sd, avg_state_dict)
-            dcp_state: dict[str, Any] = {"model": _coerce_dcp_keys(model_sd)}
+                if supports_cpu_offload and cpu_offload_req:
+                    _overlay_avg_state_dict(model_sd, avg_state_dict)
+                    save_model_sd = model_sd
+                else:
+                    if int(self._world) <= 1 and (self._dcp_process_group is None):
+                        save_model_sd = dict(avg_state_dict)
+                    else:
+                        save_model_sd = _clone_state_dict(model_sd)
+                        _overlay_avg_state_dict(save_model_sd, avg_state_dict)
+
+            dcp_state: dict[str, Any] = {
+                "model": _coerce_dcp_keys(save_model_sd)
+            }
             if optimizer is not None:
                 dcp_state["optimizer"] = _coerce_dcp_keys(optim_sd)
             if extra_state is not None:
