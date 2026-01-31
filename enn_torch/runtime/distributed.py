@@ -2069,28 +2069,39 @@ class Checkpointer:
         except Exception:
             self._dcp_inprogress_grace_sec = 60
 
-    def _iter_dcp_epoch_dirs(self) -> Iterable[tuple[int, Path]]:
+    def _list_dcp_inprogress(self) -> list[Path]:
+        out: list[Path] = []
         for p in self.dcp_root.glob("epoch_*"):
             if not p.is_dir():
                 continue
-            m = re.match(r"epoch_(\d+)", p.name)
-            if not m:
-                continue
-            yield int(m.group(1)), p
-
-    def _list_dcp_inprogress(self) -> list[tuple[int, Path]]:
-        out: list[tuple[int, Path]] = []
-        for e, p in self._iter_dcp_epoch_dirs():
             try:
                 if self._epoch_done_file(p).is_file():
                     continue
                 if self._epoch_failed_file(p).is_file():
                     continue
-                out.append((e, p))
             except Exception:
-                out.append((e, p))
-        out.sort(key=lambda x: x[0])
+                pass
+            out.append(p)
+        out.sort(key=lambda x: x.name)
         return out
+
+    def _dcp_last_activity_time(self, epoch_dir: Path) -> float | None:
+        try:
+            last = float(epoch_dir.stat().st_mtime)
+        except Exception:
+            last = None
+        try:
+            with os.scandir(epoch_dir) as it:
+                for ent in it:
+                    try:
+                        st = ent.stat(follow_symlinks=False)
+                        mt = float(st.st_mtime)
+                        last = mt if last is None else max(last, mt)
+                    except Exception:
+                        continue
+        except Exception:
+            pass
+        return last
 
     def _cleanup_stale_dcp_inprogress(self) -> None:
         if not self._is_global_rank0():
@@ -2100,37 +2111,46 @@ class Checkpointer:
         if ttl <= 0:
             return
         now = time.time()
-        for e, p in self._list_dcp_inprogress():
-            try:
-                age = now - float(p.stat().st_mtime)
-            except Exception:
+        for p in self._list_dcp_inprogress():
+            last = self._dcp_last_activity_time(p)
+            if last is None:
                 continue
+            age = now - float(last)
             if age < max(1, grace):
                 continue
             if age < ttl:
                 continue
             if env_bool("ENN_DCP_KEEP_FAILED", False):
-                with contextlib.suppress(Exception):
-                    write_json(
-                        p / "failed.json",
-                        {
-                            "format": "enn-dcp-failed-v1",
-                            "epoch": int(e),
-                            "time": now,
-                            "reason": "stale_inprogress",
-                        },
-                        indent=2,
-                    )
+                m = re.match(r"epoch_(\d+)", p.name)
+                if m:
+                    with contextlib.suppress(Exception):
+                        write_json(
+                            p / "failed.json",
+                            {
+                                "format": "enn-dcp-failed-v1",
+                                "epoch": int(m.group(1)),
+                                "time": now,
+                                "reason": "stale_inprogress",
+                            },
+                            indent=2,
+                        )
                 continue
             with contextlib.suppress(Exception):
                 shutil.rmtree(p, ignore_errors=True)
 
     def _wait_for_dcp_inprogress_slot(self) -> None:
+        last_cleanup = 0.0
+        try:
+            self._cleanup_stale_dcp_inprogress()
+        finally:
+            last_cleanup = time.monotonic()
         while True:
             inprog = self._list_dcp_inprogress()
             if len(inprog) < int(self.max_in_flight):
                 return
-            self._cleanup_stale_dcp_inprogress()
+            if time.monotonic() - last_cleanup >= 5.0:
+                self._cleanup_stale_dcp_inprogress()
+                last_cleanup = time.monotonic()
             self._maybe_wait_for_budget()
             time.sleep(0.2)
 
