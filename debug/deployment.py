@@ -17,13 +17,15 @@ from typing import Any, Dict, Iterator
 
 import numpy as np
 import torch
-from lifecycle import build_dataset
 from tensordict import TensorDict
 
 from enn_torch.core.config import ModelConfig, PatchConfig
 from enn_torch.core.tensor import extract_tensor, from_buffer
 from enn_torch.runtime.io import Exporter
 from enn_torch.runtime.workflows import new_model, train
+
+from .lifecycle import build_dataset
+
 _ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 _TL_LOG_RE = re.compile(r"(dedicated_log_torch_trace_[A-Za-z0-9_]+\.log)")
 
