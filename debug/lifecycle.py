@@ -19,6 +19,7 @@ from tensordict import TensorDict
 from enn_torch.core.config import ModelConfig, PatchConfig
 from enn_torch.core.system import get_device
 from enn_torch.runtime.workflows import new_model, predict, train
+
 COL_DIR = "방향"
 COL_ROUTE = "노선"
 COL_SECTION = "구간"
