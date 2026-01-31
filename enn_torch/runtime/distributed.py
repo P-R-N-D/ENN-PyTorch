@@ -1979,7 +1979,7 @@ class Checkpointer:
         dcp_subdir: str = "dcp_epochs",
         avg_subdir: str = "avg",
         avg_ext: str = ".pt",
-        mmap_load: bool | None = True,
+        mmap_load: bool | None = None,
         device: torch.device | None = None,
     ) -> None:
         self._device = device
