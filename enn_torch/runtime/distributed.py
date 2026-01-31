@@ -2056,6 +2056,80 @@ class Checkpointer:
 
         self.dcp_root.mkdir(parents=True, exist_ok=True)
         self.avg_root.mkdir(parents=True, exist_ok=True)
+        try:
+            self._dcp_inprogress_ttl_sec = max(
+                0, int(env_int("ENN_DCP_INPROGRESS_TTL_SEC", 1800) or 1800)
+            )
+        except Exception:
+            self._dcp_inprogress_ttl_sec = 1800
+        try:
+            self._dcp_inprogress_grace_sec = max(
+                0, int(env_int("ENN_DCP_INPROGRESS_GRACE_SEC", 60) or 60)
+            )
+        except Exception:
+            self._dcp_inprogress_grace_sec = 60
+
+    def _iter_dcp_epoch_dirs(self) -> Iterable[tuple[int, Path]]:
+        for p in self.dcp_root.glob("epoch_*"):
+            if not p.is_dir():
+                continue
+            m = re.match(r"epoch_(\d+)", p.name)
+            if not m:
+                continue
+            yield int(m.group(1)), p
+
+    def _list_dcp_inprogress(self) -> list[tuple[int, Path]]:
+        out: list[tuple[int, Path]] = []
+        for e, p in self._iter_dcp_epoch_dirs():
+            try:
+                if not self._epoch_done_file(p).is_file():
+                    out.append((e, p))
+            except Exception:
+                out.append((e, p))
+        out.sort(key=lambda x: x[0])
+        return out
+
+    def _cleanup_stale_dcp_inprogress(self) -> None:
+        if not self._is_global_rank0():
+            return
+        ttl = int(self._dcp_inprogress_ttl_sec)
+        grace = int(self._dcp_inprogress_grace_sec)
+        if ttl <= 0:
+            return
+        now = time.time()
+        for e, p in self._list_dcp_inprogress():
+            try:
+                age = now - float(p.stat().st_mtime)
+            except Exception:
+                continue
+            if age < max(1, grace):
+                continue
+            if age < ttl:
+                continue
+            if env_bool("ENN_DCP_KEEP_FAILED", False):
+                with contextlib.suppress(Exception):
+                    write_json(
+                        p / "failed.json",
+                        {
+                            "format": "enn-dcp-failed-v1",
+                            "epoch": int(e),
+                            "time": now,
+                            "reason": "stale_inprogress",
+                        },
+                        indent=2,
+                    )
+                continue
+            with contextlib.suppress(Exception):
+                shutil.rmtree(p, ignore_errors=True)
+
+    def _wait_for_dcp_inprogress_slot(self) -> None:
+        while True:
+            inprog = self._list_dcp_inprogress()
+            if len(inprog) < int(self.max_in_flight):
+                return
+            self._cleanup_stale_dcp_inprogress()
+            self._maybe_wait_for_budget()
+            time.sleep(0.2)
 
     def _is_distributed(self) -> bool:
         return bool(self._dist is not None and self._dist.is_initialized())
@@ -2425,6 +2499,7 @@ class Checkpointer:
         epoch_i = int(epoch)
 
         self._maybe_wait_for_budget()
+        self._wait_for_dcp_inprogress_slot()
 
         if avg_state_dict is not None and self._is_local_rank0():
             self._schedule_avg_save(epoch_i, avg_state_dict)
