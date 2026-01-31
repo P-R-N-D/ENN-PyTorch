@@ -1612,10 +1612,41 @@ class ProcessBroker:
         cls._configure_torch_xccl_env(device)
 
     @classmethod
+    def _coerce_process_group_backend(
+        cls, backend: object, device: torch.device
+    ) -> object:
+        if env_bool("ENN_DISABLE_PG_CPU_BACKEND", False):
+            return backend
+        b = str(backend) if backend is not None else ""
+        b = b.replace("\\n", "").replace("\n", "").replace("\r", "")
+        b = b.strip().lower()
+        dev = str(getattr(device, "type", "cpu")).strip().lower()
+        if "," in b and ":" in b:
+            return backend
+        if b == "nccl" and dev == "cuda":
+            return "cpu:gloo,cuda:nccl"
+        if b == "xccl" and dev == "xpu":
+            return "cpu:gloo,xpu:xccl"
+        return backend
+
+    @classmethod
     def configure_backend_env(
         cls, backend: object, device: torch.device
     ) -> None:
-        b = str(backend).lower() if backend is not None else ""
+        backend_pg = cls._coerce_process_group_backend(backend, device)
+        b = str(backend_pg) if backend_pg is not None else ""
+        b = b.replace("\\n", "").replace("\n", "").replace("\r", "")
+        b = b.lower()
+        if "," in b and ":" in b:
+            for part in (p.strip() for p in b.split(",") if p.strip()):
+                _dev, _, be = part.partition(":")
+                if be == "nccl":
+                    cls._configure_torch_nccl_env(device)
+                elif be == "xccl":
+                    cls._configure_torch_xccl_env(device)
+                elif be == "gloo":
+                    cls._configure_torch_gloo_env(device)
+            return
         if b == "nccl":
             cls._configure_torch_nccl_env(device)
         elif b == "xccl":
@@ -1646,9 +1677,13 @@ class ProcessBroker:
     ) -> None:
         if torch.distributed.is_initialized():
             return
+        backend_pg = cls._coerce_process_group_backend(backend, device)
         dev_id = None
         dev_type = getattr(device, "type", "cpu")
-        backend_name = str(backend).lower() if backend is not None else ""
+        backend_name = str(backend) if backend is not None else ""
+        backend_name = (
+            backend_name.replace("\\n", "").replace("\n", "").replace("\r", "")
+        ).lower()
         if backend_name in ("nccl", "xccl") and dev_type in ("cuda", "xpu"):
             index = (
                 device.index
@@ -1674,20 +1709,32 @@ class ProcessBroker:
         except Exception:
             timeout = None
 
-        try:
-            kwargs: dict[str, Any] = {"backend": backend}
+        def _init_with(bkend: object) -> None:
+            kwargs: dict[str, Any] = {"backend": bkend}
             if dev_id is not None:
                 kwargs["device_id"] = dev_id
             if timeout is not None:
                 kwargs["timeout"] = timeout
-            torch.distributed.init_process_group(**kwargs)
-        except TypeError:
             try:
-                kwargs.pop("device_id", None)
                 torch.distributed.init_process_group(**kwargs)
+                return
             except TypeError:
-                kwargs.pop("timeout", None)
+                pass
+            kwargs.pop("device_id", None)
+            try:
                 torch.distributed.init_process_group(**kwargs)
+                return
+            except TypeError:
+                pass
+            kwargs.pop("timeout", None)
+            torch.distributed.init_process_group(**kwargs)
+
+        try:
+            _init_with(backend_pg)
+        except Exception:
+            if str(backend_pg) == str(backend):
+                raise
+            _init_with(backend)
 
     @classmethod
     def loader_state_path(cls, directory: PathLike) -> str:
