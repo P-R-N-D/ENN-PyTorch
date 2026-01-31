@@ -1972,14 +1972,14 @@ class Checkpointer:
     def __init__(
         self,
         ckpt_dir: PathLike,
-        *,
-        keep_last: int = 3,
+        *args: Any,
+        keep_last: int = 1,
         max_in_flight: int = 2,
         use_async: bool = True,
         dcp_subdir: str = "dcp_epochs",
         avg_subdir: str = "avg",
         avg_ext: str = ".pt",
-        mmap_load: bool | None = None,
+        mmap_load: bool | None = True,
         device: torch.device | None = None,
     ) -> None:
         self._device = device
