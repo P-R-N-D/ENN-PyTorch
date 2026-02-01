@@ -1994,7 +1994,7 @@ class ProcessBroker:
             return tqdm(
                 total=int(total),
                 desc=f"{title} ({device.type.upper()}) ",
-                unit=f"(Total = {int(total)}, Finished = 0) Checkpoint in Progress",
+                unit=f"(Epochs = {int(total)}, Committed = 0) Checkpoint in Progress",
                 bar_format="{desc}" + "{bar} {percentage:3.2f} % " + "{unit}",
                 colour="green",
                 ascii=True,
