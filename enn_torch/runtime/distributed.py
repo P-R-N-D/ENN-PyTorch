@@ -104,13 +104,16 @@ def _overlay_avg_state_dict(dst: object, avg: Mapping[str, Any]) -> object:
     return dst
 
 
-def _clone_state_dict(state: object) -> object:
+def _clone_state_dict(state: object, *, to_cpu: bool = False) -> object:
     if torch.is_tensor(state):
-        return state.detach().clone()
+        t = state.detach()
+        if to_cpu and getattr(t, "device", None) is not None and t.device.type != "cpu":
+            return t.to(device="cpu")
+        return t.clone()
     if isinstance(state, dict):
-        return {k: _clone_state_dict(v) for k, v in state.items()}
+        return {k: _clone_state_dict(v, to_cpu=to_cpu) for k, v in state.items()}
     if isinstance(state, (list, tuple)):
-        cloned = (_clone_state_dict(v) for v in state)
+        cloned = (_clone_state_dict(v, to_cpu=to_cpu) for v in state)
         return type(state)(cloned)
     return state
 
@@ -2658,36 +2661,54 @@ class Checkpointer:
             want_kind = self._default_dcp_model_kind()
             want_avg = want_kind in ("avg", "average", "ema", "swa")
 
-            supports_cpu_offload = True
-            cpu_offload_req = bool(self._cpu_offload_enabled())
+            save_opt = bool(optimizer is not None) and env_bool(
+                ("ENN_DCP_SAVE_OPTIMIZER", "ENN_CKPT_SAVE_OPTIMIZER"), default=True
+            )
             try:
-                opts = StateDictOptions(
-                    full_state_dict=False,
-                    cpu_offload=bool(cpu_offload_req),
+                optim_every = int(
+                    env_int(
+                        "ENN_DCP_OPTIM_EVERY_EPOCHS",
+                        env_int("ENN_DCP_OPTIM_EVERY", 1) or 1,
+                    )
+                    or 1
                 )
+            except Exception:
+                optim_every = 1
+            optim_every = max(1, int(optim_every))
+            if save_opt and optim_every > 1 and (int(epoch_i) % int(optim_every)) != 0:
+                save_opt = False
+
+            supports_cpu_offload = True
+            try:
+                opts = StateDictOptions(full_state_dict=False, cpu_offload=True)
             except TypeError:
                 supports_cpu_offload = False
                 opts = StateDictOptions(full_state_dict=False)
             model_sd, optim_sd = get_state_dict(
-                model, optimizer or [], options=opts
+                model, (optimizer if save_opt else []), options=opts
             )
 
-            save_model_sd = model_sd
+            save_model_sd: object = model_sd
             if want_avg and avg_state_dict is not None:
-                if supports_cpu_offload and cpu_offload_req:
+                if supports_cpu_offload:
                     _overlay_avg_state_dict(model_sd, avg_state_dict)
                     save_model_sd = model_sd
                 else:
-                    if int(self._world) <= 1 and (self._dcp_process_group is None):
+                    default_direct = bool(int(self._world) <= 1 and self._dcp_process_group is None)
+                    direct_avg = env_bool("ENN_DCP_AVG_DIRECT", default=default_direct)
+                    if direct_avg:
                         save_model_sd = dict(avg_state_dict)
                     else:
-                        save_model_sd = _clone_state_dict(model_sd)
+                        dev_t = str(getattr(getattr(self, "_device", None), "type", "cpu") or "cpu")
+                        default_to_cpu = dev_t in ("cuda", "xpu", "mps")
+                        to_cpu = env_bool("ENN_DCP_CLONE_TO_CPU", default=default_to_cpu)
+                        save_model_sd = _clone_state_dict(model_sd, to_cpu=bool(to_cpu))
                         _overlay_avg_state_dict(save_model_sd, avg_state_dict)
 
             dcp_state: dict[str, Any] = {
                 "model": _coerce_dcp_keys(save_model_sd)
             }
-            if optimizer is not None:
+            if save_opt:
                 dcp_state["optimizer"] = _coerce_dcp_keys(optim_sd)
             if extra_state is not None:
                 dcp_state["extra"] = _coerce_dcp_keys(extra_state)
@@ -2700,7 +2721,7 @@ class Checkpointer:
                             "format": "enn-dcp-inprogress-v1",
                             "epoch": int(epoch_i),
                             "created_time": time.time(),
-                            "has_optimizer": bool(optimizer is not None),
+                            "has_optimizer": bool(save_opt),
                             "model_kind": ("avg" if want_avg else "active"),
                         },
                         indent=2,
@@ -2786,7 +2807,7 @@ class Checkpointer:
                             epoch_i,
                             epoch_dir,
                             extra_meta={
-                                "has_optimizer": optimizer is not None,
+                                "has_optimizer": bool(save_opt),
                                 "model_kind": ("avg" if want_avg else "active"),
                             },
                         )
@@ -2797,13 +2818,13 @@ class Checkpointer:
                     epoch_i,
                     dcp_future,
                     epoch_dir=str(epoch_dir),
-                    has_optimizer=bool(optimizer is not None),
+                    has_optimizer=bool(save_opt),
                 )
             else:
                 self._finalize_dcp_epoch(
                     epoch_i,
                     epoch_dir,
-                    extra_meta={"has_optimizer": optimizer is not None},
+                    extra_meta={"has_optimizer": bool(save_opt), "model_kind": ("avg" if want_avg else "active")},
                 )
         except Exception as exc:
             _LOGGER.exception("DCP epoch checkpoint failed: %s", exc)
