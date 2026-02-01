@@ -216,6 +216,7 @@ def _install_flex_uncompiled_warning_suppression() -> None:
             line: str | None = None,
         ) -> None:
             nonlocal orig
+            global _FLEX_UNCOMPILED_SUPPRESS_REPORTED
             try:
                 msg = str(message)
             except Exception:
