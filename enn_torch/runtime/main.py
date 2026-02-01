@@ -1864,11 +1864,12 @@ def epochs(
                         )
 
             if checkpointer is not None:
+                checkpointer.poll()
                 ProcessBroker.update_checkpoint_bar(
                     checkpoint_bar,
                     finish=False,
                     total=int(ops.epochs),
-                    position=int(epoch_idx),
+                    position=int(epoch_idx + 1),
                 )
                 checkpointer.request_save_epoch(
                     epoch=int(epoch_idx + 1),
@@ -1879,12 +1880,7 @@ def epochs(
                         "epoch": int(epoch_idx + 1),
                         "avg": avg_tag,
                     },
-                )
-                ProcessBroker.update_checkpoint_bar(
-                    checkpoint_bar,
-                    finish=True,
-                    total=int(ops.epochs),
-                    position=int(epoch_idx),
+                    block_if_busy=False,
                 )
                 with contextlib.suppress(Exception):
                     del avg_sd
@@ -3324,15 +3320,6 @@ def process(*args: Any, **kwargs: Any) -> object:
                         )
                     ),
                 )
-                max_in_flight = max(
-                    1,
-                    int(
-                        env_first_int(
-                            ("ENN_DCP_MAX_INFLIGHT", "ENN_CKPT_MAX_INFLIGHT"),
-                            default=1,
-                        )
-                    ),
-                )
                 use_async = bool(
                     env_bool(("ENN_DCP_ASYNC", "ENN_CKPT_ASYNC"), default=True)
                 )
@@ -3344,7 +3331,6 @@ def process(*args: Any, **kwargs: Any) -> object:
                 checkpointer = Checkpointer(
                     ops.ckpt_dir,
                     keep_last=keep_last,
-                    max_in_flight=max_in_flight,
                     use_async=use_async,
                     mmap_load=mmap_load,
                     device=device,
@@ -3384,7 +3370,7 @@ def process(*args: Any, **kwargs: Any) -> object:
                 session.close()
         with contextlib.suppress(Exception):
             if checkpointer is not None:
-                checkpointer.close()
+                checkpointer.close(abort_inflight=True)
         with contextlib.suppress(Exception):
             if swa_helper is not None and hasattr(swa_helper, "close"):
                 swa_helper.close()
