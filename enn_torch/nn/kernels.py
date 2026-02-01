@@ -248,7 +248,7 @@ def _compile_flex_attention_wrapper(
                     with warnings.catch_warnings():
                         warnings.filterwarnings(
                             "ignore",
-                            message=r"flex_attention called without torch\.compile",
+                            message=r"(?s).*flex_attention called without torch\.compile.*",
                             category=UserWarning,
                         )
                         base = _model_compile(
@@ -332,7 +332,7 @@ def _call_torch_flex_attention_eager(
         with warnings.catch_warnings():
             warnings.filterwarnings(
                 "ignore",
-                message=r"flex_attention called without torch\.compile",
+                message=r"(?s).*flex_attention called without torch\.compile.*",
                 category=UserWarning,
             )
             return _torch_flex_attention(q, k, v, **flex_kwargs)
@@ -359,6 +359,14 @@ def _get_compiled_flex_attention_for_kwargs(
     cached = _FLEX_ATTN_SPECIALIZED.get(key)
     if cached is not None:
         return cached, key
+    failed = _FLEX_ATTN_FAILED.get(key)
+    if failed is not None:
+        if _flex_retry_failed_enabled() and _flex_env_overrides_present():
+            with _FLEX_ATTN_SPECIALIZE_LOCK:
+                if _FLEX_ATTN_FAILED.get(key) is not None:
+                    _FLEX_ATTN_FAILED.pop(key, None)
+        else:
+            return _torch_flex_attention, key
     failed = _FLEX_ATTN_FAILED.get(key)
     if failed is not None:
         return _torch_flex_attention, key
@@ -435,6 +443,14 @@ def _flex_env_overrides_present() -> bool:
         "ENN_FLEX_BWD_WRITE_DQ",
     )
     return any(k in os.environ for k in keys)
+
+
+def _flex_retry_failed_enabled() -> bool:
+    try:
+        dbg = bool(env_bool("ENN_FLEX_DEBUG_KOPTS", False))
+    except Exception:
+        dbg = False
+    return bool(env_bool("ENN_FLEX_RETRY_FAILED", default=dbg))
 
 
 def _looks_like_triton_resource_error(exc: BaseException) -> bool:
@@ -1969,6 +1985,43 @@ class FlexAttention(nn.Module):
 
             try:
                 if flex_fn is _torch_flex_attention:
+                    if (
+                        _flex_retry_failed_enabled()
+                        and _flex_env_overrides_present()
+                        and torch_compiler_supported()
+                        and (not is_dynamo_compiling())
+                        and _torch_flex_attention is not None
+                    ):
+                        try:
+                            mode0 = _flex_attention_compile_mode()
+                            mode_tries = (mode0,) + _flex_attention_fallback_modes(mode0)
+                            for m in mode_tries:
+                                dyn_m = _flex_attention_dynamic_flag(m)
+                                cand = _compile_flex_attention_wrapper(
+                                    mode=str(m),
+                                    dynamic=dyn_m,
+                                    flex_kwargs=flex_kwargs,
+                                )
+                                if cand is _torch_flex_attention:
+                                    continue
+
+                                def _invoke() -> Any:
+                                    if not is_dynamo_compiling():
+                                        with skip_non_infra_dispatch_mode():
+                                            return cand(q, k, v)
+                                    return cand(q, k, v)
+
+                                out, saw_uncompiled = _call_with_flex_warn_guard(
+                                    _invoke
+                                )
+                                if saw_uncompiled:
+                                    continue
+                                with _FLEX_ATTN_SPECIALIZE_LOCK:
+                                    _FLEX_ATTN_SPECIALIZED[flex_key] = cand
+                                    _FLEX_ATTN_FAILED.pop(flex_key, None)
+                                return out
+                        except Exception:
+                            pass
                     return _call_torch_flex_attention_eager(
                         q, k, v, flex_kwargs=flex_kwargs
                     )
