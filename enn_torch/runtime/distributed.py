@@ -2251,7 +2251,44 @@ class Checkpointer:
         if ttl <= 0:
             return
         now = time.time()
+        inflight_epoch: int | None = None
+        inflight_guard = False
+        try:
+            lf = self._inflight_lock
+            if lf is not None and lf.exists():
+                inflight_guard = True
+                with open(lf, "r", encoding="utf-8") as fh:
+                    meta = json.load(fh)
+                if isinstance(meta, dict) and meta.get("epoch") is not None:
+                    inflight_epoch = int(meta.get("epoch"))
+        except Exception:
+            inflight_guard = True
+            inflight_epoch = None
         for p in self._list_dcp_inprogress():
+            epoch_i: int | None = None
+            m = re.match(r"epoch_(\d+)", p.name)
+            if m:
+                with contextlib.suppress(Exception):
+                    epoch_i = int(m.group(1))
+            if inflight_guard and (
+                inflight_epoch is None
+                or (epoch_i is not None and int(epoch_i) == int(inflight_epoch))
+            ):
+                with contextlib.suppress(Exception):
+                    ip = self._epoch_inprogress_file(p)
+                    if ip.is_file():
+                        os.utime(ip, None)
+                    else:
+                        os.utime(p, None)
+                continue
+            if self._pending_has_epoch_dir(p):
+                with contextlib.suppress(Exception):
+                    ip = self._epoch_inprogress_file(p)
+                    if ip.is_file():
+                        os.utime(ip, None)
+                    else:
+                        os.utime(p, None)
+                continue
             last = self._dcp_last_activity_time(p)
             if last is None:
                 continue
@@ -3037,8 +3074,24 @@ class Checkpointer:
         epoch_i = int(epoch)
 
         self._maybe_wait_for_budget(block=False)
-        with contextlib.suppress(Exception):
-            self._cleanup_stale_dcp_inprogress()
+        do_cleanup = False
+        try:
+            do_cleanup = bool(self._is_global_rank0())
+            if do_cleanup:
+                busy = False
+                with self._pending_lock:
+                    busy = bool(self._pending_dcp)
+                if self._is_dcp_leader():
+                    with contextlib.suppress(Exception):
+                        if self._inflight_lock.exists():
+                            busy = True
+                if busy:
+                    do_cleanup = False
+        except Exception:
+            do_cleanup = False
+        if do_cleanup:
+            with contextlib.suppress(Exception):
+                self._cleanup_stale_dcp_inprogress()
 
         accept = True
         if self._is_dcp_leader():
