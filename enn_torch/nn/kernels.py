@@ -472,30 +472,37 @@ def _clamp_max(opts: dict[str, Any], key: str, cap: int) -> None:
     opts[key] = min(_pos_int(cur, cap_i), cap_i)
 
 
-def _resource_safe_kernel_options(existing: Any) -> Optional[dict[str, Any]]:
+def _resource_safe_kernel_options(existing: Any) -> dict[str, Any]:
     if (existing is not None) and (not isinstance(existing, Mapping)):
-        return None
-    bm = _env_int("ENN_FLEX_BLOCK_M", 64)
-    bn = _env_int("ENN_FLEX_BLOCK_N", 64)
+        existing = None
+    sm = _cuda_sm_for_flex_defaults()
+    fwd_block_def = 32 if (sm is not None and sm <= 75) else 64
+    fwd_warps_def = 2 if (sm is not None and sm <= 75) else 4
+    bwd_block_def = 16 if (sm is not None and sm <= 75) else 32
+    bwd_warps_def = 2 if (sm is not None and sm <= 75) else 4
+
+    bm = _env_int("ENN_FLEX_BLOCK_M", fwd_block_def)
+    bn = _env_int("ENN_FLEX_BLOCK_N", fwd_block_def)
     ns = _env_int("ENN_FLEX_NUM_STAGES", 1)
-    nw = _env_int("ENN_FLEX_NUM_WARPS", 4)
+    nw = _env_int("ENN_FLEX_NUM_WARPS", fwd_warps_def)
     bns = _env_int("ENN_FLEX_BWD_NUM_STAGES", 1)
-    bnw = _env_int("ENN_FLEX_BWD_NUM_WARPS", 4)
-    bm1 = _env_int("ENN_FLEX_BWD_BLOCK_M1", 32)
-    bn1 = _env_int("ENN_FLEX_BWD_BLOCK_N1", 32)
+    bnw = _env_int("ENN_FLEX_BWD_NUM_WARPS", bwd_warps_def)
+    bm1 = _env_int("ENN_FLEX_BWD_BLOCK_M1", bwd_block_def)
+    bn1 = _env_int("ENN_FLEX_BWD_BLOCK_N1", bwd_block_def)
     bwd_wdq = 1 if env_bool("ENN_FLEX_BWD_WRITE_DQ", False) else 0
     key = (
         "flex-kopts",
         int(id(existing)) if existing is not None else 0,
-        bm,
-        bn,
-        ns,
-        nw,
-        bns,
-        bnw,
-        bm1,
-        bn1,
-        bwd_wdq,
+        int(sm) if sm is not None else -1,
+        int(bm),
+        int(bn),
+        int(ns),
+        int(nw),
+        int(bns),
+        int(bnw),
+        int(bm1),
+        int(bn1),
+        int(bwd_wdq),
     )
     cached = _FLEX_ATTN_RESOURCE_KOPTS.get(key)
     if cached is not None:
@@ -504,16 +511,18 @@ def _resource_safe_kernel_options(existing: Any) -> Optional[dict[str, Any]]:
     if isinstance(existing, Mapping):
         for k, v in existing.items():
             base[str(k)] = v
-    base.setdefault("BLOCK_M", int(bm))
-    base.setdefault("BLOCK_N", int(bn))
-    base.setdefault("num_stages", int(ns))
-    base.setdefault("num_warps", int(nw))
-    base.setdefault("bwd_num_stages", int(bns))
-    base.setdefault("bwd_num_warps", int(bnw))
-    base.setdefault("bwd_BLOCK_M1", int(bm1))
-    base.setdefault("bwd_BLOCK_N1", int(bn1))
+
+    _clamp_max(base, "BLOCK_M", int(bm))
+    _clamp_max(base, "BLOCK_N", int(bn))
+    _clamp_max(base, "num_stages", int(ns))
+    _clamp_max(base, "num_warps", int(nw))
+
+    _clamp_max(base, "bwd_num_stages", int(bns))
+    _clamp_max(base, "bwd_num_warps", int(bnw))
+    _clamp_max(base, "bwd_BLOCK_M1", int(bm1))
+    _clamp_max(base, "bwd_BLOCK_N1", int(bn1))
     if "WRITE_DQ" not in base and "bwd_WRITE_DQ" not in base:
-        base["bwd_WRITE_DQ"] = bool(env_bool("ENN_FLEX_BWD_WRITE_DQ", False))
+        base["bwd_WRITE_DQ"] = bool(bwd_wdq)
     with _FLEX_ATTN_RESOURCE_KOPTS_LOCK:
         cached = _FLEX_ATTN_RESOURCE_KOPTS.get(key)
         if cached is None:
@@ -1914,9 +1923,7 @@ class FlexAttention(nn.Module):
                 and kernel_options is None
                 and _flex_env_overrides_present()
             ):
-                ko = _resource_safe_kernel_options(None)
-                if ko is not None:
-                    flex_kwargs["kernel_options"] = ko
+                flex_kwargs["kernel_options"] = _resource_safe_kernel_options(None)
             flex_fn, flex_key = _get_compiled_flex_attention_for_kwargs(
                 q, flex_kwargs
             )
