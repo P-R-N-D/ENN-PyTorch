@@ -1826,8 +1826,8 @@ def epochs(
                     sched.step()
                 except Exception:
                     pass
-            avg_sd = None
             avg_tag = None
+            avg_factory = None
             if float(train_samples_epoch or 0.0) > 0.0 and local_rank == 0:
                 avg_target = (
                     model.module
@@ -1837,31 +1837,39 @@ def epochs(
                     else model
                 )
                 if swa_helper is not None and epoch_idx >= swa_start_epoch:
-                    _LOGGER.info(
-                        "[swa] epoch %d: update+snapshot (CPU shadow)",
-                        epoch_idx + 1,
-                    )
-                    swa_helper.update(avg_target)
                     avg_tag = "swa"
                     with contextlib.suppress(Exception):
-                        avg_sd = swa_helper.checkpoint_state_dict(
+                        swa_helper.update(avg_target)
+
+                    def _make_avg_sd():
+                        _LOGGER.info(
+                            "[swa] epoch %d: snapshot (CPU shadow)",
+                            epoch_idx + 1,
+                        )
+                        return swa_helper.checkpoint_state_dict(
                             avg_target,
                             include_buffers=True,
                             max_buffer_mb=25,
                         )
+
+                    avg_factory = _make_avg_sd
                 elif ema_helper is not None and getattr(
                     ema_helper, "shadow", None
                 ):
-                    _LOGGER.info(
-                        "[ema] epoch %d: snapshot (CPU shadow)", epoch_idx + 1
-                    )
                     avg_tag = "ema"
-                    with contextlib.suppress(Exception):
-                        avg_sd = ema_helper.checkpoint_state_dict(
+
+                    def _make_avg_sd():
+                        _LOGGER.info(
+                            "[ema] epoch %d: snapshot (CPU shadow)",
+                            epoch_idx + 1,
+                        )
+                        return ema_helper.checkpoint_state_dict(
                             avg_target,
                             include_buffers=True,
                             max_buffer_mb=25,
                         )
+
+                    avg_factory = _make_avg_sd
 
             if checkpointer is not None:
                 checkpointer.poll()
@@ -1875,18 +1883,13 @@ def epochs(
                     epoch=int(epoch_idx + 1),
                     model=model,
                     optimizer=optimizer,
-                    avg_state_dict=avg_sd,
+                    avg_state_dict_factory=avg_factory,
                     extra_state={
                         "epoch": int(epoch_idx + 1),
                         "avg": avg_tag,
                     },
                     block_if_busy=False,
                 )
-                with contextlib.suppress(Exception):
-                    del avg_sd
-                    import gc
-
-                    gc.collect()
             if is_distributed():
                 distributed_barrier(device)
             prev_comp_time += float(comp_time)
@@ -3334,6 +3337,7 @@ def process(*args: Any, **kwargs: Any) -> object:
                     use_async=use_async,
                     mmap_load=mmap_load,
                     device=device,
+                    cpu_offload=bool(getattr(ops, "ckpt_cpu_offload", False)),
                 )
             try:
                 new_affinity().pin_thread()

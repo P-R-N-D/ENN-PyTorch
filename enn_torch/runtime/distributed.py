@@ -3,7 +3,9 @@ from __future__ import annotations
 
 import concurrent.futures
 import contextlib
+import ctypes
 import dataclasses
+import gc
 import importlib
 import importlib.util
 import inspect
@@ -2057,6 +2059,7 @@ class Checkpointer:
         avg_subdir: str = "avg",
         avg_ext: str = ".pt",
         mmap_load: bool | None = None,
+        cpu_offload: bool | None = None,
         device: torch.device | None = None,
     ) -> None:
         self._device = device
@@ -2070,6 +2073,7 @@ class Checkpointer:
         self.max_in_flight = 1
         self.use_async = bool(use_async)
         self.mmap_load = mmap_load
+        self._cpu_offload = bool(cpu_offload) if cpu_offload is not None else False
 
         self._pending_dcp: deque[_PendingOp] = deque()
         self._pending_avg: deque[_PendingOp] = deque()
@@ -2374,7 +2378,7 @@ class Checkpointer:
         return os.environ.get("ENN_DCP_MODEL_KIND", "avg").strip().lower()
 
     def _cpu_offload_enabled(self) -> bool:
-        return bool(env_bool("ENN_DCP_CPU_OFFLOAD", False))
+        return bool(getattr(self, "_cpu_offload", False))
 
     def _try_mark_orphan_complete(self, epoch_dir: Path) -> bool:
         if not self._is_global_rank0():
@@ -2450,7 +2454,7 @@ class Checkpointer:
                 )
                 opts = StagingOptions(
                     use_pinned_memory=use_pinned_memory,
-                    use_shared_memory=True,
+                    use_shared_memory=False,
                     use_async_staging=True,
                     use_non_blocking_copy=True,
                 )
@@ -2460,6 +2464,36 @@ class Checkpointer:
                 self._stager = None
                 self._stager_owner_thread = None
             return self._stager
+
+    def _close_stager(self) -> None:
+        with self._stager_lock:
+            if self._stager is None:
+                return
+            with contextlib.suppress(Exception):
+                close = getattr(self._stager, "close", None)
+                if callable(close):
+                    close()
+            self._stager = None
+            self._stager_owner_thread = None
+
+    def _post_dcp_cleanup(self) -> None:
+        spec = importlib.util.find_spec(
+            "torch.distributed.checkpoint.state_dict_saver"
+        )
+        if spec is not None:
+            sds = importlib.import_module(
+                "torch.distributed.checkpoint.state_dict_saver"
+            )
+            close_fn = getattr(sds, "close", None)
+            if callable(close_fn):
+                close_fn()
+        self._close_stager()
+        gc.collect()
+        with contextlib.suppress(Exception):
+            libc = ctypes.CDLL("libc.so.6")
+            trim = getattr(libc, "malloc_trim", None)
+            if callable(trim):
+                trim(0)
 
     def _maybe_finalize_dcp_op(self, op: _PendingOp) -> None:
         if op.kind != "dcp" or not op.epoch_dir:
@@ -2527,6 +2561,7 @@ class Checkpointer:
                     with contextlib.suppress(Exception):
                         op.future = None
                     done_ops.append((op, ok, err))
+                    self._post_dcp_cleanup()
                 else:
                     break
             while self._pending_avg and _future_done(
@@ -2566,6 +2601,7 @@ class Checkpointer:
                         with contextlib.suppress(Exception):
                             op.future = None
                         done_ops.append((op, ok, err))
+                        self._post_dcp_cleanup()
 
             while len(self._pending_avg) >= 1:
                 op = self._pending_avg[0]
@@ -2765,6 +2801,7 @@ class Checkpointer:
         model: nn.Module,
         optimizer: Optimizer | None = None,
         avg_state_dict: Mapping[str, Any] | None = None,
+        avg_state_dict_factory: Callable[[], Mapping[str, Any] | None] | None = None,
         extra_state: dict[str, Any] | None = None,
         save_optimizer: bool | None = None,
         save_avg: bool | None = None,
@@ -2776,9 +2813,6 @@ class Checkpointer:
         self._maybe_wait_for_budget(block=False)
         with contextlib.suppress(Exception):
             self._cleanup_stale_dcp_inprogress()
-
-        if avg_state_dict is not None and self._is_local_rank0():
-            self._schedule_avg_save(epoch_i, avg_state_dict)
 
         accept = True
         if self._is_dcp_leader():
@@ -2820,6 +2854,25 @@ class Checkpointer:
             else:
                 return
 
+        if (
+            avg_state_dict is None
+            and avg_state_dict_factory is not None
+            and self._is_local_rank0()
+        ):
+            try:
+                avg_state_dict = avg_state_dict_factory()
+            except Exception as exc:
+                if self._is_global_rank0():
+                    _LOGGER.exception(
+                        "Average snapshot build failed (epoch=%d): %s",
+                        int(epoch_i),
+                        exc,
+                    )
+                avg_state_dict = None
+
+        if avg_state_dict is not None and self._is_local_rank0():
+            self._schedule_avg_save(epoch_i, avg_state_dict)
+
         dcp_future: object | None = None
         try:
             import torch.distributed.checkpoint as dcp
@@ -2852,9 +2905,12 @@ class Checkpointer:
             if save_opt and optim_every > 1 and (int(epoch_i) % int(optim_every)) != 0:
                 save_opt = False
 
+            cpu_offload = bool(self._cpu_offload_enabled())
             supports_cpu_offload = True
             try:
-                opts = StateDictOptions(full_state_dict=False, cpu_offload=True)
+                opts = StateDictOptions(
+                    full_state_dict=False, cpu_offload=bool(cpu_offload)
+                )
             except TypeError:
                 supports_cpu_offload = False
                 opts = StateDictOptions(full_state_dict=False)
@@ -2977,12 +3033,6 @@ class Checkpointer:
                                 exc,
                             )
 
-                        with contextlib.suppress(Exception):
-                            import torch.distributed.checkpoint.state_dict_saver as sds
-                            close_fn = getattr(sds, "close", None)
-                            if callable(close_fn):
-                                close_fn()
-
                         try:
                             if ok:
                                 self._finalize_dcp_epoch(
@@ -3000,6 +3050,7 @@ class Checkpointer:
                                 )
                         finally:
                             self._release_inflight_lock()
+                            self._post_dcp_cleanup()
 
                     _add_future_callback(dcp_future, _finalize_cb)
                 self._register_pending(
@@ -3010,11 +3061,6 @@ class Checkpointer:
                     has_optimizer=bool(save_opt),
                 )
             else:
-                with contextlib.suppress(Exception):
-                    import torch.distributed.checkpoint.state_dict_saver as sds
-                    close_fn = getattr(sds, "close", None)
-                    if callable(close_fn):
-                        close_fn()
                 try:
                     self._finalize_dcp_epoch(
                         epoch_i,
@@ -3028,12 +3074,14 @@ class Checkpointer:
                         _cleanup_delete_pending(self.dcp_root)
                 finally:
                     self._release_inflight_lock()
+                    self._post_dcp_cleanup()
         except Exception as exc:
             _LOGGER.exception("DCP epoch checkpoint failed: %s", exc)
             with contextlib.suppress(Exception):
                 self._cleanup_failed_epoch_dir(int(epoch_i), reason=f"{type(exc).__name__}: {exc}")
             with contextlib.suppress(Exception):
                 self._release_inflight_lock()
+            self._post_dcp_cleanup()
             if force_sync:
                 raise
 
@@ -3066,6 +3114,7 @@ class Checkpointer:
                     )
                 else:
                     self._cleanup_failed_epoch_dir(int(op.epoch), reason=err)
+                self._post_dcp_cleanup()
         with self._pending_lock:
             self._pending_dcp.clear()
             self._pending_avg.clear()

@@ -786,6 +786,7 @@ class RuntimeConfig:
         None
     )
     ckpt_dir: Optional[str] = None
+    ckpt_cpu_offload: bool = False
     init_ckpt_dir: Optional[str] = None
     epochs: int = 5
     val_frac: float = 0.1
@@ -812,6 +813,7 @@ class RuntimeConfig:
         {
             "sources",
             "ckpt_dir",
+            "ckpt_cpu_offload",
             "init_ckpt_dir",
             "epochs",
             "val_frac",
@@ -881,6 +883,8 @@ class RuntimeConfig:
             if name in data:
                 raise TypeError(f"Dup arg {name}")
             data[name] = val
+        if "dcp_cpu_offload" in data and "ckpt_cpu_offload" not in data:
+            data["ckpt_cpu_offload"] = data.pop("dcp_cpu_offload")
         if "weights" in data:
             data.setdefault("train_weights", data.pop("weights"))
         for k in ("in_dim", "out_shape", "cfg_dict"):
@@ -943,6 +947,9 @@ class RuntimeConfig:
                     str(data.get("init_ckpt_dir"))
                     if data.get("init_ckpt_dir")
                     else None
+                ),
+                ckpt_cpu_offload=_coerce_bool(
+                    data.get("ckpt_cpu_offload", False), name="ckpt_cpu_offload"
                 ),
                 epochs=_get_val("epochs", int, 1, def_=5),
                 val_frac=_get_val("val_frac", float, 0.0, 1.0, 0.1),
