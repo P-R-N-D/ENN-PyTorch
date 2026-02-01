@@ -31,6 +31,7 @@ from ..core.concurrency import Mutex
 from ..core.datatypes import PathLike, env_bool, env_int, save_temp, write_json
 from ..core.system import (
     CPU,
+    Memory,
     get_device,
     get_num_accelerators,
     init_python_path,
@@ -2378,15 +2379,39 @@ class Checkpointer:
         return os.environ.get("ENN_DCP_MODEL_KIND", "avg").strip().lower()
 
     def _cpu_offload_enabled(self) -> bool:
-        cpu_offload = getattr(self, "_cpu_offload", None)
-        if cpu_offload is None:
+        v = getattr(self, "_cpu_offload", None)
+        if isinstance(v, bool):
+            return bool(v)
+        if ("ENN_DCP_CPU_OFFLOAD" in os.environ) or (
+            "ENN_CKPT_CPU_OFFLOAD" in os.environ
+        ):
             return bool(
                 env_bool(
                     ("ENN_DCP_CPU_OFFLOAD", "ENN_CKPT_CPU_OFFLOAD"),
                     default=True,
                 )
             )
-        return bool(cpu_offload)
+        try:
+            if self._is_distributed() and int(getattr(self, "_world", 1) or 1) > 1:
+                return True
+        except Exception:
+            pass
+        try:
+            dev = self._device or get_device()
+            if getattr(dev, "type", None) == "cuda":
+                max_gb = int(env_int("ENN_DCP_CPU_OFFLOAD_AUTO_MAX_GB", 24) or 24)
+                max_gb = max(4, max_gb)
+                total = None
+                with contextlib.suppress(Exception):
+                    total = Memory.total()
+                if isinstance(total, int) and total > 0:
+                    if (float(total) / (1024.0**3)) <= float(max_gb):
+                        return False
+                    return True
+                return False
+        except Exception:
+            return False
+        return True
 
     def _try_mark_orphan_complete(self, epoch_dir: Path) -> bool:
         if not self._is_global_rank0():
@@ -2485,23 +2510,40 @@ class Checkpointer:
             self._stager_owner_thread = None
 
     def _post_dcp_cleanup(self) -> None:
-        spec = importlib.util.find_spec(
-            "torch.distributed.checkpoint.state_dict_saver"
-        )
-        if spec is not None:
-            sds = importlib.import_module(
-                "torch.distributed.checkpoint.state_dict_saver"
-            )
+        with contextlib.suppress(Exception):
+            import torch.distributed.checkpoint.state_dict_saver as sds
+
             close_fn = getattr(sds, "close", None)
             if callable(close_fn):
                 close_fn()
         self._close_stager()
-        gc.collect()
         with contextlib.suppress(Exception):
-            libc = ctypes.CDLL("libc.so.6")
-            trim = getattr(libc, "malloc_trim", None)
-            if callable(trim):
-                trim(0)
+            gc.collect()
+        try:
+            dev = self._device or get_device()
+            low_ram_default = False
+            if getattr(dev, "type", None) == "cuda":
+                total = None
+                with contextlib.suppress(Exception):
+                    total = Memory.total()
+                if isinstance(total, int) and total > 0:
+                    max_gb = int(
+                        env_int("ENN_DCP_CPU_OFFLOAD_AUTO_MAX_GB", 24) or 24
+                    )
+                    max_gb = max(4, max_gb)
+                    low_ram_default = (
+                        (float(total) / (1024.0**3)) <= float(max_gb)
+                    )
+            do_trim = bool(
+                env_bool("ENN_DCP_MALLOC_TRIM", default=low_ram_default)
+            )
+            if do_trim:
+                libc = ctypes.CDLL("libc.so.6")
+                trim = getattr(libc, "malloc_trim", None)
+                if callable(trim):
+                    trim(0)
+        except Exception:
+            pass
 
     def _maybe_finalize_dcp_op(self, op: _PendingOp) -> None:
         if op.kind != "dcp" or not op.epoch_dir:
@@ -2928,7 +2970,7 @@ class Checkpointer:
 
             save_model_sd: object = model_sd
             if want_avg and avg_state_dict is not None:
-                if supports_cpu_offload:
+                if supports_cpu_offload and cpu_offload:
                     _overlay_avg_state_dict(model_sd, avg_state_dict)
                     save_model_sd = model_sd
                 else:
