@@ -2778,9 +2778,6 @@ class Checkpointer:
         if avg_state_dict is not None and self._is_local_rank0():
             self._schedule_avg_save(epoch_i, avg_state_dict)
 
-        if not self._dcp_should_participate:
-            return
-
         accept = True
         if self._is_dcp_leader():
             with self._pending_lock:
@@ -2793,6 +2790,9 @@ class Checkpointer:
                 accept = self._try_acquire_inflight_lock(epoch_i)
 
         accept = self._bcast_bool_from_leader(bool(accept))
+
+        if not self._dcp_should_participate:
+            return
         if not accept:
             if block_if_busy:
                 while True:
