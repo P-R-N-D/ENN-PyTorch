@@ -2805,11 +2805,13 @@ class Checkpointer:
     ) -> None:
         ok = True
         err: str | None = None
+        pending_exc: Exception | None = None
         try:
             _future_result(dcp_future)
         except Exception as exc:
             ok = False
             err = f"{type(exc).__name__}: {exc}"
+            pending_exc = exc
             if self._is_global_rank0():
                 _LOGGER.exception(
                     "DCP async_save failed (epoch=%d): %s", int(epoch), exc
@@ -2832,6 +2834,8 @@ class Checkpointer:
             with contextlib.suppress(Exception):
                 self._release_inflight_lock()
             self._post_dcp_cleanup()
+        if pending_exc is not None:
+            raise pending_exc
 
     def _save_dcp_epoch_background(
         self,
