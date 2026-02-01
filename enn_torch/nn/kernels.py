@@ -63,6 +63,7 @@ except Exception:
     tl = _TLStub()
 
 try:
+    _FLEX_KWARGS: set[str] = set()
     from torch.nn.attention.flex_attention import (
         create_mask as _torch_create_mask,
     )
@@ -79,6 +80,7 @@ except Exception:
     _torch_create_mask = None
     _torch_flex_attention = None
     _HAS_TORCH_FLEX = False
+    _FLEX_KWARGS = set()
     pass
 
 _HAS_TE = False
@@ -103,7 +105,6 @@ _FLEX_ATTN_BASE_COMPILE_LOCK = threading.Lock()
 _FLEX_ATTN_VERIFIED: set[tuple[Any, ...]] = set()
 _FLEX_ATTN_VERIFIED_LOCK = threading.Lock()
 _FLEX_ATTN_UNCOMPILED_NEEDLE = "flex_attention called without torch.compile"
-_FLEX_KWARGS: set[str] = set()
 _FLEX_ATTN_SPECIALIZED: dict[tuple[Any, ...], Any] = {}
 _FLEX_ATTN_SPECIALIZE_LOCK = threading.Lock()
 _FLEX_ATTN_FAILED: dict[tuple[Any, ...], str] = {}
@@ -135,6 +136,25 @@ def _warn_once(key: str, message: str) -> None:
     _FLEX_ATTN_WARNED.add(key)
     with contextlib.suppress(Exception):
         warnings.warn(str(message), stacklevel=3)
+
+def _flex_debug_enabled() -> bool:
+    return bool(env_bool("ENN_FLEX_DEBUG_KOPTS", False))
+
+def _ensure_flex_kwargs_initialized() -> None:
+    global _FLEX_KWARGS
+    if _FLEX_KWARGS:
+        return
+    if _torch_flex_attention is None:
+        return
+    with contextlib.suppress(Exception):
+        _FLEX_KWARGS = set(
+            inspect.signature(_torch_flex_attention).parameters.keys()
+        )
+    if (not _FLEX_KWARGS) and _flex_debug_enabled():
+        _warn_once(
+            "flexattn-debug-empty-kwargs",
+            "FlexAttention debug: _FLEX_KWARGS is empty; kernel_options/env tuning will not apply.",
+        )
 
 
 def _env_bool_optional(name: str) -> Optional[bool]:
@@ -1910,6 +1930,9 @@ class FlexAttention(nn.Module):
                     is_causal=bool(is_causal),
                     score_mod=score_mod,
                 )
+
+            _ensure_flex_kwargs_initialized()
+
             flex_kwargs: dict[str, Any] = {}
             if "score_mod" in _FLEX_KWARGS and score_mod is not None:
                 flex_kwargs["score_mod"] = score_mod
@@ -2066,10 +2089,26 @@ class FlexAttention(nn.Module):
                             return out3
                         except Exception:
                             pass
+                    msg = (
+                        "FlexAttention: compiled execution failed; falling back to eager.\n"
+                    )
+                    if _flex_debug_enabled():
+                        with contextlib.suppress(Exception):
+                            msg += (
+                                f"[debug] mode={_flex_attention_compile_mode()!r} "
+                                f"dynamic={_flex_attention_dynamic_flag(_flex_attention_compile_mode())!r} "
+                                f"q={tuple(getattr(q,'shape',()))} "
+                                f"k={tuple(getattr(k,'shape',()))} "
+                                f"v={tuple(getattr(v,'shape',()))} "
+                                f"dtype={getattr(q,'dtype',None)} "
+                                f"passed_keys={sorted(list(flex_kwargs.keys()))} "
+                                f"supported_keys={sorted(list(_FLEX_KWARGS))} "
+                                f"kernel_options={flex_kwargs.get('kernel_options', None)}\n"
+                            )
+                    msg += f"{type(exc).__name__}: {exc}"
                     _warn_once(
                         f"flexattn-runtime-failed-{hash(flex_key)}",
-                        "FlexAttention: compiled execution failed; falling back to eager.\n"
-                        f"{type(exc).__name__}: {exc}",
+                        msg,
                     )
                     return _call_torch_flex_attention_eager(
                         q, k, v, flex_kwargs=flex_kwargs
