@@ -185,6 +185,13 @@ def _stack_hint(limit: int = 32, keep_last: int = 14) -> str:
     return "\n".join(keep).rstrip()
 
 
+def _flex_strict_fused_enabled() -> bool:
+    return bool(
+        env_bool("ENN_FLEX_STRICT_FUSED", False)
+        or env_bool("ENN_FLEX_ASSERT_FUSED", False)
+    )
+
+
 def _install_flex_uncompiled_warning_suppression() -> None:
     global _FLEX_UNCOMPILED_SUPPRESS_INSTALLED, _FLEX_UNCOMPILED_SUPPRESS_REPORTED
     if env_bool("ENN_FLEX_SUPPRESS_UNCOMPILED_WARNING", True) is False:
@@ -228,11 +235,12 @@ def _install_flex_uncompiled_warning_suppression() -> None:
                     _FLEX_UNCOMPILED_SUPPRESS_REPORTED = True
                     hint = _stack_hint()
                     flag = _torch_flex_disable_compile_debug_value()
+                    phase = "compile" if is_dynamo_compiling() else "runtime"
                     try:
                         suffix = f"{hint}" if hint else ""
                         text = (
                             "FlexAttention debug: suppressed PyTorch 'called without torch.compile' warning "
-                            f"(origin={filename}:{lineno}, torch_flag={flag!r})."
+                            f"(phase={phase}, origin={filename}:{lineno}, torch_flag={flag!r})."
                         )
                         if suffix:
                             text = f"{text}\n{suffix}"
@@ -2192,9 +2200,31 @@ class FlexAttention(nn.Module):
                     lambda: _run(lambda: flex_fn(q, k, v))
                 )
                 if not saw_uncompiled:
+                    if verify_any:
+                        bm = flex_kwargs.get("block_mask", None)
+                        smod = flex_kwargs.get("score_mod", None)
+                        mm = getattr(bm, "mask_mod", None)
+                        _warn_flex_debug_once(
+                            f"flexattn-fused-ok-{hash(flex_key)}",
+                            "FlexAttention debug: compiled+FUSED OK; "
+                            f"mode={mode_key!r} dynamic={dyn_key!r} "
+                            f"q={tuple(getattr(q,'shape',()))} dtype={getattr(q,'dtype',None)} "
+                            f"passed_keys={sorted(list(flex_kwargs.keys()))} "
+                            f"kernel_options={flex_kwargs.get('kernel_options', None)} "
+                            f"block_mask={type(bm).__name__}@{id(bm):x} "
+                            f"score_mod={type(smod).__name__}@{id(smod):x} "
+                            f"mask_mod={type(mm).__name__}@{id(mm):x} "
+                            f"dilation={getattr(mm,'dilation',None)} win={getattr(mm,'win',None)} causal={getattr(mm,'causal',None)}",
+                        )
                     with _FLEX_ATTN_VERIFIED_LOCK:
                         _FLEX_ATTN_VERIFIED.add(flex_key)
                     return out
+                if _flex_strict_fused_enabled():
+                    raise RuntimeError(
+                        "FlexAttention: detected unfused/uncompiled execution in a compiled path "
+                        f"(mode={mode_key!r}, dynamic={dyn_key!r}). "
+                        "Disable ENN_FLEX_STRICT_FUSED/ENN_FLEX_ASSERT_FUSED to continue."
+                    )
                 if verify_any:
                     bm = flex_kwargs.get("block_mask", None)
                     smod = flex_kwargs.get("score_mod", None)
