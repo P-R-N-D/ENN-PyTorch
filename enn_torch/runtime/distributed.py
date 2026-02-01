@@ -2156,11 +2156,7 @@ class Checkpointer:
     def _sync_group(self):
         if not self._is_distributed():
             return None
-        return (
-            self._sync_pg
-            if self._sync_pg is not None
-            else (self._dcp_process_group or dist.group.WORLD)
-        )
+        return self._sync_pg if self._sync_pg is not None else dist.group.WORLD
 
     def _sync_device(self) -> str:
         if not self._is_distributed():
@@ -2187,7 +2183,7 @@ class Checkpointer:
     def _is_dcp_leader(self) -> bool:
         if not self._is_distributed():
             return True
-        pg = self._dcp_process_group or dist.group.WORLD
+        pg = self._sync_group() or dist.group.WORLD
         try:
             return int(dist.get_rank(pg)) == 0
         except Exception:
@@ -2224,6 +2220,10 @@ class Checkpointer:
                 self._inflight_lock.unlink()
 
     def poll(self) -> None:
+        with contextlib.suppress(Exception):
+            self._cleanup_stale_dcp_inprogress()
+        with contextlib.suppress(Exception):
+            self._cleanup_stale_inflight_lock()
         self._maybe_wait_for_budget(block=False)
         if self._is_dcp_leader():
             _cleanup_delete_pending(self.dcp_root)
@@ -2774,12 +2774,16 @@ class Checkpointer:
         epoch_i = int(epoch)
 
         self._maybe_wait_for_budget(block=False)
+        with contextlib.suppress(Exception):
+            self._cleanup_stale_dcp_inprogress()
 
         if avg_state_dict is not None and self._is_local_rank0():
             self._schedule_avg_save(epoch_i, avg_state_dict)
 
         accept = True
         if self._is_dcp_leader():
+            if not self._dcp_should_participate:
+                accept = False
             with self._pending_lock:
                 if self._pending_dcp:
                     accept = False
