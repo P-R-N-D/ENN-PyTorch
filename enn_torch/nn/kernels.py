@@ -108,7 +108,7 @@ _FLEX_ATTN_SPECIALIZED: dict[tuple[Any, ...], Any] = {}
 _FLEX_ATTN_SPECIALIZE_LOCK = threading.Lock()
 _FLEX_ATTN_FAILED: dict[tuple[Any, ...], str] = {}
 _FLEX_ATTN_WARNED: set[str] = set()
-_FLEX_ATTN_RESOURCE_KOPTS: dict[int, dict[str, Any]] = {}
+_FLEX_ATTN_RESOURCE_KOPTS: dict[tuple[Any, ...], dict[str, Any]] = {}
 _FLEX_ATTN_RESOURCE_KOPTS_LOCK = threading.Lock()
 
 
@@ -402,6 +402,21 @@ def _env_int(name: str, default: int) -> int:
         return int(default)
 
 
+def _flex_env_overrides_present() -> bool:
+    keys = (
+        "ENN_FLEX_BLOCK_M",
+        "ENN_FLEX_BLOCK_N",
+        "ENN_FLEX_NUM_STAGES",
+        "ENN_FLEX_NUM_WARPS",
+        "ENN_FLEX_BWD_NUM_STAGES",
+        "ENN_FLEX_BWD_NUM_WARPS",
+        "ENN_FLEX_BWD_BLOCK_M1",
+        "ENN_FLEX_BWD_BLOCK_N1",
+        "ENN_FLEX_BWD_WRITE_DQ",
+    )
+    return any(k in os.environ for k in keys)
+
+
 def _looks_like_triton_resource_error(exc: BaseException) -> bool:
     msg = str(exc)
     if "No valid triton configs" not in msg:
@@ -457,10 +472,31 @@ def _clamp_max(opts: dict[str, Any], key: str, cap: int) -> None:
     opts[key] = min(_pos_int(cur, cap_i), cap_i)
 
 
-def _resource_safe_kernel_options(existing: Any) -> dict[str, Any]:
+def _resource_safe_kernel_options(existing: Any) -> Optional[dict[str, Any]]:
     if (existing is not None) and (not isinstance(existing, Mapping)):
-        existing = None
-    key = int(id(existing)) if existing is not None else 0
+        return None
+    bm = _env_int("ENN_FLEX_BLOCK_M", 64)
+    bn = _env_int("ENN_FLEX_BLOCK_N", 64)
+    ns = _env_int("ENN_FLEX_NUM_STAGES", 1)
+    nw = _env_int("ENN_FLEX_NUM_WARPS", 4)
+    bns = _env_int("ENN_FLEX_BWD_NUM_STAGES", 1)
+    bnw = _env_int("ENN_FLEX_BWD_NUM_WARPS", 4)
+    bm1 = _env_int("ENN_FLEX_BWD_BLOCK_M1", 32)
+    bn1 = _env_int("ENN_FLEX_BWD_BLOCK_N1", 32)
+    bwd_wdq = 1 if env_bool("ENN_FLEX_BWD_WRITE_DQ", False) else 0
+    key = (
+        "flex-kopts",
+        int(id(existing)) if existing is not None else 0,
+        bm,
+        bn,
+        ns,
+        nw,
+        bns,
+        bnw,
+        bm1,
+        bn1,
+        bwd_wdq,
+    )
     cached = _FLEX_ATTN_RESOURCE_KOPTS.get(key)
     if cached is not None:
         return cached
@@ -468,21 +504,14 @@ def _resource_safe_kernel_options(existing: Any) -> dict[str, Any]:
     if isinstance(existing, Mapping):
         for k, v in existing.items():
             base[str(k)] = v
-    sm = _cuda_sm_for_flex_defaults()
-    fwd_block_def = 32 if (sm is not None and sm <= 75) else 64
-    fwd_warps_def = 2 if (sm is not None and sm <= 75) else 4
-    bwd_block_def = 16 if (sm is not None and sm <= 75) else 32
-    bwd_warps_def = 2 if (sm is not None and sm <= 75) else 4
-
-    _clamp_max(base, "BLOCK_M", _env_int("ENN_FLEX_BLOCK_M", fwd_block_def))
-    _clamp_max(base, "BLOCK_N", _env_int("ENN_FLEX_BLOCK_N", fwd_block_def))
-    _clamp_max(base, "num_stages", _env_int("ENN_FLEX_NUM_STAGES", 1))
-    _clamp_max(base, "num_warps", _env_int("ENN_FLEX_NUM_WARPS", fwd_warps_def))
-
-    _clamp_max(base, "bwd_num_stages", _env_int("ENN_FLEX_BWD_NUM_STAGES", 1))
-    _clamp_max(base, "bwd_num_warps", _env_int("ENN_FLEX_BWD_NUM_WARPS", bwd_warps_def))
-    _clamp_max(base, "bwd_BLOCK_M1", _env_int("ENN_FLEX_BWD_BLOCK_M1", bwd_block_def))
-    _clamp_max(base, "bwd_BLOCK_N1", _env_int("ENN_FLEX_BWD_BLOCK_N1", bwd_block_def))
+    base.setdefault("BLOCK_M", int(bm))
+    base.setdefault("BLOCK_N", int(bn))
+    base.setdefault("num_stages", int(ns))
+    base.setdefault("num_warps", int(nw))
+    base.setdefault("bwd_num_stages", int(bns))
+    base.setdefault("bwd_num_warps", int(bnw))
+    base.setdefault("bwd_BLOCK_M1", int(bm1))
+    base.setdefault("bwd_BLOCK_N1", int(bn1))
     if "WRITE_DQ" not in base and "bwd_WRITE_DQ" not in base:
         base["bwd_WRITE_DQ"] = bool(env_bool("ENN_FLEX_BWD_WRITE_DQ", False))
     with _FLEX_ATTN_RESOURCE_KOPTS_LOCK:
@@ -1880,6 +1909,14 @@ class FlexAttention(nn.Module):
                     flex_kwargs["dropout"] = float(dropout_p)
             if "kernel_options" in _FLEX_KWARGS and kernel_options is not None:
                 flex_kwargs["kernel_options"] = kernel_options
+            elif (
+                "kernel_options" in _FLEX_KWARGS
+                and kernel_options is None
+                and _flex_env_overrides_present()
+            ):
+                ko = _resource_safe_kernel_options(None)
+                if ko is not None:
+                    flex_kwargs["kernel_options"] = ko
             flex_fn, flex_key = _get_compiled_flex_attention_for_kwargs(
                 q, flex_kwargs
             )
