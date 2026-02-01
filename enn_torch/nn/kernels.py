@@ -140,6 +140,13 @@ def _warn_once(key: str, message: str) -> None:
 def _flex_debug_enabled() -> bool:
     return bool(env_bool("ENN_FLEX_DEBUG_KOPTS", False))
 
+def _flex_retry_failed_enabled() -> bool:
+    try:
+        dbg = bool(env_bool("ENN_FLEX_DEBUG_KOPTS", False))
+    except Exception:
+        dbg = False
+    return bool(env_bool("ENN_FLEX_RETRY_FAILED", default=dbg))
+
 def _ensure_flex_kwargs_initialized() -> None:
     global _FLEX_KWARGS
     if _FLEX_KWARGS:
@@ -250,6 +257,7 @@ def _compile_flex_attention_wrapper(
                             "ignore",
                             message=r"(?s).*flex_attention called without torch\.compile.*",
                             category=UserWarning,
+                            module=r"torch\.nn\.attention\.flex_attention",
                         )
                         base = _model_compile(
                             _torch_flex_attention,
@@ -319,6 +327,25 @@ def _call_with_flex_warn_guard(fn: Callable[[], Any]) -> tuple[Any, bool]:
     return out, saw_uncompiled
 
 
+def _torch_flex_attention_module() -> Any | None:
+    with contextlib.suppress(Exception):
+        import torch.nn.attention.flex_attention as _fa
+
+        return _fa
+    return None
+
+
+def _force_enable_torch_flex_compile() -> None:
+    if env_bool("ENN_FLEX_RESPECT_TORCH_DISABLE_COMPILE_DEBUG", False):
+        return
+    fa = _torch_flex_attention_module()
+    if fa is None:
+        return
+    with contextlib.suppress(Exception):
+        if bool(getattr(fa, "_FLEX_ATTENTION_DISABLE_COMPILE_DEBUG", False)):
+            setattr(fa, "_FLEX_ATTENTION_DISABLE_COMPILE_DEBUG", False)
+
+
 def _call_torch_flex_attention_eager(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -328,12 +355,14 @@ def _call_torch_flex_attention_eager(
 ) -> Any:
     if _torch_flex_attention is None:
         raise RuntimeError("Flex Attention is not available")
+    _force_enable_torch_flex_compile()
     with skip_non_infra_dispatch_mode():
         with warnings.catch_warnings():
             warnings.filterwarnings(
                 "ignore",
                 message=r"(?s).*flex_attention called without torch\.compile.*",
                 category=UserWarning,
+                module=r"torch\.nn\.attention\.flex_attention",
             )
             return _torch_flex_attention(q, k, v, **flex_kwargs)
 
@@ -367,16 +396,16 @@ def _get_compiled_flex_attention_for_kwargs(
                     _FLEX_ATTN_FAILED.pop(key, None)
         else:
             return _torch_flex_attention, key
-    failed = _FLEX_ATTN_FAILED.get(key)
-    if failed is not None:
-        return _torch_flex_attention, key
     with _FLEX_ATTN_SPECIALIZE_LOCK:
         cached = _FLEX_ATTN_SPECIALIZED.get(key)
         if cached is not None:
             return cached, key
         failed = _FLEX_ATTN_FAILED.get(key)
         if failed is not None:
-            return _torch_flex_attention, key
+            if _flex_retry_failed_enabled() and _flex_env_overrides_present():
+                _FLEX_ATTN_FAILED.pop(key, None)
+            else:
+                return _torch_flex_attention, key
         try:
             compiled = _compile_flex_attention_wrapper(
                 mode=mode, dynamic=dynamic, flex_kwargs=flex_kwargs
@@ -445,14 +474,6 @@ def _flex_env_overrides_present() -> bool:
     return any(k in os.environ for k in keys)
 
 
-def _flex_retry_failed_enabled() -> bool:
-    try:
-        dbg = bool(env_bool("ENN_FLEX_DEBUG_KOPTS", False))
-    except Exception:
-        dbg = False
-    return bool(env_bool("ENN_FLEX_RETRY_FAILED", default=dbg))
-
-
 def _looks_like_triton_resource_error(exc: BaseException) -> bool:
     msg = str(exc)
     if "No valid triton configs" not in msg:
@@ -466,10 +487,6 @@ def _looks_like_triton_resource_error(exc: BaseException) -> bool:
         "num_warps",
     )
     return any(n in msg for n in needles)
-
-
-def _flex_debug_enabled() -> bool:
-    return bool(env_bool("ENN_FLEX_DEBUG_KOPTS", False))
 
 
 def _warn_flex_debug_once(key: str, msg: str) -> None:
@@ -1948,6 +1965,7 @@ class FlexAttention(nn.Module):
                 )
 
             _ensure_flex_kwargs_initialized()
+            _force_enable_torch_flex_compile()
 
             flex_kwargs: dict[str, Any] = {}
             if "score_mod" in _FLEX_KWARGS and score_mod is not None:
@@ -1976,6 +1994,7 @@ class FlexAttention(nn.Module):
             flex_fn, flex_key = _get_compiled_flex_attention_for_kwargs(
                 q, flex_kwargs
             )
+            verify_any = bool(_flex_debug_enabled() or _flex_env_overrides_present())
 
             def _run(fn: Callable[[], Any]) -> Any:
                 if not is_dynamo_compiling():
@@ -1984,55 +2003,38 @@ class FlexAttention(nn.Module):
                 return fn()
 
             try:
-                if flex_fn is _torch_flex_attention:
-                    if (
-                        _flex_retry_failed_enabled()
-                        and _flex_env_overrides_present()
-                        and torch_compiler_supported()
-                        and (not is_dynamo_compiling())
-                        and _torch_flex_attention is not None
-                    ):
-                        try:
-                            mode0 = _flex_attention_compile_mode()
-                            mode_tries = (mode0,) + _flex_attention_fallback_modes(mode0)
-                            for m in mode_tries:
-                                dyn_m = _flex_attention_dynamic_flag(m)
-                                cand = _compile_flex_attention_wrapper(
-                                    mode=str(m),
-                                    dynamic=dyn_m,
-                                    flex_kwargs=flex_kwargs,
-                                )
-                                if cand is _torch_flex_attention:
-                                    continue
-
-                                def _invoke() -> Any:
-                                    if not is_dynamo_compiling():
-                                        with skip_non_infra_dispatch_mode():
-                                            return cand(q, k, v)
-                                    return cand(q, k, v)
-
-                                out, saw_uncompiled = _call_with_flex_warn_guard(
-                                    _invoke
-                                )
-                                if saw_uncompiled:
-                                    continue
-                                with _FLEX_ATTN_SPECIALIZE_LOCK:
-                                    _FLEX_ATTN_SPECIALIZED[flex_key] = cand
-                                    _FLEX_ATTN_FAILED.pop(flex_key, None)
-                                return out
-                        except Exception:
-                            pass
-                    return _call_torch_flex_attention_eager(
-                        q, k, v, flex_kwargs=flex_kwargs
-                    )
-
                 mode_key = (
                     str(flex_key[1])
                     if isinstance(flex_key, tuple) and len(flex_key) > 1
                     else ""
                 )
+                dyn_key = (
+                    flex_key[2] if isinstance(flex_key, tuple) and len(flex_key) > 2 else None
+                )
+
+                if flex_fn is _torch_flex_attention:
+                    if verify_any:
+                        bm = flex_kwargs.get("block_mask", None)
+                        smod = flex_kwargs.get("score_mod", None)
+                        mm = getattr(bm, "mask_mod", None)
+                        _warn_flex_debug_once(
+                            f"flexattn-raw-{hash(flex_key)}",
+                            "FlexAttention debug: using raw/eager flex_attention "
+                            f"(mode={mode_key!r}, dynamic={dyn_key!r}) "
+                            f"q={tuple(getattr(q,'shape',()))} dtype={getattr(q,'dtype',None)} "
+                            f"passed_keys={sorted(list(flex_kwargs.keys()))} "
+                            f"kernel_options={flex_kwargs.get('kernel_options', None)} "
+                            f"block_mask={type(bm).__name__}@{id(bm):x} "
+                            f"score_mod={type(smod).__name__}@{id(smod):x} "
+                            f"mask_mod={type(mm).__name__}@{id(mm):x} "
+                            f"dilation={getattr(mm,'dilation',None)} win={getattr(mm,'win',None)} causal={getattr(mm,'causal',None)}",
+                        )
+                    return _call_torch_flex_attention_eager(
+                        q, k, v, flex_kwargs=flex_kwargs
+                    )
+
                 needs_verify = (
-                    mode_key in {"max-autotune", "max-autotune-no-cudagraphs"}
+                    (mode_key in {"max-autotune", "max-autotune-no-cudagraphs"} or verify_any)
                 ) and (not is_dynamo_compiling())
                 verified = False
                 if needs_verify:
@@ -2047,6 +2049,45 @@ class FlexAttention(nn.Module):
                     with _FLEX_ATTN_VERIFIED_LOCK:
                         _FLEX_ATTN_VERIFIED.add(flex_key)
                     return out
+                if verify_any:
+                    bm = flex_kwargs.get("block_mask", None)
+                    smod = flex_kwargs.get("score_mod", None)
+                    mm = getattr(bm, "mask_mod", None)
+                    _warn_flex_debug_once(
+                        f"flexattn-uncompiled-{hash(flex_key)}",
+                        "FlexAttention debug: compiled call produced uncompiled-warning; "
+                        f"mode={mode_key!r} dynamic={dyn_key!r} "
+                        f"q={tuple(getattr(q,'shape',()))} dtype={getattr(q,'dtype',None)} "
+                        f"passed_keys={sorted(list(flex_kwargs.keys()))} "
+                        f"supported_keys={sorted(list(_FLEX_KWARGS))} "
+                        f"kernel_options={flex_kwargs.get('kernel_options', None)} "
+                        f"block_mask={type(bm).__name__}@{id(bm):x} "
+                        f"score_mod={type(smod).__name__}@{id(smod):x} "
+                        f"mask_mod={type(mm).__name__}@{id(mm):x} "
+                        f"dilation={getattr(mm,'dilation',None)} win={getattr(mm,'win',None)} causal={getattr(mm,'causal',None)}",
+                    )
+                    with contextlib.suppress(Exception):
+                        fb_mode = os.environ.get(
+                            "ENN_FLEX_UNCOMPILED_FALLBACK_MODE",
+                            "max-autotune-no-cudagraphs",
+                        )
+                        dyn_fb = _flex_attention_dynamic_flag(str(fb_mode))
+                        fb_fn = _compile_flex_attention_wrapper(
+                            mode=str(fb_mode),
+                            dynamic=dyn_fb,
+                            flex_kwargs=flex_kwargs,
+                        )
+                        if fb_fn is not _torch_flex_attention:
+                            out2, saw2 = _call_with_flex_warn_guard(
+                                lambda: _run(lambda: fb_fn(q, k, v))
+                            )
+                            if not saw2:
+                                with _FLEX_ATTN_SPECIALIZE_LOCK:
+                                    _FLEX_ATTN_SPECIALIZED[flex_key] = fb_fn
+                                    _FLEX_ATTN_FAILED.pop(flex_key, None)
+                                with _FLEX_ATTN_VERIFIED_LOCK:
+                                    _FLEX_ATTN_VERIFIED.add(flex_key)
+                                return out2
                 for fb_mode in _flex_attention_fallback_modes(mode_key):
                     try:
                         dyn_fb = _flex_attention_dynamic_flag(fb_mode)
