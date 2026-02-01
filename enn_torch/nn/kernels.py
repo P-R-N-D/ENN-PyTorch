@@ -154,6 +154,8 @@ def _warn_fused_ok_throttled(
     flex_kwargs: dict[str, Any],
     dyn_key: Any,
 ) -> None:
+    if not _flex_debug_enabled():
+        return
     bm = flex_kwargs.get("block_mask", None)
     mm = getattr(bm, "mask_mod", None)
     ko = flex_kwargs.get("kernel_options", None)
@@ -166,7 +168,7 @@ def _warn_fused_ok_throttled(
             return
         _FLEX_ATTN_FUSED_OK_KEYS.add(key)
     smod = flex_kwargs.get("score_mod", None)
-    _warn_once(
+    _warn_flex_debug_once(
         f"flexattn-fused-ok-{hash(key)}",
         "FlexAttention debug: compiled+FUSED OK; "
         f"mode={mode_key!r} dynamic={dyn_key!r} "
