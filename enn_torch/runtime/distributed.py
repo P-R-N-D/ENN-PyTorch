@@ -2670,14 +2670,18 @@ class Checkpointer:
     ) -> None:
         epoch_dir = self._epoch_dir(int(epoch))
         try:
-            if not self._epoch_done_file(epoch_dir).is_file():
-                self._finalize_dcp_epoch(
-                    int(epoch),
-                    epoch_dir,
-                    extra_meta={"has_optimizer": bool(has_optimizer)},
-                )
-            else:
+            if self._epoch_done_file(epoch_dir).is_file():
                 self._prune_dcp()
+                return
+            if self._epoch_failed_file(epoch_dir).is_file():
+                return
+            if (not epoch_dir.is_dir()) or (not self._dcp_has_distcp_file(epoch_dir)):
+                return
+            self._finalize_dcp_epoch(
+                int(epoch),
+                epoch_dir,
+                extra_meta={"has_optimizer": bool(has_optimizer)},
+            )
         except Exception as exc:
             if env_bool("ENN_DCP_DEBUG", False) and self._is_global_rank0():
                 _LOGGER.warning(
@@ -2849,6 +2853,7 @@ class Checkpointer:
     ) -> None:
         epoch_i = int(epoch)
         epoch_dir = self._epoch_dir(epoch_i)
+        pending_exc: Exception | None = None
         try:
             if (
                 avg_state_dict is None
@@ -2990,6 +2995,7 @@ class Checkpointer:
                 )
                 _cleanup_delete_pending(self.dcp_root)
         except Exception as exc:
+            pending_exc = exc
             _LOGGER.exception("DCP epoch checkpoint failed: %s", exc)
             with contextlib.suppress(Exception):
                 if self._is_dcp_leader():
@@ -3000,6 +3006,8 @@ class Checkpointer:
             with contextlib.suppress(Exception):
                 self._release_inflight_lock()
             self._post_dcp_cleanup()
+        if pending_exc is not None:
+            raise pending_exc
 
     def request_save_epoch(
         self,
