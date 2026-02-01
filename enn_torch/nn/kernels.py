@@ -432,6 +432,16 @@ def _looks_like_triton_resource_error(exc: BaseException) -> bool:
     return any(n in msg for n in needles)
 
 
+def _flex_debug_enabled() -> bool:
+    return bool(env_bool("ENN_FLEX_DEBUG_KOPTS", False))
+
+
+def _warn_flex_debug_once(key: str, msg: str) -> None:
+    if not _flex_debug_enabled():
+        return
+    _warn_once(key, msg)
+
+
 def _cuda_sm_for_flex_defaults() -> Optional[int]:
     try:
         dev = get_device()
@@ -1996,6 +2006,13 @@ class FlexAttention(nn.Module):
                     if _looks_like_triton_resource_error(exc) and (
                         "kernel_options" in _FLEX_KWARGS
                     ):
+                        _warn_flex_debug_once(
+                            f"flexattn-kopts-{hash(flex_key)}",
+                            "FlexAttention debug: compiled failed; "
+                            f"mode={_flex_attention_compile_mode()!r} "
+                            f"q={tuple(getattr(q,'shape',()))} dtype={getattr(q,'dtype',None)} "
+                            f"kernel_options={flex_kwargs.get('kernel_options', None)}",
+                        )
                         try:
                             flex_kwargs2 = dict(flex_kwargs)
                             existing = flex_kwargs2.get("kernel_options", None)
@@ -2024,6 +2041,28 @@ class FlexAttention(nn.Module):
                             return _call_torch_flex_attention_eager(
                                 q, k, v, flex_kwargs=flex_kwargs2
                             )
+                        except Exception:
+                            pass
+                        try:
+                            fb_mode = os.environ.get(
+                                "ENN_FLEX_RESOURCE_FALLBACK_MODE",
+                                "max-autotune-no-cudagraphs",
+                            )
+                            fb_dyn = _flex_attention_dynamic_flag(fb_mode)
+                            fb_dyn_override = _env_bool_optional(
+                                "ENN_FLEX_RESOURCE_FALLBACK_DYNAMIC"
+                            )
+                            if isinstance(fb_dyn_override, bool):
+                                fb_dyn = fb_dyn_override
+                            fb_fn = _compile_flex_attention_wrapper(
+                                mode=str(fb_mode),
+                                dynamic=fb_dyn,
+                                flex_kwargs=flex_kwargs2,
+                            )
+                            out3 = fb_fn(q, k, v)
+                            with _FLEX_ATTN_SPECIALIZE_LOCK:
+                                _FLEX_ATTN_SPECIALIZED[flex_key] = fb_fn
+                            return out3
                         except Exception:
                             pass
                     _warn_once(
