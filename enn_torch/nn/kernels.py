@@ -105,6 +105,9 @@ _FLEX_ATTN_BASE_COMPILE_LOCK = threading.Lock()
 _FLEX_ATTN_VERIFIED: set[tuple[Any, ...]] = set()
 _FLEX_ATTN_VERIFIED_LOCK = threading.Lock()
 _FLEX_ATTN_UNCOMPILED_NEEDLE = "flex_attention called without torch.compile"
+
+_TORCH_FLEX_WARN_REGEX = r"(?s).*flex_attention called without torch\.compile.*"
+_TORCH_FLEX_WARN_MODULE = r"torch\.nn\.attention\.flex_attention"
 _FLEX_ATTN_SPECIALIZED: dict[tuple[Any, ...], Any] = {}
 _FLEX_ATTN_SPECIALIZE_LOCK = threading.Lock()
 _FLEX_ATTN_FAILED: dict[tuple[Any, ...], str] = {}
@@ -137,8 +140,45 @@ def _warn_once(key: str, message: str) -> None:
     with contextlib.suppress(Exception):
         warnings.warn(str(message), stacklevel=3)
 
+
+def _torch_flex_attention_module() -> Any | None:
+    with contextlib.suppress(Exception):
+        import torch.nn.attention.flex_attention as _fa  # type: ignore
+        return _fa
+    return None
+
+
+def _torch_flex_disable_compile_debug_value() -> Any:
+    fa = _torch_flex_attention_module()
+    if fa is None:
+        return None
+    with contextlib.suppress(Exception):
+        return getattr(fa, "_FLEX_ATTENTION_DISABLE_COMPILE_DEBUG", None)
+    return None
+
+
+def _force_enable_torch_flex_compile() -> None:
+    if env_bool("ENN_FLEX_RESPECT_TORCH_DISABLE_COMPILE_DEBUG", False):
+        return
+    fa = _torch_flex_attention_module()
+    if fa is None:
+        return
+    before = _torch_flex_disable_compile_debug_value()
+    with contextlib.suppress(Exception):
+        if bool(getattr(fa, "_FLEX_ATTENTION_DISABLE_COMPILE_DEBUG", False)):
+            setattr(fa, "_FLEX_ATTENTION_DISABLE_COMPILE_DEBUG", False)
+    after = _torch_flex_disable_compile_debug_value()
+    if env_bool("ENN_FLEX_DEBUG_KOPTS", False) and before != after:
+        _warn_once(
+            "flexattn-debug-torch-flag",
+            f"FlexAttention debug: flipped torch.nn.attention.flex_attention._FLEX_ATTENTION_DISABLE_COMPILE_DEBUG "
+            f"from {before!r} to {after!r}",
+        )
+
+
 def _flex_debug_enabled() -> bool:
     return bool(env_bool("ENN_FLEX_DEBUG_KOPTS", False))
+
 
 def _flex_retry_failed_enabled() -> bool:
     try:
@@ -244,6 +284,7 @@ def _compile_flex_attention_wrapper(
     if _torch_flex_attention is None:
         raise RuntimeError("Flex Attention is not available")
     frozen = dict(flex_kwargs)
+    _force_enable_torch_flex_compile()
     dyn_key = dynamic if dynamic is None else bool(dynamic)
     base_key = ("flexattn-base", str(mode), dyn_key)
     base = _FLEX_ATTN_BASE_COMPILED.get(base_key)
@@ -255,16 +296,25 @@ def _compile_flex_attention_wrapper(
                     with warnings.catch_warnings():
                         warnings.filterwarnings(
                             "ignore",
-                            message=r"(?s).*flex_attention called without torch\.compile.*",
+                            message=_TORCH_FLEX_WARN_REGEX,
                             category=UserWarning,
-                            module=r"torch\.nn\.attention\.flex_attention",
+                            module=_TORCH_FLEX_WARN_MODULE,
                         )
-                        base = _model_compile(
-                            _torch_flex_attention,
-                            mode=mode,
-                            dynamic=dynamic,
-                            fullgraph=False,
+                        base, saw = _call_with_flex_warn_guard(
+                            lambda: _model_compile(
+                                _torch_flex_attention,
+                                mode=mode,
+                                dynamic=dynamic,
+                                fullgraph=False,
+                            )
                         )
+                        if saw and _flex_debug_enabled():
+                            _warn_once(
+                                f"flexattn-debug-compile-warn-{hash(base_key)}",
+                                "FlexAttention debug: PyTorch emitted an 'uncompiled' warning during base compile "
+                                f"(mode={mode!r}, dynamic={dynamic!r}, torch_flag={_torch_flex_disable_compile_debug_value()!r}). "
+                                "This is usually a tracing-time warning, not a steady-state runtime regression.",
+                            )
                 _FLEX_ATTN_BASE_COMPILED[base_key] = base
     if base is _torch_flex_attention:
         return _torch_flex_attention
@@ -311,7 +361,7 @@ def _call_with_flex_warn_guard(fn: Callable[[], Any]) -> tuple[Any, bool]:
             msg = str(message)
         except Exception:
             msg = ""
-        if _FLEX_ATTN_UNCOMPILED_NEEDLE in msg:
+        if _FLEX_ATTN_UNCOMPILED_NEEDLE in msg.lower():
             saw_uncompiled = True
             return
         return orig_showwarning(
@@ -325,25 +375,6 @@ def _call_with_flex_warn_guard(fn: Callable[[], Any]) -> tuple[Any, bool]:
         finally:
             warnings.showwarning = orig_showwarning
     return out, saw_uncompiled
-
-
-def _torch_flex_attention_module() -> Any | None:
-    with contextlib.suppress(Exception):
-        import torch.nn.attention.flex_attention as _fa
-
-        return _fa
-    return None
-
-
-def _force_enable_torch_flex_compile() -> None:
-    if env_bool("ENN_FLEX_RESPECT_TORCH_DISABLE_COMPILE_DEBUG", False):
-        return
-    fa = _torch_flex_attention_module()
-    if fa is None:
-        return
-    with contextlib.suppress(Exception):
-        if bool(getattr(fa, "_FLEX_ATTENTION_DISABLE_COMPILE_DEBUG", False)):
-            setattr(fa, "_FLEX_ATTENTION_DISABLE_COMPILE_DEBUG", False)
 
 
 def _call_torch_flex_attention_eager(
@@ -360,9 +391,9 @@ def _call_torch_flex_attention_eager(
         with warnings.catch_warnings():
             warnings.filterwarnings(
                 "ignore",
-                message=r"(?s).*flex_attention called without torch\.compile.*",
+                message=_TORCH_FLEX_WARN_REGEX,
                 category=UserWarning,
-                module=r"torch\.nn\.attention\.flex_attention",
+                module=_TORCH_FLEX_WARN_MODULE,
             )
             return _torch_flex_attention(q, k, v, **flex_kwargs)
 
