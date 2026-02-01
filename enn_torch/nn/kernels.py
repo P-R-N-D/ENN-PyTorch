@@ -1937,17 +1937,18 @@ class FlexAttention(nn.Module):
             flex_fn, flex_key = _get_compiled_flex_attention_for_kwargs(
                 q, flex_kwargs
             )
+
+            def _run(fn: Callable[[], Any]) -> Any:
+                if not is_dynamo_compiling():
+                    with skip_non_infra_dispatch_mode():
+                        return fn()
+                return fn()
+
             try:
                 if flex_fn is _torch_flex_attention:
                     return _call_torch_flex_attention_eager(
                         q, k, v, flex_kwargs=flex_kwargs
                     )
-
-                def _run(fn: Callable[[], Any]) -> Any:
-                    if not is_dynamo_compiling():
-                        with skip_non_infra_dispatch_mode():
-                            return fn()
-                    return fn()
 
                 mode_key = (
                     str(flex_key[1])
@@ -2026,7 +2027,7 @@ class FlexAttention(nn.Module):
                             )
                             if flex_fn2 is not _torch_flex_attention:
                                 try:
-                                    return flex_fn2(q, k, v)
+                                    return _run(lambda: flex_fn2(q, k, v))
                                 except Exception as exc2:
                                     if _is_compile_failure(exc2):
                                         with contextlib.suppress(Exception):
@@ -2059,7 +2060,7 @@ class FlexAttention(nn.Module):
                                 dynamic=fb_dyn,
                                 flex_kwargs=flex_kwargs2,
                             )
-                            out3 = fb_fn(q, k, v)
+                            out3 = _run(lambda: fb_fn(q, k, v))
                             with _FLEX_ATTN_SPECIALIZE_LOCK:
                                 _FLEX_ATTN_SPECIALIZED[flex_key] = fb_fn
                             return out3
