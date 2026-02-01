@@ -5,6 +5,7 @@ import contextlib
 import inspect
 import math
 import os
+import traceback
 import threading
 import warnings
 from typing import Any, Callable, Mapping, Optional, Self, Tuple
@@ -106,14 +107,17 @@ _FLEX_ATTN_VERIFIED: set[tuple[Any, ...]] = set()
 _FLEX_ATTN_VERIFIED_LOCK = threading.Lock()
 _FLEX_ATTN_UNCOMPILED_NEEDLE = "flex_attention called without torch.compile"
 
-_TORCH_FLEX_WARN_REGEX = r"(?s).*flex_attention called without torch\.compile.*"
-_TORCH_FLEX_WARN_MODULE = r"torch\.nn\.attention\.flex_attention"
+_FLEX_UNCOMPILED_WARN_RE = r"(?s).*flex_attention called without torch\.compile.*"
+_FLEX_UNCOMPILED_WARN_MODULE_RE = r"torch\.nn\.attention\.flex_attention"
 _FLEX_ATTN_SPECIALIZED: dict[tuple[Any, ...], Any] = {}
 _FLEX_ATTN_SPECIALIZE_LOCK = threading.Lock()
 _FLEX_ATTN_FAILED: dict[tuple[Any, ...], str] = {}
 _FLEX_ATTN_WARNED: set[str] = set()
 _FLEX_ATTN_RESOURCE_KOPTS: dict[tuple[Any, ...], dict[str, Any]] = {}
 _FLEX_ATTN_RESOURCE_KOPTS_LOCK = threading.Lock()
+_FLEX_UNCOMPILED_SUPPRESS_LOCK = threading.Lock()
+_FLEX_UNCOMPILED_SUPPRESS_INSTALLED = False
+_FLEX_UNCOMPILED_SUPPRESS_REPORTED = False
 
 
 def _flex_attention_disabled() -> bool:
@@ -139,6 +143,122 @@ def _warn_once(key: str, message: str) -> None:
     _FLEX_ATTN_WARNED.add(key)
     with contextlib.suppress(Exception):
         warnings.warn(str(message), stacklevel=3)
+
+
+def _ensure_pythonwarnings_suppresses_flex_uncompiled() -> None:
+    if env_bool("ENN_FLEX_SUPPRESS_UNCOMPILED_WARNING", True) is False:
+        return
+    rule = (
+        "ignore:.*flex_attention called without torch\\.compile.*:"
+        "UserWarning:torch\\.nn\\.attention\\.flex_attention"
+    )
+    cur = os.environ.get("PYTHONWARNINGS", "")
+    if rule in cur:
+        return
+    os.environ["PYTHONWARNINGS"] = rule if not cur else f"{cur},{rule}"
+    if env_bool("ENN_FLEX_DEBUG_KOPTS", False):
+        _warn_once(
+            "flexattn-debug-pythonwarnings",
+            "FlexAttention debug: appended PYTHONWARNINGS filter for flex_attention uncompiled warning "
+            f"(PYTHONWARNINGS={os.environ.get('PYTHONWARNINGS','')!r})",
+        )
+
+
+def _stack_hint(limit: int = 32, keep_last: int = 14) -> str:
+    try:
+        st = traceback.format_stack(limit=limit)
+    except Exception:
+        return ""
+    keep: list[str] = []
+    for s in st:
+        if (
+            ("enn_torch" in s)
+            or ("flex_attention" in s)
+            or ("torch.compile" in s)
+            or ("torch/_inductor" in s)
+        ):
+            keep.append(s.rstrip())
+    if not keep:
+        keep = [x.rstrip() for x in st[-keep_last:]]
+    else:
+        keep = keep[-keep_last:]
+    return "\n".join(keep).rstrip()
+
+
+def _flex_strict_fused_enabled() -> bool:
+    return bool(
+        env_bool("ENN_FLEX_STRICT_FUSED", False)
+        or env_bool("ENN_FLEX_ASSERT_FUSED", False)
+    )
+
+
+def _install_flex_uncompiled_warning_suppression() -> None:
+    global _FLEX_UNCOMPILED_SUPPRESS_INSTALLED, _FLEX_UNCOMPILED_SUPPRESS_REPORTED
+    if env_bool("ENN_FLEX_SUPPRESS_UNCOMPILED_WARNING", True) is False:
+        return
+    if _FLEX_UNCOMPILED_SUPPRESS_INSTALLED:
+        return
+    with _FLEX_UNCOMPILED_SUPPRESS_LOCK:
+        if _FLEX_UNCOMPILED_SUPPRESS_INSTALLED:
+            return
+
+        _ensure_pythonwarnings_suppresses_flex_uncompiled()
+
+        with contextlib.suppress(Exception):
+            warnings.filterwarnings(
+                "ignore",
+                message=_FLEX_UNCOMPILED_WARN_RE,
+                category=UserWarning,
+                module=_FLEX_UNCOMPILED_WARN_MODULE_RE,
+            )
+
+        orig = warnings.showwarning
+
+        def _showwarning(
+            message: Any,
+            category: type[Warning],
+            filename: str,
+            lineno: int,
+            file: Any = None,
+            line: str | None = None,
+        ) -> None:
+            nonlocal orig
+            global _FLEX_UNCOMPILED_SUPPRESS_REPORTED
+            try:
+                msg = str(message)
+            except Exception:
+                msg = ""
+            if _FLEX_ATTN_UNCOMPILED_NEEDLE in msg.lower():
+                if env_bool("ENN_FLEX_DEBUG_KOPTS", False) and (
+                    not _FLEX_UNCOMPILED_SUPPRESS_REPORTED
+                ):
+                    _FLEX_UNCOMPILED_SUPPRESS_REPORTED = True
+                    hint = _stack_hint()
+                    flag = _torch_flex_disable_compile_debug_value()
+                    phase = "compile" if is_dynamo_compiling() else "runtime"
+                    try:
+                        suffix = f"{hint}" if hint else ""
+                        text = (
+                            "FlexAttention debug: suppressed PyTorch 'called without torch.compile' warning "
+                            f"(phase={phase}, origin={filename}:{lineno}, torch_flag={flag!r})."
+                        )
+                        if suffix:
+                            text = f"{text}\n{suffix}"
+                        orig(
+                            UserWarning(text),
+                            UserWarning,
+                            __file__,
+                            0,
+                            file=file,
+                            line=None,
+                        )
+                    except Exception:
+                        pass
+                return
+            return orig(message, category, filename, lineno, file=file, line=line)
+
+        warnings.showwarning = _showwarning
+        _FLEX_UNCOMPILED_SUPPRESS_INSTALLED = True
 
 
 def _torch_flex_attention_module() -> Any | None:
@@ -283,6 +403,7 @@ def _compile_flex_attention_wrapper(
 ) -> Any:
     if _torch_flex_attention is None:
         raise RuntimeError("Flex Attention is not available")
+    _install_flex_uncompiled_warning_suppression()
     frozen = dict(flex_kwargs)
     _force_enable_torch_flex_compile()
     dyn_key = dynamic if dynamic is None else bool(dynamic)
@@ -296,9 +417,9 @@ def _compile_flex_attention_wrapper(
                     with warnings.catch_warnings():
                         warnings.filterwarnings(
                             "ignore",
-                            message=_TORCH_FLEX_WARN_REGEX,
+                            message=_FLEX_UNCOMPILED_WARN_RE,
                             category=UserWarning,
-                            module=_TORCH_FLEX_WARN_MODULE,
+                            module=_FLEX_UNCOMPILED_WARN_MODULE_RE,
                         )
                         base, saw = _call_with_flex_warn_guard(
                             lambda: _model_compile(
@@ -386,14 +507,15 @@ def _call_torch_flex_attention_eager(
 ) -> Any:
     if _torch_flex_attention is None:
         raise RuntimeError("Flex Attention is not available")
+    _install_flex_uncompiled_warning_suppression()
     _force_enable_torch_flex_compile()
     with skip_non_infra_dispatch_mode():
         with warnings.catch_warnings():
             warnings.filterwarnings(
                 "ignore",
-                message=_TORCH_FLEX_WARN_REGEX,
+                message=_FLEX_UNCOMPILED_WARN_RE,
                 category=UserWarning,
-                module=_TORCH_FLEX_WARN_MODULE,
+                module=_FLEX_UNCOMPILED_WARN_MODULE_RE,
             )
             return _torch_flex_attention(q, k, v, **flex_kwargs)
 
@@ -1996,6 +2118,7 @@ class FlexAttention(nn.Module):
                 )
 
             _ensure_flex_kwargs_initialized()
+            _install_flex_uncompiled_warning_suppression()
             _force_enable_torch_flex_compile()
 
             flex_kwargs: dict[str, Any] = {}
@@ -2077,9 +2200,31 @@ class FlexAttention(nn.Module):
                     lambda: _run(lambda: flex_fn(q, k, v))
                 )
                 if not saw_uncompiled:
+                    if verify_any:
+                        bm = flex_kwargs.get("block_mask", None)
+                        smod = flex_kwargs.get("score_mod", None)
+                        mm = getattr(bm, "mask_mod", None)
+                        _warn_flex_debug_once(
+                            f"flexattn-fused-ok-{hash(flex_key)}",
+                            "FlexAttention debug: compiled+FUSED OK; "
+                            f"mode={mode_key!r} dynamic={dyn_key!r} "
+                            f"q={tuple(getattr(q,'shape',()))} dtype={getattr(q,'dtype',None)} "
+                            f"passed_keys={sorted(list(flex_kwargs.keys()))} "
+                            f"kernel_options={flex_kwargs.get('kernel_options', None)} "
+                            f"block_mask={type(bm).__name__}@{id(bm):x} "
+                            f"score_mod={type(smod).__name__}@{id(smod):x} "
+                            f"mask_mod={type(mm).__name__}@{id(mm):x} "
+                            f"dilation={getattr(mm,'dilation',None)} win={getattr(mm,'win',None)} causal={getattr(mm,'causal',None)}",
+                        )
                     with _FLEX_ATTN_VERIFIED_LOCK:
                         _FLEX_ATTN_VERIFIED.add(flex_key)
                     return out
+                if _flex_strict_fused_enabled():
+                    raise RuntimeError(
+                        "FlexAttention: detected unfused/uncompiled execution in a compiled path "
+                        f"(mode={mode_key!r}, dynamic={dyn_key!r}). "
+                        "Disable ENN_FLEX_STRICT_FUSED/ENN_FLEX_ASSERT_FUSED to continue."
+                    )
                 if verify_any:
                     bm = flex_kwargs.get("block_mask", None)
                     smod = flex_kwargs.get("score_mod", None)
