@@ -1811,7 +1811,7 @@ def epochs(
                 flops = float(stats_cpu[2].item())
                 io_bytes = float(stats_cpu[3].item())
                 train_samples_epoch = float(stats_cpu[4].item())
-                distributed_barrier(device)
+                distributed_barrier(device) if get_world_size(device) > 1 else None
             if not scheduler_step_per_batch:
                 try:
                     sched.step()
@@ -1875,7 +1875,7 @@ def epochs(
                     },
                     block_if_busy=False,
                 )
-            if is_distributed():
+            if is_distributed() and get_world_size(device) > 1:
                 distributed_barrier(device)
             prev_comp_time += float(comp_time)
             prev_io_time += float(io_time)
