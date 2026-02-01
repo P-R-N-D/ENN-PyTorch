@@ -728,15 +728,6 @@ def epochs(
         if local_rank == 0
         else None
     )
-    checkpoint_bar = (
-        ProcessBroker.get_checkpoint_bar(
-            title="Training",
-            total=int(ops.epochs),
-            device=device,
-        )
-        if local_rank == 0
-        else None
-    )
     scheduler_step_per_batch = bool(scheduler_step_per_batch)
     swa_start_epoch = max(0, int(swa_start_epoch))
     prev_io_time = 0.0
@@ -1873,12 +1864,6 @@ def epochs(
 
             if checkpointer is not None:
                 checkpointer.poll()
-                ProcessBroker.update_checkpoint_bar(
-                    checkpoint_bar,
-                    finish=False,
-                    total=int(ops.epochs),
-                    position=int(epoch_idx + 1),
-                )
                 checkpointer.request_save_epoch(
                     epoch=int(epoch_idx + 1),
                     model=model,
