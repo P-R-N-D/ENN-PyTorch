@@ -115,6 +115,8 @@ _FLEX_ATTN_FAILED: dict[tuple[Any, ...], str] = {}
 _FLEX_ATTN_WARNED: set[str] = set()
 _FLEX_ATTN_RESOURCE_KOPTS: dict[tuple[Any, ...], dict[str, Any]] = {}
 _FLEX_ATTN_RESOURCE_KOPTS_LOCK = threading.Lock()
+_FLEX_ATTN_FUSED_OK_KEYS: set[str] = set()
+_FLEX_ATTN_FUSED_OK_LOCK = threading.Lock()
 _FLEX_UNCOMPILED_SUPPRESS_LOCK = threading.Lock()
 _FLEX_UNCOMPILED_SUPPRESS_INSTALLED = False
 _FLEX_UNCOMPILED_SUPPRESS_REPORTED = False
@@ -143,6 +145,43 @@ def _warn_once(key: str, message: str) -> None:
     _FLEX_ATTN_WARNED.add(key)
     with contextlib.suppress(Exception):
         warnings.warn(str(message), stacklevel=3)
+
+
+def _warn_fused_ok_throttled(
+    *,
+    mode_key: str,
+    q: torch.Tensor,
+    flex_kwargs: dict[str, Any],
+    dyn_key: Any,
+) -> None:
+    if not _flex_debug_enabled():
+        return
+    bm = flex_kwargs.get("block_mask", None)
+    mm = getattr(bm, "mask_mod", None)
+    ko = flex_kwargs.get("kernel_options", None)
+    key = (
+        f"{mode_key}|{str(getattr(q,'dtype',None))}|"
+        f"{tuple(getattr(q,'shape',()))}|{repr(ko)}|{type(mm).__name__}"
+    )
+    with _FLEX_ATTN_FUSED_OK_LOCK:
+        if key in _FLEX_ATTN_FUSED_OK_KEYS:
+            return
+        _FLEX_ATTN_FUSED_OK_KEYS.add(key)
+    smod = flex_kwargs.get("score_mod", None)
+    _warn_flex_debug_once(
+        f"flexattn-fused-ok-{hash(key)}",
+        "FlexAttention debug: compiled+FUSED OK; "
+        f"mode={mode_key!r} dynamic={dyn_key!r} "
+        f"q={tuple(getattr(q,'shape',()))} dtype={getattr(q,'dtype',None)} "
+        f"passed_keys={sorted(list(flex_kwargs.keys()))} "
+        f"kernel_options={ko} "
+        f"block_mask={type(bm).__name__}@{id(bm):x} "
+        f"score_mod={type(smod).__name__}@{id(smod):x} "
+        f"mask_mod={type(mm).__name__}@{id(mm):x} "
+        f"dilation={getattr(mm,'dilation',None)} "
+        f"win={getattr(mm,'win',None)} "
+        f"causal={getattr(mm,'causal',None)}",
+    )
 
 
 def _ensure_pythonwarnings_suppresses_flex_uncompiled() -> None:
@@ -2201,20 +2240,11 @@ class FlexAttention(nn.Module):
                 )
                 if not saw_uncompiled:
                     if verify_any:
-                        bm = flex_kwargs.get("block_mask", None)
-                        smod = flex_kwargs.get("score_mod", None)
-                        mm = getattr(bm, "mask_mod", None)
-                        _warn_flex_debug_once(
-                            f"flexattn-fused-ok-{hash(flex_key)}",
-                            "FlexAttention debug: compiled+FUSED OK; "
-                            f"mode={mode_key!r} dynamic={dyn_key!r} "
-                            f"q={tuple(getattr(q,'shape',()))} dtype={getattr(q,'dtype',None)} "
-                            f"passed_keys={sorted(list(flex_kwargs.keys()))} "
-                            f"kernel_options={flex_kwargs.get('kernel_options', None)} "
-                            f"block_mask={type(bm).__name__}@{id(bm):x} "
-                            f"score_mod={type(smod).__name__}@{id(smod):x} "
-                            f"mask_mod={type(mm).__name__}@{id(mm):x} "
-                            f"dilation={getattr(mm,'dilation',None)} win={getattr(mm,'win',None)} causal={getattr(mm,'causal',None)}",
+                        _warn_fused_ok_throttled(
+                            mode_key=mode_key,
+                            q=q,
+                            flex_kwargs=flex_kwargs,
+                            dyn_key=dyn_key,
                         )
                     with _FLEX_ATTN_VERIFIED_LOCK:
                         _FLEX_ATTN_VERIFIED.add(flex_key)
@@ -2587,8 +2617,8 @@ class MultiScaleRetention(nn.Module):
         p = p.clamp_min(tiny)
         inv_p = torch.reciprocal(p)
         v_scaled = v.to(dtype=calc_dtype) * inv_p
-        v_scaled[:, 0].zero_()
         cumsum_scaled = torch.cumsum(v_scaled, dim=1)
+        cumsum_scaled = cumsum_scaled - cumsum_scaled[:, :1]
         prev_scaled = v[:, 0].to(dtype=calc_dtype).unsqueeze(1)
         state = p * (prev_scaled + cumsum_scaled)
         return state.to(dtype=v.dtype).contiguous()
