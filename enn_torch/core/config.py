@@ -786,7 +786,7 @@ class RuntimeConfig:
         None
     )
     ckpt_dir: Optional[str] = None
-    ckpt_cpu_offload: bool = False
+    ckpt_cpu_offload: Optional[bool] = None
     init_ckpt_dir: Optional[str] = None
     epochs: int = 5
     val_frac: float = 0.1
@@ -948,8 +948,15 @@ class RuntimeConfig:
                     if data.get("init_ckpt_dir")
                     else None
                 ),
-                ckpt_cpu_offload=_coerce_bool(
-                    data.get("ckpt_cpu_offload", False), name="ckpt_cpu_offload"
+                ckpt_cpu_offload=(
+                    _coerce_bool(
+                        data["ckpt_cpu_offload"], name="ckpt_cpu_offload"
+                    )
+                    if (
+                        "ckpt_cpu_offload" in data
+                        and data["ckpt_cpu_offload"] is not None
+                    )
+                    else None
                 ),
                 epochs=_get_val("epochs", int, 1, def_=5),
                 val_frac=_get_val("val_frac", float, 0.0, 1.0, 0.1),

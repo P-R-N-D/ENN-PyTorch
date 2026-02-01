@@ -2073,7 +2073,7 @@ class Checkpointer:
         self.max_in_flight = 1
         self.use_async = bool(use_async)
         self.mmap_load = mmap_load
-        self._cpu_offload = bool(cpu_offload) if cpu_offload is not None else False
+        self._cpu_offload = cpu_offload
 
         self._pending_dcp: deque[_PendingOp] = deque()
         self._pending_avg: deque[_PendingOp] = deque()
@@ -2378,7 +2378,15 @@ class Checkpointer:
         return os.environ.get("ENN_DCP_MODEL_KIND", "avg").strip().lower()
 
     def _cpu_offload_enabled(self) -> bool:
-        return bool(getattr(self, "_cpu_offload", False))
+        cpu_offload = getattr(self, "_cpu_offload", None)
+        if cpu_offload is None:
+            return bool(
+                env_bool(
+                    ("ENN_DCP_CPU_OFFLOAD", "ENN_CKPT_CPU_OFFLOAD"),
+                    default=True,
+                )
+            )
+        return bool(cpu_offload)
 
     def _try_mark_orphan_complete(self, epoch_dir: Path) -> bool:
         if not self._is_global_rank0():

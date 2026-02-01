@@ -3337,7 +3337,7 @@ def process(*args: Any, **kwargs: Any) -> object:
                     use_async=use_async,
                     mmap_load=mmap_load,
                     device=device,
-                    cpu_offload=bool(getattr(ops, "ckpt_cpu_offload", False)),
+                    cpu_offload=getattr(ops, "ckpt_cpu_offload", None),
                 )
             try:
                 new_affinity().pin_thread()
