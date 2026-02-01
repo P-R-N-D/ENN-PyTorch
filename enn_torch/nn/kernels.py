@@ -412,49 +412,54 @@ def _looks_like_triton_resource_error(exc: BaseException) -> bool:
         "Hardware limit",
         "Reducing block sizes",
         "num_stages",
+        "num_warps",
     )
     return any(n in msg for n in needles)
+
+
+def _cuda_sm_for_flex_defaults() -> Optional[int]:
+    try:
+        dev = get_device()
+    except Exception:
+        dev = None
+    if (
+        dev is None
+        or getattr(dev, "type", None) != "cuda"
+        or (not torch.cuda.is_available())
+    ):
+        return None
+    try:
+        idx = (
+            dev.index
+            if getattr(dev, "index", None) is not None
+            else torch.cuda.current_device()
+        )
+        major, minor = torch.cuda.get_device_capability(idx)
+        return int(major) * 10 + int(minor)
+    except Exception:
+        return None
+
+
+def _pos_int(v: Any, default: int) -> int:
+    try:
+        i = int(v)
+        return i if i > 0 else int(default)
+    except Exception:
+        return int(default)
+
+
+def _clamp_max(opts: dict[str, Any], key: str, cap: int) -> None:
+    cap_i = _pos_int(cap, 1)
+    cur = opts.get(key, None)
+    if cur is None:
+        opts[key] = cap_i
+        return
+    opts[key] = min(_pos_int(cur, cap_i), cap_i)
 
 
 def _resource_safe_kernel_options(existing: Any) -> dict[str, Any]:
-    key = int(id(existing)) if existing is not None else 0
-    cached = _FLEX_ATTN_RESOURCE_KOPTS.get(key)
-    if cached is not None:
-        return cached
-    with _FLEX_ATTN_RESOURCE_KOPTS_LOCK:
-        cached = _FLEX_ATTN_RESOURCE_KOPTS.get(key)
-        if cached is not None:
-            return cached
-        opts: dict[str, Any] = {}
-        if isinstance(existing, Mapping):
-            with contextlib.suppress(Exception):
-                opts.update(dict(existing))
-        opts.setdefault("BLOCK_M", _env_int("ENN_FLEX_BLOCK_M", 64))
-        opts.setdefault("BLOCK_N", _env_int("ENN_FLEX_BLOCK_N", 64))
-        opts.setdefault("num_stages", _env_int("ENN_FLEX_NUM_STAGES", 1))
-        opts.setdefault("num_warps", _env_int("ENN_FLEX_NUM_WARPS", 4))
-        if "WRITE_DQ" not in opts:
-            opts["WRITE_DQ"] = bool(env_bool("ENN_FLEX_WRITE_DQ", False))
-        _FLEX_ATTN_RESOURCE_KOPTS[key] = opts
-        return opts
-
-
-def _looks_like_triton_resource_error(exc: BaseException) -> bool:
-    msg = str(exc)
-    if "No valid triton configs" not in msg:
-        return False
-    needles = (
-        "out of resource",
-        "OutOfResources",
-        "Hardware limit",
-        "num_stages",
-    )
-    return any(n in msg for n in needles)
-
-
-def _resource_safe_kernel_options(existing: Any) -> Optional[dict[str, Any]]:
     if (existing is not None) and (not isinstance(existing, Mapping)):
-        return None
+        existing = None
     key = int(id(existing)) if existing is not None else 0
     cached = _FLEX_ATTN_RESOURCE_KOPTS.get(key)
     if cached is not None:
@@ -463,14 +468,21 @@ def _resource_safe_kernel_options(existing: Any) -> Optional[dict[str, Any]]:
     if isinstance(existing, Mapping):
         for k, v in existing.items():
             base[str(k)] = v
-    base.setdefault("BLOCK_M", _env_int("ENN_FLEX_BLOCK_M", 64))
-    base.setdefault("BLOCK_N", _env_int("ENN_FLEX_BLOCK_N", 64))
-    base.setdefault("num_stages", _env_int("ENN_FLEX_NUM_STAGES", 1))
-    base.setdefault("num_warps", _env_int("ENN_FLEX_NUM_WARPS", 4))
-    base.setdefault("bwd_num_stages", _env_int("ENN_FLEX_BWD_NUM_STAGES", 1))
-    base.setdefault("bwd_num_warps", _env_int("ENN_FLEX_BWD_NUM_WARPS", 4))
-    base.setdefault("bwd_BLOCK_M1", _env_int("ENN_FLEX_BWD_BLOCK_M1", 32))
-    base.setdefault("bwd_BLOCK_N1", _env_int("ENN_FLEX_BWD_BLOCK_N1", 32))
+    sm = _cuda_sm_for_flex_defaults()
+    fwd_block_def = 32 if (sm is not None and sm <= 75) else 64
+    fwd_warps_def = 2 if (sm is not None and sm <= 75) else 4
+    bwd_block_def = 16 if (sm is not None and sm <= 75) else 32
+    bwd_warps_def = 2 if (sm is not None and sm <= 75) else 4
+
+    _clamp_max(base, "BLOCK_M", _env_int("ENN_FLEX_BLOCK_M", fwd_block_def))
+    _clamp_max(base, "BLOCK_N", _env_int("ENN_FLEX_BLOCK_N", fwd_block_def))
+    _clamp_max(base, "num_stages", _env_int("ENN_FLEX_NUM_STAGES", 1))
+    _clamp_max(base, "num_warps", _env_int("ENN_FLEX_NUM_WARPS", fwd_warps_def))
+
+    _clamp_max(base, "bwd_num_stages", _env_int("ENN_FLEX_BWD_NUM_STAGES", 1))
+    _clamp_max(base, "bwd_num_warps", _env_int("ENN_FLEX_BWD_NUM_WARPS", bwd_warps_def))
+    _clamp_max(base, "bwd_BLOCK_M1", _env_int("ENN_FLEX_BWD_BLOCK_M1", bwd_block_def))
+    _clamp_max(base, "bwd_BLOCK_N1", _env_int("ENN_FLEX_BWD_BLOCK_N1", bwd_block_def))
     if "WRITE_DQ" not in base and "bwd_WRITE_DQ" not in base:
         base["bwd_WRITE_DQ"] = bool(env_bool("ENN_FLEX_BWD_WRITE_DQ", False))
     with _FLEX_ATTN_RESOURCE_KOPTS_LOCK:

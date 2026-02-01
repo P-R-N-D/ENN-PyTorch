@@ -2167,10 +2167,19 @@ class Checkpointer:
 
     def poll(self) -> None:
         with contextlib.suppress(Exception):
-            self._cleanup_stale_dcp_inprogress()
-        with contextlib.suppress(Exception):
             self._cleanup_stale_inflight_lock()
         self._maybe_wait_for_budget(block=False)
+        busy = False
+        with contextlib.suppress(Exception):
+            with self._pending_lock:
+                busy = bool(self._pending_dcp)
+        if self._is_dcp_leader():
+            with contextlib.suppress(Exception):
+                if self._inflight_lock.exists():
+                    busy = True
+        if not busy:
+            with contextlib.suppress(Exception):
+                self._cleanup_stale_dcp_inprogress()
         if self._is_dcp_leader():
             _cleanup_delete_pending(self.dcp_root)
 
@@ -2202,11 +2211,23 @@ class Checkpointer:
         return out
 
     def _dcp_last_activity_time(self, epoch_dir: Path) -> float | None:
+        last: float | None
         try:
             last = float(epoch_dir.stat().st_mtime)
         except Exception:
             last = None
+        with contextlib.suppress(Exception):
+            ip = self._epoch_inprogress_file(epoch_dir)
+            if ip.is_file():
+                mt = float(ip.stat().st_mtime)
+                last = mt if last is None else max(last, mt)
+        if not env_bool("ENN_DCP_INPROGRESS_SCAN_FILES", False):
+            return last
+        max_files = int(env_int("ENN_DCP_INPROGRESS_SCAN_FILES_MAX", 256) or 256)
+        if max_files <= 0:
+            return last
         try:
+            seen = 0
             with os.scandir(epoch_dir) as it:
                 for ent in it:
                     try:
@@ -2214,7 +2235,10 @@ class Checkpointer:
                         mt = float(st.st_mtime)
                         last = mt if last is None else max(last, mt)
                     except Exception:
-                        continue
+                        pass
+                    seen += 1
+                    if seen >= max_files:
+                        break
         except Exception:
             pass
         return last
@@ -2458,33 +2482,19 @@ class Checkpointer:
             if callable(close_fn):
                 close_fn()
         self._close_stager()
-        with contextlib.suppress(Exception):
-            gc.collect()
-        try:
-            dev = self._device or get_device()
-            low_ram_default = False
-            if getattr(dev, "type", None) == "cuda":
-                total = None
-                with contextlib.suppress(Exception):
-                    total = Memory.total()
-                if isinstance(total, int) and total > 0:
-                    max_gb = int(
-                        env_int("ENN_DCP_CPU_OFFLOAD_AUTO_MAX_GB", 24) or 24
-                    )
-                    max_gb = max(4, max_gb)
-                    low_ram_default = (
-                        (float(total) / (1024.0**3)) <= float(max_gb)
-                    )
-            do_trim = bool(
-                env_bool("ENN_DCP_MALLOC_TRIM", default=low_ram_default)
-            )
-            if do_trim:
+        do_gc = bool(env_bool("ENN_DCP_GC_COLLECT", default=False))
+        do_trim = bool(env_bool("ENN_DCP_MALLOC_TRIM", default=False))
+        if not (do_gc or do_trim):
+            return
+        if do_gc:
+            with contextlib.suppress(Exception):
+                gc.collect()
+        if do_trim:
+            with contextlib.suppress(Exception):
                 libc = ctypes.CDLL("libc.so.6")
                 trim = getattr(libc, "malloc_trim", None)
                 if callable(trim):
                     trim(0)
-        except Exception:
-            pass
 
     def _maybe_finalize_dcp_op(self, op: _PendingOp) -> None:
         if op.kind != "dcp" or not op.epoch_dir:
@@ -2964,8 +2974,9 @@ class Checkpointer:
                     )
 
             try:
+                sync_files = bool(env_bool("ENN_DCP_SYNC_FILES", default=False))
                 writer = FileSystemWriter(
-                    str(epoch_dir), sync_files=True, overwrite=True
+                    str(epoch_dir), sync_files=sync_files, overwrite=True
                 )
             except TypeError:
                 writer = FileSystemWriter(str(epoch_dir))
@@ -3203,7 +3214,11 @@ class Checkpointer:
                         indent=2,
                     )
 
-            writer = FileSystemWriter(str(epoch_dir))
+            sync_files = bool(env_bool("ENN_DCP_SYNC_FILES", default=False))
+            try:
+                writer = FileSystemWriter(str(epoch_dir), sync_files=sync_files)
+            except TypeError:
+                writer = FileSystemWriter(str(epoch_dir))
             planner: object | None = None
             with contextlib.suppress(Exception):
                 from torch.distributed.checkpoint import DefaultSavePlanner
