@@ -60,6 +60,46 @@ except ImportError:
 _DTENSOR_ACTIVE: bool = False
 _GLOOX_GLOO_PG_CACHE: dict[tuple[int, ...], ProcessGroup] = {}
 _LOGGER = logging.getLogger(__name__)
+_INFLIGHT_LOCK_NAME = ".inflight.lock"
+_INFLIGHT_LOCK_TTL_SEC = int(os.environ.get("ENN_DCP_INFLIGHT_LOCK_TTL_SEC", "21600"))
+
+
+def _atomic_create_json(path, payload: dict) -> bool:
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        pass
+    try:
+        with open(path, "x", encoding="utf-8") as f:
+            json.dump(payload, f)
+        return True
+    except FileExistsError:
+        return False
+    except Exception:
+        with contextlib.suppress(Exception):
+            if path.exists():
+                path.unlink()
+        return False
+
+
+def _safe_rmtree(path) -> None:
+    shutil.rmtree(path, ignore_errors=True)
+    try:
+        if not path.exists():
+            return
+    except Exception:
+        return
+    ts = int(time.time())
+    dp = path.with_name(f"{path.name}.delete_pending.{ts}")
+    with contextlib.suppress(Exception):
+        path.rename(dp)
+    shutil.rmtree(dp, ignore_errors=True)
+
+
+def _cleanup_delete_pending(root) -> None:
+    with contextlib.suppress(Exception):
+        for p in root.glob("*.delete_pending.*"):
+            _safe_rmtree(p)
 
 
 def _coerce_dcp_keys(state: object) -> object:
@@ -92,13 +132,11 @@ def _overlay_avg_state_dict(dst: object, avg: Mapping[str, Any]) -> object:
             continue
         try:
             vv = v.detach()
-            if vv.device != cur.device:
-                vv = vv.to(device=cur.device)
-            if vv.dtype != cur.dtype:
-                vv = vv.to(dtype=cur.dtype)
             if tuple(vv.shape) != tuple(cur.shape):
                 continue
-            cur.copy_(vv, non_blocking=False)
+            if vv.dtype != cur.dtype:
+                vv = vv.to(dtype=cur.dtype)
+            cur.copy_(vv, non_blocking=True)
         except Exception:
             continue
     return dst
@@ -1987,19 +2025,14 @@ class ProcessBroker:
     ) -> None:
         if bar is None:
             return
+        bar.set_description_str("Checkpoint Requested")
+        bar.set_postfix_str(f"Position={int(position)}/{int(total)}")
         try:
-            inc = int(finish)
+            bar.total = int(total)
+            bar.n = max(0, min(int(position), int(total)))
         except Exception:
-            inc = 1
-        finished = int(position) + (1 if inc > 0 else 0)
-        if inc == 0:
-            chpt_expr = f"(Total = {int(total)}, Finished = {finished}) Checkpoint in Progress"
-        else:
-            chpt_expr = f"(Total = {int(total)}, Finished = {finished}) Checkpoint Completed"
-        with contextlib.suppress(Exception):
-            bar.unit = chpt_expr
-        with contextlib.suppress(Exception):
-            bar.update(inc)
+            pass
+        bar.refresh()
 
 
 @dataclasses.dataclass
@@ -2019,7 +2052,6 @@ class Checkpointer:
         ckpt_dir: PathLike,
         *args: Any,
         keep_last: int = 1,
-        max_in_flight: int = 1,
         use_async: bool = True,
         dcp_subdir: str = "dcp_epochs",
         avg_subdir: str = "avg",
@@ -2035,7 +2067,7 @@ class Checkpointer:
             avg_ext if str(avg_ext).startswith(".") else f".{avg_ext}"
         )
         self.keep_last = max(1, int(keep_last))
-        self.max_in_flight = max(1, int(max_in_flight))
+        self.max_in_flight = 1
         self.use_async = bool(use_async)
         self.mmap_load = mmap_load
 
@@ -2106,6 +2138,106 @@ class Checkpointer:
             )
         except Exception:
             self._dcp_inprogress_grace_sec = 60
+
+        self._inflight_lock = self.dcp_root / _INFLIGHT_LOCK_NAME
+        self._inflight_mu = threading.Lock()
+
+        self._sync_pg = None
+        if self._is_distributed():
+            try:
+                self._sync_pg = dist.new_group(backend="gloo")
+            except Exception:
+                self._sync_pg = None
+
+        self._cleanup_stale_inflight_lock()
+        if self._is_dcp_leader():
+            _cleanup_delete_pending(self.dcp_root)
+
+    def _sync_group(self):
+        if not self._is_distributed():
+            return None
+        return (
+            self._sync_pg
+            if self._sync_pg is not None
+            else (self._dcp_process_group or dist.group.WORLD)
+        )
+
+    def _sync_device(self) -> str:
+        if not self._is_distributed():
+            return "cpu"
+        pg = self._sync_group()
+        try:
+            backend = dist.get_backend(pg)
+        except Exception:
+            backend = None
+        if backend == "nccl":
+            return f"cuda:{torch.cuda.current_device()}"
+        return "cpu"
+
+    def _bcast_bool_from_leader(self, flag: bool) -> bool:
+        if not self._is_distributed():
+            return bool(flag)
+        pg = self._sync_group()
+        t = torch.tensor(
+            [1 if flag else 0], device=self._sync_device(), dtype=torch.int32
+        )
+        dist.broadcast(t, src=0, group=pg)
+        return bool(int(t.item()))
+
+    def _is_dcp_leader(self) -> bool:
+        if not self._is_distributed():
+            return True
+        pg = self._dcp_process_group or dist.group.WORLD
+        try:
+            return int(dist.get_rank(pg)) == 0
+        except Exception:
+            return self._is_global_rank0()
+
+    def _cleanup_stale_inflight_lock(self) -> None:
+        if not self._is_dcp_leader():
+            return
+        try:
+            if not self._inflight_lock.exists():
+                return
+            if _INFLIGHT_LOCK_TTL_SEC <= 0:
+                return
+            age = time.time() - float(self._inflight_lock.stat().st_mtime)
+            if age < float(_INFLIGHT_LOCK_TTL_SEC):
+                return
+            with contextlib.suppress(Exception):
+                self._inflight_lock.unlink()
+        except Exception:
+            return
+
+    def _try_acquire_inflight_lock(self, epoch: int) -> bool:
+        if not self._is_dcp_leader():
+            return False
+        self._cleanup_stale_inflight_lock()
+        payload = {"epoch": int(epoch), "pid": int(os.getpid()), "ts": time.time()}
+        return _atomic_create_json(self._inflight_lock, payload)
+
+    def _release_inflight_lock(self) -> None:
+        if not self._is_dcp_leader():
+            return
+        with contextlib.suppress(Exception):
+            if self._inflight_lock.exists():
+                self._inflight_lock.unlink()
+
+    def poll(self) -> None:
+        self._maybe_wait_for_budget(block=False)
+        if self._is_dcp_leader():
+            _cleanup_delete_pending(self.dcp_root)
+
+    def is_idle(self) -> bool:
+        self.poll()
+        local_busy = False
+        with self._pending_lock:
+            local_busy = bool(self._pending_dcp) or bool(self._pending_avg)
+        if self._is_dcp_leader():
+            with contextlib.suppress(Exception):
+                if self._inflight_lock.exists():
+                    local_busy = True
+        return not local_busy
 
     def _list_dcp_inprogress(self) -> list[Path]:
         out: list[Path] = []
@@ -2368,7 +2500,7 @@ class Checkpointer:
                 "DCP housekeeping failed for epoch=%d: %s", int(op.epoch), exc
             )
 
-    def _maybe_wait_for_budget(self) -> None:
+    def _maybe_wait_for_budget(self, *, block: bool = True) -> None:
         done_ops: list[tuple[_PendingOp, bool, str | None]] = []
         with self._pending_lock:
             while self._pending_dcp and _future_done(self._pending_dcp[0].future):
@@ -2402,37 +2534,38 @@ class Checkpointer:
             ):
                 self._pending_avg.popleft()
 
-            while len(self._pending_dcp) >= self.max_in_flight:
-                op = self._pending_dcp[0]
-                fut = op.future
-                self._pending_lock.release()
-                ok = True
-                err: str | None = None
-                try:
-                    _future_result(fut)
-                except Exception as exc:
-                    ok = False
-                    err = f"{type(exc).__name__}: {exc}"
-                    if self._is_global_rank0():
-                        _LOGGER.exception(
-                            "DCP async_save failed while waiting budget (epoch=%d): %s",
-                            int(op.epoch),
-                            exc,
-                        )
-                finally:
-                    self._pending_lock.acquire()
-                removed = False
-                if self._pending_dcp and self._pending_dcp[0] is op:
-                    self._pending_dcp.popleft()
-                    removed = True
-                else:
-                    with contextlib.suppress(ValueError):
-                        self._pending_dcp.remove(op)
+            if block:
+                while len(self._pending_dcp) >= self.max_in_flight:
+                    op = self._pending_dcp[0]
+                    fut = op.future
+                    self._pending_lock.release()
+                    ok = True
+                    err: str | None = None
+                    try:
+                        _future_result(fut)
+                    except Exception as exc:
+                        ok = False
+                        err = f"{type(exc).__name__}: {exc}"
+                        if self._is_global_rank0():
+                            _LOGGER.exception(
+                                "DCP async_save failed while waiting budget (epoch=%d): %s",
+                                int(op.epoch),
+                                exc,
+                            )
+                    finally:
+                        self._pending_lock.acquire()
+                    removed = False
+                    if self._pending_dcp and self._pending_dcp[0] is op:
+                        self._pending_dcp.popleft()
                         removed = True
-                if removed:
-                    with contextlib.suppress(Exception):
-                        op.future = None
-                    done_ops.append((op, ok, err))
+                    else:
+                        with contextlib.suppress(ValueError):
+                            self._pending_dcp.remove(op)
+                            removed = True
+                    if removed:
+                        with contextlib.suppress(Exception):
+                            op.future = None
+                        done_ops.append((op, ok, err))
 
             while len(self._pending_avg) >= 1:
                 op = self._pending_avg[0]
@@ -2566,7 +2699,7 @@ class Checkpointer:
                 return
             for p in epoch_dirs[: max(0, len(epoch_dirs) - self.keep_last)]:
                 try:
-                    shutil.rmtree(p)
+                    _safe_rmtree(p)
                 except Exception as exc:
                     if env_bool("ENN_DCP_LOG_PRUNE", False):
                         _LOGGER.warning("DCP prune failed for %s: %s", str(p), exc)
@@ -2630,21 +2763,58 @@ class Checkpointer:
         *,
         epoch: int,
         model: nn.Module,
-        optimizer: object | None = None,
+        optimizer: Optimizer | None = None,
         avg_state_dict: Mapping[str, Any] | None = None,
         extra_state: dict[str, Any] | None = None,
+        save_optimizer: bool | None = None,
+        save_avg: bool | None = None,
         force_sync: bool = False,
+        block_if_busy: bool = False,
     ) -> None:
         epoch_i = int(epoch)
 
-        self._maybe_wait_for_budget()
-        self._wait_for_dcp_inprogress_slot()
+        self._maybe_wait_for_budget(block=False)
 
         if avg_state_dict is not None and self._is_local_rank0():
             self._schedule_avg_save(epoch_i, avg_state_dict)
 
         if not self._dcp_should_participate:
             return
+
+        accept = True
+        if self._is_dcp_leader():
+            with self._pending_lock:
+                if self._pending_dcp:
+                    accept = False
+            with contextlib.suppress(Exception):
+                if self._inflight_lock.exists():
+                    accept = False
+            if accept:
+                accept = self._try_acquire_inflight_lock(epoch_i)
+
+        accept = self._bcast_bool_from_leader(bool(accept))
+        if not accept:
+            if block_if_busy:
+                while True:
+                    time.sleep(0.2)
+                    self.poll()
+                    accept_local = False
+                    if self._is_dcp_leader():
+                        with self._pending_lock:
+                            accept_local = not bool(self._pending_dcp)
+                        with contextlib.suppress(Exception):
+                            accept_local = accept_local and (
+                                not self._inflight_lock.exists()
+                            )
+                        if accept_local:
+                            accept_local = self._try_acquire_inflight_lock(
+                                epoch_i
+                            )
+                    accept = self._bcast_bool_from_leader(bool(accept_local))
+                    if accept:
+                        break
+            else:
+                return
 
         dcp_future: object | None = None
         try:
@@ -2788,29 +2958,44 @@ class Checkpointer:
                 dcp_future = None
 
             if dcp_future is not None:
-                if self._is_global_rank0():
+                if self._is_dcp_leader():
                     def _finalize_cb() -> None:
+                        ok = True
+                        err: str | None = None
                         try:
                             _future_result(dcp_future)
                         except Exception as exc:
+                            ok = False
+                            err = f"{type(exc).__name__}: {exc}"
                             _LOGGER.exception(
                                 "DCP async_save failed (epoch=%d): %s",
                                 int(epoch_i),
                                 exc,
                             )
-                            self._cleanup_failed_epoch_dir(
-                                int(epoch_i),
-                                reason=f"{type(exc).__name__}: {exc}",
-                            )
-                            return
-                        self._finalize_dcp_epoch(
-                            epoch_i,
-                            epoch_dir,
-                            extra_meta={
-                                "has_optimizer": bool(save_opt),
-                                "model_kind": ("avg" if want_avg else "active"),
-                            },
-                        )
+
+                        with contextlib.suppress(Exception):
+                            import torch.distributed.checkpoint.state_dict_saver as sds
+                            close_fn = getattr(sds, "close", None)
+                            if callable(close_fn):
+                                close_fn()
+
+                        try:
+                            if ok:
+                                self._finalize_dcp_epoch(
+                                    epoch_i,
+                                    epoch_dir,
+                                    extra_meta={
+                                        "has_optimizer": bool(save_opt),
+                                        "model_kind": ("avg" if want_avg else "active"),
+                                    },
+                                )
+                                _cleanup_delete_pending(self.dcp_root)
+                            else:
+                                self._cleanup_failed_epoch_dir(
+                                    int(epoch_i), reason=err
+                                )
+                        finally:
+                            self._release_inflight_lock()
 
                     _add_future_callback(dcp_future, _finalize_cb)
                 self._register_pending(
@@ -2821,15 +3006,30 @@ class Checkpointer:
                     has_optimizer=bool(save_opt),
                 )
             else:
-                self._finalize_dcp_epoch(
-                    epoch_i,
-                    epoch_dir,
-                    extra_meta={"has_optimizer": bool(save_opt), "model_kind": ("avg" if want_avg else "active")},
-                )
+                with contextlib.suppress(Exception):
+                    import torch.distributed.checkpoint.state_dict_saver as sds
+                    close_fn = getattr(sds, "close", None)
+                    if callable(close_fn):
+                        close_fn()
+                try:
+                    self._finalize_dcp_epoch(
+                        epoch_i,
+                        epoch_dir,
+                        extra_meta={
+                            "has_optimizer": bool(save_opt),
+                            "model_kind": ("avg" if want_avg else "active"),
+                        },
+                    )
+                    if self._is_dcp_leader():
+                        _cleanup_delete_pending(self.dcp_root)
+                finally:
+                    self._release_inflight_lock()
         except Exception as exc:
             _LOGGER.exception("DCP epoch checkpoint failed: %s", exc)
             with contextlib.suppress(Exception):
                 self._cleanup_failed_epoch_dir(int(epoch_i), reason=f"{type(exc).__name__}: {exc}")
+            with contextlib.suppress(Exception):
+                self._release_inflight_lock()
             if force_sync:
                 raise
 
@@ -2866,8 +3066,41 @@ class Checkpointer:
             self._pending_dcp.clear()
             self._pending_avg.clear()
 
-    def close(self) -> None:
-        self.wait()
+    def abort_inflight(self) -> None:
+        with self._pending_lock:
+            pending = list(self._pending_dcp) + list(self._pending_avg)
+            self._pending_dcp.clear()
+            self._pending_avg.clear()
+
+        for op in pending:
+            fut = getattr(op, "future", None)
+            if fut is None:
+                continue
+            cancel_fn = getattr(fut, "cancel", None)
+            if callable(cancel_fn):
+                with contextlib.suppress(Exception):
+                    cancel_fn()
+            with contextlib.suppress(Exception):
+                op.future = None
+
+        with contextlib.suppress(Exception):
+            import torch.distributed.checkpoint.state_dict_saver as sds
+            close_fn = getattr(sds, "close", None)
+            if callable(close_fn):
+                close_fn()
+
+        if self._is_dcp_leader():
+            self._release_inflight_lock()
+            with contextlib.suppress(Exception):
+                for p in self._list_dcp_inprogress():
+                    _safe_rmtree(p)
+            _cleanup_delete_pending(self.dcp_root)
+
+    def close(self, *, abort_inflight: bool = True) -> None:
+        if abort_inflight and (not self.is_idle()):
+            self.abort_inflight()
+        else:
+            self.wait()
         with contextlib.suppress(Exception):
             import torch.distributed.checkpoint.state_dict_saver as sds
 
