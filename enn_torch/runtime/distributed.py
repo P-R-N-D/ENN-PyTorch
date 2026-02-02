@@ -2003,6 +2003,7 @@ class _PendingOp:
     epoch: int
     future: object | None
     started_monotonic: float
+    abort_gen: int = 0
     epoch_dir: str | None = None
     has_optimizer: bool = False
     ok: bool = False
@@ -2048,6 +2049,7 @@ class Checkpointer:
         self._stager_closed = False
         self._stager_cfg: tuple[bool, bool] | None = None
         self._stager_pinned_disabled: bool = False
+        self._abort_gen: int = 0
 
         try:
             import torch.distributed as dist
@@ -2668,7 +2670,7 @@ class Checkpointer:
                 except Exception as exc:
                     ok = False
                     err = f"{type(exc).__name__}: {exc}"
-                    if self._is_global_rank0():
+                    if self._is_global_rank0() and int(getattr(op, "abort_gen", 0)) == int(self._abort_gen):
                         _LOGGER.exception(
                             "DCP async_save failed (epoch=%d): %s",
                             int(op.epoch),
@@ -2701,7 +2703,7 @@ class Checkpointer:
                     except Exception as exc:
                         ok = False
                         err = f"{type(exc).__name__}: {exc}"
-                        if self._is_global_rank0():
+                        if self._is_global_rank0() and int(getattr(op, "abort_gen", 0)) == int(self._abort_gen):
                             _LOGGER.exception(
                                 "DCP async_save failed while waiting budget (epoch=%d): %s",
                                 int(op.epoch),
@@ -2767,6 +2769,7 @@ class Checkpointer:
                     epoch=int(epoch),
                     future=fut,
                     started_monotonic=time.monotonic(),
+                    abort_gen=int(self._abort_gen),
                     epoch_dir=epoch_dir,
                     has_optimizer=bool(has_optimizer),
                 )
@@ -2953,6 +2956,7 @@ class Checkpointer:
         dcp_future: object,
         has_optimizer: bool,
         model_kind: str,
+        abort_gen: int,
         used_pinned: bool = False,
         retry_unpinned: Callable[[], object] | None = None,
     ) -> None:
@@ -2962,7 +2966,11 @@ class Checkpointer:
         try:
             _future_result(dcp_future)
         except Exception as exc:
-            if used_pinned and callable(retry_unpinned) and _is_oomish_error(exc):
+            if int(abort_gen) != int(self._abort_gen):
+                ok = False
+                err = "aborted"
+                pending_exc = None
+            elif used_pinned and callable(retry_unpinned) and _is_oomish_error(exc):
                 self._stager_pinned_disabled = True
                 with contextlib.suppress(Exception):
                     self._close_stager()
@@ -3029,7 +3037,7 @@ class Checkpointer:
             with contextlib.suppress(Exception):
                 self._release_inflight_lock()
             self._post_dcp_cleanup()
-        if pending_exc is not None:
+        if pending_exc is not None and int(abort_gen) == int(self._abort_gen):
             raise pending_exc
 
     def _save_dcp_epoch_background(
@@ -3519,6 +3527,8 @@ class Checkpointer:
                         if thr_t is not None:
                             kwargs["async_checkpointer_type"] = thr_t
 
+                kwargs["use_pinned_memory"] = False
+
                 if supported is not None:
                     kwargs = {
                         k: v for k, v in kwargs.items() if k in supported and v is not None
@@ -3622,6 +3632,7 @@ class Checkpointer:
                         dcp_future=dcp_future,
                         has_optimizer=bool(save_opt),
                         model_kind=("avg" if want_avg else "active"),
+                        abort_gen=int(self._abort_gen),
                         used_pinned=bool(locals().get("used_pinned", False)),
                         retry_unpinned=locals().get("retry_unpinned", None),
                     )
@@ -3695,7 +3706,7 @@ class Checkpointer:
             except Exception as exc:
                 ok = False
                 err = f"{type(exc).__name__}: {exc}"
-                if self._is_global_rank0() and op.kind == "dcp":
+                if self._is_global_rank0() and op.kind == "dcp" and int(getattr(op, "abort_gen", 0)) == int(self._abort_gen):
                     _LOGGER.exception(
                         "Pending DCP save failed during wait (epoch=%d): %s",
                         int(op.epoch),
@@ -3722,6 +3733,7 @@ class Checkpointer:
             pending = list(self._pending_dcp) + list(self._pending_avg)
             self._pending_dcp.clear()
             self._pending_avg.clear()
+        self._abort_gen = int(self._abort_gen) + 1
 
         for op in pending:
             fut = getattr(op, "future", None)
@@ -3739,6 +3751,9 @@ class Checkpointer:
             close_fn = getattr(sds, "close", None)
             if callable(close_fn):
                 close_fn()
+
+        with contextlib.suppress(Exception):
+            self._sigkill_torch_checkpoint_processes()
 
         if self._is_dcp_leader():
             self._release_inflight_lock()
