@@ -3538,7 +3538,6 @@ class Checkpointer:
                         default=True,
                     )
                 )
-                # optional: host RAM guard (pinned는 system RAM/locked pages를 때림)
                 try:
                     min_free_gb = int(
                         env_int("ENN_DCP_STAGER_PINNED_MIN_FREE_GB", 2) or 2
