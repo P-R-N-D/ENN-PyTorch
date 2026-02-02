@@ -66,6 +66,28 @@ _INFLIGHT_LOCK_NAME = ".inflight.lock"
 _INFLIGHT_LOCK_TTL_SEC = int(os.environ.get("ENN_DCP_INFLIGHT_LOCK_TTL_SEC", "21600"))
 
 
+def _is_oomish_error(exc: BaseException) -> bool:
+    if isinstance(exc, (MemoryError, EOFError, BrokenPipeError)):
+        return True
+    msg = str(exc).lower()
+    return (
+        "out of memory" in msg
+        or "cuda out of memory" in msg
+        or "cannot allocate memory" in msg
+        or "cudahostalloc" in msg
+        or ("alloc" in msg and "failed" in msg and "memory" in msg)
+    )
+
+
+if env_bool("ENN_SUPPRESS_TYPEDSTORAGE_WARNING", default=True):
+    _rule = "ignore:TypedStorage is deprecated:UserWarning"
+    _w = os.environ.get("PYTHONWARNINGS", "")
+    if not _w:
+        os.environ["PYTHONWARNINGS"] = _rule
+    elif _rule not in _w:
+        os.environ["PYTHONWARNINGS"] = f"{_w},{_rule}"
+
+
 def _atomic_create_json(path, payload: dict) -> bool:
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -2471,19 +2493,6 @@ class Checkpointer:
     def _avg_latest_file(self, node_rank: int | None = None) -> Path:
         return self._avg_node_dir(node_rank) / "latest.json"
 
-    @staticmethod
-    def _is_oomish_error(exc: BaseException) -> bool:
-        if isinstance(exc, (MemoryError, EOFError, BrokenPipeError)):
-            return True
-        msg = str(exc).lower()
-        return (
-            "out of memory" in msg
-            or "cuda out of memory" in msg
-            or "cannot allocate memory" in msg
-            or "cudahostalloc" in msg
-            or ("alloc" in msg and "failed" in msg and "memory" in msg)
-        )
-
     def _sigkill_torch_checkpoint_processes(self) -> None:
         try:
             import multiprocessing as _mp
@@ -2549,7 +2558,7 @@ class Checkpointer:
                     self._stager_owner_thread = tid
                     self._stager_cfg = cfg
                 except Exception as exc:
-                    if bool(cfg[0]) and self._is_oomish_error(exc):
+                    if bool(cfg[0]) and _is_oomish_error(exc):
                         self._stager_pinned_disabled = True
                         try:
                             self._stager = _build(False)
@@ -2557,7 +2566,7 @@ class Checkpointer:
                             self._stager_cfg = (False, False)
                             return self._stager
                         except Exception as exc2:
-                            if self._is_oomish_error(exc2):
+                            if _is_oomish_error(exc2):
                                 self._sigkill_torch_checkpoint_processes()
                             self._stager = None
                             self._stager_owner_thread = None
@@ -2566,6 +2575,10 @@ class Checkpointer:
                     self._stager = None
                     self._stager_owner_thread = None
                     self._stager_cfg = None
+            except Exception:
+                self._stager = None
+                self._stager_owner_thread = None
+                self._stager_cfg = None
             return self._stager
 
     def _close_stager(self) -> None:
@@ -2949,7 +2962,7 @@ class Checkpointer:
         try:
             _future_result(dcp_future)
         except Exception as exc:
-            if used_pinned and callable(retry_unpinned) and self._is_oomish_error(exc):
+            if used_pinned and callable(retry_unpinned) and _is_oomish_error(exc):
                 self._stager_pinned_disabled = True
                 with contextlib.suppress(Exception):
                     self._close_stager()
@@ -2983,7 +2996,7 @@ class Checkpointer:
                             exc2,
                             str(epoch_dir),
                         )
-                    if self._is_oomish_error(exc2):
+                    if _is_oomish_error(exc2):
                         self._sigkill_torch_checkpoint_processes()
             else:
                 ok = False
@@ -2996,7 +3009,7 @@ class Checkpointer:
                         exc,
                         str(epoch_dir),
                     )
-                if self._is_oomish_error(exc):
+                if _is_oomish_error(exc):
                     self._sigkill_torch_checkpoint_processes()
         try:
             if self._is_dcp_leader():
@@ -3465,19 +3478,9 @@ class Checkpointer:
                     supported = None
                     supports_async_stager = None
 
-                dev_is_cuda = bool(
-                    getattr(getattr(self, "_device", None), "type", None) == "cuda"
-                )
-                is_thread = async_type in {"thread", "thr"}
-                use_pinned = bool(
-                    dev_is_cuda and is_thread and supports_async_stager is not False
-                )
-                use_pinned = bool(
-                    use_pinned and env_bool("ENN_DCP_STAGER_PINNED", default=True)
-                )
                 stager = None
                 if supports_async_stager is not False:
-                    stager = self._ensure_stager(use_pinned_memory=use_pinned)
+                    stager = self._ensure_stager(use_pinned_memory=False)
                 elif self._is_global_rank0() and env_bool("ENN_DCP_DEBUG", False):
                     _LOGGER.warning(
                         "dcp.async_save does not support async_stager; disabling stager (pinned/unpinned irrelevant)."
@@ -3523,6 +3526,41 @@ class Checkpointer:
                 else:
                     kwargs = {k: v for k, v in kwargs.items() if v is not None}
 
+                dev_is_cuda = bool(
+                    getattr(getattr(self, "_device", None), "type", None) == "cuda"
+                )
+                use_pinned = bool(
+                    dev_is_cuda
+                    and async_type in {"thread", "thr"}
+                    and (not self._stager_pinned_disabled)
+                    and env_bool(
+                        ("ENN_DCP_STAGER_PINNED", "ENN_CKPT_STAGER_PINNED"),
+                        default=True,
+                    )
+                )
+                try:
+                    min_free_gb = int(
+                        env_int("ENN_DCP_STAGER_PINNED_MIN_FREE_GB", 2) or 2
+                    )
+                except Exception:
+                    min_free_gb = 2
+                if int(min_free_gb) > 0:
+                    avail = None
+                    with contextlib.suppress(Exception):
+                        avail = Memory.available()
+                    if (
+                        isinstance(avail, int)
+                        and avail > 0
+                        and avail < int(min_free_gb) * 1024**3
+                    ):
+                        use_pinned = False
+                if "async_stager" in kwargs:
+                    stager2 = self._ensure_stager(use_pinned_memory=use_pinned)
+                    if stager2 is None:
+                        kwargs.pop("async_stager", None)
+                    else:
+                        kwargs["async_stager"] = stager2
+
                 def _call_async_save_safe(kw: dict[str, Any]) -> object:
                     try:
                         return dcp.async_save(**kw)
@@ -3549,20 +3587,19 @@ class Checkpointer:
                         raise
 
                 retry_unpinned = None
-                used_pinned = bool(use_pinned and ("async_stager" in kwargs))
-                if used_pinned:
+                supports_async_stager = "async_stager" in kwargs
+                if supports_async_stager:
                     def _retry_unpinned() -> object:
                         kw2 = dict(kwargs)
-                        if supports_async_stager is False:
-                            kw2.pop("async_stager", None)
-                            return _call_async_save_safe(kw2)
                         st2 = self._ensure_stager(use_pinned_memory=False)
                         kw2.pop("async_stager", None)
-                        if st2 is not None:
+                        if st2 is not None and supports_async_stager:
                             kw2["async_stager"] = st2
                         return _call_async_save_safe(kw2)
 
                     retry_unpinned = _retry_unpinned
+
+                used_pinned = bool(use_pinned and ("async_stager" in kwargs))
 
                 dcp_future = _call_async_save_safe(kwargs)
             else:
