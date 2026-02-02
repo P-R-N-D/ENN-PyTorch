@@ -3532,11 +3532,35 @@ class Checkpointer:
                 use_pinned = bool(
                     dev_is_cuda
                     and async_type in {"thread", "thr"}
-                    and env_bool("ENN_DCP_STAGER_PINNED", default=True)
+                    and (not self._stager_pinned_disabled)
+                    and env_bool(
+                        ("ENN_DCP_STAGER_PINNED", "ENN_CKPT_STAGER_PINNED"),
+                        default=True,
+                    )
                 )
+                # optional: host RAM guard (pinned는 system RAM/locked pages를 때림)
+                try:
+                    min_free_gb = int(
+                        env_int("ENN_DCP_STAGER_PINNED_MIN_FREE_GB", 2) or 2
+                    )
+                except Exception:
+                    min_free_gb = 2
+                if int(min_free_gb) > 0:
+                    avail = None
+                    with contextlib.suppress(Exception):
+                        avail = Memory.available()
+                    if (
+                        isinstance(avail, int)
+                        and avail > 0
+                        and avail < int(min_free_gb) * 1024**3
+                    ):
+                        use_pinned = False
                 if "async_stager" in kwargs:
                     stager2 = self._ensure_stager(use_pinned_memory=use_pinned)
-                    kwargs["async_stager"] = stager2
+                    if stager2 is None:
+                        kwargs.pop("async_stager", None)
+                    else:
+                        kwargs["async_stager"] = stager2
 
                 def _call_async_save_safe(kw: dict[str, Any]) -> object:
                     try:
