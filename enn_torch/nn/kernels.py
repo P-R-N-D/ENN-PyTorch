@@ -2776,7 +2776,6 @@ class MultiScaleRetention(nn.Module):
                     )
         st_bhd = self._extract_state_tensor(state, B=B, H=int(self.nhead))
         if st_bhd is not None:
-            v = v.clone()
             st_scaled = lam_h.view(1, 1, self.nhead, 1) * st_bhd.to(
                 dtype=v.dtype, device=v.device
             ).unsqueeze(1)

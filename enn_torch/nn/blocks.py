@@ -43,6 +43,8 @@ _ENN_HAS_FLEX_ATTENTION = getattr(
 
 
 def _safe_norm(norm: nn.Module, x: torch.Tensor) -> torch.Tensor:
+    if not torch.is_grad_enabled():
+        return norm(x)
     if isinstance(norm, nn.LayerNorm):
         weight = norm.weight
         bias = norm.bias
