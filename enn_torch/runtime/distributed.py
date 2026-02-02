@@ -2048,6 +2048,7 @@ class Checkpointer:
         self._stager_closed = False
         self._stager_cfg: tuple[bool, bool] | None = None
         self._stager_pinned_disabled: bool = False
+        self._abort_requested: bool = False
 
         try:
             import torch.distributed as dist
@@ -2668,7 +2669,7 @@ class Checkpointer:
                 except Exception as exc:
                     ok = False
                     err = f"{type(exc).__name__}: {exc}"
-                    if self._is_global_rank0():
+                    if self._is_global_rank0() and (not self._abort_requested):
                         _LOGGER.exception(
                             "DCP async_save failed (epoch=%d): %s",
                             int(op.epoch),
@@ -2701,7 +2702,7 @@ class Checkpointer:
                     except Exception as exc:
                         ok = False
                         err = f"{type(exc).__name__}: {exc}"
-                        if self._is_global_rank0():
+                        if self._is_global_rank0() and (not self._abort_requested):
                             _LOGGER.exception(
                                 "DCP async_save failed while waiting budget (epoch=%d): %s",
                                 int(op.epoch),
@@ -2962,7 +2963,11 @@ class Checkpointer:
         try:
             _future_result(dcp_future)
         except Exception as exc:
-            if used_pinned and callable(retry_unpinned) and _is_oomish_error(exc):
+            if self._abort_requested:
+                ok = False
+                err = "aborted"
+                pending_exc = None
+            elif used_pinned and callable(retry_unpinned) and _is_oomish_error(exc):
                 self._stager_pinned_disabled = True
                 with contextlib.suppress(Exception):
                     self._close_stager()
@@ -3029,7 +3034,7 @@ class Checkpointer:
             with contextlib.suppress(Exception):
                 self._release_inflight_lock()
             self._post_dcp_cleanup()
-        if pending_exc is not None:
+        if pending_exc is not None and (not self._abort_requested):
             raise pending_exc
 
     def _save_dcp_epoch_background(
@@ -3519,6 +3524,8 @@ class Checkpointer:
                         if thr_t is not None:
                             kwargs["async_checkpointer_type"] = thr_t
 
+                kwargs["use_pinned_memory"] = False
+
                 if supported is not None:
                     kwargs = {
                         k: v for k, v in kwargs.items() if k in supported and v is not None
@@ -3695,7 +3702,7 @@ class Checkpointer:
             except Exception as exc:
                 ok = False
                 err = f"{type(exc).__name__}: {exc}"
-                if self._is_global_rank0() and op.kind == "dcp":
+                if (not self._abort_requested) and self._is_global_rank0() and op.kind == "dcp":
                     _LOGGER.exception(
                         "Pending DCP save failed during wait (epoch=%d): %s",
                         int(op.epoch),
@@ -3722,6 +3729,7 @@ class Checkpointer:
             pending = list(self._pending_dcp) + list(self._pending_avg)
             self._pending_dcp.clear()
             self._pending_avg.clear()
+        self._abort_requested = True
 
         for op in pending:
             fut = getattr(op, "future", None)
@@ -3739,6 +3747,9 @@ class Checkpointer:
             close_fn = getattr(sds, "close", None)
             if callable(close_fn):
                 close_fn()
+
+        with contextlib.suppress(Exception):
+            self._sigkill_torch_checkpoint_processes()
 
         if self._is_dcp_leader():
             self._release_inflight_lock()
