@@ -2829,9 +2829,15 @@ class Checkpointer:
         return path
 
     def _schedule_avg_save(
-        self, epoch: int, avg_state_dict: Mapping[str, Any]
+        self,
+        epoch: int,
+        avg_state_dict: Mapping[str, Any],
+        *,
+        enabled: bool | None = None,
     ) -> None:
-        if not self._avg_file_enabled(None):
+        if enabled is None:
+            enabled = self._avg_file_enabled(None)
+        if not bool(enabled):
             return
         try:
             future = self._avg_executor.submit(
@@ -2946,7 +2952,7 @@ class Checkpointer:
                     avg_state_dict = None
 
             if save_avg_file and avg_state_dict is not None and self._is_local_rank0():
-                self._schedule_avg_save(epoch_i, avg_state_dict)
+                self._schedule_avg_save(epoch_i, avg_state_dict, enabled=save_avg_file)
 
             import torch.distributed.checkpoint as dcp
             from torch.distributed.checkpoint.state_dict import StateDictOptions
@@ -3222,7 +3228,7 @@ class Checkpointer:
                 avg_state_dict = None
 
         if save_avg_file and avg_state_dict is not None and self._is_local_rank0():
-            self._schedule_avg_save(epoch_i, avg_state_dict)
+            self._schedule_avg_save(epoch_i, avg_state_dict, enabled=save_avg_file)
 
         dcp_future: object | None = None
         try:
