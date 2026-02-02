@@ -1,7 +1,6 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
-import concurrent.futures
 import contextlib
 import ctypes
 import dataclasses
@@ -27,7 +26,7 @@ from typing import Any, Callable, Iterable, Mapping
 
 import torch
 import torch.distributed as dist
-from ..core.concurrency import Mutex
+from ..core.concurrency import Mutex, new_executor, is_gil_enabled
 from ..core.datatypes import PathLike, env_bool, env_int, save_temp, write_json
 from ..core.system import (
     CPU,
@@ -2018,12 +2017,8 @@ class Checkpointer:
         self._pending_avg: deque[_PendingOp] = deque()
         self._pending_lock = Mutex(reentrant=True)
 
-        self._avg_executor = concurrent.futures.ThreadPoolExecutor(
-            max_workers=1, thread_name_prefix="enn-avg-ckpt"
-        )
-        self._dcp_executor = concurrent.futures.ThreadPoolExecutor(
-            max_workers=1, thread_name_prefix="enn-dcp-ckpt"
-        )
+        self._avg_executor = new_executor(1, workload="io", name="enn-avg-ckpt")
+        self._dcp_executor = new_executor(1, workload="io", name="enn-dcp-ckpt")
 
         self._stager: object | None = None
         self._stager_lock = Mutex(reentrant=True)
@@ -2071,7 +2066,6 @@ class Checkpointer:
                 self._dcp_should_participate = True
 
         self.dcp_root.mkdir(parents=True, exist_ok=True)
-        self.avg_root.mkdir(parents=True, exist_ok=True)
         try:
             self._dcp_inprogress_ttl_sec = max(
                 0, int(env_int("ENN_DCP_INPROGRESS_TTL_SEC", 1800) or 1800)
@@ -2378,7 +2372,17 @@ class Checkpointer:
         return False
 
     def _default_dcp_model_kind(self) -> str:
-        return os.environ.get("ENN_DCP_MODEL_KIND", "avg").strip().lower()
+        return os.environ.get("ENN_DCP_MODEL_KIND", "active").strip().lower()
+
+    def _avg_file_enabled(self, save_avg: bool | None = None) -> bool:
+        if save_avg is not None:
+            return bool(save_avg)
+        return bool(
+            env_bool(
+                ("ENN_DCP_SAVE_AVG_FILE", "ENN_CKPT_SAVE_AVG_FILE"),
+                default=False,
+            )
+        )
 
     def _cpu_offload_enabled(self) -> bool:
         v = getattr(self, "_cpu_offload", None)
@@ -2827,6 +2831,8 @@ class Checkpointer:
     def _schedule_avg_save(
         self, epoch: int, avg_state_dict: Mapping[str, Any]
     ) -> None:
+        if not self._avg_file_enabled(None):
+            return
         try:
             future = self._avg_executor.submit(
                 self._save_avg_epoch, int(epoch), avg_state_dict
@@ -2841,9 +2847,19 @@ class Checkpointer:
             world = int(getattr(self, "_world", 1) or 1)
         except Exception:
             world = 1
-        default_bg = world <= 1
-        enabled = bool(env_bool("ENN_DCP_BACKGROUND", default=default_bg))
-        return bool(enabled and world <= 1)
+        if world > 1:
+            return False
+        if "ENN_DCP_BACKGROUND" in os.environ:
+            return bool(env_bool("ENN_DCP_BACKGROUND", default=False))
+        if not bool(getattr(self, "use_async", False)):
+            return True
+        try:
+            import torch.distributed.checkpoint as dcp
+            if hasattr(dcp, "async_save"):
+                return False
+        except Exception:
+            pass
+        return True
 
     def _monitor_dcp_future(
         self,
@@ -2896,12 +2912,23 @@ class Checkpointer:
         optimizer: Optimizer | None = None,
         avg_state_dict: Mapping[str, Any] | None = None,
         avg_state_dict_factory: Callable[[], Mapping[str, Any] | None] | None = None,
+        model_kind: str | None = None,
+        save_avg_file: bool = False,
+        save_optimizer: bool | None = None,
         extra_state: dict[str, Any] | None = None,
     ) -> None:
         epoch_i = int(epoch)
         epoch_dir = self._epoch_dir(epoch_i)
         pending_exc: Exception | None = None
         try:
+            want_kind = str(model_kind or self._default_dcp_model_kind()).strip().lower()
+            want_avg = want_kind in ("avg", "average", "ema", "swa")
+            save_avg_file = bool(save_avg_file)
+            need_avg_snapshot = bool(want_avg or save_avg_file)
+
+            if not need_avg_snapshot:
+                avg_state_dict_factory = None
+
             if (
                 avg_state_dict is None
                 and avg_state_dict_factory is not None
@@ -2918,7 +2945,7 @@ class Checkpointer:
                         )
                     avg_state_dict = None
 
-            if avg_state_dict is not None and self._is_local_rank0():
+            if save_avg_file and avg_state_dict is not None and self._is_local_rank0():
                 self._schedule_avg_save(epoch_i, avg_state_dict)
 
             import torch.distributed.checkpoint as dcp
@@ -2928,12 +2955,17 @@ class Checkpointer:
 
             epoch_dir.mkdir(parents=True, exist_ok=True)
 
-            want_kind = self._default_dcp_model_kind()
-            want_avg = want_kind in ("avg", "average", "ema", "swa")
-
-            save_opt = bool(optimizer is not None) and env_bool(
-                ("ENN_DCP_SAVE_OPTIMIZER", "ENN_CKPT_SAVE_OPTIMIZER"), default=True
-            )
+            save_opt = bool(optimizer is not None)
+            if save_optimizer is not None:
+                save_opt = bool(save_opt and bool(save_optimizer))
+            else:
+                save_opt = bool(
+                    save_opt
+                    and env_bool(
+                        ("ENN_DCP_SAVE_OPTIMIZER", "ENN_CKPT_SAVE_OPTIMIZER"),
+                        default=True,
+                    )
+                )
             try:
                 optim_every = int(
                     env_int(
@@ -3005,7 +3037,7 @@ class Checkpointer:
                             "epoch": int(epoch_i),
                             "created_time": time.time(),
                             "has_optimizer": bool(save_opt),
-                            "model_kind": ("avg" if want_avg else "active"),
+                            "model_kind": str(want_kind),
                         },
                         indent=2,
                     )
@@ -3038,7 +3070,7 @@ class Checkpointer:
                     epoch_dir,
                     extra_meta={
                         "has_optimizer": bool(save_opt),
-                        "model_kind": ("avg" if want_avg else "active"),
+                        "model_kind": str(want_kind),
                     },
                 )
                 _cleanup_delete_pending(self.dcp_root)
@@ -3072,6 +3104,10 @@ class Checkpointer:
         block_if_busy: bool = False,
     ) -> None:
         epoch_i = int(epoch)
+        want_kind = self._default_dcp_model_kind()
+        want_avg = str(want_kind).strip().lower() in ("avg", "average", "ema", "swa")
+        save_avg_file = self._avg_file_enabled(save_avg)
+        need_avg_snapshot = bool(want_avg or save_avg_file)
 
         self._maybe_wait_for_budget(block=False)
         do_cleanup = False
@@ -3141,7 +3177,12 @@ class Checkpointer:
                     model=model,
                     optimizer=optimizer,
                     avg_state_dict=avg_state_dict,
-                    avg_state_dict_factory=avg_state_dict_factory,
+                    avg_state_dict_factory=(
+                        avg_state_dict_factory if need_avg_snapshot else None
+                    ),
+                    model_kind=str(want_kind),
+                    save_avg_file=bool(save_avg_file),
+                    save_optimizer=save_optimizer,
                     extra_state=extra_state,
                 )
                 self._register_pending(
@@ -3164,7 +3205,7 @@ class Checkpointer:
                     raise
             return
 
-        if (
+        if need_avg_snapshot and (
             avg_state_dict is None
             and avg_state_dict_factory is not None
             and self._is_local_rank0()
@@ -3180,7 +3221,7 @@ class Checkpointer:
                     )
                 avg_state_dict = None
 
-        if avg_state_dict is not None and self._is_local_rank0():
+        if save_avg_file and avg_state_dict is not None and self._is_local_rank0():
             self._schedule_avg_save(epoch_i, avg_state_dict)
 
         dcp_future: object | None = None
@@ -3198,9 +3239,17 @@ class Checkpointer:
             want_kind = self._default_dcp_model_kind()
             want_avg = want_kind in ("avg", "average", "ema", "swa")
 
-            save_opt = bool(optimizer is not None) and env_bool(
-                ("ENN_DCP_SAVE_OPTIMIZER", "ENN_CKPT_SAVE_OPTIMIZER"), default=True
-            )
+            save_opt = bool(optimizer is not None)
+            if save_optimizer is not None:
+                save_opt = bool(save_opt and bool(save_optimizer))
+            else:
+                save_opt = bool(
+                    save_opt
+                    and env_bool(
+                        ("ENN_DCP_SAVE_OPTIMIZER", "ENN_CKPT_SAVE_OPTIMIZER"),
+                        default=True,
+                    )
+                )
             try:
                 optim_every = int(
                     env_int(
@@ -3295,19 +3344,36 @@ class Checkpointer:
                         AsyncCheckpointerType,
                     )
 
-                    async_type = (
-                        os.environ.get("ENN_DCP_ASYNC_TYPE", "thread")
-                        .strip()
-                        .lower()
-                    )
-                    if async_type == "process":
-                        kwargs["async_checkpointer_type"] = (
-                            AsyncCheckpointerType.PROCESS
-                        )
-                    elif async_type == "thread":
-                        kwargs["async_checkpointer_type"] = (
-                            AsyncCheckpointerType.THREAD
-                        )
+                    raw = os.environ.get("ENN_DCP_ASYNC_TYPE", None)
+                    async_type = str(raw).strip().lower() if raw is not None else ""
+                    if (not async_type) or async_type in {"auto", "default"}:
+                        try:
+                            w = int(getattr(self, "_world", 1) or 1)
+                        except Exception:
+                            w = 1
+                        if not is_gil_enabled():
+                            async_type = "thread"
+                        else:
+                            async_type = "process" if int(w) <= 1 else "thread"
+
+                    if async_type in {
+                        "process",
+                        "proc",
+                        "subprocess",
+                        "subinterp",
+                        "subinterpreter",
+                        "interpreter",
+                    }:
+                        proc_t = getattr(AsyncCheckpointerType, "PROCESS", None)
+                        thr_t = getattr(AsyncCheckpointerType, "THREAD", None)
+                        if proc_t is not None:
+                            kwargs["async_checkpointer_type"] = proc_t
+                        elif thr_t is not None:
+                            kwargs["async_checkpointer_type"] = thr_t
+                    elif async_type in {"thread", "thr"}:
+                        thr_t = getattr(AsyncCheckpointerType, "THREAD", None)
+                        if thr_t is not None:
+                            kwargs["async_checkpointer_type"] = thr_t
 
                 try:
                     sig = inspect.signature(dcp.async_save)

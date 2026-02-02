@@ -1235,12 +1235,12 @@ def train(
             init_dir = tempfile.mkdtemp(prefix=f"enn_init_ckpt_{run_id}_")
         else:
             init_dir = new_dir("init_ckpt")
-        init_ckpt_path = os.path.join(init_dir, "model.pt")
+        init_ckpt_path = os.fspath(init_dir)
         _save_model_checkpoint(
             model,
             init_dir,
-            save_dcp=False,
-            save_pt=True,
+            save_dcp=True,
+            save_pt=False,
             overwrite=True,
         )
         cfg_raw = _extract_model_config_dict(model)
@@ -1403,7 +1403,7 @@ def train(
         if (
             restore_path is None
             and init_ckpt_path
-            and os.path.isfile(init_ckpt_path)
+            and os.path.exists(init_ckpt_path)
         ):
             restore_path = init_ckpt_path
         if isinstance(model, torch.nn.Module) and restore_path:
@@ -1412,7 +1412,13 @@ def train(
                     with contextlib.suppress(Exception):
                         if hasattr(model, "to_empty"):
                             model.to_empty(device="cpu")
-                    load_weights(model, restore_path, map_location="cpu", weights_only=True, rebuild_tasks=False)
+                    load_weights(
+                        model,
+                        restore_path,
+                        map_location="cpu",
+                        weights_only=True,
+                        rebuild_tasks=False,
+                    )
             except Exception:
                 pass
         shutil.rmtree(memmap_dir, ignore_errors=True)
@@ -1564,11 +1570,11 @@ def predict(
     inference_ctx = inference_mode(model)
     with inference_ctx:
         try:
-            save_dcp = kwargs.pop("save_dcp", False)
+            save_dcp = kwargs.pop("save_dcp", True)
             save_pt = kwargs.pop("save_pt", False)
             dcp_dir = os.path.join(ckpt_dir, "dcp")
             if not (save_dcp or save_pt):
-                save_pt = True
+                save_dcp = True
             _save_model_checkpoint(
                 model,
                 dcp_dir,
