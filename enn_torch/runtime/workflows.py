@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import contextlib
+import json
 import logging
 import os
 import shutil
@@ -102,6 +103,79 @@ def _normalize_windows_paste(value: PathLike) -> PathLike:
             ]
             value = lines[0] if lines else ""
     return value
+
+
+def _read_safetensors_embedded_meta(p: Path) -> Mapping[str, Any] | None:
+    is_required(
+        "safetensors",
+        "pip install 'enn-torch[safetensors]'  # or: pip install safetensors",
+    )
+    try:
+        from safetensors import safe_open
+    except Exception:
+        return None
+    try:
+        with safe_open(str(p), framework="pt", device="cpu") as f:
+            md = f.metadata() or {}
+    except Exception:
+        return None
+    if not isinstance(md, dict):
+        return None
+    raw = md.get("enn_meta_json") or md.get("enn.meta_json") or md.get("enn_meta")
+    if not isinstance(raw, str) or not raw.strip():
+        return None
+    try:
+        obj = json.loads(raw)
+        return obj if isinstance(obj, dict) else None
+    except Exception:
+        return None
+
+
+def export_safetensors_single(
+    model: torch.nn.Module,
+    path: PathLike,
+    *,
+    meta: Mapping[str, Any] | None = None,
+    overwrite: bool = True,
+) -> str:
+    is_required(
+        "safetensors",
+        "pip install 'enn-torch[safetensors]'  # or: pip install safetensors",
+    )
+    from safetensors.torch import save_file as save_tensors
+
+    p = Path(_normalize_windows_paste(path))
+    if not p.suffix:
+        p = p.with_suffix(".safetensors")
+    p.parent.mkdir(parents=True, exist_ok=True)
+    if p.exists() and not bool(overwrite):
+        raise FileExistsError(f"Export destination already exists: {str(p)!r}")
+
+    sd = model.state_dict()
+    tensors: dict[str, torch.Tensor] = {}
+    for k, v in sd.items():
+        if not torch.is_tensor(v):
+            continue
+        t = v.detach()
+        if getattr(t, "device", None) is not None and t.device.type != "cpu":
+            t = t.to("cpu", non_blocking=False)
+        if not t.is_contiguous():
+            t = t.contiguous()
+        tensors[str(k)] = t
+
+    md: dict[str, str] | None = None
+    if isinstance(meta, Mapping) and meta:
+        md = {"enn_meta_json": json.dumps(meta, ensure_ascii=False, separators=(",", ":"))}
+
+    tmp = p.with_name(p.name + ".tmp")
+    try:
+        save_tensors(tensors, str(tmp), metadata=md)
+        os.replace(tmp, p)
+    finally:
+        with contextlib.suppress(Exception):
+            if tmp.exists():
+                tmp.unlink()
+    return str(p)
 
 
 def _find_latest_dcp_epoch_dir(ckpt_dir: str | None) -> str | None:
@@ -855,18 +929,17 @@ def load_weights(
         meta_path = p.with_name(p.name + ".json")
         if not meta_path.exists():
             meta_path = p.with_suffix(".json")
-        if not meta_path.exists():
-            raise RuntimeError("Missing sidecar JSON file for the safetensors checkpoint.")
-        meta = read_json(meta_path)
+        meta = None
+        if meta_path.exists():
+            meta = read_json(meta_path)
         if not isinstance(meta, dict):
-            raise RuntimeError(
-                f"Invalid sidecar JSON file for the safetensors checkpoint: {str(meta_path)!r}"
-            )
+            meta = _read_safetensors_embedded_meta(p)
         if rebuild_tasks:
             with contextlib.suppress(Exception):
-                tasks = meta.get("tasks")
-                if tasks:
-                    model.rebuild_tasks_from_specs(tasks)
+                if isinstance(meta, dict):
+                    tasks = meta.get("tasks")
+                    if tasks:
+                        model.rebuild_tasks_from_specs(tasks)
         is_required(
             "safetensors",
             "pip install 'enn-torch[safetensors]'  # or: pip install safetensors",
@@ -882,7 +955,7 @@ def load_weights(
         sd = _coerce_state_dict(sd)
         resize_scaler_buffer(model, sd)
         model.load_state_dict(sd, strict=False)
-        return meta
+        return meta if isinstance(meta, dict) else None
 
     if suffix and suffix not in (".pt", ".pth"):
         raise ValueError(
@@ -983,15 +1056,18 @@ def load_model(
         meta_path = p.with_name(p.name + ".json")
         if not meta_path.exists():
             meta_path = p.with_suffix(".json")
-        if not meta_path.exists():
-            raise RuntimeError(
-                "Missing sidecar JSON file for the safetensors checkpoint."
-            )
-        meta = read_json(meta_path)
+        meta = None
+        if meta_path.exists():
+            meta = read_json(meta_path)
         if not isinstance(meta, dict):
-            raise RuntimeError(
-                f"Invalid sidecar JSON file for the safetensors checkpoint: {str(meta_path)!r}"
-            )
+            meta = _read_safetensors_embedded_meta(p)
+        if not isinstance(meta, dict):
+            if in_dim is None or out_shape is None:
+                raise RuntimeError(
+                    "Missing metadata for safetensors checkpoint. Provide in_dim and out_shape, "
+                    "or export with embedded metadata (workflows.train export_path=...)."
+                )
+            meta = {}
         use_in_dim = int(in_dim if in_dim is not None else meta.get("in_dim"))
         out_shape_meta = (
             out_shape if out_shape is not None else meta.get("out_shape") or ()
@@ -1174,6 +1250,8 @@ def train(
     loss_tile_size: int | None = None,
     loss_mask_mode: str = "none",
     loss_mask_value: float | None = None,
+    export_path: PathLike | None = None,
+    export_overwrite: bool = True,
     **kwargs: Any,
 ) -> Model:
     ProcessBroker.bootstrap()
@@ -1235,12 +1313,12 @@ def train(
             init_dir = tempfile.mkdtemp(prefix=f"enn_init_ckpt_{run_id}_")
         else:
             init_dir = new_dir("init_ckpt")
-        init_ckpt_path = os.path.join(init_dir, "model.pt")
+        init_ckpt_path = os.fspath(init_dir)
         _save_model_checkpoint(
             model,
             init_dir,
-            save_dcp=False,
-            save_pt=True,
+            save_dcp=True,
+            save_pt=False,
             overwrite=True,
         )
         cfg_raw = _extract_model_config_dict(model)
@@ -1391,6 +1469,25 @@ def train(
                 model, m_sd, options=StateDictOptions(strict=False)
             )
         _update_history(model, ckpt_dir, epochs, val_frac, num_samples_dataset)
+        if export_path is not None and isinstance(model, torch.nn.Module):
+            export_meta: dict[str, Any] = {
+                "format": "enn-export-safetensors-v1",
+                "created_time": float(time.time()),
+                "run_id": str(run_id),
+                "in_dim": int(first_in_dim) if first_in_dim is not None else None,
+                "out_shape": list(int(x) for x in (label_shape or ())),
+                "config": cfg_dict if isinstance(cfg_dict, dict) else None,
+            }
+            with contextlib.suppress(Exception):
+                tasks = getattr(model, "tasks", None)
+                if tasks is not None:
+                    export_meta["tasks"] = tasks
+            export_safetensors_single(
+                model,
+                export_path,
+                meta=export_meta,
+                overwrite=bool(export_overwrite),
+            )
         return model
     finally:
         restore_path: str | None = None
@@ -1403,7 +1500,7 @@ def train(
         if (
             restore_path is None
             and init_ckpt_path
-            and os.path.isfile(init_ckpt_path)
+            and os.path.exists(init_ckpt_path)
         ):
             restore_path = init_ckpt_path
         if isinstance(model, torch.nn.Module) and restore_path:
@@ -1412,7 +1509,13 @@ def train(
                     with contextlib.suppress(Exception):
                         if hasattr(model, "to_empty"):
                             model.to_empty(device="cpu")
-                    load_weights(model, restore_path, map_location="cpu", weights_only=True, rebuild_tasks=False)
+                    load_weights(
+                        model,
+                        restore_path,
+                        map_location="cpu",
+                        weights_only=True,
+                        rebuild_tasks=False,
+                    )
             except Exception:
                 pass
         shutil.rmtree(memmap_dir, ignore_errors=True)
@@ -1564,11 +1667,11 @@ def predict(
     inference_ctx = inference_mode(model)
     with inference_ctx:
         try:
-            save_dcp = kwargs.pop("save_dcp", False)
+            save_dcp = kwargs.pop("save_dcp", True)
             save_pt = kwargs.pop("save_pt", False)
             dcp_dir = os.path.join(ckpt_dir, "dcp")
             if not (save_dcp or save_pt):
-                save_pt = True
+                save_dcp = True
             _save_model_checkpoint(
                 model,
                 dcp_dir,
