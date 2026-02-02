@@ -2954,6 +2954,12 @@ class Checkpointer:
                 with contextlib.suppress(Exception):
                     self._close_stager()
                 self._sigkill_torch_checkpoint_processes()
+                if self._is_global_rank0():
+                    _LOGGER.warning(
+                        "DCP async_save failed with pinned stager (epoch=%d). Retrying unpinned... dir=%s",
+                        int(epoch),
+                        str(epoch_dir),
+                    )
                 try:
                     fut2 = retry_unpinned()
                     _future_result(fut2)
@@ -2962,8 +2968,9 @@ class Checkpointer:
                     pending_exc = None
                     if self._is_global_rank0():
                         _LOGGER.warning(
-                            "DCP async_save OOM with pinned stager; retry succeeded with unpinned (epoch=%d)",
+                            "DCP unpinned retry succeeded (epoch=%d). dir=%s",
                             int(epoch),
+                            str(epoch_dir),
                         )
                 except Exception as exc2:
                     ok = False
@@ -2971,9 +2978,10 @@ class Checkpointer:
                     pending_exc = exc2
                     if self._is_global_rank0():
                         _LOGGER.exception(
-                            "DCP async_save failed after unpinned retry (epoch=%d): %s",
+                            "DCP unpinned retry failed (epoch=%d): %s dir=%s",
                             int(epoch),
                             exc2,
+                            str(epoch_dir),
                         )
                     if self._is_oomish_error(exc2):
                         self._sigkill_torch_checkpoint_processes()
@@ -2983,7 +2991,10 @@ class Checkpointer:
                 pending_exc = exc
                 if self._is_global_rank0():
                     _LOGGER.exception(
-                        "DCP async_save failed (epoch=%d): %s", int(epoch), exc
+                        "DCP async_save failed (epoch=%d): %s dir=%s",
+                        int(epoch),
+                        exc,
+                        str(epoch_dir),
                     )
                 if self._is_oomish_error(exc):
                     self._sigkill_torch_checkpoint_processes()
@@ -3444,15 +3455,33 @@ class Checkpointer:
                     else:
                         async_type = "process" if int(w) <= 1 else "thread"
 
+                supported: set[str] | None = None
+                supports_async_stager: bool | None = None
+                try:
+                    sig = inspect.signature(dcp.async_save)
+                    supported = set(sig.parameters.keys())
+                    supports_async_stager = "async_stager" in supported
+                except Exception:
+                    supported = None
+                    supports_async_stager = None
+
                 dev_is_cuda = bool(
                     getattr(getattr(self, "_device", None), "type", None) == "cuda"
                 )
                 is_thread = async_type in {"thread", "thr"}
-                use_pinned = bool(dev_is_cuda and is_thread)
+                use_pinned = bool(
+                    dev_is_cuda and is_thread and supports_async_stager is not False
+                )
                 use_pinned = bool(
                     use_pinned and env_bool("ENN_DCP_STAGER_PINNED", default=True)
                 )
-                stager = self._ensure_stager(use_pinned_memory=use_pinned)
+                stager = None
+                if supports_async_stager is not False:
+                    stager = self._ensure_stager(use_pinned_memory=use_pinned)
+                elif self._is_global_rank0() and env_bool("ENN_DCP_DEBUG", False):
+                    _LOGGER.warning(
+                        "dcp.async_save does not support async_stager; disabling stager (pinned/unpinned irrelevant)."
+                    )
                 kwargs: dict[str, Any] = {
                     "state_dict": dcp_state,
                     "checkpoint_id": str(epoch_dir),
@@ -3460,7 +3489,7 @@ class Checkpointer:
                     "planner": planner,
                     "process_group": self._dcp_process_group,
                 }
-                if stager is not None:
+                if stager is not None and supports_async_stager is not False:
                     kwargs["async_stager"] = stager
 
                 with contextlib.suppress(Exception):
@@ -3487,30 +3516,55 @@ class Checkpointer:
                         if thr_t is not None:
                             kwargs["async_checkpointer_type"] = thr_t
 
-                try:
-                    sig = inspect.signature(dcp.async_save)
-                    supported = set(sig.parameters.keys())
+                if supported is not None:
                     kwargs = {
-                        k: v
-                        for k, v in kwargs.items()
-                        if k in supported and v is not None
+                        k: v for k, v in kwargs.items() if k in supported and v is not None
                     }
-                except Exception:
+                else:
                     kwargs = {k: v for k, v in kwargs.items() if v is not None}
 
+                def _call_async_save_safe(kw: dict[str, Any]) -> object:
+                    try:
+                        return dcp.async_save(**kw)
+                    except TypeError as e:
+                        msg = str(e)
+                        m = re.search(
+                            r"unexpected keyword argument ['\"]([^'\"]+)['\"]", msg
+                        )
+                        if m:
+                            bad = m.group(1)
+                            kw2 = dict(kw)
+                            kw2.pop(str(bad), None)
+                            return dcp.async_save(**kw2)
+                        kw2 = dict(kw)
+                        if "async_stager" in kw2:
+                            kw2.pop("async_stager", None)
+                            try:
+                                return dcp.async_save(**kw2)
+                            except TypeError:
+                                pass
+                        if "async_checkpointer_type" in kw2:
+                            kw2.pop("async_checkpointer_type", None)
+                            return dcp.async_save(**kw2)
+                        raise
+
                 retry_unpinned = None
-                if use_pinned:
+                used_pinned = bool(use_pinned and ("async_stager" in kwargs))
+                if used_pinned:
                     def _retry_unpinned() -> object:
-                        st2 = self._ensure_stager(use_pinned_memory=False)
                         kw2 = dict(kwargs)
+                        if supports_async_stager is False:
+                            kw2.pop("async_stager", None)
+                            return _call_async_save_safe(kw2)
+                        st2 = self._ensure_stager(use_pinned_memory=False)
                         kw2.pop("async_stager", None)
                         if st2 is not None:
                             kw2["async_stager"] = st2
-                        return dcp.async_save(**kw2)
+                        return _call_async_save_safe(kw2)
 
                     retry_unpinned = _retry_unpinned
 
-                dcp_future = dcp.async_save(**kwargs)
+                dcp_future = _call_async_save_safe(kwargs)
             else:
                 dcp.save(
                     state_dict=dcp_state,
@@ -3531,7 +3585,7 @@ class Checkpointer:
                         dcp_future=dcp_future,
                         has_optimizer=bool(save_opt),
                         model_kind=("avg" if want_avg else "active"),
-                        used_pinned=bool(locals().get("use_pinned", False)),
+                        used_pinned=bool(locals().get("used_pinned", False)),
                         retry_unpinned=locals().get("retry_unpinned", None),
                     )
                 except Exception as exc:
