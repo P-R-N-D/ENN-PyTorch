@@ -53,6 +53,11 @@ dependencies = [
   "ml_dtypes>=0.5.4",
 ]
 
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["enn_torch*"]
+exclude = ["debug*", "tests*", "docs*", "examples*"]
+
 [project.urls]
 Repository = "https://github.com/P-R-N-D/ENN-PyTorch"
 Issues = "https://github.com/P-R-N-D/ENN-PyTorch/issues"
