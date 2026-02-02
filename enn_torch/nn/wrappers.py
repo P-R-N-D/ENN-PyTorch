@@ -27,7 +27,13 @@ from ..core.config import ModelConfig
 from ..core.datatypes import env_first_int, env_int
 from ..core.policies import LossWeightPolicy
 from ..core.precision import Autocast
-from ..core.system import CPU, empty_device_cache, get_device, set_runtime_cfg
+from ..core.system import (
+    CPU,
+    empty_device_cache,
+    get_device,
+    is_oom_error,
+    set_runtime_cfg,
+)
 from ..core.tensor import is_meta_or_fake_tensor, symint_safe_expand_as
 from ..data.collate import get_feature_key, get_label_key
 from ..runtime.distributed import _from_hsdp_module
@@ -2133,6 +2139,37 @@ class Model(nn.Module):
             pass
         raw_mode = getattr(config, "compile_mode", "disabled")
         compile_mode_canonical = canonicalize_compile_mode(raw_mode)
+        requested_compile_mode = str(compile_mode_canonical)
+
+        warmup_steps = 0
+        if (
+            compile_mode_canonical in {"max-autotune", "max-autotune-no-cudagraphs"}
+            and getattr(self._device, "type", None) == "cuda"
+        ):
+            try:
+                warmup_steps = int(
+                    env_first_int(
+                        (
+                            "ENN_COMPILE_MAX_AUTOTUNE_WARMUP_STEPS",
+                            "ENN_MAX_AUTOTUNE_WARMUP_STEPS",
+                        ),
+                        default=10,
+                    )
+                    or 10
+                )
+            except Exception:
+                warmup_steps = 10
+            warmup_steps = max(0, int(warmup_steps))
+            if warmup_steps > 0:
+                compile_mode_canonical = "reduce-overhead"
+
+        self._enn_compile_requested_mode: str = (
+            requested_compile_mode if warmup_steps > 0 else ""
+        )
+        self._enn_compile_upgrade_after_steps: int = int(warmup_steps)
+        self._enn_compile_upgrade_done: bool = bool(warmup_steps <= 0)
+        self._enn_compile_upgrade_inflight: bool = False
+        self._enn_compile_active_mode: str = str(compile_mode_canonical)
         set_runtime_cfg("compile_mode", compile_mode_canonical)
         compile_mode_arg = (
             None
@@ -2185,6 +2222,10 @@ class Model(nn.Module):
                 and (not bool(compile_cudagraphs))
             )
             else None
+        )
+        self._enn_compile_dynamic: bool = bool(compile_dynamic)
+        self._enn_compile_options: dict[str, Any] | None = (
+            dict(compile_options) if isinstance(compile_options, dict) else None
         )
 
         def _empty_cache() -> None:
@@ -2342,6 +2383,215 @@ class Model(nn.Module):
         self._amp_dtype_cache_use_lock = not bool(is_gil_enabled())
         self.__config = config
         self.__enn_instance_config__ = config
+
+    def maybe_upgrade_compile_mode(
+        self: Self,
+        *,
+        step_total: int,
+        logger: logging.Logger | None = None,
+    ) -> bool:
+        req = str(getattr(self, "_enn_compile_requested_mode", "") or "").strip()
+        if not req:
+            return False
+        if bool(getattr(self, "_enn_compile_upgrade_done", False)):
+            return False
+        try:
+            step_i = int(step_total)
+        except Exception:
+            return False
+        after = int(getattr(self, "_enn_compile_upgrade_after_steps", 0) or 0)
+        if after <= 0 or step_i < after:
+            return False
+        if not torch_compiler_supported():
+            with self._runtime_lock:
+                self._enn_compile_upgrade_done = True
+                self._enn_compile_requested_mode = ""
+            return False
+
+        log = logger if isinstance(logger, logging.Logger) else _LOGGER
+
+        with self._runtime_lock:
+            if self._enn_compile_upgrade_done or self._enn_compile_upgrade_inflight:
+                return False
+            self._enn_compile_upgrade_inflight = True
+
+        def _empty_cache() -> None:
+            if getattr(self._device, "type", None) == "cuda":
+                empty_device_cache(device=self._device, do_gc=True, min_interval_s=0.0)
+
+        try:
+            target_mode = canonicalize_compile_mode(req)
+            if target_mode not in {"max-autotune", "max-autotune-no-cudagraphs"}:
+                with self._runtime_lock:
+                    self._enn_compile_upgrade_done = True
+                    self._enn_compile_requested_mode = ""
+                return False
+
+            options = getattr(self, "_enn_compile_options", None)
+            dyn = bool(getattr(self, "_enn_compile_dynamic", False))
+
+            def _compile_one(
+                mod: nn.Module,
+                *,
+                label: str,
+                options_override: dict[str, Any] | None = None,
+            ) -> nn.Module:
+                try:
+                    return compile_module(
+                        mod,
+                        mode=target_mode,
+                        fullgraph=False,
+                        dynamic=bool(dyn),
+                        backend="inductor",
+                        options=(
+                            options_override if options_override is not None else options
+                        ),
+                        disable=False,
+                    )
+                except Exception as e:
+                    if is_oom_error(e) or ("out of memory" in str(e).lower()):
+                        raise
+                    log.warning(
+                        "torch.compile upgrade failed for %s; keeping eager/previous module",
+                        label,
+                        exc_info=True,
+                    )
+                    return mod
+
+            with self._runtime_lock:
+                orig = getattr(self, "_eager_fuser_perceiver", None)
+                if isinstance(orig, nn.Module):
+                    with contextlib.suppress(Exception):
+                        self.fuser.perceiver = orig
+                perceiver = getattr(self.fuser, "perceiver", None)
+                if isinstance(perceiver, nn.Module):
+                    cross = getattr(perceiver, "cross", None)
+                    eager_cross = getattr(self, "_eager_perceiver_cross", None)
+                    if (
+                        isinstance(cross, nn.ModuleList)
+                        and isinstance(eager_cross, list)
+                        and len(eager_cross) == len(cross)
+                    ):
+                        for i, item in enumerate(eager_cross):
+                            with contextlib.suppress(Exception):
+                                cross[i] = item
+                    self_blocks = getattr(perceiver, "self_blocks", None)
+                    eager_self = getattr(self, "_eager_perceiver_self_blocks", None)
+                    if (
+                        isinstance(self_blocks, nn.ModuleList)
+                        and isinstance(eager_self, list)
+                        and len(eager_self) == len(self_blocks)
+                    ):
+                        for i, item in enumerate(eager_self):
+                            with contextlib.suppress(Exception):
+                                self_blocks[i] = item
+
+            try:
+                from .graph import GraphSequential
+
+                decode_graph = (
+                    GraphSequential(
+                        steps=[
+                            GraphSequential.path("norm"),
+                            GraphSequential.mean(dim=1),
+                            GraphSequential.path("head"),
+                        ],
+                        out_shape=self.out_shape,
+                        name="decode",
+                        root=self.processor,
+                    )
+                    .to(self._device)
+                    .bind()
+                )
+                self._decode_compiled = _compile_one(decode_graph, label="decode head")
+            except Exception as e:
+                if is_oom_error(e) or ("out of memory" in str(e).lower()):
+                    raise
+                log.warning(
+                    "torch.compile upgrade failed for decode head; keeping existing",
+                    exc_info=True,
+                )
+
+            _empty_cache()
+
+            perceiver = getattr(self.fuser, "perceiver", None)
+            if isinstance(perceiver, nn.Module):
+                staged_heavy = bool(
+                    CPU.is_optimized_for_no_gil()
+                    or target_mode in {"max-autotune", "max-autotune-no-cudagraphs"}
+                )
+                compiled_any = False
+                if staged_heavy:
+                    cross = getattr(perceiver, "cross", None)
+                    if isinstance(cross, nn.ModuleList):
+                        eager_items = list(cross)
+                        compiled_items: list[nn.Module] = []
+                        any_changed = False
+                        for i, child in enumerate(eager_items):
+                            compiled = _compile_one(
+                                child, label=f"perceiver.cross[{i}]"
+                            )
+                            compiled_items.append(compiled)
+                            any_changed = any_changed or (compiled is not child)
+                            _empty_cache()
+                        if any_changed:
+                            for i, item in enumerate(compiled_items):
+                                with contextlib.suppress(Exception):
+                                    cross[i] = item
+                            self._eager_perceiver_cross = eager_items
+                            compiled_any = True
+                    self_blocks = getattr(perceiver, "self_blocks", None)
+                    if isinstance(self_blocks, nn.ModuleList):
+                        eager_items = list(self_blocks)
+                        compiled_items = []
+                        any_changed = False
+                        for i, child in enumerate(eager_items):
+                            compiled = _compile_one(
+                                child, label=f"perceiver.self_blocks[{i}]"
+                            )
+                            compiled_items.append(compiled)
+                            any_changed = any_changed or (compiled is not child)
+                            _empty_cache()
+                        if any_changed:
+                            for i, item in enumerate(compiled_items):
+                                with contextlib.suppress(Exception):
+                                    self_blocks[i] = item
+                            self._eager_perceiver_self_blocks = eager_items
+                            compiled_any = True
+                if not compiled_any:
+                    compiled_p = _compile_one(perceiver, label="fuser.perceiver")
+                    with contextlib.suppress(Exception):
+                        self.fuser.perceiver = compiled_p
+
+            with self._runtime_lock:
+                self._enn_compile_active_mode = str(target_mode)
+                set_runtime_cfg("compile_mode", str(target_mode))
+                self._enn_compile_upgrade_done = True
+                self._enn_compile_requested_mode = ""
+            log.info(
+                "[compile] upgraded compile_mode: warmup=reduce-overhead -> %s (after %d steps)",
+                str(target_mode),
+                int(after),
+            )
+            return True
+
+        except BaseException as e:
+            if is_oom_error(e) or ("out of memory" in str(e).lower()):
+                _empty_cache()
+                log.warning(
+                    "[compile] upgrade aborted due to OOM; keeping reduce-overhead"
+                )
+            else:
+                log.warning(
+                    "[compile] upgrade aborted; keeping reduce-overhead (%s)", str(e)
+                )
+            with self._runtime_lock:
+                self._enn_compile_upgrade_done = True
+                self._enn_compile_requested_mode = ""
+            return False
+        finally:
+            with self._runtime_lock:
+                self._enn_compile_upgrade_inflight = False
 
     @property
     def config(self: Self) -> ModelConfig:

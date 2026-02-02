@@ -2024,6 +2024,8 @@ class Checkpointer:
         self._stager_lock = Mutex(reentrant=True)
         self._stager_owner_thread: int | None = None
         self._stager_closed = False
+        self._stager_cfg: tuple[bool, bool] | None = None
+        self._stager_pinned_disabled: bool = False
 
         try:
             import torch.distributed as dist
@@ -2469,12 +2471,56 @@ class Checkpointer:
     def _avg_latest_file(self, node_rank: int | None = None) -> Path:
         return self._avg_node_dir(node_rank) / "latest.json"
 
-    def _ensure_stager(self) -> object | None:
+    @staticmethod
+    def _is_oomish_error(exc: BaseException) -> bool:
+        if isinstance(exc, (MemoryError, EOFError, BrokenPipeError)):
+            return True
+        msg = str(exc).lower()
+        return (
+            "out of memory" in msg
+            or "cuda out of memory" in msg
+            or "cannot allocate memory" in msg
+            or "cudahostalloc" in msg
+            or ("alloc" in msg and "failed" in msg and "memory" in msg)
+        )
+
+    def _sigkill_torch_checkpoint_processes(self) -> None:
+        try:
+            import multiprocessing as _mp
+            import signal as _signal
+        except Exception:
+            return
+        for p in list(_mp.active_children() or []):
+            try:
+                tgt = getattr(p, "_target", None)
+                mod = str(getattr(tgt, "__module__", "") or "")
+                if "torch.distributed.checkpoint" not in mod:
+                    continue
+                pid = getattr(p, "pid", None)
+                if pid:
+                    with contextlib.suppress(Exception):
+                        os.kill(int(pid), _signal.SIGKILL)
+                for fn_name in ("kill", "terminate"):
+                    fn = getattr(p, fn_name, None)
+                    if callable(fn):
+                        with contextlib.suppress(Exception):
+                            fn()
+            except Exception:
+                continue
+
+    def _ensure_stager(self, *, use_pinned_memory: bool) -> object | None:
         if self._stager_closed:
             return None
+        if self._stager_pinned_disabled:
+            use_pinned_memory = False
+        cfg = (bool(use_pinned_memory), False)
         tid = threading.get_ident()
         with self._stager_lock:
-            if self._stager is not None and self._stager_owner_thread == tid:
+            if (
+                self._stager is not None
+                and self._stager_owner_thread == tid
+                and self._stager_cfg == cfg
+            ):
                 return self._stager
             if self._stager is not None:
                 with contextlib.suppress(Exception):
@@ -2483,25 +2529,43 @@ class Checkpointer:
                         close()
                 self._stager = None
                 self._stager_owner_thread = None
+                self._stager_cfg = None
 
             try:
                 from torch.distributed.checkpoint.staging import DefaultStager
                 from torch.distributed.checkpoint.staging import StagingOptions
 
-                use_pinned_memory = bool(
-                    self._device is not None and self._device.type == "cuda"
-                )
-                opts = StagingOptions(
-                    use_pinned_memory=use_pinned_memory,
-                    use_shared_memory=False,
-                    use_async_staging=True,
-                    use_non_blocking_copy=True,
-                )
-                self._stager = DefaultStager(config=opts)
-                self._stager_owner_thread = tid
-            except Exception:
-                self._stager = None
-                self._stager_owner_thread = None
+                def _build(pinned: bool) -> object:
+                    opts = StagingOptions(
+                        use_pinned_memory=bool(pinned),
+                        use_shared_memory=False,
+                        use_async_staging=True,
+                        use_non_blocking_copy=True,
+                    )
+                    return DefaultStager(config=opts)
+
+                try:
+                    self._stager = _build(bool(cfg[0]))
+                    self._stager_owner_thread = tid
+                    self._stager_cfg = cfg
+                except Exception as exc:
+                    if bool(cfg[0]) and self._is_oomish_error(exc):
+                        self._stager_pinned_disabled = True
+                        try:
+                            self._stager = _build(False)
+                            self._stager_owner_thread = tid
+                            self._stager_cfg = (False, False)
+                            return self._stager
+                        except Exception as exc2:
+                            if self._is_oomish_error(exc2):
+                                self._sigkill_torch_checkpoint_processes()
+                            self._stager = None
+                            self._stager_owner_thread = None
+                            self._stager_cfg = None
+                            return None
+                    self._stager = None
+                    self._stager_owner_thread = None
+                    self._stager_cfg = None
             return self._stager
 
     def _close_stager(self) -> None:
@@ -2514,6 +2578,7 @@ class Checkpointer:
                     close()
             self._stager = None
             self._stager_owner_thread = None
+            self._stager_cfg = None
 
     def _post_dcp_cleanup(self) -> None:
         with contextlib.suppress(Exception):
@@ -2875,6 +2940,8 @@ class Checkpointer:
         dcp_future: object,
         has_optimizer: bool,
         model_kind: str,
+        used_pinned: bool = False,
+        retry_unpinned: Callable[[], object] | None = None,
     ) -> None:
         ok = True
         err: str | None = None
@@ -2882,13 +2949,55 @@ class Checkpointer:
         try:
             _future_result(dcp_future)
         except Exception as exc:
-            ok = False
-            err = f"{type(exc).__name__}: {exc}"
-            pending_exc = exc
-            if self._is_global_rank0():
-                _LOGGER.exception(
-                    "DCP async_save failed (epoch=%d): %s", int(epoch), exc
-                )
+            if used_pinned and callable(retry_unpinned) and self._is_oomish_error(exc):
+                self._stager_pinned_disabled = True
+                with contextlib.suppress(Exception):
+                    self._close_stager()
+                self._sigkill_torch_checkpoint_processes()
+                if self._is_global_rank0():
+                    _LOGGER.warning(
+                        "DCP async_save failed with pinned stager (epoch=%d). Retrying unpinned... dir=%s",
+                        int(epoch),
+                        str(epoch_dir),
+                    )
+                try:
+                    fut2 = retry_unpinned()
+                    _future_result(fut2)
+                    ok = True
+                    err = None
+                    pending_exc = None
+                    if self._is_global_rank0():
+                        _LOGGER.warning(
+                            "DCP unpinned retry succeeded (epoch=%d). dir=%s",
+                            int(epoch),
+                            str(epoch_dir),
+                        )
+                except Exception as exc2:
+                    ok = False
+                    err = f"{type(exc2).__name__}: {exc2}"
+                    pending_exc = exc2
+                    if self._is_global_rank0():
+                        _LOGGER.exception(
+                            "DCP unpinned retry failed (epoch=%d): %s dir=%s",
+                            int(epoch),
+                            exc2,
+                            str(epoch_dir),
+                        )
+                    if self._is_oomish_error(exc2):
+                        self._sigkill_torch_checkpoint_processes()
+            else:
+                ok = False
+                err = f"{type(exc).__name__}: {exc}"
+                pending_exc = exc
+                if self._is_global_rank0():
+                    _LOGGER.exception(
+                        "DCP async_save failed (epoch=%d): %s dir=%s",
+                        int(epoch),
+                        exc,
+                        str(epoch_dir),
+                    )
+                if self._is_oomish_error(exc):
+                    self._sigkill_torch_checkpoint_processes()
         try:
             if self._is_dcp_leader():
                 if ok:
@@ -3334,7 +3443,45 @@ class Checkpointer:
                 planner = DefaultSavePlanner(dedup_save_to_lowest_rank=True)
 
             if self.use_async and hasattr(dcp, "async_save"):
-                stager = self._ensure_stager()
+                raw = os.environ.get("ENN_DCP_ASYNC_TYPE", None)
+                async_type = str(raw).strip().lower() if raw is not None else ""
+                if (not async_type) or async_type in {"auto", "default"}:
+                    try:
+                        w = int(getattr(self, "_world", 1) or 1)
+                    except Exception:
+                        w = 1
+                    if not is_gil_enabled():
+                        async_type = "thread"
+                    else:
+                        async_type = "process" if int(w) <= 1 else "thread"
+
+                supported: set[str] | None = None
+                supports_async_stager: bool | None = None
+                try:
+                    sig = inspect.signature(dcp.async_save)
+                    supported = set(sig.parameters.keys())
+                    supports_async_stager = "async_stager" in supported
+                except Exception:
+                    supported = None
+                    supports_async_stager = None
+
+                dev_is_cuda = bool(
+                    getattr(getattr(self, "_device", None), "type", None) == "cuda"
+                )
+                is_thread = async_type in {"thread", "thr"}
+                use_pinned = bool(
+                    dev_is_cuda and is_thread and supports_async_stager is not False
+                )
+                use_pinned = bool(
+                    use_pinned and env_bool("ENN_DCP_STAGER_PINNED", default=True)
+                )
+                stager = None
+                if supports_async_stager is not False:
+                    stager = self._ensure_stager(use_pinned_memory=use_pinned)
+                elif self._is_global_rank0() and env_bool("ENN_DCP_DEBUG", False):
+                    _LOGGER.warning(
+                        "dcp.async_save does not support async_stager; disabling stager (pinned/unpinned irrelevant)."
+                    )
                 kwargs: dict[str, Any] = {
                     "state_dict": dcp_state,
                     "checkpoint_id": str(epoch_dir),
@@ -3342,25 +3489,13 @@ class Checkpointer:
                     "planner": planner,
                     "process_group": self._dcp_process_group,
                 }
-                if stager is not None:
+                if stager is not None and supports_async_stager is not False:
                     kwargs["async_stager"] = stager
 
                 with contextlib.suppress(Exception):
                     from torch.distributed.checkpoint.state_dict_saver import (
                         AsyncCheckpointerType,
                     )
-
-                    raw = os.environ.get("ENN_DCP_ASYNC_TYPE", None)
-                    async_type = str(raw).strip().lower() if raw is not None else ""
-                    if (not async_type) or async_type in {"auto", "default"}:
-                        try:
-                            w = int(getattr(self, "_world", 1) or 1)
-                        except Exception:
-                            w = 1
-                        if not is_gil_enabled():
-                            async_type = "thread"
-                        else:
-                            async_type = "process" if int(w) <= 1 else "thread"
 
                     if async_type in {
                         "process",
@@ -3381,18 +3516,55 @@ class Checkpointer:
                         if thr_t is not None:
                             kwargs["async_checkpointer_type"] = thr_t
 
-                try:
-                    sig = inspect.signature(dcp.async_save)
-                    supported = set(sig.parameters.keys())
+                if supported is not None:
                     kwargs = {
-                        k: v
-                        for k, v in kwargs.items()
-                        if k in supported and v is not None
+                        k: v for k, v in kwargs.items() if k in supported and v is not None
                     }
-                except Exception:
+                else:
                     kwargs = {k: v for k, v in kwargs.items() if v is not None}
 
-                dcp_future = dcp.async_save(**kwargs)
+                def _call_async_save_safe(kw: dict[str, Any]) -> object:
+                    try:
+                        return dcp.async_save(**kw)
+                    except TypeError as e:
+                        msg = str(e)
+                        m = re.search(
+                            r"unexpected keyword argument ['\"]([^'\"]+)['\"]", msg
+                        )
+                        if m:
+                            bad = m.group(1)
+                            kw2 = dict(kw)
+                            kw2.pop(str(bad), None)
+                            return dcp.async_save(**kw2)
+                        kw2 = dict(kw)
+                        if "async_stager" in kw2:
+                            kw2.pop("async_stager", None)
+                            try:
+                                return dcp.async_save(**kw2)
+                            except TypeError:
+                                pass
+                        if "async_checkpointer_type" in kw2:
+                            kw2.pop("async_checkpointer_type", None)
+                            return dcp.async_save(**kw2)
+                        raise
+
+                retry_unpinned = None
+                used_pinned = bool(use_pinned and ("async_stager" in kwargs))
+                if used_pinned:
+                    def _retry_unpinned() -> object:
+                        kw2 = dict(kwargs)
+                        if supports_async_stager is False:
+                            kw2.pop("async_stager", None)
+                            return _call_async_save_safe(kw2)
+                        st2 = self._ensure_stager(use_pinned_memory=False)
+                        kw2.pop("async_stager", None)
+                        if st2 is not None:
+                            kw2["async_stager"] = st2
+                        return _call_async_save_safe(kw2)
+
+                    retry_unpinned = _retry_unpinned
+
+                dcp_future = _call_async_save_safe(kwargs)
             else:
                 dcp.save(
                     state_dict=dcp_state,
@@ -3413,6 +3585,8 @@ class Checkpointer:
                         dcp_future=dcp_future,
                         has_optimizer=bool(save_opt),
                         model_kind=("avg" if want_avg else "active"),
+                        used_pinned=bool(locals().get("used_pinned", False)),
+                        retry_unpinned=locals().get("retry_unpinned", None),
                     )
                 except Exception as exc:
                     if self._is_global_rank0():

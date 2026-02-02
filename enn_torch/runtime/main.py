@@ -1248,6 +1248,17 @@ def epochs(
                                         pg=train_pg,
                                         local_rank=local_rank,
                                     )
+                                with contextlib.suppress(Exception):
+                                    maybe_upgrade = getattr(
+                                        inst_step, "maybe_upgrade_compile_mode", None
+                                    )
+                                    if callable(maybe_upgrade):
+                                        maybe_upgrade(
+                                            step_total=int(
+                                                delta_gate_auto_step_total
+                                            ),
+                                            logger=_LOGGER,
+                                        )
                                 match device.type:
                                     case "cuda":
                                         util_now, mem_now = (
