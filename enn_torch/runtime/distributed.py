@@ -3529,7 +3529,11 @@ class Checkpointer:
                 dev_is_cuda = bool(
                     getattr(getattr(self, "_device", None), "type", None) == "cuda"
                 )
-                use_pinned = bool(dev_is_cuda and async_type in {"thread", "thr"})
+                use_pinned = bool(
+                    dev_is_cuda
+                    and async_type in {"thread", "thr"}
+                    and env_bool("ENN_DCP_STAGER_PINNED", default=True)
+                )
                 if "async_stager" in kwargs:
                     stager2 = self._ensure_stager(use_pinned_memory=use_pinned)
                     kwargs["async_stager"] = stager2
