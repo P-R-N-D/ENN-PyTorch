@@ -2777,9 +2777,11 @@ class MultiScaleRetention(nn.Module):
         st_bhd = self._extract_state_tensor(state, B=B, H=int(self.nhead))
         if st_bhd is not None:
             v = v.clone()
-            v[:, 0] = v[:, 0] + lam_h.view(1, self.nhead, 1) * st_bhd.to(
+            st_scaled = lam_h.view(1, 1, self.nhead, 1) * st_bhd.to(
                 dtype=v.dtype, device=v.device
-            )
+            ).unsqueeze(1)
+            v0 = v[:, :1] + st_scaled
+            v = torch.cat([v0, v[:, 1:]], dim=1)
         state_tensor = self._scan_causal(v, lam_h)
         y = (q * state_tensor).contiguous().view(B, L, self.d_model)
         y = self.norm(y)

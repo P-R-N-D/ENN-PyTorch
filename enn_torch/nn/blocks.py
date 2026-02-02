@@ -9,6 +9,7 @@ from typing import Any, Callable, List, Optional, Self, Sequence, Tuple
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from ..core.compat import StochasticDepth
 from ..runtime.distributed import _from_hsdp_module
 from .activations import GeGLU
@@ -39,6 +40,20 @@ _MODELING_TYPE_ALIASES: dict[str, str] = {
 _ENN_HAS_FLEX_ATTENTION = getattr(
     import_module(".layers", __package__), "_HAS_FLEX_ATTENTION", False
 )
+
+
+def _safe_norm(norm: nn.Module, x: torch.Tensor) -> torch.Tensor:
+    if isinstance(norm, nn.LayerNorm):
+        weight = norm.weight
+        bias = norm.bias
+        return F.layer_norm(
+            x,
+            norm.normalized_shape,
+            weight.clone() if weight is not None else None,
+            bias.clone() if bias is not None else None,
+            norm.eps,
+        )
+    return norm(x)
 
 
 def _size_of_retnet(
@@ -392,14 +407,16 @@ class RetNet(nn.Module):
         if causal_mask is not None:
             causal_mask = causal_mask.contiguous()
         eff_mode = mode if mode is not None else getattr(self, "mode", None)
+        x_norm1 = _safe_norm(self.norm1, x)
         h, new_state = self.retention(
-            self.norm1(x),
+            x_norm1,
             attn_mask=causal_mask,
             state=state,
             mode=eff_mode,
         )
         x = x + self.drop_path(self.dropout(h))
-        x = x + self.drop_path(self.dropout(self.ffn(self.norm2(x))))
+        x_norm2 = _safe_norm(self.norm2, x)
+        x = x + self.drop_path(self.dropout(self.ffn(x_norm2)))
         return x, new_state
 
 
