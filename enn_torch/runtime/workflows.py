@@ -73,6 +73,8 @@ from .distributed import (
 from .io import _filtered_warnings, _torch_load_checkpoint, is_required
 from .main import process
 
+logger = logging.getLogger(__name__)
+
 
 def _rewrite_state_dict_key(k: str) -> str:
     if k.startswith("m.") and ".module." in k:
@@ -296,11 +298,24 @@ def _resize_scaler_buffers_from_metadata(
 
 
 def _parse_meta(p: PathLike) -> Mapping[str, Any]:
-    meta_path = p / "meta.json"
-    try:
-        return read_json(meta_path) if meta_path.exists() else {}
-    except Exception as exc:
-        raise RuntimeError(f"Metadata parse failed: {p}") from exc
+    base = Path(p)
+    for d in (base, base.parent, base.parent.parent, base.parent.parent.parent):
+        meta_path = d / "meta.json"
+        try:
+            if meta_path.exists():
+                out = read_json(meta_path)
+                return out if isinstance(out, Mapping) else {}
+        except Exception as exc:
+            raise RuntimeError(f"Metadata parse failed: {meta_path}") from exc
+    done_path = base / "done.json"
+    with contextlib.suppress(Exception):
+        if done_path.exists():
+            done_json = read_json(done_path)
+            if isinstance(done_json, Mapping):
+                extra_meta = done_json.get("extra_meta")
+                if isinstance(extra_meta, Mapping):
+                    return extra_meta
+    return {}
 
 
 def _is_execution_time_logged() -> bool:
@@ -914,11 +929,26 @@ def load_weights(
                 tasks = meta.get("tasks")
                 if tasks:
                     model.rebuild_tasks_from_specs(tasks)
+        reader = FileSystemReader(str(p))
+        meta_data = None
+        with contextlib.suppress(Exception):
+            meta_data = reader.read_metadata()
+        if not _resize_scaler_buffers_from_metadata(model, meta_data):
+            _resize_scaler_buffers_for_shape(
+                model,
+                getattr(model, "in_dim", None),
+                getattr(model, "out_shape", ()) or (),
+            )
         opts = StateDictOptions(full_state_dict=True)
-        m_sd = get_model_state_dict(model, options=opts)
-        load(state_dict={"model": m_sd}, storage_reader=FileSystemReader(str(p)))
-        resize_scaler_buffer(model, m_sd)
-        set_model_state_dict(model, m_sd, options=StateDictOptions(strict=False))
+        eager_ctx = getattr(model, "eager_for_export", None)
+        cm = eager_ctx() if callable(eager_ctx) else contextlib.nullcontext()
+        with cm:
+            m_sd = get_model_state_dict(model, options=opts)
+            load(state_dict={"model": m_sd}, storage_reader=reader)
+            resize_scaler_buffer(model, m_sd)
+            set_model_state_dict(
+                model, m_sd, options=StateDictOptions(strict=False)
+            )
         return meta if isinstance(meta, dict) else None
 
     if not p.exists():
@@ -1039,15 +1069,22 @@ def load_model(
             tasks = meta.get("tasks") if isinstance(meta, dict) else None
             if tasks:
                 model.rebuild_tasks_from_specs(tasks)
+        reader = FileSystemReader(str(p))
+        meta_data = None
+        with contextlib.suppress(Exception):
+            meta_data = reader.read_metadata()
+        if not _resize_scaler_buffers_from_metadata(model, meta_data):
+            _resize_scaler_buffers_for_shape(model, use_in_dim, use_out_shape)
         opts = StateDictOptions(full_state_dict=True)
-        m_sd = get_model_state_dict(model, options=opts)
-        load(
-            state_dict={"model": m_sd}, storage_reader=FileSystemReader(str(p))
-        )
-        resize_scaler_buffer(model, m_sd)
-        set_model_state_dict(
-            model, m_sd, options=StateDictOptions(strict=False)
-        )
+        eager_ctx = getattr(model, "eager_for_export", None)
+        cm = eager_ctx() if callable(eager_ctx) else contextlib.nullcontext()
+        with cm:
+            m_sd = get_model_state_dict(model, options=opts)
+            load(state_dict={"model": m_sd}, storage_reader=reader)
+            resize_scaler_buffer(model, m_sd)
+            set_model_state_dict(
+                model, m_sd, options=StateDictOptions(strict=False)
+            )
         return model
     if not p.exists():
         raise FileNotFoundError(f"Checkpoint file not found: {str(p)!r}")
