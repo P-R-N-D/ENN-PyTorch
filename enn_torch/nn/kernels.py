@@ -687,23 +687,17 @@ def _warn_flex_debug_once(key: str, msg: str) -> None:
     _warn_once(key, msg)
 
 
-def _cuda_sm_for_flex_defaults() -> Optional[int]:
-    try:
-        dev = get_device()
-    except Exception:
-        dev = None
-    if (
-        dev is None
-        or getattr(dev, "type", None) != "cuda"
-        or (not torch.cuda.is_available())
-    ):
+def _cuda_sm_for_flex_defaults(device: Optional[torch.device] = None) -> Optional[int]:
+    if device is not None and getattr(device, "type", "cpu") != "cuda":
+        return None
+    if not torch.cuda.is_available():
         return None
     try:
-        idx = (
-            dev.index
-            if getattr(dev, "index", None) is not None
-            else torch.cuda.current_device()
-        )
+        idx = None
+        if device is not None:
+            idx = getattr(device, "index", None)
+        if idx is None:
+            idx = torch.cuda.current_device()
         major, minor = torch.cuda.get_device_capability(idx)
         return int(major) * 10 + int(minor)
     except Exception:
@@ -727,10 +721,14 @@ def _clamp_max(opts: dict[str, Any], key: str, cap: int) -> None:
     opts[key] = min(_pos_int(cur, cap_i), cap_i)
 
 
-def _resource_safe_kernel_options(existing: Any) -> dict[str, Any]:
+def _resource_safe_kernel_options(
+    existing: Any,
+    *,
+    device: Optional[torch.device] = None,
+) -> dict[str, Any]:
     if (existing is not None) and (not isinstance(existing, Mapping)):
         existing = None
-    sm = _cuda_sm_for_flex_defaults()
+    sm = _cuda_sm_for_flex_defaults(device=device)
     fwd_block_def = 32 if (sm is not None and sm <= 75) else 64
     fwd_warps_def = 2 if (sm is not None and sm <= 75) else 4
     bwd_block_def = 16 if (sm is not None and sm <= 75) else 32
@@ -2176,14 +2174,15 @@ class FlexAttention(nn.Module):
                     flex_kwargs["dropout_p"] = float(dropout_p)
                 elif "dropout" in _FLEX_KWARGS:
                     flex_kwargs["dropout"] = float(dropout_p)
-            if "kernel_options" in _FLEX_KWARGS and kernel_options is not None:
-                flex_kwargs["kernel_options"] = kernel_options
-            elif (
-                "kernel_options" in _FLEX_KWARGS
-                and kernel_options is None
-                and _flex_env_overrides_present()
-            ):
-                flex_kwargs["kernel_options"] = _resource_safe_kernel_options(None)
+            if "kernel_options" in _FLEX_KWARGS:
+                if kernel_options is not None:
+                    flex_kwargs["kernel_options"] = kernel_options
+                else:
+                    sm = _cuda_sm_for_flex_defaults(q.device)
+                    if _flex_env_overrides_present() or (sm is not None and sm <= 75):
+                        flex_kwargs["kernel_options"] = _resource_safe_kernel_options(
+                            None, device=q.device
+                        )
             flex_fn, flex_key = _get_compiled_flex_attention_for_kwargs(
                 q, flex_kwargs
             )
@@ -2340,8 +2339,8 @@ class FlexAttention(nn.Module):
                         try:
                             flex_kwargs2 = dict(flex_kwargs)
                             existing = flex_kwargs2.get("kernel_options", None)
-                            flex_kwargs2["kernel_options"] = (
-                                _resource_safe_kernel_options(existing)
+                            flex_kwargs2["kernel_options"] = _resource_safe_kernel_options(
+                                existing, device=q.device
                             )
                             flex_fn2, flex_key2 = (
                                 _get_compiled_flex_attention_for_kwargs(
