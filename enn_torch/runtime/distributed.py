@@ -524,8 +524,8 @@ def _get_gloox_gloo_process_group(pg: ProcessGroup | None) -> ProcessGroup:
 
     try:
         gloo_pg = dist.new_group(ranks=list(ranks), backend="gloo")
-    except Exception:
-        return base_pg
+    except Exception as exc:
+        raise RuntimeError("Failed to create gloo process group") from exc
 
     _GLOOX_GLOO_PG_CACHE[ranks] = gloo_pg
     return gloo_pg
@@ -1166,10 +1166,34 @@ def broadcast_scalar(
 
     lane_s = str(lane).strip().lower()
     if lane_s in {"control", "cpu", "gloo"}:
-        cpg = get_control_process_group(pg if group is not None else None) or pg
-        t = torch.tensor([int(value)], device="cpu", dtype=torch.int32)
-        dist.broadcast(t, src=int(src), group=cpg)
-        return int(t.item())
+        cpg = get_control_process_group(pg if group is not None else None)
+        cpu_exc: Exception | None = None
+        if cpg is not None:
+            try:
+                t = torch.tensor([int(value)], device="cpu", dtype=torch.int32)
+                dist.broadcast(t, src=int(src), group=cpg)
+                return int(t.item())
+            except Exception as exc:
+                cpu_exc = exc
+        dev = device
+        if dev is None:
+            with contextlib.suppress(Exception):
+                dev = get_device()
+        if dev is None:
+            dev = torch.device("cpu")
+        if getattr(dev, "type", "cpu") == "cpu" and torch.cuda.is_available():
+            with contextlib.suppress(Exception):
+                dev = torch.device("cuda", torch.cuda.current_device())
+        try:
+            t = torch.tensor([int(value)], device=dev, dtype=torch.int32)
+            dist.broadcast(t, src=int(src), group=pg)
+            return int(t.item())
+        except Exception as exc2:
+            if cpu_exc is not None:
+                raise RuntimeError(
+                    "broadcast_scalar failed on both control-plane (CPU/gloo) and accelerator lanes"
+                ) from exc2
+            raise
 
     dev = device
     if dev is None:
@@ -1239,8 +1263,23 @@ def distributed_barrier(
 
     lane_s = str(lane).strip().lower()
     if lane_s in {"control", "cpu", "gloo"}:
-        cpg = get_control_process_group(pg if group is not None else None) or pg
-        dist.barrier(group=cpg)
+        cpg = get_control_process_group(pg if group is not None else None)
+        if cpg is not None:
+            dist.barrier(group=cpg)
+            return
+        dev = device
+        if dev is None:
+            with contextlib.suppress(Exception):
+                dev = get_device()
+        if dev is None:
+            dev = torch.device("cpu")
+        if getattr(dev, "type", "cpu") == "cpu" and torch.cuda.is_available():
+            with contextlib.suppress(Exception):
+                dev = torch.device("cuda", torch.cuda.current_device())
+        try:
+            dist.barrier(group=pg, device_ids=_get_device_id(dev))
+        except TypeError:
+            dist.barrier(group=pg)
         return
 
     dev = device
@@ -1333,25 +1372,32 @@ def distributed_broadcast(
         )
 
     if backend == "gloox":
-        gloo_group = _get_gloox_gloo_process_group(group)
+        gloo_group = None
+        try:
+            gloo_group = _get_gloox_gloo_process_group(group)
+        except Exception:
+            gloo_group = None
 
-        for bucket in _iter_buckets_by_bytes(
-            small_tensors, max_bucket_bytes=coalesce_bytes
-        ):
-            _broadcast_bucket_gloox(
-                bucket, src_rank=src_rank, group=gloo_group
-            )
+        if gloo_group is not None:
+            for bucket in _iter_buckets_by_bytes(
+                small_tensors, max_bucket_bytes=coalesce_bytes
+            ):
+                _broadcast_bucket_gloox(
+                    bucket, src_rank=src_rank, group=gloo_group
+                )
 
-        for t in large_tensors:
-            _broadcast_large_tensor_gloox(
-                t,
-                src_rank=src_rank,
-                group=gloo_group,
-                chunk_mb=chunk_mb,
-                max_inflight_mb=max_inflight_mb,
-            )
+            for t in large_tensors:
+                _broadcast_large_tensor_gloox(
+                    t,
+                    src_rank=src_rank,
+                    group=gloo_group,
+                    chunk_mb=chunk_mb,
+                    max_inflight_mb=max_inflight_mb,
+                )
 
-        return
+            return
+
+        backend = "c10d"
 
     if small_tensors:
         element_size = small_tensors[0].element_size()
@@ -1455,17 +1501,25 @@ def distributed_all_reduce_grads(
 
     backend = str(getattr(policy, "backend", "c10d")).strip().lower()
     if backend == "gloox":
-        gloo_pg = _get_gloox_gloo_process_group(pg)
-        for g in grads:
-            _all_reduce_tensor_gloox(
-                g,
-                group=gloo_pg,
-                chunk_mb=chunk_mb,
-                max_inflight_mb=max_inflight_mb,
-                average=average,
-                world_size=world_size,
-            )
-        return
+        gloo_pg = None
+        try:
+            gloo_pg = _get_gloox_gloo_process_group(pg)
+        except Exception:
+            gloo_pg = None
+
+        if gloo_pg is not None:
+            for g in grads:
+                _all_reduce_tensor_gloox(
+                    g,
+                    group=gloo_pg,
+                    chunk_mb=chunk_mb,
+                    max_inflight_mb=max_inflight_mb,
+                    average=average,
+                    world_size=world_size,
+                )
+            return
+
+        backend = "c10d"
 
     for g in grads:
         if g.numel() == 0:
@@ -2268,11 +2322,18 @@ class Checkpointer:
         if not self._is_distributed():
             return bool(flag)
         pg = self._sync_group()
-        t = torch.tensor(
-            [1 if flag else 0], device=self._sync_device(), dtype=torch.int32
+        dev = getattr(self, "_device", None)
+        if dev is None:
+            with contextlib.suppress(Exception):
+                dev = get_device()
+        v = broadcast_scalar(
+            1 if flag else 0,
+            device=dev,
+            src=0,
+            group=pg,
+            lane="control",
         )
-        dist.broadcast(t, src=0, group=pg)
-        return bool(int(t.item()))
+        return bool(int(v))
 
     def _is_dcp_leader(self) -> bool:
         if not self._is_distributed():
