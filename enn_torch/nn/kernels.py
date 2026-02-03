@@ -725,10 +725,12 @@ def _resource_safe_kernel_options(
     existing: Any,
     *,
     device: Optional[torch.device] = None,
+    sm: Optional[int] = None,
 ) -> dict[str, Any]:
     if (existing is not None) and (not isinstance(existing, Mapping)):
         existing = None
-    sm = _cuda_sm_for_flex_defaults(device=device)
+    if sm is None:
+        sm = _cuda_sm_for_flex_defaults(device=device)
     fwd_block_def = 32 if (sm is not None and sm <= 75) else 64
     fwd_warps_def = 2 if (sm is not None and sm <= 75) else 4
     bwd_block_def = 16 if (sm is not None and sm <= 75) else 32
@@ -2181,7 +2183,7 @@ class FlexAttention(nn.Module):
                     sm = _cuda_sm_for_flex_defaults(q.device)
                     if _flex_env_overrides_present() or (sm is not None and sm <= 75):
                         flex_kwargs["kernel_options"] = _resource_safe_kernel_options(
-                            None, device=q.device
+                            None, device=q.device, sm=sm
                         )
             flex_fn, flex_key = _get_compiled_flex_attention_for_kwargs(
                 q, flex_kwargs
@@ -2337,10 +2339,11 @@ class FlexAttention(nn.Module):
                             f"kernel_options={flex_kwargs.get('kernel_options', None)}",
                         )
                         try:
+                            sm = _cuda_sm_for_flex_defaults(q.device)
                             flex_kwargs2 = dict(flex_kwargs)
                             existing = flex_kwargs2.get("kernel_options", None)
                             flex_kwargs2["kernel_options"] = _resource_safe_kernel_options(
-                                existing, device=q.device
+                                existing, device=q.device, sm=sm
                             )
                             flex_fn2, flex_key2 = (
                                 _get_compiled_flex_attention_for_kwargs(
