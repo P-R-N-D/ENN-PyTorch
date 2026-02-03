@@ -2094,6 +2094,7 @@ class Checkpointer:
         self._stager_cfg: tuple[bool, bool] | None = None
         self._stager_pinned_disabled: bool = False
         self._abort_gen: int = 0
+        self._dcp_child_pids: set[int] = set()
 
         try:
             import torch.distributed as dist
@@ -2540,11 +2541,49 @@ class Checkpointer:
         return self._avg_node_dir(node_rank) / "latest.json"
 
     def _sigkill_torch_checkpoint_processes(self) -> None:
+        return self._sigkill_torch_checkpoint_processes_scoped(None)
+
+    def _sigkill_torch_checkpoint_processes_scoped(
+        self, only_pids: set[int] | None
+    ) -> None:
         try:
             import multiprocessing as _mp
             import signal as _signal
         except Exception:
             return
+        killed: set[int] = set()
+        for p in list(_mp.active_children() or []):
+            try:
+                tgt = getattr(p, "_target", None)
+                mod = str(getattr(tgt, "__module__", "") or "")
+                if "torch.distributed.checkpoint" not in mod:
+                    continue
+                pid = getattr(p, "pid", None)
+                if not pid:
+                    continue
+                pid_i = int(pid)
+                if only_pids is not None and pid_i not in only_pids:
+                    continue
+                with contextlib.suppress(Exception):
+                    os.kill(pid_i, _signal.SIGKILL)
+                for fn_name in ("kill", "terminate"):
+                    fn = getattr(p, fn_name, None)
+                    if callable(fn):
+                        with contextlib.suppress(Exception):
+                            fn()
+                killed.add(pid_i)
+            except Exception:
+                continue
+        if only_pids is not None and killed:
+            with contextlib.suppress(Exception):
+                self._dcp_child_pids.difference_update(killed)
+
+    def _torch_dcp_child_pids(self) -> set[int]:
+        out: set[int] = set()
+        try:
+            import multiprocessing as _mp
+        except Exception:
+            return out
         for p in list(_mp.active_children() or []):
             try:
                 tgt = getattr(p, "_target", None)
@@ -2553,15 +2592,10 @@ class Checkpointer:
                     continue
                 pid = getattr(p, "pid", None)
                 if pid:
-                    with contextlib.suppress(Exception):
-                        os.kill(int(pid), _signal.SIGKILL)
-                for fn_name in ("kill", "terminate"):
-                    fn = getattr(p, fn_name, None)
-                    if callable(fn):
-                        with contextlib.suppress(Exception):
-                            fn()
+                    out.add(int(pid))
             except Exception:
                 continue
+        return out
 
     def _ensure_stager(self, *, use_pinned_memory: bool) -> object | None:
         if self._stager_closed:
@@ -3655,7 +3689,22 @@ class Checkpointer:
 
                 used_pinned = bool(use_pinned and ("async_stager" in kwargs))
 
+                _before = None
+                if async_type in {
+                    "process",
+                    "proc",
+                    "subprocess",
+                    "subinterp",
+                    "subinterpreter",
+                    "interpreter",
+                }:
+                    with contextlib.suppress(Exception):
+                        _before = self._torch_dcp_child_pids()
                 dcp_future = _call_async_save_safe(kwargs)
+                if _before is not None:
+                    with contextlib.suppress(Exception):
+                        _after = self._torch_dcp_child_pids()
+                        self._dcp_child_pids.update(_after.difference(_before))
             else:
                 dcp.save(
                     state_dict=dcp_state,
@@ -3796,8 +3845,11 @@ class Checkpointer:
             if callable(close_fn):
                 close_fn()
 
-        with contextlib.suppress(Exception):
-            self._sigkill_torch_checkpoint_processes()
+        if self._dcp_child_pids:
+            with contextlib.suppress(Exception):
+                self._sigkill_torch_checkpoint_processes_scoped(
+                    set(self._dcp_child_pids)
+                )
 
         if self._is_dcp_leader():
             self._release_inflight_lock()
