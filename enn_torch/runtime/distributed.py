@@ -61,6 +61,8 @@ except ImportError:
 
 _DTENSOR_ACTIVE: bool = False
 _GLOOX_GLOO_PG_CACHE: dict[tuple[int, ...], ProcessGroup] = {}
+_CONTROL_GLOO_PG: object | None = None
+_CONTROL_GLOO_PG_LOCK = Mutex()
 _LOGGER = logging.getLogger(__name__)
 _INFLIGHT_LOCK_NAME = ".inflight.lock"
 _INFLIGHT_LOCK_TTL_SEC = int(os.environ.get("ENN_DCP_INFLIGHT_LOCK_TTL_SEC", "21600"))
@@ -463,6 +465,34 @@ def _hsdp_supported_params() -> set[str]:
         return set()
 
 
+def get_control_process_group(pg: ProcessGroup | None = None) -> ProcessGroup | None:
+    if not is_distributed():
+        return None
+
+    base_pg = pg or dist.group.WORLD
+
+    if pg is None:
+        global _CONTROL_GLOO_PG
+        with contextlib.suppress(Exception):
+            if is_process_group(_CONTROL_GLOO_PG):
+                return _CONTROL_GLOO_PG  # type: ignore[return-value]
+        with _CONTROL_GLOO_PG_LOCK:
+            with contextlib.suppress(Exception):
+                if is_process_group(_CONTROL_GLOO_PG):
+                    return _CONTROL_GLOO_PG  # type: ignore[return-value]
+            try:
+                _CONTROL_GLOO_PG = dist.new_group(backend="gloo")
+            except Exception:
+                _CONTROL_GLOO_PG = None
+        if is_process_group(_CONTROL_GLOO_PG):
+            return _CONTROL_GLOO_PG  # type: ignore[return-value]
+
+    with contextlib.suppress(Exception):
+        return _get_gloox_gloo_process_group(base_pg)
+
+    return None
+
+
 def _get_gloox_gloo_process_group(pg: ProcessGroup | None) -> ProcessGroup:
     if not is_distributed():
         return pg or dist.group.WORLD
@@ -479,6 +509,14 @@ def _get_gloox_gloo_process_group(pg: ProcessGroup | None) -> ProcessGroup:
         ranks = tuple(dist.get_process_group_ranks(base_pg))
     except Exception:
         ranks = tuple(range(dist.get_world_size(base_pg)))
+
+    with contextlib.suppress(Exception):
+        if (
+            is_process_group(_CONTROL_GLOO_PG)
+            and ranks == tuple(range(dist.get_world_size()))
+        ):
+            _GLOOX_GLOO_PG_CACHE.setdefault(ranks, _CONTROL_GLOO_PG)  # type: ignore[arg-type]
+            return _CONTROL_GLOO_PG  # type: ignore[return-value]
 
     cached = _GLOOX_GLOO_PG_CACHE.get(ranks)
     if cached is not None:
@@ -1111,16 +1149,37 @@ def joining(
 
 
 def broadcast_scalar(
-    value: int | float, device: torch.device, src: int = 0
+    value: int | float,
+    device: torch.device | None = None,
+    src: int = 0,
+    group: ProcessGroup | None = None,
+    *,
+    lane: str = "control",
 ) -> int:
     if not is_distributed():
         return int(value)
-    try:
-        tensor = torch.tensor([int(value)], device=device, dtype=torch.int32)
-        dist.broadcast(tensor, src=src)
-        return int(tensor.item())
-    except Exception:
-        return int(value)
+
+    pg = group or dist.group.WORLD
+    with contextlib.suppress(Exception):
+        if int(dist.get_world_size(pg)) <= 1:
+            return int(value)
+
+    lane_s = str(lane).strip().lower()
+    if lane_s in {"control", "cpu", "gloo"}:
+        cpg = get_control_process_group(pg if group is not None else None) or pg
+        t = torch.tensor([int(value)], device="cpu", dtype=torch.int32)
+        dist.broadcast(t, src=int(src), group=cpg)
+        return int(t.item())
+
+    dev = device
+    if dev is None:
+        with contextlib.suppress(Exception):
+            dev = get_device()
+    if dev is None:
+        dev = torch.device("cpu")
+    t = torch.tensor([int(value)], device=dev, dtype=torch.int32)
+    dist.broadcast(t, src=int(src), group=pg)
+    return int(t.item())
 
 
 def is_distributed() -> bool:
@@ -1145,10 +1204,21 @@ def is_rank0() -> bool:
 
 
 def distributed_barrier(
-    device: Optional[torch.device] = None, group: ProcessGroup | None = None
+    device: Optional[torch.device] = None,
+    group: ProcessGroup | None = None,
+    *,
+    lane: str = "control",
 ) -> None:
     if not is_distributed():
         return
+
+    if (
+        group is None
+        and device is not None
+        and isinstance(device, dist.ProcessGroup)
+    ):
+        group = device
+        device = None
 
     if (
         group is None
@@ -1163,8 +1233,22 @@ def distributed_barrier(
                 device = None
 
     pg = group or dist.group.WORLD
+    with contextlib.suppress(Exception):
+        if int(dist.get_world_size(pg)) <= 1:
+            return
+
+    lane_s = str(lane).strip().lower()
+    if lane_s in {"control", "cpu", "gloo"}:
+        cpg = get_control_process_group(pg if group is not None else None) or pg
+        dist.barrier(group=cpg)
+        return
+
+    dev = device
+    if dev is None:
+        with contextlib.suppress(Exception):
+            dev = get_device()
     try:
-        dist.barrier(group=pg, device_ids=_get_device_id(device))
+        dist.barrier(group=pg, device_ids=_get_device_id(dev))
     except TypeError:
         dist.barrier(group=pg)
 
@@ -1835,7 +1919,17 @@ class ProcessBroker:
                 rank = int(local_rank)
         if device.type in {"cuda", "xpu"}:
             n = max(1, int(get_num_accelerators(device.type) or 1))
-            set_accelerator_index(device.type, int(rank) % int(n))
+            idx = (
+                int(getattr(device, "index", None))
+                if getattr(device, "index", None) is not None
+                else int(rank) % int(n)
+            )
+            set_accelerator_index(device.type, int(idx))
+            with contextlib.suppress(Exception):
+                if device.type == "cuda" and hasattr(torch, "cuda"):
+                    torch.cuda.set_device(int(idx))
+                elif device.type == "xpu" and hasattr(torch, "xpu"):
+                    torch.xpu.set_device(int(idx))
         else:
             cls.ensure_default_socket_ifname()
 
@@ -1903,6 +1997,9 @@ class ProcessBroker:
             if str(backend_pg) == str(backend):
                 raise
             _init_with(backend)
+
+        with contextlib.suppress(Exception):
+            get_control_process_group()
 
     @classmethod
     def loader_state_path(cls, directory: PathLike) -> str:
@@ -2153,32 +2250,18 @@ class Checkpointer:
         self._inflight_lock = self.dcp_root / _INFLIGHT_LOCK_NAME
         self._inflight_mu = threading.Lock()
 
-        self._sync_pg = None
-        if self._is_distributed():
-            try:
-                self._sync_pg = dist.new_group(backend="gloo")
-            except Exception:
-                self._sync_pg = None
+        self._sync_pg = get_control_process_group()
 
         self._cleanup_stale_inflight_lock()
         if self._is_dcp_leader():
             _cleanup_delete_pending(self.dcp_root)
 
-    def _sync_group(self):
+    def _sync_group(self) -> ProcessGroup | None:
         if not self._is_distributed():
             return None
-        return self._sync_pg if self._sync_pg is not None else dist.group.WORLD
+        return self._sync_pg if self._sync_pg is not None else get_control_process_group()
 
     def _sync_device(self) -> str:
-        if not self._is_distributed():
-            return "cpu"
-        pg = self._sync_group()
-        try:
-            backend = dist.get_backend(pg)
-        except Exception:
-            backend = None
-        if backend == "nccl":
-            return f"cuda:{torch.cuda.current_device()}"
         return "cpu"
 
     def _bcast_bool_from_leader(self, flag: bool) -> bool:
@@ -3275,7 +3358,11 @@ class Checkpointer:
                 checkpoint_id=str(epoch_dir),
                 storage_writer=writer,
                 planner=planner,
-                process_group=self._dcp_process_group,
+                process_group=(
+                    (self._dcp_process_group or dist.group.WORLD)
+                    if self._is_distributed()
+                    else None
+                ),
             )
 
             if self._is_dcp_leader():
@@ -3543,8 +3630,14 @@ class Checkpointer:
 
             if self.use_async and hasattr(dcp, "async_save"):
                 raw = os.environ.get("ENN_DCP_ASYNC_TYPE", None)
-                async_type = str(raw).strip().lower() if raw is not None else ""
-                if (not async_type) or async_type in {"auto", "default"}:
+                if raw is None:
+                    async_type = "thread"
+                else:
+                    async_type = str(raw).strip().lower()
+
+                if (raw is not None) and (
+                    (not async_type) or async_type in {"auto", "default", "none", "null"}
+                ):
                     try:
                         w = int(getattr(self, "_world", 1) or 1)
                     except Exception:
@@ -3576,7 +3669,7 @@ class Checkpointer:
                     "checkpoint_id": str(epoch_dir),
                     "storage_writer": writer,
                     "planner": planner,
-                    "process_group": self._dcp_process_group,
+                    "process_group": (self._dcp_process_group or (dist.group.WORLD if self._is_distributed() else None)),
                 }
                 if stager is not None and supports_async_stager is not False:
                     kwargs["async_stager"] = stager
@@ -3586,21 +3679,23 @@ class Checkpointer:
                         AsyncCheckpointerType,
                     )
 
-                    if async_type in {
+                    proc_aliases = {
                         "process",
                         "proc",
                         "subprocess",
                         "subinterp",
                         "subinterpreter",
                         "interpreter",
-                    }:
+                    }
+                    thr_aliases = {"thread", "thr"}
+                    if async_type in proc_aliases:
                         proc_t = getattr(AsyncCheckpointerType, "PROCESS", None)
                         thr_t = getattr(AsyncCheckpointerType, "THREAD", None)
                         if proc_t is not None:
                             kwargs["async_checkpointer_type"] = proc_t
                         elif thr_t is not None:
                             kwargs["async_checkpointer_type"] = thr_t
-                    elif async_type in {"thread", "thr"}:
+                    elif async_type in thr_aliases:
                         thr_t = getattr(AsyncCheckpointerType, "THREAD", None)
                         if thr_t is not None:
                             kwargs["async_checkpointer_type"] = thr_t
@@ -3711,7 +3806,11 @@ class Checkpointer:
                     checkpoint_id=str(epoch_dir),
                     storage_writer=writer,
                     planner=planner,
-                    process_group=self._dcp_process_group,
+                    process_group=(
+                        (self._dcp_process_group or dist.group.WORLD)
+                        if self._is_distributed()
+                        else None
+                    ),
                 )
                 dcp_future = None
 
