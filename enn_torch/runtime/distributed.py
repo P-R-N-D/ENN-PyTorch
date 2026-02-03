@@ -3808,7 +3808,8 @@ class Checkpointer:
 
     def close(self, *, abort_inflight: bool = True) -> None:
         if abort_inflight:
-            self.abort_inflight()
+            if not self.is_idle():
+                self.abort_inflight()
         else:
             self.wait()
         with contextlib.suppress(Exception):
