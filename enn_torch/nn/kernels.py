@@ -2176,14 +2176,13 @@ class FlexAttention(nn.Module):
                     flex_kwargs["dropout_p"] = float(dropout_p)
                 elif "dropout" in _FLEX_KWARGS:
                     flex_kwargs["dropout"] = float(dropout_p)
-            if "kernel_options" in _FLEX_KWARGS and kernel_options is not None:
-                flex_kwargs["kernel_options"] = kernel_options
-            elif (
-                "kernel_options" in _FLEX_KWARGS
-                and kernel_options is None
-                and _flex_env_overrides_present()
-            ):
-                flex_kwargs["kernel_options"] = _resource_safe_kernel_options(None)
+            if "kernel_options" in _FLEX_KWARGS:
+                if kernel_options is not None:
+                    flex_kwargs["kernel_options"] = kernel_options
+                else:
+                    sm = _cuda_sm_for_flex_defaults()
+                    if _flex_env_overrides_present() or (sm is not None and sm <= 75):
+                        flex_kwargs["kernel_options"] = _resource_safe_kernel_options(None)
             flex_fn, flex_key = _get_compiled_flex_attention_for_kwargs(
                 q, flex_kwargs
             )
