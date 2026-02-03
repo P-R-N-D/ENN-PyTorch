@@ -65,6 +65,50 @@ _LOGGER = logging.getLogger(__name__)
 _INFLIGHT_LOCK_NAME = ".inflight.lock"
 _INFLIGHT_LOCK_TTL_SEC = int(os.environ.get("ENN_DCP_INFLIGHT_LOCK_TTL_SEC", "21600"))
 
+_DCP_NOISE_RE = re.compile(
+    r"("
+    r"Initializing dist\.ProcessGroup in checkpoint background process"
+    r"|Checkpoint background process is running"
+    r"|Checkpoint background process is shutting down"
+    r"|Waiting for checkpoint save request"
+    r"|Received async checkpoint request"
+    r"|Completed checkpoint save request"
+    r"|Checkpoint save failed for checkpoint_id="
+    r")",
+    re.IGNORECASE,
+)
+
+
+class _ENNDropTorchDCPNoise(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            msg = record.getMessage()
+        except Exception:
+            return True
+        if not msg:
+            return True
+        return _DCP_NOISE_RE.search(msg) is None
+
+
+def _install_torch_dcp_noise_filter() -> None:
+    root = logging.getLogger()
+    try:
+        for f in getattr(root, "filters", []) or []:
+            if isinstance(f, _ENNDropTorchDCPNoise):
+                return
+    except Exception:
+        pass
+    flt = _ENNDropTorchDCPNoise()
+    with contextlib.suppress(Exception):
+        root.addFilter(flt)
+    for h in list(getattr(root, "handlers", []) or []):
+        with contextlib.suppress(Exception):
+            h.addFilter(flt)
+
+
+with contextlib.suppress(Exception):
+    _install_torch_dcp_noise_filter()
+
 
 def _is_oomish_error(exc: BaseException) -> bool:
     if isinstance(exc, (MemoryError, EOFError, BrokenPipeError)):
@@ -3763,7 +3807,7 @@ class Checkpointer:
             _cleanup_delete_pending(self.dcp_root)
 
     def close(self, *, abort_inflight: bool = True) -> None:
-        if abort_inflight and (not self.is_idle()):
+        if abort_inflight:
             self.abort_inflight()
         else:
             self.wait()
