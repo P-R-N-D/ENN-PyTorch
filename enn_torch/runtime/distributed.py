@@ -463,10 +463,87 @@ def _hsdp_supported_params() -> set[str]:
         return set()
 
 
+def _accel_backend_for_device(device: torch.device) -> str | None:
+    dt = str(getattr(device, "type", "cpu") or "cpu").strip().lower()
+    if dt == "cuda":
+        return "nccl"
+    if dt == "xpu":
+        return "xccl"
+    if dt in {"hpu", "npu"}:
+        return "hccl"
+    return None
+
+
+_CPU_GROUP: ProcessGroup | None = None
+_ACCEL_GROUP: ProcessGroup | None = None
+_LANE_GROUPS_INITED: bool = False
+_LANE_GROUPS_LOCK = threading.Lock()
+_ACCEL_BACKEND: str | None = None
+
+
+def init_lane_process_groups(
+    device: torch.device | None = None,
+) -> tuple[ProcessGroup | None, ProcessGroup | None]:
+    global _CPU_GROUP, _ACCEL_GROUP, _LANE_GROUPS_INITED, _ACCEL_BACKEND
+    if not is_distributed():
+        return (None, None)
+
+    if _LANE_GROUPS_INITED:
+        return (_CPU_GROUP, _ACCEL_GROUP)
+
+    with _LANE_GROUPS_LOCK:
+        if _LANE_GROUPS_INITED:
+            return (_CPU_GROUP, _ACCEL_GROUP)
+
+        try:
+            _CPU_GROUP = dist.new_group(backend="gloo")
+        except Exception:
+            _CPU_GROUP = None
+
+        dev = device
+        if dev is None:
+            with contextlib.suppress(Exception):
+                dev = get_device()
+        if dev is None:
+            dev = torch.device("cpu")
+
+        be = _accel_backend_for_device(dev)
+        _ACCEL_BACKEND = be
+        if be is not None and be != "gloo":
+            try:
+                _ACCEL_GROUP = dist.new_group(backend=str(be))
+            except Exception:
+                _ACCEL_GROUP = None
+        else:
+            _ACCEL_GROUP = None
+
+        _LANE_GROUPS_INITED = True
+        return (_CPU_GROUP, _ACCEL_GROUP)
+
+
+def get_cpu_group() -> ProcessGroup | None:
+    return init_lane_process_groups()[0]
+
+
+def get_accel_group(
+    device: torch.device | None = None,
+) -> ProcessGroup | None:
+    return init_lane_process_groups(device)[1]
+
+
 def get_control_process_group(pg: ProcessGroup | None = None) -> ProcessGroup | None:
     if not is_distributed():
         return None
-    return pg or dist.group.WORLD
+    cpg = get_cpu_group()
+    return cpg or pg or dist.group.WORLD
+
+
+def get_accel_process_group(
+    device: torch.device | None = None,
+) -> ProcessGroup | None:
+    if not is_distributed():
+        return None
+    return get_accel_group(device)
 
 
 def _get_gloox_gloo_process_group(pg: ProcessGroup | None) -> ProcessGroup:
@@ -1122,7 +1199,7 @@ def broadcast_scalar(
     src: int = 0,
     group: ProcessGroup | None = None,
     *,
-    lane: str = "control",
+    lane: str = "auto",
 ) -> int:
     if not is_distributed():
         return int(value)
@@ -1133,8 +1210,23 @@ def broadcast_scalar(
             return int(value)
 
     lane_s = str(lane).strip().lower()
+    if lane_s in {"auto", ""}:
+        dev = device
+        if dev is None:
+            with contextlib.suppress(Exception):
+                dev = get_device()
+        if dev is None:
+            dev = torch.device("cpu")
+        lane_s = (
+            "accelerator"
+            if get_accel_group(dev) is not None
+            and getattr(dev, "type", "cpu") != "cpu"
+            else "control"
+        )
     if lane_s in {"control", "cpu", "gloo"}:
-        cpg = get_control_process_group(pg if group is not None else None)
+        cpg = get_cpu_group() or get_control_process_group(
+            pg if group is not None else None
+        )
         cpu_exc: Exception | None = None
         if cpg is not None:
             try:
@@ -1199,7 +1291,7 @@ def distributed_barrier(
     device: Optional[torch.device] = None,
     group: ProcessGroup | None = None,
     *,
-    lane: str = "control",
+    lane: str = "auto",
 ) -> None:
     if not is_distributed():
         return
@@ -1230,8 +1322,25 @@ def distributed_barrier(
             return
 
     lane_s = str(lane).strip().lower()
+    if lane_s in {"auto", ""}:
+        dev = device
+        if dev is None:
+            with contextlib.suppress(Exception):
+                dev = get_device()
+        if dev is None:
+            dev = torch.device("cpu")
+        lane_s = (
+            "accelerator"
+            if get_accel_group(dev) is not None
+            and getattr(dev, "type", "cpu") != "cpu"
+            else "control"
+        )
     if lane_s in {"control", "cpu", "gloo"}:
-        cpg = get_control_process_group(pg if group is not None else None) or pg
+        cpg = (
+            get_cpu_group()
+            or get_control_process_group(pg if group is not None else None)
+            or pg
+        )
         try:
             t = torch.zeros((1,), device="cpu", dtype=torch.int32)
             dist.all_reduce(t, op=dist.ReduceOp.SUM, group=cpg)
@@ -2026,6 +2135,8 @@ class ProcessBroker:
             if str(backend_pg) == str(backend):
                 raise
             _init_with(backend)
+        with contextlib.suppress(Exception):
+            init_lane_process_groups(device)
 
     @classmethod
     def loader_state_path(cls, directory: PathLike) -> str:
@@ -2559,17 +2670,10 @@ class Checkpointer:
         return False
 
     def _default_dcp_model_kind(self) -> str:
-        return os.environ.get("ENN_DCP_MODEL_KIND", "active").strip().lower()
+        return "active"
 
     def _avg_file_enabled(self, save_avg: bool | None = None) -> bool:
-        if save_avg is not None:
-            return bool(save_avg)
-        return bool(
-            env_bool(
-                ("ENN_DCP_SAVE_AVG_FILE", "ENN_CKPT_SAVE_AVG_FILE"),
-                default=False,
-            )
-        )
+        return False
 
     def _cpu_offload_enabled(self) -> bool:
         v = getattr(self, "_cpu_offload", None)
@@ -3251,10 +3355,10 @@ class Checkpointer:
         epoch_dir = self._epoch_dir(epoch_i)
         pending_exc: Exception | None = None
         try:
-            want_kind = str(model_kind or self._default_dcp_model_kind()).strip().lower()
-            want_avg = want_kind in ("avg", "average", "ema", "swa")
-            save_avg_file = bool(save_avg_file)
-            need_avg_snapshot = bool(want_avg or save_avg_file)
+            want_kind = "active"
+            want_avg = False
+            save_avg_file = False
+            need_avg_snapshot = False
 
             if not need_avg_snapshot:
                 avg_state_dict_factory = None
@@ -3367,7 +3471,7 @@ class Checkpointer:
                             "epoch": int(epoch_i),
                             "created_time": time.time(),
                             "has_optimizer": bool(save_opt),
-                            "model_kind": str(want_kind),
+                            "model_kind": "active",
                         },
                         indent=2,
                     )
@@ -3404,7 +3508,7 @@ class Checkpointer:
                     epoch_dir,
                     extra_meta={
                         "has_optimizer": bool(save_opt),
-                        "model_kind": str(want_kind),
+                        "model_kind": "active",
                     },
                 )
                 _cleanup_delete_pending(self.dcp_root)
@@ -3438,10 +3542,10 @@ class Checkpointer:
         block_if_busy: bool = False,
     ) -> None:
         epoch_i = int(epoch)
-        want_kind = self._default_dcp_model_kind()
-        want_avg = str(want_kind).strip().lower() in ("avg", "average", "ema", "swa")
-        save_avg_file = self._avg_file_enabled(save_avg)
-        need_avg_snapshot = bool(want_avg or save_avg_file)
+        want_kind = "active"
+        want_avg = False
+        save_avg_file = False
+        need_avg_snapshot = False
 
         self._maybe_wait_for_budget(block=False)
         do_cleanup = False
@@ -3570,8 +3674,8 @@ class Checkpointer:
             epoch_dir = self._epoch_dir(epoch_i)
             epoch_dir.mkdir(parents=True, exist_ok=True)
 
-            want_kind = self._default_dcp_model_kind()
-            want_avg = want_kind in ("avg", "average", "ema", "swa")
+            want_kind = "active"
+            want_avg = False
 
             save_opt = bool(optimizer is not None)
             if save_optimizer is not None:
@@ -3645,7 +3749,7 @@ class Checkpointer:
                             "epoch": int(epoch_i),
                             "created_time": time.time(),
                             "has_optimizer": bool(save_opt),
-                            "model_kind": ("avg" if want_avg else "active"),
+                            "model_kind": "active",
                         },
                         indent=2,
                     )
@@ -3856,7 +3960,7 @@ class Checkpointer:
                         epoch_dir=str(epoch_dir),
                         dcp_future=dcp_future,
                         has_optimizer=bool(save_opt),
-                        model_kind=("avg" if want_avg else "active"),
+                        model_kind="active",
                         abort_gen=int(self._abort_gen),
                         used_pinned=bool(locals().get("used_pinned", False)),
                         retry_unpinned=locals().get("retry_unpinned", None),
@@ -3887,7 +3991,7 @@ class Checkpointer:
                                 epoch_dir,
                                 extra_meta={
                                     "has_optimizer": bool(save_opt),
-                                    "model_kind": ("avg" if want_avg else "active"),
+                                    "model_kind": "active",
                                 },
                             )
                             _cleanup_delete_pending(self.dcp_root)
@@ -3901,7 +4005,7 @@ class Checkpointer:
                         epoch_dir,
                         extra_meta={
                             "has_optimizer": bool(save_opt),
-                            "model_kind": ("avg" if want_avg else "active"),
+                            "model_kind": "active",
                         },
                     )
                     if self._is_dcp_leader():
