@@ -61,8 +61,6 @@ except ImportError:
 
 _DTENSOR_ACTIVE: bool = False
 _GLOOX_GLOO_PG_CACHE: dict[tuple[int, ...], ProcessGroup] = {}
-_CONTROL_GLOO_PG: object | None = None
-_CONTROL_GLOO_PG_LOCK = Mutex()
 _LOGGER = logging.getLogger(__name__)
 _INFLIGHT_LOCK_NAME = ".inflight.lock"
 _INFLIGHT_LOCK_TTL_SEC = int(os.environ.get("ENN_DCP_INFLIGHT_LOCK_TTL_SEC", "21600"))
@@ -468,29 +466,7 @@ def _hsdp_supported_params() -> set[str]:
 def get_control_process_group(pg: ProcessGroup | None = None) -> ProcessGroup | None:
     if not is_distributed():
         return None
-
-    base_pg = pg or dist.group.WORLD
-
-    if pg is None:
-        global _CONTROL_GLOO_PG
-        with contextlib.suppress(Exception):
-            if is_process_group(_CONTROL_GLOO_PG):
-                return _CONTROL_GLOO_PG  # type: ignore[return-value]
-        with _CONTROL_GLOO_PG_LOCK:
-            with contextlib.suppress(Exception):
-                if is_process_group(_CONTROL_GLOO_PG):
-                    return _CONTROL_GLOO_PG  # type: ignore[return-value]
-            try:
-                _CONTROL_GLOO_PG = dist.new_group(backend="gloo")
-            except Exception:
-                _CONTROL_GLOO_PG = None
-        if is_process_group(_CONTROL_GLOO_PG):
-            return _CONTROL_GLOO_PG  # type: ignore[return-value]
-
-    with contextlib.suppress(Exception):
-        return _get_gloox_gloo_process_group(base_pg)
-
-    return None
+    return pg or dist.group.WORLD
 
 
 def _get_gloox_gloo_process_group(pg: ProcessGroup | None) -> ProcessGroup:
@@ -509,14 +485,6 @@ def _get_gloox_gloo_process_group(pg: ProcessGroup | None) -> ProcessGroup:
         ranks = tuple(dist.get_process_group_ranks(base_pg))
     except Exception:
         ranks = tuple(range(dist.get_world_size(base_pg)))
-
-    with contextlib.suppress(Exception):
-        if (
-            is_process_group(_CONTROL_GLOO_PG)
-            and ranks == tuple(range(dist.get_world_size()))
-        ):
-            _GLOOX_GLOO_PG_CACHE.setdefault(ranks, _CONTROL_GLOO_PG)  # type: ignore[arg-type]
-            return _CONTROL_GLOO_PG  # type: ignore[return-value]
 
     cached = _GLOOX_GLOO_PG_CACHE.get(ranks)
     if cached is not None:
@@ -1263,10 +1231,13 @@ def distributed_barrier(
 
     lane_s = str(lane).strip().lower()
     if lane_s in {"control", "cpu", "gloo"}:
-        cpg = get_control_process_group(pg if group is not None else None)
-        if cpg is not None:
-            dist.barrier(group=cpg)
+        cpg = get_control_process_group(pg if group is not None else None) or pg
+        try:
+            t = torch.zeros((1,), device="cpu", dtype=torch.int32)
+            dist.all_reduce(t, op=dist.ReduceOp.SUM, group=cpg)
             return
+        except Exception:
+            pass
         dev = device
         if dev is None:
             with contextlib.suppress(Exception):
@@ -1280,6 +1251,10 @@ def distributed_barrier(
             dist.barrier(group=pg, device_ids=_get_device_id(dev))
         except TypeError:
             dist.barrier(group=pg)
+        except Exception as exc:
+            raise RuntimeError(
+                "distributed_barrier(control) failed on both CPU and accelerator lanes"
+            ) from exc
         return
 
     dev = device
@@ -2051,9 +2026,6 @@ class ProcessBroker:
             if str(backend_pg) == str(backend):
                 raise
             _init_with(backend)
-
-        with contextlib.suppress(Exception):
-            get_control_process_group()
 
     @classmethod
     def loader_state_path(cls, directory: PathLike) -> str:
