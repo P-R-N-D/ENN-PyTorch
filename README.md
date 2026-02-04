@@ -18,7 +18,8 @@ This repository also includes a worked example notebook (`notebook.ipynb`) and a
 ## License
 
 **Code** is licensed under **PolyForm Noncommercial 1.0.0**.  
-**Weights/datasets/other artifacts** remain under the terms described in your `LICENSE` file. For commercial use, obtain a separate license
+**Weights/datasets/other artifacts** remain under the terms described in your `LICENSE` file.
+For commercial use, contact the owner to obtain a separate license.
 
 ## Requirements
 
