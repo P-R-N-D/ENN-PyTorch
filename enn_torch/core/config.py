@@ -787,6 +787,7 @@ class RuntimeConfig:
     )
     ckpt_dir: Optional[str] = None
     ckpt_cpu_offload: Optional[bool] = None
+    ckpt_save_optimizer: Optional[bool] = None
     init_ckpt_dir: Optional[str] = None
     epochs: int = 5
     val_frac: float = 0.1
@@ -814,6 +815,7 @@ class RuntimeConfig:
             "sources",
             "ckpt_dir",
             "ckpt_cpu_offload",
+            "ckpt_save_optimizer",
             "init_ckpt_dir",
             "epochs",
             "val_frac",
@@ -955,6 +957,16 @@ class RuntimeConfig:
                     if (
                         "ckpt_cpu_offload" in data
                         and data["ckpt_cpu_offload"] is not None
+                    )
+                    else None
+                ),
+                ckpt_save_optimizer=(
+                    _coerce_bool(
+                        data["ckpt_save_optimizer"], name="ckpt_save_optimizer"
+                    )
+                    if (
+                        "ckpt_save_optimizer" in data
+                        and data["ckpt_save_optimizer"] is not None
                     )
                     else None
                 ),

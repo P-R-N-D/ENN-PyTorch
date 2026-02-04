@@ -134,6 +134,7 @@ from .distributed import (
     distributed_sync,
     get_distributed_mesh,
     get_group_world_size as _get_world_size,
+    get_accel_group,
     get_world_size,
     is_distributed,
     joining,
@@ -1822,56 +1823,18 @@ def epochs(
                 flops = float(stats_cpu[2].item())
                 io_bytes = float(stats_cpu[3].item())
                 train_samples_epoch = float(stats_cpu[4].item())
-                distributed_barrier(device) if get_world_size(device) > 1 else None
+                (
+                    distributed_barrier(
+                        device, group=get_accel_group(device), lane="accelerator"
+                    )
+                    if get_world_size(device) > 1
+                    else None
+                )
             if not scheduler_step_per_batch:
                 try:
                     sched.step()
                 except Exception:
                     pass
-            avg_tag = None
-            avg_factory = None
-            if float(train_samples_epoch or 0.0) > 0.0 and local_rank == 0:
-                avg_target = (
-                    model.module
-                    if isinstance(
-                        model, torch.nn.parallel.DistributedDataParallel
-                    )
-                    else model
-                )
-                if swa_helper is not None and epoch_idx >= swa_start_epoch:
-                    avg_tag = "swa"
-                    with contextlib.suppress(Exception):
-                        swa_helper.update(avg_target)
-
-                    def _make_avg_sd():
-                        _LOGGER.info(
-                            "[swa] epoch %d: snapshot (CPU shadow)",
-                            epoch_idx + 1,
-                        )
-                        return swa_helper.checkpoint_state_dict(
-                            avg_target,
-                            include_buffers=True,
-                            max_buffer_mb=25,
-                        )
-
-                    avg_factory = _make_avg_sd
-                elif ema_helper is not None and getattr(
-                    ema_helper, "shadow", None
-                ):
-                    avg_tag = "ema"
-
-                    def _make_avg_sd():
-                        _LOGGER.info(
-                            "[ema] epoch %d: snapshot (CPU shadow)",
-                            epoch_idx + 1,
-                        )
-                        return ema_helper.checkpoint_state_dict(
-                            avg_target,
-                            include_buffers=True,
-                            max_buffer_mb=25,
-                        )
-
-                    avg_factory = _make_avg_sd
 
             if checkpointer is not None:
                 checkpointer.poll()
@@ -1879,15 +1842,12 @@ def epochs(
                     epoch=int(epoch_idx + 1),
                     model=model,
                     optimizer=optimizer,
-                    avg_state_dict_factory=avg_factory,
+                    save_optimizer=getattr(ops, "ckpt_save_optimizer", None),
                     extra_state={
                         "epoch": int(epoch_idx + 1),
-                        "avg": avg_tag,
                     },
                     block_if_busy=False,
                 )
-            if is_distributed() and get_world_size(device) > 1:
-                distributed_barrier(device)
             prev_comp_time += float(comp_time)
             prev_io_time += float(io_time)
             prev_flops += float(flops)
@@ -2209,7 +2169,7 @@ def infer(
                 torch_prof.start()
     if rank == 0:
         os.makedirs(chunk_dir, exist_ok=True)
-    distributed_barrier(device)
+    distributed_barrier(device, group=get_accel_group(device), lane="auto")
     _nogil_opt = bool(CPU.is_optimized_for_no_gil())
     _cache_default = 16 if _nogil_opt else 4
     cache_q = max(
@@ -2782,7 +2742,7 @@ def infer(
         if status_bar is not None:
             status_bar.close()
         with contextlib.suppress(Exception):
-            distributed_barrier(device)
+            distributed_barrier(device, group=get_accel_group(device), lane="auto")
         if exc_type is None and rank == 0:
             parts = []
             for rows_path in sorted(
@@ -2836,7 +2796,7 @@ def infer(
             collate.write_json(man_path, manifest, indent=2)
         if exc_type is None:
             with contextlib.suppress(Exception):
-                distributed_barrier(device)
+                distributed_barrier(device, group=get_accel_group(device), lane="auto")
     return None
 
 
@@ -3554,7 +3514,7 @@ def process(*args: Any, **kwargs: Any) -> object:
         finally:
             if session is not None:
                 session.close()
-        distributed_barrier(device)
+        distributed_barrier(device, group=get_accel_group(device), lane="auto")
         torch.distributed.destroy_process_group()
         return None
     raise ValueError(f"unsupported ops mode: {ops.mode}")
