@@ -1,5 +1,5 @@
 # ENN-PyTorch
-> ENN (Elastic Neural Networks) — fabric model, which supports a pluggable submodel interface, integrated with automated workflows for training, inference, and deployment export
+> ENN (Elastic Neural Networks) — fabric model for High-Performance Computing (HPC), which supports a pluggable submodel interface, integrated with automated workflows for training, inference, and deployment export
 
 ENN-PyTorch standardizes the end-to-end pipeline—configuration, data/I/O, elastic distributed execution, checkpointing,
 and export to deployment artifacts (ONNX/ORT/torch.export). The workflow layer automates training, inference, and artifact
