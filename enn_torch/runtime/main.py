@@ -1385,6 +1385,100 @@ def epochs(
                                             new_grad_accum = grad_accum_steps
                                         if grad_accum_steps > min_grad_accum:
                                             new_grad_accum = min_grad_accum
+                                        with contextlib.suppress(Exception):
+                                            if (
+                                                cpu_pool is not None
+                                                and hasattr(cpu_pool, "collect")
+                                            ):
+                                                cpu_pool.collect()
+                                        with contextlib.suppress(Exception):
+                                            time.sleep(
+                                                float(
+                                                    os.environ.get(
+                                                        "ENN_HOST_PRESSURE_YIELD_S",
+                                                        "0.001",
+                                                    )
+                                                )
+                                            )
+                                        try:
+                                            cd = float(
+                                                os.environ.get(
+                                                    "ENN_HOST_PRESSURE_HEAVY_COOLDOWN_SEC",
+                                                    "30",
+                                                )
+                                                or 30.0
+                                            )
+                                        except Exception:
+                                            cd = 30.0
+                                        cd = max(1.0, float(cd))
+                                        last = float(
+                                            getattr(
+                                                ops,
+                                                "_enn_host_pressure_last_heavy",
+                                                0.0,
+                                            )
+                                            or 0.0
+                                        )
+                                        now = time.monotonic()
+                                        if now - last >= cd:
+                                            with contextlib.suppress(Exception):
+                                                setattr(
+                                                    ops,
+                                                    "_enn_host_pressure_last_heavy",
+                                                    float(now),
+                                                )
+                                            if env_bool(
+                                                "ENN_HOST_PRESSURE_GC",
+                                                default=False,
+                                            ):
+                                                with contextlib.suppress(Exception):
+                                                    import gc
+
+                                                    gc.collect()
+                                            if env_bool(
+                                                "ENN_HOST_PRESSURE_MALLOC_TRIM",
+                                                default=False,
+                                            ):
+                                                with contextlib.suppress(Exception):
+                                                    import ctypes
+                                                    import platform
+
+                                                    sysname = (
+                                                        platform.system()
+                                                    )
+                                                    if sysname == "Linux":
+                                                        libc = ctypes.CDLL(
+                                                            "libc.so.6"
+                                                        )
+                                                        trim = getattr(
+                                                            libc,
+                                                            "malloc_trim",
+                                                            None,
+                                                        )
+                                                        if callable(trim):
+                                                            trim(0)
+                                                    elif sysname == "Windows":
+                                                        msvcrt = ctypes.CDLL(
+                                                            "msvcrt.dll"
+                                                        )
+                                                        heapmin = getattr(
+                                                            msvcrt,
+                                                            "_heapmin",
+                                                            None,
+                                                        )
+                                                        if callable(heapmin):
+                                                            heapmin()
+                                                    elif sysname == "Darwin":
+                                                        libsys = ctypes.CDLL(
+                                                            "libsystem_malloc.dylib"
+                                                        )
+                                                        fn = getattr(
+                                                            libsys,
+                                                            "malloc_zone_pressure_relief",
+                                                            None,
+                                                        )
+                                                        if callable(fn):
+                                                            fn(None, 0)
                                     if new_grad_accum != grad_accum_steps:
                                         new_grad_accum = broadcast_scalar(
                                             new_grad_accum,
