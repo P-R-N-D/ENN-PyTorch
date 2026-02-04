@@ -2951,7 +2951,35 @@ class Checkpointer:
         self._close_stager()
         pressure = False
         try:
-            min_free_mb = int(os.environ.get("ENN_DCP_HOST_MIN_FREE_MB", "1024"))
+            raw_min_free = str(
+                os.environ.get("ENN_DCP_HOST_MIN_FREE_MB", "") or ""
+            ).strip()
+            if raw_min_free:
+                min_free_mb = int(raw_min_free)
+            else:
+                ratio = 0.22
+                with contextlib.suppress(Exception):
+                    ratio = float(
+                        os.environ.get("ENN_DCP_HOST_MIN_FREE_RATIO", ratio)
+                        or ratio
+                    )
+                ratio = max(0.05, min(0.50, float(ratio)))
+                cap_mb = 3072
+                with contextlib.suppress(Exception):
+                    cap_mb = int(
+                        os.environ.get("ENN_DCP_HOST_MIN_FREE_MB_CAP", cap_mb)
+                        or cap_mb
+                    )
+                cap_mb = max(1024, int(cap_mb))
+                total_b = None
+                with contextlib.suppress(Exception):
+                    total_b = Memory.total()
+                if isinstance(total_b, int) and total_b > 0:
+                    total_mb = int(total_b // (1024 * 1024))
+                    min_free_mb = int(total_mb * ratio)
+                    min_free_mb = max(1024, min(int(cap_mb), int(min_free_mb)))
+                else:
+                    min_free_mb = 1024
             if min_free_mb > 0:
                 avail = int(Memory.available())
                 pressure = (avail >= 0) and (avail < (min_free_mb * 1024 * 1024))
