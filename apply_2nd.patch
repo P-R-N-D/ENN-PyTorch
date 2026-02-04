@@ -1,0 +1,71 @@
+--- a/enn_torch/runtime/distributed.py
++++ b/enn_torch/runtime/distributed.py
+@@ -1234,10 +1234,22 @@
+         )
+ 
+     def _accel_pg(default_pg: ProcessGroup) -> ProcessGroup:
+-        if pg_in is not None:
++        ag = get_accel_group(dev)
++        if ag is None:
+             return default_pg
+-        ag = get_accel_group(dev)
+-        return ag or default_pg
++        # If caller did not provide a group, prefer the accelerator group when available.
++        if pg_in is None:
++            return ag
++        # If caller provided WORLD but the WORLD backend is CPU-only (gloo), prefer accel group.
++        # This avoids attempting CUDA collectives on a gloo-only default group.
++        try:
++            if pg_in is dist.group.WORLD:
++                be = str(dist.get_backend(default_pg)).lower()
++                if (be == "gloo") or ("cpu:gloo" in be):
++                    return ag
++        except Exception:
++            pass
++        return default_pg
+ 
+     if lane_s in {"control", "cpu", "gloo"}:
+         cpg = get_cpu_group() or get_control_process_group(pg_in)
+@@ -1344,19 +1356,32 @@
+         )
+ 
+     def _accel_pg(default_pg: ProcessGroup) -> ProcessGroup:
+-        if pg_in is not None:
++        ag = get_accel_group(dev)
++        if ag is None:
+             return default_pg
+-        ag = get_accel_group(dev)
+-        return ag or default_pg
++        # If caller did not provide a group, prefer the accelerator group when available.
++        if pg_in is None:
++            return ag
++        # If caller provided WORLD but the WORLD backend is CPU-only (gloo), prefer accel group.
++        # This avoids attempting CUDA collectives on a gloo-only default group.
++        try:
++            if pg_in is dist.group.WORLD:
++                be = str(dist.get_backend(default_pg)).lower()
++                if (be == "gloo") or ("cpu:gloo" in be):
++                    return ag
++        except Exception:
++            pass
++        return default_pg
+ 
+     if lane_s in {"control", "cpu", "gloo"}:
+-        cpg = get_cpu_group() or get_control_process_group(pg_in) or pg
+-        try:
+-            t = torch.zeros((1,), device="cpu", dtype=torch.int32)
+-            dist.all_reduce(t, op=dist.ReduceOp.SUM, group=cpg)
+-            return
+-        except Exception:
+-            pass
++        cpg = get_cpu_group() or get_control_process_group(pg_in)
++        if cpg is not None:
++            try:
++                t = torch.zeros((1,), device="cpu", dtype=torch.int32)
++                dist.all_reduce(t, op=dist.ReduceOp.SUM, group=cpg)
++                return
++            except Exception:
++                pass
+         if getattr(dev, "type", "cpu") == "cpu" and torch.cuda.is_available():
+             with contextlib.suppress(Exception):
+                 dev = torch.device("cuda", torch.cuda.current_device())
