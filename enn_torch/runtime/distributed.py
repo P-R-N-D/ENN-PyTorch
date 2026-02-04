@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import contextlib
 import ctypes
+import ctypes.util
 import dataclasses
 import gc
 import importlib
@@ -503,7 +504,7 @@ def init_lane_process_groups(
             return (_CPU_GROUP, _ACCEL_GROUP)
 
         try:
-            _CPU_GROUP = dist.new_group(backend="gloo")
+            _CPU_GROUP = dist.new_group(backend="cpu:gloo")
         except Exception:
             _CPU_GROUP = None
 
@@ -542,7 +543,23 @@ def get_control_process_group(pg: ProcessGroup | None = None) -> ProcessGroup | 
     if not is_distributed():
         return None
     cpg = get_cpu_group()
-    return cpg or pg or dist.group.WORLD
+    if cpg is not None:
+        return cpg
+    if pg is not None:
+        try:
+            p_be = str(dist.get_backend(pg)).lower()
+            if (p_be == "gloo") or ("cpu:gloo" in p_be):
+                return pg
+        except Exception:
+            pass
+        return pg
+    try:
+        w_be = str(dist.get_backend(dist.group.WORLD)).lower()
+        if (w_be == "gloo") or ("cpu:gloo" in w_be):
+            return dist.group.WORLD
+    except Exception:
+        pass
+    return dist.group.WORLD
 
 
 def get_accel_process_group(
@@ -560,7 +577,8 @@ def _get_gloox_gloo_process_group(pg: ProcessGroup | None) -> ProcessGroup:
     base_pg = pg or dist.group.WORLD
 
     try:
-        if dist.get_backend(base_pg) == "gloo":
+        be = str(dist.get_backend(base_pg)).lower()
+        if be == "gloo" or "cpu:gloo" in be:
             return base_pg
     except Exception:
         pass
@@ -575,7 +593,7 @@ def _get_gloox_gloo_process_group(pg: ProcessGroup | None) -> ProcessGroup:
         return cached
 
     try:
-        gloo_pg = dist.new_group(ranks=list(ranks), backend="gloo")
+        gloo_pg = dist.new_group(ranks=list(ranks), backend="cpu:gloo")
     except Exception as exc:
         raise RuntimeError("Failed to create gloo process group") from exc
 
@@ -2905,7 +2923,7 @@ class Checkpointer:
             self._stager_owner_thread = None
             self._stager_cfg = None
 
-    def _post_dcp_cleanup(self) -> None:
+    def _post_dcp_cleanup(self, *, drop_dir: Path | None = None) -> None:
         with contextlib.suppress(Exception):
             import torch.distributed.checkpoint.state_dict_saver as sds
 
@@ -2913,19 +2931,100 @@ class Checkpointer:
             if callable(close_fn):
                 close_fn()
         self._close_stager()
-        do_gc = bool(env_bool("ENN_DCP_GC_COLLECT", default=False))
-        do_trim = bool(env_bool("ENN_DCP_MALLOC_TRIM", default=False))
-        if not (do_gc or do_trim):
+        pressure = False
+        try:
+            min_free_mb = int(os.environ.get("ENN_DCP_HOST_MIN_FREE_MB", "1024"))
+            if min_free_mb > 0:
+                avail = int(Memory.available())
+                pressure = (avail >= 0) and (avail < (min_free_mb * 1024 * 1024))
+        except Exception:
+            pressure = False
+
+        do_gc = bool(env_bool("ENN_DCP_GC_COLLECT", default=False)) or pressure
+        do_trim = bool(env_bool("ENN_DCP_MALLOC_TRIM", default=False)) or pressure
+        do_drop_cache = bool(env_bool("ENN_DCP_DROP_CACHE", default=False)) or pressure
+
+        if not (do_gc or do_trim or (do_drop_cache and drop_dir is not None)):
             return
         if do_gc:
             with contextlib.suppress(Exception):
                 gc.collect()
         if do_trim:
             with contextlib.suppress(Exception):
-                libc = ctypes.CDLL("libc.so.6")
-                trim = getattr(libc, "malloc_trim", None)
-                if callable(trim):
-                    trim(0)
+                if os.name == "nt":
+                    for dll in ("msvcrt.dll", "ucrtbase.dll"):
+                        with contextlib.suppress(Exception):
+                            crt = ctypes.CDLL(dll)
+                            heapmin = getattr(crt, "_heapmin", None)
+                            if callable(heapmin):
+                                heapmin()
+                                break
+                else:
+                    libc_name = ctypes.util.find_library("c")
+                    if libc_name:
+                        libc = ctypes.CDLL(libc_name)
+                        trim = getattr(libc, "malloc_trim", None)
+                        if callable(trim):
+                            trim(0)
+                        else:
+                            relief = getattr(libc, "malloc_zone_pressure_relief", None)
+                            if callable(relief):
+                                relief.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
+                                relief.restype = ctypes.c_int
+                                relief(None, 0)
+
+        if do_drop_cache and drop_dir is not None:
+            try:
+                local_rank_s = (
+                    os.environ.get("LOCAL_RANK")
+                    or os.environ.get("OMPI_COMM_WORLD_LOCAL_RANK")
+                    or os.environ.get("MPI_LOCALRANKID")
+                    or os.environ.get("SLURM_LOCALID")
+                )
+                local_rank = int(local_rank_s) if local_rank_s is not None else 0
+            except Exception:
+                local_rank = 0
+
+            if local_rank == 0:
+
+                def _drop_file_cache_best_effort(p: Path) -> None:
+                    if os.name == "nt":
+                        return
+                    try:
+                        if not p.is_file():
+                            return
+                    except Exception:
+                        return
+                    try:
+                        fd = os.open(str(p), os.O_RDONLY)
+                    except Exception:
+                        return
+                    try:
+                        if hasattr(os, "posix_fadvise") and hasattr(
+                            os, "POSIX_FADV_DONTNEED"
+                        ):
+                            with contextlib.suppress(Exception):
+                                os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+                        else:
+                            import sys
+
+                            if sys.platform == "darwin":
+                                import fcntl
+
+                                if hasattr(fcntl, "F_NOCACHE"):
+                                    with contextlib.suppress(Exception):
+                                        fcntl.fcntl(fd, fcntl.F_NOCACHE, 1)
+                    finally:
+                        with contextlib.suppress(Exception):
+                            os.close(fd)
+
+                try:
+                    root = Path(drop_dir)
+                    if root.is_dir():
+                        for fp in root.rglob("*"):
+                            _drop_file_cache_best_effort(fp)
+                except Exception:
+                    pass
 
     def _maybe_finalize_dcp_op(self, op: _PendingOp) -> None:
         if op.kind != "dcp" or not op.epoch_dir:
@@ -2993,7 +3092,6 @@ class Checkpointer:
                     with contextlib.suppress(Exception):
                         op.future = None
                     done_ops.append((op, ok, err))
-                    self._post_dcp_cleanup()
                 else:
                     break
             while self._pending_avg and _future_done(
@@ -3033,7 +3131,6 @@ class Checkpointer:
                         with contextlib.suppress(Exception):
                             op.future = None
                         done_ops.append((op, ok, err))
-                        self._post_dcp_cleanup()
 
             while len(self._pending_avg) >= 1:
                 op = self._pending_avg[0]
@@ -3329,24 +3426,19 @@ class Checkpointer:
                     )
                 if _is_oomish_error(exc):
                     self._sigkill_torch_checkpoint_processes()
-        try:
-            if self._is_dcp_leader():
-                if ok:
-                    self._finalize_dcp_epoch(
-                        int(epoch),
-                        Path(epoch_dir),
-                        extra_meta={
-                            "has_optimizer": bool(has_optimizer),
-                            "model_kind": str(model_kind),
-                        },
-                    )
-                    _cleanup_delete_pending(self.dcp_root)
-                else:
-                    self._cleanup_failed_epoch_dir(int(epoch), reason=err)
-        finally:
-            with contextlib.suppress(Exception):
-                self._release_inflight_lock()
-            self._post_dcp_cleanup()
+        if self._is_dcp_leader():
+            if ok:
+                self._finalize_dcp_epoch(
+                    int(epoch),
+                    Path(epoch_dir),
+                    extra_meta={
+                        "has_optimizer": bool(has_optimizer),
+                        "model_kind": str(model_kind),
+                    },
+                )
+                _cleanup_delete_pending(self.dcp_root)
+            else:
+                self._cleanup_failed_epoch_dir(int(epoch), reason=err)
         if pending_exc is not None and int(abort_gen) == int(self._abort_gen):
             raise pending_exc
 
@@ -3535,7 +3627,7 @@ class Checkpointer:
         finally:
             with contextlib.suppress(Exception):
                 self._release_inflight_lock()
-            self._post_dcp_cleanup()
+            self._post_dcp_cleanup(drop_dir=epoch_dir if pending_exc is None else None)
         if pending_exc is not None:
             raise pending_exc
 
@@ -3809,7 +3901,7 @@ class Checkpointer:
         finally:
             with contextlib.suppress(Exception):
                 self._release_inflight_lock()
-            self._post_dcp_cleanup()
+            self._post_dcp_cleanup(drop_dir=epoch_dir if pending_exc is None else None)
 
         if pending_exc is not None and force_sync:
             raise pending_exc
