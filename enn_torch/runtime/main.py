@@ -1373,32 +1373,34 @@ def epochs(
                                             )
                                             or ""
                                         ).strip()
-                                        if raw_min_free:
-                                            min_free_mb = int(raw_min_free)
-                                        else:
-                                            ratio = 0.22
-                                            with contextlib.suppress(Exception):
-                                                ratio = float(
-                                                    os.environ.get(
-                                                        "ENN_HOST_MIN_FREE_RATIO",
-                                                        ratio,
-                                                    )
-                                                    or ratio
+                                        ratio = 0.22
+                                        with contextlib.suppress(Exception):
+                                            ratio = float(
+                                                os.environ.get(
+                                                    "ENN_HOST_MIN_FREE_RATIO",
+                                                    ratio,
                                                 )
-                                            ratio = max(
-                                                0.05,
-                                                min(0.50, float(ratio)),
+                                                or ratio
                                             )
-                                            cap_mb = 3072
-                                            with contextlib.suppress(Exception):
-                                                cap_mb = int(
-                                                    os.environ.get(
-                                                        "ENN_HOST_MIN_FREE_MB_CAP",
-                                                        cap_mb,
-                                                    )
-                                                    or cap_mb
+                                        ratio = max(
+                                            0.05,
+                                            min(0.50, float(ratio)),
+                                        )
+                                        cap_mb = 3072
+                                        with contextlib.suppress(Exception):
+                                            cap_mb = int(
+                                                os.environ.get(
+                                                    "ENN_HOST_MIN_FREE_MB_CAP",
+                                                    cap_mb,
                                                 )
-                                            cap_mb = max(1024, int(cap_mb))
+                                                or cap_mb
+                                            )
+                                        cap_mb = max(1024, int(cap_mb))
+                                        min_free_mb = None
+                                        if raw_min_free:
+                                            with contextlib.suppress(Exception):
+                                                min_free_mb = int(raw_min_free)
+                                        else:
                                             if (
                                                 host_total_now is not None
                                                 and host_total_now > 0
@@ -1416,6 +1418,22 @@ def epochs(
                                                         int(cap_mb),
                                                         int(min_free_mb),
                                                     ),
+                                                )
+                                            else:
+                                                min_free_mb = 1024
+                                        if min_free_mb is None:
+                                            if (
+                                                host_total_now is not None
+                                                and host_total_now > 0
+                                            ):
+                                                total_mb = int(
+                                                    int(host_total_now)
+                                                    // (1024 * 1024)
+                                                )
+                                                cand = int(total_mb * ratio)
+                                                min_free_mb = max(
+                                                    1024,
+                                                    min(int(cap_mb), int(cand)),
                                                 )
                                             else:
                                                 min_free_mb = 1024
