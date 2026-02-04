@@ -545,12 +545,6 @@ def get_control_process_group(pg: ProcessGroup | None = None) -> ProcessGroup | 
     cpg = get_cpu_group()
     if cpg is not None:
         return cpg
-    try:
-        w_be = str(dist.get_backend(dist.group.WORLD)).lower()
-        if (w_be == "gloo") or ("cpu:gloo" in w_be):
-            return dist.group.WORLD
-    except Exception:
-        pass
     if pg is not None:
         try:
             p_be = str(dist.get_backend(pg)).lower()
@@ -558,6 +552,13 @@ def get_control_process_group(pg: ProcessGroup | None = None) -> ProcessGroup | 
                 return pg
         except Exception:
             pass
+        return pg
+    try:
+        w_be = str(dist.get_backend(dist.group.WORLD)).lower()
+        if (w_be == "gloo") or ("cpu:gloo" in w_be):
+            return dist.group.WORLD
+    except Exception:
+        pass
     return dist.group.WORLD
 
 
