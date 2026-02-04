@@ -552,14 +552,13 @@ def get_control_process_group(pg: ProcessGroup | None = None) -> ProcessGroup | 
                 return pg
         except Exception:
             pass
-        return pg
     try:
         w_be = str(dist.get_backend(dist.group.WORLD)).lower()
         if (w_be == "gloo") or ("cpu:gloo" in w_be):
             return dist.group.WORLD
     except Exception:
         pass
-    return dist.group.WORLD
+    return None
 
 
 def get_accel_process_group(
@@ -1252,10 +1251,19 @@ def broadcast_scalar(
         )
 
     def _accel_pg(default_pg: ProcessGroup) -> ProcessGroup:
-        if pg_in is not None:
-            return default_pg
         ag = get_accel_group(dev)
-        return ag or default_pg
+        if ag is None:
+            return default_pg
+        if pg_in is None:
+            return ag
+        try:
+            if pg_in is dist.group.WORLD:
+                be = str(dist.get_backend(default_pg)).lower()
+                if (be == "gloo") or ("cpu:gloo" in be):
+                    return ag
+        except Exception:
+            pass
+        return default_pg
 
     if lane_s in {"control", "cpu", "gloo"}:
         cpg = get_cpu_group() or get_control_process_group(pg_in)
@@ -1362,19 +1370,29 @@ def distributed_barrier(
         )
 
     def _accel_pg(default_pg: ProcessGroup) -> ProcessGroup:
-        if pg_in is not None:
-            return default_pg
         ag = get_accel_group(dev)
-        return ag or default_pg
-
-    if lane_s in {"control", "cpu", "gloo"}:
-        cpg = get_cpu_group() or get_control_process_group(pg_in) or pg
+        if ag is None:
+            return default_pg
+        if pg_in is None:
+            return ag
         try:
-            t = torch.zeros((1,), device="cpu", dtype=torch.int32)
-            dist.all_reduce(t, op=dist.ReduceOp.SUM, group=cpg)
-            return
+            if pg_in is dist.group.WORLD:
+                be = str(dist.get_backend(default_pg)).lower()
+                if (be == "gloo") or ("cpu:gloo" in be):
+                    return ag
         except Exception:
             pass
+        return default_pg
+
+    if lane_s in {"control", "cpu", "gloo"}:
+        cpg = get_cpu_group() or get_control_process_group(pg_in)
+        if cpg is not None:
+            try:
+                t = torch.zeros((1,), device="cpu", dtype=torch.int32)
+                dist.all_reduce(t, op=dist.ReduceOp.SUM, group=cpg)
+                return
+            except Exception:
+                pass
         if getattr(dev, "type", "cpu") == "cpu" and torch.cuda.is_available():
             with contextlib.suppress(Exception):
                 dev = torch.device("cuda", torch.cuda.current_device())
