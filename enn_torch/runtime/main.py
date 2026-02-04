@@ -1366,20 +1366,83 @@ def epochs(
                                         host_avail_now is not None
                                         and host_avail_now > 0
                                     ):
-                                        host_low_abs = (
-                                            host_avail_now < 512 * 1024 * 1024
-                                        )
-                                        host_low_rel = False
-                                        if (
-                                            host_total_now is not None
-                                            and host_total_now > 0
-                                        ):
-                                            host_low_rel = (
-                                                float(host_avail_now)
-                                                / float(host_total_now)
-                                                < 0.1
+                                        raw_min_free = str(
+                                            os.environ.get(
+                                                "ENN_HOST_MIN_FREE_MB",
+                                                "",
                                             )
-                                        host_low = host_low_abs or host_low_rel
+                                            or ""
+                                        ).strip()
+                                        ratio = 0.22
+                                        with contextlib.suppress(Exception):
+                                            ratio = float(
+                                                os.environ.get(
+                                                    "ENN_HOST_MIN_FREE_RATIO",
+                                                    ratio,
+                                                )
+                                                or ratio
+                                            )
+                                        ratio = max(
+                                            0.05,
+                                            min(0.50, float(ratio)),
+                                        )
+                                        cap_mb = 3072
+                                        with contextlib.suppress(Exception):
+                                            cap_mb = int(
+                                                os.environ.get(
+                                                    "ENN_HOST_MIN_FREE_MB_CAP",
+                                                    cap_mb,
+                                                )
+                                                or cap_mb
+                                            )
+                                        cap_mb = max(1024, int(cap_mb))
+                                        min_free_mb = None
+                                        if raw_min_free:
+                                            with contextlib.suppress(Exception):
+                                                min_free_mb = int(raw_min_free)
+                                        else:
+                                            if (
+                                                host_total_now is not None
+                                                and host_total_now > 0
+                                            ):
+                                                total_mb = int(
+                                                    int(host_total_now)
+                                                    // (1024 * 1024)
+                                                )
+                                                min_free_mb = int(
+                                                    total_mb * ratio
+                                                )
+                                                min_free_mb = max(
+                                                    1024,
+                                                    min(
+                                                        int(cap_mb),
+                                                        int(min_free_mb),
+                                                    ),
+                                                )
+                                            else:
+                                                min_free_mb = 1024
+                                        if min_free_mb is None:
+                                            if (
+                                                host_total_now is not None
+                                                and host_total_now > 0
+                                            ):
+                                                total_mb = int(
+                                                    int(host_total_now)
+                                                    // (1024 * 1024)
+                                                )
+                                                cand = int(total_mb * ratio)
+                                                min_free_mb = max(
+                                                    1024,
+                                                    min(int(cap_mb), int(cand)),
+                                                )
+                                            else:
+                                                min_free_mb = 1024
+                                        host_low = (
+                                            int(host_avail_now)
+                                            < int(min_free_mb)
+                                            * 1024
+                                            * 1024
+                                        )
                                     if host_low:
                                         if new_grad_accum > grad_accum_steps:
                                             new_grad_accum = grad_accum_steps
@@ -1479,6 +1542,62 @@ def epochs(
                                                         )
                                                         if callable(fn):
                                                             fn(None, 0)
+                                            if env_bool(
+                                                "ENN_HOST_PRESSURE_FADVISE",
+                                                default=False,
+                                            ):
+                                                with contextlib.suppress(
+                                                    Exception
+                                                ):
+                                                    from pathlib import (
+                                                        Path as _Path,
+                                                    )
+                                                    import os as _os
+
+                                                    ck = getattr(
+                                                        ops,
+                                                        "ckpt_dir",
+                                                        None,
+                                                    )
+                                                    if ck:
+                                                        for fp in _Path(
+                                                            str(ck)
+                                                        ).rglob("*"):
+                                                            if (
+                                                                not fp.is_file()
+                                                            ):
+                                                                continue
+                                                            try:
+                                                                fd = _os.open(
+                                                                    str(fp),
+                                                                    _os.O_RDONLY,
+                                                                )
+                                                            except Exception:
+                                                                continue
+                                                            try:
+                                                                if (
+                                                                    hasattr(
+                                                                        _os,
+                                                                        "posix_fadvise",
+                                                                    )
+                                                                    and hasattr(
+                                                                        _os,
+                                                                        "POSIX_FADV_DONTNEED",
+                                                                    )
+                                                                ):
+                                                                    _os.posix_fadvise(
+                                                                        fd,
+                                                                        0,
+                                                                        0,
+                                                                        _os.POSIX_FADV_DONTNEED,
+                                                                    )
+                                                            finally:
+                                                                with contextlib.suppress(
+                                                                    Exception
+                                                                ):
+                                                                    _os.close(
+                                                                        fd
+                                                                    )
                                     if new_grad_accum != grad_accum_steps:
                                         new_grad_accum = broadcast_scalar(
                                             new_grad_accum,
