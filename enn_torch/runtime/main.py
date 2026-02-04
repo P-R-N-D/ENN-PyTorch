@@ -1441,10 +1441,10 @@ def epochs(
                                             ):
                                                 with contextlib.suppress(Exception):
                                                     import ctypes
-                                                    import platform
+                                                    import platform as _platform
 
                                                     sysname = (
-                                                        platform.system()
+                                                        _platform.system()
                                                     )
                                                     if sysname == "Linux":
                                                         libc = ctypes.CDLL(
