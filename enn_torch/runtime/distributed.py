@@ -1204,29 +1204,36 @@ def broadcast_scalar(
     if not is_distributed():
         return int(value)
 
+    pg_in = group
     pg = group or dist.group.WORLD
     with contextlib.suppress(Exception):
         if int(dist.get_world_size(pg)) <= 1:
             return int(value)
 
+    dev = device
+    if dev is None:
+        with contextlib.suppress(Exception):
+            dev = get_device()
+    if dev is None:
+        dev = torch.device("cpu")
+
     lane_s = str(lane).strip().lower()
     if lane_s in {"auto", ""}:
-        dev = device
-        if dev is None:
-            with contextlib.suppress(Exception):
-                dev = get_device()
-        if dev is None:
-            dev = torch.device("cpu")
         lane_s = (
             "accelerator"
             if get_accel_group(dev) is not None
             and getattr(dev, "type", "cpu") != "cpu"
             else "control"
         )
+
+    def _accel_pg(default_pg: ProcessGroup) -> ProcessGroup:
+        if pg_in is not None:
+            return default_pg
+        ag = get_accel_group(dev)
+        return ag or default_pg
+
     if lane_s in {"control", "cpu", "gloo"}:
-        cpg = get_cpu_group() or get_control_process_group(
-            pg if group is not None else None
-        )
+        cpg = get_cpu_group() or get_control_process_group(pg_in)
         cpu_exc: Exception | None = None
         if cpg is not None:
             try:
@@ -1235,34 +1242,25 @@ def broadcast_scalar(
                 return int(t.item())
             except Exception as exc:
                 cpu_exc = exc
-        dev = device
-        if dev is None:
+        dev2 = dev
+        if getattr(dev2, "type", "cpu") == "cpu" and torch.cuda.is_available():
             with contextlib.suppress(Exception):
-                dev = get_device()
-        if dev is None:
-            dev = torch.device("cpu")
-        if getattr(dev, "type", "cpu") == "cpu" and torch.cuda.is_available():
-            with contextlib.suppress(Exception):
-                dev = torch.device("cuda", torch.cuda.current_device())
+                dev2 = torch.device("cuda", torch.cuda.current_device())
         try:
-            t = torch.tensor([int(value)], device=dev, dtype=torch.int32)
-            dist.broadcast(t, src=int(src), group=pg)
+            t = torch.tensor([int(value)], device=dev2, dtype=torch.int32)
+            dist.broadcast(t, src=int(src), group=_accel_pg(pg))
             return int(t.item())
         except Exception as exc2:
-            if cpu_exc is not None:
-                raise RuntimeError(
-                    "broadcast_scalar failed on both control-plane (CPU/gloo) and accelerator lanes"
-                ) from exc2
-            raise
+            raise RuntimeError(
+                "broadcast_scalar failed on both control-plane (CPU/gloo) and accelerator lanes"
+            ) from (exc2 if cpu_exc is None else exc2)
 
-    dev = device
-    if dev is None:
+    dev2 = dev
+    if getattr(dev2, "type", "cpu") == "cpu" and torch.cuda.is_available():
         with contextlib.suppress(Exception):
-            dev = get_device()
-    if dev is None:
-        dev = torch.device("cpu")
-    t = torch.tensor([int(value)], device=dev, dtype=torch.int32)
-    dist.broadcast(t, src=int(src), group=pg)
+            dev2 = torch.device("cuda", torch.cuda.current_device())
+    t = torch.tensor([int(value)], device=dev2, dtype=torch.int32)
+    dist.broadcast(t, src=int(src), group=_accel_pg(pg))
     return int(t.item())
 
 
@@ -1316,64 +1314,62 @@ def distributed_barrier(
                 group = device
                 device = None
 
+    pg_in = group
     pg = group or dist.group.WORLD
     with contextlib.suppress(Exception):
         if int(dist.get_world_size(pg)) <= 1:
             return
 
+    dev = device
+    if dev is None:
+        with contextlib.suppress(Exception):
+            dev = get_device()
+    if dev is None:
+        dev = torch.device("cpu")
+
     lane_s = str(lane).strip().lower()
     if lane_s in {"auto", ""}:
-        dev = device
-        if dev is None:
-            with contextlib.suppress(Exception):
-                dev = get_device()
-        if dev is None:
-            dev = torch.device("cpu")
         lane_s = (
             "accelerator"
             if get_accel_group(dev) is not None
             and getattr(dev, "type", "cpu") != "cpu"
             else "control"
         )
+
+    def _accel_pg(default_pg: ProcessGroup) -> ProcessGroup:
+        if pg_in is not None:
+            return default_pg
+        ag = get_accel_group(dev)
+        return ag or default_pg
+
     if lane_s in {"control", "cpu", "gloo"}:
-        cpg = (
-            get_cpu_group()
-            or get_control_process_group(pg if group is not None else None)
-            or pg
-        )
+        cpg = get_cpu_group() or get_control_process_group(pg_in) or pg
         try:
             t = torch.zeros((1,), device="cpu", dtype=torch.int32)
             dist.all_reduce(t, op=dist.ReduceOp.SUM, group=cpg)
             return
         except Exception:
             pass
-        dev = device
-        if dev is None:
-            with contextlib.suppress(Exception):
-                dev = get_device()
-        if dev is None:
-            dev = torch.device("cpu")
         if getattr(dev, "type", "cpu") == "cpu" and torch.cuda.is_available():
             with contextlib.suppress(Exception):
                 dev = torch.device("cuda", torch.cuda.current_device())
         try:
-            dist.barrier(group=pg, device_ids=_get_device_id(dev))
+            dist.barrier(group=_accel_pg(pg), device_ids=_get_device_id(dev))
         except TypeError:
-            dist.barrier(group=pg)
+            dist.barrier(group=_accel_pg(pg))
         except Exception as exc:
             raise RuntimeError(
                 "distributed_barrier(control) failed on both CPU and accelerator lanes"
             ) from exc
         return
 
-    dev = device
-    if dev is None:
+    if getattr(dev, "type", "cpu") == "cpu" and torch.cuda.is_available():
         with contextlib.suppress(Exception):
-            dev = get_device()
+            dev = torch.device("cuda", torch.cuda.current_device())
     try:
-        dist.barrier(group=pg, device_ids=_get_device_id(dev))
+        dist.barrier(group=_accel_pg(pg), device_ids=_get_device_id(dev))
     except TypeError:
-        dist.barrier(group=pg)
+        dist.barrier(group=_accel_pg(pg))
 
 
 def distributed_broadcast(
