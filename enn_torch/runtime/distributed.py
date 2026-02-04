@@ -3708,30 +3708,64 @@ class Checkpointer:
                 else:
                     kwargs = {k: v for k, v in kwargs.items() if v is not None}
 
-                try:
-                    dcp_future = dcp.async_save(**kwargs)
-                except AssertionError as exc:
-                    msg = str(exc)
-                    if "cpu backend" in msg.lower() and "async" in msg.lower():
-                        first = not bool(
-                            getattr(self, "_dcp_async_disabled_no_cpu", False)
-                        )
-                        self._dcp_async_disabled_no_cpu = True
-                        if first and self._is_global_rank0():
-                            _LOGGER.warning(
-                                "DCP async_save disabled (CPU backend required). Falling back to dcp.save. (%s)",
-                                msg,
+                use_async_save = True
+                if bool(getattr(self, "_dcp_async_disabled_no_cpu", False)):
+                    use_async_save = False
+                if use_async_save and self._is_distributed() and pg_for_dcp is not None:
+                    try:
+                        is_world = pg_for_dcp is dist.group.WORLD
+                    except Exception:
+                        is_world = False
+                    if not is_world:
+                        be = ""
+                        with contextlib.suppress(Exception):
+                            be = str(dist.get_backend(pg_for_dcp)).lower()
+                        if be in {"nccl", "xccl", "hccl"}:
+                            use_async_save = False
+                            if self._is_global_rank0() and env_bool("ENN_DCP_DEBUG", False):
+                                _LOGGER.warning(
+                                    "DCP async_save skipped for subgroup backend=%s; using dcp.save instead.",
+                                    be,
+                                )
+
+                if use_async_save:
+                    try:
+                        dcp_future = dcp.async_save(**kwargs)
+                    except AssertionError as exc:
+                        msg = str(exc)
+                        msg_l = msg.lower().replace("\\n", "\n")
+                        if (
+                            ("cpu backend" in msg_l or "cpu backend must be enabled" in msg_l)
+                            and "async" in msg_l
+                        ):
+                            first = not bool(
+                                getattr(self, "_dcp_async_disabled_no_cpu", False)
                             )
-                        dcp.save(
-                            state_dict=dcp_state,
-                            checkpoint_id=str(epoch_dir),
-                            storage_writer=writer,
-                            planner=planner,
-                            process_group=pg_for_dcp,
-                        )
-                        dcp_future = None
-                    else:
-                        raise
+                            self._dcp_async_disabled_no_cpu = True
+                            if first and self._is_global_rank0():
+                                _LOGGER.warning(
+                                    "DCP async_save disabled (CPU backend required). Falling back to dcp.save. (%s)",
+                                    msg,
+                                )
+                            dcp.save(
+                                state_dict=dcp_state,
+                                checkpoint_id=str(epoch_dir),
+                                storage_writer=writer,
+                                planner=planner,
+                                process_group=pg_for_dcp,
+                            )
+                            dcp_future = None
+                        else:
+                            raise
+                else:
+                    dcp.save(
+                        state_dict=dcp_state,
+                        checkpoint_id=str(epoch_dir),
+                        storage_writer=writer,
+                        planner=planner,
+                        process_group=pg_for_dcp,
+                    )
+                    dcp_future = None
             else:
                 dcp.save(
                     state_dict=dcp_state,
