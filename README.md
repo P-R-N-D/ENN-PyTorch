@@ -15,6 +15,11 @@ of checkpoints, so training weights remain portable across iterative model-side 
 
 This repository also includes a worked example notebook (`notebook.ipynb`) and a sample data (`raw_data.xlsx`) demonstrating a tabular‑to‑grid regression workflow.
 
+## License
+
+**Code** is licensed under **PolyForm Noncommercial 1.0.0**.  
+**Weights/datasets/other artifacts** remain under the terms described in your `LICENSE` file. For commercial use, obtain a separate license
+
 ## Requirements
 
 ### Mandatory
@@ -354,8 +359,3 @@ to reduce "almost-right" config bugs:
 - `tensordict` provides TensorDict integration and memory-mapped tensor utilities.
 - `triton` ≥ 3.5.1 is necessary.
 - Export backends (TensorRT/CoreML/ExecuTorch/ORT) have additional system requirements; install only what you need.
-
-## License
-
-**Code** is licensed under **PolyForm Noncommercial 1.0.0**.  
-**Weights/datasets/other artifacts** remain under the terms described in your `LICENSE` file. For commercial use, obtain a separate license
