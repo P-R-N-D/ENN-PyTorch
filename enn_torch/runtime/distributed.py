@@ -3680,9 +3680,7 @@ class Checkpointer:
                     "checkpoint_id": str(epoch_dir),
                     "storage_writer": writer,
                     "planner": planner,
-                    "process_group": (
-                        dist.group.WORLD if self._is_distributed() else None
-                    ),
+                    "process_group": pg_for_dcp,
                 }
                 if stager is not None:
                     kwargs["async_stager"] = stager
@@ -3729,9 +3727,7 @@ class Checkpointer:
                             checkpoint_id=str(epoch_dir),
                             storage_writer=writer,
                             planner=planner,
-                            process_group=(
-                                dist.group.WORLD if self._is_distributed() else None
-                            ),
+                            process_group=pg_for_dcp,
                         )
                         dcp_future = None
                     else:
