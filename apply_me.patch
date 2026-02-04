@@ -1,0 +1,143 @@
+--- a/enn_torch/runtime/distributed.py
++++ b/enn_torch/runtime/distributed.py
+@@ -61,8 +61,6 @@
+ 
+ _DTENSOR_ACTIVE: bool = False
+ _GLOOX_GLOO_PG_CACHE: dict[tuple[int, ...], ProcessGroup] = {}
+-_CONTROL_GLOO_PG: object | None = None
+-_CONTROL_GLOO_PG_LOCK = Mutex()
+ _LOGGER = logging.getLogger(__name__)
+ _INFLIGHT_LOCK_NAME = ".inflight.lock"
+ _INFLIGHT_LOCK_TTL_SEC = int(os.environ.get("ENN_DCP_INFLIGHT_LOCK_TTL_SEC", "21600"))
+@@ -467,51 +465,20 @@
+ 
+ 
+ def get_control_process_group(pg: ProcessGroup | None = None) -> ProcessGroup | None:
+-    """Return a CPU-capable (gloo) process group for control-plane collectives.
+-
+-    This repo frequently runs with a *multi-backend* default process group, e.g.
+-    ``cpu:gloo,cuda:nccl``. Control-plane collectives (barrier/broadcast of small
+-    scalars, etc.) must be forced onto the CPU lane to avoid backend mismatches
+-    and deadlocks when both CPU + accelerator lanes are active.
+-
+-    Rules:
+-      * If ``pg`` is ``None`` (WORLD), prefer a dedicated cached gloo group.
+-      * If ``pg`` is provided, derive a gloo group over the same ranks.
++    """Return the process group used for *control-plane* collectives.
++
++    In PyTorch, a multi-backend process group (e.g. ``cpu:gloo,cuda:nccl``)
++    dispatches *tensor* collectives based on the tensor device. We exploit that
++    by running control-plane collectives on **CPU tensors**, which routes them
++    to the CPU backend (typically gloo) without creating an additional process
++    group.
++
++    If the build/job does not support a CPU backend (e.g. NCCL-only builds), the
++    control-plane helpers will fall back to the accelerator lane at call sites.
+     """
+     if not is_distributed():
+         return None
+-
+-    base_pg = pg or dist.group.WORLD
+-
+-    # Single-rank jobs don't need an extra control PG. Avoid creating an
+-    # additional gloo group (and the noisy "cuda:gloo" log line) when
+-    # world_size==1.
+-    with contextlib.suppress(Exception):
+-        if int(dist.get_world_size(base_pg)) <= 1:
+-            return base_pg
+-
+-    # WORLD fast-path: reuse a single cached gloo group.
+-    if pg is None:
+-        global _CONTROL_GLOO_PG
+-        with contextlib.suppress(Exception):
+-            if is_process_group(_CONTROL_GLOO_PG):
+-                return _CONTROL_GLOO_PG  # type: ignore[return-value]
+-        with _CONTROL_GLOO_PG_LOCK:
+-            with contextlib.suppress(Exception):
+-                if is_process_group(_CONTROL_GLOO_PG):
+-                    return _CONTROL_GLOO_PG  # type: ignore[return-value]
+-            try:
+-                _CONTROL_GLOO_PG = dist.new_group(backend="gloo")
+-            except Exception:
+-                _CONTROL_GLOO_PG = None
+-        if is_process_group(_CONTROL_GLOO_PG):
+-            return _CONTROL_GLOO_PG  # type: ignore[return-value]
+-
+-    # Fallback: build (or reuse) a gloo group for the ranks of base_pg.
+-    with contextlib.suppress(Exception):
+-        return _get_gloox_gloo_process_group(base_pg)
+-
+-    return None
++    return pg or dist.group.WORLD
+ 
+ 
+ def _get_gloox_gloo_process_group(pg: ProcessGroup | None) -> ProcessGroup:
+@@ -531,15 +498,6 @@
+     except Exception:
+         ranks = tuple(range(dist.get_world_size(base_pg)))
+ 
+-    # WORLD optimization: if we already created a global control gloo group,
+-    # reuse it instead of creating another identical gloo PG.
+-    with contextlib.suppress(Exception):
+-        if (
+-            is_process_group(_CONTROL_GLOO_PG)
+-            and ranks == tuple(range(dist.get_world_size()))
+-        ):
+-            _GLOOX_GLOO_PG_CACHE.setdefault(ranks, _CONTROL_GLOO_PG)  # type: ignore[arg-type]
+-            return _CONTROL_GLOO_PG  # type: ignore[return-value]
+ 
+     cached = _GLOOX_GLOO_PG_CACHE.get(ranks)
+     if cached is not None:
+@@ -1302,13 +1260,19 @@
+ 
+     lane_s = str(lane).strip().lower()
+     if lane_s in {"control", "cpu", "gloo"}:
+-        # Prefer a dedicated CPU-capable (gloo) control-plane group.
+-        cpg = get_control_process_group(pg if group is not None else None)
+-        if cpg is not None:
+-            dist.barrier(group=cpg)
++        # Control-plane barrier: force the CPU backend by using a CPU tensor
++        # collective. This routes to the CPU backend (typically gloo) in a
++        # multi-backend process group like ``cpu:gloo,cuda:nccl``.
++        cpg = get_control_process_group(pg if group is not None else None) or pg
++
++        try:
++            t = torch.zeros((1,), device="cpu", dtype=torch.int32)
++            dist.all_reduce(t, op=dist.ReduceOp.SUM, group=cpg)
+             return
+-
+-        # Fall back to accelerator barrier if a CPU-capable control PG is unavailable.
++        except Exception:
++            pass
++
++        # Fall back to accelerator barrier if a CPU lane is unavailable.
+         dev = device
+         if dev is None:
+             with contextlib.suppress(Exception):
+@@ -1322,9 +1286,13 @@
+             dist.barrier(group=pg, device_ids=_get_device_id(dev))
+         except TypeError:
+             dist.barrier(group=pg)
++        except Exception as exc:
++            raise RuntimeError(
++                "distributed_barrier(control) failed on both CPU and accelerator lanes"
++            ) from exc
+         return
+ 
+-    # Accelerator lane
++# Accelerator lane
+     dev = device
+     if dev is None:
+         with contextlib.suppress(Exception):
+@@ -2134,11 +2102,6 @@
+                 raise
+             _init_with(backend)
+ 
+-        # Ensure the control-plane (CPU/gloo) group exists early and
+-        # deterministically. This prevents later lazy group creation from
+-        # happening only on a subset of ranks.
+-        with contextlib.suppress(Exception):
+-            get_control_process_group()
+ 
+     @classmethod
+     def loader_state_path(cls, directory: PathLike) -> str:
