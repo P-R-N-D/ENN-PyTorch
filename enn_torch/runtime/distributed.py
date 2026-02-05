@@ -40,6 +40,82 @@ from ..core.system import (
 )
 from torch import nn
 from torch.optim import Optimizer
+
+
+def _is_tmpfs_path(path: str) -> bool:
+    if not os.path.exists("/proc/mounts"):
+        return False
+    try:
+        rp = os.path.realpath(str(path))
+    except Exception:
+        rp = str(path)
+    try:
+        best_mnt = ""
+        best_fs = ""
+        with open("/proc/mounts", "r", encoding="utf-8") as f:
+            for line in f:
+                parts = line.split()
+                if len(parts) < 3:
+                    continue
+                mnt = parts[1]
+                fs = parts[2].lower()
+                if not mnt:
+                    continue
+                if rp == mnt or rp.startswith(mnt.rstrip("/") + "/"):
+                    if len(mnt) > len(best_mnt):
+                        best_mnt, best_fs = mnt, fs
+        return best_fs in {"tmpfs", "ramfs"}
+    except Exception:
+        return False
+
+
+def _pick_disk_cache_base() -> str | None:
+    for key in ("ENN_TEMP_DIR", "ENN_TMPDIR"):
+        v = os.environ.get(key)
+        if v and os.path.isdir(v) and os.access(v, os.W_OK) and (not _is_tmpfs_path(v)):
+            return v
+    for key in ("TMPDIR", "TEMP", "TMP"):
+        v = os.environ.get(key)
+        if v and os.path.isdir(v) and os.access(v, os.W_OK) and (not _is_tmpfs_path(v)):
+            return v
+    for cand in ("/var/tmp",):
+        if os.path.isdir(cand) and os.access(cand, os.W_OK) and (not _is_tmpfs_path(cand)):
+            return cand
+    try:
+        cwd = os.getcwd()
+        if cwd and os.path.isdir(cwd) and os.access(cwd, os.W_OK) and (not _is_tmpfs_path(cwd)):
+            return cwd
+    except Exception:
+        pass
+    if os.path.isdir("/tmp") and os.access("/tmp", os.W_OK):
+        return "/tmp"
+    return None
+
+
+def _ensure_disk_cache_env() -> None:
+    base = _pick_disk_cache_base()
+    if not base:
+        return
+    root = os.path.join(str(base), "enn_cache")
+    try:
+        Path(root).mkdir(parents=True, exist_ok=True)
+    except Exception:
+        return
+
+    def _set_if_unset_or_tmpfs(key: str, value: str) -> None:
+        cur = os.environ.get(key)
+        if cur and (not _is_tmpfs_path(cur)):
+            return
+        os.environ[key] = value
+
+    _set_if_unset_or_tmpfs("TMPDIR", root)
+    _set_if_unset_or_tmpfs("TEMP", root)
+    _set_if_unset_or_tmpfs("TMP", root)
+    _set_if_unset_or_tmpfs("TORCHINDUCTOR_CACHE_DIR", os.path.join(root, "torchinductor"))
+    _set_if_unset_or_tmpfs("TRITON_CACHE_DIR", os.path.join(root, "triton"))
+    _set_if_unset_or_tmpfs("CUDA_CACHE_PATH", os.path.join(root, "cuda_cache"))
+    _set_if_unset_or_tmpfs("XDG_CACHE_HOME", os.path.join(root, "xdg"))
+
 try:
     from torch.distributed._composable.fsdp import fully_shard
 except ImportError:
@@ -1883,6 +1959,8 @@ class ProcessBroker:
             cls.clear_process_group()
 
         init_python_path()
+        with contextlib.suppress(Exception):
+            _ensure_disk_cache_env()
         with contextlib.suppress(Exception):
             torch.multiprocessing.allow_connection_pickling()
         with contextlib.suppress(Exception):
