@@ -1,0 +1,436 @@
+diff --git a/enn_torch/data/nodes.py b/enn_torch/data/nodes.py
+--- a/enn_torch/data/nodes.py
++++ b/enn_torch/data/nodes.py
+@@ -358,6 +358,55 @@
+         self._feat_dtype = f_dtype
+         self._label_dtype = l_dtype
+         self._feat_shape = torch.Size([self._N, fdim])
++        # Cache-hinting for MemoryMappedTensor on small-RAM hosts (best-effort).
++        # Enabled by default on small hosts; can be overridden via ENN_MEMMAP_FADVISE.
++        self._mm_fadvise_enabled = False
++        self._mm_fadvise_every = 8
++        self._mm_fadvise_cooldown_s = 0.5
++        self._mm_fadvise_last = 0.0
++        self._mm_fadvise_counter = 0
++        self._feat_row_bytes = 0
++        self._label_row_bytes = 0
++        small_host = False
++        with suppress(Exception):
++            total_b = Memory.total()
++            small_host = bool(
++                isinstance(total_b, int)
++                and total_b > 0
++                and total_b <= (16 * 1024**3)
++            )
++        self._mm_fadvise_enabled = env_bool(
++            ("ENN_MEMMAP_FADVISE",),
++            default=bool(small_host),
++        )
++        with suppress(Exception):
++            self._mm_fadvise_every = max(
++                1,
++                int(
++                    env_first_int(("ENN_MEMMAP_FADVISE_EVERY",), default=8)
++                    or 8
++                ),
++            )
++        with suppress(Exception):
++            self._mm_fadvise_cooldown_s = max(
++                0.0,
++                float(
++                    os.environ.get("ENN_MEMMAP_FADVISE_COOLDOWN_S", "0.5")
++                    or 0.5
++                ),
++            )
++        with suppress(Exception):
++            self._feat_row_bytes = int(fdim) * int(
++                torch.tensor([], dtype=f_dtype).element_size()
++            )
++        with suppress(Exception):
++            if lshape_meta:
++                _row_elems = 1
++                for _d in lshape_meta:
++                    _row_elems *= max(1, int(_d))
++                self._label_row_bytes = int(_row_elems) * int(
++                    torch.tensor([], dtype=l_dtype).element_size()
++                )
+         if MemoryMappedTensor is None:
+             raise ImportError(
+                 "tensordict is required for MemoryMappedTensor-backed pipelines. "
+@@ -590,8 +639,119 @@
+                 y = y.reshape(end - start, *self._label_shape)
+             yt = y if isinstance(y, torch.Tensor) else torch.as_tensor(y)
+             out["Y"] = yt
++        with suppress(Exception):
++            self._maybe_memmap_fadvise_dontneed(start, end)
+         return out
+ 
++    def _maybe_memmap_fadvise_dontneed(self: Self, start: int, end: int) -> None:
++        """Best-effort cache hinting for MemoryMappedTensor sources.
++
++        Motivation: on small-RAM hosts (e.g. Colab), OS page cache for large memmaps can
++        grow until reclaim/writeback stalls dominate. This is not a Python heap leak.
++        When enabled and the host is under memory pressure, advise the OS that the
++        recently-read range is not needed (POSIX_FADV_DONTNEED).
++
++        Defaults: enabled on small hosts (<=16GiB) unless overridden by ENN_MEMMAP_FADVISE.
++        """
++        if not bool(getattr(self, "_mm_fadvise_enabled", False)):
++            return
++        if not (
++            hasattr(os, "posix_fadvise")
++            and hasattr(os, "POSIX_FADV_DONTNEED")
++        ):
++            return
++        try:
++            self._mm_fadvise_counter = int(
++                getattr(self, "_mm_fadvise_counter", 0) or 0
++            ) + 1
++        except Exception:
++            self._mm_fadvise_counter = 1
++        every = int(getattr(self, "_mm_fadvise_every", 8) or 8)
++        if every > 1 and (self._mm_fadvise_counter % every) != 0:
++            return
++        cooldown = float(getattr(self, "_mm_fadvise_cooldown_s", 0.5) or 0.0)
++        try:
++            last = float(getattr(self, "_mm_fadvise_last", 0.0) or 0.0)
++        except Exception:
++            last = 0.0
++        now = time.monotonic()
++        if cooldown > 0.0 and (now - last) < cooldown:
++            return
++        self._mm_fadvise_last = float(now)
++
++        avail = None
++        with suppress(Exception):
++            avail = Memory.available()
++        # Memory.available() returns 0 when it cannot detect host memory.
++        if not avail or int(avail) <= 0:
++            return
++
++        host_total = None
++        with suppress(Exception):
++            host_total = Memory.total()
++
++        ratio = 0.25
++        with suppress(Exception):
++            ratio = float(os.environ.get("ENN_HOST_MIN_FREE_RATIO", ratio) or ratio)
++        ratio = max(0.05, min(0.50, float(ratio)))
++        cap_mb = 3072
++        with suppress(Exception):
++            cap_mb = int(os.environ.get("ENN_HOST_MIN_FREE_MB_CAP", cap_mb) or cap_mb)
++        cap_mb = max(1024, int(cap_mb))
++        raw_min_free = str(os.environ.get("ENN_HOST_MIN_FREE_MB", "") or "").strip()
++        min_free_mb = None
++        if raw_min_free:
++            with suppress(Exception):
++                min_free_mb = int(raw_min_free)
++        if min_free_mb is None:
++            if host_total and int(host_total) > 0:
++                total_mb = int(int(host_total) // (1024 * 1024))
++                cand = int(total_mb * ratio)
++                min_free_mb = max(1024, min(int(cap_mb), int(cand)))
++            else:
++                min_free_mb = 1024
++
++        if int(avail) >= int(min_free_mb) * 1024 * 1024:
++            return
++
++        n = max(0, int(end) - int(start))
++        if n <= 0:
++            return
++
++        feat_path = getattr(self, "_feat_path", "")
++        row_bytes = int(getattr(self, "_feat_row_bytes", 0) or 0)
++        if feat_path and row_bytes > 0:
++            off = int(start) * row_bytes
++            length = n * row_bytes
++            fd = None
++            with suppress(Exception):
++                fd = os.open(str(feat_path), os.O_RDONLY)
++            if fd is not None:
++                try:
++                    os.posix_fadvise(
++                        fd, int(off), int(length), os.POSIX_FADV_DONTNEED
++                    )
++                finally:
++                    with suppress(Exception):
++                        os.close(fd)
++
++        lab_path = getattr(self, "_lab_path", None)
++        row_bytes = int(getattr(self, "_label_row_bytes", 0) or 0)
++        if lab_path and row_bytes > 0:
++            off = int(start) * row_bytes
++            length = n * row_bytes
++            fd = None
++            with suppress(Exception):
++                fd = os.open(str(lab_path), os.O_RDONLY)
++            if fd is not None:
++                try:
++                    os.posix_fadvise(
++                        fd, int(off), int(length), os.POSIX_FADV_DONTNEED
++                    )
++                finally:
++                    with suppress(Exception):
++                        os.close(fd)
++
+     def _gather(
+         self: Self, idx_tensor: torch.Tensor, features: Any, labels: Any
+     ) -> Mapping[str, torch.Tensor]:
+
+diff --git a/enn_torch/runtime/distributed.py b/enn_torch/runtime/distributed.py
+--- a/enn_torch/runtime/distributed.py
++++ b/enn_torch/runtime/distributed.py
+@@ -16,6 +16,8 @@
+ import re
+ import shutil
+ import socket
++import sys
++import platform
+ import threading
+ import time
+ import warnings
+@@ -2345,6 +2347,16 @@
+             self._rank = 0
+             self._world = 1
+ 
++        # Host sizing for adaptive defaults (e.g., Colab / small-RAM environments).
++        self._small_host = False
++        with contextlib.suppress(Exception):
++            total_b = Memory.total()
++            self._small_host = bool(
++                isinstance(total_b, int)
++                and total_b > 0
++                and total_b <= (16 * 1024**3)
++            )
++
+         self._local_rank = int(os.environ.get("LOCAL_RANK", "0") or 0)
+         self._local_world = int(os.environ.get("LOCAL_WORLD_SIZE", "1") or 1)
+         if self._local_world < 1:
+@@ -2374,13 +2386,8 @@
+                 self._dcp_process_group = None
+                 self._dcp_should_participate = True
+ 
+-        if self._dcp_process_group is None and device is not None and self._is_distributed():
+-            try:
+-                ag = get_accel_group(device)
+-                if ag is not None:
+-                    self._dcp_process_group = ag
+-            except Exception:
+-                pass
++        # NOTE: do not default DCP to an accel-only subgroup.
++        # If not on a partial-participation mesh, DCP uses dist.group.WORLD (multi-backend) at save time.
+ 
+         self.dcp_root.mkdir(parents=True, exist_ok=True)
+         try:
+@@ -2413,6 +2420,149 @@
+     def _sync_device(self) -> str:
+         return "cpu"
+ 
++def _host_min_free_bytes(self) -> int:
++    # Absolute override (MB)
++    raw = str(os.environ.get("ENN_DCP_HOST_MIN_FREE_MB", "") or "").strip()
++    if raw:
++        with contextlib.suppress(Exception):
++            return max(0, int(raw)) * 1024 * 1024
++
++    # Percent-based default (+ cap), tuned for small-RAM hosts.
++    ratio = 0.25 if bool(getattr(self, "_small_host", False)) else 0.15
++    with contextlib.suppress(Exception):
++        ratio = float(os.environ.get("ENN_DCP_HOST_MIN_FREE_RATIO", ratio) or ratio)
++    ratio = max(0.05, min(0.50, float(ratio)))
++
++    cap_mb = 3072
++    with contextlib.suppress(Exception):
++        cap_mb = int(os.environ.get("ENN_DCP_HOST_MIN_FREE_MB_CAP", cap_mb) or cap_mb)
++    cap_mb = max(1024, int(cap_mb))
++
++    total_b = None
++    with contextlib.suppress(Exception):
++        total_b = Memory.total()
++    if isinstance(total_b, int) and total_b > 0:
++        total_mb = int(total_b // (1024 * 1024))
++        cand_mb = int(total_mb * ratio)
++        cand_mb = max(1024, min(int(cap_mb), int(cand_mb)))
++        return int(cand_mb) * 1024 * 1024
++
++    # Fallback: keep at least 1GiB free
++    return 1024 * 1024 * 1024
++
++def _host_under_pressure(self) -> bool:
++    avail = None
++    with contextlib.suppress(Exception):
++        avail = Memory.available()
++    # Memory.available() returns 0 when it cannot detect host memory.
++    if not avail or int(avail) <= 0:
++        return False
++    return int(avail) < int(self._host_min_free_bytes())
++
++def _malloc_trim_best_effort(self) -> None:
++    # Best-effort across OSes:
++    # - Linux/glibc: malloc_trim
++    # - Windows: _heapmin
++    # - macOS: malloc_zone_pressure_relief (if present)
++    sysname = str(platform.system() or "")
++    if sysname == "Linux":
++        with contextlib.suppress(Exception):
++            libc = ctypes.CDLL("libc.so.6")
++            trim = getattr(libc, "malloc_trim", None)
++            if callable(trim):
++                trim(0)
++    elif sysname == "Windows":
++        with contextlib.suppress(Exception):
++            msvcrt = ctypes.CDLL("msvcrt.dll")
++            heapmin = getattr(msvcrt, "_heapmin", None)
++            if callable(heapmin):
++                heapmin()
++    elif sysname == "Darwin":
++        with contextlib.suppress(Exception):
++            libsys = ctypes.CDLL("libsystem_malloc.dylib")
++            fn = getattr(libsys, "malloc_zone_pressure_relief", None)
++            if callable(fn):
++                fn(None, 0)
++
++def _drop_dir_page_cache(self, root: Path) -> None:
++    # Best-effort page-cache drop for recently-written checkpoints.
++    # Uses posix_fadvise(DONTNEED) on POSIX platforms; no-op elsewhere.
++    if not (
++        hasattr(os, "posix_fadvise") and hasattr(os, "POSIX_FADV_DONTNEED")
++    ):
++        return
++    try:
++        max_files = int(os.environ.get("ENN_DCP_FADVISE_MAX_FILES", "4096") or 4096)
++    except Exception:
++        max_files = 4096
++    max_files = max(64, int(max_files))
++    count = 0
++    for fp in root.rglob("*"):
++        if count >= max_files:
++            break
++        if not fp.is_file():
++            continue
++        fd = None
++        with contextlib.suppress(Exception):
++            fd = os.open(str(fp), os.O_RDONLY)
++        if fd is None:
++            continue
++        try:
++            with contextlib.suppress(Exception):
++                os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
++        finally:
++            with contextlib.suppress(Exception):
++                os.close(fd)
++        count += 1
++
++
++def _wait_for_host_budget(self) -> None:
++    # Enabled by default on small hosts; disable with ENN_DCP_HOST_BUDGET=0.
++    if not bool(
++        env_bool(
++            "ENN_DCP_HOST_BUDGET",
++            default=bool(getattr(self, "_small_host", False)),
++        )
++    ):
++        return
++    min_free = int(self._host_min_free_bytes())
++    if min_free <= 0:
++        return
++    try:
++        timeout_s = float(
++            os.environ.get("ENN_DCP_HOST_BUDGET_WAIT_SEC", "30") or 30.0
++        )
++    except Exception:
++        timeout_s = 30.0
++    timeout_s = max(0.0, float(timeout_s))
++    sleep_s = 0.2
++    with contextlib.suppress(Exception):
++        sleep_s = float(
++            os.environ.get("ENN_DCP_HOST_BUDGET_SLEEP_S", sleep_s) or sleep_s
++        )
++    sleep_s = max(0.01, min(1.0, float(sleep_s)))
++    deadline = (time.monotonic() + timeout_s) if timeout_s > 0.0 else None
++    last_heavy = 0.0
++    while True:
++        avail = None
++        with contextlib.suppress(Exception):
++            avail = Memory.available()
++        # Memory.available() returns 0 when it cannot detect host memory.
++        if not avail or int(avail) <= 0:
++            return
++        if int(avail) >= min_free:
++            return
++        now = time.monotonic()
++        if now - last_heavy >= 5.0:
++            last_heavy = now
++            with contextlib.suppress(Exception):
++                gc.collect()
++            with contextlib.suppress(Exception):
++                self._malloc_trim_best_effort()
++        time.sleep(sleep_s)
++        if deadline is not None and time.monotonic() >= deadline:
++            return
++
+     def _bcast_bool_from_leader(self, flag: bool) -> bool:
+         if not self._is_distributed():
+             return bool(flag)
+@@ -2913,19 +3063,18 @@
+             if callable(close_fn):
+                 close_fn()
+         self._close_stager()
+-        do_gc = bool(env_bool("ENN_DCP_GC_COLLECT", default=False))
+-        do_trim = bool(env_bool("ENN_DCP_MALLOC_TRIM", default=False))
+-        if not (do_gc or do_trim):
+-            return
++        # Default to being aggressive on small-RAM hosts: better a small, frequent cleanup
++        # than rare OS-level stalls (reclaim/writeback) that can trip elastic heartbeats.
++        host_pressure = bool(getattr(self, "_small_host", False)) or bool(self._host_under_pressure())
++        raw_gc = os.environ.get("ENN_DCP_GC_COLLECT", None)
++        raw_trim = os.environ.get("ENN_DCP_MALLOC_TRIM", None)
++        do_gc = bool(env_bool("ENN_DCP_GC_COLLECT", default=host_pressure)) if raw_gc is not None else bool(host_pressure)
++        do_trim = bool(env_bool("ENN_DCP_MALLOC_TRIM", default=host_pressure)) if raw_trim is not None else bool(host_pressure)
+         if do_gc:
+             with contextlib.suppress(Exception):
+                 gc.collect()
+         if do_trim:
+-            with contextlib.suppress(Exception):
+-                libc = ctypes.CDLL("libc.so.6")
+-                trim = getattr(libc, "malloc_trim", None)
+-                if callable(trim):
+-                    trim(0)
++            self._malloc_trim_best_effort()
+ 
+     def _maybe_finalize_dcp_op(self, op: _PendingOp) -> None:
+         if op.kind != "dcp" or not op.epoch_dir:
+@@ -3153,6 +3302,12 @@
+                 **(extra_meta or {}),
+             }
+             write_json(done_file, payload, indent=2)
++            # Best-effort: advise OS to drop page cache for freshly-written checkpoint files.
++            # This helps keep system RAM stable on small hosts (e.g. Colab) where page-cache growth
++            # can otherwise lead to reclaim/writeback stalls and elastic heartbeat timeouts.
++            if bool(getattr(self, "_small_host", False)) or bool(self._host_under_pressure()):
++                with contextlib.suppress(Exception):
++                    self._drop_dir_page_cache(epoch_dir)
+         finally:
+             with contextlib.suppress(Exception):
+                 self._prune_dcp()
+@@ -3172,6 +3327,9 @@
+                 return
+             for p in epoch_dirs[: max(0, len(epoch_dirs) - self.keep_last)]:
+                 try:
++                    with contextlib.suppress(Exception):
++                        if bool(getattr(self, "_small_host", False)) or bool(self._host_under_pressure()):
++                            self._drop_dir_page_cache(p)
+                     _safe_rmtree(p)
+                 except Exception as exc:
+                     if env_bool("ENN_DCP_LOG_PRUNE", False):
+@@ -3400,6 +3558,9 @@
+             from torch.distributed.checkpoint import FileSystemWriter
+ 
+             epoch_dir.mkdir(parents=True, exist_ok=True)
++            # Host budget gate: avoid starting heavy checkpoint work under host memory pressure.
++            self._wait_for_host_budget()
++
+ 
+             save_opt = bool(optimizer is not None)
+             if save_optimizer is not None:
