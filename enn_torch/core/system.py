@@ -1374,6 +1374,8 @@ def default_temp(*, large: bool = False) -> str:
         return os.environ.get("TEMP", r"C:\Windows\Temp")
     tmp = "/tmp" if os.path.isdir("/tmp") and os.access("/tmp", os.W_OK) else None
     vtmp = "/var/tmp" if os.path.isdir("/var/tmp") and os.access("/var/tmp", os.W_OK) else None
+    if large and vtmp is not None:
+        return vtmp
     if large and sys.platform.startswith("linux") and tmp is not None:
         if _linux_is_tmpfs(tmp) and vtmp is not None:
             return vtmp

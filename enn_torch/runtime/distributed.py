@@ -502,10 +502,7 @@ def init_lane_process_groups(
         if _LANE_GROUPS_INITED:
             return (_CPU_GROUP, _ACCEL_GROUP)
 
-        try:
-            _CPU_GROUP = dist.new_group(backend="gloo")
-        except Exception:
-            _CPU_GROUP = None
+        _CPU_GROUP = None
 
         dev = device
         if dev is None:
@@ -541,10 +538,21 @@ def get_accel_group(
 def get_control_process_group(pg: ProcessGroup | None = None) -> ProcessGroup | None:
     if not is_distributed():
         return None
+
+    def _cfg(g: ProcessGroup) -> str:
+        with contextlib.suppress(Exception):
+            return str(dist.get_backend_config(g)).lower()
+        with contextlib.suppress(Exception):
+            return str(dist.get_backend(g)).lower()
+        return ""
+
+    def _is_cpu_capable(cfg: str) -> bool:
+        c = (cfg or "").lower()
+        return (c == "gloo") or ("cpu:gloo" in c)
+
     if pg is not None:
         try:
-            p_be = str(dist.get_backend(pg)).lower()
-            if (p_be == "gloo") or ("cpu:gloo" in p_be):
+            if _is_cpu_capable(_cfg(pg)):
                 return pg
         except Exception:
             pass
@@ -553,8 +561,7 @@ def get_control_process_group(pg: ProcessGroup | None = None) -> ProcessGroup | 
     if cpg is not None:
         return cpg
     try:
-        w_be = str(dist.get_backend(dist.group.WORLD)).lower()
-        if (w_be == "gloo") or ("cpu:gloo" in w_be):
+        if _is_cpu_capable(_cfg(dist.group.WORLD)):
             return dist.group.WORLD
     except Exception:
         pass
