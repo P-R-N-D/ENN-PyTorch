@@ -358,6 +358,53 @@ class Sampler(torch.utils.data.Sampler):
         self._feat_dtype = f_dtype
         self._label_dtype = l_dtype
         self._feat_shape = torch.Size([self._N, fdim])
+        self._mm_fadvise_enabled = False
+        self._mm_fadvise_every = 8
+        self._mm_fadvise_cooldown_s = 0.5
+        self._mm_fadvise_last = 0.0
+        self._mm_fadvise_counter = 0
+        self._feat_row_bytes = 0
+        self._label_row_bytes = 0
+        small_host = False
+        with suppress(Exception):
+            total_b = Memory.total()
+            small_host = bool(
+                isinstance(total_b, int)
+                and total_b > 0
+                and total_b <= (16 * 1024**3)
+            )
+        self._mm_fadvise_enabled = env_bool(
+            ("ENN_MEMMAP_FADVISE",),
+            default=bool(small_host),
+        )
+        with suppress(Exception):
+            self._mm_fadvise_every = max(
+                1,
+                int(
+                    env_first_int(("ENN_MEMMAP_FADVISE_EVERY",), default=8)
+                    or 8
+                ),
+            )
+        with suppress(Exception):
+            self._mm_fadvise_cooldown_s = max(
+                0.0,
+                float(
+                    os.environ.get("ENN_MEMMAP_FADVISE_COOLDOWN_S", "0.5")
+                    or 0.5
+                ),
+            )
+        with suppress(Exception):
+            self._feat_row_bytes = int(fdim) * int(
+                torch.tensor([], dtype=f_dtype).element_size()
+            )
+        with suppress(Exception):
+            if lshape_meta:
+                _row_elems = 1
+                for _d in lshape_meta:
+                    _row_elems *= max(1, int(_d))
+                self._label_row_bytes = int(_row_elems) * int(
+                    torch.tensor([], dtype=l_dtype).element_size()
+                )
         if MemoryMappedTensor is None:
             raise ImportError(
                 "tensordict is required for MemoryMappedTensor-backed pipelines. "
@@ -590,7 +637,108 @@ class Sampler(torch.utils.data.Sampler):
                 y = y.reshape(end - start, *self._label_shape)
             yt = y if isinstance(y, torch.Tensor) else torch.as_tensor(y)
             out["Y"] = yt
+        with suppress(Exception):
+            self._maybe_memmap_fadvise_dontneed(start, end)
         return out
+
+    def _maybe_memmap_fadvise_dontneed(self: Self, start: int, end: int) -> None:
+        if not bool(getattr(self, "_mm_fadvise_enabled", False)):
+            return
+        if not (
+            hasattr(os, "posix_fadvise")
+            and hasattr(os, "POSIX_FADV_DONTNEED")
+        ):
+            return
+        try:
+            self._mm_fadvise_counter = int(
+                getattr(self, "_mm_fadvise_counter", 0) or 0
+            ) + 1
+        except Exception:
+            self._mm_fadvise_counter = 1
+        every = int(getattr(self, "_mm_fadvise_every", 8) or 8)
+        if every > 1 and (self._mm_fadvise_counter % every) != 0:
+            return
+        cooldown = float(getattr(self, "_mm_fadvise_cooldown_s", 0.5) or 0.0)
+        try:
+            last = float(getattr(self, "_mm_fadvise_last", 0.0) or 0.0)
+        except Exception:
+            last = 0.0
+        now = time.monotonic()
+        if cooldown > 0.0 and (now - last) < cooldown:
+            return
+        self._mm_fadvise_last = float(now)
+
+        avail = None
+        with suppress(Exception):
+            avail = Memory.available()
+        if not avail or int(avail) <= 0:
+            return
+
+        host_total = None
+        with suppress(Exception):
+            host_total = Memory.total()
+
+        ratio = 0.25
+        with suppress(Exception):
+            ratio = float(os.environ.get("ENN_HOST_MIN_FREE_RATIO", ratio) or ratio)
+        ratio = max(0.05, min(0.50, float(ratio)))
+        cap_mb = 3072
+        with suppress(Exception):
+            cap_mb = int(os.environ.get("ENN_HOST_MIN_FREE_MB_CAP", cap_mb) or cap_mb)
+        cap_mb = max(1024, int(cap_mb))
+        raw_min_free = str(os.environ.get("ENN_HOST_MIN_FREE_MB", "") or "").strip()
+        min_free_mb = None
+        if raw_min_free:
+            with suppress(Exception):
+                min_free_mb = int(raw_min_free)
+        if min_free_mb is None:
+            if host_total and int(host_total) > 0:
+                total_mb = int(int(host_total) // (1024 * 1024))
+                cand = int(total_mb * ratio)
+                min_free_mb = max(1024, min(int(cap_mb), int(cand)))
+            else:
+                min_free_mb = 1024
+
+        if int(avail) >= int(min_free_mb) * 1024 * 1024:
+            return
+
+        n = max(0, int(end) - int(start))
+        if n <= 0:
+            return
+
+        feat_path = getattr(self, "_feat_path", "")
+        row_bytes = int(getattr(self, "_feat_row_bytes", 0) or 0)
+        if feat_path and row_bytes > 0:
+            off = int(start) * row_bytes
+            length = n * row_bytes
+            fd = None
+            with suppress(Exception):
+                fd = os.open(str(feat_path), os.O_RDONLY)
+            if fd is not None:
+                try:
+                    os.posix_fadvise(
+                        fd, int(off), int(length), os.POSIX_FADV_DONTNEED
+                    )
+                finally:
+                    with suppress(Exception):
+                        os.close(fd)
+
+        lab_path = getattr(self, "_lab_path", None)
+        row_bytes = int(getattr(self, "_label_row_bytes", 0) or 0)
+        if lab_path and row_bytes > 0:
+            off = int(start) * row_bytes
+            length = n * row_bytes
+            fd = None
+            with suppress(Exception):
+                fd = os.open(str(lab_path), os.O_RDONLY)
+            if fd is not None:
+                try:
+                    os.posix_fadvise(
+                        fd, int(off), int(length), os.POSIX_FADV_DONTNEED
+                    )
+                finally:
+                    with suppress(Exception):
+                        os.close(fd)
 
     def _gather(
         self: Self, idx_tensor: torch.Tensor, features: Any, labels: Any
