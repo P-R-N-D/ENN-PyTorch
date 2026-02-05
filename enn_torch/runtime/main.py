@@ -233,19 +233,6 @@ def _export_return_model_pt(
         return
     os.makedirs(str(ckpt_dir), exist_ok=True)
 
-    sd_cpu: dict[str, object] = {}
-    with torch.no_grad():
-        for k, v in model.state_dict().items():
-            if torch.is_tensor(v):
-                t = v.detach()
-                if getattr(t, "is_meta", False) or t.device.type == "meta":
-                    continue
-                if t.device.type != "cpu":
-                    t = t.to("cpu")
-                sd_cpu[str(k)] = t
-            else:
-                sd_cpu[str(k)] = v
-
     avg_params: dict[str, torch.Tensor] | None = None
     if swa_helper is not None:
         fn = getattr(swa_helper, "checkpoint_state_dict", None)
@@ -280,6 +267,23 @@ def _export_return_model_pt(
                     if t.device.type != "cpu":
                         t = t.to("cpu")
                     avg_params[str(name)] = t
+
+    skip_keys: set[str] = set(avg_params.keys()) if isinstance(avg_params, dict) else set()
+    sd_cpu: dict[str, object] = {}
+    with torch.no_grad():
+        for k, v in model.state_dict().items():
+            sk = str(k)
+            if sk in skip_keys:
+                continue
+            if torch.is_tensor(v):
+                t = v.detach()
+                if getattr(t, "is_meta", False) or t.device.type == "meta":
+                    continue
+                if t.device.type != "cpu":
+                    t = t.to("cpu")
+                sd_cpu[sk] = t
+            else:
+                sd_cpu[sk] = v
 
     if isinstance(avg_params, dict) and avg_params:
         for name, t in avg_params.items():
@@ -3586,6 +3590,40 @@ def process(*args: Any, **kwargs: Any) -> object:
             if session is not None:
                 session.close()
         with contextlib.suppress(Exception):
+            if checkpointer is not None:
+                checkpointer.close(abort_inflight=True)
+                checkpointer = None
+        with contextlib.suppress(Exception):
+            import gc
+
+            gc.collect()
+        with contextlib.suppress(Exception):
+            if env_bool("ENN_FINALIZE_MALLOC_TRIM", default=False):
+                import ctypes
+                import platform as _platform
+
+                sysname = _platform.system()
+                if sysname == "Linux":
+                    libc = ctypes.CDLL("libc.so.6")
+                    trim = getattr(libc, "malloc_trim", None)
+                    if callable(trim):
+                        trim(0)
+                elif sysname == "Windows":
+                    msvcrt = ctypes.CDLL("msvcrt.dll")
+                    heapmin = getattr(msvcrt, "_heapmin", None)
+                    if callable(heapmin):
+                        heapmin()
+                elif sysname == "Darwin":
+                    libsys = ctypes.CDLL("libsystem_malloc.dylib")
+                    fn = getattr(libsys, "malloc_zone_pressure_relief", None)
+                    if callable(fn):
+                        fn(None, 0)
+        with contextlib.suppress(Exception):
+            yield_s = os.environ.get("ENN_FINALIZE_YIELD_S", "0.02")
+            if isinstance(yield_s, str):
+                yield_s = yield_s.strip()
+            time.sleep(float(yield_s or 0.02))
+        with contextlib.suppress(Exception):
             if int(local_rank) == 0 and getattr(ops, "ckpt_dir", None):
                 target = model.module if hasattr(model, "module") else model
                 _export_return_model_pt(
@@ -3594,9 +3632,6 @@ def process(*args: Any, **kwargs: Any) -> object:
                     ema_helper=ema_helper,
                     swa_helper=swa_helper,
                 )
-        with contextlib.suppress(Exception):
-            if checkpointer is not None:
-                checkpointer.close(abort_inflight=True)
         with contextlib.suppress(Exception):
             if swa_helper is not None and hasattr(swa_helper, "close"):
                 swa_helper.close()
