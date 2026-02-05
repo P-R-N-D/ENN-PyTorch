@@ -2866,7 +2866,20 @@ def infer(
                         if rows_i.device.type == "cpu"
                         else rows_i.to(device="cpu")
                     )
-                    writer.append(rows_cpu, preds)
+                    force_cpu = env_bool("ENN_PRED_FORCE_CPU_COPY", default=False)
+                    need_cpu_copy = bool(force_cpu) or bool(use_td_cg) or bool(cg_enabled)
+                    with contextlib.suppress(Exception):
+                        rows_cpu = rows_cpu.clone()
+                    if need_cpu_copy:
+                        preds_cpu = preds.detach()
+                        if getattr(preds_cpu, "device", None) is not None and preds_cpu.device.type != "cpu":
+                            preds_cpu = preds_cpu.to(device="cpu")
+                        else:
+                            with contextlib.suppress(Exception):
+                                preds_cpu = preds_cpu.clone()
+                        writer.append(rows_cpu, preds_cpu)
+                    else:
+                        writer.append(rows_cpu, preds)
                     appended_rows_total += int(
                         getattr(preds, "shape", (0,))[0]
                     )
