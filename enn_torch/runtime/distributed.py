@@ -4179,10 +4179,21 @@ class Checkpointer:
                         close()
                 self._stager = None
                 self._stager_owner_thread = None
+        wait_shutdown = not bool(abort_inflight)
         with contextlib.suppress(Exception):
-            self._avg_executor.shutdown(wait=True)
+            ex = self._avg_executor
+            self._avg_executor = None
+            try:
+                ex.shutdown(wait=wait_shutdown, cancel_futures=bool(abort_inflight))
+            except TypeError:
+                ex.shutdown(wait=wait_shutdown)
         with contextlib.suppress(Exception):
-            self._dcp_executor.shutdown(wait=True)
+            ex = self._dcp_executor
+            self._dcp_executor = None
+            try:
+                ex.shutdown(wait=wait_shutdown, cancel_futures=bool(abort_inflight))
+            except TypeError:
+                ex.shutdown(wait=wait_shutdown)
 
     def find_latest_dcp_epoch(self) -> int | None:
         try:
