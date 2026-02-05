@@ -229,9 +229,10 @@ def _export_return_model_pt(
     import os
     import torch
 
-    if not ckpt_dir:
+    out_dir = os.environ.get("ENN_RETURN_DIR") or str(ckpt_dir or "")
+    if not out_dir:
         return
-    os.makedirs(str(ckpt_dir), exist_ok=True)
+    os.makedirs(str(out_dir), exist_ok=True)
 
     avg_params: dict[str, torch.Tensor] | None = None
     if swa_helper is not None:
@@ -290,7 +291,7 @@ def _export_return_model_pt(
             if torch.is_tensor(t):
                 sd_cpu[str(name)] = t
 
-    out_path = os.path.join(str(ckpt_dir), "model.pt")
+    out_path = os.path.join(str(out_dir), "model.pt")
     tmp_path = out_path + ".tmp"
     torch.save(sd_cpu, tmp_path)
     os.replace(tmp_path, out_path)
@@ -301,6 +302,17 @@ def _export_return_model_pt(
                 os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
             finally:
                 os.close(fd)
+    copy_to_ckpt = (
+        os.environ.get("ENN_RETURN_COPY_TO_CKPT", "").strip().lower()
+        in ("1", "true", "yes", "y", "on")
+    )
+    if copy_to_ckpt and ckpt_dir and str(ckpt_dir) != str(out_dir):
+        with contextlib.suppress(Exception):
+            import shutil
+
+            os.makedirs(str(ckpt_dir), exist_ok=True)
+            dst = os.path.join(str(ckpt_dir), "model.pt")
+            shutil.copyfile(out_path, dst)
 
 
 def _pin(

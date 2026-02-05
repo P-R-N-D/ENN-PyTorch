@@ -144,6 +144,23 @@ def _ensure_disk_cache_env() -> None:
     _set_if_unset_or_unsafe("TRITON_CACHE_DIR", os.path.join(root, "triton"))
     _set_if_unset_or_unsafe("CUDA_CACHE_PATH", os.path.join(root, "cuda_cache"))
     _set_if_unset_or_unsafe("XDG_CACHE_HOME", os.path.join(root, "xdg"))
+    with contextlib.suppress(Exception):
+        Path(os.environ.get("TORCHINDUCTOR_CACHE_DIR", inductor_dir)).mkdir(
+            parents=True,
+            exist_ok=True,
+        )
+    with contextlib.suppress(Exception):
+        Path(os.environ.get("TRITON_CACHE_DIR", os.path.join(root, "triton"))).mkdir(
+            parents=True,
+            exist_ok=True,
+        )
+    with contextlib.suppress(Exception):
+        xdg = os.environ.get("XDG_CACHE_HOME", os.path.join(root, "xdg"))
+        Path(xdg).mkdir(parents=True, exist_ok=True)
+        Path(os.path.join(xdg, "torch", "kernels")).mkdir(
+            parents=True,
+            exist_ok=True,
+        )
 
     with contextlib.suppress(Exception):
         import torch._inductor.config as _icfg
