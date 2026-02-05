@@ -1256,7 +1256,7 @@ def epochs(
                                             host_total_now = Memory.total()
                                         if (
                                             host_avail_now is not None
-                                            and int(host_avail_now) >= 0
+                                            and int(host_avail_now) > 0
                                         ):
                                             raw_min_free = str(
                                                 os.environ.get(
