@@ -306,10 +306,27 @@ def _export_return_model_pt(
 
     out_path = os.path.join(str(out_dir), "model.pt")
     tmp_path = out_path + ".tmp"
-    with contextlib.suppress(Exception):
+    try:
         torch.save(sd_cpu, tmp_path, _use_new_zipfile_serialization=False)
-    if not os.path.exists(tmp_path):
-        torch.save(sd_cpu, tmp_path)
+    except Exception:
+        with contextlib.suppress(Exception):
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        try:
+            torch.save(sd_cpu, tmp_path)
+        except Exception:
+            with contextlib.suppress(Exception):
+                if os.path.exists(tmp_path):
+                    os.remove(tmp_path)
+            raise
+    try:
+        if (not os.path.exists(tmp_path)) or (os.path.getsize(tmp_path) <= 0):
+            raise RuntimeError("export produced empty model.pt.tmp")
+    except Exception:
+        with contextlib.suppress(Exception):
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        raise
     os.replace(tmp_path, out_path)
     with contextlib.suppress(Exception):
         if hasattr(os, "posix_fadvise") and hasattr(os, "POSIX_FADV_DONTNEED"):
