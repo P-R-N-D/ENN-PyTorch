@@ -1366,12 +1366,13 @@ def distributed_barrier(
 
     if lane_s in {"control", "cpu", "gloo"}:
         cpg = get_cpu_group() or get_control_process_group(pg_in)
-        try:
-            t = torch.zeros((1,), device="cpu", dtype=torch.int32)
-            dist.all_reduce(t, op=dist.ReduceOp.SUM, group=cpg)
-            return
-        except Exception:
-            pass
+        if cpg is not None:
+            try:
+                t = torch.zeros((1,), device="cpu", dtype=torch.int32)
+                dist.all_reduce(t, op=dist.ReduceOp.SUM, group=cpg)
+                return
+            except Exception:
+                pass
         if getattr(dev, "type", "cpu") == "cpu" and torch.cuda.is_available():
             with contextlib.suppress(Exception):
                 dev = torch.device("cuda", torch.cuda.current_device())
