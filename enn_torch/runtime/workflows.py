@@ -1456,8 +1456,13 @@ def train(
         with _start_context():
             elastic_launch(lc, process)(ops)
         fallback: str | None = None
+        ret_dir = os.environ.get("ENN_RETURN_DIR") or ""
         for fname in ("model.pt",):
             fp = os.path.join(ckpt_dir, fname)
+            if ret_dir:
+                alt = os.path.join(str(ret_dir), fname)
+                if os.path.isfile(alt):
+                    fp = alt
             if os.path.isfile(fp):
                 fallback = fp
                 break
