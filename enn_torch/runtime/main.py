@@ -269,6 +269,7 @@ def _export_return_model_pt(
                         t = t.to("cpu")
                     avg_params[str(name)] = t
 
+    include_buffers = True
     skip_keys: set[str] = set(avg_params.keys()) if isinstance(avg_params, dict) else set()
     sd_cpu: dict[str, object] = {}
     with torch.no_grad():
@@ -286,6 +287,18 @@ def _export_return_model_pt(
             else:
                 sd_cpu[sk] = v
 
+    if include_buffers:
+        with torch.no_grad():
+            for name, b in model.named_buffers(recurse=True):
+                if not torch.is_tensor(b):
+                    continue
+                t = b.detach()
+                if getattr(t, "is_meta", False) or t.device.type == "meta":
+                    continue
+                if t.device.type != "cpu":
+                    t = t.to("cpu")
+                sd_cpu[str(name)] = t
+
     if isinstance(avg_params, dict) and avg_params:
         for name, t in avg_params.items():
             if torch.is_tensor(t):
@@ -293,7 +306,27 @@ def _export_return_model_pt(
 
     out_path = os.path.join(str(out_dir), "model.pt")
     tmp_path = out_path + ".tmp"
-    torch.save(sd_cpu, tmp_path)
+    try:
+        torch.save(sd_cpu, tmp_path, _use_new_zipfile_serialization=False)
+    except Exception:
+        with contextlib.suppress(Exception):
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        try:
+            torch.save(sd_cpu, tmp_path)
+        except Exception:
+            with contextlib.suppress(Exception):
+                if os.path.exists(tmp_path):
+                    os.remove(tmp_path)
+            raise
+    try:
+        if (not os.path.exists(tmp_path)) or (os.path.getsize(tmp_path) <= 0):
+            raise RuntimeError("export produced empty model.pt.tmp")
+    except Exception:
+        with contextlib.suppress(Exception):
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        raise
     os.replace(tmp_path, out_path)
     with contextlib.suppress(Exception):
         if hasattr(os, "posix_fadvise") and hasattr(os, "POSIX_FADV_DONTNEED"):
@@ -302,6 +335,77 @@ def _export_return_model_pt(
                 os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
             finally:
                 os.close(fd)
+
+    with contextlib.suppress(Exception):
+        import json
+
+        meta_path = os.path.join(str(out_dir), "model.meta.json")
+
+        def _json_safe(obj: object) -> object:
+            import torch
+
+            if obj is None:
+                return None
+            if isinstance(obj, (str, int, float, bool)):
+                return obj
+            if isinstance(obj, (list, tuple)):
+                return [_json_safe(x) for x in obj]
+            if isinstance(obj, dict):
+                return {str(k): _json_safe(v) for k, v in obj.items()}
+            if torch.is_tensor(obj):
+                t = obj.detach()
+                if getattr(t, "is_meta", False) or t.device.type == "meta":
+                    return None
+                if t.device.type != "cpu":
+                    t = t.to("cpu")
+                try:
+                    numel = int(t.numel())
+                except Exception:
+                    numel = 0
+                if numel <= 256:
+                    return t.reshape(-1).tolist()
+                return {"dtype": str(t.dtype), "shape": list(t.shape)}
+            return str(obj)
+
+        meta: dict[str, object] = {
+            "version": 1,
+            "pytorch_version": getattr(torch, "__version__", None),
+        }
+        with contextlib.suppress(Exception):
+            meta["in_dim"] = int(getattr(model, "in_dim"))
+        with contextlib.suppress(Exception):
+            meta["out_shape"] = list(getattr(model, "out_shape"))
+        meta["artifact"] = {"model_pt": os.path.basename(out_path)}
+
+        hist = None
+        for key in ("training_history", "_training_history", "history"):
+            with contextlib.suppress(Exception):
+                v = getattr(model, key, None)
+                if v:
+                    hist = v
+                    break
+        if hist is not None:
+            try:
+                if isinstance(hist, list) and len(hist) > 2000:
+                    hist = hist[-2000:]
+            except Exception:
+                pass
+            meta["training_history"] = _json_safe(hist)
+
+        buf_summary: dict[str, object] = {}
+        with torch.no_grad():
+            for name, b in model.named_buffers(recurse=True):
+                if not torch.is_tensor(b):
+                    continue
+                low = name.lower()
+                if any(k in low for k in ("mean", "std", "scale", "shift", "min", "max", "offset")):
+                    buf_summary[name] = _json_safe(b)
+        if buf_summary:
+            meta["scaling_buffers"] = buf_summary
+
+        with open(meta_path + ".tmp", "w", encoding="utf-8") as fh:
+            json.dump(meta, fh, ensure_ascii=False, indent=2)
+        os.replace(meta_path + ".tmp", meta_path)
     copy_to_ckpt = (
         os.environ.get("ENN_RETURN_COPY_TO_CKPT", "").strip().lower()
         in ("1", "true", "yes", "y", "on")
