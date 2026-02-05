@@ -1555,11 +1555,38 @@ def train(
                     )
             except Exception:
                 pass
-        shutil.rmtree(memmap_dir, ignore_errors=True)
-        if ckpt_dir is not None:
-            shutil.rmtree(ckpt_dir, ignore_errors=True)
-        if init_dir is not None:
-            shutil.rmtree(init_dir, ignore_errors=True)
+        do_async = (
+            str(os.environ.get("ENN_ASYNC_CLEANUP", "1") or "1")
+            .strip()
+            .lower()
+            not in ("0", "false", "off", "no", "n")
+        )
+        if do_async:
+            import threading
+
+            paths = [memmap_dir]
+            if ckpt_dir is not None:
+                paths.append(ckpt_dir)
+            if init_dir is not None:
+                paths.append(init_dir)
+
+            def _cleanup(ps: list[str]) -> None:
+                for p in ps:
+                    with contextlib.suppress(Exception):
+                        shutil.rmtree(p, ignore_errors=True)
+
+            threading.Thread(
+                target=_cleanup,
+                args=(paths,),
+                daemon=True,
+                name="enn-cleanup",
+            ).start()
+        else:
+            shutil.rmtree(memmap_dir, ignore_errors=True)
+            if ckpt_dir is not None:
+                shutil.rmtree(ckpt_dir, ignore_errors=True)
+            if init_dir is not None:
+                shutil.rmtree(init_dir, ignore_errors=True)
 
 
 def predict(
