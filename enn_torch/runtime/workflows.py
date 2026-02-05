@@ -1303,8 +1303,8 @@ def train(
         "cpu", feature_dtype=torch.float64, label_float_dtype=torch.float64
     )
     ds_meta.underflow_action = underflow_action
-    memmap_dir = new_dir("memmap_ds")
-    ckpt_dir = new_dir("ckpt_dcp")
+    memmap_dir = new_dir("memmap_ds", large=True)
+    ckpt_dir = new_dir("ckpt_dcp", large=True)
     init_dir = None
     init_ckpt_path: str | None = None
     trained_loaded: bool = False
@@ -1349,7 +1349,7 @@ def train(
         if use_local_init:
             init_dir = tempfile.mkdtemp(prefix=f"enn_init_ckpt_{run_id}_")
         else:
-            init_dir = new_dir("init_ckpt")
+            init_dir = new_dir("init_ckpt", large=True)
         init_ckpt_path = os.fspath(init_dir)
         _save_model_checkpoint(
             model,
@@ -1695,7 +1695,7 @@ def predict(
         "cpu", feature_dtype=master_dtype, label_float_dtype=master_dtype
     )
     ds.underflow_action = underflow_action
-    tmp_dir = new_dir("infer")
+    tmp_dir = new_dir("infer", large=True)
     ckpt_dir = os.path.join(tmp_dir, "ckpt")
     memmap_dir = os.path.join(tmp_dir, "memmap")
     os.makedirs(ckpt_dir, exist_ok=True)

@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import contextlib
 import ctypes
-import ctypes.util
 import dataclasses
 import gc
 import importlib
@@ -17,8 +16,6 @@ import random
 import re
 import shutil
 import socket
-import sys
-import platform
 import threading
 import time
 import warnings
@@ -506,7 +503,7 @@ def init_lane_process_groups(
             return (_CPU_GROUP, _ACCEL_GROUP)
 
         try:
-            _CPU_GROUP = dist.new_group(backend="cpu:gloo")
+            _CPU_GROUP = dist.new_group(backend="gloo")
         except Exception:
             _CPU_GROUP = None
 
@@ -544,9 +541,6 @@ def get_accel_group(
 def get_control_process_group(pg: ProcessGroup | None = None) -> ProcessGroup | None:
     if not is_distributed():
         return None
-    cpg = get_cpu_group()
-    if cpg is not None:
-        return cpg
     if pg is not None:
         try:
             p_be = str(dist.get_backend(pg)).lower()
@@ -554,6 +548,10 @@ def get_control_process_group(pg: ProcessGroup | None = None) -> ProcessGroup | 
                 return pg
         except Exception:
             pass
+        return None
+    cpg = get_cpu_group()
+    if cpg is not None:
+        return cpg
     try:
         w_be = str(dist.get_backend(dist.group.WORLD)).lower()
         if (w_be == "gloo") or ("cpu:gloo" in w_be):
@@ -578,8 +576,7 @@ def _get_gloox_gloo_process_group(pg: ProcessGroup | None) -> ProcessGroup:
     base_pg = pg or dist.group.WORLD
 
     try:
-        be = str(dist.get_backend(base_pg)).lower()
-        if be == "gloo" or "cpu:gloo" in be:
+        if dist.get_backend(base_pg) == "gloo":
             return base_pg
     except Exception:
         pass
@@ -594,7 +591,7 @@ def _get_gloox_gloo_process_group(pg: ProcessGroup | None) -> ProcessGroup:
         return cached
 
     try:
-        gloo_pg = dist.new_group(ranks=list(ranks), backend="cpu:gloo")
+        gloo_pg = dist.new_group(ranks=list(ranks), backend="gloo")
     except Exception as exc:
         raise RuntimeError("Failed to create gloo process group") from exc
 
@@ -1253,22 +1250,17 @@ def broadcast_scalar(
         )
 
     def _accel_pg(default_pg: ProcessGroup) -> ProcessGroup:
-        ag = get_accel_group(dev)
-        if ag is None:
+        if pg_in is not None:
             return default_pg
-        if pg_in is None:
-            return ag
-        try:
-            if pg_in is dist.group.WORLD:
-                be = str(dist.get_backend(default_pg)).lower()
-                if (be == "gloo") or ("cpu:gloo" in be):
-                    return ag
-        except Exception:
-            pass
-        return default_pg
+        ag = get_accel_group(dev)
+        return ag or default_pg
 
     if lane_s in {"control", "cpu", "gloo"}:
-        cpg = get_cpu_group() or get_control_process_group(pg_in)
+        cpg = (
+            get_control_process_group(pg_in)
+            if pg_in is not None
+            else (get_cpu_group() or get_control_process_group(None))
+        )
         cpu_exc: Exception | None = None
         if cpg is not None:
             try:
@@ -1372,22 +1364,17 @@ def distributed_barrier(
         )
 
     def _accel_pg(default_pg: ProcessGroup) -> ProcessGroup:
-        ag = get_accel_group(dev)
-        if ag is None:
+        if pg_in is not None:
             return default_pg
-        if pg_in is None:
-            return ag
-        try:
-            if pg_in is dist.group.WORLD:
-                be = str(dist.get_backend(default_pg)).lower()
-                if (be == "gloo") or ("cpu:gloo" in be):
-                    return ag
-        except Exception:
-            pass
-        return default_pg
+        ag = get_accel_group(dev)
+        return ag or default_pg
 
     if lane_s in {"control", "cpu", "gloo"}:
-        cpg = get_cpu_group() or get_control_process_group(pg_in)
+        cpg = (
+            get_control_process_group(pg_in)
+            if pg_in is not None
+            else (get_cpu_group() or get_control_process_group(None))
+        )
         if cpg is not None:
             try:
                 t = torch.zeros((1,), device="cpu", dtype=torch.int32)
@@ -2383,15 +2370,6 @@ class Checkpointer:
             self._rank = 0
             self._world = 1
 
-        self._small_host = False
-        with contextlib.suppress(Exception):
-            total_b = Memory.total()
-            self._small_host = bool(
-                isinstance(total_b, int)
-                and total_b > 0
-                and total_b <= (16 * 1024**3)
-            )
-
         self._local_rank = int(os.environ.get("LOCAL_RANK", "0") or 0)
         self._local_world = int(os.environ.get("LOCAL_WORLD_SIZE", "1") or 1)
         if self._local_world < 1:
@@ -2420,6 +2398,14 @@ class Checkpointer:
             except Exception:
                 self._dcp_process_group = None
                 self._dcp_should_participate = True
+
+        if self._dcp_process_group is None and device is not None and self._is_distributed():
+            try:
+                ag = get_accel_group(device)
+                if ag is not None:
+                    self._dcp_process_group = ag
+            except Exception:
+                pass
 
         self.dcp_root.mkdir(parents=True, exist_ok=True)
         try:
@@ -2451,136 +2437,6 @@ class Checkpointer:
 
     def _sync_device(self) -> str:
         return "cpu"
-
-    def _host_min_free_bytes(self) -> int:
-        raw = str(os.environ.get("ENN_DCP_HOST_MIN_FREE_MB", "") or "").strip()
-        if raw:
-            with contextlib.suppress(Exception):
-                return max(0, int(raw)) * 1024 * 1024
-
-        ratio = 0.25 if bool(getattr(self, "_small_host", False)) else 0.15
-        with contextlib.suppress(Exception):
-            ratio = float(os.environ.get("ENN_DCP_HOST_MIN_FREE_RATIO", ratio) or ratio)
-        ratio = max(0.05, min(0.50, float(ratio)))
-
-        cap_mb = 3072
-        with contextlib.suppress(Exception):
-            cap_mb = int(os.environ.get("ENN_DCP_HOST_MIN_FREE_MB_CAP", cap_mb) or cap_mb)
-        cap_mb = max(1024, int(cap_mb))
-
-        total_b = None
-        with contextlib.suppress(Exception):
-            total_b = Memory.total()
-        if isinstance(total_b, int) and total_b > 0:
-            total_mb = int(total_b // (1024 * 1024))
-            cand_mb = int(total_mb * ratio)
-            cand_mb = max(1024, min(int(cap_mb), int(cand_mb)))
-            return int(cand_mb) * 1024 * 1024
-
-        return 1024 * 1024 * 1024
-
-    def _host_under_pressure(self) -> bool:
-        avail = None
-        with contextlib.suppress(Exception):
-            avail = Memory.available()
-        if not avail or int(avail) <= 0:
-            return False
-        return int(avail) < int(self._host_min_free_bytes())
-
-    def _malloc_trim_best_effort(self) -> None:
-        sysname = str(platform.system() or "")
-        if sysname == "Linux":
-            with contextlib.suppress(Exception):
-                libc = ctypes.CDLL("libc.so.6")
-                trim = getattr(libc, "malloc_trim", None)
-                if callable(trim):
-                    trim(0)
-        elif sysname == "Windows":
-            with contextlib.suppress(Exception):
-                msvcrt = ctypes.CDLL("msvcrt.dll")
-                heapmin = getattr(msvcrt, "_heapmin", None)
-                if callable(heapmin):
-                    heapmin()
-        elif sysname == "Darwin":
-            with contextlib.suppress(Exception):
-                libsys = ctypes.CDLL("libsystem_malloc.dylib")
-                fn = getattr(libsys, "malloc_zone_pressure_relief", None)
-                if callable(fn):
-                    fn(None, 0)
-
-    def _drop_dir_page_cache(self, root: Path) -> None:
-        if not (
-            hasattr(os, "posix_fadvise") and hasattr(os, "POSIX_FADV_DONTNEED")
-        ):
-            return
-        try:
-            max_files = int(os.environ.get("ENN_DCP_FADVISE_MAX_FILES", "4096") or 4096)
-        except Exception:
-            max_files = 4096
-        max_files = max(64, int(max_files))
-        count = 0
-        for fp in root.rglob("*"):
-            if count >= max_files:
-                break
-            if not fp.is_file():
-                continue
-            fd = None
-            with contextlib.suppress(Exception):
-                fd = os.open(str(fp), os.O_RDONLY)
-            if fd is None:
-                continue
-            try:
-                with contextlib.suppress(Exception):
-                    os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
-            finally:
-                with contextlib.suppress(Exception):
-                    os.close(fd)
-            count += 1
-
-    def _wait_for_host_budget(self) -> None:
-        if not bool(
-            env_bool(
-                "ENN_DCP_HOST_BUDGET",
-                default=bool(getattr(self, "_small_host", False)),
-            )
-        ):
-            return
-        min_free = int(self._host_min_free_bytes())
-        if min_free <= 0:
-            return
-        try:
-            timeout_s = float(
-                os.environ.get("ENN_DCP_HOST_BUDGET_WAIT_SEC", "30") or 30.0
-            )
-        except Exception:
-            timeout_s = 30.0
-        timeout_s = max(0.0, float(timeout_s))
-        sleep_s = 0.2
-        with contextlib.suppress(Exception):
-            sleep_s = float(
-                os.environ.get("ENN_DCP_HOST_BUDGET_SLEEP_S", sleep_s) or sleep_s
-            )
-        sleep_s = max(0.01, min(1.0, float(sleep_s)))
-        deadline = (time.monotonic() + timeout_s) if timeout_s > 0.0 else None
-        last_heavy = 0.0
-        while True:
-            avail = None
-            with contextlib.suppress(Exception):
-                avail = Memory.available()
-            if not avail or int(avail) <= 0:
-                return
-            if int(avail) >= min_free:
-                return
-            now = time.monotonic()
-            if now - last_heavy >= 5.0:
-                last_heavy = now
-                with contextlib.suppress(Exception):
-                    gc.collect()
-                with contextlib.suppress(Exception):
-                    self._malloc_trim_best_effort()
-            time.sleep(sleep_s)
-            if deadline is not None and time.monotonic() >= deadline:
-                return
 
     def _bcast_bool_from_leader(self, flag: bool) -> bool:
         if not self._is_distributed():
@@ -3074,7 +2930,7 @@ class Checkpointer:
             self._stager_owner_thread = None
             self._stager_cfg = None
 
-    def _post_dcp_cleanup(self, *, drop_dir: Path | None = None) -> None:
+    def _post_dcp_cleanup(self) -> None:
         with contextlib.suppress(Exception):
             import torch.distributed.checkpoint.state_dict_saver as sds
 
@@ -3082,74 +2938,19 @@ class Checkpointer:
             if callable(close_fn):
                 close_fn()
         self._close_stager()
-        host_pressure = bool(getattr(self, "_small_host", False)) or bool(self._host_under_pressure())
-        raw_gc = os.environ.get("ENN_DCP_GC_COLLECT", None)
-        raw_trim = os.environ.get("ENN_DCP_MALLOC_TRIM", None)
-        do_gc = bool(env_bool("ENN_DCP_GC_COLLECT", default=host_pressure)) if raw_gc is not None else bool(host_pressure)
-        do_trim = bool(env_bool("ENN_DCP_MALLOC_TRIM", default=host_pressure)) if raw_trim is not None else bool(host_pressure)
-        do_drop_cache = bool(env_bool("ENN_DCP_DROP_CACHE", default=False)) or host_pressure
-
-        if not (do_gc or do_trim or (do_drop_cache and drop_dir is not None)):
+        do_gc = bool(env_bool("ENN_DCP_GC_COLLECT", default=False))
+        do_trim = bool(env_bool("ENN_DCP_MALLOC_TRIM", default=False))
+        if not (do_gc or do_trim):
             return
         if do_gc:
             with contextlib.suppress(Exception):
                 gc.collect()
         if do_trim:
             with contextlib.suppress(Exception):
-                self._malloc_trim_best_effort()
-
-        if do_drop_cache and drop_dir is not None:
-            try:
-                local_rank_s = (
-                    os.environ.get("LOCAL_RANK")
-                    or os.environ.get("OMPI_COMM_WORLD_LOCAL_RANK")
-                    or os.environ.get("MPI_LOCALRANKID")
-                    or os.environ.get("SLURM_LOCALID")
-                )
-                local_rank = int(local_rank_s) if local_rank_s is not None else 0
-            except Exception:
-                local_rank = 0
-
-            if local_rank == 0:
-
-                def _drop_file_cache_best_effort(p: Path) -> None:
-                    if os.name == "nt":
-                        return
-                    try:
-                        if not p.is_file():
-                            return
-                    except Exception:
-                        return
-                    try:
-                        fd = os.open(str(p), os.O_RDONLY)
-                    except Exception:
-                        return
-                    try:
-                        if hasattr(os, "posix_fadvise") and hasattr(
-                            os, "POSIX_FADV_DONTNEED"
-                        ):
-                            with contextlib.suppress(Exception):
-                                os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
-                        else:
-                            import sys
-
-                            if sys.platform == "darwin":
-                                import fcntl
-
-                                if hasattr(fcntl, "F_NOCACHE"):
-                                    with contextlib.suppress(Exception):
-                                        fcntl.fcntl(fd, fcntl.F_NOCACHE, 1)
-                    finally:
-                        with contextlib.suppress(Exception):
-                            os.close(fd)
-
-                try:
-                    root = Path(drop_dir)
-                    if root.is_dir():
-                        for fp in root.rglob("*"):
-                            _drop_file_cache_best_effort(fp)
-                except Exception:
-                    pass
+                libc = ctypes.CDLL("libc.so.6")
+                trim = getattr(libc, "malloc_trim", None)
+                if callable(trim):
+                    trim(0)
 
     def _maybe_finalize_dcp_op(self, op: _PendingOp) -> None:
         if op.kind != "dcp" or not op.epoch_dir:
@@ -3217,6 +3018,7 @@ class Checkpointer:
                     with contextlib.suppress(Exception):
                         op.future = None
                     done_ops.append((op, ok, err))
+                    self._post_dcp_cleanup()
                 else:
                     break
             while self._pending_avg and _future_done(
@@ -3256,6 +3058,7 @@ class Checkpointer:
                         with contextlib.suppress(Exception):
                             op.future = None
                         done_ops.append((op, ok, err))
+                        self._post_dcp_cleanup()
 
             while len(self._pending_avg) >= 1:
                 op = self._pending_avg[0]
@@ -3375,9 +3178,6 @@ class Checkpointer:
                 **(extra_meta or {}),
             }
             write_json(done_file, payload, indent=2)
-            if bool(getattr(self, "_small_host", False)) or bool(self._host_under_pressure()):
-                with contextlib.suppress(Exception):
-                    self._drop_dir_page_cache(epoch_dir)
         finally:
             with contextlib.suppress(Exception):
                 self._prune_dcp()
@@ -3397,9 +3197,6 @@ class Checkpointer:
                 return
             for p in epoch_dirs[: max(0, len(epoch_dirs) - self.keep_last)]:
                 try:
-                    with contextlib.suppress(Exception):
-                        if bool(getattr(self, "_small_host", False)) or bool(self._host_under_pressure()):
-                            self._drop_dir_page_cache(p)
                     _safe_rmtree(p)
                 except Exception as exc:
                     if env_bool("ENN_DCP_LOG_PRUNE", False):
@@ -3557,19 +3354,24 @@ class Checkpointer:
                     )
                 if _is_oomish_error(exc):
                     self._sigkill_torch_checkpoint_processes()
-        if self._is_dcp_leader():
-            if ok:
-                self._finalize_dcp_epoch(
-                    int(epoch),
-                    Path(epoch_dir),
-                    extra_meta={
-                        "has_optimizer": bool(has_optimizer),
-                        "model_kind": str(model_kind),
-                    },
-                )
-                _cleanup_delete_pending(self.dcp_root)
-            else:
-                self._cleanup_failed_epoch_dir(int(epoch), reason=err)
+        try:
+            if self._is_dcp_leader():
+                if ok:
+                    self._finalize_dcp_epoch(
+                        int(epoch),
+                        Path(epoch_dir),
+                        extra_meta={
+                            "has_optimizer": bool(has_optimizer),
+                            "model_kind": str(model_kind),
+                        },
+                    )
+                    _cleanup_delete_pending(self.dcp_root)
+                else:
+                    self._cleanup_failed_epoch_dir(int(epoch), reason=err)
+        finally:
+            with contextlib.suppress(Exception):
+                self._release_inflight_lock()
+            self._post_dcp_cleanup()
         if pending_exc is not None and int(abort_gen) == int(self._abort_gen):
             raise pending_exc
 
@@ -3623,7 +3425,6 @@ class Checkpointer:
             from torch.distributed.checkpoint import FileSystemWriter
 
             epoch_dir.mkdir(parents=True, exist_ok=True)
-            self._wait_for_host_budget()
 
             save_opt = bool(optimizer is not None)
             if save_optimizer is not None:
@@ -3759,7 +3560,7 @@ class Checkpointer:
         finally:
             with contextlib.suppress(Exception):
                 self._release_inflight_lock()
-            self._post_dcp_cleanup(drop_dir=epoch_dir if pending_exc is None else None)
+            self._post_dcp_cleanup()
         if pending_exc is not None:
             raise pending_exc
 
@@ -3776,7 +3577,6 @@ class Checkpointer:
         epoch_i = int(epoch)
         epoch_dir = self._epoch_dir(epoch_i)
         epoch_dir.mkdir(parents=True, exist_ok=True)
-        self._wait_for_host_budget()
 
         pending_exc: Exception | None = None
         try:
@@ -4034,7 +3834,7 @@ class Checkpointer:
         finally:
             with contextlib.suppress(Exception):
                 self._release_inflight_lock()
-            self._post_dcp_cleanup(drop_dir=epoch_dir if pending_exc is None else None)
+            self._post_dcp_cleanup()
 
         if pending_exc is not None and force_sync:
             raise pending_exc

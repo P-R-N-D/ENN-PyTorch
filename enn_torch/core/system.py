@@ -1339,18 +1339,61 @@ def init_start_method() -> None:
     ) from last_error
 
 
-def default_temp() -> str:
+def _linux_is_tmpfs(mountpoint: str) -> bool:
+    if not sys.platform.startswith("linux"):
+        return False
+    try:
+        mp = os.path.realpath(str(mountpoint))
+    except Exception:
+        mp = str(mountpoint)
+    try:
+        best_mnt = ""
+        best_fs = ""
+        with open("/proc/mounts", "r", encoding="utf-8", errors="ignore") as f:
+            for line in f:
+                parts = line.split()
+                if len(parts) < 3:
+                    continue
+                mnt = parts[1]
+                fstype = parts[2].lower()
+                if not mnt:
+                    continue
+                if mp == mnt or mp.startswith(mnt.rstrip("/") + "/"):
+                    if len(mnt) > len(best_mnt):
+                        best_mnt, best_fs = mnt, fstype
+        return best_fs in {"tmpfs", "ramfs"}
+    except Exception:
+        return False
+
+
+def default_temp(*, large: bool = False) -> str:
+    override = os.environ.get("ENN_TEMP_DIR") or os.environ.get("ENN_TMPDIR")
+    if override and os.path.isdir(override) and os.access(override, os.W_OK):
+        return override
     if sys.platform.startswith("win"):
         return os.environ.get("TEMP", r"C:\Windows\Temp")
-    return "/tmp" if os.path.isdir("/tmp") else "/var/tmp"
+    tmp = "/tmp" if os.path.isdir("/tmp") and os.access("/tmp", os.W_OK) else None
+    vtmp = "/var/tmp" if os.path.isdir("/var/tmp") and os.access("/var/tmp", os.W_OK) else None
+    if large and sys.platform.startswith("linux") and tmp is not None:
+        if _linux_is_tmpfs(tmp) and vtmp is not None:
+            return vtmp
+    if tmp is not None:
+        return tmp
+    if vtmp is not None:
+        return vtmp
+    try:
+        cwd = os.getcwd()
+        if cwd and os.path.isdir(cwd) and os.access(cwd, os.W_OK):
+            return cwd
+    except Exception:
+        pass
+    return "/tmp"
 
 
-def new_dir(prefix: str) -> str:
-    base = default_temp()
+def new_dir(prefix: str, *, large: bool = False) -> str:
+    base = default_temp(large=large)
     os.makedirs(base, exist_ok=True)
-    directory = os.path.join(
-        base, f"{prefix}_{os.getpid()}_{os.urandom(4).hex()}"
-    )
+    directory = os.path.join(base, f"{prefix}_{os.getpid()}_{os.urandom(4).hex()}")
     os.makedirs(directory, exist_ok=True)
     return directory
 

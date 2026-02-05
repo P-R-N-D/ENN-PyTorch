@@ -1237,233 +1237,6 @@ def epochs(
                             if should_sync:
                                 global_step += 1
                                 delta_gate_auto_step_total += 1
-                                if env_bool("ENN_HOST_PRESSURE", default=True):
-                                    try:
-                                        _hp_every = int(
-                                            os.environ.get(
-                                                "ENN_HOST_PRESSURE_CHECK_EVERY", "4"
-                                            )
-                                            or 4
-                                        )
-                                    except Exception:
-                                        _hp_every = 4
-                                    _hp_every = max(1, int(_hp_every))
-                                    if (int(global_step) % int(_hp_every)) == 0:
-                                        host_avail_now = None
-                                        host_total_now = None
-                                        with contextlib.suppress(Exception):
-                                            host_avail_now = Memory.available()
-                                            host_total_now = Memory.total()
-                                        if (
-                                            host_avail_now is not None
-                                            and int(host_avail_now) > 0
-                                        ):
-                                            raw_min_free = str(
-                                                os.environ.get(
-                                                    "ENN_HOST_MIN_FREE_MB", ""
-                                                )
-                                                or ""
-                                            ).strip()
-                                            min_free_mb = None
-                                            if raw_min_free:
-                                                with contextlib.suppress(Exception):
-                                                    min_free_mb = int(raw_min_free)
-                                            if min_free_mb is None:
-                                                ratio = 0.25
-                                                with contextlib.suppress(Exception):
-                                                    ratio = float(
-                                                        os.environ.get(
-                                                            "ENN_HOST_MIN_FREE_RATIO",
-                                                            ratio,
-                                                        )
-                                                        or ratio
-                                                    )
-                                                ratio = max(
-                                                    0.05, min(0.50, float(ratio))
-                                                )
-                                                cap_mb = 3072
-                                                with contextlib.suppress(Exception):
-                                                    cap_mb = int(
-                                                        os.environ.get(
-                                                            "ENN_HOST_MIN_FREE_MB_CAP",
-                                                            cap_mb,
-                                                        )
-                                                        or cap_mb
-                                                    )
-                                                cap_mb = max(1024, int(cap_mb))
-                                                if (
-                                                    host_total_now is not None
-                                                    and int(host_total_now) > 0
-                                                ):
-                                                    total_mb = int(
-                                                        int(host_total_now)
-                                                        // (1024 * 1024)
-                                                    )
-                                                    cand = int(total_mb * ratio)
-                                                    min_free_mb = max(
-                                                        1024,
-                                                        min(
-                                                            int(cap_mb), int(cand)
-                                                        ),
-                                                    )
-                                                else:
-                                                    min_free_mb = 1024
-                                            host_low = (
-                                                int(host_avail_now)
-                                                < int(min_free_mb)
-                                                * 1024
-                                                * 1024
-                                            )
-                                            if host_low:
-                                                with contextlib.suppress(Exception):
-                                                    if cpu_pool is not None and hasattr(
-                                                        cpu_pool, "collect"
-                                                    ):
-                                                        cpu_pool.collect()
-                                                with contextlib.suppress(Exception):
-                                                    time.sleep(
-                                                        float(
-                                                            os.environ.get(
-                                                                "ENN_HOST_PRESSURE_YIELD_S",
-                                                                "0.001",
-                                                            )
-                                                            or 0.001
-                                                        )
-                                                    )
-                                                try:
-                                                    cd = float(
-                                                        os.environ.get(
-                                                            "ENN_HOST_PRESSURE_HEAVY_COOLDOWN_SEC",
-                                                            "30",
-                                                        )
-                                                        or 30.0
-                                                    )
-                                                except Exception:
-                                                    cd = 30.0
-                                                cd = max(1.0, float(cd))
-                                                last = float(
-                                                    getattr(
-                                                        ops,
-                                                        "_enn_host_pressure_last_heavy",
-                                                        0.0,
-                                                    )
-                                                    or 0.0
-                                                )
-                                                now = time.monotonic()
-                                                if now - last >= cd:
-                                                    with contextlib.suppress(Exception):
-                                                        setattr(
-                                                            ops,
-                                                            "_enn_host_pressure_last_heavy",
-                                                            float(now),
-                                                        )
-                                                    if env_bool(
-                                                        "ENN_HOST_PRESSURE_GC",
-                                                        default=False,
-                                                    ):
-                                                        with contextlib.suppress(
-                                                            Exception
-                                                        ):
-                                                            import gc
-
-                                                            gc.collect()
-                                                    if env_bool(
-                                                        "ENN_HOST_PRESSURE_MALLOC_TRIM",
-                                                        default=False,
-                                                    ):
-                                                        with contextlib.suppress(
-                                                            Exception
-                                                        ):
-                                                            import ctypes
-                                                            import platform as _platform
-
-                                                            sysname = (
-                                                                _platform.system()
-                                                            )
-                                                            if sysname == "Linux":
-                                                                libc = ctypes.CDLL(
-                                                                    "libc.so.6"
-                                                                )
-                                                                trim = getattr(
-                                                                    libc,
-                                                                    "malloc_trim",
-                                                                    None,
-                                                                )
-                                                                if callable(trim):
-                                                                    trim(0)
-                                                            elif sysname == "Windows":
-                                                                msvcrt = ctypes.CDLL(
-                                                                    "msvcrt.dll"
-                                                                )
-                                                                heapmin = getattr(
-                                                                    msvcrt,
-                                                                    "_heapmin",
-                                                                    None,
-                                                                )
-                                                                if callable(heapmin):
-                                                                    heapmin()
-                                                            elif sysname == "Darwin":
-                                                                libsys = ctypes.CDLL(
-                                                                    "libsystem_malloc.dylib"
-                                                                )
-                                                                fn = getattr(
-                                                                    libsys,
-                                                                    "malloc_zone_pressure_relief",
-                                                                    None,
-                                                                )
-                                                                if callable(fn):
-                                                                    fn(None, 0)
-                                                    if env_bool(
-                                                        "ENN_HOST_PRESSURE_FADVISE_OPEN_FDS",
-                                                        default=False,
-                                                    ):
-                                                        with contextlib.suppress(
-                                                            Exception
-                                                        ):
-                                                            import os as _os
-                                                            import stat as _stat
-
-                                                            if (
-                                                                hasattr(
-                                                                    _os,
-                                                                    "posix_fadvise",
-                                                                )
-                                                                and hasattr(
-                                                                    _os,
-                                                                    "POSIX_FADV_DONTNEED",
-                                                                )
-                                                                and _os.path.isdir(
-                                                                    "/proc/self/fd"
-                                                                )
-                                                            ):
-                                                                for _ent in _os.listdir(
-                                                                    "/proc/self/fd"
-                                                                ):
-                                                                    if (
-                                                                        not _ent.isdigit()
-                                                                    ):
-                                                                        continue
-                                                                    _fd = int(_ent)
-                                                                    if _fd <= 2:
-                                                                        continue
-                                                                    with contextlib.suppress(
-                                                                        Exception
-                                                                    ):
-                                                                        st = _os.fstat(
-                                                                            _fd
-                                                                        )
-                                                                        if not _stat.S_ISREG(
-                                                                            int(
-                                                                                st.st_mode
-                                                                            )
-                                                                        ):
-                                                                            continue
-                                                                        _os.posix_fadvise(
-                                                                            _fd,
-                                                                            0,
-                                                                            0,
-                                                                            _os.POSIX_FADV_DONTNEED,
-                                                                        )
                                 with contextlib.suppress(Exception):
                                     target_for_autok = (
                                         model.module
@@ -1595,12 +1368,15 @@ def epochs(
                                     ):
                                         raw_min_free = str(
                                             os.environ.get(
-                                                "ENN_HOST_MIN_FREE_MB",
-                                                "",
+                                                "ENN_HOST_MIN_FREE_MB", ""
                                             )
                                             or ""
                                         ).strip()
-                                        ratio = 0.22
+                                        min_free_mb = None
+                                        if raw_min_free:
+                                            with contextlib.suppress(Exception):
+                                                min_free_mb = int(raw_min_free)
+                                        ratio = 0.25
                                         with contextlib.suppress(Exception):
                                             ratio = float(
                                                 os.environ.get(
@@ -1609,10 +1385,7 @@ def epochs(
                                                 )
                                                 or ratio
                                             )
-                                        ratio = max(
-                                            0.05,
-                                            min(0.50, float(ratio)),
-                                        )
+                                        ratio = max(0.05, min(0.50, float(ratio)))
                                         cap_mb = 3072
                                         with contextlib.suppress(Exception):
                                             cap_mb = int(
@@ -1623,31 +1396,6 @@ def epochs(
                                                 or cap_mb
                                             )
                                         cap_mb = max(1024, int(cap_mb))
-                                        min_free_mb = None
-                                        if raw_min_free:
-                                            with contextlib.suppress(Exception):
-                                                min_free_mb = int(raw_min_free)
-                                        else:
-                                            if (
-                                                host_total_now is not None
-                                                and host_total_now > 0
-                                            ):
-                                                total_mb = int(
-                                                    int(host_total_now)
-                                                    // (1024 * 1024)
-                                                )
-                                                min_free_mb = int(
-                                                    total_mb * ratio
-                                                )
-                                                min_free_mb = max(
-                                                    1024,
-                                                    min(
-                                                        int(cap_mb),
-                                                        int(min_free_mb),
-                                                    ),
-                                                )
-                                            else:
-                                                min_free_mb = 1024
                                         if min_free_mb is None:
                                             if (
                                                 host_total_now is not None
@@ -1666,19 +1414,12 @@ def epochs(
                                                 min_free_mb = 1024
                                         host_low = (
                                             int(host_avail_now)
-                                            < int(min_free_mb)
-                                            * 1024
-                                            * 1024
+                                            < int(min_free_mb) * 1024 * 1024
                                         )
                                     if host_low:
-                                        if new_grad_accum > grad_accum_steps:
-                                            new_grad_accum = grad_accum_steps
-                                        if grad_accum_steps > min_grad_accum:
-                                            new_grad_accum = min_grad_accum
                                         with contextlib.suppress(Exception):
-                                            if (
-                                                cpu_pool is not None
-                                                and hasattr(cpu_pool, "collect")
+                                            if cpu_pool is not None and hasattr(
+                                                cpu_pool, "collect"
                                             ):
                                                 cpu_pool.collect()
                                         with contextlib.suppress(Exception):
@@ -1688,6 +1429,7 @@ def epochs(
                                                         "ENN_HOST_PRESSURE_YIELD_S",
                                                         "0.001",
                                                     )
+                                                    or 0.001
                                                 )
                                             )
                                         try:
@@ -1733,17 +1475,13 @@ def epochs(
                                                     import ctypes
                                                     import platform as _platform
 
-                                                    sysname = (
-                                                        _platform.system()
-                                                    )
+                                                    sysname = _platform.system()
                                                     if sysname == "Linux":
                                                         libc = ctypes.CDLL(
                                                             "libc.so.6"
                                                         )
                                                         trim = getattr(
-                                                            libc,
-                                                            "malloc_trim",
-                                                            None,
+                                                            libc, "malloc_trim", None
                                                         )
                                                         if callable(trim):
                                                             trim(0)
@@ -1752,9 +1490,7 @@ def epochs(
                                                             "msvcrt.dll"
                                                         )
                                                         heapmin = getattr(
-                                                            msvcrt,
-                                                            "_heapmin",
-                                                            None,
+                                                            msvcrt, "_heapmin", None
                                                         )
                                                         if callable(heapmin):
                                                             heapmin()
@@ -1770,61 +1506,49 @@ def epochs(
                                                         if callable(fn):
                                                             fn(None, 0)
                                             if env_bool(
-                                                "ENN_HOST_PRESSURE_FADVISE",
+                                                "ENN_HOST_PRESSURE_FADVISE_OPEN_FDS",
                                                 default=False,
                                             ):
-                                                with contextlib.suppress(
-                                                    Exception
-                                                ):
-                                                    from pathlib import (
-                                                        Path as _Path,
-                                                    )
+                                                with contextlib.suppress(Exception):
                                                     import os as _os
+                                                    import stat as _stat
 
-                                                    ck = getattr(
-                                                        ops,
-                                                        "ckpt_dir",
-                                                        None,
-                                                    )
-                                                    if ck:
-                                                        for fp in _Path(
-                                                            str(ck)
-                                                        ).rglob("*"):
-                                                            if (
-                                                                not fp.is_file()
+                                                    if (
+                                                        hasattr(_os, "posix_fadvise")
+                                                        and hasattr(
+                                                            _os,
+                                                            "POSIX_FADV_DONTNEED",
+                                                        )
+                                                        and _os.path.isdir(
+                                                            "/proc/self/fd"
+                                                        )
+                                                    ):
+                                                        for _ent in _os.listdir(
+                                                            "/proc/self/fd"
+                                                        ):
+                                                            if not _ent.isdigit():
+                                                                continue
+                                                            _fd = int(_ent)
+                                                            if _fd <= 2:
+                                                                continue
+                                                            with contextlib.suppress(
+                                                                Exception
                                                             ):
-                                                                continue
-                                                            try:
-                                                                fd = _os.open(
-                                                                    str(fp),
-                                                                    _os.O_RDONLY,
+                                                                st = _os.fstat(_fd)
+                                                                if not _stat.S_ISREG(
+                                                                    int(st.st_mode)
+                                                                ):
+                                                                    continue
+                                                                _os.posix_fadvise(
+                                                                    _fd,
+                                                                    0,
+                                                                    0,
+                                                                    _os.POSIX_FADV_DONTNEED,
                                                                 )
-                                                            except Exception:
-                                                                continue
-                                                            try:
-                                                                if (
-                                                                    hasattr(
-                                                                        _os,
-                                                                        "posix_fadvise",
-                                                                    )
-                                                                    and hasattr(
-                                                                        _os,
-                                                                        "POSIX_FADV_DONTNEED",
-                                                                    )
-                                                                ):
-                                                                    _os.posix_fadvise(
-                                                                        fd,
-                                                                        0,
-                                                                        0,
-                                                                        _os.POSIX_FADV_DONTNEED,
-                                                                    )
-                                                            finally:
-                                                                with contextlib.suppress(
-                                                                    Exception
-                                                                ):
-                                                                    _os.close(
-                                                                        fd
-                                                                    )
+                                        if new_grad_accum > grad_accum_steps:
+                                            new_grad_accum = grad_accum_steps
+                                        if grad_accum_steps > min_grad_accum:
+                                            new_grad_accum = min_grad_accum
                                     if new_grad_accum != grad_accum_steps:
                                         new_grad_accum = broadcast_scalar(
                                             new_grad_accum,
