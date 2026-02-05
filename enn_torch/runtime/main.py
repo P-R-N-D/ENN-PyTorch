@@ -219,6 +219,74 @@ def _schedule(
     )
 
 
+def _export_return_model_pt(
+    model: "torch.nn.Module",
+    ckpt_dir: str,
+    *,
+    ema_helper: object | None = None,
+    swa_helper: object | None = None,
+) -> None:
+    import os
+    import torch
+
+    if not ckpt_dir:
+        return
+    os.makedirs(str(ckpt_dir), exist_ok=True)
+
+    sd_cpu: dict[str, object] = {}
+    with torch.no_grad():
+        for k, v in model.state_dict().items():
+            if torch.is_tensor(v):
+                t = v.detach()
+                if getattr(t, "is_meta", False) or t.device.type == "meta":
+                    continue
+                if t.device.type != "cpu":
+                    t = t.to("cpu")
+                sd_cpu[str(k)] = t
+            else:
+                sd_cpu[str(k)] = v
+
+    avg_params: dict[str, torch.Tensor] | None = None
+    if swa_helper is not None:
+        fn = getattr(swa_helper, "checkpoint_state_dict", None)
+        if callable(fn):
+            with contextlib.suppress(Exception):
+                avg_params = fn(model, include_buffers=False)
+    if avg_params is None and ema_helper is not None:
+        shadow = getattr(ema_helper, "shadow", None)
+        if isinstance(shadow, dict) and shadow:
+            avg_params = {}
+            with torch.no_grad():
+                for name, p in model.named_parameters(recurse=True):
+                    sv = shadow.get(name, None)
+                    tv = sv if torch.is_tensor(sv) else p
+                    if not torch.is_tensor(tv):
+                        continue
+                    t = tv.detach()
+                    if getattr(t, "is_meta", False) or t.device.type == "meta":
+                        continue
+                    if t.device.type != "cpu":
+                        t = t.to("cpu")
+                    avg_params[str(name)] = t
+
+    if isinstance(avg_params, dict) and avg_params:
+        for name, t in avg_params.items():
+            if torch.is_tensor(t):
+                sd_cpu[str(name)] = t
+
+    out_path = os.path.join(str(ckpt_dir), "model.pt")
+    tmp_path = out_path + ".tmp"
+    torch.save(sd_cpu, tmp_path)
+    os.replace(tmp_path, out_path)
+    with contextlib.suppress(Exception):
+        if hasattr(os, "posix_fadvise") and hasattr(os, "POSIX_FADV_DONTNEED"):
+            fd = os.open(out_path, os.O_RDONLY)
+            try:
+                os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+            finally:
+                os.close(fd)
+
+
 def _pin(
     meta: object,
     raw: object,
@@ -3505,6 +3573,15 @@ def process(*args: Any, **kwargs: Any) -> object:
         finally:
             if session is not None:
                 session.close()
+        with contextlib.suppress(Exception):
+            if int(local_rank) == 0 and getattr(ops, "ckpt_dir", None):
+                target = model.module if hasattr(model, "module") else model
+                _export_return_model_pt(
+                    target,
+                    str(ops.ckpt_dir),
+                    ema_helper=ema_helper,
+                    swa_helper=swa_helper,
+                )
         with contextlib.suppress(Exception):
             if checkpointer is not None:
                 checkpointer.close(abort_inflight=True)
