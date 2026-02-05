@@ -3619,10 +3619,7 @@ def process(*args: Any, **kwargs: Any) -> object:
                     if callable(fn):
                         fn(None, 0)
         with contextlib.suppress(Exception):
-            yield_s = os.environ.get("ENN_FINALIZE_YIELD_S", "0.02")
-            if isinstance(yield_s, str):
-                yield_s = yield_s.strip()
-            time.sleep(float(yield_s or 0.02))
+            time.sleep(float(os.environ.get("ENN_FINALIZE_YIELD_S", "0.02") or 0.02))
         with contextlib.suppress(Exception):
             if int(local_rank) == 0 and getattr(ops, "ckpt_dir", None):
                 target = model.module if hasattr(model, "module") else model

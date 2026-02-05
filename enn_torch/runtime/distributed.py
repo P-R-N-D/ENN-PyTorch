@@ -102,19 +102,61 @@ def _ensure_disk_cache_env() -> None:
     except Exception:
         return
 
-    def _set_if_unset_or_tmpfs(key: str, value: str) -> None:
+    user = None
+    with contextlib.suppress(Exception):
+        import getpass
+
+        user = getpass.getuser()
+    if not user:
+        user = os.environ.get("USER") or "user"
+    inductor_dir = os.path.join(root, f"torchinductor_{user}")
+
+    def _is_unsafe_cache_path(key: str, cur: str | None) -> bool:
+        if not cur:
+            return True
+        if _is_tmpfs_path(cur):
+            return True
+        if key in {
+            "TORCHINDUCTOR_CACHE_DIR",
+            "TRITON_CACHE_DIR",
+            "CUDA_CACHE_PATH",
+            "XDG_CACHE_HOME",
+        }:
+            if cur.startswith("/tmp/") or cur == "/tmp":
+                return True
+            if cur.startswith("/var/colab/") or cur.startswith("/dev/shm/"):
+                return True
+        if key in {"TMPDIR", "TEMP", "TMP"}:
+            if cur.startswith("/var/colab/") or cur.startswith("/dev/shm/"):
+                return True
+        return False
+
+    def _set_if_unset_or_unsafe(key: str, value: str) -> None:
         cur = os.environ.get(key)
-        if cur and (not _is_tmpfs_path(cur)):
+        if not _is_unsafe_cache_path(key, cur):
             return
         os.environ[key] = value
 
-    _set_if_unset_or_tmpfs("TMPDIR", root)
-    _set_if_unset_or_tmpfs("TEMP", root)
-    _set_if_unset_or_tmpfs("TMP", root)
-    _set_if_unset_or_tmpfs("TORCHINDUCTOR_CACHE_DIR", os.path.join(root, "torchinductor"))
-    _set_if_unset_or_tmpfs("TRITON_CACHE_DIR", os.path.join(root, "triton"))
-    _set_if_unset_or_tmpfs("CUDA_CACHE_PATH", os.path.join(root, "cuda_cache"))
-    _set_if_unset_or_tmpfs("XDG_CACHE_HOME", os.path.join(root, "xdg"))
+    _set_if_unset_or_unsafe("TMPDIR", root)
+    _set_if_unset_or_unsafe("TEMP", root)
+    _set_if_unset_or_unsafe("TMP", root)
+    _set_if_unset_or_unsafe("TORCHINDUCTOR_CACHE_DIR", inductor_dir)
+    _set_if_unset_or_unsafe("TRITON_CACHE_DIR", os.path.join(root, "triton"))
+    _set_if_unset_or_unsafe("CUDA_CACHE_PATH", os.path.join(root, "cuda_cache"))
+    _set_if_unset_or_unsafe("XDG_CACHE_HOME", os.path.join(root, "xdg"))
+
+    with contextlib.suppress(Exception):
+        import torch._inductor.config as _icfg
+
+        if hasattr(_icfg, "global_cache_dir"):
+            _icfg.global_cache_dir = os.environ.get("TORCHINDUCTOR_CACHE_DIR")
+        if hasattr(_icfg, "cache_dir"):
+            _icfg.cache_dir = os.environ.get("TORCHINDUCTOR_CACHE_DIR")
+    with contextlib.suppress(Exception):
+        import torch._inductor.codecache as _cc
+
+        if hasattr(_cc, "_cache_dir"):
+            _cc._cache_dir = os.environ.get("TORCHINDUCTOR_CACHE_DIR")
 
 try:
     from torch.distributed._composable.fsdp import fully_shard
