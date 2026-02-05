@@ -17,6 +17,8 @@ import random
 import re
 import shutil
 import socket
+import sys
+import platform
 import threading
 import time
 import warnings
@@ -2381,6 +2383,15 @@ class Checkpointer:
             self._rank = 0
             self._world = 1
 
+        self._small_host = False
+        with contextlib.suppress(Exception):
+            total_b = Memory.total()
+            self._small_host = bool(
+                isinstance(total_b, int)
+                and total_b > 0
+                and total_b <= (16 * 1024**3)
+            )
+
         self._local_rank = int(os.environ.get("LOCAL_RANK", "0") or 0)
         self._local_world = int(os.environ.get("LOCAL_WORLD_SIZE", "1") or 1)
         if self._local_world < 1:
@@ -2409,14 +2420,6 @@ class Checkpointer:
             except Exception:
                 self._dcp_process_group = None
                 self._dcp_should_participate = True
-
-        if self._dcp_process_group is None and device is not None and self._is_distributed():
-            try:
-                ag = get_accel_group(device)
-                if ag is not None:
-                    self._dcp_process_group = ag
-            except Exception:
-                pass
 
         self.dcp_root.mkdir(parents=True, exist_ok=True)
         try:
@@ -2448,6 +2451,136 @@ class Checkpointer:
 
     def _sync_device(self) -> str:
         return "cpu"
+
+    def _host_min_free_bytes(self) -> int:
+        raw = str(os.environ.get("ENN_DCP_HOST_MIN_FREE_MB", "") or "").strip()
+        if raw:
+            with contextlib.suppress(Exception):
+                return max(0, int(raw)) * 1024 * 1024
+
+        ratio = 0.25 if bool(getattr(self, "_small_host", False)) else 0.15
+        with contextlib.suppress(Exception):
+            ratio = float(os.environ.get("ENN_DCP_HOST_MIN_FREE_RATIO", ratio) or ratio)
+        ratio = max(0.05, min(0.50, float(ratio)))
+
+        cap_mb = 3072
+        with contextlib.suppress(Exception):
+            cap_mb = int(os.environ.get("ENN_DCP_HOST_MIN_FREE_MB_CAP", cap_mb) or cap_mb)
+        cap_mb = max(1024, int(cap_mb))
+
+        total_b = None
+        with contextlib.suppress(Exception):
+            total_b = Memory.total()
+        if isinstance(total_b, int) and total_b > 0:
+            total_mb = int(total_b // (1024 * 1024))
+            cand_mb = int(total_mb * ratio)
+            cand_mb = max(1024, min(int(cap_mb), int(cand_mb)))
+            return int(cand_mb) * 1024 * 1024
+
+        return 1024 * 1024 * 1024
+
+    def _host_under_pressure(self) -> bool:
+        avail = None
+        with contextlib.suppress(Exception):
+            avail = Memory.available()
+        if not avail or int(avail) <= 0:
+            return False
+        return int(avail) < int(self._host_min_free_bytes())
+
+    def _malloc_trim_best_effort(self) -> None:
+        sysname = str(platform.system() or "")
+        if sysname == "Linux":
+            with contextlib.suppress(Exception):
+                libc = ctypes.CDLL("libc.so.6")
+                trim = getattr(libc, "malloc_trim", None)
+                if callable(trim):
+                    trim(0)
+        elif sysname == "Windows":
+            with contextlib.suppress(Exception):
+                msvcrt = ctypes.CDLL("msvcrt.dll")
+                heapmin = getattr(msvcrt, "_heapmin", None)
+                if callable(heapmin):
+                    heapmin()
+        elif sysname == "Darwin":
+            with contextlib.suppress(Exception):
+                libsys = ctypes.CDLL("libsystem_malloc.dylib")
+                fn = getattr(libsys, "malloc_zone_pressure_relief", None)
+                if callable(fn):
+                    fn(None, 0)
+
+    def _drop_dir_page_cache(self, root: Path) -> None:
+        if not (
+            hasattr(os, "posix_fadvise") and hasattr(os, "POSIX_FADV_DONTNEED")
+        ):
+            return
+        try:
+            max_files = int(os.environ.get("ENN_DCP_FADVISE_MAX_FILES", "4096") or 4096)
+        except Exception:
+            max_files = 4096
+        max_files = max(64, int(max_files))
+        count = 0
+        for fp in root.rglob("*"):
+            if count >= max_files:
+                break
+            if not fp.is_file():
+                continue
+            fd = None
+            with contextlib.suppress(Exception):
+                fd = os.open(str(fp), os.O_RDONLY)
+            if fd is None:
+                continue
+            try:
+                with contextlib.suppress(Exception):
+                    os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+            finally:
+                with contextlib.suppress(Exception):
+                    os.close(fd)
+            count += 1
+
+    def _wait_for_host_budget(self) -> None:
+        if not bool(
+            env_bool(
+                "ENN_DCP_HOST_BUDGET",
+                default=bool(getattr(self, "_small_host", False)),
+            )
+        ):
+            return
+        min_free = int(self._host_min_free_bytes())
+        if min_free <= 0:
+            return
+        try:
+            timeout_s = float(
+                os.environ.get("ENN_DCP_HOST_BUDGET_WAIT_SEC", "30") or 30.0
+            )
+        except Exception:
+            timeout_s = 30.0
+        timeout_s = max(0.0, float(timeout_s))
+        sleep_s = 0.2
+        with contextlib.suppress(Exception):
+            sleep_s = float(
+                os.environ.get("ENN_DCP_HOST_BUDGET_SLEEP_S", sleep_s) or sleep_s
+            )
+        sleep_s = max(0.01, min(1.0, float(sleep_s)))
+        deadline = (time.monotonic() + timeout_s) if timeout_s > 0.0 else None
+        last_heavy = 0.0
+        while True:
+            avail = None
+            with contextlib.suppress(Exception):
+                avail = Memory.available()
+            if not avail or int(avail) <= 0:
+                return
+            if int(avail) >= min_free:
+                return
+            now = time.monotonic()
+            if now - last_heavy >= 5.0:
+                last_heavy = now
+                with contextlib.suppress(Exception):
+                    gc.collect()
+                with contextlib.suppress(Exception):
+                    self._malloc_trim_best_effort()
+            time.sleep(sleep_s)
+            if deadline is not None and time.monotonic() >= deadline:
+                return
 
     def _bcast_bool_from_leader(self, flag: bool) -> bool:
         if not self._is_distributed():
@@ -2949,46 +3082,12 @@ class Checkpointer:
             if callable(close_fn):
                 close_fn()
         self._close_stager()
-        pressure = False
-        try:
-            raw_min_free = str(
-                os.environ.get("ENN_DCP_HOST_MIN_FREE_MB", "") or ""
-            ).strip()
-            if raw_min_free:
-                min_free_mb = int(raw_min_free)
-            else:
-                ratio = 0.22
-                with contextlib.suppress(Exception):
-                    ratio = float(
-                        os.environ.get("ENN_DCP_HOST_MIN_FREE_RATIO", ratio)
-                        or ratio
-                    )
-                ratio = max(0.05, min(0.50, float(ratio)))
-                cap_mb = 3072
-                with contextlib.suppress(Exception):
-                    cap_mb = int(
-                        os.environ.get("ENN_DCP_HOST_MIN_FREE_MB_CAP", cap_mb)
-                        or cap_mb
-                    )
-                cap_mb = max(1024, int(cap_mb))
-                total_b = None
-                with contextlib.suppress(Exception):
-                    total_b = Memory.total()
-                if isinstance(total_b, int) and total_b > 0:
-                    total_mb = int(total_b // (1024 * 1024))
-                    min_free_mb = int(total_mb * ratio)
-                    min_free_mb = max(1024, min(int(cap_mb), int(min_free_mb)))
-                else:
-                    min_free_mb = 1024
-            if min_free_mb > 0:
-                avail = int(Memory.available())
-                pressure = (avail >= 0) and (avail < (min_free_mb * 1024 * 1024))
-        except Exception:
-            pressure = False
-
-        do_gc = bool(env_bool("ENN_DCP_GC_COLLECT", default=False)) or pressure
-        do_trim = bool(env_bool("ENN_DCP_MALLOC_TRIM", default=False)) or pressure
-        do_drop_cache = bool(env_bool("ENN_DCP_DROP_CACHE", default=False)) or pressure
+        host_pressure = bool(getattr(self, "_small_host", False)) or bool(self._host_under_pressure())
+        raw_gc = os.environ.get("ENN_DCP_GC_COLLECT", None)
+        raw_trim = os.environ.get("ENN_DCP_MALLOC_TRIM", None)
+        do_gc = bool(env_bool("ENN_DCP_GC_COLLECT", default=host_pressure)) if raw_gc is not None else bool(host_pressure)
+        do_trim = bool(env_bool("ENN_DCP_MALLOC_TRIM", default=host_pressure)) if raw_trim is not None else bool(host_pressure)
+        do_drop_cache = bool(env_bool("ENN_DCP_DROP_CACHE", default=False)) or host_pressure
 
         if not (do_gc or do_trim or (do_drop_cache and drop_dir is not None)):
             return
@@ -2997,27 +3096,7 @@ class Checkpointer:
                 gc.collect()
         if do_trim:
             with contextlib.suppress(Exception):
-                if os.name == "nt":
-                    for dll in ("msvcrt.dll", "ucrtbase.dll"):
-                        with contextlib.suppress(Exception):
-                            crt = ctypes.CDLL(dll)
-                            heapmin = getattr(crt, "_heapmin", None)
-                            if callable(heapmin):
-                                heapmin()
-                                break
-                else:
-                    libc_name = ctypes.util.find_library("c")
-                    if libc_name:
-                        libc = ctypes.CDLL(libc_name)
-                        trim = getattr(libc, "malloc_trim", None)
-                        if callable(trim):
-                            trim(0)
-                        else:
-                            relief = getattr(libc, "malloc_zone_pressure_relief", None)
-                            if callable(relief):
-                                relief.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
-                                relief.restype = ctypes.c_int
-                                relief(None, 0)
+                self._malloc_trim_best_effort()
 
         if do_drop_cache and drop_dir is not None:
             try:
@@ -3296,6 +3375,9 @@ class Checkpointer:
                 **(extra_meta or {}),
             }
             write_json(done_file, payload, indent=2)
+            if bool(getattr(self, "_small_host", False)) or bool(self._host_under_pressure()):
+                with contextlib.suppress(Exception):
+                    self._drop_dir_page_cache(epoch_dir)
         finally:
             with contextlib.suppress(Exception):
                 self._prune_dcp()
@@ -3315,6 +3397,9 @@ class Checkpointer:
                 return
             for p in epoch_dirs[: max(0, len(epoch_dirs) - self.keep_last)]:
                 try:
+                    with contextlib.suppress(Exception):
+                        if bool(getattr(self, "_small_host", False)) or bool(self._host_under_pressure()):
+                            self._drop_dir_page_cache(p)
                     _safe_rmtree(p)
                 except Exception as exc:
                     if env_bool("ENN_DCP_LOG_PRUNE", False):
@@ -3538,6 +3623,7 @@ class Checkpointer:
             from torch.distributed.checkpoint import FileSystemWriter
 
             epoch_dir.mkdir(parents=True, exist_ok=True)
+            self._wait_for_host_budget()
 
             save_opt = bool(optimizer is not None)
             if save_optimizer is not None:
@@ -3690,6 +3776,7 @@ class Checkpointer:
         epoch_i = int(epoch)
         epoch_dir = self._epoch_dir(epoch_i)
         epoch_dir.mkdir(parents=True, exist_ok=True)
+        self._wait_for_host_budget()
 
         pending_exc: Exception | None = None
         try:
