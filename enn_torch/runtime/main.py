@@ -310,6 +310,7 @@ def _export_return_model_pt(
         with contextlib.suppress(Exception):
             import shutil
 
+            os.makedirs(str(ckpt_dir), exist_ok=True)
             dst = os.path.join(str(ckpt_dir), "model.pt")
             shutil.copyfile(out_path, dst)
 
