@@ -358,6 +358,36 @@ class Sampler(torch.utils.data.Sampler):
         self._feat_dtype = f_dtype
         self._label_dtype = l_dtype
         self._feat_shape = torch.Size([self._N, fdim])
+        self._fadvise_tick = 0
+        self._fadvise_every = env_first_int(
+            ("ENN_MEMMAP_FADVISE_EVERY",), default=16
+        )
+        default_fadvise = False
+        if hasattr(os, "posix_fadvise") and hasattr(
+            os, "POSIX_FADV_DONTNEED"
+        ):
+            with suppress(Exception):
+                total_b = Memory.total()
+                if (
+                    isinstance(total_b, int)
+                    and total_b > 0
+                    and total_b <= 16 * 1024**3
+                ):
+                    default_fadvise = True
+        self._fadvise_enabled = env_bool(
+            "ENN_MEMMAP_FADVISE", default=default_fadvise
+        )
+        self._feat_row_bytes = int(fdim) * int(
+            torch.tensor([], dtype=f_dtype).element_size()
+        )
+        self._label_row_bytes = 0
+        if lshape_meta:
+            _row_elems = 1
+            for _d in lshape_meta:
+                _row_elems *= max(1, int(_d))
+            self._label_row_bytes = int(_row_elems) * int(
+                torch.tensor([], dtype=l_dtype).element_size()
+            )
         if MemoryMappedTensor is None:
             raise ImportError(
                 "tensordict is required for MemoryMappedTensor-backed pipelines. "
@@ -590,7 +620,65 @@ class Sampler(torch.utils.data.Sampler):
                 y = y.reshape(end - start, *self._label_shape)
             yt = y if isinstance(y, torch.Tensor) else torch.as_tensor(y)
             out["Y"] = yt
+        with suppress(Exception):
+            self._maybe_fadvise_dontneed(start, end)
         return out
+
+    def _maybe_fadvise_dontneed(self: Self, start: int, end: int) -> None:
+        if not bool(getattr(self, "_fadvise_enabled", False)):
+            return
+        if not (
+            hasattr(os, "posix_fadvise")
+            and hasattr(os, "POSIX_FADV_DONTNEED")
+        ):
+            return
+        try:
+            every = int(getattr(self, "_fadvise_every", 16) or 16)
+        except Exception:
+            every = 16
+        every = max(1, int(every))
+        try:
+            self._fadvise_tick = (
+                int(getattr(self, "_fadvise_tick", 0) or 0) + 1
+            )
+        except Exception:
+            self._fadvise_tick = 1
+        if (int(self._fadvise_tick) % int(every)) != 0:
+            return
+        n = max(0, int(end) - int(start))
+        if n <= 0:
+            return
+
+        def _advise(path: str | None, row_bytes: int) -> None:
+            if not path or row_bytes <= 0:
+                return
+            off = int(start) * int(row_bytes)
+            length = int(n) * int(row_bytes)
+            if length <= 0:
+                return
+            if length > (1 << 30):
+                length = 1 << 30
+            fd = None
+            try:
+                fd = os.open(str(path), os.O_RDONLY)
+                os.posix_fadvise(
+                    fd, int(off), int(length), os.POSIX_FADV_DONTNEED
+                )
+            finally:
+                if fd is not None:
+                    with suppress(Exception):
+                        os.close(fd)
+
+        with suppress(Exception):
+            _advise(
+                getattr(self, "_feat_path", None),
+                int(getattr(self, "_feat_row_bytes", 0) or 0),
+            )
+        with suppress(Exception):
+            _advise(
+                getattr(self, "_lab_path", None),
+                int(getattr(self, "_label_row_bytes", 0) or 0),
+            )
 
     def _gather(
         self: Self, idx_tensor: torch.Tensor, features: Any, labels: Any

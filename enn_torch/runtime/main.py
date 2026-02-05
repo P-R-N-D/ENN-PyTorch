@@ -1376,7 +1376,7 @@ def epochs(
                                         if raw_min_free:
                                             with contextlib.suppress(Exception):
                                                 min_free_mb = int(raw_min_free)
-                                        ratio = 0.25
+                                        ratio = 0.30
                                         with contextlib.suppress(Exception):
                                             ratio = float(
                                                 os.environ.get(
@@ -1386,7 +1386,7 @@ def epochs(
                                                 or ratio
                                             )
                                         ratio = max(0.05, min(0.50, float(ratio)))
-                                        cap_mb = 3072
+                                        cap_mb = 4096
                                         with contextlib.suppress(Exception):
                                             cap_mb = int(
                                                 os.environ.get(
