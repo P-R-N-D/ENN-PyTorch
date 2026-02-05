@@ -1,8 +1,26 @@
 # ENN-PyTorch
+> ENN (Elastic Neural Networks) — fabric model for High-Performance Computing (HPC), which supports a pluggable submodel interface, integrated with automated workflows for training, inference, and deployment export
 
-Elastic Neural Networks (ENN), MLOps framework for high-performance computing (HPC) — flexible and efficient by design, adaptive and stable at runtime, implemented in PyTorch. This features pragmatic utilities for data pipelines, training, export, and system tuning. The package is structured to keep the *model code* small while providing a clean façade over configuration, I/O, distributed runtime, and export helpers.
+ENN-PyTorch standardizes the end-to-end pipeline—configuration, data/I/O, elastic distributed execution, checkpointing,
+and export to deployment artifacts (ONNX/ORT/torch.export). The workflow layer automates training, inference, and artifact
+saving, so you can iterate on modeling without rebuilding the surrounding runtime.
+
+The repository includes an optional reference ENN model stack built from RetNet-based blocks for spatio-temporal modeling:
+here, *temporal* refers to order-sensitive sequence dependencies (permutation-like), while *spatial* refers to combination-style
+interactions across fields/entities/positions (not literal geometric coordinates).
+It provides templated tasks and Perceiver-style fusion with conservative defaults. For domain-specific needs, you can attach custom
+`torch.nn.Module` components via BYOM (Bring Your Own Model) and compose task templates into a DAG-structured task graph
+(Directed Acyclic Graph), while keeping the same integrated train/infer/export interface. BYOM components are intentionally kept out
+of checkpoints, so training weights remain portable across iterative model-side changes.
 
 This repository also includes a worked example notebook (`notebook.ipynb`) and a sample data (`raw_data.xlsx`) demonstrating a tabular‑to‑grid regression workflow.
+
+## License
+
+**Source code** is licensed under the **PolyForm Noncommercial License 1.0.0** (see `LICENSE`).  
+**Weights, datasets, and other artifacts** may be licensed separately.
+
+For commercial use, please contact the **copyright holder** to obtain a separate **commercial license**.
 
 ## Requirements
 
@@ -343,8 +361,3 @@ to reduce "almost-right" config bugs:
 - `tensordict` provides TensorDict integration and memory-mapped tensor utilities.
 - `triton` ≥ 3.5.1 is necessary.
 - Export backends (TensorRT/CoreML/ExecuTorch/ORT) have additional system requirements; install only what you need.
-
-## License
-
-**Code** is licensed under **PolyForm Noncommercial 1.0.0**.  
-**Weights/datasets/other artifacts** remain under the terms described in your `LICENSE` file. For commercial use, obtain a separate license
