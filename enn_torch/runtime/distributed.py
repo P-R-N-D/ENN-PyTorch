@@ -541,9 +541,6 @@ def get_accel_group(
 def get_control_process_group(pg: ProcessGroup | None = None) -> ProcessGroup | None:
     if not is_distributed():
         return None
-    cpg = get_cpu_group()
-    if cpg is not None:
-        return cpg
     if pg is not None:
         try:
             p_be = str(dist.get_backend(pg)).lower()
@@ -551,6 +548,10 @@ def get_control_process_group(pg: ProcessGroup | None = None) -> ProcessGroup | 
                 return pg
         except Exception:
             pass
+        return None
+    cpg = get_cpu_group()
+    if cpg is not None:
+        return cpg
     try:
         w_be = str(dist.get_backend(dist.group.WORLD)).lower()
         if (w_be == "gloo") or ("cpu:gloo" in w_be):
@@ -1255,7 +1256,11 @@ def broadcast_scalar(
         return ag or default_pg
 
     if lane_s in {"control", "cpu", "gloo"}:
-        cpg = get_cpu_group() or get_control_process_group(pg_in)
+        cpg = (
+            get_control_process_group(pg_in)
+            if pg_in is not None
+            else (get_cpu_group() or get_control_process_group(None))
+        )
         cpu_exc: Exception | None = None
         if cpg is not None:
             try:
@@ -1365,7 +1370,11 @@ def distributed_barrier(
         return ag or default_pg
 
     if lane_s in {"control", "cpu", "gloo"}:
-        cpg = get_cpu_group() or get_control_process_group(pg_in)
+        cpg = (
+            get_control_process_group(pg_in)
+            if pg_in is not None
+            else (get_cpu_group() or get_control_process_group(None))
+        )
         if cpg is not None:
             try:
                 t = torch.zeros((1,), device="cpu", dtype=torch.int32)
