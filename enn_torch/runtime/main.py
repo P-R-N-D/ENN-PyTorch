@@ -251,7 +251,19 @@ def _export_return_model_pt(
         fn = getattr(swa_helper, "checkpoint_state_dict", None)
         if callable(fn):
             with contextlib.suppress(Exception):
-                avg_params = fn(model, include_buffers=False)
+                raw = fn(model, include_buffers=False)
+                if isinstance(raw, dict) and raw:
+                    avg_params = {}
+                    with torch.no_grad():
+                        for name, v in raw.items():
+                            if not torch.is_tensor(v):
+                                continue
+                            t = v.detach()
+                            if getattr(t, "is_meta", False) or t.device.type == "meta":
+                                continue
+                            if t.device.type != "cpu":
+                                t = t.to("cpu")
+                            avg_params[str(name)] = t
     if avg_params is None and ema_helper is not None:
         shadow = getattr(ema_helper, "shadow", None)
         if isinstance(shadow, dict) and shadow:
