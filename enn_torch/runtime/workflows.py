@@ -379,17 +379,21 @@ def _save_model_checkpoint(
         return None
     os.makedirs(out_dir, exist_ok=True)
     if save_dcp:
+        dcp_cpu_offload = env_bool("ENN_DCP_CPU_OFFLOAD", default=False)
+        dcp_sync_files = env_bool("ENN_DCP_SYNC_FILES", default=True)
         with _filtered_warnings():
             m_sd = get_model_state_dict(
                 model,
                 options=StateDictOptions(
-                    full_state_dict=True, cpu_offload=True
+                    full_state_dict=True, cpu_offload=bool(dcp_cpu_offload)
                 ),
             )
             save(
                 state_dict={"model": m_sd},
                 storage_writer=FileSystemWriter(
-                    out_dir, sync_files=True, overwrite=bool(overwrite)
+                    out_dir,
+                    sync_files=bool(dcp_sync_files),
+                    overwrite=bool(overwrite),
                 ),
             )
     if save_pt:
