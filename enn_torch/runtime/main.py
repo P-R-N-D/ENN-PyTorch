@@ -367,14 +367,18 @@ def _export_return_model_pt(
         return
     os.makedirs(out_dir, exist_ok=True)
 
-    env_ma = os.environ.get("ENN_MODEL_AVERAGING", None)
-    if env_ma is not None:
-        model_averaging = env_ma
     model_averaging = _normalize_model_averaging(
         model_averaging, default="auto"
     )
     if model_averaging == "auto":
-        model_averaging = "ema" if _has_bn_modules(model) else "swa"
+        env_ma = os.environ.get("ENN_MODEL_AVERAGING", None)
+        if env_ma is not None:
+            with contextlib.suppress(Exception):
+                model_averaging = _normalize_model_averaging(
+                    env_ma, default="auto"
+                )
+        if model_averaging == "auto":
+            model_averaging = "ema" if _has_bn_modules(model) else "swa"
 
     try:
         p0 = next((p for p in model.parameters() if torch.is_tensor(p)), None)
@@ -3219,7 +3223,11 @@ def process(*args: Any, **kwargs: Any) -> object:
 
     if not args:
         raise TypeError("process requires at least a RuntimeConfig argument")
-    model_averaging = kwargs.pop("model_averaging", "auto")
+    _MA_SENTINEL = object()
+    model_averaging = kwargs.pop("model_averaging", _MA_SENTINEL)
+    model_averaging_provided = model_averaging is not _MA_SENTINEL
+    if not model_averaging_provided:
+        model_averaging = "auto"
     if kwargs:
         raise TypeError(
             f"process got unexpected keyword arguments: {', '.join(sorted(kwargs))}"
@@ -3241,9 +3249,20 @@ def process(*args: Any, **kwargs: Any) -> object:
         raise TypeError(
             "process expects (RuntimeConfig,), (RuntimeConfig, ret_sink), (local_rank, RuntimeConfig), or (local_rank, RuntimeConfig, ret_sink) arguments"
         )
-    env_ma = os.environ.get("ENN_MODEL_AVERAGING", None)
-    if env_ma is not None:
-        model_averaging = env_ma
+    use_env = False
+    try:
+        if not model_averaging_provided:
+            use_env = True
+        else:
+            use_env = (
+                _normalize_model_averaging(model_averaging, default="auto") == "auto"
+            )
+    except Exception:
+        use_env = False
+    if use_env:
+        env_ma = os.environ.get("ENN_MODEL_AVERAGING", None)
+        if env_ma is not None:
+            model_averaging = env_ma
     try:
         if int(local_rank) == 0 and getattr(ops, "ckpt_dir", None):
             _mark_ephemeral_ckpt_dir(str(ops.ckpt_dir))

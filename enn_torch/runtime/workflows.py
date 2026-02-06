@@ -1313,11 +1313,24 @@ def train(
     num_samples_dataset = 0
     first_in_dim = None
     label_shape = ()
+    _prev_env_model_averaging = os.environ.get("ENN_MODEL_AVERAGING", None)
     try:
-        if os.environ.get("ENN_MODEL_AVERAGING", None) is None:
-            os.environ["ENN_MODEL_AVERAGING"] = (
-                "none" if model_averaging is None else str(model_averaging)
+        try:
+            _ma_txt = (
+                str(model_averaging).strip() if model_averaging is not None else None
             )
+        except Exception:
+            _ma_txt = None
+        if model_averaging is None:
+            os.environ["ENN_MODEL_AVERAGING"] = "none"
+        elif (
+            _ma_txt is not None
+            and _ma_txt.lower() == "auto"
+            and _prev_env_model_averaging is not None
+        ):
+            pass
+        else:
+            os.environ["ENN_MODEL_AVERAGING"] = str(model_averaging)
         datasets, manifest = iter_dataset(data)
         for key, d in datasets:
             sub = os.path.join(memmap_dir, key) if manifest else memmap_dir
@@ -1572,6 +1585,13 @@ def train(
             )
         return model
     finally:
+        try:
+            if _prev_env_model_averaging is None:
+                os.environ.pop("ENN_MODEL_AVERAGING", None)
+            else:
+                os.environ["ENN_MODEL_AVERAGING"] = _prev_env_model_averaging
+        except Exception:
+            pass
         restore_path: str | None = None
         with contextlib.suppress(Exception):
             for _name in ("model.pt",):
