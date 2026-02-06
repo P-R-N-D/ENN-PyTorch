@@ -306,7 +306,7 @@ def main() -> None:
         temporal_depth=2,
         spatial_latents=32,
         temporal_latents=32,
-        modeling_type="spatiotemporal",
+        preset="spatiotemporal",
         compile_mode="disabled",
     )
     model = new_model(

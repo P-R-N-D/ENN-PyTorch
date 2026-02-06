@@ -51,7 +51,7 @@ For commercial use, please contact the **copyright holder** to obtain a separate
 
 ## Features
 - **APIs** (`enn_torch.runtime.workflows`): build/load models, elastic train/predict entrypoints (uses `torch.distributed.elastic`), and checkpoint/export helpers.
-- **Templated configurations** (`enn_torch.core.config`): dataclass configs with coercion/validation and string canonicalizers for modeling type, normalization, and compile options.
+- **Templated configurations** (`enn_torch.core.config`): dataclass configs with coercion/validation and string canonicalizers for preset, normalization, and compile options.
 - **Neural network stacks** (`enn_torch.nn`): spatio-temporal Fuser/Collector blocks (Template tasks + Perceiver resampler), attention variants, scaler + recorder modules, AMP negotiation guard band (`ModelConfig.safety_margin_pow2`).
 - **Data pipeline** (`enn_torch.data`): `torchdata.nodes`-driven memmap pipeline with TensorDict support, prefetch/pin/pool options, and scale-aware dataset metadata.
 - **Runnable tasks** (`enn_torch.runtime`): thread/NUMA tuning, free-threaded/no-GIL optimizations, mixed-precision helpers, history recorder, and OOM recovery hooks (see `enn_torch.runtime.autobatch`). ONNX/ORT/onnxscript/onnx_ir/torch.export (PT2) out of the box; optional platform-dependent backends (TensorRT/CoreML/ExecuTorch/onnx-tf) via extras. elastic launch wiring and group setup for multi-process CPU/GPU runs.
@@ -300,8 +300,8 @@ enn_torch/
 `enn_torch.core.config.coerce_model_config()` normalizes common separator variants in a few string fields
 to reduce "almost-right" config bugs:
 
-- `modeling_type`: canonical values `{ss, tt, st}`.
-  - Examples accepted: `spatial`, `temporal`, `spatiotemporal`, `spatio-temporal`, `spatio_temporal`, `temporal-spatial`, …
+- `preset`: canonical values `{spatial, temporal, spatiotemporal}` (or `None` to start with no tasks).
+  - Examples accepted: `ss`, `tt`, `st`, `spatial`, `temporal`, `spatiotemporal`, `spatio-temporal`, `spatio_temporal`, `temporal-spatial`, …
 - `normalization_method`: canonical values `layernorm`, `batchnorm`, `rmsnorm`.
   - Examples accepted: `ln`, `layer_norm`, `layer-norm`, `bn`, `batch_norm`, `rms_norm`, …
 - `compile_mode`: canonical values `disabled` (default), `reduce-overhead` (alias: `stable`),

@@ -74,6 +74,27 @@ def _coerce_model_averaging(
     )
 
 
+def _coerce_preset(
+    value: Any, *args: Any, name: str = "preset"
+) -> Optional[str]:
+    _ = args
+    if value is None:
+        return None
+    if isinstance(value, str):
+        s = value.strip().lower()
+        if s in ("none", "null", "off", "false", "0", ""):
+            return None
+        key = s.replace("_", "-").replace(" ", "-")
+        if key in ("ss", "spatial", "sxs"):
+            return "spatial"
+        if key in ("tt", "temporal", "txt"):
+            return "temporal"
+        if any(x in key for x in ("st", "ts", "spatial", "temporal")):
+            return "spatiotemporal"
+    raise ValueError(
+        f"{name} must be one of None|'spatial'|'temporal'|'spatiotemporal' (got {value!r})"
+    )
+
 def _coerce_bool(value: Any, *args: Any, name: str, **kwargs: Any) -> bool:
     if isinstance(value, bool):
         return value
@@ -482,19 +503,14 @@ def coerce_model_config(
         normalization_method = "batchnorm"
     elif norm_key in ("rms", "rmsnorm"):
         normalization_method = "rmsnorm"
-    modeling_type = _coerce_str(
-        get("modeling_type", _MODEL_DEFAULTS.modeling_type),
-        "modeling_type",
-        _MODEL_DEFAULTS.modeling_type,
-        lower=True,
-    )
-    mt_key = modeling_type.replace("_", "-").replace(" ", "-")
-    if mt_key in ("ss", "spatial", "sxs"):
-        modeling_type = "ss"
-    elif mt_key in ("tt", "temporal", "txt"):
-        modeling_type = "tt"
-    elif any(x in mt_key for x in ("st", "ts", "spatial", "temporal")):
-        modeling_type = "st"
+    if "preset" in data:
+        preset_raw = data.get("preset")
+    else:
+        preset_raw = data.get(
+            "modeling_type",
+            getattr(_MODEL_DEFAULTS, "preset", "spatiotemporal"),
+        )
+    preset = _coerce_preset(preset_raw, name="preset")
     compile_mode = canonicalize_compile_mode(
         _coerce_str(
             get("compile_mode", _MODEL_DEFAULTS.compile_mode),
@@ -579,7 +595,7 @@ def coerce_model_config(
         {
             "device": device,
             "normalization_method": normalization_method,
-            "modeling_type": modeling_type,
+            "preset": preset,
             "patch": patch_cfg,
             "compile_mode": compile_mode,
             "delta_gate_tile_shape": delta_gate_tile_shape,
@@ -716,7 +732,7 @@ class ModelConfig:
     drop_path: float = 0.0
     spatial_latents: int = 64
     temporal_latents: int = 64
-    modeling_type: str = "spatiotemporal"
+    preset: Optional[str] = "spatiotemporal"
     fuser_depth: Optional[int] = None
     fuser_self_attn_layers: int = 1
     stream_task_id: Optional[str] = None
