@@ -1290,7 +1290,7 @@ def train(
     loss_mask_value: float | None = None,
     export_path: PathLike | None = None,
     export_overwrite: bool = True,
-    model_averaging: str | None = "auto",
+    model_averaging: Optional[str] = "auto",
     **kwargs: Any,
 ) -> Model:
     ProcessBroker.bootstrap()
@@ -1424,6 +1424,7 @@ def train(
             "loss_tile_size": loss_tile_size,
             "loss_mask_mode": loss_mask_mode,
             "loss_mask_value": loss_mask_value,
+            "model_averaging": model_averaging,
         }
         for key in RuntimeConfig.TRAIN_POS_ORDER[: len(args)]:
             default_kwargs.pop(key, None)
@@ -1456,7 +1457,7 @@ def train(
 
         _clear_device_caches()
         with _start_context():
-            elastic_launch(lc, process)(ops, model_averaging=model_averaging)
+            elastic_launch(lc, process)(ops)
         fallback: str | None = None
         ret_dir = os.environ.get("ENN_RETURN_DIR") or ""
         for fname in ("model.pt",):

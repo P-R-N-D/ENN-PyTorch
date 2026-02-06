@@ -804,6 +804,7 @@ class RuntimeConfig:
     loss_tile_size: Optional[int] = None
     loss_mask_mode: str = "none"
     loss_mask_value: Optional[float] = None
+    model_averaging: Optional[str] = "auto"
     model_ckpt_dir: Optional[str] = None
     keys: Optional[Sequence[Any]] = None
     loss_skew: bool = True
@@ -833,6 +834,7 @@ class RuntimeConfig:
             "loss_mask_mode",
             "loss_mask_value",
             "loss_skew",
+            "model_averaging",
         }
     )
     _PRED_KEYS: ClassVar[frozenset[str]] = _COMMON_KEYS | frozenset(
@@ -1016,6 +1018,7 @@ class RuntimeConfig:
                 loss_skew=_coerce_bool(
                     data.get("loss_skew", True), name="loss_skew"
                 ),
+                model_averaging=data.get("model_averaging", "auto"),
             )
         for k in ("sources", "ckpt_dir"):
             if k not in data or data[k] is None:

@@ -3270,11 +3270,15 @@ def process(*args: Any, **kwargs: Any) -> object:
             + ", ".join(type(x).__name__ for x in extras)
         )
 
+    ops_model_averaging = getattr(ops, "model_averaging", _MA_SENTINEL)
     if kw_model_averaging is not _MA_SENTINEL:
         model_averaging = kw_model_averaging
         model_averaging_provided = True
     elif pos_model_averaging is not _MA_SENTINEL:
         model_averaging = pos_model_averaging
+        model_averaging_provided = True
+    elif ops_model_averaging is not _MA_SENTINEL:
+        model_averaging = ops_model_averaging
         model_averaging_provided = True
     else:
         model_averaging = "auto"
