@@ -169,6 +169,21 @@ def _torch_load_checkpoint(
             load_kwargs.pop("mmap", None)
             return torch.load(str(path), *load_args, **load_kwargs)
     except Exception as exc:
+        if load_kwargs.get("mmap") is True:
+            retry_kwargs = dict(load_kwargs)
+            try:
+                retry_kwargs["mmap"] = False
+                return torch.load(str(path), *load_args, **retry_kwargs)
+            except TypeError:
+                retry_kwargs.pop("mmap", None)
+                try:
+                    return torch.load(str(path), *load_args, **retry_kwargs)
+                except Exception:
+                    pass
+            except Exception:
+                retry_kwargs.pop("mmap", None)
+                with contextlib.suppress(Exception):
+                    return torch.load(str(path), *load_args, **retry_kwargs)
         if weights_only:
             raise RuntimeError("weights_only=True failed") from exc
         raise

@@ -1313,24 +1313,7 @@ def train(
     num_samples_dataset = 0
     first_in_dim = None
     label_shape = ()
-    _prev_env_model_averaging = os.environ.get("ENN_MODEL_AVERAGING", None)
     try:
-        try:
-            _ma_txt = (
-                str(model_averaging).strip() if model_averaging is not None else None
-            )
-        except Exception:
-            _ma_txt = None
-        if model_averaging is None:
-            os.environ["ENN_MODEL_AVERAGING"] = "none"
-        elif (
-            _ma_txt is not None
-            and _ma_txt.lower() == "auto"
-            and _prev_env_model_averaging is not None
-        ):
-            pass
-        else:
-            os.environ["ENN_MODEL_AVERAGING"] = str(model_averaging)
         datasets, manifest = iter_dataset(data)
         for key, d in datasets:
             sub = os.path.join(memmap_dir, key) if manifest else memmap_dir
@@ -1508,6 +1491,26 @@ def train(
                         if name.endswith(".tmp") and "model.pt" in name:
                             with contextlib.suppress(Exception):
                                 os.remove(os.path.join(d, name))
+            _update_history(model, ckpt_dir, epochs, val_frac, num_samples_dataset)
+            if export_path is not None and isinstance(model, torch.nn.Module):
+                export_meta: dict[str, Any] = {
+                    "format": "enn-export-safetensors-v1",
+                    "created_time": float(time.time()),
+                    "run_id": str(run_id),
+                    "in_dim": int(first_in_dim) if first_in_dim is not None else None,
+                    "out_shape": list(int(x) for x in (label_shape or ())),
+                    "config": cfg_dict if isinstance(cfg_dict, dict) else None,
+                }
+                with contextlib.suppress(Exception):
+                    tasks = getattr(model, "tasks", None)
+                    if tasks is not None:
+                        export_meta["tasks"] = tasks
+                export_safetensors_single(
+                    model,
+                    export_path,
+                    meta=export_meta,
+                    overwrite=bool(export_overwrite),
+                )
             cleanup = os.environ.get("ENN_CKPT_CLEANUP_ON_SUCCESS", "1")
             do_cleanup = cleanup.strip().lower() not in (
                 "0",
@@ -1585,13 +1588,6 @@ def train(
             )
         return model
     finally:
-        try:
-            if _prev_env_model_averaging is None:
-                os.environ.pop("ENN_MODEL_AVERAGING", None)
-            else:
-                os.environ["ENN_MODEL_AVERAGING"] = _prev_env_model_averaging
-        except Exception:
-            pass
         restore_path: str | None = None
         with contextlib.suppress(Exception):
             for _name in ("model.pt",):

@@ -21,7 +21,7 @@ from collections.abc import Mapping, MutableMapping
 from dataclasses import replace
 from functools import partial
 from pathlib import Path
-from typing import Any, TypeAlias, overload
+from typing import Any, TypeAlias
 
 import torch
 import torch.distributed
@@ -2507,6 +2507,17 @@ def epochs(
                             str(ops.ckpt_dir), "history.json"
                         )
                         collate.write_json(hist_path, hist.save(), indent=2)
+                        ret_dir = os.environ.get("ENN_RETURN_DIR") or ""
+                        if ret_dir and str(ret_dir) != str(ops.ckpt_dir):
+                            try:
+                                os.makedirs(ret_dir, exist_ok=True)
+                                collate.write_json(
+                                    os.path.join(ret_dir, "history.json"),
+                                    hist.save(),
+                                    indent=2,
+                                )
+                            except Exception:
+                                pass
                 except Exception:
                     pass
             except Exception:
@@ -3205,50 +3216,59 @@ def infer(
     return None
 
 
-@overload
-def process(
-    ops: RuntimeConfig, ret_sink: ReturnSink | None = None
-) -> object: ...
-
-
-@overload
-def process(
-    local_rank: int, ops: RuntimeConfig, ret_sink: ReturnSink | None = None
-) -> object: ...
-
-
-@worker_main
+@worker_main()
 def process(*args: Any, **kwargs: Any) -> object:
     from ..data.pipeline import Session
 
     if not args:
         raise TypeError("process requires at least a RuntimeConfig argument")
     _MA_SENTINEL = object()
-    model_averaging = kwargs.pop("model_averaging", _MA_SENTINEL)
-    model_averaging_provided = model_averaging is not _MA_SENTINEL
-    if not model_averaging_provided:
-        model_averaging = "auto"
+    kw_model_averaging = kwargs.pop("model_averaging", _MA_SENTINEL)
     if kwargs:
         raise TypeError(
             f"process got unexpected keyword arguments: {', '.join(sorted(kwargs))}"
         )
     init_python_path()
     _validate_compile_safe()
-    ret_sink = None
+    ret_sink: ReturnSink | None = None
+    pos_model_averaging = _MA_SENTINEL
+    tail: tuple[Any, ...]
     if isinstance(args[0], RuntimeConfig):
         ops = args[0]
         local_rank = env_int("LOCAL_RANK", 0)
-        if len(args) >= 2:
-            ret_sink = args[1]
+        tail = tuple(args[1:])
     elif len(args) >= 2 and isinstance(args[1], RuntimeConfig):
         local_rank = int(args[0])
         ops = args[1]
-        if len(args) >= 3:
-            ret_sink = args[2]
+        tail = tuple(args[2:])
     else:
         raise TypeError(
             "process expects (RuntimeConfig,), (RuntimeConfig, ret_sink), (local_rank, RuntimeConfig), or (local_rank, RuntimeConfig, ret_sink) arguments"
         )
+    extras: list[Any] = []
+    for v in tail:
+        if ret_sink is None and isinstance(v, MutableMapping):
+            ret_sink = v
+            continue
+        if pos_model_averaging is _MA_SENTINEL and (v is None or isinstance(v, str)):
+            pos_model_averaging = v
+            continue
+        extras.append(v)
+    if extras:
+        raise TypeError(
+            "process got unexpected positional arguments: "
+            + ", ".join(type(x).__name__ for x in extras)
+        )
+
+    if kw_model_averaging is not _MA_SENTINEL:
+        model_averaging = kw_model_averaging
+        model_averaging_provided = True
+    elif pos_model_averaging is not _MA_SENTINEL:
+        model_averaging = pos_model_averaging
+        model_averaging_provided = True
+    else:
+        model_averaging = "auto"
+        model_averaging_provided = False
     use_env = False
     try:
         if not model_averaging_provided:
