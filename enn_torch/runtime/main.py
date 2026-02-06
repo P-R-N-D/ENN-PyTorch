@@ -3224,6 +3224,7 @@ def process(*args: Any, **kwargs: Any) -> object:
         raise TypeError("process requires at least a RuntimeConfig argument")
     _MA_SENTINEL = object()
     kw_model_averaging = kwargs.pop("model_averaging", _MA_SENTINEL)
+    kw_ret_sink = kwargs.pop("ret_sink", _MA_SENTINEL)
     if kwargs:
         raise TypeError(
             f"process got unexpected keyword arguments: {', '.join(sorted(kwargs))}"
@@ -3231,6 +3232,12 @@ def process(*args: Any, **kwargs: Any) -> object:
     init_python_path()
     _validate_compile_safe()
     ret_sink: ReturnSink | None = None
+    if kw_ret_sink is not _MA_SENTINEL:
+        if not isinstance(kw_ret_sink, MutableMapping):
+            raise TypeError(
+                f"process ret_sink must be a mutable mapping, got {type(kw_ret_sink).__name__}"
+            )
+        ret_sink = kw_ret_sink
     pos_model_averaging = _MA_SENTINEL
     tail: tuple[Any, ...]
     if isinstance(args[0], RuntimeConfig):
@@ -3247,8 +3254,11 @@ def process(*args: Any, **kwargs: Any) -> object:
         )
     extras: list[Any] = []
     for v in tail:
-        if ret_sink is None and isinstance(v, MutableMapping):
-            ret_sink = v
+        if isinstance(v, MutableMapping):
+            if ret_sink is None:
+                ret_sink = v
+                continue
+            extras.append(v)
             continue
         if pos_model_averaging is _MA_SENTINEL and (v is None or isinstance(v, str)):
             pos_model_averaging = v
