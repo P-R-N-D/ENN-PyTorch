@@ -72,11 +72,19 @@ def _is_tmpfs_path(path: str) -> bool:
 def _pick_disk_cache_base() -> str | None:
     for key in ("ENN_TEMP_DIR", "ENN_TMPDIR"):
         v = os.environ.get(key)
+        if v:
+            v = str(v).strip()
         if v and os.path.isdir(v) and os.access(v, os.W_OK) and (not _is_tmpfs_path(v)):
             return v
     for key in ("TMPDIR", "TEMP", "TMP"):
         v = os.environ.get(key)
-        if v and os.path.isdir(v) and os.access(v, os.W_OK) and (not _is_tmpfs_path(v)):
+        if not v:
+            continue
+        v = str(v).strip()
+        vv = v.rstrip("/")
+        if vv == "/tmp" or vv.startswith("/tmp/"):
+            continue
+        if os.path.isdir(v) and os.access(v, os.W_OK) and (not _is_tmpfs_path(v)):
             return v
     for cand in ("/var/tmp",):
         if os.path.isdir(cand) and os.access(cand, os.W_OK) and (not _is_tmpfs_path(cand)):
@@ -87,7 +95,7 @@ def _pick_disk_cache_base() -> str | None:
             return cwd
     except Exception:
         pass
-    if os.path.isdir("/tmp") and os.access("/tmp", os.W_OK):
+    if os.path.isdir("/tmp") and os.access("/tmp", os.W_OK) and (not _is_tmpfs_path("/tmp")):
         return "/tmp"
     return None
 
@@ -127,6 +135,8 @@ def _ensure_disk_cache_env() -> None:
             if cur.startswith("/var/colab/") or cur.startswith("/dev/shm/"):
                 return True
         if key in {"TMPDIR", "TEMP", "TMP"}:
+            if cur.startswith("/tmp/") or cur == "/tmp":
+                return True
             if cur.startswith("/var/colab/") or cur.startswith("/dev/shm/"):
                 return True
         return False
@@ -174,6 +184,9 @@ def _ensure_disk_cache_env() -> None:
 
         if hasattr(_cc, "_cache_dir"):
             _cc._cache_dir = os.environ.get("TORCHINDUCTOR_CACHE_DIR")
+
+with contextlib.suppress(Exception):
+    _ensure_disk_cache_env()
 
 try:
     from torch.distributed._composable.fsdp import fully_shard
