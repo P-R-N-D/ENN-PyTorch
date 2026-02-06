@@ -57,6 +57,23 @@ def _coerce_str(
     return (s.lower() if lower else s) or default
 
 
+def _coerce_model_averaging(
+    value: Any, *args: Any, name: str = "model_averaging"
+) -> Optional[str]:
+    _ = args
+    if value is None:
+        return None
+    if isinstance(value, str):
+        s = value.strip().lower()
+        if s in ("auto", "ema", "swa"):
+            return s
+        if s in ("none", "null", "off", "false", "0", ""):
+            return None
+    raise ValueError(
+        f"{name} must be one of None|'auto'|'ema'|'swa' (got {value!r})"
+    )
+
+
 def _coerce_bool(value: Any, *args: Any, name: str, **kwargs: Any) -> bool:
     if isinstance(value, bool):
         return value
@@ -842,6 +859,7 @@ class RuntimeConfig:
             "sources",
             "ckpt_dir",
             "model_ckpt_dir",
+            "model_averaging",
             "keys",
             "seed",
             "shuffle",
@@ -914,6 +932,12 @@ class RuntimeConfig:
             def_: Any = None,
         ) -> Any:
             return _coerce_num(data.get(key, def_), typ, key, min, max)
+
+        extra: Dict[str, Any] = {}
+        if "model_averaging" in data:
+            extra["model_averaging"] = _coerce_model_averaging(
+                data.get("model_averaging"), name="model_averaging"
+            )
 
         if mode_norm == "train":
             for k in ("sources", "ckpt_dir"):
@@ -1018,7 +1042,7 @@ class RuntimeConfig:
                 loss_skew=_coerce_bool(
                     data.get("loss_skew", True), name="loss_skew"
                 ),
-                model_averaging=data.get("model_averaging", "auto"),
+                **extra,
             )
         for k in ("sources", "ckpt_dir"):
             if k not in data or data[k] is None:
@@ -1058,4 +1082,5 @@ class RuntimeConfig:
                 if src_n > 1
                 else None
             ),
+            **extra,
         )
