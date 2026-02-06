@@ -1175,6 +1175,22 @@ class StochasticWeightAverage(nn.Module):
         with self.reduction(self._model):
             update_bn(dataloader, self._model, device=device)
 
+    def apply_and_update_batch_norm(
+        self: Self,
+        dataloader: torch.utils.data.DataLoader,
+        *,
+        model: nn.Module | None = None,
+        device: torch.device | None = None,
+    ) -> None:
+        if model is None:
+            model = self._model
+        if model is None or not self._has_bn:
+            return
+        if device is None:
+            device = self._model_device
+        self.apply(model)
+        update_bn(dataloader, model, device=device)
+
     def close(self: Self) -> None:
         with self._lock:
             try:

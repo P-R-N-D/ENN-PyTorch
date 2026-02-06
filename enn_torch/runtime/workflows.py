@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import contextlib
+import gc
 import json
 import logging
 import os
@@ -1289,6 +1290,7 @@ def train(
     loss_mask_value: float | None = None,
     export_path: PathLike | None = None,
     export_overwrite: bool = True,
+    model_averaging: str | None = "auto",
     **kwargs: Any,
 ) -> Model:
     ProcessBroker.bootstrap()
@@ -1312,6 +1314,10 @@ def train(
     first_in_dim = None
     label_shape = ()
     try:
+        if os.environ.get("ENN_MODEL_AVERAGING", None) is None:
+            os.environ["ENN_MODEL_AVERAGING"] = (
+                "none" if model_averaging is None else str(model_averaging)
+            )
         datasets, manifest = iter_dataset(data)
         for key, d in datasets:
             sub = os.path.join(memmap_dir, key) if manifest else memmap_dir
@@ -1454,7 +1460,7 @@ def train(
 
         _clear_device_caches()
         with _start_context():
-            elastic_launch(lc, process)(ops)
+            elastic_launch(lc, process)(ops, model_averaging=model_averaging)
         fallback: str | None = None
         ret_dir = os.environ.get("ENN_RETURN_DIR") or ""
         for fname in ("model.pt",):
@@ -1470,7 +1476,41 @@ def train(
             if isinstance(model, torch.nn.Module) and _has_meta_tensors(model):
                 with contextlib.suppress(Exception):
                     _materialize_to_cpu(model)
-            load_weights(model, fallback, map_location="cpu", rebuild_tasks=False)
+            try:
+                load_weights(
+                    model, fallback, map_location="cpu", rebuild_tasks=False
+                )
+            finally:
+                with contextlib.suppress(Exception):
+                    os.remove(fallback)
+                with contextlib.suppress(Exception):
+                    meta_path = os.path.join(
+                        os.path.dirname(fallback), "model.meta.json"
+                    )
+                    if os.path.isfile(meta_path):
+                        os.remove(meta_path)
+                with contextlib.suppress(Exception):
+                    d = os.path.dirname(fallback)
+                    for name in os.listdir(d):
+                        if name.endswith(".tmp") and "model.pt" in name:
+                            with contextlib.suppress(Exception):
+                                os.remove(os.path.join(d, name))
+            cleanup = os.environ.get("ENN_CKPT_CLEANUP_ON_SUCCESS", "1")
+            do_cleanup = cleanup.strip().lower() not in (
+                "0",
+                "false",
+                "off",
+                "no",
+                "n",
+            )
+            if do_cleanup:
+                cand = os.path.dirname(fallback)
+                marker = os.path.join(cand, ".enn_ephemeral_ckpt")
+                if os.path.isfile(marker):
+                    with contextlib.suppress(Exception):
+                        shutil.rmtree(cand, ignore_errors=True)
+            gc.collect()
+            return model
         else:
             if isinstance(model, torch.nn.Module) and _has_meta_tensors(model):
                 with contextlib.suppress(Exception):

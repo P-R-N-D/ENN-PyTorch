@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import contextlib
 import datetime
+import gc
 import glob
 import itertools
 import logging
@@ -13,19 +14,21 @@ import re
 import socket
 import sys
 import threading
+import tempfile
 import time
 import warnings
 from collections.abc import Mapping, MutableMapping
 from dataclasses import replace
 from functools import partial
 from pathlib import Path
-from typing import Any, TypeAlias
+from typing import Any, TypeAlias, overload
 
 import torch
 import torch.distributed
 import torch.nn as nn
 from tensordict import TensorDictBase
 from torch.distributed.checkpoint import FileSystemReader, load
+from torch.distributed.elastic.control_plane import worker_main
 from torch.distributed.checkpoint.state_dict import (
     StateDictOptions,
     get_model_state_dict,
@@ -176,6 +179,7 @@ _COMPILE_SAFE_DONE = False
 _COMPILE_SAFE_LOCK = Mutex()
 _LOGGER = logging.getLogger(__name__)
 _float8_log = ProcessBroker.rank0_logger(_LOGGER)
+_EXPORT_RETURN_LOCK = threading.Lock()
 JsonPrimitive: TypeAlias = str | int | float | bool | None
 JsonValue: TypeAlias = (
     JsonPrimitive | list["JsonValue"] | dict[str, "JsonValue"]
@@ -184,6 +188,135 @@ MB_DIV = 1024.0 * 1024.0
 PathLike: TypeAlias = str | os.PathLike[str] | Path
 ReturnSink: TypeAlias = MutableMapping[str, object]
 TorchDeviceLike: TypeAlias = torch.device | str | int
+
+
+def _env_bool(key: str, default: bool = False) -> bool:
+    v = os.environ.get(key, None)
+    if v is None:
+        return bool(default)
+    s = str(v).strip().lower()
+    if s in ("1", "true", "t", "yes", "y", "on"):
+        return True
+    if s in ("0", "false", "f", "no", "n", "off", ""):
+        return False
+    return bool(default)
+
+
+def _normalize_model_averaging(
+    x: object, *, default: str = "auto"
+) -> str | None:
+    if default is None:
+        raise ValueError("default model_averaging must not be None")
+    if x is None:
+        return None
+    if isinstance(x, str):
+        s = x.strip().lower()
+        if s in ("auto", "ema", "swa"):
+            return s
+        if s in ("none", "null", "off", "false", "0", ""):
+            return None
+    raise ValueError(
+        f"Invalid model_averaging={x!r}. Expected None|'auto'|'ema'|'swa'."
+    )
+
+
+def _has_bn_modules(model: Any) -> bool:
+    try:
+        import torch
+        from torch import nn
+
+        if not isinstance(model, nn.Module):
+            return False
+        bn_types = (
+            nn.BatchNorm1d,
+            nn.BatchNorm2d,
+            nn.BatchNorm3d,
+            getattr(nn, "SyncBatchNorm", nn.BatchNorm1d),
+        )
+        for m in model.modules():
+            if isinstance(m, bn_types):
+                return True
+    except Exception:
+        return False
+    return False
+
+
+def _resolve_model_averaging(
+    model: Any, requested: object
+) -> tuple[str | None, bool]:
+    req = _normalize_model_averaging(requested, default="auto")
+    has_bn = _has_bn_modules(model)
+    if req is None:
+        return None, has_bn
+    if req == "auto":
+        return ("ema" if has_bn else "swa"), has_bn
+    return req, has_bn
+
+
+def _atomic_torch_save(obj: object, path: str) -> None:
+    import torch
+
+    d = os.path.dirname(path) or "."
+    os.makedirs(d, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(
+        prefix=os.path.basename(path) + ".", suffix=".tmp", dir=d
+    )
+    os.close(fd)
+    try:
+        try:
+            torch.save(obj, tmp, _use_new_zipfile_serialization=False)
+        except Exception:
+            torch.save(obj, tmp)
+        os.replace(tmp, path)
+    finally:
+        try:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+        except Exception:
+            pass
+
+
+def _mark_ephemeral_ckpt_dir(d: str) -> None:
+    try:
+        os.makedirs(d, exist_ok=True)
+        with open(
+            os.path.join(d, ".enn_ephemeral_ckpt"), "w", encoding="utf-8"
+        ) as f:
+            f.write("1\n")
+    except Exception:
+        pass
+
+
+def _force_final_avg_update(
+    ema_helper: object | None,
+    swa_helper: object | None,
+    model: Any,
+    optimizer: object | None,
+) -> None:
+    try:
+        if ema_helper is not None and hasattr(ema_helper, "update"):
+            prev = getattr(ema_helper, "update_every", None)
+            try:
+                if prev is not None:
+                    ema_helper.update_every = 1
+                ema_helper.update(model, optimizer=optimizer)
+            finally:
+                if prev is not None:
+                    ema_helper.update_every = prev
+    except Exception:
+        pass
+    try:
+        if swa_helper is not None and hasattr(swa_helper, "update"):
+            prev = getattr(swa_helper, "_update_every", None)
+            try:
+                if prev is not None:
+                    swa_helper._update_every = 1
+                swa_helper.update(model)
+            finally:
+                if prev is not None:
+                    swa_helper._update_every = prev
+    except Exception:
+        pass
 
 
 def _validate_compile_safe() -> None:
@@ -220,203 +353,83 @@ def _schedule(
 
 
 def _export_return_model_pt(
-    model: "torch.nn.Module",
+    model: Any,
     ckpt_dir: str,
     *,
     ema_helper: object | None = None,
     swa_helper: object | None = None,
+    model_averaging: str | None = "auto",
 ) -> None:
-    import os
     import torch
 
     out_dir = os.environ.get("ENN_RETURN_DIR") or str(ckpt_dir or "")
     if not out_dir:
         return
-    os.makedirs(str(out_dir), exist_ok=True)
+    os.makedirs(out_dir, exist_ok=True)
 
-    avg_params: dict[str, torch.Tensor] | None = None
-    if swa_helper is not None:
-        fn = getattr(swa_helper, "checkpoint_state_dict", None)
-        if callable(fn):
-            with contextlib.suppress(Exception):
-                raw = fn(model, include_buffers=False)
-                if isinstance(raw, dict) and raw:
-                    avg_params = {}
-                    with torch.no_grad():
-                        for name, v in raw.items():
-                            if not torch.is_tensor(v):
-                                continue
-                            t = v.detach()
-                            if getattr(t, "is_meta", False) or t.device.type == "meta":
-                                continue
-                            if t.device.type != "cpu":
-                                t = t.to("cpu")
-                            avg_params[str(name)] = t
-    if avg_params is None and ema_helper is not None:
+    env_ma = os.environ.get("ENN_MODEL_AVERAGING", None)
+    if env_ma is not None:
+        model_averaging = env_ma
+    model_averaging = _normalize_model_averaging(
+        model_averaging, default="auto"
+    )
+    if model_averaging == "auto":
+        model_averaging = "ema" if _has_bn_modules(model) else "swa"
+
+    try:
+        p0 = next((p for p in model.parameters() if torch.is_tensor(p)), None)
+        if torch.is_tensor(p0) and p0.device.type == "cuda":
+            torch.cuda.synchronize()
+    except Exception:
+        pass
+
+    avg_params = None
+    if model_averaging == "swa" and swa_helper is not None:
+        shadow = getattr(swa_helper, "shadow", None)
+        n_avg = int(getattr(swa_helper, "n_averaged", 0) or 0)
+        if n_avg > 0 and isinstance(shadow, dict) and shadow:
+            avg_params = shadow
+    if model_averaging == "ema" and avg_params is None and ema_helper is not None:
         shadow = getattr(ema_helper, "shadow", None)
         if isinstance(shadow, dict) and shadow:
-            avg_params = {}
-            with torch.no_grad():
-                for name, p in model.named_parameters(recurse=True):
-                    sv = shadow.get(name, None)
-                    tv = sv if torch.is_tensor(sv) else p
-                    if not torch.is_tensor(tv):
-                        continue
-                    t = tv.detach()
-                    if getattr(t, "is_meta", False) or t.device.type == "meta":
-                        continue
-                    if t.device.type != "cpu":
-                        t = t.to("cpu")
-                    avg_params[str(name)] = t
+            avg_params = shadow
 
-    include_buffers = True
-    skip_keys: set[str] = set(avg_params.keys()) if isinstance(avg_params, dict) else set()
-    sd_cpu: dict[str, object] = {}
-    with torch.no_grad():
-        for k, v in model.state_dict().items():
-            sk = str(k)
-            if sk in skip_keys:
-                continue
-            if torch.is_tensor(v):
-                t = v.detach()
+    with _EXPORT_RETURN_LOCK:
+        sd_out: dict[str, object] = {}
+        with torch.no_grad():
+            for name, p in model.named_parameters(recurse=True):
+                if not torch.is_tensor(p) or p.numel() <= 0:
+                    continue
+                key = str(name)
+                if avg_params is not None:
+                    av = avg_params.get(key, None)
+                    if torch.is_tensor(av):
+                        sd_out[key] = av.detach()
+                        continue
+                t = p.detach()
                 if getattr(t, "is_meta", False) or t.device.type == "meta":
                     continue
                 if t.device.type != "cpu":
                     t = t.to("cpu")
-                sd_cpu[sk] = t
-            else:
-                sd_cpu[sk] = v
+                sd_out[key] = t
 
-    if include_buffers:
-        with torch.no_grad():
             for name, b in model.named_buffers(recurse=True):
-                if not torch.is_tensor(b):
+                if not torch.is_tensor(b) or b.numel() <= 0:
                     continue
+                key = str(name)
                 t = b.detach()
                 if getattr(t, "is_meta", False) or t.device.type == "meta":
                     continue
                 if t.device.type != "cpu":
                     t = t.to("cpu")
-                sd_cpu[str(name)] = t
+                sd_out[key] = t
 
-    if isinstance(avg_params, dict) and avg_params:
-        for name, t in avg_params.items():
-            if torch.is_tensor(t):
-                sd_cpu[str(name)] = t
+        out_path = os.path.join(out_dir, "model.pt")
+        _atomic_torch_save(sd_out, out_path)
 
-    out_path = os.path.join(str(out_dir), "model.pt")
-    tmp_path = out_path + ".tmp"
-    try:
-        torch.save(sd_cpu, tmp_path, _use_new_zipfile_serialization=False)
-    except Exception:
-        with contextlib.suppress(Exception):
-            if os.path.exists(tmp_path):
-                os.remove(tmp_path)
-        try:
-            torch.save(sd_cpu, tmp_path)
-        except Exception:
-            with contextlib.suppress(Exception):
-                if os.path.exists(tmp_path):
-                    os.remove(tmp_path)
-            raise
-    try:
-        if (not os.path.exists(tmp_path)) or (os.path.getsize(tmp_path) <= 0):
-            raise RuntimeError("export produced empty model.pt.tmp")
-    except Exception:
-        with contextlib.suppress(Exception):
-            if os.path.exists(tmp_path):
-                os.remove(tmp_path)
-        raise
-    os.replace(tmp_path, out_path)
-    with contextlib.suppress(Exception):
-        if hasattr(os, "posix_fadvise") and hasattr(os, "POSIX_FADV_DONTNEED"):
-            fd = os.open(out_path, os.O_RDONLY)
-            try:
-                os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
-            finally:
-                os.close(fd)
-
-    with contextlib.suppress(Exception):
-        import json
-
-        meta_path = os.path.join(str(out_dir), "model.meta.json")
-
-        def _json_safe(obj: object) -> object:
-            import torch
-
-            if obj is None:
-                return None
-            if isinstance(obj, (str, int, float, bool)):
-                return obj
-            if isinstance(obj, (list, tuple)):
-                return [_json_safe(x) for x in obj]
-            if isinstance(obj, dict):
-                return {str(k): _json_safe(v) for k, v in obj.items()}
-            if torch.is_tensor(obj):
-                t = obj.detach()
-                if getattr(t, "is_meta", False) or t.device.type == "meta":
-                    return None
-                if t.device.type != "cpu":
-                    t = t.to("cpu")
-                try:
-                    numel = int(t.numel())
-                except Exception:
-                    numel = 0
-                if numel <= 256:
-                    return t.reshape(-1).tolist()
-                return {"dtype": str(t.dtype), "shape": list(t.shape)}
-            return str(obj)
-
-        meta: dict[str, object] = {
-            "version": 1,
-            "pytorch_version": getattr(torch, "__version__", None),
-        }
-        with contextlib.suppress(Exception):
-            meta["in_dim"] = int(getattr(model, "in_dim"))
-        with contextlib.suppress(Exception):
-            meta["out_shape"] = list(getattr(model, "out_shape"))
-        meta["artifact"] = {"model_pt": os.path.basename(out_path)}
-
-        hist = None
-        for key in ("training_history", "_training_history", "history"):
-            with contextlib.suppress(Exception):
-                v = getattr(model, key, None)
-                if v:
-                    hist = v
-                    break
-        if hist is not None:
-            try:
-                if isinstance(hist, list) and len(hist) > 2000:
-                    hist = hist[-2000:]
-            except Exception:
-                pass
-            meta["training_history"] = _json_safe(hist)
-
-        buf_summary: dict[str, object] = {}
-        with torch.no_grad():
-            for name, b in model.named_buffers(recurse=True):
-                if not torch.is_tensor(b):
-                    continue
-                low = name.lower()
-                if any(k in low for k in ("mean", "std", "scale", "shift", "min", "max", "offset")):
-                    buf_summary[name] = _json_safe(b)
-        if buf_summary:
-            meta["scaling_buffers"] = buf_summary
-
-        with open(meta_path + ".tmp", "w", encoding="utf-8") as fh:
-            json.dump(meta, fh, ensure_ascii=False, indent=2)
-        os.replace(meta_path + ".tmp", meta_path)
-    copy_to_ckpt = (
-        os.environ.get("ENN_RETURN_COPY_TO_CKPT", "").strip().lower()
-        in ("1", "true", "yes", "y", "on")
-    )
-    if copy_to_ckpt and ckpt_dir and str(ckpt_dir) != str(out_dir):
-        with contextlib.suppress(Exception):
-            import shutil
-
-            os.makedirs(str(ckpt_dir), exist_ok=True)
-            dst = os.path.join(str(ckpt_dir), "model.pt")
-            shutil.copyfile(out_path, dst)
+        sd_out.clear()
+        del sd_out
+        gc.collect()
 
 
 def _pin(
@@ -1280,13 +1293,24 @@ def epochs(
                                         scaler.step(optimizer)
                                         scaler.update()
                                         optimizer.zero_grad(set_to_none=True)
+                                        ema_target = (
+                                            model.module
+                                            if hasattr(model, "module")
+                                            else model
+                                        )
                                         if ema_helper is not None:
-                                            ema_target = (
-                                                model.module
-                                                if hasattr(model, "module")
-                                                else model
-                                            )
-                                            ema_helper.update(ema_target)
+                                            try:
+                                                ema_helper.update(
+                                                    ema_target,
+                                                    optimizer=optimizer,
+                                                )
+                                            except Exception:
+                                                pass
+                                        if swa_helper is not None:
+                                            try:
+                                                swa_helper.update(ema_target)
+                                            except Exception:
+                                                pass
                                         target_for_step = (
                                             model.module
                                             if hasattr(model, "module")
@@ -3177,21 +3201,29 @@ def infer(
     return None
 
 
+@overload
 def process(
     ops: RuntimeConfig, ret_sink: ReturnSink | None = None
 ) -> object: ...
 
 
+@overload
 def process(
     local_rank: int, ops: RuntimeConfig, ret_sink: ReturnSink | None = None
 ) -> object: ...
 
 
+@worker_main
 def process(*args: Any, **kwargs: Any) -> object:
     from ..data.pipeline import Session
 
     if not args:
         raise TypeError("process requires at least a RuntimeConfig argument")
+    model_averaging = kwargs.pop("model_averaging", "auto")
+    if kwargs:
+        raise TypeError(
+            f"process got unexpected keyword arguments: {', '.join(sorted(kwargs))}"
+        )
     init_python_path()
     _validate_compile_safe()
     ret_sink = None
@@ -3209,6 +3241,14 @@ def process(*args: Any, **kwargs: Any) -> object:
         raise TypeError(
             "process expects (RuntimeConfig,), (RuntimeConfig, ret_sink), (local_rank, RuntimeConfig), or (local_rank, RuntimeConfig, ret_sink) arguments"
         )
+    env_ma = os.environ.get("ENN_MODEL_AVERAGING", None)
+    if env_ma is not None:
+        model_averaging = env_ma
+    try:
+        if int(local_rank) == 0 and getattr(ops, "ckpt_dir", None):
+            _mark_ephemeral_ckpt_dir(str(ops.ckpt_dir))
+    except Exception:
+        pass
     verbose = bool(getattr(ops, "verbose", False))
     det = bool(getattr(ops, "deterministic", False))
     seed_value = int(getattr(ops, "seed", 42)) + int(local_rank)
@@ -3220,6 +3260,8 @@ def process(*args: Any, **kwargs: Any) -> object:
         torch.backends.cudnn.deterministic = det
         torch.backends.cudnn.benchmark = not det
     if ops.mode == "train":
+        resolved_ma: str | None = None
+        has_bn = False
         device = get_device()
         ProcessBroker.init_backend(device, local_rank=int(local_rank))
         backend = ProcessBroker.get_backend_type(device)
@@ -3612,14 +3654,10 @@ def process(*args: Any, **kwargs: Any) -> object:
             ema_helper = None
             swa_helper = None
             swa_start_epoch = int(total_epochs)
-            try:
-                has_bn = any(
-                    isinstance(m, nn.modules.batchnorm._BatchNorm)
-                    for m in tracked_module.modules()
-                )
-            except Exception:
-                has_bn = False
-            use_swa = not has_bn
+            resolved_ma, has_bn = _resolve_model_averaging(
+                tracked_module, model_averaging
+            )
+            use_swa = resolved_ma == "swa"
             if local_rank == 0:
                 if use_swa:
                     swa_start_epoch = 0
@@ -3634,7 +3672,7 @@ def process(*args: Any, **kwargs: Any) -> object:
                     swa_helper = StochasticWeightAverage(
                         tracked_module, metadata=metadata
                     )
-                else:
+                elif resolved_ma == "ema":
                     ema_helper = ExponentialMovingAverage(
                         tracked_module, decay=0.9999, metadata=metadata
                     )
@@ -3739,12 +3777,49 @@ def process(*args: Any, **kwargs: Any) -> object:
         with contextlib.suppress(Exception):
             if int(local_rank) == 0 and getattr(ops, "ckpt_dir", None):
                 target = model.module if hasattr(model, "module") else model
+                _force_final_avg_update(
+                    ema_helper, swa_helper, target, optimizer
+                )
+                if (
+                    swa_helper is not None
+                    and has_bn
+                    and _env_bool("ENN_SWA_UPDATE_BN", default=True)
+                ):
+                    try:
+                        dev = None
+                        try:
+                            p0 = next(
+                                (
+                                    p
+                                    for p in target.parameters()
+                                    if torch.is_tensor(p)
+                                ),
+                                None,
+                            )
+                            if torch.is_tensor(p0):
+                                dev = p0.device
+                        except Exception:
+                            dev = None
+                        fn = getattr(
+                            swa_helper, "apply_and_update_batch_norm", None
+                        )
+                        if callable(fn):
+                            fn(train_loader, model=target, device=dev)
+                    except Exception:
+                        pass
                 _export_return_model_pt(
                     target,
                     str(ops.ckpt_dir),
                     ema_helper=ema_helper,
                     swa_helper=swa_helper,
+                    model_averaging=resolved_ma,
                 )
+                try:
+                    if swa_helper is not None and hasattr(swa_helper, "close"):
+                        swa_helper.close()
+                except Exception:
+                    pass
+                gc.collect()
         with contextlib.suppress(Exception):
             if swa_helper is not None and hasattr(swa_helper, "close"):
                 swa_helper.close()
