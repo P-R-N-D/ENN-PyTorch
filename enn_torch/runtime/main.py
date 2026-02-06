@@ -362,7 +362,21 @@ def _export_return_model_pt(
 ) -> None:
     import torch
 
-    out_dir = os.environ.get("ENN_RETURN_DIR") or str(ckpt_dir or "")
+    out_dir_env = os.environ.get("ENN_RETURN_DIR", None)
+    out_dir = (out_dir_env or "").strip() or str(ckpt_dir or "").strip()
+    if not out_dir_env:
+        try:
+            from .distributed import _is_tmpfs_path, _pick_disk_cache_base
+
+            if out_dir and _is_tmpfs_path(out_dir):
+                out_dir = ""
+            if not out_dir:
+                base = _pick_disk_cache_base()
+                if base and (not _is_tmpfs_path(base)):
+                    out_dir = os.path.join(str(base), "enn_return")
+                    _mark_ephemeral_ckpt_dir(out_dir)
+        except Exception:
+            pass
     if not out_dir:
         return
     os.makedirs(out_dir, exist_ok=True)
