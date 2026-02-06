@@ -155,6 +155,11 @@ def _ensure_disk_cache_env() -> None:
     _set_if_unset_or_unsafe("CUDA_CACHE_PATH", os.path.join(root, "cuda_cache"))
     _set_if_unset_or_unsafe("XDG_CACHE_HOME", os.path.join(root, "xdg"))
     with contextlib.suppress(Exception):
+        import tempfile
+
+        tempfile.tempdir = None
+        tempfile.gettempdir()
+    with contextlib.suppress(Exception):
         Path(os.environ.get("TORCHINDUCTOR_CACHE_DIR", inductor_dir)).mkdir(
             parents=True,
             exist_ok=True,
