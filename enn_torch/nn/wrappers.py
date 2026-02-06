@@ -42,7 +42,7 @@ from .blocks import (
     Perceiver,
     RetNet,
     _autofit_microbatch,
-    _coerce_modeling_types,
+    _coerce_preset,
     _coerce_tensor,
     _infer_module_device,
     _prealloc_microbatch,
@@ -955,7 +955,10 @@ class Fuser(nn.Module):
         self.__enn_instance_config__ = config
         self.d_model = int(config.d_model)
         self.nhead = int(config.heads)
-        self.modeling_type = _coerce_modeling_types(config.modeling_type)
+        raw_preset = getattr(config, "preset", None)
+        if raw_preset is None and hasattr(config, "modeling_type"):
+            raw_preset = getattr(config, "modeling_type", None)
+        self.preset = _coerce_preset(raw_preset)
         self.spatial_tokens = max(
             1, int(getattr(config, "spatial_latents", 1))
         )
@@ -1128,8 +1131,10 @@ class Fuser(nn.Module):
             raise RuntimeError(
                 "Fuser requires a ModelConfig to initialize default tasks"
             )
-        mt = str(self.modeling_type)
-        if mt in {"ss"}:
+        pr = getattr(self, "preset", None)
+        if pr is None:
+            return
+        if pr == "spatial":
             self.add_task(
                 "spatial",
                 mode="spatial",
@@ -1139,7 +1144,7 @@ class Fuser(nn.Module):
                 eps=1e-6,
                 submodel=None,
             )
-        elif mt in {"tt"}:
+        elif pr == "temporal":
             self.add_task(
                 "temporal",
                 mode="temporal",
@@ -1518,22 +1523,7 @@ class Fuser(nn.Module):
             self.stream_task_id = ""
         self._resolve_stream_task_id()
 
-    def _select_tasks_for_modeling_type(self: Self) -> list[str]:
-        mt = str(self.modeling_type)
-        if mt == "ss":
-            spatial = [
-                k
-                for k, t in self.tasks.items()
-                if getattr(t, "mode", "") == "spatial"
-            ]
-            return spatial if spatial else list(self.tasks.keys())
-        if mt == "tt":
-            temporal = [
-                k
-                for k, t in self.tasks.items()
-                if getattr(t, "mode", "") == "temporal"
-            ]
-            return temporal if temporal else list(self.tasks.keys())
+    def _select_tasks(self: Self) -> list[str]:
         return list(self.tasks.keys())
 
     def _build_attn_bias(
@@ -1601,7 +1591,7 @@ class Fuser(nn.Module):
         **kwargs: Any,
     ) -> Any:
         del args, kwargs
-        names = self._select_tasks_for_modeling_type()
+        names = self._select_tasks()
         token_sets: list[torch.Tensor] = []
         state_is_map = isinstance(temporal_state, Mapping)
         next_state_map: dict[str, torch.Tensor] = {}

@@ -85,7 +85,7 @@ def _build_model_and_sample(
         temporal_depth=2,
         spatial_latents=24,
         temporal_latents=24,
-        modeling_type="spatiotemporal",
+        preset="spatiotemporal",
         compile_mode="disabled",
     )
     model = new_model(

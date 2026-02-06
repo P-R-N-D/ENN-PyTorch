@@ -17,25 +17,25 @@ from .graph import coerce_checkpoint, is_export_or_trace, is_symbolic
 from .kernels import DotProductAttention
 from .layers import DilatedAttention, Resampler, Retention, norm_layer
 _LOGGER = logging.getLogger(__name__)
-_MODELING_TYPE_ALIASES: dict[str, str] = {
-    "ss": "ss",
-    "spatial": "ss",
-    "sxs": "ss",
-    "tt": "tt",
-    "temporal": "tt",
-    "txt": "tt",
-    "st": "st",
-    "ts": "st",
-    "sxt": "st",
-    "txs": "st",
-    "temporal-spatial": "st",
-    "temporo-spatial": "st",
-    "temporospatial": "st",
-    "tempospatial": "st",
-    "tempo-spatial": "st",
-    "temporalspatial": "st",
-    "spatiotemporal": "st",
-    "spatio-temporal": "st",
+_PRESET_ALIASES: dict[str, str] = {
+    "ss": "spatial",
+    "spatial": "spatial",
+    "sxs": "spatial",
+    "tt": "temporal",
+    "temporal": "temporal",
+    "txt": "temporal",
+    "st": "spatiotemporal",
+    "ts": "spatiotemporal",
+    "sxt": "spatiotemporal",
+    "txs": "spatiotemporal",
+    "temporal-spatial": "spatiotemporal",
+    "temporo-spatial": "spatiotemporal",
+    "temporospatial": "spatiotemporal",
+    "tempospatial": "spatiotemporal",
+    "tempo-spatial": "spatiotemporal",
+    "temporalspatial": "spatiotemporal",
+    "spatiotemporal": "spatiotemporal",
+    "spatio-temporal": "spatiotemporal",
 }
 _ENN_HAS_FLEX_ATTENTION = getattr(
     import_module(".layers", __package__), "_HAS_FLEX_ATTENTION", False
@@ -200,11 +200,16 @@ def _prealloc_microbatch(
     return out_bufs[0] if len(out_bufs) == 1 else tuple(out_bufs)
 
 
-def _coerce_modeling_types(value: Any) -> str:
-    mode = str(value).strip().lower()
-    normalized = _MODELING_TYPE_ALIASES.get(mode)
+def _coerce_preset(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    s = str(value).strip().lower()
+    if s in ("none", "null", "off", "false", "0", ""):
+        return None
+    key = s.replace("_", "-").replace(" ", "-")
+    normalized = _PRESET_ALIASES.get(key)
     if normalized is None:
-        raise ValueError(f"Unsupported modeling type '{value}'")
+        raise ValueError(f"Unsupported preset '{value}'")
     return normalized
 
 
