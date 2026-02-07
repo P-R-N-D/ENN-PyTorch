@@ -2626,10 +2626,144 @@ class Checkpointer:
             if avail < int(min_avail_mb) * 1024 * 1024:
                 return True
 
-        if max_used_mb > 0 and isinstance(total, int) and total > 0:
-            used = int(total) - int(avail)
-            if used > int(max_used_mb) * 1024 * 1024:
-                return True
+        if max_used_mb > 0:
+            thr_bytes = int(max_used_mb) * 1024 * 1024
+
+            def _proc_rss_bytes() -> int | None:
+                try:
+                    import psutil
+                    return int(psutil.Process(os.getpid()).memory_info().rss)
+                except Exception:
+                    pass
+                try:
+                    if os.path.isfile("/proc/self/statm"):
+                        with open("/proc/self/statm", "r", encoding="utf-8") as fh:
+                            parts = fh.read().split()
+                        if len(parts) >= 2 and parts[1].isdigit():
+                            rss_pages = int(parts[1])
+                            page = int(os.sysconf("SC_PAGE_SIZE"))
+                            return int(rss_pages) * int(page)
+                except Exception:
+                    pass
+                return None
+
+            def _linux_cgroup_stats() -> tuple[int | None, int | None, int | None]:
+                if not (os.path.exists("/proc/self/cgroup") and os.path.isdir("/sys/fs/cgroup")):
+                    return (None, None, None)
+                try:
+                    root = "/sys/fs/cgroup"
+                    if os.path.exists(os.path.join(root, "cgroup.controllers")):
+                        rel = "/"
+                        with open("/proc/self/cgroup", "r", encoding="utf-8", errors="ignore") as fh:
+                            for ln in fh:
+                                parts = ln.strip().split(":")
+                                if len(parts) >= 3 and parts[0] == "0":
+                                    rel = parts[2] or "/"
+                                    break
+                        grp = os.path.join(root, rel.lstrip("/"))
+                        raw_lim = ""
+                        raw_cur = ""
+                        with contextlib.suppress(Exception):
+                            raw_lim = open(os.path.join(grp, "memory.max"), "r", encoding="utf-8", errors="ignore").read().strip()
+                        with contextlib.suppress(Exception):
+                            raw_cur = open(os.path.join(grp, "memory.current"), "r", encoding="utf-8", errors="ignore").read().strip()
+                        if raw_lim and raw_lim != "max" and raw_lim.isdigit() and raw_cur and raw_cur.isdigit():
+                            lim = int(raw_lim)
+                            cur = int(raw_cur)
+                            if 0 < lim < (1 << 60) and 0 <= cur:
+                                rem = max(0, lim - cur)
+                                return (lim, cur, rem)
+                        return (None, None, None)
+
+                    mem_rel = None
+                    with open("/proc/self/cgroup", "r", encoding="utf-8", errors="ignore") as fh:
+                        for ln in fh:
+                            parts = ln.strip().split(":")
+                            if len(parts) >= 3:
+                                ctrls = parts[1].split(",") if parts[1] else []
+                                if "memory" in ctrls:
+                                    mem_rel = parts[2] or "/"
+                                    break
+                    if mem_rel is None:
+                        return (None, None, None)
+                    base = "/sys/fs/cgroup/memory"
+                    if not os.path.isdir(base):
+                        return (None, None, None)
+                    grp = os.path.join(base, mem_rel.lstrip("/"))
+                    raw_lim = ""
+                    raw_use = ""
+                    with contextlib.suppress(Exception):
+                        raw_lim = open(os.path.join(grp, "memory.limit_in_bytes"), "r", encoding="utf-8", errors="ignore").read().strip()
+                    with contextlib.suppress(Exception):
+                        raw_use = open(os.path.join(grp, "memory.usage_in_bytes"), "r", encoding="utf-8", errors="ignore").read().strip()
+                    if raw_lim and raw_lim.isdigit() and raw_use and raw_use.isdigit():
+                        lim = int(raw_lim)
+                        use = int(raw_use)
+                        if 0 < lim < (1 << 60) and 0 <= use:
+                            rem = max(0, lim - use)
+                            return (lim, use, rem)
+                except Exception:
+                    return (None, None, None)
+                return (None, None, None)
+
+            base_av = None
+            with contextlib.suppress(Exception):
+                fn = getattr(Memory, "_sys_available_memory", None)
+                if callable(fn):
+                    base_av = fn()
+            cg_lim, cg_cur, cg_av = _linux_cgroup_stats()
+            win_av = None
+            with contextlib.suppress(Exception):
+                fn = getattr(Memory, "_windows_limit", None)
+                if callable(fn):
+                    win_av = fn()
+            rlim_av = None
+            with contextlib.suppress(Exception):
+                fn = getattr(Memory, "_bsd_limit", None)
+                if callable(fn):
+                    rlim_av = fn()
+
+            candidates: list[tuple[str, int]] = []
+            for name, v in (("cgroup", cg_av), ("winjob", win_av), ("rlim", rlim_av), ("base", base_av)):
+                if isinstance(v, int) and v >= 0:
+                    candidates.append((name, int(v)))
+
+            if candidates:
+                min_val = min(v for _, v in candidates)
+                prio = {"cgroup": 0, "winjob": 1, "rlim": 2, "base": 3}
+                winners = [n for n, v in candidates if v == min_val]
+                winners.sort(key=lambda n: prio.get(n, 99))
+                scope = winners[0]
+
+                used_b: int | None = None
+                scope_total_b: int | None = None
+
+                if scope == "cgroup" and isinstance(cg_cur, int) and cg_cur >= 0:
+                    used_b = int(cg_cur)
+                    scope_total_b = int(cg_lim) if isinstance(cg_lim, int) and cg_lim > 0 else None
+                elif scope in {"winjob", "rlim"}:
+                    rss = _proc_rss_bytes()
+                    if isinstance(rss, int) and rss >= 0:
+                        used_b = int(rss)
+                        rem = dict(candidates).get(scope, None)
+                        if isinstance(rem, int) and rem >= 0:
+                            scope_total_b = int(rem) + int(rss)
+                elif scope == "base":
+                    if isinstance(total, int) and total > 0 and isinstance(base_av, int) and base_av >= 0:
+                        used_b = max(0, int(total) - int(base_av))
+                        scope_total_b = int(total)
+
+                if used_b is not None and int(used_b) > int(thr_bytes):
+                    if self._is_global_rank0() and env_bool("ENN_DCP_DEBUG", False):
+                        _LOGGER.warning(
+                            "DCP blocked by MAX_HOST_USED_MB (scope=%s used=%.2fGiB thr=%.2fGiB avail=%dMiB total=%s)",
+                            scope,
+                            float(used_b) / (1024.0**3),
+                            float(thr_bytes) / (1024.0**3),
+                            int(avail) // (1024 * 1024),
+                            (str(scope_total_b) if scope_total_b is not None else str(total)),
+                        )
+                    return True
 
         return False
 
