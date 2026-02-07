@@ -2584,19 +2584,22 @@ class Checkpointer:
             fut = getattr(self._resp, "upload_completion", None)
             if fut is not None and getattr(fut, "done", lambda: False)():
                 strict = bool(env_bool("ENN_DCP_RECIPE_STRICT", default=False))
+                success = True
                 try:
                     fut.result()
                 except Exception:
                     if strict:
                         raise
-                try:
-                    epoch_dir = getattr(self, "_inflight_epoch_dir", None)
-                    if isinstance(epoch_dir, Path):
-                        with contextlib.suppress(Exception):
-                            self._done_file(epoch_dir).write_text("ok\\n", encoding="utf-8")
-                finally:
-                    if self._rank == 0:
-                        self._cleanup_keep_last()
+                    success = False
+                if success:
+                    try:
+                        epoch_dir = getattr(self, "_inflight_epoch_dir", None)
+                        if isinstance(epoch_dir, Path):
+                            with contextlib.suppress(Exception):
+                                self._done_file(epoch_dir).write_text("ok\\n", encoding="utf-8")
+                    finally:
+                        if self._rank == 0:
+                            self._cleanup_keep_last()
                 self._resp = None
                 self._staging_waited = True
                 if hasattr(self, "_inflight_epoch_dir"):
