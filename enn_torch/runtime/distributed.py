@@ -2601,6 +2601,209 @@ class Checkpointer:
     def _sync_device(self) -> str:
         return "cpu"
 
+    def _host_pressure_blocks_ckpt(self) -> bool:
+        try:
+            min_avail_mb = int(env_int("ENN_DCP_MIN_HOST_AVAIL_MB", 0) or 0)
+        except Exception:
+            min_avail_mb = 0
+        try:
+            max_used_mb = int(env_int("ENN_DCP_MAX_HOST_USED_MB", 0) or 0)
+        except Exception:
+            max_used_mb = 0
+        if min_avail_mb <= 0 and max_used_mb <= 0:
+            return False
+
+        avail = None
+        total = None
+        with contextlib.suppress(Exception):
+            avail = Memory.available()
+        with contextlib.suppress(Exception):
+            total = Memory.total()
+        if not isinstance(avail, int) or avail <= 0:
+            return False
+
+        if min_avail_mb > 0:
+            if avail < int(min_avail_mb) * 1024 * 1024:
+                return True
+
+        if max_used_mb > 0:
+            thr_bytes = int(max_used_mb) * 1024 * 1024
+
+            def _proc_rss_bytes() -> int | None:
+                try:
+                    import psutil
+                    return int(psutil.Process(os.getpid()).memory_info().rss)
+                except Exception:
+                    pass
+                try:
+                    if os.path.isfile("/proc/self/statm"):
+                        with open("/proc/self/statm", "r", encoding="utf-8") as fh:
+                            parts = fh.read().split()
+                        if len(parts) >= 2 and parts[1].isdigit():
+                            rss_pages = int(parts[1])
+                            page = int(os.sysconf("SC_PAGE_SIZE"))
+                            return int(rss_pages) * int(page)
+                except Exception:
+                    pass
+                return None
+
+            def _linux_cgroup_stats() -> tuple[int | None, int | None, int | None]:
+                if not (os.path.exists("/proc/self/cgroup") and os.path.isdir("/sys/fs/cgroup")):
+                    return (None, None, None)
+                try:
+                    root = "/sys/fs/cgroup"
+                    if os.path.exists(os.path.join(root, "cgroup.controllers")):
+                        rel = "/"
+                        with open("/proc/self/cgroup", "r", encoding="utf-8", errors="ignore") as fh:
+                            for ln in fh:
+                                parts = ln.strip().split(":")
+                                if len(parts) >= 3 and parts[0] == "0":
+                                    rel = parts[2] or "/"
+                                    break
+                        grp = os.path.join(root, rel.lstrip("/"))
+                        raw_lim = ""
+                        raw_cur = ""
+                        with contextlib.suppress(Exception):
+                            raw_lim = open(os.path.join(grp, "memory.max"), "r", encoding="utf-8", errors="ignore").read().strip()
+                        with contextlib.suppress(Exception):
+                            raw_cur = open(os.path.join(grp, "memory.current"), "r", encoding="utf-8", errors="ignore").read().strip()
+                        if raw_lim and raw_lim != "max" and raw_lim.isdigit() and raw_cur and raw_cur.isdigit():
+                            lim = int(raw_lim)
+                            cur = int(raw_cur)
+                            if 0 < lim < (1 << 60) and 0 <= cur:
+                                rem = max(0, lim - cur)
+                                return (lim, cur, rem)
+                        return (None, None, None)
+
+                    mem_rel = None
+                    with open("/proc/self/cgroup", "r", encoding="utf-8", errors="ignore") as fh:
+                        for ln in fh:
+                            parts = ln.strip().split(":")
+                            if len(parts) >= 3:
+                                ctrls = parts[1].split(",") if parts[1] else []
+                                if "memory" in ctrls:
+                                    mem_rel = parts[2] or "/"
+                                    break
+                    if mem_rel is None:
+                        return (None, None, None)
+                    base = "/sys/fs/cgroup/memory"
+                    if not os.path.isdir(base):
+                        return (None, None, None)
+                    grp = os.path.join(base, mem_rel.lstrip("/"))
+                    raw_lim = ""
+                    raw_use = ""
+                    with contextlib.suppress(Exception):
+                        raw_lim = open(os.path.join(grp, "memory.limit_in_bytes"), "r", encoding="utf-8", errors="ignore").read().strip()
+                    with contextlib.suppress(Exception):
+                        raw_use = open(os.path.join(grp, "memory.usage_in_bytes"), "r", encoding="utf-8", errors="ignore").read().strip()
+                    if raw_lim and raw_lim.isdigit() and raw_use and raw_use.isdigit():
+                        lim = int(raw_lim)
+                        use = int(raw_use)
+                        if 0 < lim < (1 << 60) and 0 <= use:
+                            rem = max(0, lim - use)
+                            return (lim, use, rem)
+                except Exception:
+                    return (None, None, None)
+                return (None, None, None)
+
+            base_av = None
+            with contextlib.suppress(Exception):
+                fn = getattr(Memory, "_sys_available_memory", None)
+                if callable(fn):
+                    base_av = fn()
+            cg_lim, cg_cur, cg_av = _linux_cgroup_stats()
+            win_av = None
+            with contextlib.suppress(Exception):
+                fn = getattr(Memory, "_windows_limit", None)
+                if callable(fn):
+                    win_av = fn()
+            rlim_av = None
+            with contextlib.suppress(Exception):
+                fn = getattr(Memory, "_bsd_limit", None)
+                if callable(fn):
+                    rlim_av = fn()
+
+            candidates: list[tuple[str, int]] = []
+            for name, v in (("cgroup", cg_av), ("winjob", win_av), ("rlim", rlim_av), ("base", base_av)):
+                if isinstance(v, int) and v >= 0:
+                    candidates.append((name, int(v)))
+
+            if candidates:
+                min_val = min(v for _, v in candidates)
+                prio = {"cgroup": 0, "winjob": 1, "rlim": 2, "base": 3}
+                winners = [n for n, v in candidates if v == min_val]
+                winners.sort(key=lambda n: prio.get(n, 99))
+                scope = winners[0]
+
+                used_b: int | None = None
+                scope_total_b: int | None = None
+
+                if scope == "cgroup" and isinstance(cg_cur, int) and cg_cur >= 0:
+                    used_b = int(cg_cur)
+                    scope_total_b = int(cg_lim) if isinstance(cg_lim, int) and cg_lim > 0 else None
+                elif scope in {"winjob", "rlim"}:
+                    rss = _proc_rss_bytes()
+                    if isinstance(rss, int) and rss >= 0:
+                        used_b = int(rss)
+                        rem = dict(candidates).get(scope, None)
+                        if isinstance(rem, int) and rem >= 0:
+                            scope_total_b = int(rem) + int(rss)
+                elif scope == "base":
+                    if isinstance(total, int) and total > 0 and isinstance(base_av, int) and base_av >= 0:
+                        used_b = max(0, int(total) - int(base_av))
+                        scope_total_b = int(total)
+
+                if used_b is not None and int(used_b) > int(thr_bytes):
+                    if self._is_global_rank0() and env_bool("ENN_DCP_DEBUG", False):
+                        _LOGGER.warning(
+                            "DCP blocked by MAX_HOST_USED_MB (scope=%s used=%.2fGiB thr=%.2fGiB avail=%dMiB total=%s)",
+                            scope,
+                            float(used_b) / (1024.0**3),
+                            float(thr_bytes) / (1024.0**3),
+                            int(avail) // (1024 * 1024),
+                            (str(scope_total_b) if scope_total_b is not None else str(total)),
+                        )
+                    return True
+
+        return False
+
+    @staticmethod
+    def _try_deprioritize_ckpt_io() -> None:
+        if not env_bool("ENN_DCP_IONICE", False):
+            return
+        exe = shutil.which("ionice")
+        if not exe:
+            return
+        try:
+            import subprocess
+        except Exception:
+            return
+        try:
+            cls = int(env_int("ENN_DCP_IONICE_CLASS", 2) or 2)
+        except Exception:
+            cls = 2
+        try:
+            lvl = int(env_int("ENN_DCP_IONICE_LEVEL", 7) or 7)
+        except Exception:
+            lvl = 7
+        cls = int(cls)
+        lvl = int(max(0, min(7, int(lvl))))
+        try:
+            tid = int(threading.get_native_id())
+        except Exception:
+            tid = int(os.getpid())
+        cmd = [exe, "-c", str(cls)]
+        if cls in (1, 2):
+            cmd += ["-n", str(lvl)]
+        cmd += ["-p", str(int(tid))]
+        with contextlib.suppress(Exception):
+            subprocess.run(
+                cmd,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+            )
+
     def _resolve_dcp_process_group(self, pg: object | None) -> object | None:
         if not self._is_distributed() or pg is None:
             return pg
@@ -3602,6 +3805,7 @@ class Checkpointer:
     ) -> None:
         epoch_i = int(epoch)
         epoch_dir = self._epoch_dir(epoch_i)
+        self._try_deprioritize_ckpt_io()
         pending_exc: Exception | None = None
         try:
             want_kind = "active"
@@ -3789,6 +3993,7 @@ class Checkpointer:
         epoch_i = int(epoch)
         epoch_dir = self._epoch_dir(epoch_i)
         epoch_dir.mkdir(parents=True, exist_ok=True)
+        self._try_deprioritize_ckpt_io()
 
         pending_exc: Exception | None = None
         try:
@@ -3883,14 +4088,9 @@ class Checkpointer:
                 and (not bool(getattr(self, "_dcp_async_disabled_no_cpu", False)))
             ):
                 raw = os.environ.get("ENN_DCP_ASYNC_TYPE", None)
-                if raw is None:
-                    async_type = "thread"
-                else:
-                    async_type = str(raw).strip().lower()
+                async_type = "auto" if raw is None else str(raw).strip().lower()
 
-                if raw is not None and (
-                    (not async_type) or async_type in {"auto", "default", "none", "null"}
-                ):
+                if (not async_type) or async_type in {"auto", "default", "none", "null", ""}:
                     try:
                         w = int(getattr(self, "_world", 1) or 1)
                     except Exception:
@@ -4108,6 +4308,12 @@ class Checkpointer:
             with self._pending_lock:
                 if self._pending_dcp:
                     accept = False
+            if accept and self._host_pressure_blocks_ckpt():
+                accept = False
+                if self._is_global_rank0() and env_bool("ENN_DCP_DEBUG", False):
+                    _LOGGER.warning(
+                        "DCP request skipped due to host pressure (avail/used thresholds)."
+                    )
             with contextlib.suppress(Exception):
                 if self._inflight_lock.exists():
                     accept = False
@@ -4131,6 +4337,8 @@ class Checkpointer:
                             accept_local = accept_local and (
                                 not self._inflight_lock.exists()
                             )
+                        if accept_local and self._host_pressure_blocks_ckpt():
+                            accept_local = False
                         if accept_local:
                             accept_local = self._try_acquire_inflight_lock(
                                 epoch_i

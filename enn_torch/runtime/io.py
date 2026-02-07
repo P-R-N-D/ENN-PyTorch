@@ -250,7 +250,7 @@ class Builder:
                     state_dict={
                         "model": get_model_state_dict(
                             model,
-                            options=StateDictOptions(full_state_dict=True),
+                            options=StateDictOptions(full_state_dict=False),
                         )
                     },
                     storage_writer=FileSystemWriter(str(p)),
