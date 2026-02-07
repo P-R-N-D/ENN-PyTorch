@@ -193,8 +193,28 @@ def _find_latest_dcp_epoch_dir(ckpt_dir: str | None) -> str | None:
             continue
         if not entry.name.startswith("epoch_"):
             continue
-        if os.path.isfile(os.path.join(entry.path, "done.json")):
-            epoch_dirs.append(entry.path)
+        done_path = os.path.join(entry.path, ".done")
+        failed_path = os.path.join(entry.path, ".failed")
+        if os.path.exists(failed_path):
+            continue
+        if not os.path.isfile(done_path):
+            continue
+        ok = False
+        with contextlib.suppress(Exception):
+            raw = Path(done_path).read_text(encoding="utf-8").strip()
+            raw = raw.replace("\\n", "\n")
+            obj = json.loads(raw) if raw else None
+            if isinstance(obj, dict) and obj.get("status") == "ok":
+                if obj.get("epoch_dir") in (None, "", entry.name):
+                    ok = True
+        if not ok:
+            continue
+        with contextlib.suppress(Exception):
+            entries = os.listdir(entry.path)
+            non_marker = [n for n in entries if n not in {".done", ".failed"} and not n.startswith(".done.tmp")]
+            if len(non_marker) == 0:
+                continue
+        epoch_dirs.append(entry.path)
     if not epoch_dirs:
         return None
     epoch_dirs.sort()

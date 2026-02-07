@@ -2529,6 +2529,57 @@ class Checkpointer:
     def _done_file(self, epoch_dir: Path) -> Path:
         return epoch_dir / ".done"
 
+    def _failed_file(self, epoch_dir: Path) -> Path:
+        return epoch_dir / ".failed"
+
+    def _atomic_write_text(self, path: Path, text: str) -> None:
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        tmp.write_text(text, encoding="utf-8")
+        tmp.replace(path)
+
+    def _atomic_write_json(self, path: Path, obj: dict) -> None:
+        self._atomic_write_text(path, json.dumps(obj, ensure_ascii=False, sort_keys=True) + "\n")
+
+    def _done_payload(self, *, epoch_dir: Path) -> dict:
+        return {
+            "status": "ok",
+            "epoch_dir": epoch_dir.name,
+            "created_at_unix": int(time.time()),
+            "rank": int(getattr(self, "_rank", 0) or 0),
+            "world_size": int(getattr(self, "_world", 1) or 1),
+            "torch_version": getattr(torch, "__version__", "unknown"),
+        }
+
+    def _finalize_inflight(self, *, success: bool) -> None:
+        epoch_dir = getattr(self, "_inflight_epoch_dir", None)
+        if isinstance(epoch_dir, Path):
+            if success:
+                with contextlib.suppress(Exception):
+                    ff = self._failed_file(epoch_dir)
+                    if ff.exists():
+                        ff.unlink()
+                with contextlib.suppress(Exception):
+                    self._atomic_write_json(self._done_file(epoch_dir), self._done_payload(epoch_dir=epoch_dir))
+            else:
+                deleted = False
+                try:
+                    shutil.rmtree(epoch_dir)
+                    deleted = True
+                except Exception:
+                    deleted = False
+                if not deleted:
+                    with contextlib.suppress(Exception):
+                        self._atomic_write_text(self._failed_file(epoch_dir), "failed\n")
+
+        if success and getattr(self, "_rank", 0) == 0:
+            with contextlib.suppress(Exception):
+                self._cleanup_keep_last()
+
+        self._resp = None
+        self._staging_waited = True
+        if hasattr(self, "_inflight_epoch_dir"):
+            delattr(self, "_inflight_epoch_dir")
+
     def _ensure_stager(self) -> object:
         if self._stager is None:
             from torch.distributed.checkpoint.staging import DefaultStager
@@ -2560,7 +2611,9 @@ class Checkpointer:
         **kwargs: Any,
     ) -> bool:
         if block_if_busy and self._resp is not None:
-            self._wait_upload()
+            success = self._wait_upload()
+            self._finalize_inflight(success=bool(success))
+            self._maybe_start()
 
         self._pending = (int(epoch), model, optimizer, save_optimizer, extra_state)
         self._maybe_start()
@@ -2588,22 +2641,10 @@ class Checkpointer:
                 try:
                     fut.result()
                 except Exception:
+                    success = False
                     if strict:
                         raise
-                    success = False
-                if success:
-                    try:
-                        epoch_dir = getattr(self, "_inflight_epoch_dir", None)
-                        if isinstance(epoch_dir, Path):
-                            with contextlib.suppress(Exception):
-                                self._done_file(epoch_dir).write_text("ok\\n", encoding="utf-8")
-                    finally:
-                        if self._rank == 0:
-                            self._cleanup_keep_last()
-                self._resp = None
-                self._staging_waited = True
-                if hasattr(self, "_inflight_epoch_dir"):
-                    delattr(self, "_inflight_epoch_dir")
+                self._finalize_inflight(success=success)
 
         self._maybe_start()
 
@@ -2612,18 +2653,26 @@ class Checkpointer:
             self._resp = None
             self._pending = None
             return
-        self._wait_upload()
+        success = self._wait_upload()
+        self._finalize_inflight(success=bool(success))
         self._maybe_start()
-        self._wait_upload()
+        success = self._wait_upload()
+        self._finalize_inflight(success=bool(success))
 
-    def _wait_upload(self) -> None:
+    def _wait_upload(self) -> bool:
         if self._resp is None:
-            return
+            return True
         fut = getattr(self._resp, "upload_completion", None)
         if fut is None:
-            return
-        with contextlib.suppress(Exception):
+            return True
+        strict = bool(env_bool("ENN_DCP_RECIPE_STRICT", default=False))
+        try:
             fut.result()
+            return True
+        except Exception:
+            if strict:
+                raise
+            return False
 
     def _maybe_start(self) -> None:
         if self._resp is not None:
