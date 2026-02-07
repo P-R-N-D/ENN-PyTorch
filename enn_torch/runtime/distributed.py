@@ -2604,27 +2604,48 @@ class Checkpointer:
     def _resolve_dcp_process_group(self, pg: object | None) -> object | None:
         if not self._is_distributed() or pg is None:
             return pg
-        try:
-            if pg is dist.group.WORLD:
-                return pg
-        except Exception:
-            pass
+        def _cfg(g: object) -> str:
+            with contextlib.suppress(Exception):
+                return str(dist.get_backend_config(g)).lower()
+            with contextlib.suppress(Exception):
+                return str(dist.get_backend(g)).lower()
+            return ""
 
-        be = ""
-        with contextlib.suppress(Exception):
-            be = str(dist.get_backend(pg)).lower()
-        if "gloo" in be:
+        cfg = _cfg(pg)
+        cfg_l = (cfg or "").lower()
+
+        if "gloo" in cfg_l or "cpu:gloo" in cfg_l:
             return pg
 
-        if be in {"nccl", "xccl", "hccl"}:
+        is_world = False
+        with contextlib.suppress(Exception):
+            is_world = pg is dist.group.WORLD
+        if is_world:
             gloo_pg = None
             with contextlib.suppress(Exception):
                 gloo_pg = _get_gloox_gloo_process_group(pg)
             if gloo_pg is not None:
                 if self._is_global_rank0() and env_bool("ENN_DCP_DEBUG", False):
                     _LOGGER.warning(
-                        "DCP subgroup backend=%s -> using gloo control process group for checkpoint coordination.",
-                        be,
+                        "DCP WORLD backend=%s -> using gloo process group for checkpoint coordination.",
+                        cfg_l or "unknown",
+                    )
+                return gloo_pg
+            return pg
+
+        accel_only = (
+            (cfg_l in {"nccl", "xccl", "hccl"})
+            or (("nccl" in cfg_l or "xccl" in cfg_l or "hccl" in cfg_l) and ("gloo" not in cfg_l))
+        )
+        if accel_only:
+            gloo_pg = None
+            with contextlib.suppress(Exception):
+                gloo_pg = _get_gloox_gloo_process_group(pg)
+            if gloo_pg is not None:
+                if self._is_global_rank0() and env_bool("ENN_DCP_DEBUG", False):
+                    _LOGGER.warning(
+                        "DCP subgroup backend=%s -> using gloo process group for checkpoint coordination.",
+                        cfg_l or "unknown",
                     )
                 return gloo_pg
         return pg
@@ -3925,15 +3946,25 @@ class Checkpointer:
                 if bool(getattr(self, "_dcp_async_disabled_no_cpu", False)):
                     use_async_save = False
                 if use_async_save and self._is_distributed() and pg_for_dcp is not None:
-                    be = ""
+                    cfg = ""
                     with contextlib.suppress(Exception):
-                        be = str(dist.get_backend(pg_for_dcp)).lower()
-                    if be in {"nccl", "xccl", "hccl"}:
+                        cfg = str(dist.get_backend_config(pg_for_dcp)).lower()
+                    if not cfg:
+                        with contextlib.suppress(Exception):
+                            cfg = str(dist.get_backend(pg_for_dcp)).lower()
+                    cfg_l = (cfg or "").lower()
+
+                    cpu_capable = ("gloo" in cfg_l) or ("cpu:gloo" in cfg_l)
+                    accel_only = (
+                        (cfg_l in {"nccl", "xccl", "hccl"})
+                        or (("nccl" in cfg_l or "xccl" in cfg_l or "hccl" in cfg_l) and ("gloo" not in cfg_l))
+                    )
+                    if (not cpu_capable) and accel_only:
                         use_async_save = False
                         if self._is_global_rank0() and env_bool("ENN_DCP_DEBUG", False):
                             _LOGGER.warning(
-                                "DCP async_save skipped (no CPU-capable process group) backend=%s; using dcp.save instead.",
-                                be,
+                                "DCP async_save skipped (no CPU-capable process group) cfg=%s; using dcp.save instead.",
+                                cfg_l or "unknown",
                             )
 
                 if use_async_save:
