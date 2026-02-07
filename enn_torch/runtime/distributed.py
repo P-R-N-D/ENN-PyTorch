@@ -2562,12 +2562,13 @@ class Checkpointer:
                 self._dcp_should_participate = True
 
         if self._dcp_process_group is None and device is not None and self._is_distributed():
-            try:
-                ag = get_accel_group(device)
-                if ag is not None:
-                    self._dcp_process_group = ag
-            except Exception:
-                pass
+            if env_bool("ENN_DCP_USE_ACCEL_GROUP", False):
+                try:
+                    ag = get_accel_group(device)
+                    if ag is not None:
+                        self._dcp_process_group = ag
+                except Exception:
+                    pass
 
         self.dcp_root.mkdir(parents=True, exist_ok=True)
         try:
@@ -2599,6 +2600,34 @@ class Checkpointer:
 
     def _sync_device(self) -> str:
         return "cpu"
+
+    def _resolve_dcp_process_group(self, pg: object | None) -> object | None:
+        if not self._is_distributed() or pg is None:
+            return pg
+        try:
+            if pg is dist.group.WORLD:
+                return pg
+        except Exception:
+            pass
+
+        be = ""
+        with contextlib.suppress(Exception):
+            be = str(dist.get_backend(pg)).lower()
+        if "gloo" in be:
+            return pg
+
+        if be in {"nccl", "xccl", "hccl"}:
+            gloo_pg = None
+            with contextlib.suppress(Exception):
+                gloo_pg = _get_gloox_gloo_process_group(pg)
+            if gloo_pg is not None:
+                if self._is_global_rank0() and env_bool("ENN_DCP_DEBUG", False):
+                    _LOGGER.warning(
+                        "DCP subgroup backend=%s -> using gloo control process group for checkpoint coordination.",
+                        be,
+                    )
+                return gloo_pg
+        return pg
 
     def _bcast_bool_from_leader(self, flag: bool) -> bool:
         if not self._is_distributed():
@@ -3823,11 +3852,8 @@ class Checkpointer:
 
             pg_for_dcp = None
             if self._is_distributed():
-                pg_for_dcp = (
-                    self._dcp_process_group
-                    or get_accel_group(self._device or get_device())
-                    or dist.group.WORLD
-                )
+                pg_for_dcp = self._dcp_process_group or dist.group.WORLD
+                pg_for_dcp = self._resolve_dcp_process_group(pg_for_dcp)
 
             dcp_future: object | None = None
             if (
@@ -3899,21 +3925,16 @@ class Checkpointer:
                 if bool(getattr(self, "_dcp_async_disabled_no_cpu", False)):
                     use_async_save = False
                 if use_async_save and self._is_distributed() and pg_for_dcp is not None:
-                    try:
-                        is_world = pg_for_dcp is dist.group.WORLD
-                    except Exception:
-                        is_world = False
-                    if not is_world:
-                        be = ""
-                        with contextlib.suppress(Exception):
-                            be = str(dist.get_backend(pg_for_dcp)).lower()
-                        if be in {"nccl", "xccl", "hccl"}:
-                            use_async_save = False
-                            if self._is_global_rank0() and env_bool("ENN_DCP_DEBUG", False):
-                                _LOGGER.warning(
-                                    "DCP async_save skipped for subgroup backend=%s; using dcp.save instead.",
-                                    be,
-                                )
+                    be = ""
+                    with contextlib.suppress(Exception):
+                        be = str(dist.get_backend(pg_for_dcp)).lower()
+                    if be in {"nccl", "xccl", "hccl"}:
+                        use_async_save = False
+                        if self._is_global_rank0() and env_bool("ENN_DCP_DEBUG", False):
+                            _LOGGER.warning(
+                                "DCP async_save skipped (no CPU-capable process group) backend=%s; using dcp.save instead.",
+                                be,
+                            )
 
                 if use_async_save:
                     try:
