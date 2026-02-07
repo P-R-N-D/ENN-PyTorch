@@ -2601,6 +2601,75 @@ class Checkpointer:
     def _sync_device(self) -> str:
         return "cpu"
 
+    def _host_pressure_blocks_ckpt(self) -> bool:
+        try:
+            min_avail_mb = int(env_int("ENN_DCP_MIN_HOST_AVAIL_MB", 0) or 0)
+        except Exception:
+            min_avail_mb = 0
+        try:
+            max_used_mb = int(env_int("ENN_DCP_MAX_HOST_USED_MB", 0) or 0)
+        except Exception:
+            max_used_mb = 0
+        if min_avail_mb <= 0 and max_used_mb <= 0:
+            return False
+
+        avail = None
+        total = None
+        with contextlib.suppress(Exception):
+            avail = Memory.available()
+        with contextlib.suppress(Exception):
+            total = Memory.total()
+        if not isinstance(avail, int) or avail <= 0:
+            return False
+
+        if min_avail_mb > 0:
+            if avail < int(min_avail_mb) * 1024 * 1024:
+                return True
+
+        if max_used_mb > 0 and isinstance(total, int) and total > 0:
+            used = int(total) - int(avail)
+            if used > int(max_used_mb) * 1024 * 1024:
+                return True
+
+        return False
+
+    @staticmethod
+    def _try_deprioritize_ckpt_io() -> None:
+        if not env_bool("ENN_DCP_IONICE", False):
+            return
+        exe = shutil.which("ionice")
+        if not exe:
+            return
+        try:
+            import subprocess
+        except Exception:
+            return
+        try:
+            cls = int(env_int("ENN_DCP_IONICE_CLASS", 2) or 2)
+        except Exception:
+            cls = 2
+        try:
+            lvl = int(env_int("ENN_DCP_IONICE_LEVEL", 7) or 7)
+        except Exception:
+            lvl = 7
+        cls = int(cls)
+        lvl = int(max(0, min(7, int(lvl))))
+        try:
+            tid = int(threading.get_native_id())
+        except Exception:
+            tid = int(os.getpid())
+        cmd = [exe, "-c", str(cls)]
+        if cls in (1, 2):
+            cmd += ["-n", str(lvl)]
+        cmd += ["-p", str(int(tid))]
+        with contextlib.suppress(Exception):
+            subprocess.run(
+                cmd,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+            )
+
     def _resolve_dcp_process_group(self, pg: object | None) -> object | None:
         if not self._is_distributed() or pg is None:
             return pg
@@ -3602,6 +3671,7 @@ class Checkpointer:
     ) -> None:
         epoch_i = int(epoch)
         epoch_dir = self._epoch_dir(epoch_i)
+        self._try_deprioritize_ckpt_io()
         pending_exc: Exception | None = None
         try:
             want_kind = "active"
@@ -3789,6 +3859,7 @@ class Checkpointer:
         epoch_i = int(epoch)
         epoch_dir = self._epoch_dir(epoch_i)
         epoch_dir.mkdir(parents=True, exist_ok=True)
+        self._try_deprioritize_ckpt_io()
 
         pending_exc: Exception | None = None
         try:
@@ -3883,14 +3954,9 @@ class Checkpointer:
                 and (not bool(getattr(self, "_dcp_async_disabled_no_cpu", False)))
             ):
                 raw = os.environ.get("ENN_DCP_ASYNC_TYPE", None)
-                if raw is None:
-                    async_type = "thread"
-                else:
-                    async_type = str(raw).strip().lower()
+                async_type = "auto" if raw is None else str(raw).strip().lower()
 
-                if raw is not None and (
-                    (not async_type) or async_type in {"auto", "default", "none", "null"}
-                ):
+                if (not async_type) or async_type in {"auto", "default", "none", "null", ""}:
                     try:
                         w = int(getattr(self, "_world", 1) or 1)
                     except Exception:
@@ -4108,6 +4174,12 @@ class Checkpointer:
             with self._pending_lock:
                 if self._pending_dcp:
                     accept = False
+            if accept and self._host_pressure_blocks_ckpt():
+                accept = False
+                if self._is_global_rank0() and env_bool("ENN_DCP_DEBUG", False):
+                    _LOGGER.warning(
+                        "DCP request skipped due to host pressure (avail/used thresholds)."
+                    )
             with contextlib.suppress(Exception):
                 if self._inflight_lock.exists():
                     accept = False
@@ -4131,6 +4203,8 @@ class Checkpointer:
                             accept_local = accept_local and (
                                 not self._inflight_lock.exists()
                             )
+                        if accept_local and self._host_pressure_blocks_ckpt():
+                            accept_local = False
                         if accept_local:
                             accept_local = self._try_acquire_inflight_lock(
                                 epoch_i

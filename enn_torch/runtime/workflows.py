@@ -385,7 +385,7 @@ def _save_model_checkpoint(
             m_sd = get_model_state_dict(
                 model,
                 options=StateDictOptions(
-                    full_state_dict=True, cpu_offload=bool(dcp_cpu_offload)
+                    full_state_dict=False, cpu_offload=bool(dcp_cpu_offload)
                 ),
             )
             save(
@@ -944,7 +944,7 @@ def load_weights(
                 getattr(model, "in_dim", None),
                 getattr(model, "out_shape", ()) or (),
             )
-        opts = StateDictOptions(full_state_dict=True)
+        opts = StateDictOptions(full_state_dict=False)
         eager_ctx = getattr(model, "eager_for_export", None)
         cm = eager_ctx() if callable(eager_ctx) else contextlib.nullcontext()
         with cm:
@@ -952,7 +952,7 @@ def load_weights(
             load(state_dict={"model": m_sd}, storage_reader=reader)
             resize_scaler_buffer(model, m_sd)
             set_model_state_dict(
-                model, m_sd, options=StateDictOptions(strict=False)
+                model, m_sd, options=StateDictOptions(full_state_dict=False, strict=False)
             )
         return meta if isinstance(meta, dict) else None
 
@@ -1080,7 +1080,7 @@ def load_model(
             meta_data = reader.read_metadata()
         if not _resize_scaler_buffers_from_metadata(model, meta_data):
             _resize_scaler_buffers_for_shape(model, use_in_dim, use_out_shape)
-        opts = StateDictOptions(full_state_dict=True)
+        opts = StateDictOptions(full_state_dict=False)
         eager_ctx = getattr(model, "eager_for_export", None)
         cm = eager_ctx() if callable(eager_ctx) else contextlib.nullcontext()
         with cm:
@@ -1088,7 +1088,7 @@ def load_model(
             load(state_dict={"model": m_sd}, storage_reader=reader)
             resize_scaler_buffer(model, m_sd)
             set_model_state_dict(
-                model, m_sd, options=StateDictOptions(strict=False)
+                model, m_sd, options=StateDictOptions(full_state_dict=False, strict=False)
             )
         return model
     if not p.exists():
@@ -1549,7 +1549,7 @@ def train(
                 get_model_state_dict(
                     model,
                     options=StateDictOptions(
-                        full_state_dict=True, cpu_offload=True
+                        full_state_dict=False, cpu_offload=True
                     ),
                 )
             )
@@ -1569,7 +1569,7 @@ def train(
             )
             resize_scaler_buffer(model, m_sd)
             set_model_state_dict(
-                model, m_sd, options=StateDictOptions(strict=False)
+                model, m_sd, options=StateDictOptions(full_state_dict=False, strict=False)
             )
         _update_history(model, ckpt_dir, epochs, val_frac, num_samples_dataset)
         if export_path is not None and isinstance(model, torch.nn.Module):
