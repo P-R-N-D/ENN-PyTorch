@@ -3972,7 +3972,11 @@ class Checkpointer:
                         dcp_future = dcp.async_save(**kwargs)
                     except AssertionError as exc:
                         msg = str(exc)
-                        msg_l = msg.lower().replace("\\n", "\n")
+                        msg_l = (
+                            msg.lower()
+                            .replace("\\r\\n", "\n")
+                            .replace("\\n", "\n")
+                        )
                         if (
                             ("cpu backend" in msg_l or "cpu backend must be enabled" in msg_l)
                             and "async" in msg_l
