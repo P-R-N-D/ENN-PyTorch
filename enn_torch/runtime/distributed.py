@@ -2562,12 +2562,13 @@ class Checkpointer:
                 self._dcp_should_participate = True
 
         if self._dcp_process_group is None and device is not None and self._is_distributed():
-            try:
-                ag = get_accel_group(device)
-                if ag is not None:
-                    self._dcp_process_group = ag
-            except Exception:
-                pass
+            if env_bool("ENN_DCP_USE_ACCEL_GROUP", False):
+                try:
+                    ag = get_accel_group(device)
+                    if ag is not None:
+                        self._dcp_process_group = ag
+                except Exception:
+                    pass
 
         self.dcp_root.mkdir(parents=True, exist_ok=True)
         try:
@@ -2599,6 +2600,55 @@ class Checkpointer:
 
     def _sync_device(self) -> str:
         return "cpu"
+
+    def _resolve_dcp_process_group(self, pg: object | None) -> object | None:
+        if not self._is_distributed() or pg is None:
+            return pg
+        def _cfg(g: object) -> str:
+            with contextlib.suppress(Exception):
+                return str(dist.get_backend_config(g)).lower()
+            with contextlib.suppress(Exception):
+                return str(dist.get_backend(g)).lower()
+            return ""
+
+        cfg = _cfg(pg)
+        cfg_l = (cfg or "").lower()
+
+        if "gloo" in cfg_l or "cpu:gloo" in cfg_l:
+            return pg
+
+        is_world = False
+        with contextlib.suppress(Exception):
+            is_world = pg is dist.group.WORLD
+        if is_world:
+            gloo_pg = None
+            with contextlib.suppress(Exception):
+                gloo_pg = _get_gloox_gloo_process_group(pg)
+            if gloo_pg is not None:
+                if self._is_global_rank0() and env_bool("ENN_DCP_DEBUG", False):
+                    _LOGGER.warning(
+                        "DCP WORLD backend=%s -> using gloo process group for checkpoint coordination.",
+                        cfg_l or "unknown",
+                    )
+                return gloo_pg
+            return pg
+
+        accel_only = (
+            (cfg_l in {"nccl", "xccl", "hccl"})
+            or (("nccl" in cfg_l or "xccl" in cfg_l or "hccl" in cfg_l) and ("gloo" not in cfg_l))
+        )
+        if accel_only:
+            gloo_pg = None
+            with contextlib.suppress(Exception):
+                gloo_pg = _get_gloox_gloo_process_group(pg)
+            if gloo_pg is not None:
+                if self._is_global_rank0() and env_bool("ENN_DCP_DEBUG", False):
+                    _LOGGER.warning(
+                        "DCP subgroup backend=%s -> using gloo process group for checkpoint coordination.",
+                        cfg_l or "unknown",
+                    )
+                return gloo_pg
+        return pg
 
     def _bcast_bool_from_leader(self, flag: bool) -> bool:
         if not self._is_distributed():
@@ -3823,11 +3873,8 @@ class Checkpointer:
 
             pg_for_dcp = None
             if self._is_distributed():
-                pg_for_dcp = (
-                    self._dcp_process_group
-                    or get_accel_group(self._device or get_device())
-                    or dist.group.WORLD
-                )
+                pg_for_dcp = self._dcp_process_group or dist.group.WORLD
+                pg_for_dcp = self._resolve_dcp_process_group(pg_for_dcp)
 
             dcp_future: object | None = None
             if (
@@ -3899,28 +3946,41 @@ class Checkpointer:
                 if bool(getattr(self, "_dcp_async_disabled_no_cpu", False)):
                     use_async_save = False
                 if use_async_save and self._is_distributed() and pg_for_dcp is not None:
-                    try:
-                        is_world = pg_for_dcp is dist.group.WORLD
-                    except Exception:
-                        is_world = False
-                    if not is_world:
-                        be = ""
+                    cfg = ""
+                    with contextlib.suppress(Exception):
+                        cfg = str(dist.get_backend_config(pg_for_dcp)).lower()
+                    if not cfg:
                         with contextlib.suppress(Exception):
-                            be = str(dist.get_backend(pg_for_dcp)).lower()
-                        if be in {"nccl", "xccl", "hccl"}:
-                            use_async_save = False
-                            if self._is_global_rank0() and env_bool("ENN_DCP_DEBUG", False):
-                                _LOGGER.warning(
-                                    "DCP async_save skipped for subgroup backend=%s; using dcp.save instead.",
-                                    be,
-                                )
+                            cfg = str(dist.get_backend(pg_for_dcp)).lower()
+                    cfg_l = (cfg or "").lower()
+
+                    cpu_capable = ("gloo" in cfg_l) or ("cpu:gloo" in cfg_l)
+                    accel_only = (
+                        (cfg_l in {"nccl", "xccl", "hccl"})
+                        or (("nccl" in cfg_l or "xccl" in cfg_l or "hccl" in cfg_l) and ("gloo" not in cfg_l))
+                    )
+                    if (not cpu_capable) and accel_only:
+                        use_async_save = False
+                        if self._is_global_rank0() and env_bool("ENN_DCP_DEBUG", False):
+                            _LOGGER.warning(
+                                "DCP async_save skipped (no CPU-capable process group) cfg=%s; using dcp.save instead.",
+                                cfg_l or "unknown",
+                            )
 
                 if use_async_save:
                     try:
                         dcp_future = dcp.async_save(**kwargs)
                     except AssertionError as exc:
                         msg = str(exc)
-                        msg_l = msg.lower().replace("\\n", "\n")
+                        msg_l = msg.lower()
+                        msg_l = (
+                            msg_l.replace("\r\n", "\n")
+                            .replace("\r", "\n")
+                            .replace("\\r\\n", "\n")
+                            .replace("\\n", "\n")
+                            .replace("\\r", "\n")
+                        )
+                        msg_l = re.sub(r"\s+", " ", msg_l).strip()
                         if (
                             ("cpu backend" in msg_l or "cpu backend must be enabled" in msg_l)
                             and "async" in msg_l

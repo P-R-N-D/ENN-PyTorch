@@ -2244,16 +2244,32 @@ def epochs(
 
             if checkpointer is not None:
                 checkpointer.poll()
-                checkpointer.request_save_epoch(
-                    epoch=int(epoch_idx + 1),
-                    model=model,
-                    optimizer=optimizer,
-                    save_optimizer=getattr(ops, "ckpt_save_optimizer", None),
-                    extra_state={
-                        "epoch": int(epoch_idx + 1),
-                    },
-                    block_if_busy=False,
-                )
+                ws_now = 1
+                with contextlib.suppress(Exception):
+                    ws_now = int(get_world_size(device)) if is_distributed() else 1
+                if ws_now <= 1:
+                    if checkpointer.is_idle():
+                        checkpointer.request_save_epoch(
+                            epoch=int(epoch_idx + 1),
+                            model=model,
+                            optimizer=optimizer,
+                            save_optimizer=getattr(ops, "ckpt_save_optimizer", None),
+                            extra_state={
+                                "epoch": int(epoch_idx + 1),
+                            },
+                            block_if_busy=False,
+                        )
+                else:
+                    checkpointer.request_save_epoch(
+                        epoch=int(epoch_idx + 1),
+                        model=model,
+                        optimizer=optimizer,
+                        save_optimizer=getattr(ops, "ckpt_save_optimizer", None),
+                        extra_state={
+                            "epoch": int(epoch_idx + 1),
+                        },
+                        block_if_busy=False,
+                    )
             prev_comp_time += float(comp_time)
             prev_io_time += float(io_time)
             prev_flops += float(flops)
