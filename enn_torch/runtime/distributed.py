@@ -2692,7 +2692,7 @@ class Checkpointer:
         epoch_dir.parent.mkdir(parents=True, exist_ok=True)
 
         from torch.distributed.checkpoint.stateful import Stateful
-        from torch.distributed.checkpoint.state_dict import get_state_dict
+        from torch.distributed.checkpoint.state_dict import get_state_dict, set_state_dict
 
         class _AppState(Stateful):
             def __init__(self, m: nn.Module, opt: Optimizer | None) -> None:
@@ -2700,11 +2700,36 @@ class Checkpointer:
                 self.optimizer = opt
 
             def state_dict(self):
-                m_sd, o_sd = get_state_dict(self.model, self.optimizer)
+                if self.optimizer is None:
+                    m_sd, o_sd = get_state_dict(self.model, ())
+                    return {"model": m_sd, "optim": o_sd}
+                m_sd, o_sd = get_state_dict(self.model, (self.optimizer,))
                 return {"model": m_sd, "optim": o_sd}
 
             def load_state_dict(self, state_dict):
-                return None
+                model_sd = None
+                optim_sd = None
+                if isinstance(state_dict, dict):
+                    model_sd = state_dict.get("model")
+                    optim_sd = state_dict.get("optim", None)
+
+                has_optim_state = isinstance(optim_sd, dict) and len(optim_sd) > 0
+                if self.optimizer is None or not has_optim_state:
+                    set_state_dict(
+                        self.model,
+                        (),
+                        model_state_dict=model_sd,
+                        optim_state_dict={},
+                    )
+                    return
+
+                set_state_dict(
+                    self.model,
+                    (self.optimizer,),
+                    model_state_dict=model_sd,
+                    optim_state_dict=optim_sd,
+                )
+                return
 
         state: dict[str, Any] = {"app": _AppState(model, optimizer if save_opt else None)}
         if isinstance(extra_state, dict) and extra_state:
