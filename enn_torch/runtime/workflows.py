@@ -1314,7 +1314,7 @@ def train(
     loss_mask_value: float | None = None,
     export_path: PathLike | None = None,
     export_overwrite: bool = True,
-    checkpoint: bool = False,
+    checkpoint: bool = True,
     model_averaging: Optional[str] = "auto",
     **kwargs: Any,
 ) -> Model:
