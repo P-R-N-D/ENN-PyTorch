@@ -3137,7 +3137,8 @@ def infer(
                         if rows_i.device.type == "cpu"
                         else rows_i.to(device="cpu")
                     )
-                    force_cpu = env_bool("ENN_PRED_FORCE_CPU_COPY", default=False)
+                    force_cpu_default = bool(use_async_write) and bool(dev_type in ("cuda", "xpu"))
+                    force_cpu = env_bool("ENN_PRED_FORCE_CPU_COPY", default=force_cpu_default)
                     need_cpu_copy = bool(force_cpu) or bool(use_td_cg) or bool(cg_enabled)
                     with contextlib.suppress(Exception):
                         rows_cpu = rows_cpu.clone()
