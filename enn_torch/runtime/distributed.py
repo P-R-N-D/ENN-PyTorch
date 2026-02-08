@@ -2737,20 +2737,63 @@ class Checkpointer:
 
         import torch.distributed.checkpoint as dcp
         stager = self._ensure_stager()
+        storage_writer = None
+        with contextlib.suppress(Exception):
+            from torch.distributed.checkpoint import FileSystemWriter
+
+            default_sync = bool(int(getattr(self, "_world", 1) or 1) > 1)
+            sync_files = bool(
+                env_bool(
+                    ("ENN_DCP_SYNC_FILES", "ENN_CKPT_SYNC_FILES"),
+                    default=default_sync,
+                )
+            )
+            storage_writer = FileSystemWriter(
+                str(epoch_dir),
+                single_file_per_rank=True,
+                sync_files=sync_files,
+                thread_count=1,
+                overwrite=True,
+            )
 
         if not self.use_async:
-            dcp.save(state, checkpoint_id=str(epoch_dir))
+            try:
+                if storage_writer is not None:
+                    dcp.save(
+                        state,
+                        checkpoint_id=str(epoch_dir),
+                        storage_writer=storage_writer,
+                    )
+                else:
+                    dcp.save(state, checkpoint_id=str(epoch_dir))
+            except TypeError:
+                dcp.save(state, checkpoint_id=str(epoch_dir))
             if self._rank == 0:
                 with contextlib.suppress(Exception):
                     self._done_file(epoch_dir).write_text("ok\\n", encoding="utf-8")
                 self._cleanup_keep_last()
             return
 
-        self._resp = dcp.async_save(
-            state,
-            checkpoint_id=str(epoch_dir),
-            async_stager=stager,
-        )
+        try:
+            if storage_writer is not None:
+                self._resp = dcp.async_save(
+                    state,
+                    checkpoint_id=str(epoch_dir),
+                    storage_writer=storage_writer,
+                    async_stager=stager,
+                )
+            else:
+                self._resp = dcp.async_save(
+                    state,
+                    checkpoint_id=str(epoch_dir),
+                    async_stager=stager,
+                )
+        except TypeError:
+            self._resp = dcp.async_save(
+                state,
+                checkpoint_id=str(epoch_dir),
+                async_stager=stager,
+            )
         self._staging_waited = False
         setattr(self, "_inflight_epoch_dir", epoch_dir)
 

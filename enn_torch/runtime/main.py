@@ -1307,6 +1307,8 @@ def epochs(
                                                 average=True,
                                                 policy=dist_policy.collective,
                                             )
+                                        if checkpointer is not None:
+                                            checkpointer.await_staging()
                                         scaler.unscale_(optimizer)
                                         scaler.step(optimizer)
                                         scaler.update()
