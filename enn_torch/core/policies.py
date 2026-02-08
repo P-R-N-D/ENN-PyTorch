@@ -480,7 +480,10 @@ class WorkerPolicy:
                 "ENN_CKPT_WRITER_THREADS"
             )
             if explicit is None:
-                os.environ["ENN_DCP_WRITER_THREADS"] = str(max(1, int(wt)))
+                val = str(max(1, int(wt)))
+                os.environ["ENN_DCP_WRITER_THREADS"] = val
+                if env_str("ENN_CKPT_WRITER_THREADS") is None:
+                    os.environ["ENN_CKPT_WRITER_THREADS"] = val
 
 
 @dataclass

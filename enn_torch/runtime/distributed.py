@@ -2806,6 +2806,9 @@ class Checkpointer:
         if abort_inflight:
             self._resp = None
             self._staging_waited = True
+            with contextlib.suppress(Exception):
+                if hasattr(self, "_inflight_epoch_dir"):
+                    delattr(self, "_inflight_epoch_dir")
             return
         success = self._wait_upload()
         self._finalize_inflight(success=bool(success))
