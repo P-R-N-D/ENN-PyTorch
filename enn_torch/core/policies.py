@@ -91,6 +91,7 @@ class WorkerPolicy:
     intra_ops: int = 1
     inter_ops: int = 1
     compile_threads: int = 0
+    ckpt_writer_threads: int = 0
     num_workers: int = 1
     prebatch: int = 1
     prefetch_factor: int = 1
@@ -188,6 +189,29 @@ class WorkerPolicy:
         cap_mult = _default_thread_limit(
             ncpu_raw, is_accel=is_accel, nogil=_nogil
         )
+        try:
+            thr = int(
+                env_first_int(
+                    ("ENN_THREAD_CAP_THRESHOLD_CORES", "ENN_THREAD_CAP_THRESHOLD"),
+                    8,
+                )
+            )
+            low_mult = int(
+                env_first_int(
+                    ("ENN_THREAD_CAP_MULT_LOW", "ENN_THREAD_CAP_MULT_SMALL"), 2
+                )
+            )
+            high_mult = int(
+                env_first_int(
+                    ("ENN_THREAD_CAP_MULT_HIGH", "ENN_THREAD_CAP_MULT_LARGE"), 1
+                )
+            )
+            if int(ncpu_raw) <= int(thr):
+                cap_mult = max(1, int(low_mult))
+            else:
+                cap_mult = max(1, int(high_mult))
+        except Exception:
+            pass
         distribute_default = int(local_world_guess) > 1
         distribute = bool(
             env_first_int(
@@ -231,7 +255,39 @@ class WorkerPolicy:
                 0, min(int(compile_threads), int(max_compile))
             )
 
-        thread_cap = max(2, int(thread_cap_total) - int(compile_threads))
+        thread_cap_after_compile = max(
+            2, int(thread_cap_total) - int(compile_threads)
+        )
+        eff_cores_pre = max(
+            1, int(thread_cap_after_compile) // max(1, int(cap_mult))
+        )
+        ckpt_writer_threads = 0
+        req_ckpt = int(
+            env_first_int(
+                ("ENN_DCP_WRITER_THREADS", "ENN_CKPT_WRITER_THREADS"), 0
+            )
+            or 0
+        )
+        if req_ckpt > 0:
+            ckpt_writer_threads = req_ckpt
+        else:
+            if eff_cores_pre <= 4:
+                ckpt_writer_threads = 1
+            elif eff_cores_pre <= 8:
+                ckpt_writer_threads = 2
+            else:
+                ckpt_writer_threads = 4
+        min_non_ckpt = 2
+        ckpt_writer_threads = max(
+            0,
+            min(
+                int(ckpt_writer_threads),
+                max(0, int(thread_cap_after_compile) - int(min_non_ckpt)),
+            ),
+        )
+        thread_cap = max(
+            2, int(thread_cap_after_compile) - int(ckpt_writer_threads)
+        )
         eff_cores = max(1, int(thread_cap) // max(1, int(cap_mult)))
         soft_inflight = 8 if is_accel else 4
         with contextlib.suppress(Exception):
@@ -356,6 +412,7 @@ class WorkerPolicy:
             intra_ops=int(intra_ops),
             inter_ops=int(inter_ops),
             compile_threads=int(compile_threads),
+            ckpt_writer_threads=int(ckpt_writer_threads),
             num_workers=int(num_workers),
             prebatch=int(prebatch),
             prefetch_factor=int(prefetch_factor),
@@ -368,6 +425,7 @@ class WorkerPolicy:
             "intra_ops": int(self.intra_ops),
             "inter_ops": int(self.inter_ops),
             "compile_threads": int(getattr(self, "compile_threads", 0) or 0),
+            "ckpt_writer_threads": int(getattr(self, "ckpt_writer_threads", 0) or 0),
             "num_workers": int(self.num_workers),
             "max_concurrency": int(self.max_concurrency),
             "prebatch": int(self.prebatch),
@@ -412,6 +470,20 @@ class WorkerPolicy:
                 os.environ["ENN_INDUCTOR_COMPILE_THREADS"] = val
                 if env_str("TORCHINDUCTOR_COMPILE_THREADS") is None:
                     os.environ["TORCHINDUCTOR_COMPILE_THREADS"] = val
+
+        try:
+            wt = int(getattr(self, "ckpt_writer_threads", 0) or 0)
+        except Exception:
+            wt = 0
+        if wt > 0:
+            explicit = env_str("ENN_DCP_WRITER_THREADS") or env_str(
+                "ENN_CKPT_WRITER_THREADS"
+            )
+            if explicit is None:
+                val = str(max(1, int(wt)))
+                os.environ["ENN_DCP_WRITER_THREADS"] = val
+                if env_str("ENN_CKPT_WRITER_THREADS") is None:
+                    os.environ["ENN_CKPT_WRITER_THREADS"] = val
 
 
 @dataclass

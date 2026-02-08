@@ -2496,6 +2496,7 @@ class Checkpointer:
         self.use_async = bool(use_async)
         self.mmap_load = mmap_load
         self._device = device
+        self._cpu_offload = cpu_offload
 
         self._rank = 0
         self._world = 1
@@ -2512,8 +2513,10 @@ class Checkpointer:
 
         self._resp: object | None = None
         self._staging_waited: bool = True
-        self._pending: tuple[int, nn.Module, Optimizer | None, bool | None, dict[str, Any] | None] | None = None
         self._stager: object | None = None
+
+    def is_busy(self) -> bool:
+        return self._resp is not None
 
     def _is_distributed(self) -> bool:
         return bool(
@@ -2597,7 +2600,147 @@ class Checkpointer:
         )
 
     def is_idle(self) -> bool:
-        return self._resp is None and self._pending is None
+        return self._resp is None
+
+    def try_request_save_epoch_collective(
+        self,
+        *,
+        epoch: int,
+        model: nn.Module,
+        optimizer: Optimizer | None = None,
+        save_optimizer: bool | None = None,
+        extra_state: dict[str, Any] | None = None,
+        block_if_busy: bool = False,
+        device: torch.device | None = None,
+        group: object | None = None,
+        lane: str = "control",
+        **kwargs: Any,
+    ) -> bool:
+        self.poll()
+
+        if not self._is_distributed():
+            return bool(
+                self.request_save_epoch(
+                    epoch=int(epoch),
+                    model=model,
+                    optimizer=optimizer,
+                    save_optimizer=save_optimizer,
+                    extra_state=extra_state,
+                    block_if_busy=block_if_busy,
+                    **kwargs,
+                )
+            )
+
+        dist = self._dist
+        if dist is None:
+            return False
+
+        ready_local = 1 if self.is_idle() else 0
+
+        lane_s = str(lane or "control").strip().lower()
+        prefer_accel = lane_s in {"accelerator", "accel", "cuda", "nccl", "xpu", "xccl"}
+        prefer_control = lane_s in {"control", "cpu", "gloo", "", "auto"}
+
+        def _resolve_accel_device() -> torch.device:
+            dev = device or getattr(self, "_device", None)
+            if dev is None:
+                dev = get_device()
+            dev = torch.device(dev) if dev is not None else torch.device("cpu")
+            if dev.type == "cpu":
+                with contextlib.suppress(Exception):
+                    if hasattr(torch, "cuda") and torch.cuda.is_available():
+                        dev = torch.device("cuda", torch.cuda.current_device())
+                with contextlib.suppress(Exception):
+                    if (
+                        dev.type == "cpu"
+                        and hasattr(torch, "xpu")
+                        and callable(getattr(torch.xpu, "is_available", None))
+                        and torch.xpu.is_available()
+                    ):
+                        dev = torch.device("xpu", torch.xpu.current_device())
+            return dev
+
+        pg = None
+        tensor_device = torch.device("cpu")
+
+        if prefer_accel and not prefer_control:
+            pg = get_accel_process_group(device)
+            if pg is not None:
+                tensor_device = _resolve_accel_device()
+        else:
+            if group is not None and is_process_group(group):
+                pg = get_control_process_group(group)
+            if pg is None:
+                pg = get_control_process_group(None)
+            if pg is None:
+                pg = get_accel_process_group(device)
+                if pg is not None:
+                    tensor_device = _resolve_accel_device()
+
+        if pg is None:
+            pg = dist.group.WORLD
+            be = ""
+            with contextlib.suppress(Exception):
+                be = str(dist.get_backend(pg)).lower()
+            if any(x in be for x in ("nccl", "xccl", "hccl", "rccl")):
+                tensor_device = _resolve_accel_device()
+            else:
+                tensor_device = torch.device("cpu")
+
+        if tensor_device.type == "cpu":
+            be = ""
+            with contextlib.suppress(Exception):
+                be = str(dist.get_backend(pg)).lower()
+            if any(x in be for x in ("nccl", "xccl", "hccl", "rccl")):
+                raise RuntimeError(
+                    "collective checkpoint readiness: resolved CPU tensor device for a "
+                    f"non-CPU backend ({be}); pass device=... or ensure accelerator is available"
+                )
+
+        t_ready = torch.tensor(
+            [int(ready_local)], device=tensor_device, dtype=torch.int32
+        )
+        dist.all_reduce(t_ready, op=dist.ReduceOp.MIN, group=pg)
+        if int(t_ready.item()) != 1:
+            return False
+
+        started_local = 0
+        start_exc: BaseException | None = None
+        try:
+            started_local = (
+                1
+                if self.request_save_epoch(
+                    epoch=int(epoch),
+                    model=model,
+                    optimizer=optimizer,
+                    save_optimizer=save_optimizer,
+                    extra_state=extra_state,
+                    block_if_busy=block_if_busy,
+                    **kwargs,
+                )
+                else 0
+            )
+        except BaseException as exc:
+            started_local = 0
+            start_exc = exc
+
+        t_started = torch.tensor(
+            [int(started_local)], device=tensor_device, dtype=torch.int32
+        )
+        dist.all_reduce(t_started, op=dist.ReduceOp.MIN, group=pg)
+        if int(t_started.item()) != 1:
+            with contextlib.suppress(Exception):
+                self.close(abort_inflight=True)
+            if start_exc is not None:
+                raise RuntimeError(
+                    "collective checkpoint start failed on at least one rank: "
+                    f"{type(start_exc).__name__}: {start_exc}"
+                ) from start_exc
+            raise RuntimeError(
+                "collective checkpoint start failed on at least one rank"
+            )
+
+        return True
 
     def request_save_epoch(
         self,
@@ -2610,14 +2753,26 @@ class Checkpointer:
         block_if_busy: bool = False,
         **kwargs: Any,
     ) -> bool:
-        if block_if_busy and self._resp is not None:
+        self.poll()
+
+        if self._resp is not None:
+            if not bool(block_if_busy):
+                return False
             success = self._wait_upload()
             self._finalize_inflight(success=bool(success))
-            self._maybe_start()
 
-        self._pending = (int(epoch), model, optimizer, save_optimizer, extra_state)
-        self._maybe_start()
-        return True
+        if save_optimizer is None:
+            save_optimizer = self._save_optimizer_default()
+
+        return bool(
+            self._start_save(
+                epoch=int(epoch),
+                model=model,
+                optimizer=optimizer,
+                save_opt=bool(save_optimizer),
+                extra_state=extra_state,
+            )
+        )
 
     def await_staging(self) -> None:
         if self._resp is None:
@@ -2645,19 +2800,19 @@ class Checkpointer:
                     if strict:
                         raise
                 self._finalize_inflight(success=success)
-
-        self._maybe_start()
+        return
 
     def close(self, *, abort_inflight: bool = True) -> None:
         if abort_inflight:
             self._resp = None
-            self._pending = None
+            self._staging_waited = True
+            with contextlib.suppress(Exception):
+                if hasattr(self, "_inflight_epoch_dir"):
+                    delattr(self, "_inflight_epoch_dir")
             return
         success = self._wait_upload()
         self._finalize_inflight(success=bool(success))
-        self._maybe_start()
-        success = self._wait_upload()
-        self._finalize_inflight(success=bool(success))
+        return
 
     def _wait_upload(self) -> bool:
         if self._resp is None:
@@ -2674,25 +2829,32 @@ class Checkpointer:
                 raise
             return False
 
-    def _maybe_start(self) -> None:
+    def _start_save(
+        self,
+        *,
+        epoch: int,
+        model: nn.Module,
+        optimizer: Optimizer | None,
+        save_opt: bool,
+        extra_state: dict[str, Any] | None,
+    ) -> bool:
         if self._resp is not None:
-            return
-        if self._pending is None:
-            return
-        self._start_from_pending()
-
-    def _start_from_pending(self) -> None:
-        epoch, model, optimizer, save_opt, extra_state = self._pending
-        self._pending = None
-
-        if save_opt is None:
-            save_opt = self._save_optimizer_default()
+            return False
+        epoch = int(epoch)
+        save_opt = bool(save_opt)
 
         epoch_dir = self._epoch_dir(epoch)
         epoch_dir.parent.mkdir(parents=True, exist_ok=True)
 
         from torch.distributed.checkpoint.stateful import Stateful
         from torch.distributed.checkpoint.state_dict import get_state_dict, set_state_dict
+
+        opts = None
+        with contextlib.suppress(Exception):
+            from torch.distributed.checkpoint.state_dict import StateDictOptions
+
+            if self._cpu_offload is not None:
+                opts = StateDictOptions(cpu_offload=bool(self._cpu_offload))
 
         class _AppState(Stateful):
             def __init__(self, m: nn.Module, opt: Optimizer | None) -> None:
@@ -2701,9 +2863,17 @@ class Checkpointer:
 
             def state_dict(self):
                 if self.optimizer is None:
-                    m_sd, o_sd = get_state_dict(self.model, ())
+                    try:
+                        m_sd, o_sd = get_state_dict(self.model, (), options=opts)
+                    except TypeError:
+                        m_sd, o_sd = get_state_dict(self.model, ())
                     return {"model": m_sd, "optim": o_sd}
-                m_sd, o_sd = get_state_dict(self.model, (self.optimizer,))
+                try:
+                    m_sd, o_sd = get_state_dict(
+                        self.model, (self.optimizer,), options=opts
+                    )
+                except TypeError:
+                    m_sd, o_sd = get_state_dict(self.model, (self.optimizer,))
                 return {"model": m_sd, "optim": o_sd}
 
             def load_state_dict(self, state_dict):
@@ -2731,13 +2901,16 @@ class Checkpointer:
                 )
                 return
 
-        state: dict[str, Any] = {"app": _AppState(model, optimizer if save_opt else None)}
+        state: dict[str, Any] = {
+            "app": _AppState(model, optimizer if save_opt else None)
+        }
         if isinstance(extra_state, dict) and extra_state:
             state["extra"] = extra_state
 
         import torch.distributed.checkpoint as dcp
         stager = self._ensure_stager()
         storage_writer = None
+        planner = None
         with contextlib.suppress(Exception):
             from torch.distributed.checkpoint import FileSystemWriter
 
@@ -2748,22 +2921,58 @@ class Checkpointer:
                     default=default_sync,
                 )
             )
+            single_file = bool(
+                env_bool(
+                    (
+                        "ENN_DCP_SINGLE_FILE_PER_RANK",
+                        "ENN_CKPT_SINGLE_FILE_PER_RANK",
+                    ),
+                    default=False,
+                )
+            )
+            writer_threads = int(
+                env_int(
+                    ("ENN_DCP_WRITER_THREADS", "ENN_CKPT_WRITER_THREADS"),
+                    default=1,
+                )
+                or 1
+            )
+            writer_threads = max(1, min(64, int(writer_threads)))
             storage_writer = FileSystemWriter(
                 str(epoch_dir),
-                single_file_per_rank=True,
+                single_file_per_rank=single_file,
                 sync_files=sync_files,
-                thread_count=1,
+                thread_count=int(writer_threads),
                 overwrite=True,
             )
+
+        if env_bool(("ENN_DCP_USE_PLANNER", "ENN_CKPT_USE_PLANNER"), default=True):
+            with contextlib.suppress(Exception):
+                from torch.distributed.checkpoint import DefaultSavePlanner
+
+                planner = DefaultSavePlanner()
+            if planner is None:
+                with contextlib.suppress(Exception):
+                    from torch.distributed.checkpoint.planner import DefaultSavePlanner
+
+                    planner = DefaultSavePlanner()
 
         if not self.use_async:
             try:
                 if storage_writer is not None:
-                    dcp.save(
-                        state,
-                        checkpoint_id=str(epoch_dir),
-                        storage_writer=storage_writer,
-                    )
+                    try:
+                        dcp.save(
+                            state,
+                            checkpoint_id=str(epoch_dir),
+                            storage_writer=storage_writer,
+                            planner=planner,
+                        )
+                    except TypeError:
+                        dcp.save(
+                            state,
+                            checkpoint_id=str(epoch_dir),
+                            storage_writer=storage_writer,
+                        )
                 else:
                     dcp.save(state, checkpoint_id=str(epoch_dir))
             except TypeError:
@@ -2772,22 +2981,39 @@ class Checkpointer:
                 with contextlib.suppress(Exception):
                     self._done_file(epoch_dir).write_text("ok\\n", encoding="utf-8")
                 self._cleanup_keep_last()
-            return
+            return True
 
         try:
             if storage_writer is not None:
-                self._resp = dcp.async_save(
-                    state,
-                    checkpoint_id=str(epoch_dir),
-                    storage_writer=storage_writer,
-                    async_stager=stager,
-                )
+                try:
+                    self._resp = dcp.async_save(
+                        state,
+                        checkpoint_id=str(epoch_dir),
+                        storage_writer=storage_writer,
+                        async_stager=stager,
+                        planner=planner,
+                    )
+                except TypeError:
+                    self._resp = dcp.async_save(
+                        state,
+                        checkpoint_id=str(epoch_dir),
+                        storage_writer=storage_writer,
+                        async_stager=stager,
+                    )
             else:
-                self._resp = dcp.async_save(
-                    state,
-                    checkpoint_id=str(epoch_dir),
-                    async_stager=stager,
-                )
+                try:
+                    self._resp = dcp.async_save(
+                        state,
+                        checkpoint_id=str(epoch_dir),
+                        async_stager=stager,
+                        planner=planner,
+                    )
+                except TypeError:
+                    self._resp = dcp.async_save(
+                        state,
+                        checkpoint_id=str(epoch_dir),
+                        async_stager=stager,
+                    )
         except TypeError:
             self._resp = dcp.async_save(
                 state,
@@ -2796,6 +3022,7 @@ class Checkpointer:
             )
         self._staging_waited = False
         setattr(self, "_inflight_epoch_dir", epoch_dir)
+        return True
 
     def _cleanup_keep_last(self) -> None:
         try:
