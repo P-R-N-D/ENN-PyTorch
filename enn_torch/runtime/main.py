@@ -3815,7 +3815,7 @@ def process(*args: Any, **kwargs: Any) -> object:
                 )
             )
             checkpointer: Checkpointer | None = None
-            checkpoint_enabled = bool(getattr(ops, "checkpoint", False))
+            checkpoint_enabled = bool(getattr(ops, "checkpoint", True))
             if ops.ckpt_dir and checkpoint_enabled:
                 keep_last = max(
                     1,
