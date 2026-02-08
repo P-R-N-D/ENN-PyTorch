@@ -2701,8 +2701,8 @@ class Checkpointer:
 
             def state_dict(self):
                 if self.optimizer is None:
-                    m_sd, _ = get_state_dict(self.model, ())
-                    return {"model": m_sd}
+                    m_sd, o_sd = get_state_dict(self.model, ())
+                    return {"model": m_sd, "optim": o_sd}
                 m_sd, o_sd = get_state_dict(self.model, (self.optimizer,))
                 return {"model": m_sd, "optim": o_sd}
 
@@ -2713,12 +2713,13 @@ class Checkpointer:
                     model_sd = state_dict.get("model")
                     optim_sd = state_dict.get("optim", None)
 
-                if self.optimizer is None or optim_sd is None:
+                has_optim_state = isinstance(optim_sd, dict) and len(optim_sd) > 0
+                if self.optimizer is None or not has_optim_state:
                     set_state_dict(
                         self.model,
                         (),
                         model_state_dict=model_sd,
-                        optim_state_dict=None,
+                        optim_state_dict={},
                     )
                     return
 
