@@ -2769,6 +2769,10 @@ def infer(
             td_cg_max_bs = 0
             td_cg_target = None
             td_cg_x_inner_shape = None
+            force_single = False
+            broadcast_checked = False
+            detect_broadcast = bool(env_bool("ENN_PRED_DETECT_BATCH_BROADCAST", True))
+            broadcast_atol = float(env_float("ENN_PRED_BROADCAST_ATOL", 1e-6))
 
             def _td_predict(x: torch.Tensor) -> torch.Tensor:
                 out = run_model(x, calibrate_output=True, return_loss=False)
@@ -2981,7 +2985,7 @@ def infer(
                     if status_bar is not None:
                         status_bar.update(1)
                     continue
-                if (not td_cg_disabled) and (not td_cg_active):
+                if (not force_single) and (not td_cg_disabled) and (not td_cg_active):
                     _td_cudagraph(int(bs), X)
                 if row_ids is None:
                     if row_ids_buf is None or int(row_ids_buf.numel()) < bs:
@@ -3020,6 +3024,8 @@ def infer(
                     and (td_cg_mod is not None)
                     and (td_cg_mb is not None)
                 )
+                if force_single:
+                    use_td_cg = False
                 if use_td_cg and (td_cg_x_inner_shape is not None):
                     if tuple(int(d) for d in tuple(X.shape[1:])) != tuple(
                         td_cg_x_inner_shape
@@ -3031,7 +3037,9 @@ def infer(
                         td_cg_pad_buf = None
                         td_cg_x_inner_shape = None
                         use_td_cg = False
-                mb = int(td_cg_mb) if use_td_cg else int(mb_eager)
+                mb = (
+                    1 if force_single else (int(td_cg_mb) if use_td_cg else int(mb_eager))
+                )
                 predict_fn = td_cg_mod if use_td_cg else _td_predict
                 start = 0
                 while start < bs:
@@ -3125,6 +3133,49 @@ def infer(
                         )
                     if pad_n > 0:
                         preds = preds[:n_i]
+                    if (
+                        (not force_single)
+                        and bool(detect_broadcast)
+                        and (not broadcast_checked)
+                        and int(n_i) >= 2
+                        and hasattr(preds, "shape")
+                        and int(getattr(preds, "shape", (0,))[0]) >= 2
+                    ):
+                        broadcast_checked = True
+                        try:
+                            x0 = Xi[0].detach()
+                            x1 = Xi[1].detach()
+                            x_diff = (x0 - x1).abs().max()
+                            if float(x_diff.item()) > 0.0:
+                                y0 = preds[0].detach()
+                                y1 = preds[1].detach()
+                                y_diff = (y0 - y1).abs().max()
+                                if float(y_diff.item()) <= float(broadcast_atol):
+                                    _LOGGER.warning(
+                                        "[infer] detected batch-broadcasted predictions (inputs differ but outputs match within atol=%.3e). "
+                                        "Falling back to per-sample inference (microbatch=1) for correctness.",
+                                        float(broadcast_atol),
+                                    )
+                                    force_single = True
+                                    cg_enabled = False
+                                    td_cg_active = False
+                                    td_cg_disabled = True
+                                    td_cg_mb = None
+                                    td_cg_mod = None
+                                    td_cg_pad_buf = None
+                                    td_cg_x_inner_shape = None
+                                    use_td_cg = False
+                                    mb = 1
+                                    predict_fn = _td_predict
+                                    with contextlib.suppress(Exception):
+                                        setattr(model, "microbatch", 1)
+                                    preds_list: list[torch.Tensor] = []
+                                    for j in range(int(n_i)):
+                                        pj = _td_predict(Xi[j : j + 1])
+                                        preds_list.append(pj)
+                                    preds = torch.cat(preds_list, dim=0)
+                        except Exception:
+                            pass
                     rows_cpu = (
                         rows_i
                         if rows_i.device.type == "cpu"
@@ -3139,9 +3190,10 @@ def infer(
                         preds_cpu = preds.detach()
                         if getattr(preds_cpu, "device", None) is not None and preds_cpu.device.type != "cpu":
                             preds_cpu = preds_cpu.to(device="cpu")
-                        else:
-                            with contextlib.suppress(Exception):
-                                preds_cpu = preds_cpu.clone()
+                        if isinstance(preds_cpu, torch.Tensor) and (not preds_cpu.is_contiguous()):
+                            preds_cpu = preds_cpu.contiguous()
+                        with contextlib.suppress(Exception):
+                            preds_cpu = preds_cpu.clone()
                         writer.append(rows_cpu, preds_cpu)
                     else:
                         writer.append(rows_cpu, preds)
@@ -3763,7 +3815,8 @@ def process(*args: Any, **kwargs: Any) -> object:
                 )
             )
             checkpointer: Checkpointer | None = None
-            if ops.ckpt_dir:
+            checkpoint_enabled = bool(getattr(ops, "checkpoint", False))
+            if ops.ckpt_dir and checkpoint_enabled:
                 keep_last = max(
                     1,
                     int(

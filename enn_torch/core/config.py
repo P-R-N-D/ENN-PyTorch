@@ -819,6 +819,7 @@ class RuntimeConfig:
         None
     )
     ckpt_dir: Optional[str] = None
+    checkpoint: bool = False
     ckpt_cpu_offload: Optional[bool] = None
     ckpt_save_optimizer: Optional[bool] = None
     init_ckpt_dir: Optional[str] = None
@@ -848,6 +849,7 @@ class RuntimeConfig:
         {
             "sources",
             "ckpt_dir",
+            "checkpoint",
             "ckpt_cpu_offload",
             "ckpt_save_optimizer",
             "init_ckpt_dir",
@@ -987,6 +989,9 @@ class RuntimeConfig:
                 cfg_dict=cfg_dict,
                 sources=data["sources"],
                 ckpt_dir=str(data["ckpt_dir"]),
+                checkpoint=_coerce_bool(
+                    data.get("checkpoint", False), name="checkpoint"
+                ),
                 init_ckpt_dir=(
                     str(data.get("init_ckpt_dir"))
                     if data.get("init_ckpt_dir")
