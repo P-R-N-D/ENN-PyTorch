@@ -2244,46 +2244,27 @@ def epochs(
 
             if checkpointer is not None:
                 checkpointer.poll()
-                did_start_ckpt = False
-                try:
-                    did_start_ckpt = bool(
-                        checkpointer.try_request_save_epoch_collective(
-                            epoch=int(epoch_idx + 1),
-                            model=model,
-                            optimizer=optimizer,
-                            save_optimizer=getattr(ops, "ckpt_save_optimizer", None),
-                            extra_state={
-                                "epoch": int(epoch_idx + 1),
-                            },
-                            block_if_busy=False,
-                            device=device,
-                        )
+                did_start_ckpt = bool(
+                    checkpointer.try_request_save_epoch_collective(
+                        epoch=int(epoch_idx + 1),
+                        model=model,
+                        optimizer=optimizer,
+                        save_optimizer=getattr(ops, "ckpt_save_optimizer", None),
+                        extra_state={
+                            "epoch": int(epoch_idx + 1),
+                        },
+                        block_if_busy=False,
+                        device=device,
                     )
-                except Exception:
-                    if checkpointer.is_idle():
-                        did_start_ckpt = bool(
-                            checkpointer.request_save_epoch(
-                                epoch=int(epoch_idx + 1),
-                                model=model,
-                                optimizer=optimizer,
-                                save_optimizer=getattr(
-                                    ops, "ckpt_save_optimizer", None
-                                ),
-                                extra_state={
-                                    "epoch": int(epoch_idx + 1),
-                                },
-                                block_if_busy=False,
-                            )
-                        )
+                )
                 if did_start_ckpt:
                     checkpointer.await_staging()
                     if is_distributed():
-                        with contextlib.suppress(Exception):
-                            distributed_barrier(
-                                device,
-                                group=get_accel_group(device),
-                                lane="auto",
-                            )
+                        distributed_barrier(
+                            device,
+                            group=get_accel_group(device),
+                            lane="auto",
+                        )
             prev_comp_time += float(comp_time)
             prev_io_time += float(io_time)
             prev_flops += float(flops)

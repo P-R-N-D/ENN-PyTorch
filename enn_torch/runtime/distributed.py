@@ -2647,26 +2647,65 @@ class Checkpointer:
         if pg is None:
             pg = get_accel_process_group(device)
             if pg is None:
-                return False
-            tensor_device = device or get_device() or torch.device("cpu")
+                raise RuntimeError(
+                    "collective checkpoint readiness: no CPU-capable control group "
+                    "and no accelerator group available"
+                )
+            dev = device or getattr(self, "_device", None)
+            if dev is None:
+                dev = get_device()
+            dev = torch.device(dev)
+            if dev.type == "cpu":
+                raise RuntimeError(
+                    "collective checkpoint readiness: accelerator group selected "
+                    "but resolved device is CPU"
+                )
+            tensor_device = dev
 
-        t = torch.tensor([int(ready_local)], device=tensor_device, dtype=torch.int32)
-        dist.all_reduce(t, op=dist.ReduceOp.MIN, group=pg)
-
-        if int(t.item()) != 1:
+        t_ready = torch.tensor(
+            [int(ready_local)], device=tensor_device, dtype=torch.int32
+        )
+        dist.all_reduce(t_ready, op=dist.ReduceOp.MIN, group=pg)
+        if int(t_ready.item()) != 1:
             return False
 
-        return bool(
-            self.request_save_epoch(
-                epoch=int(epoch),
-                model=model,
-                optimizer=optimizer,
-                save_optimizer=save_optimizer,
-                extra_state=extra_state,
-                block_if_busy=block_if_busy,
-                **kwargs,
+        started_local = 0
+        start_exc: BaseException | None = None
+        try:
+            started_local = (
+                1
+                if self.request_save_epoch(
+                    epoch=int(epoch),
+                    model=model,
+                    optimizer=optimizer,
+                    save_optimizer=save_optimizer,
+                    extra_state=extra_state,
+                    block_if_busy=block_if_busy,
+                    **kwargs,
+                )
+                else 0
             )
+        except BaseException as exc:
+            started_local = 0
+            start_exc = exc
+
+        t_started = torch.tensor(
+            [int(started_local)], device=tensor_device, dtype=torch.int32
         )
+        dist.all_reduce(t_started, op=dist.ReduceOp.MIN, group=pg)
+        if int(t_started.item()) != 1:
+            with contextlib.suppress(Exception):
+                self.close(abort_inflight=True)
+            if start_exc is not None:
+                raise RuntimeError(
+                    "collective checkpoint start failed on at least one rank: "
+                    f"{type(start_exc).__name__}: {start_exc}"
+                ) from start_exc
+            raise RuntimeError(
+                "collective checkpoint start failed on at least one rank"
+            )
+
+        return True
 
     def request_save_epoch(
         self,
