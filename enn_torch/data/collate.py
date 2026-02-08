@@ -2558,6 +2558,7 @@ class Unsharder:
         "pred_buf_is_pinned",
         "buf_needs_wait_evt",
         "buf_wait_evt",
+        "buf_wait_device",
         "buf_fill",
         "pending_rows",
         "pending_preds",
@@ -2593,6 +2594,7 @@ class Unsharder:
         self.pred_buf_is_pinned = False
         self.buf_needs_wait_evt = False
         self.buf_wait_evt = None
+        self.buf_wait_device = None
         self.buf_fill = 0
         self.pending_rows: list[torch.Tensor] = []
         self.pending_preds: list[torch.Tensor] = []
@@ -2615,12 +2617,14 @@ class Unsharder:
             local_handle = self.pred_handle
             need_wait_evt = bool(self.buf_needs_wait_evt)
             wait_evt_cached = getattr(self, "buf_wait_evt", None)
+            wait_dev_cached = getattr(self, "buf_wait_device", None)
             self.buf_fill = 0
             self.pred_buf = None
             self.pred_handle = None
             self.pred_buf_is_pinned = False
             self.buf_needs_wait_evt = False
             self.buf_wait_evt = None
+            self.buf_wait_device = None
         else:
             if self.pending_count <= 0:
                 return
@@ -2657,19 +2661,16 @@ class Unsharder:
         if self.use_buffer:
             if need_wait_evt:
                 wait_evt = wait_evt_cached
-                wait_evt_cached = None
-                try:
-                    if local_handle is not None and self.pred_pool is not None:
-                        fe = getattr(self.pred_pool, "fence_event", None)
-                        if callable(fe):
-                            wait_evt = fe(local_handle, self.make_fence_event)
-                    if wait_evt is None:
-                        wait_evt = self.make_fence_event()
-                    if wait_evt is not None:
-                        with contextlib.suppress(Exception):
-                            wait_evt.record()
-                except Exception:
-                    wait_evt = None
+                if wait_evt is None:
+                    try:
+                        dev = wait_dev_cached
+                        if isinstance(dev, torch.device):
+                            if dev.type == "cuda" and hasattr(torch, "cuda"):
+                                torch.cuda.synchronize(device=dev)
+                            elif dev.type == "xpu" and hasattr(torch, "xpu"):
+                                torch.xpu.synchronize(device=dev)
+                    except Exception:
+                        pass
 
             if local_handle is not None and self.pred_pool is not None:
                 release_cb = partial(self.pred_pool.release, local_handle)
@@ -2836,6 +2837,7 @@ class Unsharder:
                                 with contextlib.suppress(Exception):
                                     rec()
                         self.buf_wait_evt = evt
+                        self.buf_wait_device = preds.device
                 except Exception:
                     pass
             self.buf_fill += n

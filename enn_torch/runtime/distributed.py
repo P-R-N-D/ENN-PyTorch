@@ -2637,30 +2637,65 @@ class Checkpointer:
 
         ready_local = 1 if self.is_idle() else 0
 
-        pg = None
-        if group is not None and is_process_group(group):
-            pg = get_control_process_group(group)
-        if pg is None:
-            pg = get_control_process_group(None)
+        lane_s = str(lane or "control").strip().lower()
+        prefer_accel = lane_s in {"accelerator", "accel", "cuda", "nccl", "xpu", "xccl"}
+        prefer_control = lane_s in {"control", "cpu", "gloo", "", "auto"}
 
-        tensor_device = torch.device("cpu")
-        if pg is None:
-            pg = get_accel_process_group(device)
-            if pg is None:
-                raise RuntimeError(
-                    "collective checkpoint readiness: no CPU-capable control group "
-                    "and no accelerator group available"
-                )
+        def _resolve_accel_device() -> torch.device:
             dev = device or getattr(self, "_device", None)
             if dev is None:
                 dev = get_device()
-            dev = torch.device(dev)
+            dev = torch.device(dev) if dev is not None else torch.device("cpu")
             if dev.type == "cpu":
+                with contextlib.suppress(Exception):
+                    if hasattr(torch, "cuda") and torch.cuda.is_available():
+                        dev = torch.device("cuda", torch.cuda.current_device())
+                with contextlib.suppress(Exception):
+                    if (
+                        dev.type == "cpu"
+                        and hasattr(torch, "xpu")
+                        and callable(getattr(torch.xpu, "is_available", None))
+                        and torch.xpu.is_available()
+                    ):
+                        dev = torch.device("xpu", torch.xpu.current_device())
+            return dev
+
+        pg = None
+        tensor_device = torch.device("cpu")
+
+        if prefer_accel and not prefer_control:
+            pg = get_accel_process_group(device)
+            if pg is not None:
+                tensor_device = _resolve_accel_device()
+        else:
+            if group is not None and is_process_group(group):
+                pg = get_control_process_group(group)
+            if pg is None:
+                pg = get_control_process_group(None)
+            if pg is None:
+                pg = get_accel_process_group(device)
+                if pg is not None:
+                    tensor_device = _resolve_accel_device()
+
+        if pg is None:
+            pg = dist.group.WORLD
+            be = ""
+            with contextlib.suppress(Exception):
+                be = str(dist.get_backend(pg)).lower()
+            if any(x in be for x in ("nccl", "xccl", "hccl", "rccl")):
+                tensor_device = _resolve_accel_device()
+            else:
+                tensor_device = torch.device("cpu")
+
+        if tensor_device.type == "cpu":
+            be = ""
+            with contextlib.suppress(Exception):
+                be = str(dist.get_backend(pg)).lower()
+            if any(x in be for x in ("nccl", "xccl", "hccl", "rccl")):
                 raise RuntimeError(
-                    "collective checkpoint readiness: accelerator group selected "
-                    "but resolved device is CPU"
+                    "collective checkpoint readiness: resolved CPU tensor device for a "
+                    f"non-CPU backend ({be}); pass device=... or ensure accelerator is available"
                 )
-            tensor_device = dev
 
         t_ready = torch.tensor(
             [int(ready_local)], device=tensor_device, dtype=torch.int32
