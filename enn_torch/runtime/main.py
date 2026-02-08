@@ -1307,8 +1307,6 @@ def epochs(
                                                 average=True,
                                                 policy=dist_policy.collective,
                                             )
-                                        if checkpointer is not None:
-                                            checkpointer.await_staging()
                                         scaler.unscale_(optimizer)
                                         scaler.step(optimizer)
                                         scaler.update()
@@ -2246,12 +2244,10 @@ def epochs(
 
             if checkpointer is not None:
                 checkpointer.poll()
-                ws_now = 1
-                with contextlib.suppress(Exception):
-                    ws_now = int(get_world_size(device)) if is_distributed() else 1
-                if ws_now <= 1:
-                    if checkpointer.is_idle():
-                        checkpointer.request_save_epoch(
+                did_start_ckpt = False
+                try:
+                    did_start_ckpt = bool(
+                        checkpointer.try_request_save_epoch_collective(
                             epoch=int(epoch_idx + 1),
                             model=model,
                             optimizer=optimizer,
@@ -2260,18 +2256,34 @@ def epochs(
                                 "epoch": int(epoch_idx + 1),
                             },
                             block_if_busy=False,
+                            device=device,
                         )
-                else:
-                    checkpointer.request_save_epoch(
-                        epoch=int(epoch_idx + 1),
-                        model=model,
-                        optimizer=optimizer,
-                        save_optimizer=getattr(ops, "ckpt_save_optimizer", None),
-                        extra_state={
-                            "epoch": int(epoch_idx + 1),
-                        },
-                        block_if_busy=False,
                     )
+                except Exception:
+                    if checkpointer.is_idle():
+                        did_start_ckpt = bool(
+                            checkpointer.request_save_epoch(
+                                epoch=int(epoch_idx + 1),
+                                model=model,
+                                optimizer=optimizer,
+                                save_optimizer=getattr(
+                                    ops, "ckpt_save_optimizer", None
+                                ),
+                                extra_state={
+                                    "epoch": int(epoch_idx + 1),
+                                },
+                                block_if_busy=False,
+                            )
+                        )
+                if did_start_ckpt:
+                    checkpointer.await_staging()
+                    if is_distributed():
+                        with contextlib.suppress(Exception):
+                            distributed_barrier(
+                                device,
+                                group=get_accel_group(device),
+                                lane="auto",
+                            )
             prev_comp_time += float(comp_time)
             prev_io_time += float(io_time)
             prev_flops += float(flops)

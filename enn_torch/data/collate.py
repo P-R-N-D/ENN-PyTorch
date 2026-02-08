@@ -2557,6 +2557,7 @@ class Unsharder:
         "pred_handle",
         "pred_buf_is_pinned",
         "buf_needs_wait_evt",
+        "buf_wait_evt",
         "buf_fill",
         "pending_rows",
         "pending_preds",
@@ -2591,6 +2592,7 @@ class Unsharder:
         self.pred_handle: TensorPagePool.Token | None = None
         self.pred_buf_is_pinned = False
         self.buf_needs_wait_evt = False
+        self.buf_wait_evt = None
         self.buf_fill = 0
         self.pending_rows: list[torch.Tensor] = []
         self.pending_preds: list[torch.Tensor] = []
@@ -2612,11 +2614,13 @@ class Unsharder:
             preds = self.pred_buf[: self.buf_fill]
             local_handle = self.pred_handle
             need_wait_evt = bool(self.buf_needs_wait_evt)
+            wait_evt_cached = getattr(self, "buf_wait_evt", None)
             self.buf_fill = 0
             self.pred_buf = None
             self.pred_handle = None
             self.pred_buf_is_pinned = False
             self.buf_needs_wait_evt = False
+            self.buf_wait_evt = None
         else:
             if self.pending_count <= 0:
                 return
@@ -2652,6 +2656,8 @@ class Unsharder:
         release_cb = None
         if self.use_buffer:
             if need_wait_evt:
+                wait_evt = wait_evt_cached
+                wait_evt_cached = None
                 try:
                     if local_handle is not None and self.pred_pool is not None:
                         fe = getattr(self.pred_pool, "fence_event", None)
@@ -2802,6 +2808,36 @@ class Unsharder:
             )
             if non_blocking:
                 self.buf_needs_wait_evt = True
+                try:
+                    evt = None
+                    if self.pred_pool is not None and self.pred_handle is not None:
+                        fe = getattr(self.pred_pool, "fence_event", None)
+                        if callable(fe):
+                            evt = fe(self.pred_handle, self.make_fence_event)
+                    if evt is None and callable(self.make_fence_event):
+                        evt = self.make_fence_event()
+                    if evt is not None:
+                        rec = getattr(evt, "record", None)
+                        if callable(rec):
+                            try:
+                                if preds.device.type == "cuda" and hasattr(
+                                    torch, "cuda"
+                                ):
+                                    stream = torch.cuda.current_stream(
+                                        device=preds.device
+                                    )
+                                    try:
+                                        rec(stream)
+                                    except TypeError:
+                                        rec()
+                                else:
+                                    rec()
+                            except Exception:
+                                with contextlib.suppress(Exception):
+                                    rec()
+                        self.buf_wait_evt = evt
+                except Exception:
+                    pass
             self.buf_fill += n
             start += n
             if self.buf_fill >= int(self.target_rows):
