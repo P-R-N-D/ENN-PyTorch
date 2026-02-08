@@ -1314,6 +1314,7 @@ def train(
     loss_mask_value: float | None = None,
     export_path: PathLike | None = None,
     export_overwrite: bool = True,
+    checkpoint: bool = True,
     model_averaging: Optional[str] = "auto",
     **kwargs: Any,
 ) -> Model:
@@ -1448,6 +1449,7 @@ def train(
             "loss_tile_size": loss_tile_size,
             "loss_mask_mode": loss_mask_mode,
             "loss_mask_value": loss_mask_value,
+            "checkpoint": checkpoint,
             "model_averaging": model_averaging,
         }
         for key in RuntimeConfig.TRAIN_POS_ORDER[: len(args)]:
