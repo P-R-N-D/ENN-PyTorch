@@ -2638,18 +2638,20 @@ class Checkpointer:
         ready_local = 1 if self.is_idle() else 0
 
         pg = None
-        with contextlib.suppress(Exception):
-            if group is not None and is_process_group(group):
-                pg = get_control_process_group(group)
+        if group is not None and is_process_group(group):
+            pg = get_control_process_group(group)
         if pg is None:
-            pg = get_control_process_group(None) or dist.group.WORLD
+            pg = get_control_process_group(None)
 
-        t = torch.tensor([int(ready_local)], device="cpu", dtype=torch.int32)
-        try:
-            dist.all_reduce(t, op=dist.ReduceOp.MIN, group=pg)
-        except Exception:
-            with contextlib.suppress(Exception):
-                dist.all_reduce(t, op=dist.ReduceOp.MIN)
+        tensor_device = torch.device("cpu")
+        if pg is None:
+            pg = get_accel_process_group(device)
+            if pg is None:
+                return False
+            tensor_device = device or get_device() or torch.device("cpu")
+
+        t = torch.tensor([int(ready_local)], device=tensor_device, dtype=torch.int32)
+        dist.all_reduce(t, op=dist.ReduceOp.MIN, group=pg)
 
         if int(t.item()) != 1:
             return False
