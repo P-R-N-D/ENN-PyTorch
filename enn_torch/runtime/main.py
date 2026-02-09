@@ -2244,27 +2244,46 @@ def epochs(
 
             if checkpointer is not None:
                 checkpointer.poll()
-                did_start_ckpt = bool(
-                    checkpointer.try_request_save_epoch_collective(
-                        epoch=int(epoch_idx + 1),
-                        model=model,
-                        optimizer=optimizer,
-                        save_optimizer=getattr(ops, "ckpt_save_optimizer", None),
-                        extra_state={
-                            "epoch": int(epoch_idx + 1),
-                        },
-                        block_if_busy=False,
-                        device=device,
-                    )
-                )
-                if did_start_ckpt:
-                    checkpointer.await_staging()
-                    if is_distributed():
-                        distributed_barrier(
-                            device,
-                            group=get_accel_group(device),
-                            lane="auto",
+                ckpt_participate = True
+                ckpt_pg = None
+                use_collectives = bool(is_distributed())
+                if is_distributed():
+                    try:
+                        mesh, mesh_kind = get_distributed_mesh(device)
+                        if mesh_kind == "hsdp2" and mesh is not None:
+                            coord = None
+                            with contextlib.suppress(Exception):
+                                coord = mesh.get_coordinate()
+                            if not coord or int(coord[0]) != 0:
+                                ckpt_participate = False
+                            else:
+                                with contextlib.suppress(Exception):
+                                    ckpt_pg = mesh.get_group(mesh_dim="dp_shard")
+                                if ckpt_pg is None:
+                                    with contextlib.suppress(Exception):
+                                        ckpt_pg = mesh.get_group("dp_shard")
+                    except Exception:
+                        pass
+                    if ckpt_pg is None:
+                        ckpt_pg = train_pg
+
+                if ckpt_participate:
+                    did_start_ckpt = bool(
+                        checkpointer.try_request_save_epoch_collective(
+                            epoch=int(epoch_idx + 1),
+                            model=model,
+                            optimizer=optimizer,
+                            save_optimizer=getattr(ops, "ckpt_save_optimizer", None),
+                            extra_state={"epoch": int(epoch_idx + 1)},
+                            block_if_busy=False,
+                            device=device,
+                            group=ckpt_pg,
+                            process_group=ckpt_pg,
+                            use_collectives=use_collectives,
                         )
+                    )
+                    if did_start_ckpt:
+                        checkpointer.await_staging()
             prev_comp_time += float(comp_time)
             prev_io_time += float(io_time)
             prev_flops += float(flops)
@@ -2597,7 +2616,8 @@ def infer(
                 torch_prof.start()
     if rank == 0:
         os.makedirs(chunk_dir, exist_ok=True)
-    distributed_barrier(device, group=get_accel_group(device), lane="auto")
+    with contextlib.suppress(Exception):
+        os.makedirs(chunk_dir, exist_ok=True)
     _nogil_opt = bool(CPU.is_optimized_for_no_gil())
     _cache_default = 16 if _nogil_opt else 4
     cache_q = max(
@@ -3235,8 +3255,32 @@ def infer(
                 )
         if status_bar is not None:
             status_bar.close()
-        with contextlib.suppress(Exception):
-            distributed_barrier(device, group=get_accel_group(device), lane="auto")
+        if exc_type is None:
+            with contextlib.suppress(Exception):
+                done_path = os.path.join(str(chunk_dir), f".rankdone.{int(rank):06d}")
+                Path(done_path).write_text(f"ok{os.linesep}", encoding="utf-8")
+
+        if exc_type is None and rank == 0:
+            timeout_s = int(env_int("ENN_PRED_MANIFEST_WAIT_SEC", 600) or 600)
+            strict = bool(env_bool("ENN_PRED_MANIFEST_STRICT", default=True))
+            t0 = time.monotonic()
+            expected = int(world_size)
+            got = 0
+            while True:
+                got = 0
+                for i in range(expected):
+                    p = os.path.join(str(chunk_dir), f".rankdone.{i:06d}")
+                    if os.path.exists(p):
+                        got += 1
+                if got >= expected:
+                    break
+                if time.monotonic() - t0 >= float(timeout_s):
+                    msg = f"infer: manifest wait timeout ({timeout_s}s): got {got}/{expected} rankdone markers"
+                    if strict:
+                        raise RuntimeError(msg)
+                    _LOGGER.warning(msg)
+                    break
+                time.sleep(0.2)
         if exc_type is None and rank == 0:
             parts = []
             for rows_path in sorted(
@@ -3288,9 +3332,12 @@ def infer(
             }
             man_path = os.path.join(chunk_dir, "manifest.json")
             collate.write_json(man_path, manifest, indent=2)
-        if exc_type is None:
             with contextlib.suppress(Exception):
-                distributed_barrier(device, group=get_accel_group(device), lane="auto")
+                for i in range(int(world_size)):
+                    p = os.path.join(str(chunk_dir), f".rankdone.{i:06d}")
+                    with contextlib.suppress(Exception):
+                        if os.path.exists(p):
+                            os.remove(p)
     return None
 
 
