@@ -3258,7 +3258,7 @@ def infer(
         if exc_type is None:
             with contextlib.suppress(Exception):
                 done_path = os.path.join(str(chunk_dir), f".rankdone.{int(rank):06d}")
-                Path(done_path).write_text("ok\n", encoding="utf-8")
+                Path(done_path).write_text(f"ok{os.linesep}", encoding="utf-8")
 
         if exc_type is None and rank == 0:
             timeout_s = int(env_int("ENN_PRED_MANIFEST_WAIT_SEC", 600) or 600)
@@ -3332,6 +3332,12 @@ def infer(
             }
             man_path = os.path.join(chunk_dir, "manifest.json")
             collate.write_json(man_path, manifest, indent=2)
+            with contextlib.suppress(Exception):
+                for i in range(int(world_size)):
+                    p = os.path.join(str(chunk_dir), f".rankdone.{i:06d}")
+                    with contextlib.suppress(Exception):
+                        if os.path.exists(p):
+                            os.remove(p)
     return None
 
 

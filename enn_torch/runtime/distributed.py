@@ -2881,17 +2881,17 @@ class Checkpointer:
             self._staging_waited = True
             return
         with contextlib.suppress(Exception):
-            fut.result()
+            _future_result(fut)
         self._staging_waited = True
 
     def poll(self) -> None:
         if self._resp is not None:
             fut = getattr(self._resp, "upload_completion", None)
-            if fut is not None and getattr(fut, "done", lambda: False)():
+            if fut is not None and _future_done(fut):
                 strict = bool(env_bool("ENN_DCP_RECIPE_STRICT", default=False))
                 success = True
                 try:
-                    fut.result()
+                    _future_result(fut)
                 except Exception:
                     success = False
                     if strict:
@@ -2919,7 +2919,7 @@ class Checkpointer:
             return True
         strict = bool(env_bool("ENN_DCP_RECIPE_STRICT", default=False))
         try:
-            fut.result()
+            _future_result(fut)
             return True
         except Exception:
             if strict:
@@ -3098,7 +3098,7 @@ class Checkpointer:
             raise RuntimeError("torch.distributed.checkpoint.async_save is not available")
         call_kw = self._filter_kwargs(fn, call_kw)
         self._resp = fn(state, **call_kw)
-        self._staging_waited = not bool(env_bool("ENN_DCP_AWAIT_STAGING", default=False))
+        self._staging_waited = False
         setattr(self, "_inflight_epoch_dir", epoch_dir)
         return True
 
