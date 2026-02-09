@@ -969,7 +969,20 @@ def load_weights(
         cm = eager_ctx() if callable(eager_ctx) else contextlib.nullcontext()
         with cm:
             m_sd = get_model_state_dict(model, options=opts)
-            load(state_dict={"model": m_sd}, storage_reader=reader)
+            planner = None
+            with contextlib.suppress(Exception):
+                from torch.distributed.checkpoint import DefaultLoadPlanner
+
+                planner = DefaultLoadPlanner()
+            if planner is None:
+                with contextlib.suppress(Exception):
+                    from torch.distributed.checkpoint.planner import DefaultLoadPlanner
+
+                    planner = DefaultLoadPlanner()
+            try:
+                load(state_dict={"model": m_sd}, storage_reader=reader, planner=planner)
+            except TypeError:
+                load(state_dict={"model": m_sd}, storage_reader=reader)
             resize_scaler_buffer(model, m_sd)
             set_model_state_dict(
                 model, m_sd, options=StateDictOptions(full_state_dict=False, strict=False)
@@ -1105,7 +1118,20 @@ def load_model(
         cm = eager_ctx() if callable(eager_ctx) else contextlib.nullcontext()
         with cm:
             m_sd = get_model_state_dict(model, options=opts)
-            load(state_dict={"model": m_sd}, storage_reader=reader)
+            planner = None
+            with contextlib.suppress(Exception):
+                from torch.distributed.checkpoint import DefaultLoadPlanner
+
+                planner = DefaultLoadPlanner()
+            if planner is None:
+                with contextlib.suppress(Exception):
+                    from torch.distributed.checkpoint.planner import DefaultLoadPlanner
+
+                    planner = DefaultLoadPlanner()
+            try:
+                load(state_dict={"model": m_sd}, storage_reader=reader, planner=planner)
+            except TypeError:
+                load(state_dict={"model": m_sd}, storage_reader=reader)
             resize_scaler_buffer(model, m_sd)
             set_model_state_dict(
                 model, m_sd, options=StateDictOptions(full_state_dict=False, strict=False)

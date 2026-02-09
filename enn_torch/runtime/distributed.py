@@ -26,7 +26,7 @@ from typing import Any, Callable, Iterable, Mapping
 
 import torch
 import torch.distributed as dist
-from ..core.concurrency import Mutex, new_executor, is_gil_enabled
+from ..core.concurrency import Mutex, is_gil_enabled
 from ..core.datatypes import PathLike, env_bool, env_int, save_temp, write_json
 from ..core.system import (
     CPU,
@@ -2478,6 +2478,36 @@ class _PendingOp:
 
 
 class Checkpointer:
+    @staticmethod
+    def _filter_kwargs(fn: object, kwargs: dict[str, Any]) -> dict[str, Any]:
+        try:
+            sig = inspect.signature(fn)  # type: ignore[arg-type]
+            params = getattr(sig, "parameters", None)
+            if isinstance(params, dict) and params:
+                return {k: v for k, v in kwargs.items() if k in params}
+        except Exception:
+            pass
+        return kwargs
+
+    def _resolve_async_checkpointer_type(self) -> object | None:
+        mode = (
+            str(os.environ.get("ENN_DCP_ASYNC_CHECKPOINTER_TYPE", "auto") or "auto")
+            .strip()
+            .lower()
+        )
+        try:
+            from torch.distributed.checkpoint.state_dict_saver import AsyncCheckpointerType
+        except Exception:
+            try:
+                from torch.distributed.checkpoint import AsyncCheckpointerType  # type: ignore
+            except Exception:
+                return None
+        if mode in {"thread", "threads", "t"}:
+            return AsyncCheckpointerType.THREAD
+        if mode in {"process", "proc", "p"}:
+            return AsyncCheckpointerType.PROCESS
+        return AsyncCheckpointerType.PROCESS if bool(is_gil_enabled()) else AsyncCheckpointerType.THREAD
+
     def __init__(
         self,
         ckpt_dir: PathLike,
@@ -2585,9 +2615,60 @@ class Checkpointer:
 
     def _ensure_stager(self) -> object:
         if self._stager is None:
-            from torch.distributed.checkpoint.staging import DefaultStager
+            async_type = self._resolve_async_checkpointer_type()
+            dev = self._device
+            if dev is None:
+                with contextlib.suppress(Exception):
+                    dev = get_device()
+            dev = torch.device(dev) if dev is not None else torch.device("cpu")
 
-            self._stager = DefaultStager()
+            use_async_staging = bool(env_bool("ENN_DCP_USE_ASYNC_STAGING", default=True))
+
+            is_cuda = (getattr(dev, "type", "cpu") == "cuda")
+            is_thread = False
+            try:
+                name = str(getattr(async_type, "name", async_type)).lower()
+                is_thread = "thread" in name
+            except Exception:
+                is_thread = False
+
+            use_pinned = bool(is_cuda and is_thread and env_bool("ENN_DCP_USE_PINNED_MEMORY", default=True))
+            use_non_blocking = bool(use_pinned and env_bool("ENN_DCP_USE_NON_BLOCKING_COPY", default=True))
+
+            DefaultStager = None
+            StagingOptions = None
+            with contextlib.suppress(Exception):
+                from torch.distributed.checkpoint.staging import DefaultStager, StagingOptions
+            if DefaultStager is None:
+                with contextlib.suppress(Exception):
+                    from torch.distributed.checkpoint import DefaultStager, StagingOptions  # type: ignore
+            if DefaultStager is None:
+                self._stager = None
+                return None
+
+            if StagingOptions is None:
+                with contextlib.suppress(Exception):
+                    self._stager = DefaultStager()
+                return self._stager
+
+            opts = StagingOptions(
+                use_pinned_memory=bool(use_pinned),
+                use_shared_memory=False,
+                use_async_staging=bool(use_async_staging),
+                use_non_blocking_copy=bool(use_non_blocking),
+            )
+
+            for kw in ({"config": opts}, {"options": opts}):
+                try:
+                    self._stager = DefaultStager(**kw)
+                    break
+                except TypeError:
+                    continue
+                except Exception:
+                    break
+            if self._stager is None:
+                with contextlib.suppress(Exception):
+                    self._stager = DefaultStager()
         return self._stager
 
     def _save_optimizer_default(self) -> bool:
@@ -2663,7 +2744,16 @@ class Checkpointer:
         pg = None
         tensor_device = torch.device("cpu")
 
-        if prefer_accel and not prefer_control:
+        if group is not None and is_process_group(group):
+            pg = group
+            be = ""
+            with contextlib.suppress(Exception):
+                be = str(dist.get_backend(pg)).lower()
+            if any(x in be for x in ("nccl", "xccl", "hccl", "rccl")):
+                tensor_device = _resolve_accel_device()
+            else:
+                tensor_device = torch.device("cpu")
+        elif prefer_accel and not prefer_control:
             pg = get_accel_process_group(device)
             if pg is not None:
                 tensor_device = _resolve_accel_device()
@@ -2751,6 +2841,8 @@ class Checkpointer:
         save_optimizer: bool | None = None,
         extra_state: dict[str, Any] | None = None,
         block_if_busy: bool = False,
+        process_group: object | None = None,
+        use_collectives: bool | None = None,
         **kwargs: Any,
     ) -> bool:
         self.poll()
@@ -2771,10 +2863,15 @@ class Checkpointer:
                 optimizer=optimizer,
                 save_opt=bool(save_optimizer),
                 extra_state=extra_state,
+                process_group=process_group,
+                use_collectives=use_collectives,
             )
         )
 
     def await_staging(self) -> None:
+        if not bool(env_bool("ENN_DCP_AWAIT_STAGING", default=False)):
+            self._staging_waited = True
+            return
         if self._resp is None:
             return
         if self._staging_waited:
@@ -2837,6 +2934,8 @@ class Checkpointer:
         optimizer: Optimizer | None,
         save_opt: bool,
         extra_state: dict[str, Any] | None,
+        process_group: object | None,
+        use_collectives: bool | None,
     ) -> bool:
         if self._resp is not None:
             return False
@@ -2912,6 +3011,15 @@ class Checkpointer:
         storage_writer = None
         planner = None
         with contextlib.suppress(Exception):
+            from torch.distributed.checkpoint import DefaultSavePlanner
+
+            planner = DefaultSavePlanner()
+        if planner is None:
+            with contextlib.suppress(Exception):
+                from torch.distributed.checkpoint.planner import DefaultSavePlanner
+
+                planner = DefaultSavePlanner()
+        with contextlib.suppress(Exception):
             from torch.distributed.checkpoint import FileSystemWriter
 
             default_sync = bool(int(getattr(self, "_world", 1) or 1) > 1)
@@ -2946,17 +3054,6 @@ class Checkpointer:
                 overwrite=True,
             )
 
-        if env_bool(("ENN_DCP_USE_PLANNER", "ENN_CKPT_USE_PLANNER"), default=True):
-            with contextlib.suppress(Exception):
-                from torch.distributed.checkpoint import DefaultSavePlanner
-
-                planner = DefaultSavePlanner()
-            if planner is None:
-                with contextlib.suppress(Exception):
-                    from torch.distributed.checkpoint.planner import DefaultSavePlanner
-
-                    planner = DefaultSavePlanner()
-
         if not self.use_async:
             try:
                 if storage_writer is not None:
@@ -2983,44 +3080,25 @@ class Checkpointer:
                 self._cleanup_keep_last()
             return True
 
-        try:
-            if storage_writer is not None:
-                try:
-                    self._resp = dcp.async_save(
-                        state,
-                        checkpoint_id=str(epoch_dir),
-                        storage_writer=storage_writer,
-                        async_stager=stager,
-                        planner=planner,
-                    )
-                except TypeError:
-                    self._resp = dcp.async_save(
-                        state,
-                        checkpoint_id=str(epoch_dir),
-                        storage_writer=storage_writer,
-                        async_stager=stager,
-                    )
-            else:
-                try:
-                    self._resp = dcp.async_save(
-                        state,
-                        checkpoint_id=str(epoch_dir),
-                        async_stager=stager,
-                        planner=planner,
-                    )
-                except TypeError:
-                    self._resp = dcp.async_save(
-                        state,
-                        checkpoint_id=str(epoch_dir),
-                        async_stager=stager,
-                    )
-        except TypeError:
-            self._resp = dcp.async_save(
-                state,
-                checkpoint_id=str(epoch_dir),
-                async_stager=stager,
-            )
-        self._staging_waited = False
+        async_type = self._resolve_async_checkpointer_type()
+        if use_collectives is None:
+            use_collectives = bool(self._is_distributed())
+        call_kw: dict[str, Any] = {
+            "checkpoint_id": str(epoch_dir),
+            "storage_writer": storage_writer,
+            "planner": planner,
+            "async_stager": stager,
+            "async_checkpointer_type": async_type,
+            "process_group": process_group,
+            "use_collectives": bool(use_collectives),
+        }
+        call_kw = {k: v for k, v in call_kw.items() if v is not None or k in {"use_collectives"}}
+        fn = getattr(dcp, "async_save", None)
+        if not callable(fn):
+            raise RuntimeError("torch.distributed.checkpoint.async_save is not available")
+        call_kw = self._filter_kwargs(fn, call_kw)
+        self._resp = fn(state, **call_kw)
+        self._staging_waited = not bool(env_bool("ENN_DCP_AWAIT_STAGING", default=False))
         setattr(self, "_inflight_epoch_dir", epoch_dir)
         return True
 
