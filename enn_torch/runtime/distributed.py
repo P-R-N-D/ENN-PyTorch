@@ -2869,7 +2869,7 @@ class Checkpointer:
         )
 
     def await_staging(self) -> None:
-        if not bool(env_bool("ENN_DCP_AWAIT_STAGING", default=False)):
+        if not bool(env_bool("ENN_DCP_AWAIT_STAGING", default=True)):
             self._staging_waited = True
             return
         if self._resp is None:
