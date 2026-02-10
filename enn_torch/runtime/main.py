@@ -3343,6 +3343,11 @@ def infer(
 
 @worker_main()
 def process(*args: Any, **kwargs: Any) -> object:
+    import faulthandler, signal, os
+    faulthandler.enable(all_threads=True)
+    faulthandler.register(signal.SIGUSR1, all_threads=True)
+    print(f"[WORKER PID] local_rank={os.environ.get('LOCAL_RANK')} pid={os.getpid()}", flush=True)
+
     from ..data.pipeline import Session
 
     if not args:
