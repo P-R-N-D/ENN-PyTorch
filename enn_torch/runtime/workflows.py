@@ -455,6 +455,20 @@ def _dcp_load_model_state(
     load(state_dict={"model": model_state}, storage_reader=reader)
 
 
+def _raise_if_empty_dcp_model_state(
+    model_state: Mapping[str, Any],
+    *,
+    checkpoint_path: Path,
+) -> None:
+    if model_state:
+        return
+    raise RuntimeError(
+        "Directory checkpoint load resolved zero model parameters after metadata "
+        f"filtering at {str(checkpoint_path)!r}; refusing partial load from an "
+        "empty parameter set."
+    )
+
+
 def _try_load_dir_checkpoint_fallback_pt(
     model: torch.nn.Module,
     *,
@@ -1146,6 +1160,7 @@ def load_weights(
                     )
             planner = _make_dcp_load_planner(allow_partial_load=not strict)
             try:
+                _raise_if_empty_dcp_model_state(m_sd, checkpoint_path=p)
                 _dcp_load_model_state(reader=reader, model_state=m_sd, planner=planner)
             except Exception:
                 if (not strict) and _try_load_dir_checkpoint_fallback_pt(
@@ -1303,6 +1318,7 @@ def load_model(
                     )
             planner = _make_dcp_load_planner(allow_partial_load=not strict)
             try:
+                _raise_if_empty_dcp_model_state(m_sd, checkpoint_path=p)
                 _dcp_load_model_state(reader=reader, model_state=m_sd, planner=planner)
             except Exception:
                 if (not strict) and _try_load_dir_checkpoint_fallback_pt(
