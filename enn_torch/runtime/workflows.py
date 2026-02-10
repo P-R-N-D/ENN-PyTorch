@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import contextlib
 import gc
+import inspect
 import json
 import logging
 import os
@@ -337,6 +338,172 @@ def _parse_meta(p: PathLike) -> Mapping[str, Any]:
                 if isinstance(extra_meta, Mapping):
                     return extra_meta
     return {}
+
+
+def _dcp_strict_load_enabled() -> bool:
+    return env_bool(
+        ("ENN_DCP_STRICT_LOAD", "ENN_CHECKPOINT_STRICT", "ENN_STRICT_LOAD"),
+        default=False,
+    )
+
+
+def _dcp_allowed_keys_and_shapes(
+    metadata: object | None,
+    *,
+    root_prefix: str = "model.",
+) -> tuple[set[str], dict[str, tuple[int, ...]]]:
+    allowed: set[str] = set()
+    shapes: dict[str, tuple[int, ...]] = {}
+    if metadata is None:
+        return allowed, shapes
+
+    state_meta = getattr(metadata, "state_dict_metadata", None)
+    if not isinstance(state_meta, Mapping) or not state_meta:
+        return allowed, shapes
+
+    for k, v in state_meta.items():
+        key = str(k)
+        if root_prefix and key.startswith(root_prefix):
+            key = key[len(root_prefix) :]
+        allowed.add(key)
+
+        size = getattr(v, "size", None)
+        if size is None:
+            continue
+        try:
+            shapes[key] = tuple(int(x) for x in size)
+        except Exception:
+            continue
+    return allowed, shapes
+
+
+def _dcp_filter_model_state_dict(
+    m_sd: Mapping[str, Any],
+    *,
+    allowed_keys: set[str] | None,
+    shapes: Mapping[str, tuple[int, ...]] | None,
+) -> dict[str, Any]:
+    out: dict[str, Any] = {}
+    allowed = allowed_keys or set()
+    for k, v in m_sd.items():
+        kk = str(k)
+        if allowed and kk not in allowed:
+            continue
+        if shapes and kk in shapes and torch.is_tensor(v):
+            try:
+                if tuple(v.shape) != tuple(shapes[kk]):
+                    continue
+            except Exception:
+                continue
+        out[kk] = v
+    return out
+
+
+def _make_dcp_load_planner(*, allow_partial_load: bool) -> object | None:
+    Planner = None
+    with contextlib.suppress(Exception):
+        from torch.distributed.checkpoint import DefaultLoadPlanner as _DLP
+
+        Planner = _DLP
+    if Planner is None:
+        with contextlib.suppress(Exception):
+            from torch.distributed.checkpoint.planner import DefaultLoadPlanner as _DLP2
+
+            Planner = _DLP2
+    if Planner is None:
+        return None
+
+    kwargs: dict[str, Any] = {}
+    if allow_partial_load:
+        try:
+            sig = inspect.signature(Planner)
+            params = getattr(sig, "parameters", None)
+            if isinstance(params, Mapping):
+                if "allow_partial_load" in params:
+                    kwargs["allow_partial_load"] = True
+                elif "allow_partial" in params:
+                    kwargs["allow_partial"] = True
+        except Exception:
+            kwargs["allow_partial_load"] = True
+
+    if kwargs:
+        try:
+            return Planner(**kwargs)
+        except Exception:
+            pass
+    with contextlib.suppress(Exception):
+        return Planner()
+    return None
+
+
+def _dcp_load_model_state(
+    *,
+    reader: FileSystemReader,
+    model_state: dict[str, Any],
+    planner: object | None,
+) -> None:
+    if planner is not None:
+        try:
+            load(
+                state_dict={"model": model_state},
+                storage_reader=reader,
+                planner=planner,
+            )
+            return
+        except TypeError:
+            pass
+    load(state_dict={"model": model_state}, storage_reader=reader)
+
+
+def _try_load_dir_checkpoint_fallback_pt(
+    model: torch.nn.Module,
+    *,
+    pt_path: Path,
+    map_location: TorchDeviceLike | None,
+    mmap: bool | None,
+) -> bool:
+    if not pt_path.is_file():
+        return False
+    obj = _torch_load_checkpoint(
+        pt_path,
+        map_location=map_location or "cpu",
+        weights_only=True,
+        mmap=mmap,
+    )
+
+    sd = None
+    if isinstance(obj, dict):
+        for kk in (
+            "state_dict",
+            "model_state_dict",
+            "model",
+            "model_sd",
+            "weights",
+            "model_weights",
+        ):
+            vv = obj.get(kk)
+            if isinstance(vv, dict):
+                sd = vv
+                break
+        if sd is None:
+            try:
+                if obj and all(
+                    isinstance(k, str) and torch.is_tensor(v)
+                    for k, v in obj.items()
+                ):
+                    sd = obj
+            except Exception:
+                sd = None
+    else:
+        sd = obj
+
+    if not isinstance(sd, dict):
+        return False
+    sd = _coerce_state_dict(sd)
+    with contextlib.suppress(Exception):
+        resize_scaler_buffer(model, sd)
+    model.load_state_dict(sd, strict=False)
+    return True
 
 
 def _is_execution_time_logged() -> bool:
@@ -968,24 +1135,32 @@ def load_weights(
         eager_ctx = getattr(model, "eager_for_export", None)
         cm = eager_ctx() if callable(eager_ctx) else contextlib.nullcontext()
         with cm:
-            m_sd = get_model_state_dict(model, options=opts)
-            planner = None
-            with contextlib.suppress(Exception):
-                from torch.distributed.checkpoint import DefaultLoadPlanner
-
-                planner = DefaultLoadPlanner()
-            if planner is None:
-                with contextlib.suppress(Exception):
-                    from torch.distributed.checkpoint.planner import DefaultLoadPlanner
-
-                    planner = DefaultLoadPlanner()
+            strict = _dcp_strict_load_enabled()
+            m_sd = dict(get_model_state_dict(model, options=opts))
+            _coerce_dcp_keys(m_sd)
+            if not strict:
+                allowed, shapes = _dcp_allowed_keys_and_shapes(meta_data)
+                if allowed:
+                    m_sd = _dcp_filter_model_state_dict(
+                        m_sd, allowed_keys=allowed, shapes=shapes
+                    )
+            planner = _make_dcp_load_planner(allow_partial_load=not strict)
             try:
-                load(state_dict={"model": m_sd}, storage_reader=reader, planner=planner)
-            except TypeError:
-                load(state_dict={"model": m_sd}, storage_reader=reader)
+                _dcp_load_model_state(reader=reader, model_state=m_sd, planner=planner)
+            except Exception:
+                if (not strict) and _try_load_dir_checkpoint_fallback_pt(
+                    model,
+                    pt_path=(p / "model.pt"),
+                    map_location=map_location,
+                    mmap=mmap,
+                ):
+                    return meta if isinstance(meta, dict) else None
+                raise
             resize_scaler_buffer(model, m_sd)
             set_model_state_dict(
-                model, m_sd, options=StateDictOptions(full_state_dict=False, strict=False)
+                model,
+                m_sd,
+                options=StateDictOptions(full_state_dict=False, strict=False),
             )
         return meta if isinstance(meta, dict) else None
 
@@ -1117,24 +1292,32 @@ def load_model(
         eager_ctx = getattr(model, "eager_for_export", None)
         cm = eager_ctx() if callable(eager_ctx) else contextlib.nullcontext()
         with cm:
-            m_sd = get_model_state_dict(model, options=opts)
-            planner = None
-            with contextlib.suppress(Exception):
-                from torch.distributed.checkpoint import DefaultLoadPlanner
-
-                planner = DefaultLoadPlanner()
-            if planner is None:
-                with contextlib.suppress(Exception):
-                    from torch.distributed.checkpoint.planner import DefaultLoadPlanner
-
-                    planner = DefaultLoadPlanner()
+            strict = _dcp_strict_load_enabled()
+            m_sd = dict(get_model_state_dict(model, options=opts))
+            _coerce_dcp_keys(m_sd)
+            if not strict:
+                allowed, shapes = _dcp_allowed_keys_and_shapes(meta_data)
+                if allowed:
+                    m_sd = _dcp_filter_model_state_dict(
+                        m_sd, allowed_keys=allowed, shapes=shapes
+                    )
+            planner = _make_dcp_load_planner(allow_partial_load=not strict)
             try:
-                load(state_dict={"model": m_sd}, storage_reader=reader, planner=planner)
-            except TypeError:
-                load(state_dict={"model": m_sd}, storage_reader=reader)
+                _dcp_load_model_state(reader=reader, model_state=m_sd, planner=planner)
+            except Exception:
+                if (not strict) and _try_load_dir_checkpoint_fallback_pt(
+                    model,
+                    pt_path=(p / "model.pt"),
+                    map_location=map_location,
+                    mmap=mmap,
+                ):
+                    return model
+                raise
             resize_scaler_buffer(model, m_sd)
             set_model_state_dict(
-                model, m_sd, options=StateDictOptions(full_state_dict=False, strict=False)
+                model,
+                m_sd,
+                options=StateDictOptions(full_state_dict=False, strict=False),
             )
         return model
     if not p.exists():
@@ -1404,11 +1587,15 @@ def train(
         else:
             init_dir = new_dir("init_ckpt", large=True)
         init_ckpt_path = os.fspath(init_dir)
+        save_init_pt = env_bool(
+            ("ENN_INIT_SAVE_PT", "ENN_INIT_CKPT_SAVE_PT"),
+            default=True,
+        )
         _save_model_checkpoint(
             model,
             init_dir,
             save_dcp=True,
-            save_pt=False,
+            save_pt=bool(save_init_pt),
             overwrite=True,
         )
         cfg_raw = _extract_model_config_dict(model)
