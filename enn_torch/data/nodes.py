@@ -1227,12 +1227,12 @@ class Loader:
             bool(pin_memory) if pin_memory is not None else bool(default_pin)
         )
         if dev_t == "cuda" and self._non_blocking:
-            gpu_guard_mb = 2048
-        elif dev_t in {"xpu"} and self._non_blocking:
             gpu_guard_mb = 512
+        elif dev_t in {"xpu"} and self._non_blocking:
+            gpu_guard_mb = 256
         else:
             gpu_guard_mb = 0
-        host_guard_mb = 1024 if self._non_blocking else 0
+        host_guard_mb = 512 if self._non_blocking else 256
         with suppress(Exception):
             gpu_guard_mb = int(
                 env_first_int(("ENN_GPU_GUARD_MB",), default=gpu_guard_mb)
