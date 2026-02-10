@@ -1160,7 +1160,8 @@ def load_weights(
                     )
             planner = _make_dcp_load_planner(allow_partial_load=not strict)
             try:
-                _raise_if_empty_dcp_model_state(m_sd, checkpoint_path=p)
+                if not strict:
+                    _raise_if_empty_dcp_model_state(m_sd, checkpoint_path=p)
                 _dcp_load_model_state(reader=reader, model_state=m_sd, planner=planner)
             except Exception:
                 if (not strict) and _try_load_dir_checkpoint_fallback_pt(
@@ -1318,7 +1319,8 @@ def load_model(
                     )
             planner = _make_dcp_load_planner(allow_partial_load=not strict)
             try:
-                _raise_if_empty_dcp_model_state(m_sd, checkpoint_path=p)
+                if not strict:
+                    _raise_if_empty_dcp_model_state(m_sd, checkpoint_path=p)
                 _dcp_load_model_state(reader=reader, model_state=m_sd, planner=planner)
             except Exception:
                 if (not strict) and _try_load_dir_checkpoint_fallback_pt(
