@@ -2455,9 +2455,8 @@ def epochs(
     dyn_ctx = contextlib.nullcontext()
     if disable_calib_compile:
         with contextlib.suppress(Exception):
-            import torch._dynamo
-
-            dyn_ctx = torch._dynamo.disable()
+            torch_dynamo = importlib.import_module("torch._dynamo")
+            dyn_ctx = torch_dynamo.disable()
 
     def _dist_all_reduce_sum_(t: torch.Tensor) -> None:
         if not is_distributed():
