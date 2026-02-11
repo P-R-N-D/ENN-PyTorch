@@ -2301,10 +2301,17 @@ def epochs(
         for batch in train_loader:
             x_b, y_b = collate.get_row(batch, labels_required=True)
             x_raw = x_b.to(device)
+            x_raw = torch.atleast_2d(x_raw)
+            B = int(x_raw.shape[0]) if hasattr(x_raw, "shape") else 1
             y_raw = y_b.to(scaler_y_device)
-            y_flat = (
-                y_raw.reshape(y_raw.shape[0], -1) if y_raw.ndim >= 2 else y_raw
-            )
+            if isinstance(y_raw, torch.Tensor):
+                if y_raw.ndim == 0:
+                    y_raw = y_raw.view(1, 1).expand(max(1, B), 1)
+                elif y_raw.ndim >= 1 and int(y_raw.shape[0]) != int(B):
+                    y_raw = y_raw.unsqueeze(0)
+                y_flat = y_raw.reshape(int(B), -1)
+            else:
+                y_flat = y_raw
             out = model(
                 x_raw,
                 labels_flat=None,

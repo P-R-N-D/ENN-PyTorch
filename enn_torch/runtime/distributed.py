@@ -1975,6 +1975,7 @@ class ProcessBroker:
         "found no DeviceMesh from dtensor args",
         "mixed precision.*may be unavailable",
         "Either mode or options can be specified, but both can't be specified at the same time\\.",
+        "\\s*Online softmax is disabled",
     )
     _IGNORED_WARNING_MESSAGE_RE = re.compile(
         r".*(?:"
