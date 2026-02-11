@@ -2599,11 +2599,42 @@ def epochs(
 
     try:
         run_fn = _run_calibration
+        dyn_ctx = None
         if _dynamo_disable is not None:
-            run_fn = _dynamo_disable(run_fn)
-        sum_x, sum_y, sum_x2, sum_xy, total_n, seen_batches, seen_samples = run_fn(
-            sum_x, sum_y, sum_x2, sum_xy, total_n, seen_batches, seen_samples
-        )
+            wrapped_run_fn = None
+            with contextlib.suppress(Exception):
+                cand = _dynamo_disable(run_fn)
+                if callable(cand):
+                    wrapped_run_fn = cand
+            if wrapped_run_fn is not None:
+                run_fn = wrapped_run_fn
+            else:
+                with contextlib.suppress(Exception):
+                    cand_ctx = _dynamo_disable()
+                    if hasattr(cand_ctx, "__enter__") and hasattr(cand_ctx, "__exit__"):
+                        dyn_ctx = cand_ctx
+
+        if dyn_ctx is not None:
+            with dyn_ctx:
+                (
+                    sum_x,
+                    sum_y,
+                    sum_x2,
+                    sum_xy,
+                    total_n,
+                    seen_batches,
+                    seen_samples,
+                ) = run_fn(sum_x, sum_y, sum_x2, sum_xy, total_n, seen_batches, seen_samples)
+        else:
+            (
+                sum_x,
+                sum_y,
+                sum_x2,
+                sum_xy,
+                total_n,
+                seen_batches,
+                seen_samples,
+            ) = run_fn(sum_x, sum_y, sum_x2, sum_xy, total_n, seen_batches, seen_samples)
     finally:
         if calib_bar is not None:
             calib_bar.close()
