@@ -2453,11 +2453,19 @@ def epochs(
     disable_calib_compile = env_bool(
         "ENN_CALIB_DISABLE_COMPILE", default=bool(CPU.is_optimized_for_no_gil())
     )
-    dyn_ctx = contextlib.nullcontext()
+    _dynamo_disable = None
     if disable_calib_compile:
         with contextlib.suppress(Exception):
-            torch_dynamo = importlib.import_module("torch._dynamo")
-            dyn_ctx = torch_dynamo.disable()
+            comp = getattr(torch, "compiler", None)
+            cand = getattr(comp, "disable", None) if comp is not None else None
+            if callable(cand):
+                _dynamo_disable = cand
+        if _dynamo_disable is None:
+            with contextlib.suppress(Exception):
+                torch_dynamo = importlib.import_module("torch._dynamo")
+                cand = getattr(torch_dynamo, "disable", None)
+                if callable(cand):
+                    _dynamo_disable = cand
 
     def _dist_all_reduce_sum_(t: torch.Tensor) -> None:
         if not is_distributed():
@@ -2478,9 +2486,11 @@ def epochs(
 
     seen_batches = 0
     seen_samples = 0
-    try:
+    def _run_calibration(
+        sum_x, sum_y, sum_x2, sum_xy, total_n: int, seen_batches: int, seen_samples: int
+    ):
         model.eval()
-        with dyn_ctx, inference_mode(model), Autocast.float(device):
+        with inference_mode(model), Autocast.float(device):
             for batch in _iter_raw(calib_src):
                 if int(max_batches) > 0 and int(seen_batches) >= int(max_batches):
                     break
@@ -2590,6 +2600,67 @@ def epochs(
                 seen_samples += int(B)
                 if calib_bar is not None:
                     ProcessBroker.update_progress_bar(calib_bar, finish=1)
+
+        return sum_x, sum_y, sum_x2, sum_xy, total_n, seen_batches, seen_samples
+
+    try:
+        run_fn = _run_calibration
+        dyn_ctx = None
+        if _dynamo_disable is not None:
+            wrapped_run_fn = None
+            with contextlib.suppress(Exception):
+                cand = _dynamo_disable(run_fn)
+                if callable(cand):
+                    wrapped_run_fn = cand
+            if wrapped_run_fn is not None:
+                run_fn = wrapped_run_fn
+            else:
+                with contextlib.suppress(Exception):
+                    cand_ctx = _dynamo_disable()
+                    if hasattr(cand_ctx, "__enter__") and hasattr(cand_ctx, "__exit__"):
+                        dyn_ctx = cand_ctx
+
+        if dyn_ctx is not None:
+            try:
+                dyn_ctx.__enter__()
+            except Exception:
+                if local_rank == 0:
+                    _LOGGER.debug(
+                        "[calibration] disable() context enter failed; continuing unwrapped",
+                        exc_info=True,
+                    )
+                dyn_ctx = None
+
+        if dyn_ctx is not None:
+            try:
+                (
+                    sum_x,
+                    sum_y,
+                    sum_x2,
+                    sum_xy,
+                    total_n,
+                    seen_batches,
+                    seen_samples,
+                ) = run_fn(sum_x, sum_y, sum_x2, sum_xy, total_n, seen_batches, seen_samples)
+            except BaseException as e:
+                suppress_exc = False
+                with contextlib.suppress(Exception):
+                    suppress_exc = bool(dyn_ctx.__exit__(type(e), e, e.__traceback__))
+                if not suppress_exc:
+                    raise
+            else:
+                with contextlib.suppress(Exception):
+                    dyn_ctx.__exit__(None, None, None)
+        else:
+            (
+                sum_x,
+                sum_y,
+                sum_x2,
+                sum_xy,
+                total_n,
+                seen_batches,
+                seen_samples,
+            ) = run_fn(sum_x, sum_y, sum_x2, sum_xy, total_n, seen_batches, seen_samples)
     finally:
         if calib_bar is not None:
             calib_bar.close()
