@@ -2453,11 +2453,13 @@ def epochs(
     disable_calib_compile = env_bool(
         "ENN_CALIB_DISABLE_COMPILE", default=bool(CPU.is_optimized_for_no_gil())
     )
-    dyn_ctx = contextlib.nullcontext()
+    _dynamo_disable = None
     if disable_calib_compile:
         with contextlib.suppress(Exception):
             torch_dynamo = importlib.import_module("torch._dynamo")
-            dyn_ctx = torch_dynamo.disable()
+            _cand = getattr(torch_dynamo, "disable", None)
+            if callable(_cand):
+                _dynamo_disable = _cand
 
     def _dist_all_reduce_sum_(t: torch.Tensor) -> None:
         if not is_distributed():
@@ -2478,9 +2480,11 @@ def epochs(
 
     seen_batches = 0
     seen_samples = 0
-    try:
+    def _run_calibration(
+        sum_x, sum_y, sum_x2, sum_xy, total_n: int, seen_batches: int, seen_samples: int
+    ):
         model.eval()
-        with dyn_ctx, inference_mode(model), Autocast.float(device):
+        with inference_mode(model), Autocast.float(device):
             for batch in _iter_raw(calib_src):
                 if int(max_batches) > 0 and int(seen_batches) >= int(max_batches):
                     break
@@ -2590,6 +2594,16 @@ def epochs(
                 seen_samples += int(B)
                 if calib_bar is not None:
                     ProcessBroker.update_progress_bar(calib_bar, finish=1)
+
+        return sum_x, sum_y, sum_x2, sum_xy, total_n, seen_batches, seen_samples
+
+    try:
+        run_fn = _run_calibration
+        if _dynamo_disable is not None:
+            run_fn = _dynamo_disable(run_fn)
+        sum_x, sum_y, sum_x2, sum_xy, total_n, seen_batches, seen_samples = run_fn(
+            sum_x, sum_y, sum_x2, sum_xy, total_n, seen_batches, seen_samples
+        )
     finally:
         if calib_bar is not None:
             calib_bar.close()
