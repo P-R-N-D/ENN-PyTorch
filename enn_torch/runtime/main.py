@@ -2418,6 +2418,7 @@ def epochs(
 
     sum_x = sum_y = sum_x2 = sum_xy = None
     total_n = 0
+    target_chunk_bytes = 16 * 1024 * 1024
     seen_batches = 0
     seen_samples = 0
     try:
@@ -2505,10 +2506,23 @@ def epochs(
                     sum_y = torch.zeros((feat,), device=scaler_y_device, dtype=torch.float64)
                     sum_x2 = torch.zeros((feat,), device=scaler_y_device, dtype=torch.float64)
                     sum_xy = torch.zeros((feat,), device=scaler_y_device, dtype=torch.float64)
-                sum_x += z_pred.sum(dim=0, dtype=torch.float64)
-                sum_y += z_true.sum(dim=0, dtype=torch.float64)
-                sum_x2 += (z_pred * z_pred).sum(dim=0, dtype=torch.float64)
-                sum_xy += (z_pred * z_true).sum(dim=0, dtype=torch.float64)
+                denom = max(1, n_batch * int(z_pred.element_size()))
+                chunk_f = max(1, int(target_chunk_bytes // denom))
+                chunk_f = min(chunk_f, feat)
+                if chunk_f >= feat:
+                    sum_x += z_pred.sum(dim=0, dtype=torch.float64)
+                    sum_y += z_true.sum(dim=0, dtype=torch.float64)
+                    sum_x2 += (z_pred * z_pred).sum(dim=0, dtype=torch.float64)
+                    sum_xy += (z_pred * z_true).sum(dim=0, dtype=torch.float64)
+                else:
+                    for j in range(0, feat, chunk_f):
+                        j2 = j + chunk_f
+                        zp = z_pred[:, j:j2]
+                        zt = z_true[:, j:j2]
+                        sum_x[j:j2] += zp.sum(dim=0, dtype=torch.float64)
+                        sum_y[j:j2] += zt.sum(dim=0, dtype=torch.float64)
+                        sum_x2[j:j2] += (zp * zp).sum(dim=0, dtype=torch.float64)
+                        sum_xy[j:j2] += (zp * zt).sum(dim=0, dtype=torch.float64)
 
                 seen_batches += 1
                 seen_samples += int(B)
