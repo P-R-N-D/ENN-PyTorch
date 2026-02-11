@@ -176,6 +176,12 @@ try:
 except Exception:
     TD_CudaGraphModule = None
 
+try:
+    from tensordict.nn.functional_modules import _exclude_td_from_pytree
+    _exclude_td_from_pytree().set()
+except Exception:
+    pass
+
 _COMPILE_SAFE_DONE = False
 _COMPILE_SAFE_LOCK = Mutex()
 _LOGGER = logging.getLogger(__name__)
@@ -3573,7 +3579,6 @@ def infer(
 
 @worker_main()
 def process(*args: Any, **kwargs: Any) -> object:
-    os.environ["EXCLUDE_TD_FROM_PYTREE"]="1"
     from ..data.pipeline import Session
 
     if not args:
