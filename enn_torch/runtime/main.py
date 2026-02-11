@@ -2082,7 +2082,13 @@ def epochs(
                 lw_bottom_sum = None
                 lw_count = 0
             if train_accum_since_last > 0:
-                if ddp_fallback:
+                # If the epoch ends mid-accumulation, the final micro-batches
+                # may have run under DDP no_sync(...). Ensure gradients are
+                # synchronized before applying the remainder optimizer step.
+                if ddp_fallback or (
+                    is_distributed()
+                    and max(1, grad_accum_steps) > 1
+                ):
                     distributed_all_reduce_grads(
                         _m_post,
                         average=True,
