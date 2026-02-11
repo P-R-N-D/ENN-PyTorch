@@ -2419,11 +2419,68 @@ def epochs(
     sum_x = sum_y = sum_x2 = sum_xy = None
     total_n = 0
     target_chunk_bytes = 16 * 1024 * 1024
+    with contextlib.suppress(Exception):
+        target_chunk_bytes = int(
+            env_first_int(
+                ("ENN_CALIB_CHUNK_BYTES", "ENN_CALIB_TARGET_CHUNK_BYTES"),
+                default=target_chunk_bytes,
+            )
+            or target_chunk_bytes
+        )
+    target_chunk_bytes = int(target_chunk_bytes)
+    if target_chunk_bytes < 0:
+        target_chunk_bytes = 0
+
+    accum_spec = str(env_str("ENN_CALIB_ACCUM_DEVICE") or "cpu").strip().lower()
+    if accum_spec in {"cpu", ""}:
+        accum_device = torch.device("cpu")
+    elif accum_spec in {"scaler", "scaler_y", "y"}:
+        accum_device = scaler_y_device
+    elif accum_spec in {"device", "train", "accel"}:
+        accum_device = device
+    else:
+        with contextlib.suppress(Exception):
+            accum_device = torch.device(accum_spec)
+        if "accum_device" not in locals():
+            accum_device = torch.device("cpu")
+
+    def _to_accum(v: torch.Tensor) -> torch.Tensor:
+        if v.dtype is not torch.float64 or v.device != accum_device:
+            return v.to(device=accum_device, dtype=torch.float64)
+        return v
+
+    disable_calib_compile = env_bool(
+        "ENN_CALIB_DISABLE_COMPILE", default=bool(CPU.is_optimized_for_no_gil())
+    )
+    dyn_ctx = contextlib.nullcontext()
+    if disable_calib_compile:
+        with contextlib.suppress(Exception):
+            import torch._dynamo
+
+            dyn_ctx = torch._dynamo.disable()
+
+    def _dist_all_reduce_sum_(t: torch.Tensor) -> None:
+        if not is_distributed():
+            return
+        try:
+            torch.distributed.all_reduce(t, op=torch.distributed.ReduceOp.SUM)
+            return
+        except Exception:
+            pass
+        try:
+            if t.device.type == "cpu":
+                td = t.to(device=device)
+                torch.distributed.all_reduce(td, op=torch.distributed.ReduceOp.SUM)
+                t.copy_(td.to(device="cpu"))
+                return
+        except Exception:
+            raise
+
     seen_batches = 0
     seen_samples = 0
     try:
         model.eval()
-        with inference_mode(model), Autocast.float(device):
+        with dyn_ctx, inference_mode(model), Autocast.float(device):
             for batch in _iter_raw(calib_src):
                 if int(max_batches) > 0 and int(seen_batches) >= int(max_batches):
                     break
@@ -2502,27 +2559,32 @@ def epochs(
                 total_n += n_batch
                 feat = int(z_pred.shape[1])
                 if sum_x is None:
-                    sum_x = torch.zeros((feat,), device=scaler_y_device, dtype=torch.float64)
-                    sum_y = torch.zeros((feat,), device=scaler_y_device, dtype=torch.float64)
-                    sum_x2 = torch.zeros((feat,), device=scaler_y_device, dtype=torch.float64)
-                    sum_xy = torch.zeros((feat,), device=scaler_y_device, dtype=torch.float64)
-                denom = max(1, n_batch * int(z_pred.element_size()))
-                chunk_f = max(1, int(target_chunk_bytes // denom))
-                chunk_f = min(chunk_f, feat)
+                    sum_x = torch.zeros((feat,), device=accum_device, dtype=torch.float64)
+                    sum_y = torch.zeros((feat,), device=accum_device, dtype=torch.float64)
+                    sum_x2 = torch.zeros((feat,), device=accum_device, dtype=torch.float64)
+                    sum_xy = torch.zeros((feat,), device=accum_device, dtype=torch.float64)
+
+                if int(target_chunk_bytes) <= 0:
+                    chunk_f = feat
+                else:
+                    denom = max(1, n_batch * int(z_pred.element_size()))
+                    chunk_f = max(1, int(int(target_chunk_bytes) // denom))
+                    chunk_f = min(chunk_f, feat)
+
                 if chunk_f >= feat:
-                    sum_x += z_pred.sum(dim=0, dtype=torch.float64)
-                    sum_y += z_true.sum(dim=0, dtype=torch.float64)
-                    sum_x2 += (z_pred * z_pred).sum(dim=0, dtype=torch.float64)
-                    sum_xy += (z_pred * z_true).sum(dim=0, dtype=torch.float64)
+                    sum_x += _to_accum(z_pred.sum(dim=0, dtype=torch.float64))
+                    sum_y += _to_accum(z_true.sum(dim=0, dtype=torch.float64))
+                    sum_x2 += _to_accum((z_pred * z_pred).sum(dim=0, dtype=torch.float64))
+                    sum_xy += _to_accum((z_pred * z_true).sum(dim=0, dtype=torch.float64))
                 else:
                     for j in range(0, feat, chunk_f):
                         j2 = j + chunk_f
                         zp = z_pred[:, j:j2]
                         zt = z_true[:, j:j2]
-                        sum_x[j:j2] += zp.sum(dim=0, dtype=torch.float64)
-                        sum_y[j:j2] += zt.sum(dim=0, dtype=torch.float64)
-                        sum_x2[j:j2] += (zp * zp).sum(dim=0, dtype=torch.float64)
-                        sum_xy[j:j2] += (zp * zt).sum(dim=0, dtype=torch.float64)
+                        sum_x[j:j2] += _to_accum(zp.sum(dim=0, dtype=torch.float64))
+                        sum_y[j:j2] += _to_accum(zt.sum(dim=0, dtype=torch.float64))
+                        sum_x2[j:j2] += _to_accum((zp * zp).sum(dim=0, dtype=torch.float64))
+                        sum_xy[j:j2] += _to_accum((zp * zt).sum(dim=0, dtype=torch.float64))
 
                 seen_batches += 1
                 seen_samples += int(B)
@@ -2533,17 +2595,17 @@ def epochs(
             calib_bar.close()
 
     if is_distributed():
-        n_t = torch.tensor(int(total_n), device=scaler_y_device, dtype=torch.int64)
-        torch.distributed.all_reduce(n_t, op=torch.distributed.ReduceOp.SUM)
+        n_t = torch.tensor(int(total_n), device="cpu", dtype=torch.int64)
+        _dist_all_reduce_sum_(n_t)
         total_n = int(n_t.item())
         if sum_x is not None:
-            torch.distributed.all_reduce(sum_x, op=torch.distributed.ReduceOp.SUM)
+            _dist_all_reduce_sum_(sum_x)
         if sum_y is not None:
-            torch.distributed.all_reduce(sum_y, op=torch.distributed.ReduceOp.SUM)
+            _dist_all_reduce_sum_(sum_y)
         if sum_x2 is not None:
-            torch.distributed.all_reduce(sum_x2, op=torch.distributed.ReduceOp.SUM)
+            _dist_all_reduce_sum_(sum_x2)
         if sum_xy is not None:
-            torch.distributed.all_reduce(sum_xy, op=torch.distributed.ReduceOp.SUM)
+            _dist_all_reduce_sum_(sum_xy)
 
     with torch.inference_mode():
         _finalize_affine(total_n, sum_x, sum_y, sum_x2, sum_xy)
