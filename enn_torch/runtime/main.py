@@ -2456,10 +2456,16 @@ def epochs(
     _dynamo_disable = None
     if disable_calib_compile:
         with contextlib.suppress(Exception):
-            torch_dynamo = importlib.import_module("torch._dynamo")
-            _cand = getattr(torch_dynamo, "disable", None)
-            if callable(_cand):
-                _dynamo_disable = _cand
+            comp = getattr(torch, "compiler", None)
+            cand = getattr(comp, "disable", None) if comp is not None else None
+            if callable(cand):
+                _dynamo_disable = cand
+        if _dynamo_disable is None:
+            with contextlib.suppress(Exception):
+                torch_dynamo = importlib.import_module("torch._dynamo")
+                cand = getattr(torch_dynamo, "disable", None)
+                if callable(cand):
+                    _dynamo_disable = cand
 
     def _dist_all_reduce_sum_(t: torch.Tensor) -> None:
         if not is_distributed():
@@ -2615,7 +2621,18 @@ def epochs(
                         dyn_ctx = cand_ctx
 
         if dyn_ctx is not None:
-            with dyn_ctx:
+            try:
+                dyn_ctx.__enter__()
+            except Exception:
+                if local_rank == 0:
+                    _LOGGER.debug(
+                        "[calibration] disable() context enter failed; continuing unwrapped",
+                        exc_info=True,
+                    )
+                dyn_ctx = None
+
+        if dyn_ctx is not None:
+            try:
                 (
                     sum_x,
                     sum_y,
@@ -2625,6 +2642,15 @@ def epochs(
                     seen_batches,
                     seen_samples,
                 ) = run_fn(sum_x, sum_y, sum_x2, sum_xy, total_n, seen_batches, seen_samples)
+            except BaseException as e:
+                suppress_exc = False
+                with contextlib.suppress(Exception):
+                    suppress_exc = bool(dyn_ctx.__exit__(type(e), e, e.__traceback__))
+                if not suppress_exc:
+                    raise
+            else:
+                with contextlib.suppress(Exception):
+                    dyn_ctx.__exit__(None, None, None)
         else:
             (
                 sum_x,
