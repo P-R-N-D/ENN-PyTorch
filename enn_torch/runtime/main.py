@@ -569,6 +569,7 @@ def epochs(
     bottom_loss: object,
     train_loader: object,
     val_loader: object,
+    calibration_loader: object | None = None,
     total_epochs: int,
     scheduler_step_per_batch: bool = True,
     swa_helper: object | None = None,
@@ -2289,193 +2290,6 @@ def epochs(
             prev_flops += float(flops)
             prev_io_bytes += float(io_bytes)
             prev_samples += float(train_samples_epoch)
-    model_for_scaler = model.module if hasattr(model, "module") else model
-    scaler_y_device = model_for_scaler.scaler.y_mean.device
-    with torch.inference_mode():
-        sum_x = None
-        sum_y = None
-        sum_x2 = None
-        sum_xy = None
-        total_n = 0
-        target_chunk_bytes = 16 * 1024 * 1024
-        for batch in train_loader:
-            x_b, y_b = collate.get_row(batch, labels_required=True)
-            x_raw = x_b.to(device)
-            x_raw = torch.atleast_2d(x_raw)
-            B = int(x_raw.shape[0]) if hasattr(x_raw, "shape") else 1
-            y_raw = y_b.to(scaler_y_device) if isinstance(y_b, torch.Tensor) else y_b
-            if not isinstance(y_raw, torch.Tensor):
-                try:
-                    y_raw = torch.as_tensor(y_raw, device=scaler_y_device)
-                except Exception as e:
-                    raise TypeError(
-                        "Calibration: target must be a Tensor (or convertible to Tensor). "
-                        f"got type={type(y_raw).__name__}"
-                    ) from e
-            if isinstance(y_raw, torch.Tensor):
-                if y_raw.ndim == 0:
-                    y_raw = y_raw.view(1, 1).expand(max(1, B), 1)
-                elif y_raw.ndim == 1:
-                    if int(y_raw.shape[0]) == int(B):
-                        y_raw = y_raw.view(int(B), 1)
-                    elif int(B) == 1:
-                        y_raw = y_raw.view(1, -1)
-                    else:
-                        raise RuntimeError(
-                            "Calibration: 1D target length does not match batch size. "
-                            f"target.shape={tuple(y_raw.shape)}, batch={int(B)}"
-                        )
-                else:
-                    # ndim >= 2
-                    if int(y_raw.shape[0]) == int(B):
-                        pass
-                    elif int(B) == 1:
-                        y_raw = y_raw.unsqueeze(0)
-                    else:
-                        candidates = [
-                            dim_idx
-                            for dim_idx, dim_size in enumerate(y_raw.shape[1:], start=1)
-                            if int(dim_size) == int(B)
-                        ]
-                        if not candidates:
-                            raise RuntimeError(
-                                "Calibration: could not infer batch axis for target tensor. "
-                                f"target.shape={tuple(y_raw.shape)}, batch={int(B)}"
-                            )
-                        if len(candidates) > 1:
-                            raise RuntimeError(
-                                "Calibration: ambiguous batch axis for target tensor "
-                                f"(candidates={candidates}). Please provide targets in (B, ...) layout. "
-                                f"target.shape={tuple(y_raw.shape)}, batch={int(B)}"
-                            )
-                        y_raw = y_raw.movedim(int(candidates[0]), 0)
-                y_flat = y_raw.reshape(int(B), -1)
-            out = None
-            try:
-                z_pred_raw = model(x_raw, calibrate_output=False, return_loss=False)
-            except TypeError:
-                out = model(x_raw, calibrate_output=False)
-                z_pred_raw = out[0] if isinstance(out, tuple) else out
-            z_pred = z_pred_raw.detach()
-            if z_pred.device != scaler_y_device:
-                z_pred = z_pred.to(device=scaler_y_device)
-            z_pred = (
-                z_pred.reshape(z_pred.shape[0], -1)
-                if z_pred.ndim >= 2
-                else z_pred.view(-1, 1)
-            )
-            z_true = model_for_scaler.scaler.normalize_y(y_flat.detach())
-            if z_true.device != scaler_y_device:
-                z_true = z_true.to(device=scaler_y_device)
-            z_true = (
-                z_true.reshape(z_true.shape[0], -1)
-                if z_true.ndim >= 2
-                else z_true.view(-1, 1)
-            )
-            if z_pred.shape[-1] != z_true.shape[-1]:
-                f_pred = z_pred.shape[-1]
-                f_true = z_true.shape[-1]
-                if f_true % f_pred == 0:
-                    group = f_true // f_pred
-                    z_true = z_true.view(z_true.shape[0], group, f_pred).mean(
-                        dim=1
-                    )
-                elif f_pred % f_true == 0:
-                    group = f_pred // f_true
-                    z_true = z_true.repeat_interleave(group, dim=1)
-                else:
-                    raise RuntimeError(
-                        f"Calibration: feature dimension mismatch between prediction and target that cannot be reconciled generically. z_pred.shape={tuple(z_pred.shape)}, z_true.shape={tuple(z_true.shape)}"
-                    )
-            if z_pred.shape[0] != z_true.shape[0]:
-                raise RuntimeError(
-                    f"Calibration: batch dimension mismatch between prediction and target. z_pred.shape={tuple(z_pred.shape)}, z_true.shape={tuple(z_true.shape)}"
-                )
-            if z_pred.numel() == 0 or z_true.numel() == 0:
-                continue
-            n_batch = int(z_pred.shape[0])
-            total_n += n_batch
-            feat = int(z_pred.shape[1])
-            if sum_x is None:
-                sum_x = torch.zeros(
-                    (feat,), device=scaler_y_device, dtype=torch.float64
-                )
-                sum_y = torch.zeros(
-                    (feat,), device=scaler_y_device, dtype=torch.float64
-                )
-                sum_x2 = torch.zeros(
-                    (feat,), device=scaler_y_device, dtype=torch.float64
-                )
-                sum_xy = torch.zeros(
-                    (feat,), device=scaler_y_device, dtype=torch.float64
-                )
-            denom = max(1, n_batch * int(z_pred.element_size()))
-            chunk_f = max(1, int(target_chunk_bytes // denom))
-            chunk_f = min(chunk_f, feat)
-            if chunk_f >= feat:
-                sum_x += z_pred.sum(dim=0, dtype=torch.float64)
-                sum_y += z_true.sum(dim=0, dtype=torch.float64)
-                sum_x2 += (z_pred * z_pred).sum(dim=0, dtype=torch.float64)
-                sum_xy += (z_pred * z_true).sum(dim=0, dtype=torch.float64)
-            else:
-                for j in range(0, feat, chunk_f):
-                    j2 = j + chunk_f
-                    zp = z_pred[:, j:j2]
-                    zt = z_true[:, j:j2]
-                    sum_x[j:j2] += zp.sum(dim=0, dtype=torch.float64)
-                    sum_y[j:j2] += zt.sum(dim=0, dtype=torch.float64)
-                    sum_x2[j:j2] += (zp * zp).sum(dim=0, dtype=torch.float64)
-                    sum_xy[j:j2] += (zp * zt).sum(dim=0, dtype=torch.float64)
-        if is_distributed():
-            n_t = torch.tensor(
-                int(total_n), device=scaler_y_device, dtype=torch.int64
-            )
-            torch.distributed.all_reduce(
-                n_t, op=torch.distributed.ReduceOp.SUM
-            )
-            total_n = int(n_t.item())
-            if sum_x is not None:
-                torch.distributed.all_reduce(
-                    sum_x, op=torch.distributed.ReduceOp.SUM
-                )
-            if sum_y is not None:
-                torch.distributed.all_reduce(
-                    sum_y, op=torch.distributed.ReduceOp.SUM
-                )
-            if sum_x2 is not None:
-                torch.distributed.all_reduce(
-                    sum_x2, op=torch.distributed.ReduceOp.SUM
-                )
-            if sum_xy is not None:
-                torch.distributed.all_reduce(
-                    sum_xy, op=torch.distributed.ReduceOp.SUM
-                )
-        if (
-            total_n > 0
-            and sum_x is not None
-            and (sum_y is not None)
-            and (sum_x2 is not None)
-            and (sum_xy is not None)
-        ):
-            N = float(total_n)
-            mean_x = sum_x / N
-            mean_y = sum_y / N
-            Ex2 = sum_x2 / N
-            Exy = sum_xy / N
-            var_x = Ex2 - mean_x * mean_x
-            cov_xy = Exy - mean_x * mean_y
-            eps = float(model_for_scaler.scaler.eps)
-            denom = var_x
-            tiny_mask = denom.abs() < eps
-            denom[tiny_mask] = 1.0
-            affine_dtype = model_for_scaler.scaler.affine_a.dtype
-            a = (cov_xy / denom).to(dtype=affine_dtype)
-            b = (mean_y - a.to(dtype=affine_dtype) * mean_x).to(
-                dtype=affine_dtype
-            )
-            a[tiny_mask] = 1.0
-            b[tiny_mask] = 0.0
-            model_for_scaler.scaler.set_affine(a, b)
     if torch_prof is not None:
         with contextlib.suppress(Exception):
             torch_prof.stop()
@@ -2489,6 +2303,236 @@ def epochs(
             f"{mbps:.2f} MB/s, {tflops:.2f} TFLOPS", refresh=True
         )
         status_bar.close()
+
+    model_for_scaler = model.module if hasattr(model, "module") else model
+    scaler_y_device = model_for_scaler.scaler.y_mean.device
+    calib_src = calibration_loader if calibration_loader is not None else (val_loader or train_loader)
+    if calib_src is None:
+        end_kst_ns = posix_time()
+        return None
+
+    max_batches = int(
+        env_first_int(("ENN_CALIB_MAX_BATCHES", "ENN_CALIB_MAX_STEPS"), default=32)
+        or 32
+    )
+    max_samples = int(env_first_int(("ENN_CALIB_MAX_SAMPLES",), default=2048) or 2048)
+    if max_batches < 0:
+        max_batches = 0
+    if max_samples < 0:
+        max_samples = 0
+
+    def _iter_raw(loader_obj: object):
+        node_obj = getattr(loader_obj, "_node", None)
+        if node_obj is not None:
+            try:
+                import torchdata.nodes as _tdn
+
+                base = (
+                    node_obj
+                    if isinstance(node_obj, _tdn.Loader)
+                    else _tdn.Loader(node_obj)
+                )
+                with contextlib.suppress(Exception):
+                    base.reset(None)
+                return iter(base)
+            except Exception:
+                pass
+        base_it = getattr(loader_obj, "_base_iterable", None)
+        if base_it is not None:
+            with contextlib.suppress(Exception):
+                base_it.reset(None)
+            return iter(base_it)
+        return iter(loader_obj)
+
+    def _coerce_targets_to_B(y_raw: torch.Tensor, B: int) -> torch.Tensor:
+        if y_raw.ndim == 0:
+            return y_raw.view(1, 1).expand(max(1, int(B)), 1)
+        if y_raw.ndim == 1:
+            if int(y_raw.shape[0]) == int(B):
+                return y_raw.view(int(B), 1)
+            if int(B) == 1:
+                return y_raw.view(1, -1)
+            raise RuntimeError(
+                "Calibration: 1D target length does not match batch size. "
+                f"target.shape={tuple(y_raw.shape)}, batch={int(B)}"
+            )
+        if int(y_raw.shape[0]) == int(B):
+            return y_raw
+        if int(B) == 1:
+            return y_raw.unsqueeze(0)
+        candidates = [
+            dim_idx
+            for dim_idx, dim_size in enumerate(y_raw.shape[1:], start=1)
+            if int(dim_size) == int(B)
+        ]
+        if not candidates:
+            raise RuntimeError(
+                "Calibration: could not infer batch axis for target tensor. "
+                f"target.shape={tuple(y_raw.shape)}, batch={int(B)}"
+            )
+        if len(candidates) > 1:
+            raise RuntimeError(
+                "Calibration: ambiguous batch axis for target tensor "
+                f"(candidates={candidates}). Provide targets in (B, ...) layout. "
+                f"target.shape={tuple(y_raw.shape)}, batch={int(B)}"
+            )
+        return y_raw.movedim(int(candidates[0]), 0)
+
+    def _finalize_affine(total_n: int, sum_x, sum_y, sum_x2, sum_xy) -> None:
+        if (
+            int(total_n) <= 0
+            or sum_x is None
+            or sum_y is None
+            or sum_x2 is None
+            or sum_xy is None
+        ):
+            return
+        N = float(int(total_n))
+        mean_x = sum_x / N
+        mean_y = sum_y / N
+        Ex2 = sum_x2 / N
+        Exy = sum_xy / N
+        var_x = Ex2 - mean_x * mean_x
+        cov_xy = Exy - mean_x * mean_y
+        eps = float(model_for_scaler.scaler.eps)
+        denom = var_x
+        tiny_mask = denom.abs() < eps
+        denom[tiny_mask] = 1.0
+        affine_dtype = model_for_scaler.scaler.affine_a.dtype
+        a = (cov_xy / denom).to(dtype=affine_dtype)
+        b = (mean_y - a.to(dtype=affine_dtype) * mean_x).to(dtype=affine_dtype)
+        a[tiny_mask] = 1.0
+        b[tiny_mask] = 0.0
+        model_for_scaler.scaler.set_affine(a, b)
+
+    planned = int(_get_batch_length(calib_src) or 0)
+    if int(max_batches) > 0 and planned > int(max_batches):
+        planned = int(max_batches)
+    calib_bar = (
+        ProcessBroker.get_progress_bar(
+            title="Calibration", total=int(planned), device=device, leave=False
+        )
+        if local_rank == 0 and int(planned) > 0
+        else None
+    )
+
+    sum_x = sum_y = sum_x2 = sum_xy = None
+    total_n = 0
+    seen_batches = 0
+    seen_samples = 0
+    try:
+        model.eval()
+        with inference_mode(model), Autocast.float(device):
+            for batch in _iter_raw(calib_src):
+                if int(max_batches) > 0 and int(seen_batches) >= int(max_batches):
+                    break
+                if int(max_samples) > 0 and int(seen_samples) >= int(max_samples):
+                    break
+
+                x_b, y_b = collate.get_row(batch, labels_required=True)
+                x_raw = torch.atleast_2d(x_b.to(device))
+                B = int(x_raw.shape[0])
+
+                y_raw = (
+                    y_b.to(scaler_y_device)
+                    if isinstance(y_b, torch.Tensor)
+                    else torch.as_tensor(y_b, device=scaler_y_device)
+                )
+                y_raw = _coerce_targets_to_B(y_raw, B)
+                y_flat = y_raw.reshape(int(B), -1)
+
+                y_for_loss = y_flat.to(
+                    device=device, dtype=param_dtype, non_blocking=non_blocking_ok
+                )
+                out = model(
+                    x_raw,
+                    labels_flat=y_for_loss,
+                    global_loss=top_loss,
+                    local_loss=bottom_loss,
+                    loss_weights=loss_controller.weights(),
+                    calibrate_output=False,
+                )
+                z_pred_raw = out[0] if isinstance(out, tuple) else out
+                z_pred = z_pred_raw.detach()
+                if z_pred.device != scaler_y_device:
+                    z_pred = z_pred.to(device=scaler_y_device)
+                z_pred = (
+                    z_pred.reshape(z_pred.shape[0], -1)
+                    if z_pred.ndim >= 2
+                    else z_pred.view(-1, 1)
+                )
+
+                z_true = model_for_scaler.scaler.normalize_y(y_flat.detach())
+                if z_true.device != scaler_y_device:
+                    z_true = z_true.to(device=scaler_y_device)
+                z_true = (
+                    z_true.reshape(z_true.shape[0], -1)
+                    if z_true.ndim >= 2
+                    else z_true.view(-1, 1)
+                )
+
+                if z_pred.shape[-1] != z_true.shape[-1]:
+                    f_pred = z_pred.shape[-1]
+                    f_true = z_true.shape[-1]
+                    if f_true % f_pred == 0:
+                        group = f_true // f_pred
+                        z_true = z_true.view(z_true.shape[0], group, f_pred).mean(dim=1)
+                    elif f_pred % f_true == 0:
+                        group = f_pred // f_true
+                        z_true = z_true.repeat_interleave(group, dim=1)
+                    else:
+                        raise RuntimeError(
+                            "Calibration: feature dim mismatch cannot be reconciled. "
+                            f"z_pred.shape={tuple(z_pred.shape)}, z_true.shape={tuple(z_true.shape)}"
+                        )
+                if z_pred.shape[0] != z_true.shape[0]:
+                    raise RuntimeError(
+                        "Calibration: batch dim mismatch. "
+                        f"z_pred.shape={tuple(z_pred.shape)}, z_true.shape={tuple(z_true.shape)}"
+                    )
+                if z_pred.numel() == 0 or z_true.numel() == 0:
+                    seen_batches += 1
+                    seen_samples += int(B)
+                    if calib_bar is not None:
+                        ProcessBroker.update_progress_bar(calib_bar, finish=1)
+                    continue
+
+                n_batch = int(z_pred.shape[0])
+                total_n += n_batch
+                feat = int(z_pred.shape[1])
+                if sum_x is None:
+                    sum_x = torch.zeros((feat,), device=scaler_y_device, dtype=torch.float64)
+                    sum_y = torch.zeros((feat,), device=scaler_y_device, dtype=torch.float64)
+                    sum_x2 = torch.zeros((feat,), device=scaler_y_device, dtype=torch.float64)
+                    sum_xy = torch.zeros((feat,), device=scaler_y_device, dtype=torch.float64)
+                sum_x += z_pred.sum(dim=0, dtype=torch.float64)
+                sum_y += z_true.sum(dim=0, dtype=torch.float64)
+                sum_x2 += (z_pred * z_pred).sum(dim=0, dtype=torch.float64)
+                sum_xy += (z_pred * z_true).sum(dim=0, dtype=torch.float64)
+
+                seen_batches += 1
+                seen_samples += int(B)
+                if calib_bar is not None:
+                    ProcessBroker.update_progress_bar(calib_bar, finish=1)
+    finally:
+        if calib_bar is not None:
+            calib_bar.close()
+
+    if is_distributed():
+        n_t = torch.tensor(int(total_n), device=scaler_y_device, dtype=torch.int64)
+        torch.distributed.all_reduce(n_t, op=torch.distributed.ReduceOp.SUM)
+        total_n = int(n_t.item())
+        if sum_x is not None:
+            torch.distributed.all_reduce(sum_x, op=torch.distributed.ReduceOp.SUM)
+        if sum_y is not None:
+            torch.distributed.all_reduce(sum_y, op=torch.distributed.ReduceOp.SUM)
+        if sum_x2 is not None:
+            torch.distributed.all_reduce(sum_x2, op=torch.distributed.ReduceOp.SUM)
+        if sum_xy is not None:
+            torch.distributed.all_reduce(sum_xy, op=torch.distributed.ReduceOp.SUM)
+
+    with torch.inference_mode():
+        _finalize_affine(total_n, sum_x, sum_y, sum_x2, sum_xy)
     end_kst_ns = posix_time()
     try:
         dev_t = getattr(device, "type", "")
@@ -3839,6 +3883,28 @@ def process(*args: Any, **kwargs: Any) -> object:
             val_loader = session.validation_loader
             raw_train_loader = session.raw_training_loader
             raw_val_loader = session.raw_validation_loader
+
+            calibration_loader = None
+            try:
+                if raw_val_loader is not None and int(_get_batch_length(raw_val_loader)) > 0:
+                    calibration_loader = raw_val_loader
+            except Exception:
+                calibration_loader = None
+            if calibration_loader is None:
+                try:
+                    if raw_train_loader is not None and int(_get_batch_length(raw_train_loader)) > 0:
+                        calibration_loader = raw_train_loader
+                except Exception:
+                    calibration_loader = None
+            if calibration_loader is None:
+                try:
+                    if val_loader is not None and int(_get_batch_length(val_loader)) > 0:
+                        calibration_loader = val_loader
+                except Exception:
+                    calibration_loader = None
+            if calibration_loader is None:
+                calibration_loader = train_loader
+
             train_steps = _get_batch_length(train_loader)
             val_steps = _get_batch_length(val_loader)
             steps_per_epoch = max(1, train_steps + val_steps)
@@ -3948,6 +4014,7 @@ def process(*args: Any, **kwargs: Any) -> object:
                 bottom_loss=bottom_loss,
                 train_loader=train_loader,
                 val_loader=val_loader,
+                calibration_loader=calibration_loader,
                 total_epochs=total_epochs,
                 scheduler_step_per_batch=scheduler_step_per_batch,
                 swa_helper=swa_helper,
