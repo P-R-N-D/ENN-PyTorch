@@ -75,6 +75,12 @@ from .distributed import (
 from .io import _filtered_warnings, _torch_load_checkpoint, is_required
 from .main import process
 
+try:
+    from tensordict.nn.functional_modules import _exclude_td_from_pytree
+    _exclude_td_from_pytree().set()
+except Exception:
+    pass
+
 logger = logging.getLogger(__name__)
 
 
