@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import contextlib
+import sys
 import ctypes
 import dataclasses
 import gc
@@ -2401,15 +2402,35 @@ class ProcessBroker:
     ) -> object:
         if not cls._rank0_only():
             return None
-        if int(total) <= 0:
-            return None
         try:
-            import sys
-
             from tqdm.auto import tqdm
 
+            fp = sys.stdout
+            is_tty = bool(getattr(fp, "isatty", lambda: False)())
+            leave = bool(kwargs.get("leave", False))
+            if not is_tty:
+                leave = True
+
+            total_i = 0
+            with contextlib.suppress(Exception):
+                total_i = int(total)
+            unknown_total = int(total_i) <= 0
+
+            if unknown_total:
+                return tqdm(
+                    total=None,
+                    desc=f"{title} ({device.type.upper()}) ",
+                    unit="I/O < 0.01 MB/s, COM < 0.01 TFLOPS",
+                    bar_format="{desc}{n_fmt} ({unit}) Elapsed: {elapsed}",
+                    colour="green",
+                    ascii=True,
+                    position=int(kwargs.get("position", 0) or 0),
+                    leave=leave,
+                    file=fp,
+                )
+
             return tqdm(
-                total=int(total),
+                total=int(total_i),
                 desc=f"{title} ({device.type.upper()}) ",
                 unit="I/O < 0.01 MB/s, COM < 0.01 TFLOPS",
                 bar_format="{desc}"
@@ -2418,8 +2439,8 @@ class ProcessBroker:
                 colour="green",
                 ascii=True,
                 position=int(kwargs.get("position", 0) or 0),
-                leave=bool(kwargs.get("leave", False)),
-                file=sys.stdout,
+                leave=leave,
+                file=fp,
             )
         except Exception:
             return None

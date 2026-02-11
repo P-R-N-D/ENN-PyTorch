@@ -443,7 +443,12 @@ def canonicalize_compile_mode(mode: object | None) -> str:
         "debug": "aot-eager",
         "stable": "reduce-overhead",
     }
-    return mode_map.get(compact_mode, "disabled")
+    out = mode_map.get(compact_mode, "disabled")
+    if out in {"max-autotune", "max-autotune-no-cudagraphs"}:
+        with suppress(Exception):
+            if bool(CPU.is_optimized_for_no_gil()):
+                return "reduce-overhead"
+    return out
 
 
 def clear_model_cache(model: Optional[nn.Module]) -> None:
