@@ -3206,9 +3206,16 @@ class Model(nn.Module):
         ):
             x_raw = x_raw.reshape(x_raw.shape[0], -1)
         if isinstance(x_raw, torch.Tensor) and x_raw.ndim == 1:
-            with contextlib.suppress(Exception):
-                if int(x_raw.numel()) == int(self.in_dim):
-                    x_raw = x_raw.reshape(1, -1)
+            n = int(x_raw.numel())
+            if n == int(self.in_dim):
+                x_raw = x_raw.reshape(1, -1)
+            elif int(self.in_dim) == 1 and n > 0:
+                x_raw = x_raw.reshape(-1, 1)
+            else:
+                raise ValueError(
+                    f"Expected features shaped (B, {self.in_dim}) (or ({self.in_dim},) for a single sample), "
+                    f"got {tuple(x_raw.shape)}"
+                )
         if isinstance(x_raw, torch.Tensor) and x_raw.device != device:
             x_raw = x_raw.to(device=device, non_blocking=True)
         x_scaled = self.scaler.normalize_x(x_raw)

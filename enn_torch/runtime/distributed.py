@@ -1991,6 +1991,12 @@ class ProcessBroker:
                 message=cls._IGNORED_WARNING_MESSAGE_RE.pattern,
                 category=UserWarning,
             )
+        with contextlib.suppress(Exception):
+            warnings.filterwarnings(
+                "ignore",
+                message=r"(?s).*Online softmax is disabled.*",
+                category=UserWarning,
+            )
 
     @classmethod
     def clear_process_group(cls) -> None:
