@@ -1260,6 +1260,14 @@ def epochs(
                                                 dtype=param_dtype,
                                                 non_blocking=non_blocking_ok,
                                             )
+
+                                        t_kern_s = 0
+                                        if kern_ev_s is not None:
+                                            with contextlib.suppress(Exception):
+                                                kern_ev_s.record()
+                                        else:
+                                            t_kern_s = time.perf_counter_ns()
+
                                         (
                                             y_hat,
                                             loss_val,
@@ -1293,13 +1301,6 @@ def epochs(
                                         loss_bottom_val = (
                                             loss_bottom_val.mean()
                                         )
-
-                                    t_kern_s = 0
-                                    if kern_ev_s is not None:
-                                        with contextlib.suppress(Exception):
-                                            kern_ev_s.record()
-                                    else:
-                                        t_kern_s = time.perf_counter_ns()
 
                                     if loss_val is None:
                                         raise RuntimeError(
@@ -2082,9 +2083,6 @@ def epochs(
                 lw_bottom_sum = None
                 lw_count = 0
             if train_accum_since_last > 0:
-                # If the epoch ends mid-accumulation, the final micro-batches
-                # may have run under DDP no_sync(...). Ensure gradients are
-                # synchronized before applying the remainder optimizer step.
                 if ddp_fallback or (
                     is_distributed()
                     and max(1, grad_accum_steps) > 1

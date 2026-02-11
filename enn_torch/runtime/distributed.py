@@ -241,7 +241,15 @@ class _LineProgress:
         self._t0 = time.monotonic()
         self._last = 0.0
 
-    def _fmt_hms(self, sec: float) -> str:
+    @staticmethod
+    def _normalize_text(v: Any) -> str:
+        s = str(v or "")
+        s = s.replace("\\r\\n", " ").replace("\\n", " ").replace("\\r", " ")
+        s = s.replace(chr(13), " ").replace(chr(10), " ")
+        return " ".join(s.split())
+
+    @staticmethod
+    def _fmt_hms(sec: float) -> str:
         sec = max(0.0, float(sec))
         s = int(sec)
         h = s // 3600
@@ -249,53 +257,48 @@ class _LineProgress:
         ss = s % 60
         return f"{h:02d}:{m:02d}:{ss:02d}"
 
-    def _print(self, force: bool = False) -> None:
+    def _emit(self, force: bool = False) -> None:
         now = time.monotonic()
         if (not force) and (now - self._last) < self.mininterval:
             return
         self._last = now
         elapsed = now - self._t0
-        rem = ""
         pct = ""
+        rem = ""
         if self.total is not None and self.total > 0:
-            frac = float(self.n) / float(self.total)
-            frac = max(0.0, min(1.0, frac))
-            pct = f"{100.0 * frac:6.2f} %"
+            frac = max(0.0, min(1.0, float(self.n) / float(self.total)))
+            pct = f"{100.0 * frac:6.2f} % "
             if self.n > 0 and elapsed > 0:
                 rate = float(self.n) / float(elapsed)
-                if rate > 0:
-                    rem_s = max(0.0, float(self.total - self.n) / rate)
-                    rem = f", Remaining: {self._fmt_hms(rem_s)}"
-                else:
-                    rem = ", Remaining: ?"
+                rem_s = float(self.total - self.n) / rate if rate > 0 else 0.0
+                rem = f", Remaining: {self._fmt_hms(rem_s)}"
             else:
                 rem = ", Remaining: ?"
-        line = f"{self.title} ({self.device.type.upper()}) {pct} ({self.unit}) Elapsed: {self._fmt_hms(elapsed)}{rem}"
+        line = (
+            f"{self.title} ({str(getattr(self.device, 'type', 'cpu')).upper()}) "
+            f"{pct}({self.unit}) Elapsed: {self._fmt_hms(elapsed)}{rem}"
+        )
         if self._postfix:
             line += f" {self._postfix}"
-        try:
+        with contextlib.suppress(Exception):
             self.file.write(line + "\n")
             self.file.flush()
-        except Exception:
-            pass
 
     def update(self, n: int = 1):
-        try:
+        with contextlib.suppress(Exception):
             self.n += int(n)
-        except Exception:
-            self.n += 1
-        self._print(False)
+        self._emit(False)
 
     def set_postfix_str(self, s: str, refresh: bool = False):
-        self._postfix = str(s or "")
+        self._postfix = self._normalize_text(s)
         if refresh:
-            self._print(True)
+            self._emit(True)
 
     def refresh(self):
-        self._print(True)
+        self._emit(True)
 
     def close(self):
-        self._print(True)
+        self._emit(True)
 
 _DCP_NOISE_RE = re.compile(
     r"("
