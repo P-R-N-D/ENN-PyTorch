@@ -3573,6 +3573,7 @@ def infer(
 
 @worker_main()
 def process(*args: Any, **kwargs: Any) -> object:
+    os.environ["EXCLUDE_TD_FROM_PYTREE"]="1"
     from ..data.pipeline import Session
 
     if not args:
