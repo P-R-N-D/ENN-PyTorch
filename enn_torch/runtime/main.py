@@ -2301,22 +2301,61 @@ def epochs(
         for batch in train_loader:
             x_b, y_b = collate.get_row(batch, labels_required=True)
             x_raw = x_b.to(device)
-            y_raw = y_b.to(scaler_y_device)
-            y_flat = (
-                y_raw.reshape(y_raw.shape[0], -1) if y_raw.ndim >= 2 else y_raw
-            )
-            out = model(
-                x_raw,
-                labels_flat=None,
-                net_loss=None,
-                global_loss=None,
-                local_loss=None,
-                calibrate_output=False,
-            )
-            if isinstance(out, tuple):
-                z_pred_raw, _ = out
-            else:
-                z_pred_raw = out
+            x_raw = torch.atleast_2d(x_raw)
+            B = int(x_raw.shape[0]) if hasattr(x_raw, "shape") else 1
+            y_raw = y_b.to(scaler_y_device) if isinstance(y_b, torch.Tensor) else y_b
+            if not isinstance(y_raw, torch.Tensor):
+                try:
+                    y_raw = torch.as_tensor(y_raw, device=scaler_y_device)
+                except Exception as e:
+                    raise TypeError(
+                        "Calibration: target must be a Tensor (or convertible to Tensor). "
+                        f"got type={type(y_raw).__name__}"
+                    ) from e
+            if isinstance(y_raw, torch.Tensor):
+                if y_raw.ndim == 0:
+                    y_raw = y_raw.view(1, 1).expand(max(1, B), 1)
+                elif y_raw.ndim == 1:
+                    if int(y_raw.shape[0]) == int(B):
+                        y_raw = y_raw.view(int(B), 1)
+                    elif int(B) == 1:
+                        y_raw = y_raw.view(1, -1)
+                    else:
+                        raise RuntimeError(
+                            "Calibration: 1D target length does not match batch size. "
+                            f"target.shape={tuple(y_raw.shape)}, batch={int(B)}"
+                        )
+                else:
+                    # ndim >= 2
+                    if int(y_raw.shape[0]) == int(B):
+                        pass
+                    elif int(B) == 1:
+                        y_raw = y_raw.unsqueeze(0)
+                    else:
+                        candidates = [
+                            dim_idx
+                            for dim_idx, dim_size in enumerate(y_raw.shape[1:], start=1)
+                            if int(dim_size) == int(B)
+                        ]
+                        if not candidates:
+                            raise RuntimeError(
+                                "Calibration: could not infer batch axis for target tensor. "
+                                f"target.shape={tuple(y_raw.shape)}, batch={int(B)}"
+                            )
+                        if len(candidates) > 1:
+                            raise RuntimeError(
+                                "Calibration: ambiguous batch axis for target tensor "
+                                f"(candidates={candidates}). Please provide targets in (B, ...) layout. "
+                                f"target.shape={tuple(y_raw.shape)}, batch={int(B)}"
+                            )
+                        y_raw = y_raw.movedim(int(candidates[0]), 0)
+                y_flat = y_raw.reshape(int(B), -1)
+            out = None
+            try:
+                z_pred_raw = model(x_raw, calibrate_output=False, return_loss=False)
+            except TypeError:
+                out = model(x_raw, calibrate_output=False)
+                z_pred_raw = out[0] if isinstance(out, tuple) else out
             z_pred = z_pred_raw.detach()
             if z_pred.device != scaler_y_device:
                 z_pred = z_pred.to(device=scaler_y_device)
