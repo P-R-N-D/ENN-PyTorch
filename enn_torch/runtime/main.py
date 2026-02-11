@@ -972,9 +972,16 @@ def epochs(
     swa_start_epoch = max(0, int(swa_start_epoch))
     prev_io_time = 0.0
     prev_comp_time = 0.0
+    prev_kern_time = 0.0
     prev_io_bytes = 0.0
     prev_flops = 0.0
     prev_samples = 0.0
+    tflops_warmup = int(env_int("ENN_TFLOPS_WARMUP_ITERS", 0) or 0)
+    if tflops_warmup <= 0 and getattr(device, "type", "cpu") == "cuda":
+        tflops_warmup = 5
+    tflops_seen = 0
+    prev_flops_tflops = 0.0
+    prev_kern_tflops = 0.0
     join_context = joining(model=model, optimizer=optimizer)
     with join_context:
         with contextlib.suppress(Exception):
@@ -1000,10 +1007,16 @@ def epochs(
         )
         comp_ev_s = None
         comp_ev_e = None
+        kern_ev_s = None
+        kern_ev_e = None
         if use_timer:
             pair = Monitor.get_thread_events(device, slot="comp")
             if pair is not None:
                 comp_ev_s, comp_ev_e = pair
+        if getattr(device, "type", "cpu") == "cuda":
+            with contextlib.suppress(Exception):
+                kern_ev_s = torch.cuda.Event(enable_timing=True)
+                kern_ev_e = torch.cuda.Event(enable_timing=True)
         torch_prof = None
         prof_enabled = env_bool(
             "ENN_TORCH_PROFILE_TRAIN",
@@ -1062,9 +1075,12 @@ def epochs(
             flop_breakdown_epoch = {}
             io_time = 0.0
             comp_time = 0.0
+            kern_time = 0.0
             io_bytes = 0.0
             flops = 0.0
             train_samples_epoch = 0.0
+            flops_tflops = 0.0
+            kern_tflops = 0.0
             with flop_counter_train:
                 model.train()
                 train_pg = (
@@ -1075,7 +1091,15 @@ def epochs(
                 global_step = 0
                 optimizer.zero_grad(set_to_none=True)
                 t_fetch_start = time.perf_counter_ns()
-                total_batches = len(train_loader)
+                total_batches = 0
+                with contextlib.suppress(Exception):
+                    if int(train_steps) > 0:
+                        total_batches = int(train_steps)
+                if int(total_batches) <= 0:
+                    with contextlib.suppress(Exception):
+                        total_batches = int(len(train_loader))
+                if int(total_batches) < 0:
+                    total_batches = 0
                 train_accum_since_last = 0
                 lw_top_sum = None
                 lw_bottom_sum = None
@@ -1194,9 +1218,12 @@ def epochs(
                                     X.element_size() * X.nelement()
                                     + Y.element_size() * Y.nelement()
                                 )
-                            should_sync = (step_idx + 1) % max(
+                            should_sync = ((step_idx + 1) % max(
                                 1, grad_accum_steps
-                            ) == 0 or step_idx + 1 == total_batches
+                            ) == 0) or (
+                                (int(total_batches) > 0)
+                                and ((step_idx + 1) == int(total_batches))
+                            )
                             if (
                                 use_timer
                                 and comp_ev_s is not None
@@ -1233,6 +1260,14 @@ def epochs(
                                                 dtype=param_dtype,
                                                 non_blocking=non_blocking_ok,
                                             )
+
+                                        t_kern_s = 0
+                                        if kern_ev_s is not None:
+                                            with contextlib.suppress(Exception):
+                                                kern_ev_s.record()
+                                        else:
+                                            t_kern_s = time.perf_counter_ns()
+
                                         (
                                             y_hat,
                                             loss_val,
@@ -1266,6 +1301,7 @@ def epochs(
                                         loss_bottom_val = (
                                             loss_bottom_val.mean()
                                         )
+
                                     if loss_val is None:
                                         raise RuntimeError(
                                             "Model returned no loss value during training. Ensure loss functions are provided and returning valid outputs."
@@ -1285,6 +1321,19 @@ def epochs(
                                         accum_scale
                                     )
                                     scaler.scale(loss_for_backprop).backward()
+
+                                    t_kern_step = 0.0
+                                    if kern_ev_e is not None:
+                                        with contextlib.suppress(Exception):
+                                            kern_ev_e.record()
+                                    else:
+                                        t_kern_e = time.perf_counter_ns()
+                                        if timer_sync:
+                                            sync_accelerator(device)
+                                        t_kern_step = (
+                                            float(t_kern_e - t_kern_s)
+                                            / 1000000000.0
+                                        )
                                     if (
                                         loss_top_val is not None
                                         or loss_bottom_val is not None
@@ -1458,13 +1507,19 @@ def epochs(
                                         lw_top_sum = None
                                         lw_bottom_sum = None
                                         lw_count = 0
+                                    step_flops = 0.0
                                     with contextlib.suppress(Exception):
-                                        flops += max(
+                                        step_flops = max(
                                             0.0,
                                             float(
                                                 train_counter.get_total_flops()
                                             ),
                                         )
+                                    flops += float(step_flops)
+                                    tflops_seen += 1
+                                    if int(tflops_seen) > int(tflops_warmup):
+                                        flops_tflops += float(step_flops)
+                                        kern_tflops += float(t_kern_step)
                                     breakdown_getter = getattr(
                                         train_counter,
                                         "get_manual_breakdown",
@@ -1823,12 +1878,21 @@ def epochs(
                                     float(comp_ev_s.elapsed_time(comp_ev_e))
                                     / 1000.0
                                 )
+                                if (
+                                    kern_ev_s is not None
+                                    and kern_ev_e is not None
+                                ):
+                                    with contextlib.suppress(Exception):
+                                        t_kern_step = float(
+                                            kern_ev_s.elapsed_time(kern_ev_e)
+                                        ) / 1000.0
                             else:
                                 if timer_sync:
                                     sync_accelerator(device)
                                 comp_time += (
                                     time.perf_counter_ns() - t_comp_s
                                 ) / 1000000000.0
+                            kern_time += float(t_kern_step)
                             if local_rank == 0 and should_sync:
                                 io_elapsed = prev_io_time + float(io_time)
                                 io_transferred = prev_io_bytes + float(
@@ -1837,15 +1901,29 @@ def epochs(
                                 comp_elapsed = prev_comp_time + float(
                                     comp_time
                                 )
-                                flop_total = prev_flops + float(flops)
                                 mbps_cur = (
                                     io_transferred
                                     / max(io_elapsed, 1e-06)
                                     / MB_DIV
                                 )
+                                flops_used = prev_flops_tflops + float(
+                                    flops_tflops
+                                )
+                                kern_used = prev_kern_tflops + float(
+                                    kern_tflops
+                                )
+                                denom = (
+                                    kern_used
+                                    if kern_used > 0.0
+                                    else (
+                                        prev_kern_time + float(kern_time)
+                                    )
+                                )
+                                if denom <= 0.0:
+                                    denom = comp_elapsed
                                 tflops_cur = (
-                                    flop_total
-                                    / max(comp_elapsed, 1e-06)
+                                    flops_used
+                                    / max(float(denom), 1e-06)
                                     / 1000000000000.0
                                 )
                                 ProcessBroker.update_progress_bar(
@@ -2004,6 +2082,51 @@ def epochs(
                 lw_top_sum = None
                 lw_bottom_sum = None
                 lw_count = 0
+            if train_accum_since_last > 0:
+                if ddp_fallback or (
+                    is_distributed()
+                    and max(1, grad_accum_steps) > 1
+                ):
+                    distributed_all_reduce_grads(
+                        _m_post,
+                        average=True,
+                        policy=dist_policy.collective,
+                    )
+                scaler.unscale_(optimizer)
+                scaler.step(optimizer)
+                scaler.update()
+                optimizer.zero_grad(set_to_none=True)
+                if scheduler_step_per_batch:
+                    with contextlib.suppress(Exception):
+                        sched.step()
+                if local_rank == 0 and status_bar is not None:
+                    io_elapsed = prev_io_time + float(io_time)
+                    io_transferred = prev_io_bytes + float(io_bytes)
+                    comp_elapsed = prev_comp_time + float(comp_time)
+                    mbps_cur = (
+                        io_transferred / max(io_elapsed, 1e-06) / MB_DIV
+                    )
+                    flops_used = prev_flops_tflops + float(flops_tflops)
+                    kern_used = prev_kern_tflops + float(kern_tflops)
+                    denom = (
+                        kern_used
+                        if kern_used > 0.0
+                        else (prev_kern_time + float(kern_time))
+                    )
+                    if denom <= 0.0:
+                        denom = comp_elapsed
+                    tflops_cur = (
+                        flops_used
+                        / max(float(denom), 1e-06)
+                        / 1000000000000.0
+                    )
+                    ProcessBroker.update_progress_bar(
+                        status_bar,
+                        finish=train_accum_since_last,
+                        mbps=mbps_cur,
+                        tflops=tflops_cur,
+                    )
+                train_accum_since_last = 0
             if val_loader is not None and flop_counter_val is not None:
                 with flop_counter_val:
                     model.eval()
@@ -2293,10 +2416,13 @@ def epochs(
                     if did_start_ckpt:
                         checkpointer.await_staging()
             prev_comp_time += float(comp_time)
+            prev_kern_time += float(kern_time)
             prev_io_time += float(io_time)
             prev_flops += float(flops)
             prev_io_bytes += float(io_bytes)
             prev_samples += float(train_samples_epoch)
+            prev_flops_tflops += float(flops_tflops)
+            prev_kern_tflops += float(kern_tflops)
     if torch_prof is not None:
         with contextlib.suppress(Exception):
             torch_prof.stop()
@@ -2305,7 +2431,10 @@ def epochs(
         )
     if local_rank == 0 and status_bar is not None:
         mbps = prev_io_bytes / max(prev_io_time, 1e-06) / MB_DIV
-        tflops = prev_flops / max(prev_comp_time, 1e-06) / 1000000000000.0
+        denom = prev_kern_tflops if prev_kern_tflops > 0.0 else prev_kern_time
+        if denom <= 0.0:
+            denom = prev_comp_time
+        tflops = prev_flops_tflops / max(float(denom), 1e-06) / 1000000000000.0
         status_bar.set_postfix_str(
             f"{mbps:.2f} MB/s, {tflops:.2f} TFLOPS", refresh=True
         )

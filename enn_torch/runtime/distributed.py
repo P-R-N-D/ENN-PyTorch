@@ -219,6 +219,87 @@ _LOGGER = logging.getLogger(__name__)
 _INFLIGHT_LOCK_NAME = ".inflight.lock"
 _INFLIGHT_LOCK_TTL_SEC = int(os.environ.get("ENN_DCP_INFLIGHT_LOCK_TTL_SEC", "21600"))
 
+
+class _LineProgress:
+    def __init__(
+        self,
+        *,
+        title: str,
+        total: int | None,
+        device: torch.device,
+        file,
+        mininterval: float = 1.0,
+    ):
+        self.title = str(title)
+        self.total = int(total) if (total is not None and int(total) > 0) else None
+        self.device = device
+        self.file = file
+        self.mininterval = float(mininterval)
+        self.n = 0
+        self.unit = "I/O < 0.01 MB/s, COM < 0.01 TFLOPS"
+        self._postfix = ""
+        self._t0 = time.monotonic()
+        self._last = 0.0
+
+    @staticmethod
+    def _normalize_text(v: Any) -> str:
+        s = str(v or "")
+        s = s.replace("\\r\\n", " ").replace("\\n", " ").replace("\\r", " ")
+        s = s.replace(chr(13), " ").replace(chr(10), " ")
+        return " ".join(s.split())
+
+    @staticmethod
+    def _fmt_hms(sec: float) -> str:
+        sec = max(0.0, float(sec))
+        s = int(sec)
+        h = s // 3600
+        m = (s % 3600) // 60
+        ss = s % 60
+        return f"{h:02d}:{m:02d}:{ss:02d}"
+
+    def _emit(self, force: bool = False) -> None:
+        now = time.monotonic()
+        if (not force) and (now - self._last) < self.mininterval:
+            return
+        self._last = now
+        elapsed = now - self._t0
+        pct = ""
+        rem = ""
+        if self.total is not None and self.total > 0:
+            frac = max(0.0, min(1.0, float(self.n) / float(self.total)))
+            pct = f"{100.0 * frac:6.2f} % "
+            if self.n > 0 and elapsed > 0:
+                rate = float(self.n) / float(elapsed)
+                rem_s = float(self.total - self.n) / rate if rate > 0 else 0.0
+                rem = f", Remaining: {self._fmt_hms(rem_s)}"
+            else:
+                rem = ", Remaining: ?"
+        line = (
+            f"{self.title} ({str(getattr(self.device, 'type', 'cpu')).upper()}) "
+            f"{pct}({self.unit}) Elapsed: {self._fmt_hms(elapsed)}{rem}"
+        )
+        if self._postfix:
+            line += f" {self._postfix}"
+        with contextlib.suppress(Exception):
+            self.file.write(line + "\n")
+            self.file.flush()
+
+    def update(self, n: int = 1):
+        with contextlib.suppress(Exception):
+            self.n += int(n)
+        self._emit(False)
+
+    def set_postfix_str(self, s: str, refresh: bool = False):
+        self._postfix = self._normalize_text(s)
+        if refresh:
+            self._emit(True)
+
+    def refresh(self):
+        self._emit(True)
+
+    def close(self):
+        self._emit(True)
+
 _DCP_NOISE_RE = re.compile(
     r"("
     r"Initializing dist\.ProcessGroup in checkpoint background process"
@@ -2409,7 +2490,17 @@ class ProcessBroker:
             is_tty = bool(getattr(fp, "isatty", lambda: False)())
             leave = bool(kwargs.get("leave", False))
             if not is_tty:
-                leave = True
+                total_i = 0
+                with contextlib.suppress(Exception):
+                    total_i = int(total)
+                mi = kwargs.get("mininterval", 1.0)
+                return _LineProgress(
+                    title=title,
+                    total=(total_i if total_i > 0 else None),
+                    device=device,
+                    file=fp,
+                    mininterval=float(mi),
+                )
 
             total_i = 0
             with contextlib.suppress(Exception):
