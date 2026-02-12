@@ -592,6 +592,8 @@ def epochs(
     ddp_fallback: bool = bool(kwargs.pop("ddp_fallback", False))
     if train_loader is None:
         raise RuntimeError("epochs requires a training dataloader")
+    model_for_grads = model.module if hasattr(model, "module") else model
+    world_sz = int(get_world_size(device)) if is_distributed() else 1
     meta = (
         dataset if isinstance(dataset, Dataset) else Dataset.for_device(device)
     )
@@ -1358,9 +1360,9 @@ def epochs(
                                                 else lw_bottom_sum + v
                                             )
                                     if should_sync:
-                                        if ddp_fallback:
+                                        if ddp_fallback and world_sz > 1:
                                             distributed_all_reduce_grads(
-                                                _m_post,
+                                                model_for_grads,
                                                 average=True,
                                                 policy=dist_policy.collective,
                                             )
@@ -2083,12 +2085,13 @@ def epochs(
                 lw_bottom_sum = None
                 lw_count = 0
             if train_accum_since_last > 0:
-                if ddp_fallback or (
+                if (
                     is_distributed()
-                    and max(1, grad_accum_steps) > 1
+                    and world_sz > 1
+                    and (ddp_fallback or (max(1, grad_accum_steps) > 1))
                 ):
                     distributed_all_reduce_grads(
-                        _m_post,
+                        model_for_grads,
                         average=True,
                         policy=dist_policy.collective,
                     )
