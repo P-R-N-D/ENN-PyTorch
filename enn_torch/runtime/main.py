@@ -1242,13 +1242,7 @@ def epochs(
                                 with flop_counter_train.step(
                                     display=False
                                 ) as train_counter:
-                                    if getattr(
-                                        device, "type", None
-                                    ) == "cuda" and bool(
-                                        getattr(
-                                            model, "_compile_cudagraphs", False
-                                        )
-                                    ):
+                                    if getattr(device, "type", None) == "cuda":
                                         cudagraph_mark_step_begin()
                                         mark_cudagraph = True
                                     with Autocast.float(device):
@@ -2185,15 +2179,7 @@ def epochs(
                                     with flop_counter_val.step(
                                         display=False
                                     ) as val_counter:
-                                        if getattr(
-                                            device, "type", None
-                                        ) == "cuda" and bool(
-                                            getattr(
-                                                model,
-                                                "_compile_cudagraphs",
-                                                False,
-                                            )
-                                        ):
+                                        if getattr(device, "type", None) == "cuda":
                                             cudagraph_mark_step_begin()
                                             mark_cudagraph = True
                                         with Autocast.float(device):
