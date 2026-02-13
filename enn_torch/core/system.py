@@ -52,6 +52,9 @@ _ENN_MP_MAIN_STUB_PATH: Optional[str] = None
 _EMPTY_CACHE_LAST_CALL_S_BY_DEVICE: dict[Tuple[str, int], float] = {}
 _FP32_PRECISION_CACHE: dict[str, str] = {}
 _LOGGER = logging.getLogger(__name__)
+_ENN_ORIG_SET_F32_MATMUL_PREC = getattr(
+    torch, "set_float32_matmul_precision", None
+)
 _LAZY_LOCK_INIT_LOCK = threading.Lock()
 _LAZY_LOCK_NAMES = {
     "_FP32_PRECISION_LOCK",
@@ -192,6 +195,39 @@ def _call(fn: Any, *args: Any, **kwargs: Any) -> Any:
         if callable(fn):
             return fn(*args, **kwargs)
     return None
+
+
+def _enn_set_fp32_precision_new_api(prec: str) -> None:
+    with contextlib.suppress(Exception):
+        torch.backends.fp32_precision = prec
+    with contextlib.suppress(Exception):
+        torch.backends.cuda.matmul.fp32_precision = prec
+    cudnn = getattr(torch.backends, "cudnn", None)
+    if cudnn is not None and hasattr(cudnn, "fp32_precision"):
+        with contextlib.suppress(Exception):
+            cudnn.fp32_precision = prec
+
+
+def _install_matmul_precision_legacy_shim_if_needed() -> None:
+    if _FP32_PRECISION_CACHE.get("legacy_matmul_shim_installed", "") == "1":
+        return
+    if not callable(getattr(torch, "set_float32_matmul_precision", None)):
+        return
+    if not (hasattr(torch, "backends") and hasattr(torch.backends, "fp32_precision")):
+        return
+
+    def _shim(precision: str) -> None:
+        p = str(precision).strip().lower()
+        use_tf32 = p in {"high", "medium", "tf32"}
+        prec = "tf32" if use_tf32 else "ieee"
+        _enn_set_fp32_precision_new_api(prec)
+        return
+
+    try:
+        torch.set_float32_matmul_precision = _shim
+        _FP32_PRECISION_CACHE["legacy_matmul_shim_installed"] = "1"
+    except Exception:
+        pass
 
 
 def _clear_device_index(
@@ -1120,6 +1156,7 @@ def set_float32_precision(
         if cudnn is not None and hasattr(cudnn, "fp32_precision"):
             with contextlib.suppress(Exception):
                 cudnn.fp32_precision = prec
+        _install_matmul_precision_legacy_shim_if_needed()
         return
 
     precision = "high" if use_tf32 else "highest"
