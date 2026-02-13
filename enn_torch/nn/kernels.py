@@ -128,10 +128,16 @@ def _flex_attention_disabled() -> bool:
     return bool(env_bool("ENN_DISABLE_FLEX_ATTENTION", False))
 
 
+def _flex_cudagraphs_enabled() -> bool:
+    return bool(env_bool("ENN_FLEX_CUDAGRAPHS", default=False))
+
+
 def _flex_attention_compile_mode() -> str:
     cfg = get_runtime_cfg()
     global_mode = getattr(cfg, "compile_mode", "disabled")
     global_mode = canonicalize_compile_mode(global_mode)
+    if (not _flex_cudagraphs_enabled()) and global_mode in {"max-autotune", "reduce-overhead"}:
+        global_mode = "max-autotune-no-cudagraphs"
     if global_mode in {"disabled", "aot-eager"}:
         return "aot-eager"
     if global_mode == "reduce-overhead":
@@ -394,11 +400,25 @@ def _flex_attention_dynamic_flag(mode: str) -> Optional[bool]:
 
 def _flex_attention_fallback_modes(mode: str) -> tuple[str, ...]:
     m = str(mode)
+    allow_reduce_overhead = _flex_cudagraphs_enabled()
     if m == "max-autotune":
-        return ("max-autotune-no-cudagraphs", "reduce-overhead")
+        if allow_reduce_overhead:
+            return ("max-autotune-no-cudagraphs", "reduce-overhead")
+        return ("max-autotune-no-cudagraphs",)
     if m == "max-autotune-no-cudagraphs":
-        return ("reduce-overhead",)
+        if allow_reduce_overhead:
+            return ("reduce-overhead",)
+        return ()
     return ()
+
+
+def _coerce_flex_fallback_mode(mode: str) -> str:
+    fallback_mode = canonicalize_compile_mode(str(mode))
+    if fallback_mode in {"disabled", "aot-eager"}:
+        return "max-autotune-no-cudagraphs"
+    if (not _flex_cudagraphs_enabled()) and fallback_mode == "reduce-overhead":
+        return "max-autotune-no-cudagraphs"
+    return fallback_mode
 
 
 def _flex_attention_cache_key(
@@ -482,7 +502,7 @@ def _compile_flex_attention_wrapper(
         return _torch_flex_attention
 
     def _wrapped(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> Any:
-        if bool(is_checkpoint()) and bool(getattr(q.device, "type", None) == "cuda"):
+        if _flex_cudagraphs_enabled() and bool(is_checkpoint()) and bool(getattr(q.device, "type", None) == "cuda"):
             cudagraph_mark_step_begin()
         with skip_non_infra_dispatch_mode():
             out = base(q, k, v, **frozen)
@@ -547,6 +567,10 @@ def _call_with_flex_warn_guard(fn: Callable[[], Any]) -> tuple[Any, bool]:
 def _flex_ckpt_always_clone_enabled(out: Any) -> bool:
     if not bool(is_checkpoint()):
         return False
+    if not _flex_cudagraphs_enabled():
+        return False
+    if _flex_attention_compile_mode() not in {"max-autotune", "reduce-overhead"}:
+        return False
     t0 = None
     if torch.is_tensor(out):
         t0 = out
@@ -595,7 +619,7 @@ def _call_torch_flex_attention_eager(
                 category=UserWarning,
                 module=_FLEX_UNCOMPILED_WARN_MODULE_RE,
             )
-            if bool(is_checkpoint()) and bool(getattr(q.device, "type", None) == "cuda"):
+            if _flex_cudagraphs_enabled() and bool(is_checkpoint()) and bool(getattr(q.device, "type", None) == "cuda"):
                 cudagraph_mark_step_begin()
             out = _torch_flex_attention(q, k, v, **flex_kwargs)
             out = _flex_ckpt_always_clone_out(out)
@@ -2317,13 +2341,15 @@ class FlexAttention(nn.Module):
                         f"dilation={getattr(mm,'dilation',None)} win={getattr(mm,'win',None)} causal={getattr(mm,'causal',None)}",
                     )
                     with contextlib.suppress(Exception):
-                        fb_mode = os.environ.get(
-                            "ENN_FLEX_UNCOMPILED_FALLBACK_MODE",
-                            "max-autotune-no-cudagraphs",
+                        fb_mode = _coerce_flex_fallback_mode(
+                            os.environ.get(
+                                "ENN_FLEX_UNCOMPILED_FALLBACK_MODE",
+                                "max-autotune-no-cudagraphs",
+                            )
                         )
-                        dyn_fb = _flex_attention_dynamic_flag(str(fb_mode))
+                        dyn_fb = _flex_attention_dynamic_flag(fb_mode)
                         fb_fn = _compile_flex_attention_wrapper(
-                            mode=str(fb_mode),
+                            mode=fb_mode,
                             dynamic=dyn_fb,
                             flex_kwargs=flex_kwargs,
                         )
@@ -2413,9 +2439,11 @@ class FlexAttention(nn.Module):
                         except Exception:
                             pass
                         try:
-                            fb_mode = os.environ.get(
-                                "ENN_FLEX_RESOURCE_FALLBACK_MODE",
-                                "max-autotune-no-cudagraphs",
+                            fb_mode = _coerce_flex_fallback_mode(
+                                os.environ.get(
+                                    "ENN_FLEX_RESOURCE_FALLBACK_MODE",
+                                    "max-autotune-no-cudagraphs",
+                                )
                             )
                             fb_dyn = _flex_attention_dynamic_flag(fb_mode)
                             fb_dyn_override = _env_bool_optional(
@@ -2424,7 +2452,7 @@ class FlexAttention(nn.Module):
                             if isinstance(fb_dyn_override, bool):
                                 fb_dyn = fb_dyn_override
                             fb_fn = _compile_flex_attention_wrapper(
-                                mode=str(fb_mode),
+                                mode=fb_mode,
                                 dynamic=fb_dyn,
                                 flex_kwargs=flex_kwargs2,
                             )

@@ -3467,6 +3467,28 @@ def infer(
                             Xi_pad = None
                             pad_n = 0
                             Xi_run = Xi
+                    elif cg_enabled:
+                        pad_n = int(max(0, int(mb) - int(n_i)))
+                        try:
+                            want_shape = (int(mb),) + tuple(Xi.shape[1:])
+                            if (
+                                pad_buf is None
+                                or pad_buf.shape != want_shape
+                                or pad_buf.dtype != Xi.dtype
+                                or pad_buf.device != Xi.device
+                            ):
+                                pad_buf = Xi.new_empty(want_shape)
+                            Xi_pad = pad_buf
+                            Xi_pad[:n_i].copy_(Xi)
+                            if pad_n > 0:
+                                Xi_pad[n_i:].copy_(
+                                    Xi[-1:].expand(pad_n, *tuple(Xi.shape[1:]))
+                                )
+                            Xi_run = Xi_pad
+                        except Exception:
+                            Xi_pad = None
+                            pad_n = 0
+                            Xi_run = Xi
                     try:
                         if cg_enabled:
                             cudagraph_mark_step_begin()
