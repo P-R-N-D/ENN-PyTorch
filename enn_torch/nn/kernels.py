@@ -128,10 +128,16 @@ def _flex_attention_disabled() -> bool:
     return bool(env_bool("ENN_DISABLE_FLEX_ATTENTION", False))
 
 
+def _flex_cudagraphs_enabled() -> bool:
+    return bool(env_bool("ENN_FLEX_CUDAGRAPHS", default=False))
+
+
 def _flex_attention_compile_mode() -> str:
     cfg = get_runtime_cfg()
     global_mode = getattr(cfg, "compile_mode", "disabled")
     global_mode = canonicalize_compile_mode(global_mode)
+    if (not _flex_cudagraphs_enabled()) and global_mode in {"max-autotune", "reduce-overhead"}:
+        global_mode = "max-autotune-no-cudagraphs"
     if global_mode in {"disabled", "aot-eager"}:
         return "aot-eager"
     if global_mode == "reduce-overhead":
@@ -482,7 +488,7 @@ def _compile_flex_attention_wrapper(
         return _torch_flex_attention
 
     def _wrapped(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> Any:
-        if bool(is_checkpoint()) and bool(getattr(q.device, "type", None) == "cuda"):
+        if _flex_cudagraphs_enabled() and bool(is_checkpoint()) and bool(getattr(q.device, "type", None) == "cuda"):
             cudagraph_mark_step_begin()
         with skip_non_infra_dispatch_mode():
             out = base(q, k, v, **frozen)
@@ -547,6 +553,10 @@ def _call_with_flex_warn_guard(fn: Callable[[], Any]) -> tuple[Any, bool]:
 def _flex_ckpt_always_clone_enabled(out: Any) -> bool:
     if not bool(is_checkpoint()):
         return False
+    if not _flex_cudagraphs_enabled():
+        return False
+    if _flex_attention_compile_mode() not in {"max-autotune", "reduce-overhead"}:
+        return False
     t0 = None
     if torch.is_tensor(out):
         t0 = out
@@ -595,7 +605,7 @@ def _call_torch_flex_attention_eager(
                 category=UserWarning,
                 module=_FLEX_UNCOMPILED_WARN_MODULE_RE,
             )
-            if bool(is_checkpoint()) and bool(getattr(q.device, "type", None) == "cuda"):
+            if _flex_cudagraphs_enabled() and bool(is_checkpoint()) and bool(getattr(q.device, "type", None) == "cuda"):
                 cudagraph_mark_step_begin()
             out = _torch_flex_attention(q, k, v, **flex_kwargs)
             out = _flex_ckpt_always_clone_out(out)

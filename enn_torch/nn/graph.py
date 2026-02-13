@@ -527,9 +527,6 @@ def compile(
     if canonical_mode == "max-autotune" and not _is_for_cuda(module):
         canonical_mode = "max-autotune-no-cudagraphs"
     opt: Dict[str, Any] = dict(options or {})
-    if CPU.is_free_threaded_build():
-        opt.setdefault("compile_threads", 1)
-        opt.setdefault("triton.cudagraphs", False)
     if canonical_mode == "max-autotune-no-cudagraphs":
         opt.setdefault("triton.cudagraphs", False)
     options_merged: Dict[str, Any] | None = opt or None
