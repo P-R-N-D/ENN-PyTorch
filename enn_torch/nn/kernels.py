@@ -600,9 +600,10 @@ def _call_torch_flex_attention_eager(
                 module=_FLEX_UNCOMPILED_WARN_MODULE_RE,
             )
             out = _torch_flex_attention(q, k, v, **flex_kwargs)
-    return _flex_ckpt_cudagraph_clone_out(
-        out, mode=_flex_attention_compile_mode()
-    )
+    # Eager fallback is not backed by Inductor/CUDAGraph output buffers.
+    # Avoid unconditional clones here; the overwrite guard (when needed)
+    # is applied in the compiled wrapper path.
+    return out
 
 
 def _get_compiled_flex_attention_for_kwargs(
