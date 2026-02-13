@@ -91,7 +91,11 @@ def _install_matmul_precision_legacy_shim_if_needed() -> None:
 
     def _shim(precision: str) -> None:
         p = str(precision).strip().lower()
-        if p in {"high", "medium", "tf32"}:
+        if p == "medium":
+            with contextlib.suppress(Exception):
+                _ENN_ORIG_SET_F32_MATMUL_PREC("medium")
+            return
+        if p in {"high", "tf32"}:
             _enn_set_fp32_precision_new_api("tf32")
             return
         if p in {"highest", "ieee"}:
@@ -106,6 +110,11 @@ def _install_matmul_precision_legacy_shim_if_needed() -> None:
         return
 
     def _shim_get() -> str:
+        with contextlib.suppress(Exception):
+            if callable(_ENN_ORIG_GET_F32_MATMUL_PREC):
+                legacy_v = str(_ENN_ORIG_GET_F32_MATMUL_PREC() or "").strip().lower()
+                if legacy_v in {"highest", "high", "medium"}:
+                    return legacy_v
         try:
             v = str(getattr(torch.backends, "fp32_precision", "ieee") or "ieee").strip().lower()
             return "high" if v == "tf32" else "highest"
