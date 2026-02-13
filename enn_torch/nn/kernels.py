@@ -303,7 +303,7 @@ def _install_flex_uncompiled_warning_suppression() -> None:
 
 def _torch_flex_attention_module() -> Any | None:
     with contextlib.suppress(Exception):
-        import torch.nn.attention.flex_attention as _fa  # type: ignore
+        import torch.nn.attention.flex_attention as _fa
         return _fa
     return None
 
@@ -600,9 +600,6 @@ def _call_torch_flex_attention_eager(
                 module=_FLEX_UNCOMPILED_WARN_MODULE_RE,
             )
             out = _torch_flex_attention(q, k, v, **flex_kwargs)
-    # Eager fallback is not backed by Inductor/CUDAGraph output buffers.
-    # Avoid unconditional clones here; the overwrite guard (when needed)
-    # is applied in the compiled wrapper path.
     return out
 
 
