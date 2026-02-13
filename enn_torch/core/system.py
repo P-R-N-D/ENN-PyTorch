@@ -1079,24 +1079,8 @@ def set_float32_precision(
             use_tf32 = False
             break
 
-    def _parse_int_prefix(s: str) -> int:
-        n = 0
-        for ch in s:
-            if "0" <= ch <= "9":
-                n = n * 10 + (ord(ch) - 48)
-            else:
-                break
-        return int(n)
-
-    ver = str(getattr(torch, "__version__", "") or "")
-    ver_main = ver.split("+", 1)[0]
-    parts = ver_main.split(".", 2)
-    major = _parse_int_prefix(parts[0]) if len(parts) > 0 else 0
-    minor = _parse_int_prefix(parts[1]) if len(parts) > 1 else 0
-
-    use_new_api = (
-        (major, minor) >= (2, 8)
-        and hasattr(torch, "backends")
+    use_new_api = bool(
+        hasattr(torch, "backends")
         and hasattr(torch.backends, "cuda")
         and hasattr(torch.backends.cuda, "matmul")
         and hasattr(torch.backends.cuda.matmul, "fp32_precision")
@@ -1120,10 +1104,11 @@ def set_float32_precision(
     if use_new_api:
         prec = "tf32" if use_tf32 else "ieee"
         with contextlib.suppress(Exception):
-            if hasattr(torch.backends, "fp32_precision"):
-                torch.backends.fp32_precision = prec
-        with contextlib.suppress(Exception):
             torch.backends.cuda.matmul.fp32_precision = prec
+        cudnn = getattr(torch.backends, "cudnn", None)
+        if cudnn is not None and hasattr(cudnn, "fp32_precision"):
+            with contextlib.suppress(Exception):
+                cudnn.fp32_precision = prec
         return
 
     precision = "high" if use_tf32 else "highest"
