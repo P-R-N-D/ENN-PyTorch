@@ -21,6 +21,7 @@ from ..core.system import (
 )
 from ..core.tensor import is_meta_or_fake_tensor
 from .graph import (
+    is_checkpoint,
     assert_trace,
     canonicalize_compile_mode,
     compile as _model_compile,
@@ -480,7 +481,9 @@ def _compile_flex_attention_wrapper(
         return _torch_flex_attention
 
     def _wrapped(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> Any:
-        return base(q, k, v, **frozen)
+        with skip_non_infra_dispatch_mode():
+            out = base(q, k, v, **frozen)
+        return _flex_ckpt_cudagraph_clone_out(out, mode=str(mode))
 
     return _wrapped
 
@@ -537,6 +540,46 @@ def _call_with_flex_warn_guard(fn: Callable[[], Any]) -> tuple[Any, bool]:
     return out, saw_uncompiled
 
 
+
+def _flex_ckpt_cudagraph_clone_enabled(*, mode: str, out: Any) -> bool:
+    if not torch.is_grad_enabled():
+        return False
+    if not bool(is_checkpoint()):
+        return False
+    m = str(mode or "")
+    if m in ("aot-eager", "max-autotune-no-cudagraphs"):
+        return False
+    if m not in ("max-autotune", "reduce-overhead"):
+        return False
+    t0 = None
+    if torch.is_tensor(out):
+        t0 = out
+    elif isinstance(out, (tuple, list)) and out:
+        for v in out:
+            if torch.is_tensor(v):
+                t0 = v
+                break
+    if not torch.is_tensor(t0):
+        return False
+    return bool(getattr(t0.device, "type", None) == "cuda")
+
+
+@torch_compiler_disable(
+    recursive=False,
+    reason="FlexAttention: clone outputs outside torch.compile under reentrant checkpoint to avoid CUDAGraph overwrite",
+)
+def _flex_ckpt_cudagraph_clone_out(out: Any, *, mode: str) -> Any:
+    if not _flex_ckpt_cudagraph_clone_enabled(mode=mode, out=out):
+        return out
+    if torch.is_tensor(out):
+        return out.clone()
+    if isinstance(out, tuple):
+        return tuple((v.clone() if torch.is_tensor(v) else v) for v in out)
+    if isinstance(out, list):
+        return [(v.clone() if torch.is_tensor(v) else v) for v in out]
+    return out
+
+
 def _call_torch_flex_attention_eager(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -556,7 +599,11 @@ def _call_torch_flex_attention_eager(
                 category=UserWarning,
                 module=_FLEX_UNCOMPILED_WARN_MODULE_RE,
             )
-            return _torch_flex_attention(q, k, v, **flex_kwargs)
+            out = _torch_flex_attention(q, k, v, **flex_kwargs)
+    # Eager fallback is not backed by Inductor/CUDAGraph output buffers.
+    # Avoid unconditional clones here; the overwrite guard (when needed)
+    # is applied in the compiled wrapper path.
+    return out
 
 
 def _get_compiled_flex_attention_for_kwargs(
