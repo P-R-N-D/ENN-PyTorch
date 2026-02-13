@@ -58,85 +58,6 @@ _ENN_ORIG_SET_F32_MATMUL_PREC = getattr(
 _ENN_ORIG_GET_F32_MATMUL_PREC = getattr(
     torch, "get_float32_matmul_precision", None
 )
-
-
-def _enn_set_fp32_precision_new_api(prec: str) -> None:
-    with contextlib.suppress(Exception):
-        torch.backends.fp32_precision = prec
-    with contextlib.suppress(Exception):
-        torch.backends.cuda.matmul.fp32_precision = prec
-    cudnn = getattr(torch.backends, "cudnn", None)
-    if cudnn is not None and hasattr(cudnn, "fp32_precision"):
-        with contextlib.suppress(Exception):
-            cudnn.fp32_precision = prec
-
-
-def _install_matmul_precision_legacy_shim_if_needed() -> None:
-    if _FP32_PRECISION_CACHE.get("legacy_matmul_shim_installed", "") == "1":
-        return
-    current_setter = getattr(torch, "set_float32_matmul_precision", None)
-    current_getter = getattr(torch, "get_float32_matmul_precision", None)
-    if not callable(current_setter):
-        return
-    if not callable(_ENN_ORIG_SET_F32_MATMUL_PREC):
-        return
-    if not (
-        hasattr(torch, "backends")
-        and hasattr(torch.backends, "fp32_precision")
-        and hasattr(torch.backends, "cuda")
-        and hasattr(torch.backends.cuda, "matmul")
-        and hasattr(torch.backends.cuda.matmul, "fp32_precision")
-    ):
-        return
-
-    def _shim(precision: str) -> None:
-        p = str(precision).strip().lower()
-        if p == "medium":
-            with contextlib.suppress(Exception):
-                _ENN_ORIG_SET_F32_MATMUL_PREC("medium")
-            return
-        if p in {"high", "tf32"}:
-            _enn_set_fp32_precision_new_api("tf32")
-            return
-        if p in {"highest", "ieee"}:
-            _enn_set_fp32_precision_new_api("ieee")
-            return
-        with contextlib.suppress(Exception):
-            warnings.warn(
-                f"Invalid matmul precision {precision!r}; leaving current precision unchanged.",
-                UserWarning,
-                stacklevel=2,
-            )
-        return
-
-    def _shim_get() -> str:
-        with contextlib.suppress(Exception):
-            if callable(_ENN_ORIG_GET_F32_MATMUL_PREC):
-                legacy_v = str(_ENN_ORIG_GET_F32_MATMUL_PREC() or "").strip().lower()
-                if legacy_v in {"highest", "high", "medium"}:
-                    return legacy_v
-        try:
-            v_cuda = None
-            with contextlib.suppress(Exception):
-                v_cuda = str(torch.backends.cuda.matmul.fp32_precision or "").strip().lower()
-            if v_cuda in {"tf32", "ieee"}:
-                return "high" if v_cuda == "tf32" else "highest"
-            v = str(getattr(torch.backends, "fp32_precision", "ieee") or "ieee").strip().lower()
-            return "high" if v == "tf32" else "highest"
-        except Exception:
-            return "highest"
-
-    try:
-        if current_setter is _ENN_ORIG_SET_F32_MATMUL_PREC:
-            torch.set_float32_matmul_precision = _shim
-        if callable(current_getter) and current_getter is _ENN_ORIG_GET_F32_MATMUL_PREC:
-            torch.get_float32_matmul_precision = _shim_get
-        _FP32_PRECISION_CACHE["legacy_matmul_shim_installed"] = "1"
-    except Exception:
-        pass
-
-with contextlib.suppress(Exception):
-    _install_matmul_precision_legacy_shim_if_needed()
 _LAZY_LOCK_INIT_LOCK = threading.Lock()
 _LAZY_LOCK_NAMES = {
     "_FP32_PRECISION_LOCK",
@@ -231,6 +152,81 @@ def __getattr__(name: str) -> Any:
 
 def _mutex_lock(name: str) -> _thread.LockType:
     return getattr(sys.modules[__name__], name)
+
+
+def _enn_set_fp32_precision_new_api(prec: str) -> None:
+    with contextlib.suppress(Exception):
+        torch.backends.fp32_precision = prec
+        torch.backends.cuda.matmul.fp32_precision = prec
+    cudnn = getattr(torch.backends, "cudnn", None)
+    if cudnn is not None and hasattr(cudnn, "fp32_precision"):
+        with contextlib.suppress(Exception):
+            cudnn.fp32_precision = prec
+
+
+def _install_matmul_precision_legacy_shim_if_needed() -> None:
+    if _FP32_PRECISION_CACHE.get("legacy_matmul_shim_installed", "") == "1":
+        return
+    current_setter = getattr(torch, "set_float32_matmul_precision", None)
+    current_getter = getattr(torch, "get_float32_matmul_precision", None)
+    if not callable(current_setter):
+        return
+    if not callable(_ENN_ORIG_SET_F32_MATMUL_PREC):
+        return
+    if not (
+        hasattr(torch, "backends")
+        and hasattr(torch.backends, "fp32_precision")
+        and hasattr(torch.backends, "cuda")
+        and hasattr(torch.backends.cuda, "matmul")
+        and hasattr(torch.backends.cuda.matmul, "fp32_precision")
+    ):
+        return
+
+    def _shim(precision: str) -> None:
+        p = str(precision).strip().lower()
+        if p == "medium":
+            with contextlib.suppress(Exception):
+                _ENN_ORIG_SET_F32_MATMUL_PREC("medium")
+            return
+        if p in {"high", "tf32"}:
+            _enn_set_fp32_precision_new_api("tf32")
+            return
+        if p in {"highest", "ieee"}:
+            _enn_set_fp32_precision_new_api("ieee")
+            return
+        with contextlib.suppress(Exception):
+            warnings.warn(
+                f"Invalid matmul precision {precision!r}; leaving current precision unchanged.",
+                UserWarning,
+                stacklevel=2,
+            )
+        return
+
+    def _shim_get() -> str:
+        with contextlib.suppress(Exception):
+            if callable(_ENN_ORIG_GET_F32_MATMUL_PREC):
+                legacy_v = str(_ENN_ORIG_GET_F32_MATMUL_PREC() or "").strip().lower()
+                if legacy_v in {"highest", "high", "medium"}:
+                    return legacy_v
+        try:
+            v_cuda = None
+            with contextlib.suppress(Exception):
+                v_cuda = str(torch.backends.cuda.matmul.fp32_precision or "").strip().lower()
+            if v_cuda in {"tf32", "ieee"}:
+                return "high" if v_cuda == "tf32" else "highest"
+            v = str(getattr(torch.backends, "fp32_precision", "ieee") or "ieee").strip().lower()
+            return "high" if v == "tf32" else "highest"
+        except Exception:
+            return "highest"
+
+    try:
+        if current_setter is _ENN_ORIG_SET_F32_MATMUL_PREC:
+            torch.set_float32_matmul_precision = _shim
+        if callable(current_getter) and current_getter is _ENN_ORIG_GET_F32_MATMUL_PREC:
+            torch.get_float32_matmul_precision = _shim_get
+        _FP32_PRECISION_CACHE["legacy_matmul_shim_installed"] = "1"
+    except Exception:
+        pass
 
 
 def _device_from(device: Optional[Union[torch.device, str]]) -> torch.device:
@@ -2703,3 +2699,7 @@ class Monitor:
             cached = (ev_s, ev_e)
             d[key] = cached
         return cached
+
+
+with contextlib.suppress(Exception):
+    _install_matmul_precision_legacy_shim_if_needed()
