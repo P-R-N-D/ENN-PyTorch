@@ -90,7 +90,7 @@ def _install_matmul_precision_legacy_shim_if_needed() -> None:
 
     try:
         if current_setter is _ENN_ORIG_SET_F32_MATMUL_PREC:
-            torch.set_float32_matmul_precision = _shim  # type: ignore[assignment]
+            torch.set_float32_matmul_precision = _shim
         _FP32_PRECISION_CACHE["legacy_matmul_shim_installed"] = "1"
     except Exception:
         pass
