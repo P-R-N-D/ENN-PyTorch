@@ -400,11 +400,25 @@ def _flex_attention_dynamic_flag(mode: str) -> Optional[bool]:
 
 def _flex_attention_fallback_modes(mode: str) -> tuple[str, ...]:
     m = str(mode)
+    allow_reduce_overhead = _flex_cudagraphs_enabled()
     if m == "max-autotune":
-        return ("max-autotune-no-cudagraphs", "reduce-overhead")
+        if allow_reduce_overhead:
+            return ("max-autotune-no-cudagraphs", "reduce-overhead")
+        return ("max-autotune-no-cudagraphs",)
     if m == "max-autotune-no-cudagraphs":
-        return ("reduce-overhead",)
+        if allow_reduce_overhead:
+            return ("reduce-overhead",)
+        return ()
     return ()
+
+
+def _coerce_flex_fallback_mode(mode: str) -> str:
+    fallback_mode = canonicalize_compile_mode(str(mode))
+    if fallback_mode in {"disabled", "aot-eager"}:
+        return "max-autotune-no-cudagraphs"
+    if (not _flex_cudagraphs_enabled()) and fallback_mode == "reduce-overhead":
+        return "max-autotune-no-cudagraphs"
+    return fallback_mode
 
 
 def _flex_attention_cache_key(
@@ -2327,13 +2341,15 @@ class FlexAttention(nn.Module):
                         f"dilation={getattr(mm,'dilation',None)} win={getattr(mm,'win',None)} causal={getattr(mm,'causal',None)}",
                     )
                     with contextlib.suppress(Exception):
-                        fb_mode = os.environ.get(
-                            "ENN_FLEX_UNCOMPILED_FALLBACK_MODE",
-                            "max-autotune-no-cudagraphs",
+                        fb_mode = _coerce_flex_fallback_mode(
+                            os.environ.get(
+                                "ENN_FLEX_UNCOMPILED_FALLBACK_MODE",
+                                "max-autotune-no-cudagraphs",
+                            )
                         )
-                        dyn_fb = _flex_attention_dynamic_flag(str(fb_mode))
+                        dyn_fb = _flex_attention_dynamic_flag(fb_mode)
                         fb_fn = _compile_flex_attention_wrapper(
-                            mode=str(fb_mode),
+                            mode=fb_mode,
                             dynamic=dyn_fb,
                             flex_kwargs=flex_kwargs,
                         )
