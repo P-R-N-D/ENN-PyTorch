@@ -892,7 +892,7 @@ class Template(nn.Module):
                     y, _ = _blk(
                         t, causal_mask=causal_mask, state=None, mode="spatial"
                     )
-                    return y
+                    return _enn_ckpt_cudagraph_clone_if_needed(y)
 
                 x = cast(
                     torch.Tensor,
@@ -900,7 +900,6 @@ class Template(nn.Module):
                         _f, x, use_reentrant=True, preserve_rng_state=True
                     ),
                 )
-                x = _enn_ckpt_cudagraph_clone_if_needed(x)
             else:
                 x, _ = blk(
                     x, causal_mask=causal_mask, state=None, mode="spatial"
@@ -961,7 +960,7 @@ class Template(nn.Module):
                     y, _ = _blk(
                         t, causal_mask=causal_mask, state=None, mode="temporal"
                     )
-                    return y
+                    return _enn_ckpt_cudagraph_clone_if_needed(y)
 
                 x = cast(
                     torch.Tensor,
@@ -969,7 +968,6 @@ class Template(nn.Module):
                         _f, x, use_reentrant=True, preserve_rng_state=True
                     ),
                 )
-                x = _enn_ckpt_cudagraph_clone_if_needed(x)
             else:
                 x, blk_next_state = blk(
                     x,
