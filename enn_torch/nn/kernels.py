@@ -21,6 +21,7 @@ from ..core.system import (
 )
 from ..core.tensor import is_meta_or_fake_tensor
 from .graph import (
+    cudagraph_mark_step_begin,
     is_checkpoint,
     assert_trace,
     canonicalize_compile_mode,
@@ -303,7 +304,7 @@ def _install_flex_uncompiled_warning_suppression() -> None:
 
 def _torch_flex_attention_module() -> Any | None:
     with contextlib.suppress(Exception):
-        import torch.nn.attention.flex_attention as _fa
+        import torch.nn.attention.flex_attention as _fa  # type: ignore
         return _fa
     return None
 
@@ -481,9 +482,11 @@ def _compile_flex_attention_wrapper(
         return _torch_flex_attention
 
     def _wrapped(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> Any:
+        if torch.is_grad_enabled() and bool(is_checkpoint()) and bool(getattr(q.device, "type", None) == "cuda"):
+            cudagraph_mark_step_begin()
         with skip_non_infra_dispatch_mode():
             out = base(q, k, v, **frozen)
-        return _flex_ckpt_cudagraph_clone_out(out, mode=str(mode))
+        return _flex_ckpt_always_clone_out(out)
 
     return _wrapped
 
@@ -540,16 +543,10 @@ def _call_with_flex_warn_guard(fn: Callable[[], Any]) -> tuple[Any, bool]:
     return out, saw_uncompiled
 
 
-
-def _flex_ckpt_cudagraph_clone_enabled(*, mode: str, out: Any) -> bool:
+def _flex_ckpt_always_clone_enabled(out: Any) -> bool:
     if not torch.is_grad_enabled():
         return False
     if not bool(is_checkpoint()):
-        return False
-    m = str(mode or "")
-    if m in ("aot-eager", "max-autotune-no-cudagraphs"):
-        return False
-    if m not in ("max-autotune", "reduce-overhead"):
         return False
     t0 = None
     if torch.is_tensor(out):
@@ -566,10 +563,10 @@ def _flex_ckpt_cudagraph_clone_enabled(*, mode: str, out: Any) -> bool:
 
 @torch_compiler_disable(
     recursive=False,
-    reason="FlexAttention: clone outputs outside torch.compile under reentrant checkpoint to avoid CUDAGraph overwrite",
+    reason="FlexAttention: always clone outputs under reentrant checkpoint to avoid CUDAGraph overwrite",
 )
-def _flex_ckpt_cudagraph_clone_out(out: Any, *, mode: str) -> Any:
-    if not _flex_ckpt_cudagraph_clone_enabled(mode=mode, out=out):
+def _flex_ckpt_always_clone_out(out: Any) -> Any:
+    if not _flex_ckpt_always_clone_enabled(out):
         return out
     if torch.is_tensor(out):
         return out.clone()
@@ -599,8 +596,10 @@ def _call_torch_flex_attention_eager(
                 category=UserWarning,
                 module=_FLEX_UNCOMPILED_WARN_MODULE_RE,
             )
+            if torch.is_grad_enabled() and bool(is_checkpoint()) and bool(getattr(q.device, "type", None) == "cuda"):
+                cudagraph_mark_step_begin()
             out = _torch_flex_attention(q, k, v, **flex_kwargs)
-    return out
+    return _flex_ckpt_always_clone_out(out)
 
 
 def _get_compiled_flex_attention_for_kwargs(

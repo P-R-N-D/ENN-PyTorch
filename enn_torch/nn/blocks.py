@@ -4,7 +4,6 @@ from __future__ import annotations
 import contextlib
 import logging
 import os
-import threading
 from importlib import import_module
 from typing import Any, Callable, List, Optional, Self, Sequence, Tuple
 
@@ -14,14 +13,7 @@ import torch.nn.functional as F
 from ..core.compat import StochasticDepth
 from ..runtime.distributed import _from_hsdp_module
 from .activations import GeGLU
-from .graph import (
-    coerce_checkpoint,
-    cudagraph_mark_step_begin,
-    get_cudagraph_step_id,
-    is_export_or_trace,
-    is_symbolic,
-    torch_compiler_disable,
-)
+from .graph import coerce_checkpoint, is_export_or_trace, is_symbolic
 from .kernels import DotProductAttention
 from .layers import DilatedAttention, Resampler, Retention, norm_layer
 _LOGGER = logging.getLogger(__name__)
@@ -48,37 +40,6 @@ _PRESET_ALIASES: dict[str, str] = {
 _ENN_HAS_FLEX_ATTENTION = getattr(
     import_module(".layers", __package__), "_HAS_FLEX_ATTENTION", False
 )
-_ENN_LONGNET_CKPT_TL = threading.local()
-
-
-@torch_compiler_disable(
-    recursive=False,
-    reason="LongNet checkpoint: conditional clone to avoid CUDAGraph overwrite",
-)
-def _enn_longnet_ckpt_clone_if_needed(t: torch.Tensor) -> torch.Tensor:
-    if not isinstance(t, torch.Tensor):
-        return t
-    if getattr(t.device, "type", None) != "cuda":
-        return t
-    if is_export_or_trace():
-        return t
-    sid = int(get_cudagraph_step_id() or 0)
-    last = getattr(_ENN_LONGNET_CKPT_TL, "sid", None)
-    if last != sid:
-        _ENN_LONGNET_CKPT_TL.sid = sid
-        _ENN_LONGNET_CKPT_TL.ptrs = set()
-    ptrs = getattr(_ENN_LONGNET_CKPT_TL, "ptrs", None)
-    if not isinstance(ptrs, set):
-        ptrs = set()
-        _ENN_LONGNET_CKPT_TL.ptrs = ptrs
-    try:
-        ptr = int(t.untyped_storage().data_ptr())
-    except Exception:
-        return t
-    if ptr in ptrs:
-        return t.clone()
-    ptrs.add(ptr)
-    return t
 
 
 def _safe_norm(norm: nn.Module, x: torch.Tensor) -> torch.Tensor:
@@ -599,14 +560,13 @@ class LongNet(nn.Module):
         if torch.is_grad_enabled():
             _from_hsdp_module(self)
             _from_hsdp_module(layer)
-        y = layer(
+        return layer(
             t,
             key_padding_mask=key_padding_mask,
             need_weights=False,
             average_attn_weights=False,
             skip_ffn_checkpoint=True,
         )[0]
-        return _enn_longnet_ckpt_clone_if_needed(y)
 
     def forward(
         self: Self,
@@ -632,8 +592,6 @@ class LongNet(nn.Module):
         do_ckpt = self._should_enable_checkpoint(
             out, layout_batch_first, need_weights, key_padding_mask
         )
-        if do_ckpt and out.is_cuda:
-            cudagraph_mark_step_begin()
         for layer in self.layers:
             if do_ckpt:
                 out = coerce_checkpoint(
