@@ -1111,7 +1111,10 @@ def set_float32_precision(
     if use_new_api:
         prec = "tf32" if use_tf32 else "ieee"
         with contextlib.suppress(Exception):
-            torch.backends.cuda.matmul.fp32_precision = prec
+            if hasattr(torch.backends, "fp32_precision"):
+                torch.backends.fp32_precision = prec
+            else:
+                torch.backends.cuda.matmul.fp32_precision = prec
         cudnn = getattr(torch.backends, "cudnn", None)
         if cudnn is not None and hasattr(cudnn, "fp32_precision"):
             with contextlib.suppress(Exception):
