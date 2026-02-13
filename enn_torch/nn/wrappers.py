@@ -4,6 +4,7 @@ from __future__ import annotations
 import contextlib
 import logging
 import math
+import threading
 import uuid
 from typing import (
     Any,
@@ -31,6 +32,7 @@ from ..core.system import (
     CPU,
     empty_device_cache,
     get_device,
+    get_runtime_cfg,
     is_oom_error,
     set_runtime_cfg,
 )
@@ -56,15 +58,62 @@ from .graph import (
     compile as compile_module,
     cudagraph_mark_step_begin,
     cudagraph_mark_step_end,
+    get_cudagraph_step_id,
     graph_break,
     inference_mode,
     is_export_or_trace,
     is_symbolic,
+    torch_compiler_disable,
     torch_compiler_supported,
 )
 from .layers import Recorder, Scaler, SigmoidGate
 from tensordict import TensorDictBase
 _LOGGER = logging.getLogger(__name__)
+
+
+_ENN_CKPT_CG_TL = threading.local()
+
+
+def _enn_should_guard_ckpt_cudagraph(t: object) -> bool:
+    if not isinstance(t, torch.Tensor):
+        return False
+    if is_meta_or_fake_tensor(t):
+        return False
+    if getattr(t.device, "type", None) != "cuda":
+        return False
+    cfg = get_runtime_cfg()
+    mode = canonicalize_compile_mode(getattr(cfg, "compile_mode", "disabled"))
+    if mode in {"disabled", "aot-eager", "max-autotune-no-cudagraphs"}:
+        return False
+    if CPU.is_free_threaded_build():
+        return False
+    return True
+
+
+@torch_compiler_disable(
+    recursive=False,
+    reason="Conditional clone for reentrant checkpoint + CUDAGraph overwrite safety",
+)
+def _enn_ckpt_cudagraph_clone_if_needed(t: torch.Tensor) -> torch.Tensor:
+    if not _enn_should_guard_ckpt_cudagraph(t):
+        return t
+    sid = int(get_cudagraph_step_id() or 0)
+    last = getattr(_ENN_CKPT_CG_TL, "sid", None)
+    if last != sid:
+        _ENN_CKPT_CG_TL.sid = sid
+        _ENN_CKPT_CG_TL.ptrs = set()
+    ptrs = getattr(_ENN_CKPT_CG_TL, "ptrs", None)
+    if not isinstance(ptrs, set):
+        ptrs = set()
+        _ENN_CKPT_CG_TL.ptrs = ptrs
+    try:
+        ptr = int(t.untyped_storage().data_ptr())
+    except Exception:
+        return t
+    if ptr in ptrs:
+        return t.clone()
+    ptrs.add(ptr)
+    return t
 
 
 def _is_process_group(obj: object) -> bool:
@@ -835,6 +884,8 @@ class Template(nn.Module):
             if do_ckpt:
 
                 def _f(t: torch.Tensor, _blk: RetNet = blk) -> torch.Tensor:
+                    if getattr(t.device, "type", None) == "cuda":
+                        cudagraph_mark_step_begin()
                     if torch.is_grad_enabled():
                         _from_hsdp_module(self)
                         _from_hsdp_module(_blk)
@@ -849,6 +900,7 @@ class Template(nn.Module):
                         _f, x, use_reentrant=True, preserve_rng_state=True
                     ),
                 )
+                x = _enn_ckpt_cudagraph_clone_if_needed(x)
             else:
                 x, _ = blk(
                     x, causal_mask=causal_mask, state=None, mode="spatial"
@@ -901,6 +953,8 @@ class Template(nn.Module):
             if do_ckpt:
 
                 def _f(t: torch.Tensor, _blk: RetNet = blk) -> torch.Tensor:
+                    if getattr(t.device, "type", None) == "cuda":
+                        cudagraph_mark_step_begin()
                     if torch.is_grad_enabled():
                         _from_hsdp_module(self)
                         _from_hsdp_module(_blk)
@@ -915,6 +969,7 @@ class Template(nn.Module):
                         _f, x, use_reentrant=True, preserve_rng_state=True
                     ),
                 )
+                x = _enn_ckpt_cudagraph_clone_if_needed(x)
             else:
                 x, blk_next_state = blk(
                     x,
