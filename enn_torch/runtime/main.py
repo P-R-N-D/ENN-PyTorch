@@ -3049,6 +3049,7 @@ def infer(
         and (TD_CudaGraphModule is not None)
         and bool(getattr(torch.cuda, "is_available", lambda: False)())
         and hasattr(torch.cuda, "CUDAGraph")
+        and (not bool(force_eager))
     )
     non_blocking_ok = bool(dev_type in ("cuda", "xpu"))
     pinned_ok = bool(is_pin_supported(dev_type))
@@ -3370,7 +3371,7 @@ def infer(
                     if status_bar is not None:
                         status_bar.update(1)
                     continue
-                if (not force_single) and (not td_cg_disabled) and (not td_cg_active):
+                if (not force_single) and (not force_eager) and (not td_cg_disabled) and (not td_cg_active):
                     _td_cudagraph(int(bs), X)
                 if row_ids is None:
                     if row_ids_buf is None or int(row_ids_buf.numel()) < bs:
@@ -3408,6 +3409,7 @@ def infer(
                     td_cg_active
                     and (td_cg_mod is not None)
                     and (td_cg_mb is not None)
+                    and (not bool(force_eager))
                 )
                 if force_single:
                     use_td_cg = False
