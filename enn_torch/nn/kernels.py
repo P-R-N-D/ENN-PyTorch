@@ -544,8 +544,6 @@ def _call_with_flex_warn_guard(fn: Callable[[], Any]) -> tuple[Any, bool]:
 
 
 def _flex_ckpt_always_clone_enabled(out: Any) -> bool:
-    if not torch.is_grad_enabled():
-        return False
     if not bool(is_checkpoint()):
         return False
     t0 = None

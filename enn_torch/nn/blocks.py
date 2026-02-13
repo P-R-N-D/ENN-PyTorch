@@ -13,7 +13,7 @@ import torch.nn.functional as F
 from ..core.compat import StochasticDepth
 from ..runtime.distributed import _from_hsdp_module
 from .activations import GeGLU
-from .graph import coerce_checkpoint, is_export_or_trace, is_symbolic
+from .graph import coerce_checkpoint, is_checkpoint, is_export_or_trace, is_symbolic
 from .kernels import DotProductAttention
 from .layers import DilatedAttention, Resampler, Retention, norm_layer
 _LOGGER = logging.getLogger(__name__)
@@ -56,6 +56,16 @@ def _safe_norm(norm: nn.Module, x: torch.Tensor) -> torch.Tensor:
             norm.eps,
         )
     return norm(x)
+
+
+def _enn_longnet_ckpt_clone_if_needed(t: torch.Tensor) -> torch.Tensor:
+    if not torch.is_tensor(t):
+        return t
+    if not bool(getattr(t.device, "type", None) == "cuda"):
+        return t
+    if not bool(torch.is_grad_enabled() or is_checkpoint()):
+        return t
+    return t.clone()
 
 
 def _size_of_retnet(
@@ -557,16 +567,21 @@ class LongNet(nn.Module):
         layer: nn.Module,
         key_padding_mask: Optional[torch.Tensor],
     ) -> torch.Tensor:
-        if torch.is_grad_enabled():
+        if torch.is_grad_enabled() or is_checkpoint():
             _from_hsdp_module(self)
             _from_hsdp_module(layer)
-        return layer(
+        if bool(torch.is_grad_enabled() or is_checkpoint()) and bool(getattr(t.device, "type", None) == "cuda"):
+            from .graph import cudagraph_mark_step_begin
+
+            cudagraph_mark_step_begin()
+        out = layer(
             t,
             key_padding_mask=key_padding_mask,
             need_weights=False,
             average_attn_weights=False,
             skip_ffn_checkpoint=True,
         )[0]
+        return _enn_longnet_ckpt_clone_if_needed(out)
 
     def forward(
         self: Self,
