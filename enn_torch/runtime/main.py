@@ -3034,6 +3034,11 @@ def infer(
         run_model.module if hasattr(run_model, "module") else run_model
     )
     distributed_sync(module_eval, device=dev_obj)
+
+    eager_ctx_factory = getattr(module_eval, "eager_for_export", None)
+    force_eager = bool(env_bool("ENN_PRED_FORCE_EAGER", False))
+    eager_on_broadcast = bool(env_bool("ENN_PRED_EAGER_ON_BROADCAST", True))
+
     cg_enabled = bool(
         dev_type == "cuda"
         and getattr(module_eval, "_compile_cudagraphs", False)
@@ -3149,7 +3154,13 @@ def infer(
             broadcast_atol = float(env_float("ENN_PRED_BROADCAST_ATOL", 1e-6))
 
             def _td_predict(x: torch.Tensor) -> torch.Tensor:
-                out = run_model(x, calibrate_output=True, return_loss=False)
+                ctx = (
+                    eager_ctx_factory()
+                    if (force_eager and callable(eager_ctx_factory))
+                    else contextlib.nullcontext()
+                )
+                with ctx:
+                    out = run_model(x, calibrate_output=True, return_loss=False)
                 if isinstance(out, tuple):
                     out = out[0]
                 if not isinstance(out, torch.Tensor):
@@ -3552,6 +3563,9 @@ def infer(
                                         "Falling back to per-sample inference (microbatch=1) for correctness.",
                                         float(broadcast_atol),
                                     )
+                                    if eager_on_broadcast and callable(eager_ctx_factory):
+                                        force_eager = True
+
                                     force_single = True
                                     cg_enabled = False
                                     td_cg_active = False
@@ -3570,6 +3584,15 @@ def infer(
                                         pj = _td_predict(Xi[j : j + 1])
                                         preds_list.append(pj)
                                     preds = torch.cat(preds_list, dim=0)
+                                    with contextlib.suppress(Exception):
+                                        if int(preds.shape[0]) >= 2:
+                                            y0b = preds[0].detach()
+                                            y1b = preds[1].detach()
+                                            ydiff2 = (y0b - y1b).abs().max()
+                                            if float(ydiff2.item()) <= float(broadcast_atol):
+                                                _LOGGER.warning(
+                                                    "[infer] outputs remain batch-broadcasted even after per-sample fallback; this indicates a model/preprocess collapse (not just cudagraph batching)."
+                                                )
                         except Exception:
                             pass
                     rows_cpu = (
