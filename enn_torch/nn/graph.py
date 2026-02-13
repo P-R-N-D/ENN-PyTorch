@@ -38,6 +38,28 @@ _SAFE_DIST_PATCHED: set[str] = set()
 _TORCH_COMPILER = getattr(torch, "compiler", None)
 _TORCH_COMPILE_LOCK = Mutex(reentrant=True)
 _NO_COMPILE_SENTINEL = "__enn_no_compile_wrapped__"
+_ENN_CUDAGRAPH_STEP_LOCK = threading.Lock()
+_ENN_CUDAGRAPH_STEP_COUNTER: int = 0
+_ENN_CUDAGRAPH_STEP_TL = threading.local()
+
+
+def get_cudagraph_step_id() -> int:
+    try:
+        return int(getattr(_ENN_CUDAGRAPH_STEP_TL, "step_id", 0) or 0)
+    except Exception:
+        return 0
+
+
+def _bump_cudagraph_step_id() -> int:
+    global _ENN_CUDAGRAPH_STEP_COUNTER
+    with _ENN_CUDAGRAPH_STEP_LOCK:
+        _ENN_CUDAGRAPH_STEP_COUNTER = int(_ENN_CUDAGRAPH_STEP_COUNTER) + 1
+        sid = int(_ENN_CUDAGRAPH_STEP_COUNTER)
+    try:
+        setattr(_ENN_CUDAGRAPH_STEP_TL, "step_id", sid)
+    except Exception:
+        pass
+    return sid
 
 
 def _is_in_jupyter() -> bool:
@@ -852,6 +874,7 @@ def torch_compiler_supported() -> bool:
 def cudagraph_mark_step_begin() -> None:
     if is_export_or_trace():
         return
+    _bump_cudagraph_step_id()
     mark_step = getattr(_TORCH_COMPILER, "cudagraph_mark_step_begin", None)
     if callable(mark_step):
         try:
