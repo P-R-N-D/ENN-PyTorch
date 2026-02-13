@@ -1105,6 +1105,10 @@ def set_float32_precision(
         prec = "tf32" if use_tf32 else "ieee"
         with contextlib.suppress(Exception):
             torch.backends.cuda.matmul.fp32_precision = prec
+        cudnn = getattr(torch.backends, "cudnn", None)
+        if cudnn is not None and hasattr(cudnn, "fp32_precision"):
+            with contextlib.suppress(Exception):
+                cudnn.fp32_precision = prec
         return
 
     precision = "high" if use_tf32 else "highest"
