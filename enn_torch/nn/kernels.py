@@ -2439,9 +2439,11 @@ class FlexAttention(nn.Module):
                         except Exception:
                             pass
                         try:
-                            fb_mode = os.environ.get(
-                                "ENN_FLEX_RESOURCE_FALLBACK_MODE",
-                                "max-autotune-no-cudagraphs",
+                            fb_mode = _coerce_flex_fallback_mode(
+                                os.environ.get(
+                                    "ENN_FLEX_RESOURCE_FALLBACK_MODE",
+                                    "max-autotune-no-cudagraphs",
+                                )
                             )
                             fb_dyn = _flex_attention_dynamic_flag(fb_mode)
                             fb_dyn_override = _env_bool_optional(
@@ -2450,7 +2452,7 @@ class FlexAttention(nn.Module):
                             if isinstance(fb_dyn_override, bool):
                                 fb_dyn = fb_dyn_override
                             fb_fn = _compile_flex_attention_wrapper(
-                                mode=str(fb_mode),
+                                mode=fb_mode,
                                 dynamic=fb_dyn,
                                 flex_kwargs=flex_kwargs2,
                             )
