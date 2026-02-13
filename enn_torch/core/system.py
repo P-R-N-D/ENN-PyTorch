@@ -116,6 +116,11 @@ def _install_matmul_precision_legacy_shim_if_needed() -> None:
                 if legacy_v in {"highest", "high", "medium"}:
                     return legacy_v
         try:
+            v_cuda = None
+            with contextlib.suppress(Exception):
+                v_cuda = str(torch.backends.cuda.matmul.fp32_precision or "").strip().lower()
+            if v_cuda in {"tf32", "ieee"}:
+                return "high" if v_cuda == "tf32" else "highest"
             v = str(getattr(torch.backends, "fp32_precision", "ieee") or "ieee").strip().lower()
             return "high" if v == "tf32" else "highest"
         except Exception:
