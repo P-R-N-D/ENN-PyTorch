@@ -482,11 +482,12 @@ def _compile_flex_attention_wrapper(
         return _torch_flex_attention
 
     def _wrapped(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> Any:
-        if torch.is_grad_enabled() and bool(is_checkpoint()) and bool(getattr(q.device, "type", None) == "cuda"):
+        if bool(is_checkpoint()) and bool(getattr(q.device, "type", None) == "cuda"):
             cudagraph_mark_step_begin()
         with skip_non_infra_dispatch_mode():
             out = base(q, k, v, **frozen)
-        return _flex_ckpt_always_clone_out(out)
+            out = _flex_ckpt_always_clone_out(out)
+            return out
 
     return _wrapped
 
@@ -594,10 +595,11 @@ def _call_torch_flex_attention_eager(
                 category=UserWarning,
                 module=_FLEX_UNCOMPILED_WARN_MODULE_RE,
             )
-            if torch.is_grad_enabled() and bool(is_checkpoint()) and bool(getattr(q.device, "type", None) == "cuda"):
+            if bool(is_checkpoint()) and bool(getattr(q.device, "type", None) == "cuda"):
                 cudagraph_mark_step_begin()
             out = _torch_flex_attention(q, k, v, **flex_kwargs)
-    return _flex_ckpt_always_clone_out(out)
+            out = _flex_ckpt_always_clone_out(out)
+            return out
 
 
 def _get_compiled_flex_attention_for_kwargs(
