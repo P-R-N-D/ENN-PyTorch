@@ -880,12 +880,12 @@ class Template(nn.Module):
             do_ckpt = bool(
                 est >= int(getattr(self, "_ckpt_min_bytes", 0) or 0)
             )
+        if do_ckpt and getattr(x.device, "type", None) == "cuda":
+            cudagraph_mark_step_begin()
         for blk in self.blocks:
             if do_ckpt:
 
                 def _f(t: torch.Tensor, _blk: RetNet = blk) -> torch.Tensor:
-                    if getattr(t.device, "type", None) == "cuda":
-                        cudagraph_mark_step_begin()
                     if torch.is_grad_enabled():
                         _from_hsdp_module(self)
                         _from_hsdp_module(_blk)
@@ -941,6 +941,8 @@ class Template(nn.Module):
             do_ckpt = bool(
                 est >= int(getattr(self, "_ckpt_min_bytes", 0) or 0)
             )
+        if do_ckpt and getattr(x.device, "type", None) == "cuda":
+            cudagraph_mark_step_begin()
         next_state: Optional[torch.Tensor] = None
         if return_state:
             next_state = x.new_empty(
@@ -953,8 +955,6 @@ class Template(nn.Module):
             if do_ckpt:
 
                 def _f(t: torch.Tensor, _blk: RetNet = blk) -> torch.Tensor:
-                    if getattr(t.device, "type", None) == "cuda":
-                        cudagraph_mark_step_begin()
                     if torch.is_grad_enabled():
                         _from_hsdp_module(self)
                         _from_hsdp_module(_blk)
