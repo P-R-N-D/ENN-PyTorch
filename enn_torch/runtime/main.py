@@ -3506,6 +3506,18 @@ def infer(
                         if cg_enabled:
                             cudagraph_mark_step_begin()
                         out = predict_fn(Xi_run)
+                        if isinstance(out, torch.Tensor):
+                            if int(n_i) < int(mb) and int(out.shape[0]) == int(mb):
+                                out = out[: int(n_i)]
+                            reuse_risk = bool(cg_enabled) or bool(locals().get("td_cg_active", False))
+                            if reuse_risk and getattr(out.device, "type", None) == "cuda":
+                                try:
+                                    out = out.clone()
+                                except Exception as e:
+                                    if is_oom_error(e):
+                                        out = out.detach().cpu()
+                                    else:
+                                        raise
                     except RuntimeError as e:
                         if is_oom_error(e) and mb > 1:
                             with contextlib.suppress(Exception):
@@ -3540,7 +3552,7 @@ def infer(
                         raise RuntimeError(
                             "infer: unexpected model output type"
                         )
-                    if pad_n > 0:
+                    if pad_n > 0 and int(preds.shape[0]) == int(mb):
                         preds = preds[:n_i]
                     if (
                         (not force_single)
@@ -3581,16 +3593,17 @@ def infer(
                                     predict_fn = _td_predict
                                     with contextlib.suppress(Exception):
                                         setattr(model, "microbatch", 1)
+                                    x1_buf = Xi.new_empty((1,) + tuple(Xi.shape[1:]))
                                     preds_fix: torch.Tensor | None = None
                                     for j in range(int(n_i)):
-                                        pj = _td_predict(Xi[j : j + 1])
+                                        x1_buf.copy_(Xi[j : j + 1])
+                                        pj = _td_predict(x1_buf)
                                         if preds_fix is None:
                                             preds_fix = pj.new_empty(
                                                 (int(n_i),) + tuple(pj.shape[1:])
                                             )
                                         preds_fix[j : j + 1].copy_(pj[:1])
-                                    if preds_fix is not None:
-                                        preds = preds_fix
+                                    preds = preds_fix if preds_fix is not None else preds
                                     with contextlib.suppress(Exception):
                                         if int(preds.shape[0]) >= 2:
                                             y0b = preds[0].detach()
