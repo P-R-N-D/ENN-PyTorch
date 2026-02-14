@@ -3667,6 +3667,14 @@ def infer(
                                     predict_fn = _td_predict
                                     with contextlib.suppress(Exception):
                                         setattr(model, "microbatch", 1)
+                                    with contextlib.suppress(Exception):
+                                        if torch.is_tensor(preds) and getattr(preds.device, "type", None) == "cuda":
+                                            _preds_tmp = preds
+                                            preds = None
+                                            del _preds_tmp
+                                            empty_device_cache(
+                                                device=dev_obj, do_gc=False, min_interval_s=0.0
+                                            )
                                     x1_buf = Xi.new_empty((1,) + tuple(Xi.shape[1:]))
                                     preds_fix_cpu: torch.Tensor | None = None
                                     for j in range(int(n_i)):
@@ -3689,6 +3697,9 @@ def infer(
                                         pj_cpu = pj.detach()
                                         if getattr(pj_cpu.device, "type", None) != "cpu":
                                             pj_cpu = pj_cpu.to(device="cpu")
+                                        with contextlib.suppress(Exception):
+                                            pj_cpu = pj_cpu.contiguous()
+                                        pj_cpu = pj_cpu.clone()
                                         if preds_fix_cpu is None:
                                             preds_fix_cpu = pj_cpu.new_empty(
                                                 (int(n_i),) + tuple(pj_cpu.shape[1:])
@@ -3727,6 +3738,9 @@ def infer(
                                                         pj2_cpu = pj2.detach()
                                                         if getattr(pj2_cpu.device, "type", None) != "cpu":
                                                             pj2_cpu = pj2_cpu.to(device="cpu")
+                                                        with contextlib.suppress(Exception):
+                                                            pj2_cpu = pj2_cpu.contiguous()
+                                                        pj2_cpu = pj2_cpu.clone()
                                                         if preds_fix2 is None:
                                                             preds_fix2 = pj2_cpu.new_empty(
                                                                 (int(n_i),) + tuple(pj2_cpu.shape[1:])
