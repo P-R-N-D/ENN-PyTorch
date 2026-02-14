@@ -430,6 +430,7 @@ class DilatedAttention(nn.Module):
         self._mask_cache: Optional[torch.Tensor] = None
         self._mask_cache_device: Optional[torch.device] = None
         self._flex_cache_len: int = 0
+        self._flex_cache_B: int = 0
         self._flex_cache_device: Optional[torch.device] = None
         self._flex_block_mask = None
 
@@ -473,14 +474,16 @@ class DilatedAttention(nn.Module):
             self._mask_cache_device = device
         return self._mask_cache
 
-    def _get_flex_block_mask(self, L: int, device: torch.device):
+    def _get_flex_block_mask(self, L: int, B: int, device: torch.device):
         if is_export_or_trace() or is_compiling():
             return None
         if not _HAS_FLEX_ATTENTION or create_block_mask is None:
             return None
+        B = int(B) if not torch.is_tensor(B) else int(B.item())
         if (
             self._flex_block_mask is None
             or self._flex_cache_len != L
+            or self._flex_cache_B != B
             or self._flex_cache_device != device
         ):
             mask_mod = _FlexDilatedMaskMod(
@@ -492,13 +495,14 @@ class DilatedAttention(nn.Module):
             )
             self._flex_block_mask = create_block_mask(
                 mask_mod=mask_mod,
-                B=1,
+                B=B,
                 H=self.nhead,
                 Q_LEN=L,
                 KV_LEN=L,
                 device=device,
             )
             self._flex_cache_len = L
+            self._flex_cache_B = B
             self._flex_cache_device = device
         return self._flex_block_mask
 
@@ -543,7 +547,7 @@ class DilatedAttention(nn.Module):
         attn_mask_keep: Optional[torch.Tensor] = None
         attn_weights = None
         if use_flex:
-            block_mask = self._get_flex_block_mask(L, device)
+            block_mask = self._get_flex_block_mask(L, B, device)
             if block_mask is None:
                 use_flex = False
         if use_flex:
