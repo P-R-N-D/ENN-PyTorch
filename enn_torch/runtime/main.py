@@ -3756,7 +3756,11 @@ def infer(
                                                                 "this indicates a true model/preprocess collapse. "
                                                                 "Set ENN_PRED_COLLAPSE_ABORT=0 to ignore and write outputs anyway."
                                                             )
-                        except Exception:
+                        except Exception as exc:
+                            if isinstance(exc, RuntimeError) and (
+                                "collapse persisted even in calibrate_output=False path" in str(exc)
+                            ):
+                                raise
                             pass
 
                     reuse_risk = bool(_pred_reuse_active(predict_fn))
