@@ -244,6 +244,70 @@ class _FlexDilatedMaskMod:
         return keep
 
 
+class _FlexDilatedScoreMod:
+    __slots__ = ("L_q", "L_k", "dilation", "win", "causal")
+
+    def __init__(
+        self,
+        *,
+        L_q: int,
+        L_k: int,
+        dilation: int,
+        win: Optional[int],
+        causal: bool,
+    ) -> None:
+        self.L_q = L_q if torch.is_tensor(L_q) else int(L_q)
+        self.L_k = L_k if torch.is_tensor(L_k) else int(L_k)
+        self.dilation = max(1, int(dilation))
+        self.win = None if win is None else int(win)
+        self.causal = bool(causal)
+
+    def __call__(
+        self,
+        score: torch.Tensor,
+        b: torch.Tensor,
+        h: torch.Tensor,
+        q_idx: torch.Tensor,
+        kv_idx: torch.Tensor,
+    ) -> torch.Tensor:
+        _ = (b, h)
+        dq = q_idx - kv_idx
+        keep = kv_idx == kv_idx
+
+        L_q = self.L_q
+        L_k = self.L_k
+        if torch.is_tensor(L_q) or torch.is_tensor(L_k):
+            Lq = (
+                L_q.to(device=kv_idx.device)
+                if torch.is_tensor(L_q)
+                else kv_idx.new_tensor(int(L_q))
+            )
+            Lk = (
+                L_k.to(device=kv_idx.device)
+                if torch.is_tensor(L_k)
+                else kv_idx.new_tensor(int(L_k))
+            )
+            cond = Lk > Lq
+            keep = keep & torch.where(
+                cond,
+                (kv_idx < Lq),
+                torch.ones_like(keep, dtype=torch.bool),
+            )
+        else:
+            if int(L_k) > int(L_q):
+                keep = keep & (kv_idx < int(L_q))
+
+        if self.causal:
+            keep = keep & (kv_idx <= q_idx)
+        if self.win is not None:
+            keep = keep & (dq.abs() <= int(self.win))
+        if self.dilation > 1:
+            keep = keep & ((dq % int(self.dilation)) == 0)
+
+        neg = score.new_full((), torch.finfo(score.dtype).min)
+        return torch.where(keep, score, neg)
+
+
 class Retention(nn.Module):
     def __init__(
         self: Self,
@@ -433,6 +497,8 @@ class DilatedAttention(nn.Module):
         self._flex_cache_B: int = 0
         self._flex_cache_device: Optional[torch.device] = None
         self._flex_block_mask = None
+        self._flex_score_cache_len: int = 0
+        self._flex_score_mod: Optional[_FlexDilatedScoreMod] = None
 
     def _get_torch_mha(self) -> Optional[nn.MultiheadAttention]:
         impl = getattr(self.mha, "impl", None)
@@ -506,6 +572,18 @@ class DilatedAttention(nn.Module):
             self._flex_cache_device = device
         return self._flex_block_mask
 
+    def _get_flex_score_mod(self, L: int) -> _FlexDilatedScoreMod:
+        if self._flex_score_mod is None or self._flex_score_cache_len != L:
+            self._flex_score_mod = _FlexDilatedScoreMod(
+                L_q=L,
+                L_k=L,
+                dilation=self.dilation,
+                win=self.window_size,
+                causal=self.causal,
+            )
+            self._flex_score_cache_len = L
+        return self._flex_score_mod
+
     def forward(
         self,
         x: torch.Tensor,
@@ -547,16 +625,14 @@ class DilatedAttention(nn.Module):
         attn_mask_keep: Optional[torch.Tensor] = None
         attn_weights = None
         if use_flex:
-            block_mask = self._get_flex_block_mask(L, B, device)
-            if block_mask is None:
-                use_flex = False
-        if use_flex:
             q, k, v, out_proj = self._project_qkv_for_flex(x_norm)
+            score_mod = self._get_flex_score_mod(int(L))
             a = _FLEX_KERNEL(
                 q,
                 k,
                 v,
-                block_mask=block_mask,
+                score_mod=score_mod,
+                block_mask=None,
                 scale=None,
                 dropout_p=self.dropout_p if self.training else 0.0,
                 training=bool(self.training),
