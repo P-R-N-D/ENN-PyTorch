@@ -3506,8 +3506,18 @@ def infer(
                         if cg_enabled:
                             cudagraph_mark_step_begin()
                         out = predict_fn(Xi_run)
-                        if isinstance(out, torch.Tensor) and getattr(out.device, "type", None) == "cuda":
-                            out = out.clone()
+                        if isinstance(out, torch.Tensor):
+                            if int(n_i) < int(mb) and int(out.shape[0]) == int(mb):
+                                out = out[: int(n_i)]
+                            reuse_risk = bool(cg_enabled) or bool(locals().get("td_cg_active", False))
+                            if reuse_risk and getattr(out.device, "type", None) == "cuda":
+                                try:
+                                    out = out.clone()
+                                except Exception as e:
+                                    if is_oom_error(e):
+                                        out = out.detach().cpu()
+                                    else:
+                                        raise
                     except RuntimeError as e:
                         if is_oom_error(e) and mb > 1:
                             with contextlib.suppress(Exception):
@@ -3542,7 +3552,7 @@ def infer(
                         raise RuntimeError(
                             "infer: unexpected model output type"
                         )
-                    if pad_n > 0:
+                    if pad_n > 0 and int(preds.shape[0]) == int(mb):
                         preds = preds[:n_i]
                     if (
                         (not force_single)
