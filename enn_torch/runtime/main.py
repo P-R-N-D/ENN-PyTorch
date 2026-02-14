@@ -3153,6 +3153,9 @@ def infer(
             broadcast_checked = False
             detect_broadcast = bool(env_bool("ENN_PRED_DETECT_BATCH_BROADCAST", True))
             broadcast_atol = float(env_float("ENN_PRED_BROADCAST_ATOL", 1e-6))
+            calibrate_pred_output = bool(env_bool("ENN_PRED_CALIBRATE_OUTPUT", True))
+            collapse_fallback_raw = bool(env_bool("ENN_PRED_COLLAPSE_FALLBACK_RAW", True))
+            collapse_switched_raw = False
             pred_cg_strict_sync = bool(
                 env_bool(
                     "ENN_PRED_CUDAGRAPH_STRICT_SYNC",
@@ -3174,7 +3177,20 @@ def infer(
                         _pred_disable_decorator = cand
 
             def _run_model_predict(x: torch.Tensor):
-                return run_model(x, calibrate_output=True, return_loss=False)
+                return run_model(
+                    x,
+                    calibrate_output=bool(calibrate_pred_output),
+                    return_loss=False,
+                )
+
+            def _run_model_predict_with_calibration(
+                x: torch.Tensor, *, calibrate_output: bool
+            ):
+                return run_model(
+                    x,
+                    calibrate_output=bool(calibrate_output),
+                    return_loss=False,
+                )
 
             _run_model_predict_disabled = None
             if callable(_pred_disable_decorator):
@@ -3183,15 +3199,22 @@ def infer(
                     if callable(wrapped):
                         _run_model_predict_disabled = wrapped
 
-            def _td_predict(x: torch.Tensor) -> torch.Tensor:
+            def _td_predict(
+                x: torch.Tensor, *, calibrate_output: bool | None = None
+            ) -> torch.Tensor:
                 ctx = (
                     eager_ctx_factory()
                     if (force_eager and callable(eager_ctx_factory))
                     else contextlib.nullcontext()
                 )
                 with ctx:
-                    if force_eager and callable(_run_model_predict_disabled):
+                    if force_eager and callable(_run_model_predict_disabled) and calibrate_output is None:
                         out = _run_model_predict_disabled(x)
+                    elif calibrate_output is not None:
+                        out = _run_model_predict_with_calibration(
+                            x,
+                            calibrate_output=bool(calibrate_output),
+                        )
                     else:
                         out = _run_model_predict(x)
                 if isinstance(out, tuple):
@@ -3558,7 +3581,7 @@ def infer(
                             and getattr(getattr(Xi_run, "device", None), "type", None) == "cuda"
                         ):
                             sync_accelerator(dev_obj)
-                        if cg_enabled:
+                        if dev_type == "cuda":
                             cudagraph_mark_step_begin()
                         out = predict_fn(Xi_run)
                         if (
@@ -3597,7 +3620,7 @@ def infer(
                             continue
                         raise
                     finally:
-                        if cg_enabled:
+                        if dev_type == "cuda":
                             cudagraph_mark_step_end()
                     preds = out
                     if not isinstance(preds, torch.Tensor):
@@ -3644,6 +3667,14 @@ def infer(
                                     predict_fn = _td_predict
                                     with contextlib.suppress(Exception):
                                         setattr(model, "microbatch", 1)
+                                    with contextlib.suppress(Exception):
+                                        if torch.is_tensor(preds) and getattr(preds.device, "type", None) == "cuda":
+                                            _preds_tmp = preds
+                                            preds = None
+                                            del _preds_tmp
+                                            empty_device_cache(
+                                                device=dev_obj, do_gc=False, min_interval_s=0.0
+                                            )
                                     x1_buf = Xi.new_empty((1,) + tuple(Xi.shape[1:]))
                                     preds_fix_cpu: torch.Tensor | None = None
                                     for j in range(int(n_i)):
@@ -3653,10 +3684,10 @@ def infer(
                                             and getattr(x1_buf.device, "type", None) == "cuda"
                                         ):
                                             sync_accelerator(dev_obj)
-                                        if cg_enabled:
+                                        if dev_type == "cuda":
                                             cudagraph_mark_step_begin()
                                         pj = _td_predict(x1_buf)
-                                        if cg_enabled:
+                                        if dev_type == "cuda":
                                             cudagraph_mark_step_end()
                                         if (
                                             pred_cg_strict_sync
@@ -3666,6 +3697,9 @@ def infer(
                                         pj_cpu = pj.detach()
                                         if getattr(pj_cpu.device, "type", None) != "cpu":
                                             pj_cpu = pj_cpu.to(device="cpu")
+                                        with contextlib.suppress(Exception):
+                                            pj_cpu = pj_cpu.contiguous()
+                                        pj_cpu = pj_cpu.clone()
                                         if preds_fix_cpu is None:
                                             preds_fix_cpu = pj_cpu.new_empty(
                                                 (int(n_i),) + tuple(pj_cpu.shape[1:])
@@ -3681,6 +3715,46 @@ def infer(
                                                 _LOGGER.warning(
                                                     "[infer] outputs remain batch-broadcasted even after per-sample fallback; this indicates a model/preprocess collapse (not just cudagraph batching)."
                                                 )
+                                                if (
+                                                    (not collapse_switched_raw)
+                                                    and bool(collapse_fallback_raw)
+                                                    and bool(calibrate_pred_output)
+                                                ):
+                                                    collapse_switched_raw = True
+                                                    _LOGGER.warning(
+                                                        "[infer] collapse persisted; retrying this batch per-sample with calibrate_output=False (ENN_PRED_COLLAPSE_FALLBACK_RAW=1)."
+                                                    )
+                                                    preds_fix2: torch.Tensor | None = None
+                                                    for j in range(int(n_i)):
+                                                        x1_buf.copy_(Xi[j : j + 1])
+                                                        if dev_type == "cuda":
+                                                            cudagraph_mark_step_begin()
+                                                        pj2 = _td_predict(
+                                                            x1_buf,
+                                                            calibrate_output=False,
+                                                        )
+                                                        if dev_type == "cuda":
+                                                            cudagraph_mark_step_end()
+                                                        pj2_cpu = pj2.detach()
+                                                        if getattr(pj2_cpu.device, "type", None) != "cpu":
+                                                            pj2_cpu = pj2_cpu.to(device="cpu")
+                                                        with contextlib.suppress(Exception):
+                                                            pj2_cpu = pj2_cpu.contiguous()
+                                                        pj2_cpu = pj2_cpu.clone()
+                                                        if preds_fix2 is None:
+                                                            preds_fix2 = pj2_cpu.new_empty(
+                                                                (int(n_i),) + tuple(pj2_cpu.shape[1:])
+                                                            )
+                                                        preds_fix2[j : j + 1].copy_(pj2_cpu[:1])
+                                                    if preds_fix2 is not None:
+                                                        preds = preds_fix2
+                                                        with contextlib.suppress(Exception):
+                                                            if int(preds.shape[0]) >= 2:
+                                                                dy2 = (preds[0] - preds[1]).abs().max()
+                                                                _LOGGER.warning(
+                                                                    "[infer] calibrate_output=False sanity: max|Y0-Y1|=%.6g",
+                                                                    float(dy2.item()),
+                                                                )
                         except Exception:
                             pass
                     rows_cpu = (
