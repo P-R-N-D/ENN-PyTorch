@@ -35,6 +35,8 @@ from .kernels import (
     FlexAttention,
     MultiHeadAttention,
     MultiScaleRetention,
+    _FLEX_KWARGS,
+    _ensure_flex_kwargs_initialized,
 )
 try:
     from torch.nn.attention.flex_attention import create_block_mask
@@ -626,13 +628,20 @@ class DilatedAttention(nn.Module):
         attn_weights = None
         if use_flex:
             q, k, v, out_proj = self._project_qkv_for_flex(x_norm)
-            score_mod = self._get_flex_score_mod(int(L))
+            _ensure_flex_kwargs_initialized()
+            flex_supports_score_mod = "score_mod" in _FLEX_KWARGS
+            flex_supports_block_mask = "block_mask" in _FLEX_KWARGS
+            use_score_mod = bool(q.is_cuda and flex_supports_score_mod)
+            score_mod = self._get_flex_score_mod(int(L)) if use_score_mod else None
+            block_mask = None
+            if (not use_score_mod) and flex_supports_block_mask:
+                block_mask = self._get_flex_block_mask(int(L), int(B), device)
             a = _FLEX_KERNEL(
                 q,
                 k,
                 v,
                 score_mod=score_mod,
-                block_mask=None,
+                block_mask=block_mask,
                 scale=None,
                 dropout_p=self.dropout_p if self.training else 0.0,
                 training=bool(self.training),
