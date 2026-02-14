@@ -3183,6 +3183,15 @@ def infer(
                     return_loss=False,
                 )
 
+            def _run_model_predict_with_calibration(
+                x: torch.Tensor, *, calibrate_output: bool
+            ):
+                return run_model(
+                    x,
+                    calibrate_output=bool(calibrate_output),
+                    return_loss=False,
+                )
+
             _run_model_predict_disabled = None
             if callable(_pred_disable_decorator):
                 with contextlib.suppress(Exception):
@@ -3190,15 +3199,22 @@ def infer(
                     if callable(wrapped):
                         _run_model_predict_disabled = wrapped
 
-            def _td_predict(x: torch.Tensor) -> torch.Tensor:
+            def _td_predict(
+                x: torch.Tensor, *, calibrate_output: bool | None = None
+            ) -> torch.Tensor:
                 ctx = (
                     eager_ctx_factory()
                     if (force_eager and callable(eager_ctx_factory))
                     else contextlib.nullcontext()
                 )
                 with ctx:
-                    if force_eager and callable(_run_model_predict_disabled):
+                    if force_eager and callable(_run_model_predict_disabled) and calibrate_output is None:
                         out = _run_model_predict_disabled(x)
+                    elif calibrate_output is not None:
+                        out = _run_model_predict_with_calibration(
+                            x,
+                            calibrate_output=bool(calibrate_output),
+                        )
                     else:
                         out = _run_model_predict(x)
                 if isinstance(out, tuple):
@@ -3694,16 +3710,18 @@ def infer(
                                                     and bool(calibrate_pred_output)
                                                 ):
                                                     collapse_switched_raw = True
-                                                    calibrate_pred_output = False
                                                     _LOGGER.warning(
-                                                        "[infer] collapse persisted; retrying per-sample with calibrate_output=False (ENN_PRED_COLLAPSE_FALLBACK_RAW=1)."
+                                                        "[infer] collapse persisted; retrying this batch per-sample with calibrate_output=False (ENN_PRED_COLLAPSE_FALLBACK_RAW=1)."
                                                     )
                                                     preds_fix2: torch.Tensor | None = None
                                                     for j in range(int(n_i)):
                                                         x1_buf.copy_(Xi[j : j + 1])
                                                         if dev_type == "cuda":
                                                             cudagraph_mark_step_begin()
-                                                        pj2 = _td_predict(x1_buf)
+                                                        pj2 = _td_predict(
+                                                            x1_buf,
+                                                            calibrate_output=False,
+                                                        )
                                                         if dev_type == "cuda":
                                                             cudagraph_mark_step_end()
                                                         pj2_cpu = pj2.detach()
