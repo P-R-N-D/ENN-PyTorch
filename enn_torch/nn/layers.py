@@ -228,15 +228,21 @@ class _FlexDilatedMaskMod:
                 if torch.is_tensor(L_k)
                 else kv_idx.new_tensor(int(L_k))
             )
-            cond = Lk > Lq
-            keep = keep & torch.where(
-                cond,
-                (kv_idx < Lq),
-                torch.ones_like(keep, dtype=torch.bool),
+            keep = (
+                keep
+                & (q_idx >= 0)
+                & (q_idx < Lq)
+                & (kv_idx >= 0)
+                & (kv_idx < Lk)
             )
         else:
-            if int(L_k) > int(L_q):
-                keep = keep & (kv_idx < int(L_q))
+            keep = (
+                keep
+                & (q_idx >= 0)
+                & (q_idx < int(L_q))
+                & (kv_idx >= 0)
+                & (kv_idx < int(L_k))
+            )
         if self.causal:
             keep = keep & (kv_idx <= q_idx)
         if self.win is not None:
@@ -289,15 +295,21 @@ class _FlexDilatedScoreMod:
                 if torch.is_tensor(L_k)
                 else kv_idx.new_tensor(int(L_k))
             )
-            cond = Lk > Lq
-            keep = keep & torch.where(
-                cond,
-                (kv_idx < Lq),
-                torch.ones_like(keep, dtype=torch.bool),
+            keep = (
+                keep
+                & (q_idx >= 0)
+                & (q_idx < Lq)
+                & (kv_idx >= 0)
+                & (kv_idx < Lk)
             )
         else:
-            if int(L_k) > int(L_q):
-                keep = keep & (kv_idx < int(L_q))
+            keep = (
+                keep
+                & (q_idx >= 0)
+                & (q_idx < int(L_q))
+                & (kv_idx >= 0)
+                & (kv_idx < int(L_k))
+            )
 
         if self.causal:
             keep = keep & (kv_idx <= q_idx)
@@ -569,6 +581,16 @@ class DilatedAttention(nn.Module):
                 KV_LEN=L,
                 device=device,
             )
+            if env_bool("ENN_FLEX_VALIDATE_BLOCK_MASK", False):
+                with contextlib.suppress(Exception):
+                    kv = getattr(self._flex_block_mask, "kv_indices", None)
+                    if torch.is_tensor(kv):
+                        mn = int(kv.min().item())
+                        mx = int(kv.max().item())
+                        if mn < 0 or mx >= int(L):
+                            raise RuntimeError(
+                                f"Flex BlockMask kv_indices out of range: min={mn}, max={mx}, L={int(L)}"
+                            )
             self._flex_cache_len = L
             self._flex_cache_B = B
             self._flex_cache_device = device
@@ -636,19 +658,23 @@ class DilatedAttention(nn.Module):
             block_mask = None
             if (not use_score_mod) and flex_supports_block_mask:
                 block_mask = self._get_flex_block_mask(int(L), int(B), device)
-            a = _FLEX_KERNEL(
-                q,
-                k,
-                v,
-                score_mod=score_mod,
-                block_mask=block_mask,
-                scale=None,
-                dropout_p=self.dropout_p if self.training else 0.0,
-                training=bool(self.training),
-            )
-            a = a.transpose(1, 2).contiguous().view(B, L, self.embed_dim)
-            attn_out = out_proj(a)
-        else:
+            needs_mask = bool(self.causal) or (self.window_size is not None) or (int(self.dilation) != 1)
+            if needs_mask and (not use_score_mod) and (block_mask is None):
+                use_flex = False
+            if use_flex:
+                a = _FLEX_KERNEL(
+                    q,
+                    k,
+                    v,
+                    score_mod=score_mod,
+                    block_mask=block_mask,
+                    scale=None,
+                    dropout_p=self.dropout_p if self.training else 0.0,
+                    training=bool(self.training),
+                )
+                a = a.transpose(1, 2).contiguous().view(B, L, self.embed_dim)
+                attn_out = out_proj(a)
+        if not use_flex:
             use_is_causal = False
             attn_mask = None
             if self.dilation == 1 and self.window_size is None:
