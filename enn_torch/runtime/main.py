@@ -3154,13 +3154,36 @@ def infer(
             detect_broadcast = bool(env_bool("ENN_PRED_DETECT_BATCH_BROADCAST", True))
             broadcast_atol = float(env_float("ENN_PRED_BROADCAST_ATOL", 1e-6))
 
+            _pred_disable_compile = None
+            with contextlib.suppress(Exception):
+                comp = getattr(torch, "compiler", None)
+                cand = getattr(comp, "disable", None) if comp is not None else None
+                if callable(cand):
+                    _pred_disable_compile = cand
+            if _pred_disable_compile is None:
+                with contextlib.suppress(Exception):
+                    torch_dynamo = importlib.import_module("torch._dynamo")
+                    cand = getattr(torch_dynamo, "disable", None)
+                    if callable(cand):
+                        _pred_disable_compile = cand
+
+            def _pred_disable_compile_ctx():
+                if (not force_eager) or (_pred_disable_compile is None):
+                    return contextlib.nullcontext()
+                with contextlib.suppress(Exception):
+                    cand_ctx = _pred_disable_compile()
+                    if hasattr(cand_ctx, "__enter__") and hasattr(cand_ctx, "__exit__"):
+                        return cand_ctx
+                return contextlib.nullcontext()
+
             def _td_predict(x: torch.Tensor) -> torch.Tensor:
                 ctx = (
                     eager_ctx_factory()
                     if (force_eager and callable(eager_ctx_factory))
                     else contextlib.nullcontext()
                 )
-                with ctx:
+                dyn_ctx = _pred_disable_compile_ctx()
+                with ctx, dyn_ctx:
                     out = run_model(x, calibrate_output=True, return_loss=False)
                 if isinstance(out, tuple):
                     out = out[0]
@@ -3577,11 +3600,10 @@ def infer(
                                         "Falling back to per-sample inference (microbatch=1) for correctness.",
                                         float(broadcast_atol),
                                     )
-                                    if eager_on_broadcast and callable(eager_ctx_factory):
+                                    if eager_on_broadcast:
                                         force_eager = True
 
                                     force_single = True
-                                    cg_enabled = False
                                     td_cg_active = False
                                     td_cg_disabled = True
                                     td_cg_mb = None
@@ -3597,7 +3619,13 @@ def infer(
                                     preds_fix: torch.Tensor | None = None
                                     for j in range(int(n_i)):
                                         x1_buf.copy_(Xi[j : j + 1])
+                                        if cg_enabled:
+                                            cudagraph_mark_step_begin()
                                         pj = _td_predict(x1_buf)
+                                        if cg_enabled:
+                                            cudagraph_mark_step_end()
+                                        if getattr(pj.device, "type", None) == "cuda":
+                                            sync_accelerator(dev_obj)
                                         if preds_fix is None:
                                             preds_fix = pj.new_empty(
                                                 (int(n_i),) + tuple(pj.shape[1:])
