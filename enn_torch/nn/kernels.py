@@ -128,15 +128,11 @@ def _flex_attention_disabled() -> bool:
     return bool(env_bool("ENN_DISABLE_FLEX_ATTENTION", False))
 
 
-def _flex_cudagraphs_enabled() -> bool:
-    return bool(env_bool("ENN_FLEX_CUDAGRAPHS", default=False))
-
-
 def _flex_attention_compile_mode() -> str:
     cfg = get_runtime_cfg()
     global_mode = getattr(cfg, "compile_mode", "disabled")
     global_mode = canonicalize_compile_mode(global_mode)
-    if (not _flex_cudagraphs_enabled()) and global_mode in {"max-autotune", "reduce-overhead"}:
+    if (not bool(getattr(cfg, "compile_cudagraphs", True))) and global_mode in {"max-autotune", "reduce-overhead"}:
         global_mode = "max-autotune-no-cudagraphs"
     if global_mode in {"disabled", "aot-eager"}:
         return "aot-eager"
@@ -400,14 +396,9 @@ def _flex_attention_dynamic_flag(mode: str) -> Optional[bool]:
 
 def _flex_attention_fallback_modes(mode: str) -> tuple[str, ...]:
     m = str(mode)
-    allow_reduce_overhead = _flex_cudagraphs_enabled()
     if m == "max-autotune":
-        if allow_reduce_overhead:
-            return ("max-autotune-no-cudagraphs", "reduce-overhead")
-        return ("max-autotune-no-cudagraphs",)
+        return ("max-autotune-no-cudagraphs", "reduce-overhead")
     if m == "max-autotune-no-cudagraphs":
-        if allow_reduce_overhead:
-            return ("reduce-overhead",)
         return ()
     return ()
 
@@ -416,7 +407,8 @@ def _coerce_flex_fallback_mode(mode: str) -> str:
     fallback_mode = canonicalize_compile_mode(str(mode))
     if fallback_mode in {"disabled", "aot-eager"}:
         return "max-autotune-no-cudagraphs"
-    if (not _flex_cudagraphs_enabled()) and fallback_mode == "reduce-overhead":
+    cfg = get_runtime_cfg()
+    if (not bool(getattr(cfg, "compile_cudagraphs", True))) and fallback_mode == "reduce-overhead":
         return "max-autotune-no-cudagraphs"
     return fallback_mode
 
@@ -502,7 +494,11 @@ def _compile_flex_attention_wrapper(
         return _torch_flex_attention
 
     def _wrapped(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> Any:
-        if _flex_cudagraphs_enabled() and bool(is_checkpoint()) and bool(getattr(q.device, "type", None) == "cuda"):
+        if (
+            bool(is_checkpoint())
+            and bool(getattr(q.device, "type", None) == "cuda")
+            and _flex_attention_compile_mode() in {"max-autotune", "reduce-overhead"}
+        ):
             cudagraph_mark_step_begin()
         with skip_non_infra_dispatch_mode():
             out = base(q, k, v, **frozen)
@@ -567,8 +563,6 @@ def _call_with_flex_warn_guard(fn: Callable[[], Any]) -> tuple[Any, bool]:
 def _flex_ckpt_always_clone_enabled(out: Any) -> bool:
     if not bool(is_checkpoint()):
         return False
-    if not _flex_cudagraphs_enabled():
-        return False
     if _flex_attention_compile_mode() not in {"max-autotune", "reduce-overhead"}:
         return False
     t0 = None
@@ -619,7 +613,11 @@ def _call_torch_flex_attention_eager(
                 category=UserWarning,
                 module=_FLEX_UNCOMPILED_WARN_MODULE_RE,
             )
-            if _flex_cudagraphs_enabled() and bool(is_checkpoint()) and bool(getattr(q.device, "type", None) == "cuda"):
+            if (
+                bool(is_checkpoint())
+                and bool(getattr(q.device, "type", None) == "cuda")
+                and _flex_attention_compile_mode() in {"max-autotune", "reduce-overhead"}
+            ):
                 cudagraph_mark_step_begin()
             out = _torch_flex_attention(q, k, v, **flex_kwargs)
             out = _flex_ckpt_always_clone_out(out)

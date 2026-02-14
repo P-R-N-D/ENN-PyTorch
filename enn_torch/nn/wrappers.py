@@ -2203,6 +2203,7 @@ class Model(nn.Module):
             and compile_cudagraphs
             and getattr(self._device, "type", None) == "cuda"
         )
+        set_runtime_cfg("compile_cudagraphs", bool(self._compile_cudagraphs))
         compile_patch_ctx = contextlib.nullcontext()
         compile_options = (
             {"triton.cudagraphs": False}

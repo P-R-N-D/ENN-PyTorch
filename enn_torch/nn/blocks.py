@@ -13,7 +13,7 @@ import torch.nn.functional as F
 from ..core.compat import StochasticDepth
 from ..runtime.distributed import _from_hsdp_module
 from .activations import GeGLU
-from .graph import coerce_checkpoint, is_checkpoint, is_export_or_trace, is_symbolic
+from .graph import coerce_checkpoint, is_checkpoint, is_export_or_trace, is_symbolic, canonicalize_compile_mode
 from .kernels import DotProductAttention
 from .layers import DilatedAttention, Resampler, Retention, norm_layer
 _LOGGER = logging.getLogger(__name__)
@@ -64,6 +64,17 @@ def _enn_longnet_ckpt_clone_if_needed(t: torch.Tensor) -> torch.Tensor:
     if not bool(getattr(t.device, "type", None) == "cuda"):
         return t
     if not bool(torch.is_grad_enabled() or is_checkpoint()):
+        return t
+    try:
+        from ..core.system import get_runtime_cfg
+
+        cfg = get_runtime_cfg()
+        mode = canonicalize_compile_mode(getattr(cfg, "compile_mode", "disabled"))
+        if mode not in {"max-autotune", "reduce-overhead"}:
+            return t
+        if not bool(getattr(cfg, "compile_cudagraphs", True)):
+            return t
+    except Exception:
         return t
     return t.clone()
 
