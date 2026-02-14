@@ -3198,6 +3198,22 @@ def infer(
                     raise RuntimeError("infer: unexpected model output type")
                 return out.detach()
 
+            def _pred_reuse_active(cur_fn: object) -> bool:
+                if bool(cg_enabled):
+                    return True
+                if (
+                    bool(td_cg_active)
+                    and (td_cg_mod is not None)
+                    and (cur_fn is td_cg_mod)
+                    and (not bool(td_cg_disabled))
+                    and (td_cg_pad_buf is not None)
+                    and (td_cg_mb is not None)
+                    and (not bool(force_eager))
+                    and (not bool(force_single))
+                ):
+                    return True
+                return False
+
             def _td_benchmark(bs_now: int) -> int:
                 mb_cfg = int(getattr(model, "microbatch", 0) or 0)
                 dl_bs = int(getattr(data_loader, "batch_size", 0) or 0)
@@ -3458,7 +3474,6 @@ def infer(
                     1 if force_single else (int(td_cg_mb) if use_td_cg else int(mb_eager))
                 )
                 predict_fn = td_cg_mod if use_td_cg else _td_predict
-                reuse_risk = bool(cg_enabled) or bool(use_td_cg)
                 start = 0
                 while start < bs:
                     end = min(bs, start + mb)
@@ -3534,7 +3549,7 @@ def infer(
                             pad_n = 0
                             Xi_run = Xi
                     try:
-                        if bool(sync_cg_inputs) and bool(reuse_risk) and getattr(Xi_run.device, "type", None) == "cuda":
+                        if bool(sync_cg_inputs) and _pred_reuse_active(predict_fn) and getattr(Xi_run.device, "type", None) == "cuda":
                             sync_accelerator(dev_obj)
                         if cg_enabled:
                             cudagraph_mark_step_begin()
@@ -3620,7 +3635,7 @@ def infer(
                                     preds_fix: torch.Tensor | None = None
                                     for j in range(int(n_i)):
                                         x1_buf.copy_(Xi[j : j + 1])
-                                        if bool(sync_cg_inputs) and bool(reuse_risk) and getattr(x1_buf.device, "type", None) == "cuda":
+                                        if bool(sync_cg_inputs) and _pred_reuse_active(_td_predict) and getattr(x1_buf.device, "type", None) == "cuda":
                                             sync_accelerator(dev_obj)
                                         if cg_enabled:
                                             cudagraph_mark_step_begin()
@@ -3657,7 +3672,7 @@ def infer(
                     )
                     force_cpu_default = bool(use_async_write) and bool(dev_type in ("cuda", "xpu"))
                     force_cpu = env_bool("ENN_PRED_FORCE_CPU_COPY", default=force_cpu_default)
-                    need_cpu_copy = bool(force_cpu) or bool(use_td_cg) or bool(cg_enabled)
+                    need_cpu_copy = bool(force_cpu) or _pred_reuse_active(predict_fn)
                     with contextlib.suppress(Exception):
                         rows_cpu = rows_cpu.clone()
                     if need_cpu_copy:
@@ -3670,7 +3685,7 @@ def infer(
                             preds_cpu = preds_cpu.clone()
                         writer.append(rows_cpu, preds_cpu)
                     else:
-                        if bool(reuse_risk) and getattr(preds.device, "type", None) == "cuda":
+                        if _pred_reuse_active(predict_fn) and getattr(preds.device, "type", None) == "cuda":
                             preds = preds.clone()
                         writer.append(rows_cpu, preds)
                     appended_rows_total += int(
