@@ -3155,6 +3155,11 @@ def infer(
             broadcast_atol = float(env_float("ENN_PRED_BROADCAST_ATOL", 1e-6))
             calibrate_pred_output = bool(env_bool("ENN_PRED_CALIBRATE_OUTPUT", True))
             collapse_fallback_raw = bool(env_bool("ENN_PRED_COLLAPSE_FALLBACK_RAW", True))
+            collapse_abort = bool(env_bool("ENN_PRED_COLLAPSE_ABORT", False))
+
+            class _InferCollapseAbort(RuntimeError):
+                pass
+
             collapse_switched_raw = False
             pred_cg_strict_sync = bool(
                 env_bool(
@@ -3729,10 +3734,7 @@ def infer(
                                                         x1_buf.copy_(Xi[j : j + 1])
                                                         if dev_type == "cuda":
                                                             cudagraph_mark_step_begin()
-                                                        pj2 = _td_predict(
-                                                            x1_buf,
-                                                            calibrate_output=False,
-                                                        )
+                                                        pj2 = _td_predict(x1_buf, calibrate_output=False)
                                                         if dev_type == "cuda":
                                                             cudagraph_mark_step_end()
                                                         pj2_cpu = pj2.detach()
@@ -3746,17 +3748,25 @@ def infer(
                                                                 (int(n_i),) + tuple(pj2_cpu.shape[1:])
                                                             )
                                                         preds_fix2[j : j + 1].copy_(pj2_cpu[:1])
-                                                    if preds_fix2 is not None:
-                                                        preds = preds_fix2
-                                                        with contextlib.suppress(Exception):
-                                                            if int(preds.shape[0]) >= 2:
-                                                                dy2 = (preds[0] - preds[1]).abs().max()
-                                                                _LOGGER.warning(
-                                                                    "[infer] calibrate_output=False sanity: max|Y0-Y1|=%.6g",
-                                                                    float(dy2.item()),
-                                                                )
-                        except Exception:
+                                                    if preds_fix2 is not None and int(preds_fix2.shape[0]) >= 2:
+                                                        dy2 = (preds_fix2[0] - preds_fix2[1]).abs().max()
+                                                        _LOGGER.warning(
+                                                            "[infer] calibrate_output=False sanity (this batch only): max|Y0-Y1|=%.6g",
+                                                            float(dy2.item()),
+                                                        )
+                                                        if float(dy2.item()) <= float(broadcast_atol) and bool(collapse_abort):
+                                                            raise _InferCollapseAbort(
+                                                                "infer: collapse persisted even in calibrate_output=False path; "
+                                                                "this indicates a true model/preprocess collapse. "
+                                                                "Set ENN_PRED_COLLAPSE_ABORT=0 to ignore and write outputs anyway."
+                                                            )
+                        except Exception as exc:
+                            if isinstance(exc, _InferCollapseAbort):
+                                raise
                             pass
+
+                    reuse_risk = bool(_pred_reuse_active(predict_fn))
+
                     rows_cpu = (
                         rows_i
                         if rows_i.device.type == "cpu"
@@ -3764,7 +3774,7 @@ def infer(
                     )
                     force_cpu_default = bool(use_async_write) and bool(dev_type in ("cuda", "xpu"))
                     force_cpu = env_bool("ENN_PRED_FORCE_CPU_COPY", default=force_cpu_default)
-                    need_cpu_copy = bool(force_cpu) or _pred_reuse_active(predict_fn)
+                    need_cpu_copy = bool(force_cpu) or bool(reuse_risk)
                     with contextlib.suppress(Exception):
                         rows_cpu = rows_cpu.clone()
                     if need_cpu_copy:
@@ -3777,7 +3787,7 @@ def infer(
                             preds_cpu = preds_cpu.clone()
                         writer.append(rows_cpu, preds_cpu)
                     else:
-                        if _pred_reuse_active(predict_fn) and getattr(preds.device, "type", None) == "cuda":
+                        if reuse_risk and getattr(preds.device, "type", None) == "cuda":
                             preds = preds.clone()
                         writer.append(rows_cpu, preds)
                     appended_rows_total += int(
