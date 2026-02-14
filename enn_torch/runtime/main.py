@@ -3153,6 +3153,10 @@ def infer(
             broadcast_checked = False
             detect_broadcast = bool(env_bool("ENN_PRED_DETECT_BATCH_BROADCAST", True))
             broadcast_atol = float(env_float("ENN_PRED_BROADCAST_ATOL", 1e-6))
+            sync_cg_inputs = bool(
+                dev_type == "cuda"
+                and env_bool("ENN_PRED_SYNC_CG_INPUTS", default=True)
+            )
 
             _pred_disable_decorator = None
             with contextlib.suppress(Exception):
@@ -3193,6 +3197,22 @@ def infer(
                 if not isinstance(out, torch.Tensor):
                     raise RuntimeError("infer: unexpected model output type")
                 return out.detach()
+
+            def _pred_reuse_active(cur_fn: object) -> bool:
+                if bool(cg_enabled):
+                    return True
+                if (
+                    bool(td_cg_active)
+                    and (td_cg_mod is not None)
+                    and (cur_fn is td_cg_mod)
+                    and (not bool(td_cg_disabled))
+                    and (td_cg_pad_buf is not None)
+                    and (td_cg_mb is not None)
+                    and (not bool(force_eager))
+                    and (not bool(force_single))
+                ):
+                    return True
+                return False
 
             def _td_benchmark(bs_now: int) -> int:
                 mb_cfg = int(getattr(model, "microbatch", 0) or 0)
@@ -3529,21 +3549,14 @@ def infer(
                             pad_n = 0
                             Xi_run = Xi
                     try:
+                        if bool(sync_cg_inputs) and _pred_reuse_active(predict_fn) and getattr(Xi_run.device, "type", None) == "cuda":
+                            sync_accelerator(dev_obj)
                         if cg_enabled:
                             cudagraph_mark_step_begin()
                         out = predict_fn(Xi_run)
                         if isinstance(out, torch.Tensor):
                             if int(n_i) < int(mb) and int(out.shape[0]) == int(mb):
                                 out = out[: int(n_i)]
-                            reuse_risk = bool(cg_enabled) or bool(locals().get("td_cg_active", False))
-                            if reuse_risk and getattr(out.device, "type", None) == "cuda":
-                                try:
-                                    out = out.clone()
-                                except Exception as e:
-                                    if is_oom_error(e):
-                                        out = out.detach().cpu()
-                                    else:
-                                        raise
                     except RuntimeError as e:
                         if is_oom_error(e) and mb > 1:
                             with contextlib.suppress(Exception):
@@ -3622,18 +3635,24 @@ def infer(
                                     preds_fix: torch.Tensor | None = None
                                     for j in range(int(n_i)):
                                         x1_buf.copy_(Xi[j : j + 1])
+                                        if bool(sync_cg_inputs) and _pred_reuse_active(_td_predict) and getattr(x1_buf.device, "type", None) == "cuda":
+                                            sync_accelerator(dev_obj)
                                         if cg_enabled:
                                             cudagraph_mark_step_begin()
                                         pj = _td_predict(x1_buf)
                                         if cg_enabled:
                                             cudagraph_mark_step_end()
-                                        if getattr(pj.device, "type", None) == "cuda":
-                                            sync_accelerator(dev_obj)
+                                        pj_cpu = pj.detach()
+                                        if getattr(pj_cpu.device, "type", None) != "cpu":
+                                            pj_cpu = pj_cpu.to(device="cpu")
+                                        with contextlib.suppress(Exception):
+                                            pj_cpu = pj_cpu.contiguous()
+                                        pj_cpu = pj_cpu.clone()
                                         if preds_fix is None:
-                                            preds_fix = pj.new_empty(
-                                                (int(n_i),) + tuple(pj.shape[1:])
+                                            preds_fix = pj_cpu.new_empty(
+                                                (int(n_i),) + tuple(pj_cpu.shape[1:])
                                             )
-                                        preds_fix[j : j + 1].copy_(pj[:1])
+                                        preds_fix[j : j + 1].copy_(pj_cpu[:1])
                                     preds = preds_fix if preds_fix is not None else preds
                                     with contextlib.suppress(Exception):
                                         if int(preds.shape[0]) >= 2:
@@ -3653,7 +3672,7 @@ def infer(
                     )
                     force_cpu_default = bool(use_async_write) and bool(dev_type in ("cuda", "xpu"))
                     force_cpu = env_bool("ENN_PRED_FORCE_CPU_COPY", default=force_cpu_default)
-                    need_cpu_copy = bool(force_cpu) or bool(use_td_cg) or bool(cg_enabled)
+                    need_cpu_copy = bool(force_cpu) or _pred_reuse_active(predict_fn)
                     with contextlib.suppress(Exception):
                         rows_cpu = rows_cpu.clone()
                     if need_cpu_copy:
@@ -3666,6 +3685,8 @@ def infer(
                             preds_cpu = preds_cpu.clone()
                         writer.append(rows_cpu, preds_cpu)
                     else:
+                        if _pred_reuse_active(predict_fn) and getattr(preds.device, "type", None) == "cuda":
+                            preds = preds.clone()
                         writer.append(rows_cpu, preds)
                     appended_rows_total += int(
                         getattr(preds, "shape", (0,))[0]
