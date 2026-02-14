@@ -3156,6 +3156,10 @@ def infer(
             calibrate_pred_output = bool(env_bool("ENN_PRED_CALIBRATE_OUTPUT", True))
             collapse_fallback_raw = bool(env_bool("ENN_PRED_COLLAPSE_FALLBACK_RAW", True))
             collapse_abort = bool(env_bool("ENN_PRED_COLLAPSE_ABORT", False))
+
+            class _InferCollapseAbort(RuntimeError):
+                pass
+
             collapse_switched_raw = False
             pred_cg_strict_sync = bool(
                 env_bool(
@@ -3751,15 +3755,13 @@ def infer(
                                                             float(dy2.item()),
                                                         )
                                                         if float(dy2.item()) <= float(broadcast_atol) and bool(collapse_abort):
-                                                            raise RuntimeError(
+                                                            raise _InferCollapseAbort(
                                                                 "infer: collapse persisted even in calibrate_output=False path; "
                                                                 "this indicates a true model/preprocess collapse. "
                                                                 "Set ENN_PRED_COLLAPSE_ABORT=0 to ignore and write outputs anyway."
                                                             )
                         except Exception as exc:
-                            if isinstance(exc, RuntimeError) and (
-                                "collapse persisted even in calibrate_output=False path" in str(exc)
-                            ):
+                            if isinstance(exc, _InferCollapseAbort):
                                 raise
                             pass
 
