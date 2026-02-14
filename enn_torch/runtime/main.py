@@ -3645,7 +3645,7 @@ def infer(
                                     with contextlib.suppress(Exception):
                                         setattr(model, "microbatch", 1)
                                     x1_buf = Xi.new_empty((1,) + tuple(Xi.shape[1:]))
-                                    preds_fix: torch.Tensor | None = None
+                                    preds_fix_cpu: torch.Tensor | None = None
                                     for j in range(int(n_i)):
                                         x1_buf.copy_(Xi[j : j + 1])
                                         if (
@@ -3663,12 +3663,15 @@ def infer(
                                             and getattr(getattr(pj, "device", None), "type", None) == "cuda"
                                         ):
                                             sync_accelerator(dev_obj)
-                                        if preds_fix is None:
-                                            preds_fix = pj.new_empty(
-                                                (int(n_i),) + tuple(pj.shape[1:])
+                                        pj_cpu = pj.detach()
+                                        if getattr(pj_cpu.device, "type", None) != "cpu":
+                                            pj_cpu = pj_cpu.to(device="cpu")
+                                        if preds_fix_cpu is None:
+                                            preds_fix_cpu = pj_cpu.new_empty(
+                                                (int(n_i),) + tuple(pj_cpu.shape[1:])
                                             )
-                                        preds_fix[j : j + 1].copy_(pj[:1])
-                                    preds = preds_fix if preds_fix is not None else preds
+                                        preds_fix_cpu[j : j + 1].copy_(pj_cpu[:1])
+                                    preds = preds_fix_cpu if preds_fix_cpu is not None else preds
                                     with contextlib.suppress(Exception):
                                         if int(preds.shape[0]) >= 2:
                                             y0b = preds[0].detach()
