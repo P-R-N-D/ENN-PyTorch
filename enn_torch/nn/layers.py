@@ -35,6 +35,8 @@ from .kernels import (
     FlexAttention,
     MultiHeadAttention,
     MultiScaleRetention,
+    _FLEX_KWARGS,
+    _ensure_flex_kwargs_initialized,
 )
 try:
     from torch.nn.attention.flex_attention import create_block_mask
@@ -226,15 +228,21 @@ class _FlexDilatedMaskMod:
                 if torch.is_tensor(L_k)
                 else kv_idx.new_tensor(int(L_k))
             )
-            cond = Lk > Lq
-            keep = keep & torch.where(
-                cond,
-                (kv_idx < Lq),
-                torch.ones_like(keep, dtype=torch.bool),
+            keep = (
+                keep
+                & (q_idx >= 0)
+                & (q_idx < Lq)
+                & (kv_idx >= 0)
+                & (kv_idx < Lk)
             )
         else:
-            if int(L_k) > int(L_q):
-                keep = keep & (kv_idx < int(L_q))
+            keep = (
+                keep
+                & (q_idx >= 0)
+                & (q_idx < int(L_q))
+                & (kv_idx >= 0)
+                & (kv_idx < int(L_k))
+            )
         if self.causal:
             keep = keep & (kv_idx <= q_idx)
         if self.win is not None:
@@ -242,6 +250,76 @@ class _FlexDilatedMaskMod:
         if self.dilation > 1:
             keep = keep & ((dq % int(self.dilation)) == 0)
         return keep
+
+
+class _FlexDilatedScoreMod:
+    __slots__ = ("L_q", "L_k", "dilation", "win", "causal")
+
+    def __init__(
+        self,
+        *,
+        L_q: int,
+        L_k: int,
+        dilation: int,
+        win: Optional[int],
+        causal: bool,
+    ) -> None:
+        self.L_q = L_q if torch.is_tensor(L_q) else int(L_q)
+        self.L_k = L_k if torch.is_tensor(L_k) else int(L_k)
+        self.dilation = max(1, int(dilation))
+        self.win = None if win is None else int(win)
+        self.causal = bool(causal)
+
+    def __call__(
+        self,
+        score: torch.Tensor,
+        b: torch.Tensor,
+        h: torch.Tensor,
+        q_idx: torch.Tensor,
+        kv_idx: torch.Tensor,
+    ) -> torch.Tensor:
+        _ = (b, h)
+        dq = q_idx - kv_idx
+        keep = kv_idx == kv_idx
+
+        L_q = self.L_q
+        L_k = self.L_k
+        if torch.is_tensor(L_q) or torch.is_tensor(L_k):
+            Lq = (
+                L_q.to(device=kv_idx.device)
+                if torch.is_tensor(L_q)
+                else kv_idx.new_tensor(int(L_q))
+            )
+            Lk = (
+                L_k.to(device=kv_idx.device)
+                if torch.is_tensor(L_k)
+                else kv_idx.new_tensor(int(L_k))
+            )
+            keep = (
+                keep
+                & (q_idx >= 0)
+                & (q_idx < Lq)
+                & (kv_idx >= 0)
+                & (kv_idx < Lk)
+            )
+        else:
+            keep = (
+                keep
+                & (q_idx >= 0)
+                & (q_idx < int(L_q))
+                & (kv_idx >= 0)
+                & (kv_idx < int(L_k))
+            )
+
+        if self.causal:
+            keep = keep & (kv_idx <= q_idx)
+        if self.win is not None:
+            keep = keep & (dq.abs() <= int(self.win))
+        if self.dilation > 1:
+            keep = keep & ((dq % int(self.dilation)) == 0)
+
+        neg = score.new_full((), torch.finfo(score.dtype).min)
+        return torch.where(keep, score, neg)
 
 
 class Retention(nn.Module):
@@ -433,6 +511,8 @@ class DilatedAttention(nn.Module):
         self._flex_cache_B: int = 0
         self._flex_cache_device: Optional[torch.device] = None
         self._flex_block_mask = None
+        self._flex_score_cache_len: int = 0
+        self._flex_score_mod: Optional[_FlexDilatedScoreMod] = None
 
     def _get_torch_mha(self) -> Optional[nn.MultiheadAttention]:
         impl = getattr(self.mha, "impl", None)
@@ -501,10 +581,32 @@ class DilatedAttention(nn.Module):
                 KV_LEN=L,
                 device=device,
             )
+            if env_bool("ENN_FLEX_VALIDATE_BLOCK_MASK", False):
+                with contextlib.suppress(Exception):
+                    kv = getattr(self._flex_block_mask, "kv_indices", None)
+                    if torch.is_tensor(kv):
+                        mn = int(kv.min().item())
+                        mx = int(kv.max().item())
+                        if mn < 0 or mx >= int(L):
+                            raise RuntimeError(
+                                f"Flex BlockMask kv_indices out of range: min={mn}, max={mx}, L={int(L)}"
+                            )
             self._flex_cache_len = L
             self._flex_cache_B = B
             self._flex_cache_device = device
         return self._flex_block_mask
+
+    def _get_flex_score_mod(self, L: int) -> _FlexDilatedScoreMod:
+        if self._flex_score_mod is None or self._flex_score_cache_len != L:
+            self._flex_score_mod = _FlexDilatedScoreMod(
+                L_q=L,
+                L_k=L,
+                dilation=self.dilation,
+                win=self.window_size,
+                causal=self.causal,
+            )
+            self._flex_score_cache_len = L
+        return self._flex_score_mod
 
     def forward(
         self,
@@ -547,23 +649,32 @@ class DilatedAttention(nn.Module):
         attn_mask_keep: Optional[torch.Tensor] = None
         attn_weights = None
         if use_flex:
-            block_mask = self._get_flex_block_mask(L, B, device)
-            if block_mask is None:
-                use_flex = False
-        if use_flex:
             q, k, v, out_proj = self._project_qkv_for_flex(x_norm)
-            a = _FLEX_KERNEL(
-                q,
-                k,
-                v,
-                block_mask=block_mask,
-                scale=None,
-                dropout_p=self.dropout_p if self.training else 0.0,
-                training=bool(self.training),
-            )
-            a = a.transpose(1, 2).contiguous().view(B, L, self.embed_dim)
-            attn_out = out_proj(a)
-        else:
+            _ensure_flex_kwargs_initialized()
+            flex_supports_score_mod = "score_mod" in _FLEX_KWARGS
+            flex_supports_block_mask = "block_mask" in _FLEX_KWARGS
+            use_score_mod = bool(q.is_cuda and flex_supports_score_mod)
+            score_mod = self._get_flex_score_mod(int(L)) if use_score_mod else None
+            block_mask = None
+            if (not use_score_mod) and flex_supports_block_mask:
+                block_mask = self._get_flex_block_mask(int(L), int(B), device)
+            needs_mask = bool(self.causal) or (self.window_size is not None) or (int(self.dilation) != 1)
+            if needs_mask and (not use_score_mod) and (block_mask is None):
+                use_flex = False
+            if use_flex:
+                a = _FLEX_KERNEL(
+                    q,
+                    k,
+                    v,
+                    score_mod=score_mod,
+                    block_mask=block_mask,
+                    scale=None,
+                    dropout_p=self.dropout_p if self.training else 0.0,
+                    training=bool(self.training),
+                )
+                a = a.transpose(1, 2).contiguous().view(B, L, self.embed_dim)
+                attn_out = out_proj(a)
+        if not use_flex:
             use_is_causal = False
             attn_mask = None
             if self.dilation == 1 and self.window_size is None:
