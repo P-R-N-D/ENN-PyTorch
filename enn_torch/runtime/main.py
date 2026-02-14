@@ -3153,6 +3153,10 @@ def infer(
             broadcast_checked = False
             detect_broadcast = bool(env_bool("ENN_PRED_DETECT_BATCH_BROADCAST", True))
             broadcast_atol = float(env_float("ENN_PRED_BROADCAST_ATOL", 1e-6))
+            sync_cg_inputs = bool(
+                dev_type == "cuda"
+                and env_bool("ENN_PRED_SYNC_CG_INPUTS", default=True)
+            )
 
             _pred_disable_decorator = None
             with contextlib.suppress(Exception):
@@ -3454,6 +3458,7 @@ def infer(
                     1 if force_single else (int(td_cg_mb) if use_td_cg else int(mb_eager))
                 )
                 predict_fn = td_cg_mod if use_td_cg else _td_predict
+                reuse_risk = bool(cg_enabled) or bool(use_td_cg)
                 start = 0
                 while start < bs:
                     end = min(bs, start + mb)
@@ -3529,21 +3534,14 @@ def infer(
                             pad_n = 0
                             Xi_run = Xi
                     try:
+                        if bool(sync_cg_inputs) and bool(reuse_risk) and getattr(Xi_run.device, "type", None) == "cuda":
+                            sync_accelerator(dev_obj)
                         if cg_enabled:
                             cudagraph_mark_step_begin()
                         out = predict_fn(Xi_run)
                         if isinstance(out, torch.Tensor):
                             if int(n_i) < int(mb) and int(out.shape[0]) == int(mb):
                                 out = out[: int(n_i)]
-                            reuse_risk = bool(cg_enabled) or bool(locals().get("td_cg_active", False))
-                            if reuse_risk and getattr(out.device, "type", None) == "cuda":
-                                try:
-                                    out = out.clone()
-                                except Exception as e:
-                                    if is_oom_error(e):
-                                        out = out.detach().cpu()
-                                    else:
-                                        raise
                     except RuntimeError as e:
                         if is_oom_error(e) and mb > 1:
                             with contextlib.suppress(Exception):
@@ -3622,18 +3620,24 @@ def infer(
                                     preds_fix: torch.Tensor | None = None
                                     for j in range(int(n_i)):
                                         x1_buf.copy_(Xi[j : j + 1])
+                                        if bool(sync_cg_inputs) and bool(reuse_risk) and getattr(x1_buf.device, "type", None) == "cuda":
+                                            sync_accelerator(dev_obj)
                                         if cg_enabled:
                                             cudagraph_mark_step_begin()
                                         pj = _td_predict(x1_buf)
                                         if cg_enabled:
                                             cudagraph_mark_step_end()
-                                        if getattr(pj.device, "type", None) == "cuda":
-                                            sync_accelerator(dev_obj)
+                                        pj_cpu = pj.detach()
+                                        if getattr(pj_cpu.device, "type", None) != "cpu":
+                                            pj_cpu = pj_cpu.to(device="cpu")
+                                        with contextlib.suppress(Exception):
+                                            pj_cpu = pj_cpu.contiguous()
+                                        pj_cpu = pj_cpu.clone()
                                         if preds_fix is None:
-                                            preds_fix = pj.new_empty(
-                                                (int(n_i),) + tuple(pj.shape[1:])
+                                            preds_fix = pj_cpu.new_empty(
+                                                (int(n_i),) + tuple(pj_cpu.shape[1:])
                                             )
-                                        preds_fix[j : j + 1].copy_(pj[:1])
+                                        preds_fix[j : j + 1].copy_(pj_cpu[:1])
                                     preds = preds_fix if preds_fix is not None else preds
                                     with contextlib.suppress(Exception):
                                         if int(preds.shape[0]) >= 2:
@@ -3666,6 +3670,8 @@ def infer(
                             preds_cpu = preds_cpu.clone()
                         writer.append(rows_cpu, preds_cpu)
                     else:
+                        if bool(reuse_risk) and getattr(preds.device, "type", None) == "cuda":
+                            preds = preds.clone()
                         writer.append(rows_cpu, preds)
                     appended_rows_total += int(
                         getattr(preds, "shape", (0,))[0]
