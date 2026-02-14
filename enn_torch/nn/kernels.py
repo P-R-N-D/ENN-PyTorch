@@ -2220,7 +2220,13 @@ class FlexAttention(nn.Module):
                     is_causal=bool(is_causal),
                     score_mod=score_mod,
                 )
-
+            if not q.is_contiguous():
+                q = q.contiguous()
+            if not k.is_contiguous():
+                k = k.contiguous()
+            if not v.is_contiguous():
+                v = v.contiguous()
+            
             _ensure_flex_kwargs_initialized()
             _install_flex_uncompiled_warning_suppression()
             _force_enable_torch_flex_compile()
