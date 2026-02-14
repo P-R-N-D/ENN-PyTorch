@@ -3153,9 +3153,11 @@ def infer(
             broadcast_checked = False
             detect_broadcast = bool(env_bool("ENN_PRED_DETECT_BATCH_BROADCAST", True))
             broadcast_atol = float(env_float("ENN_PRED_BROADCAST_ATOL", 1e-6))
-            sync_cg_inputs = bool(
-                dev_type == "cuda"
-                and env_bool("ENN_PRED_SYNC_CG_INPUTS", default=True)
+            pred_cg_strict_sync = bool(
+                env_bool(
+                    "ENN_PRED_CUDAGRAPH_STRICT_SYNC",
+                    default=bool(dev_type == "cuda" and (cg_enabled or td_cg_candidate)),
+                )
             )
 
             _pred_disable_decorator = None
@@ -3549,11 +3551,22 @@ def infer(
                             pad_n = 0
                             Xi_run = Xi
                     try:
-                        if bool(sync_cg_inputs) and _pred_reuse_active(predict_fn) and getattr(Xi_run.device, "type", None) == "cuda":
+                        reuse_risk = bool(cg_enabled) or bool(use_td_cg)
+                        if (
+                            pred_cg_strict_sync
+                            and reuse_risk
+                            and getattr(getattr(Xi_run, "device", None), "type", None) == "cuda"
+                        ):
                             sync_accelerator(dev_obj)
                         if cg_enabled:
                             cudagraph_mark_step_begin()
                         out = predict_fn(Xi_run)
+                        if (
+                            pred_cg_strict_sync
+                            and reuse_risk
+                            and getattr(getattr(out, "device", None), "type", None) == "cuda"
+                        ):
+                            sync_accelerator(dev_obj)
                         if isinstance(out, torch.Tensor):
                             if int(n_i) < int(mb) and int(out.shape[0]) == int(mb):
                                 out = out[: int(n_i)]
@@ -3635,24 +3648,26 @@ def infer(
                                     preds_fix: torch.Tensor | None = None
                                     for j in range(int(n_i)):
                                         x1_buf.copy_(Xi[j : j + 1])
-                                        if bool(sync_cg_inputs) and _pred_reuse_active(_td_predict) and getattr(x1_buf.device, "type", None) == "cuda":
+                                        if (
+                                            pred_cg_strict_sync
+                                            and getattr(x1_buf.device, "type", None) == "cuda"
+                                        ):
                                             sync_accelerator(dev_obj)
                                         if cg_enabled:
                                             cudagraph_mark_step_begin()
                                         pj = _td_predict(x1_buf)
                                         if cg_enabled:
                                             cudagraph_mark_step_end()
-                                        pj_cpu = pj.detach()
-                                        if getattr(pj_cpu.device, "type", None) != "cpu":
-                                            pj_cpu = pj_cpu.to(device="cpu")
-                                        with contextlib.suppress(Exception):
-                                            pj_cpu = pj_cpu.contiguous()
-                                        pj_cpu = pj_cpu.clone()
+                                        if (
+                                            pred_cg_strict_sync
+                                            and getattr(getattr(pj, "device", None), "type", None) == "cuda"
+                                        ):
+                                            sync_accelerator(dev_obj)
                                         if preds_fix is None:
-                                            preds_fix = pj_cpu.new_empty(
-                                                (int(n_i),) + tuple(pj_cpu.shape[1:])
+                                            preds_fix = pj.new_empty(
+                                                (int(n_i),) + tuple(pj.shape[1:])
                                             )
-                                        preds_fix[j : j + 1].copy_(pj_cpu[:1])
+                                        preds_fix[j : j + 1].copy_(pj[:1])
                                     preds = preds_fix if preds_fix is not None else preds
                                     with contextlib.suppress(Exception):
                                         if int(preds.shape[0]) >= 2:
