@@ -3581,11 +3581,16 @@ def infer(
                                     predict_fn = _td_predict
                                     with contextlib.suppress(Exception):
                                         setattr(model, "microbatch", 1)
-                                    preds_list: list[torch.Tensor] = []
+                                    preds_fix: torch.Tensor | None = None
                                     for j in range(int(n_i)):
                                         pj = _td_predict(Xi[j : j + 1])
-                                        preds_list.append(pj)
-                                    preds = torch.cat(preds_list, dim=0)
+                                        if preds_fix is None:
+                                            preds_fix = pj.new_empty(
+                                                (int(n_i),) + tuple(pj.shape[1:])
+                                            )
+                                        preds_fix[j : j + 1].copy_(pj[:1])
+                                    if preds_fix is not None:
+                                        preds = preds_fix
                                     with contextlib.suppress(Exception):
                                         if int(preds.shape[0]) >= 2:
                                             y0b = preds[0].detach()
