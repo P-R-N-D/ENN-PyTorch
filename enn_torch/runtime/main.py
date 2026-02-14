@@ -3154,27 +3154,28 @@ def infer(
             detect_broadcast = bool(env_bool("ENN_PRED_DETECT_BATCH_BROADCAST", True))
             broadcast_atol = float(env_float("ENN_PRED_BROADCAST_ATOL", 1e-6))
 
-            _pred_disable_compile = None
+            _pred_disable_decorator = None
             with contextlib.suppress(Exception):
                 comp = getattr(torch, "compiler", None)
                 cand = getattr(comp, "disable", None) if comp is not None else None
-                if callable(cand):
-                    _pred_disable_compile = cand
-            if _pred_disable_compile is None:
+                if callable(cand) and getattr(cand, "__name__", "") == "disable":
+                    _pred_disable_decorator = cand
+            if _pred_disable_decorator is None:
                 with contextlib.suppress(Exception):
                     torch_dynamo = importlib.import_module("torch._dynamo")
                     cand = getattr(torch_dynamo, "disable", None)
-                    if callable(cand):
-                        _pred_disable_compile = cand
+                    if callable(cand) and getattr(cand, "__name__", "") == "disable":
+                        _pred_disable_decorator = cand
 
-            def _pred_disable_compile_ctx():
-                if (not force_eager) or (_pred_disable_compile is None):
-                    return contextlib.nullcontext()
+            def _run_model_predict(x: torch.Tensor):
+                return run_model(x, calibrate_output=True, return_loss=False)
+
+            _run_model_predict_disabled = None
+            if callable(_pred_disable_decorator):
                 with contextlib.suppress(Exception):
-                    cand_ctx = _pred_disable_compile()
-                    if hasattr(cand_ctx, "__enter__") and hasattr(cand_ctx, "__exit__"):
-                        return cand_ctx
-                return contextlib.nullcontext()
+                    wrapped = _pred_disable_decorator(_run_model_predict)
+                    if callable(wrapped):
+                        _run_model_predict_disabled = wrapped
 
             def _td_predict(x: torch.Tensor) -> torch.Tensor:
                 ctx = (
@@ -3182,9 +3183,11 @@ def infer(
                     if (force_eager and callable(eager_ctx_factory))
                     else contextlib.nullcontext()
                 )
-                dyn_ctx = _pred_disable_compile_ctx()
-                with ctx, dyn_ctx:
-                    out = run_model(x, calibrate_output=True, return_loss=False)
+                with ctx:
+                    if force_eager and callable(_run_model_predict_disabled):
+                        out = _run_model_predict_disabled(x)
+                    else:
+                        out = _run_model_predict(x)
                 if isinstance(out, tuple):
                     out = out[0]
                 if not isinstance(out, torch.Tensor):
