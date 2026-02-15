@@ -22,7 +22,7 @@ from collections.abc import Mapping, MutableMapping
 from dataclasses import replace
 from functools import partial
 from pathlib import Path
-from typing import Any, TypeAlias
+from typing import Any, Optional, TypeAlias
 
 import torch
 import torch.distributed
@@ -3034,10 +3034,18 @@ def infer(
         run_model.module if hasattr(run_model, "module") else run_model
     )
     distributed_sync(module_eval, device=dev_obj)
+    run_model_uncompiled = to_submodule(run_model) or run_model
+    if run_model_uncompiled is not run_model:
+        with contextlib.suppress(Exception):
+            run_model_uncompiled.eval()
 
     eager_ctx_factory = getattr(module_eval, "eager_for_export", None)
     force_eager = bool(env_bool("ENN_PRED_FORCE_EAGER", False))
     eager_on_broadcast = bool(env_bool("ENN_PRED_EAGER_ON_BROADCAST", True))
+    force_uncompiled = bool(env_bool("ENN_PRED_FORCE_UNCOMPILED", False))
+    collapse_force_uncompiled = bool(
+        env_bool("ENN_PRED_COLLAPSE_FORCE_UNCOMPILED", default=True)
+    )
 
     cg_enabled = bool(
         dev_type == "cuda"
@@ -3153,6 +3161,7 @@ def infer(
             broadcast_checked = False
             detect_broadcast = bool(env_bool("ENN_PRED_DETECT_BATCH_BROADCAST", True))
             broadcast_atol = float(env_float("ENN_PRED_BROADCAST_ATOL", 1e-6))
+            collapse_switched_uncompiled = False
             calibrate_pred_output = bool(env_bool("ENN_PRED_CALIBRATE_OUTPUT", True))
             collapse_fallback_raw = bool(env_bool("ENN_PRED_COLLAPSE_FALLBACK_RAW", True))
             collapse_abort = bool(env_bool("ENN_PRED_COLLAPSE_ABORT", False))
@@ -3181,8 +3190,14 @@ def infer(
                     if callable(cand) and getattr(cand, "__name__", "") == "disable":
                         _pred_disable_decorator = cand
 
+            def _pred_model():
+                if bool(force_uncompiled) and (run_model_uncompiled is not None):
+                    return run_model_uncompiled
+                return run_model
+
             def _run_model_predict(x: torch.Tensor):
-                return run_model(
+                m = _pred_model()
+                return m(
                     x,
                     calibrate_output=bool(calibrate_pred_output),
                     return_loss=False,
@@ -3191,7 +3206,8 @@ def infer(
             def _run_model_predict_with_calibration(
                 x: torch.Tensor, *, calibrate_output: bool
             ):
-                return run_model(
+                m = _pred_model()
+                return m(
                     x,
                     calibrate_output=bool(calibrate_output),
                     return_loss=False,
@@ -3213,7 +3229,10 @@ def infer(
                     else contextlib.nullcontext()
                 )
                 with ctx:
-                    if force_eager and callable(_run_model_predict_disabled) and calibrate_output is None:
+                    if (
+                        force_eager and callable(_run_model_predict_disabled)
+                        and calibrate_output is None
+                    ):
                         out = _run_model_predict_disabled(x)
                     elif calibrate_output is not None:
                         out = _run_model_predict_with_calibration(
@@ -3720,6 +3739,53 @@ def infer(
                                                 _LOGGER.warning(
                                                     "[infer] outputs remain batch-broadcasted even after per-sample fallback; this indicates a model/preprocess collapse (not just cudagraph batching)."
                                                 )
+                                                if (
+                                                    (not collapse_switched_uncompiled)
+                                                    and bool(collapse_force_uncompiled)
+                                                    and (not bool(force_uncompiled))
+                                                    and (run_model_uncompiled is not run_model)
+                                                ):
+                                                    collapse_switched_uncompiled = True
+                                                    _LOGGER.warning(
+                                                        "[infer] collapse persisted; retrying this batch per-sample on uncompiled model (ENN_PRED_COLLAPSE_FORCE_UNCOMPILED=1)."
+                                                    )
+                                                    prev_force_uncompiled = bool(force_uncompiled)
+                                                    force_uncompiled = True
+
+                                                    preds_fix_uc: Optional[torch.Tensor] = None
+                                                    for j in range(int(n_i)):
+                                                        x1_buf.copy_(Xi[j : j + 1])
+                                                        if dev_type == "cuda":
+                                                            cudagraph_mark_step_begin()
+                                                        pj_uc = _td_predict(x1_buf)
+                                                        if dev_type == "cuda":
+                                                            cudagraph_mark_step_end()
+                                                        if getattr(pj_uc.device, "type", None) == "cuda":
+                                                            sync_accelerator(dev_obj)
+                                                        pj_uc_cpu = pj_uc.detach()
+                                                        if getattr(pj_uc_cpu.device, "type", None) != "cpu":
+                                                            pj_uc_cpu = pj_uc_cpu.to(device="cpu")
+                                                        with contextlib.suppress(Exception):
+                                                            pj_uc_cpu = pj_uc_cpu.contiguous()
+                                                        pj_uc_cpu = pj_uc_cpu.clone()
+                                                        if preds_fix_uc is None:
+                                                            preds_fix_uc = pj_uc_cpu.new_empty(
+                                                                (int(n_i),) + tuple(pj_uc_cpu.shape[1:])
+                                                            )
+                                                        preds_fix_uc[j : j + 1].copy_(pj_uc_cpu[:1])
+
+                                                    if preds_fix_uc is not None:
+                                                        preds = preds_fix_uc
+                                                        with contextlib.suppress(Exception):
+                                                            if int(preds.shape[0]) >= 2:
+                                                                dy_uc = (preds[0] - preds[1]).abs().max()
+                                                                if float(dy_uc.item()) > float(broadcast_atol):
+                                                                    _LOGGER.warning(
+                                                                        "[infer] uncompiled per-sample resolved collapse for this batch; keeping force_eager=1 and force_uncompiled=1."
+                                                                    )
+                                                                    force_eager = True
+                                                                else:
+                                                                    force_uncompiled = bool(prev_force_uncompiled)
                                                 if (
                                                     (not collapse_switched_raw)
                                                     and bool(collapse_fallback_raw)
