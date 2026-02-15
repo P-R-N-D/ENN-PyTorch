@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import contextlib
+import json
 import datetime
 import gc
 import glob
@@ -3187,6 +3188,147 @@ def infer(
             broadcast_checked = False
             detect_broadcast = bool(env_bool("ENN_PRED_DETECT_BATCH_BROADCAST", True))
             broadcast_atol = float(env_float("ENN_PRED_BROADCAST_ATOL", 1e-6))
+            collapse_diag = bool(env_bool("ENN_PRED_COLLAPSE_DIAG", True))
+            collapse_diag_save = bool(env_bool("ENN_PRED_COLLAPSE_DIAG_SAVE", True))
+            collapse_diag_max_elems = int(env_int("ENN_PRED_COLLAPSE_DIAG_MAX_ELEMS", 64) or 64)
+            collapse_diag_once = bool(env_bool("ENN_PRED_COLLAPSE_DIAG_ONCE", True))
+            _collapse_diag_done = False
+
+            def _brief_stats(t: torch.Tensor) -> dict[str, object]:
+                try:
+                    d: dict[str, object] = {}
+                    if not isinstance(t, torch.Tensor):
+                        return {"type": str(type(t))}
+                    d["shape"] = [int(x) for x in t.shape]
+                    d["dtype"] = str(t.dtype)
+                    d["device"] = str(t.device)
+                    if t.numel() == 0:
+                        d["numel"] = 0
+                        return d
+                    d["numel"] = int(t.numel())
+                    if t.is_floating_point():
+                        with contextlib.suppress(Exception):
+                            d["finite"] = bool(torch.isfinite(t).all().item())
+                        tt = t.detach()
+                        with contextlib.suppress(Exception):
+                            d["abs_max"] = float(tt.abs().max().item())
+                        with contextlib.suppress(Exception):
+                            v = tt
+                            if v.dim() >= 2:
+                                s2 = v.to(dtype=torch.float32).std(dim=-1, unbiased=False).mean()
+                            else:
+                                s2 = v.to(dtype=torch.float32).std(unbiased=False)
+                            d["std_mean"] = float(s2.item())
+                        with contextlib.suppress(Exception):
+                            d["min"] = float(tt.min().item())
+                            d["max"] = float(tt.max().item())
+                    else:
+                        with contextlib.suppress(Exception):
+                            d["min"] = int(t.min().item())
+                            d["max"] = int(t.max().item())
+                    with contextlib.suppress(Exception):
+                        flat = t.detach().reshape(-1)
+                        k = int(min(int(collapse_diag_max_elems), int(flat.numel())))
+                        if k > 0:
+                            sample = flat[:k]
+                            if sample.is_floating_point():
+                                d["sample"] = [float(x) for x in sample.to(dtype=torch.float32).cpu().tolist()]
+                            else:
+                                d["sample"] = [int(x) for x in sample.cpu().tolist()]
+                    return d
+                except Exception as e:
+                    return {"error": f"{type(e).__name__}: {e}"}
+
+            def _max_abs_diff(a: torch.Tensor, b: torch.Tensor) -> float:
+                try:
+                    if not (isinstance(a, torch.Tensor) and isinstance(b, torch.Tensor)):
+                        return float("nan")
+                    if a.numel() == 0 or b.numel() == 0:
+                        return 0.0
+                    if a.shape != b.shape:
+                        if a.dim() >= 1 and b.dim() >= 1 and a.shape[1:] == b.shape[1:]:
+                            n = min(int(a.shape[0]), int(b.shape[0]))
+                            if n <= 0:
+                                return float("nan")
+                            a = a[:n]
+                            b = b[:n]
+                        else:
+                            return float("nan")
+                    d = (a.detach() - b.detach()).abs()
+                    return float(d.max().item())
+                except Exception:
+                    return float("nan")
+
+            def _try_normalize_x(x_in: torch.Tensor) -> torch.Tensor | None:
+                try:
+                    sc = getattr(module_eval, "scaler", None)
+                    if sc is None:
+                        return None
+                    fn = getattr(sc, "normalize_x", None)
+                    if not callable(fn):
+                        return None
+                    return fn(x_in)
+                except Exception:
+                    return None
+
+            def _diag_collapse_once(*, Xi2: torch.Tensor, preds2: torch.Tensor, x_diff: float, y_diff: float, where: str) -> None:
+                nonlocal _collapse_diag_done
+                if not collapse_diag:
+                    return
+                if collapse_diag_once and _collapse_diag_done:
+                    return
+                _collapse_diag_done = True
+                diag: dict[str, object] = {}
+                try:
+                    diag["where"] = str(where)
+                    diag["rank"] = int(rank)
+                    diag["seen_batches"] = int(seen_batches)
+                    diag["x_diff"] = float(x_diff)
+                    diag["y_diff_calibrated"] = float(y_diff)
+                    diag["X"] = _brief_stats(Xi2)
+                    diag["Y_cal"] = _brief_stats(preds2)
+                    z2 = _try_normalize_x(Xi2)
+                    if z2 is not None and isinstance(z2, torch.Tensor):
+                        diag["Z_norm"] = _brief_stats(z2)
+                        if int(z2.shape[0]) >= 2:
+                            diag["z_diff"] = _max_abs_diff(z2[0], z2[1])
+                        else:
+                            diag["z_diff"] = 0.0
+                    try:
+                        raw2 = _td_predict(Xi2, calibrate_output=False)
+                        if isinstance(raw2, torch.Tensor):
+                            diag["Y_raw"] = _brief_stats(raw2)
+                            if int(raw2.shape[0]) >= 2:
+                                diag["y_diff_raw"] = _max_abs_diff(raw2[0], raw2[1])
+                    except Exception as e:
+                        diag["Y_raw_error"] = f"{type(e).__name__}: {e}"
+                    try:
+                        if bool(force_uncompiled) and (run_model_uncompiled is not None) and (run_model_uncompiled is not run_model):
+                            out_uc = run_model_uncompiled(Xi2, calibrate_output=True, return_loss=False)
+                            if isinstance(out_uc, tuple):
+                                out_uc = out_uc[0]
+                            if isinstance(out_uc, torch.Tensor):
+                                diag["Y_uncompiled"] = _brief_stats(out_uc)
+                                if int(out_uc.shape[0]) >= 2:
+                                    diag["y_diff_uncompiled"] = _max_abs_diff(out_uc[0], out_uc[1])
+                    except Exception as e:
+                        diag["Y_uncompiled_error"] = f"{type(e).__name__}: {e}"
+                finally:
+                    with contextlib.suppress(Exception):
+                        _LOGGER.warning(
+                            "[infer][collapse-diag] where=%s x_diff=%.6g y_diff_cal=%.6g diag_keys=%s",
+                            str(where),
+                            float(x_diff),
+                            float(y_diff),
+                            ",".join(sorted(list(diag.keys()))),
+                        )
+                    if collapse_diag_save:
+                        with contextlib.suppress(Exception):
+                            os.makedirs(str(chunk_dir), exist_ok=True)
+                            fp = os.path.join(str(chunk_dir), f"collapse_diag.rank{int(rank)}.batch{int(seen_batches):06d}.json")
+                            with open(fp, "w", encoding="utf-8") as f:
+                                json.dump(diag, f, ensure_ascii=False, indent=2)
+
             collapse_switched_uncompiled = False
             calibrate_pred_output = bool(env_bool("ENN_PRED_CALIBRATE_OUTPUT", True))
             collapse_fallback_raw = bool(env_bool("ENN_PRED_COLLAPSE_FALLBACK_RAW", True))
@@ -3703,6 +3845,14 @@ def infer(
                                 y1 = preds[1].detach()
                                 y_diff = (y0 - y1).abs().max()
                                 if float(y_diff.item()) <= float(broadcast_atol):
+                                    with contextlib.suppress(Exception):
+                                        _diag_collapse_once(
+                                            Xi2=Xi[:2].detach(),
+                                            preds2=preds[:2].detach(),
+                                            x_diff=float(x_diff.item()),
+                                            y_diff=float(y_diff.item()),
+                                            where="broadcast_trigger",
+                                        )
                                     _LOGGER.warning(
                                         "[infer] detected batch-broadcasted predictions (inputs differ but outputs match within atol=%.3e). "
                                         "Falling back to per-sample inference (microbatch=1) for correctness.",
@@ -3768,6 +3918,14 @@ def infer(
                                             y1b = preds[1].detach()
                                             ydiff2 = (y0b - y1b).abs().max()
                                             if float(ydiff2.item()) <= float(broadcast_atol):
+                                                with contextlib.suppress(Exception):
+                                                    _diag_collapse_once(
+                                                        Xi2=Xi[:2].detach(),
+                                                        preds2=preds[:2].detach(),
+                                                        x_diff=float(x_diff.item()) if "x_diff" in locals() else float("nan"),
+                                                        y_diff=float(ydiff2.item()),
+                                                        where="after_per_sample_fix",
+                                                    )
                                                 _LOGGER.warning(
                                                     "[infer] outputs remain batch-broadcasted even after per-sample fallback; this indicates a model/preprocess collapse (not just cudagraph batching)."
                                                 )
