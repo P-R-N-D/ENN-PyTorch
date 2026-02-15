@@ -1760,6 +1760,7 @@ class Scaler(nn.Module):
     ) -> torch.Tensor:
         if t.numel() == 0:
             return t
+        input_dtype = t.dtype
         feature_dim = int(t.shape[-1])
         master_dtype = self._resolve_master_dtype_for_io(t)
         if master_dtype is torch.int64:
@@ -1784,6 +1785,8 @@ class Scaler(nn.Module):
         denom = (std_b + float(self.eps)).clamp_min(float(self.eps))
         out2 = (t2 - mean_b) / denom
         out = out2.reshape(orig_shape) if t.dim() != 1 else out2.reshape(-1)
+        if t.is_floating_point() and out.dtype != input_dtype:
+            out = out.to(dtype=input_dtype)
         return out
 
     def normalize_x(self: Self, x: torch.Tensor) -> torch.Tensor:
@@ -1798,6 +1801,7 @@ class Scaler(nn.Module):
     ) -> torch.Tensor:
         if t.numel() == 0:
             return t
+        input_dtype = t.dtype
         feature_dim = int(t.shape[-1])
         master_dtype = self._resolve_master_dtype_for_io(t)
         if master_dtype is torch.int64:
@@ -1822,6 +1826,8 @@ class Scaler(nn.Module):
         scale = (std_b + float(self.eps)).clamp_min(float(self.eps))
         out2 = t2 * scale + mean_b
         out = out2.reshape(orig_shape) if t.dim() != 1 else out2.reshape(-1)
+        if t.is_floating_point() and out.dtype != input_dtype:
+            out = out.to(dtype=input_dtype)
         return out
 
     def denormalize_x(self: Self, x_scaled: torch.Tensor) -> torch.Tensor:
@@ -1894,13 +1900,17 @@ class Scaler(nn.Module):
     def affine(self: Self, z_raw: torch.Tensor) -> torch.Tensor:
         if z_raw.numel() == 0:
             return z_raw
+        input_dtype = z_raw.dtype
         master_dtype = self._resolve_master_dtype_for_io(z_raw)
         if master_dtype is torch.int64:
             master_dtype = torch.float64
         z = z_raw.to(dtype=master_dtype)
         a = self.affine_a.to(device=z.device, dtype=master_dtype)
         b = self.affine_b.to(device=z.device, dtype=master_dtype)
-        return self._apply_affine_no_broadcast(z, weight=a, bias=b)
+        out = self._apply_affine_no_broadcast(z, weight=a, bias=b)
+        if z_raw.is_floating_point() and out.dtype != input_dtype:
+            out = out.to(dtype=input_dtype)
+        return out
 
     @torch.no_grad()
     def set_affine(self: Self, a: torch.Tensor, b: torch.Tensor) -> None:
