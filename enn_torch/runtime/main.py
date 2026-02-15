@@ -3188,6 +3188,13 @@ def infer(
             broadcast_checked = False
             detect_broadcast = bool(env_bool("ENN_PRED_DETECT_BATCH_BROADCAST", True))
             broadcast_atol = float(env_float("ENN_PRED_BROADCAST_ATOL", 1e-6))
+            collapse_force_fp32 = bool(
+                env_bool("ENN_PRED_COLLAPSE_FORCE_FP32", default=True)
+            )
+            collapse_force_fp32_persist = bool(
+                env_bool("ENN_PRED_COLLAPSE_FORCE_FP32_PERSIST", default=True)
+            )
+            collapse_fp32_active = False
             collapse_diag = bool(env_bool("ENN_PRED_COLLAPSE_DIAG", True))
             collapse_diag_save = bool(env_bool("ENN_PRED_COLLAPSE_DIAG_SAVE", True))
             collapse_diag_max_elems = int(env_int("ENN_PRED_COLLAPSE_DIAG_MAX_ELEMS", 64) or 64)
@@ -3371,14 +3378,56 @@ def infer(
                 return run_model
 
             def _run_model_predict_with_calibration(
-                x: torch.Tensor, *, calibrate_output: bool, use_uncompiled: bool
+                x: torch.Tensor,
+                *,
+                calibrate_output: bool,
+                use_uncompiled: bool = False,
+                force_fp32: bool = False,
             ):
                 m = _select_pred_model(bool(use_uncompiled))
+                if bool(force_fp32) or bool(collapse_fp32_active):
+                    with Autocast.suspend(device):
+                        x_fp32 = x
+                        if torch.is_tensor(x_fp32) and x_fp32.dtype != torch.float32:
+                            x_fp32 = x_fp32.to(dtype=torch.float32)
+                        return m(
+                            x_fp32,
+                            calibrate_output=bool(calibrate_output),
+                            return_loss=False,
+                        )
                 return m(
                     x,
                     calibrate_output=bool(calibrate_output),
                     return_loss=False,
                 )
+
+            def _maybe_enable_fp32_collapse_fallback() -> bool:
+                nonlocal collapse_fp32_active, force_uncompiled, force_eager
+                if (not bool(collapse_force_fp32)) or bool(collapse_fp32_active):
+                    return False
+                if str(dev_type) != "cuda":
+                    return False
+                mods: list[torch.nn.Module] = []
+                for cand in (run_model_uncompiled, run_model):
+                    if isinstance(cand, torch.nn.Module) and cand not in mods:
+                        mods.append(cand)
+                try:
+                    for mm in mods:
+                        mm.to(dtype=torch.float32)
+                    force_uncompiled = True
+                    force_eager = True
+                    collapse_fp32_active = bool(collapse_force_fp32_persist)
+                    _LOGGER.warning(
+                        "[infer] collapse persisted; enabled fp32+no-autocast fallback (ENN_PRED_COLLAPSE_FORCE_FP32=1)."
+                    )
+                    return True
+                except RuntimeError as e:
+                    if is_oom_error(e):
+                        _LOGGER.warning(
+                            "[infer] fp32 upcast fallback skipped due to OOM; keeping current precision path."
+                        )
+                        return False
+                    raise
 
             _run_model_predict_disabled = None
             if callable(_pred_disable_decorator):
@@ -3392,6 +3441,7 @@ def infer(
                 *,
                 calibrate_output: bool | None = None,
                 use_uncompiled: bool | None = None,
+                force_fp32: bool = False,
             ) -> torch.Tensor:
                 ctx = (
                     eager_ctx_factory()
@@ -3405,11 +3455,15 @@ def infer(
                         and callable(_run_model_predict_disabled)
                         and calibrate_output is None
                         and use_uncompiled is None
+                        and (not force_fp32)
                     ):
                         out = _run_model_predict_disabled(x)
                     elif calibrate_output is not None:
                         out = _run_model_predict_with_calibration(
-                            x, calibrate_output=bool(calibrate_output), use_uncompiled=uc
+                            x,
+                            calibrate_output=bool(calibrate_output),
+                            use_uncompiled=uc,
+                            force_fp32=bool(force_fp32),
                         )
                     else:
                         out = _run_model_predict_with_calibration(
@@ -3892,7 +3946,7 @@ def infer(
                                             sync_accelerator(dev_obj)
                                         if dev_type == "cuda":
                                             cudagraph_mark_step_begin()
-                                        pj = _td_predict(x1_buf)
+                                        pj = _td_predict(x1_buf, calibrate_output=True)
                                         if dev_type == "cuda":
                                             cudagraph_mark_step_end()
                                         if (
@@ -3929,6 +3983,48 @@ def infer(
                                                 _LOGGER.warning(
                                                     "[infer] outputs remain batch-broadcasted even after per-sample fallback; this indicates a model/preprocess collapse (not just cudagraph batching)."
                                                 )
+                                                if _maybe_enable_fp32_collapse_fallback():
+                                                    preds_fix_fp32: torch.Tensor | None = None
+                                                    for j in range(int(n_i)):
+                                                        x1_buf.copy_(Xi[j : j + 1])
+                                                        if cg_enabled:
+                                                            cudagraph_mark_step_begin()
+                                                        pj_fp32 = _td_predict(
+                                                            x1_buf,
+                                                            calibrate_output=True,
+                                                            use_uncompiled=True,
+                                                            force_fp32=True,
+                                                        )
+                                                        if cg_enabled:
+                                                            cudagraph_mark_step_end()
+                                                        pj_fp32_cpu = pj_fp32.detach()
+                                                        if getattr(pj_fp32_cpu.device, "type", None) != "cpu":
+                                                            pj_fp32_cpu = pj_fp32_cpu.to(device="cpu")
+                                                        with contextlib.suppress(Exception):
+                                                            pj_fp32_cpu = pj_fp32_cpu.contiguous()
+                                                        pj_fp32_cpu = pj_fp32_cpu.clone()
+                                                        if preds_fix_fp32 is None:
+                                                            preds_fix_fp32 = pj_fp32_cpu.new_empty(
+                                                                (int(n_i),) + tuple(pj_fp32_cpu.shape[1:])
+                                                            )
+                                                        preds_fix_fp32[j : j + 1].copy_(pj_fp32_cpu[:1])
+                                                    if preds_fix_fp32 is not None and int(preds_fix_fp32.shape[0]) >= 2:
+                                                        dy_fp32 = (preds_fix_fp32[0] - preds_fix_fp32[1]).abs().max()
+                                                        _LOGGER.warning(
+                                                            "[infer] fp32 fallback sanity (this batch): max|Y0-Y1|=%.6g",
+                                                            float(dy_fp32.item()),
+                                                        )
+                                                        if float(dy_fp32.item()) > float(broadcast_atol):
+                                                            preds = preds_fix_fp32
+                                                            if not bool(collapse_force_fp32_persist):
+                                                                collapse_fp32_active = False
+                                                        else:
+                                                            if bool(collapse_abort):
+                                                                raise RuntimeError(
+                                                                    "infer: collapse persisted even after fp32 upcast retry; "
+                                                                    "this indicates a true model/preprocess collapse. "
+                                                                    "Set ENN_PRED_COLLAPSE_ABORT=0 to ignore and write outputs anyway."
+                                                                )
                                                 if (
                                                     (not collapse_switched_uncompiled)
                                                     and bool(collapse_force_uncompiled)
