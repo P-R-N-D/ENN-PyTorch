@@ -1205,8 +1205,16 @@ def set_float32_precision(
         return
 
     precision = "high" if use_tf32 else "highest"
+    set_prec = getattr(torch, "set_float32_matmul_precision", None)
+    if callable(set_prec):
+        with contextlib.suppress(Exception):
+            set_prec(str(precision))
+    else:
+        with contextlib.suppress(Exception):
+            torch.backends.cuda.matmul.allow_tf32 = bool(use_tf32)
+
     with contextlib.suppress(Exception):
-        torch.set_float32_matmul_precision(str(precision))
+        torch.backends.cudnn.allow_tf32 = bool(use_tf32)
 
 
 def timezone_from(name: Optional[str] = None) -> Optional[tzinfo]:
