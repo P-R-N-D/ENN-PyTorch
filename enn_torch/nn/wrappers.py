@@ -31,6 +31,7 @@ from ..core.system import (
     CPU,
     empty_device_cache,
     get_device,
+    get_runtime_cfg,
     is_oom_error,
     set_runtime_cfg,
 )
@@ -1695,9 +1696,13 @@ class Fuser(nn.Module):
             infer_cuda
             and env_bool("ENN_PRED_DISABLE_CUDAGRAPHS", default=True)
         )
-        cg_ok = bool(getattr(self, "_compile_cudagraphs", False)) and (
-            not disable_pred_cg
-        )
+        compile_cg_enabled = bool(getattr(self, "_compile_cudagraphs", False))
+        if not compile_cg_enabled:
+            with contextlib.suppress(Exception):
+                compile_cg_enabled = bool(
+                    getattr(get_runtime_cfg(), "compile_cudagraphs", False)
+                )
+        cg_ok = bool(compile_cg_enabled and (not disable_pred_cg))
         bg = getattr(self, "_backbone_graph", None)
         if isinstance(bg, nn.Module) and cg_ok:
             fused_tokens, context = cast(
