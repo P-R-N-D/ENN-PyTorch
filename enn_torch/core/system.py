@@ -1220,6 +1220,9 @@ def set_float32_precision(
         if cudnn is not None and hasattr(cudnn, "fp32_precision"):
             with contextlib.suppress(Exception):
                 cudnn.fp32_precision = ("tf32" if use_tf32 else "ieee")
+        else:
+            with contextlib.suppress(Exception):
+                torch.backends.cudnn.allow_tf32 = bool(use_tf32)
     else:
         with contextlib.suppress(Exception):
             torch.backends.cudnn.allow_tf32 = bool(use_tf32)
