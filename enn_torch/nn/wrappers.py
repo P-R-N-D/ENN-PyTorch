@@ -3214,14 +3214,22 @@ class Model(nn.Module):
             if loss_weights is None and td_loss_weights is not None:
                 loss_weights = td_loss_weights
         device = _infer_module_device(self.fuser, self._device)
-        pred_disable_cg = bool(
+        infer_cuda = bool(
             infer_mode
+            and (not self.training)
             and (getattr(device, "type", None) == "cuda")
+        )
+        pred_disable_cg = bool(
+            infer_cuda
             and env_bool("ENN_PRED_DISABLE_CUDAGRAPHS", default=True)
         )
-        cg_ok = bool(getattr(self, "_compile_cudagraphs", False)) and (
-            not pred_disable_cg
-        )
+        compile_cg_enabled = bool(getattr(self, "_compile_cudagraphs", False))
+        if not compile_cg_enabled:
+            with contextlib.suppress(Exception):
+                compile_cg_enabled = bool(
+                    getattr(get_runtime_cfg(), "compile_cudagraphs", False)
+                )
+        cg_ok = bool(compile_cg_enabled and (not pred_disable_cg))
         x_raw = features
         if (
             isinstance(x_raw, torch.Tensor)
