@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import contextlib
 import os
+import warnings
 from typing import (
     Any,
     Callable,
@@ -1595,18 +1596,63 @@ class Scaler(nn.Module):
 
     def _resolve_master_dtype_for_io(self: Self, t: torch.Tensor) -> torch.dtype:
         pref = str(os.environ.get("ENN_SCALER_MASTER_DTYPE", "") or "").strip().lower()
-        if pref in {"fp32", "float32", "f32", "32"}:
-            return torch.float32
         if pref in {"fp64", "float64", "f64", "64"}:
             return torch.float64
-        if pref in {"int64", "i64"}:
+        if pref in {"fp32", "float32", "f32", "32"}:
+            return torch.float32
+        if pref in {"int64", "i64", "long"}:
             return torch.int64
+        for attr in ("master_dtype", "_master_dtype", "scaler_master_dtype", "_scaler_master_dtype"):
+            v = getattr(self, attr, None)
+            if isinstance(v, torch.dtype):
+                return v
         if not (t.is_floating_point() or t.is_complex()):
             return torch.int64
-        dev_t = str(getattr(t.device, "type", "cpu"))
-        if dev_t in {"cuda", "xpu", "mps"}:
+        if getattr(t.device, "type", None) == "cuda" and t.dtype in (torch.float16, torch.bfloat16):
             return torch.float32
         return torch.float64
+
+    def _should_restore_input_dtype(self: Self, input_dtype: torch.dtype) -> bool:
+        if env_bool("ENN_SCALER_RESTORE_INPUT_DTYPE", False):
+            return True
+        if input_dtype in (torch.float32, torch.float64):
+            return True
+        if input_dtype in (torch.float16, torch.bfloat16):
+            return False
+        return True
+
+    def _scaler_guard_enabled(self: Self) -> bool:
+        return bool(env_bool("ENN_SCALER_GUARD", False))
+
+    def _scaler_guard_params(self: Self, t: torch.Tensor) -> tuple[float, float, bool]:
+        std_min = float(os.environ.get("ENN_SCALER_COLLAPSE_STD_MIN", "") or 0.0)
+        eps_min = float(os.environ.get("ENN_SCALER_EPS_MIN", "") or float(self.eps))
+        force_fp32_on_cuda = bool(env_bool("ENN_SCALER_GUARD_FORCE_FP32_ON_CUDA", True))
+        if std_min <= 0.0:
+            if t.dtype == torch.bfloat16:
+                std_min = float(os.environ.get("ENN_SCALER_COLLAPSE_STD_MIN_BF16", "") or 1e-3)
+            elif t.dtype == torch.float16:
+                std_min = float(os.environ.get("ENN_SCALER_COLLAPSE_STD_MIN_FP16", "") or 5e-4)
+            else:
+                std_min = float(os.environ.get("ENN_SCALER_COLLAPSE_STD_MIN_FP32", "") or 1e-6)
+        if eps_min <= 0.0:
+            eps_min = float(self.eps)
+        if t.dtype == torch.bfloat16:
+            eps_min = max(eps_min, float(os.environ.get("ENN_SCALER_EPS_MIN_BF16", "") or 1e-4))
+        elif t.dtype == torch.float16:
+            eps_min = max(eps_min, float(os.environ.get("ENN_SCALER_EPS_MIN_FP16", "") or 1e-5))
+        return float(std_min), float(eps_min), bool(force_fp32_on_cuda)
+
+    def _guard_is_collapse(self: Self, out2: torch.Tensor, *, std_min: float) -> bool:
+        if out2.numel() == 0:
+            return False
+        if out2.is_floating_point() and not torch.isfinite(out2).all():
+            return True
+        if out2.is_floating_point():
+            v = out2.to(dtype=torch.float32)
+            std = v.std(unbiased=False) if v.dim() == 1 else v.std(dim=-1, unbiased=False).mean()
+            return bool(float(std.item()) <= float(std_min))
+        return False
 
     def _cached_mean_std(
         self: Self,
@@ -1618,18 +1664,24 @@ class Scaler(nn.Module):
         master_dtype: torch.dtype,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         key = (str(t.device), int(t.shape[-1]), master_dtype)
-        with self._stats_cache_lock:
-            cache = getattr(self, f"_{cache_key_prefix}_stats_cache")
+        lock = getattr(self, "_stats_cache_lock", None)
+        if lock is None:
+            lock = Mutex()
+            setattr(self, "_stats_cache_lock", lock)
+        with lock:
+            cache = getattr(self, f"_{cache_key_prefix}_stats_cache", None)
+            if cache is None:
+                cache = {}
+                setattr(self, f"_{cache_key_prefix}_stats_cache", cache)
             cached = cache.get(key)
             if cached is None:
                 mean_b = mean_buf.to(device=t.device, dtype=master_dtype)
                 std_b = std_buf.to(device=t.device, dtype=master_dtype)
-                if len(cache) > self._stats_cache_max:
+                if len(cache) > int(getattr(self, "_stats_cache_max", 8) or 8):
                     cache.clear()
                 cache[key] = (mean_b, std_b)
-            else:
-                mean_b, std_b = cached
-        return mean_b, std_b
+                return mean_b, std_b
+            return cached
 
     def _invalidate_stats_cache(self: Self) -> None:
         lock = getattr(self, "_stats_cache_lock", None)
@@ -1778,14 +1830,28 @@ class Scaler(nn.Module):
                 f"mean.shape={tuple(mean_b.shape)} std.shape={tuple(std_b.shape)}"
             )
         orig_shape = tuple(t.shape)
-        if t.dim() == 1:
-            t2 = t.reshape(1, -1).to(dtype=master_dtype)
-        else:
-            t2 = t.reshape(-1, feature_dim).to(dtype=master_dtype)
-        denom = (std_b + float(self.eps)).clamp_min(float(self.eps))
+        t2 = (t.reshape(1, -1) if t.dim() == 1 else t.reshape(-1, feature_dim)).to(dtype=master_dtype)
+        std_min, eps_min, force_fp32_on_cuda = self._scaler_guard_params(t)
+        eps_use = float(max(float(self.eps), float(eps_min)))
+        denom = (std_b + eps_use).clamp_min(eps_use)
         out2 = (t2 - mean_b) / denom
+        if self._scaler_guard_enabled() and getattr(t.device, "type", None) == "cuda":
+            if self._guard_is_collapse(out2, std_min=float(std_min)):
+                md2 = torch.float32 if force_fp32_on_cuda else master_dtype
+                mean2 = mean_buf.to(device=t.device, dtype=md2)
+                std2 = std_buf.to(device=t.device, dtype=md2)
+                t32 = (t.reshape(1, -1) if t.dim() == 1 else t.reshape(-1, feature_dim)).to(dtype=md2)
+                eps_use2 = float(max(eps_use, 1e-4 if t.dtype == torch.bfloat16 else 1e-5))
+                denom2 = (std2 + eps_use2).clamp_min(eps_use2)
+                out2 = (t32 - mean2) / denom2
+                if env_bool("ENN_SCALER_GUARD_LOG", True):
+                    warnings.warn(
+                        "Scaler.normalize_x: detected collapse/nonfinite; retried this batch with safer fp32 math.",
+                        RuntimeWarning,
+                        stacklevel=2,
+                    )
         out = out2.reshape(orig_shape) if t.dim() != 1 else out2.reshape(-1)
-        if t.is_floating_point() and out.dtype != input_dtype:
+        if t.is_floating_point() and out.dtype != input_dtype and self._should_restore_input_dtype(input_dtype):
             out = out.to(dtype=input_dtype)
         return out
 
@@ -1819,14 +1885,13 @@ class Scaler(nn.Module):
                 f"mean.shape={tuple(mean_b.shape)} std.shape={tuple(std_b.shape)}"
             )
         orig_shape = tuple(t.shape)
-        if t.dim() == 1:
-            t2 = t.reshape(1, -1).to(dtype=master_dtype)
-        else:
-            t2 = t.reshape(-1, feature_dim).to(dtype=master_dtype)
-        scale = (std_b + float(self.eps)).clamp_min(float(self.eps))
+        t2 = (t.reshape(1, -1) if t.dim() == 1 else t.reshape(-1, feature_dim)).to(dtype=master_dtype)
+        _, eps_min, _ = self._scaler_guard_params(t)
+        eps_use = float(max(float(self.eps), float(eps_min)))
+        scale = (std_b + eps_use).clamp_min(eps_use)
         out2 = t2 * scale + mean_b
         out = out2.reshape(orig_shape) if t.dim() != 1 else out2.reshape(-1)
-        if t.is_floating_point() and out.dtype != input_dtype:
+        if t.is_floating_point() and out.dtype != input_dtype and self._should_restore_input_dtype(input_dtype):
             out = out.to(dtype=input_dtype)
         return out
 
@@ -1908,7 +1973,7 @@ class Scaler(nn.Module):
         a = self.affine_a.to(device=z.device, dtype=master_dtype)
         b = self.affine_b.to(device=z.device, dtype=master_dtype)
         out = self._apply_affine_no_broadcast(z, weight=a, bias=b)
-        if z_raw.is_floating_point() and out.dtype != input_dtype:
+        if z_raw.is_floating_point() and out.dtype != input_dtype and self._should_restore_input_dtype(input_dtype):
             out = out.to(dtype=input_dtype)
         return out
 
