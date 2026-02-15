@@ -3216,23 +3216,22 @@ def infer(
                     if callable(cand) and getattr(cand, "__name__", "") == "disable":
                         _pred_disable_decorator = cand
 
-            def _pred_model():
-                if bool(force_uncompiled) and (run_model_uncompiled is not None):
-                    return run_model_uncompiled
-                return run_model
-
             def _run_model_predict(x: torch.Tensor):
-                m = _pred_model()
-                return m(
+                return run_model(
                     x,
                     calibrate_output=bool(calibrate_pred_output),
                     return_loss=False,
                 )
 
+            def _select_pred_model(use_uncompiled: bool) -> torch.nn.Module:
+                if bool(use_uncompiled) and (run_model_uncompiled is not run_model):
+                    return run_model_uncompiled
+                return run_model
+
             def _run_model_predict_with_calibration(
-                x: torch.Tensor, *, calibrate_output: bool
+                x: torch.Tensor, *, calibrate_output: bool, use_uncompiled: bool
             ):
-                m = _pred_model()
+                m = _select_pred_model(bool(use_uncompiled))
                 return m(
                     x,
                     calibrate_output=bool(calibrate_output),
@@ -3247,26 +3246,33 @@ def infer(
                         _run_model_predict_disabled = wrapped
 
             def _td_predict(
-                x: torch.Tensor, *, calibrate_output: bool | None = None
+                x: torch.Tensor,
+                *,
+                calibrate_output: bool | None = None,
+                use_uncompiled: bool | None = None,
             ) -> torch.Tensor:
                 ctx = (
                     eager_ctx_factory()
                     if (force_eager and callable(eager_ctx_factory))
                     else contextlib.nullcontext()
                 )
+                uc = bool(force_uncompiled) if use_uncompiled is None else bool(use_uncompiled)
                 with ctx:
                     if (
-                        force_eager and callable(_run_model_predict_disabled)
+                        force_eager
+                        and callable(_run_model_predict_disabled)
                         and calibrate_output is None
+                        and use_uncompiled is None
                     ):
                         out = _run_model_predict_disabled(x)
                     elif calibrate_output is not None:
                         out = _run_model_predict_with_calibration(
-                            x,
-                            calibrate_output=bool(calibrate_output),
+                            x, calibrate_output=bool(calibrate_output), use_uncompiled=uc
                         )
                     else:
-                        out = _run_model_predict(x)
+                        out = _run_model_predict_with_calibration(
+                            x, calibrate_output=bool(calibrate_pred_output), use_uncompiled=uc
+                        )
                 if isinstance(out, tuple):
                     out = out[0]
                 if not isinstance(out, torch.Tensor):
