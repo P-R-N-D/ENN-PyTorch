@@ -24,13 +24,14 @@ import torch.nn as nn
 import torch.nn.functional as F
 from ..core.concurrency import Mutex, is_gil_enabled
 from ..core.config import ModelConfig
-from ..core.datatypes import env_first_int, env_int
+from ..core.datatypes import env_bool, env_first_int, env_int
 from ..core.policies import LossWeightPolicy
 from ..core.precision import Autocast
 from ..core.system import (
     CPU,
     empty_device_cache,
     get_device,
+    get_runtime_cfg,
     is_oom_error,
     set_runtime_cfg,
 )
@@ -1685,16 +1686,30 @@ class Fuser(nn.Module):
             device=all_tokens.device,
             dtype=all_tokens.dtype,
         )
+        infer_cuda = bool(
+            (not torch.is_grad_enabled())
+            and (not self.training)
+            and (not is_export_or_trace())
+            and (getattr(all_tokens.device, "type", None) == "cuda")
+        )
+        disable_pred_cg = bool(
+            infer_cuda
+            and env_bool("ENN_PRED_DISABLE_CUDAGRAPHS", default=True)
+        )
+        compile_cg_enabled = bool(getattr(self, "_compile_cudagraphs", False))
+        if not compile_cg_enabled:
+            with contextlib.suppress(Exception):
+                compile_cg_enabled = bool(
+                    getattr(get_runtime_cfg(), "compile_cudagraphs", False)
+                )
+        cg_ok = bool(compile_cg_enabled and (not disable_pred_cg))
         bg = getattr(self, "_backbone_graph", None)
-        if isinstance(bg, nn.Module):
+        if isinstance(bg, nn.Module) and cg_ok:
             fused_tokens, context = cast(
                 tuple[torch.Tensor, torch.Tensor], bg(all_tokens, attn_bias)
             )
         else:
-            if (
-                self._compile_cudagraphs
-                and getattr(all_tokens.device, "type", None) == "cuda"
-            ):
+            if cg_ok:
                 cudagraph_mark_step_begin()
                 fused_tokens = self.perceiver(all_tokens, attn_bias=attn_bias)
                 cudagraph_mark_step_end()
@@ -3199,6 +3214,22 @@ class Model(nn.Module):
             if loss_weights is None and td_loss_weights is not None:
                 loss_weights = td_loss_weights
         device = _infer_module_device(self.fuser, self._device)
+        infer_cuda = bool(
+            infer_mode
+            and (not self.training)
+            and (getattr(device, "type", None) == "cuda")
+        )
+        pred_disable_cg = bool(
+            infer_cuda
+            and env_bool("ENN_PRED_DISABLE_CUDAGRAPHS", default=True)
+        )
+        compile_cg_enabled = bool(getattr(self, "_compile_cudagraphs", False))
+        if not compile_cg_enabled:
+            with contextlib.suppress(Exception):
+                compile_cg_enabled = bool(
+                    getattr(get_runtime_cfg(), "compile_cudagraphs", False)
+                )
+        cg_ok = bool(compile_cg_enabled and (not pred_disable_cg))
         x_raw = features
         if (
             isinstance(x_raw, torch.Tensor)
@@ -3450,7 +3481,10 @@ class Model(nn.Module):
                             _encode,
                             pad_to=(
                                 int(mb)
-                                if self._pad_compiled_microbatch
+                                if (
+                                    self._pad_compiled_microbatch
+                                    and (not pred_disable_cg)
+                                )
                                 else None
                             ),
                             out_dtype=base_dtype,
@@ -3529,10 +3563,7 @@ class Model(nn.Module):
                         else Autocast.suspend(device)
                     ):
                         if dc is not None:
-                            if (
-                                self._compile_cudagraphs
-                                and getattr(device, "type", None) == "cuda"
-                            ):
+                            if cg_ok and (getattr(device, "type", None) == "cuda"):
                                 cudagraph_mark_step_begin()
                                 out = cast(torch.Tensor, dc(chunk))
                                 cudagraph_mark_step_end()
@@ -3551,6 +3582,7 @@ class Model(nn.Module):
                             if (
                                 dc is not None
                                 and self._pad_compiled_microbatch
+                                and (not pred_disable_cg)
                             )
                             else None
                         ),
