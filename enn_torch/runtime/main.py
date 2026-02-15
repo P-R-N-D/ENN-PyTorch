@@ -3188,6 +3188,200 @@ def infer(
             broadcast_checked = False
             detect_broadcast = bool(env_bool("ENN_PRED_DETECT_BATCH_BROADCAST", True))
             broadcast_atol = float(env_float("ENN_PRED_BROADCAST_ATOL", 1e-6))
+            collapse_stage_diag_enabled = bool(
+                env_bool("ENN_PRED_COLLAPSE_STAGE_DIAG", default=True)
+            )
+            collapse_stage_diag_done = False
+
+            def _tensor_diag(t: object, *, sample_n: int = 64) -> dict[str, object]:
+                if not torch.is_tensor(t):
+                    return {"type": type(t).__name__}
+                x = t.detach()
+                out: dict[str, object] = {
+                    "shape": [int(v) for v in tuple(x.shape)],
+                    "dtype": str(x.dtype),
+                    "device": str(x.device),
+                    "numel": int(x.numel()),
+                }
+                if x.numel() <= 0:
+                    out["finite"] = True
+                    out["abs_max"] = 0.0
+                    out["min"] = 0.0
+                    out["max"] = 0.0
+                    out["std_mean"] = 0.0
+                    out["sample"] = []
+                    return out
+                try:
+                    if x.is_floating_point() or x.is_complex():
+                        out["finite"] = bool(torch.isfinite(x).all().item())
+                    else:
+                        out["finite"] = True
+                except Exception:
+                    out["finite"] = False
+                try:
+                    xf = x
+                    if not (xf.is_floating_point() or xf.is_complex()):
+                        xf = xf.to(dtype=torch.float32)
+                    out["abs_max"] = float(xf.abs().max().item())
+                    out["std_mean"] = float(xf.reshape(xf.shape[0], -1).std(dim=1, unbiased=False).mean().item()) if xf.dim() >= 2 else float(xf.std(unbiased=False).item())
+                    out["min"] = float(xf.min().item())
+                    out["max"] = float(xf.max().item())
+                except Exception:
+                    out["abs_max"] = None
+                    out["std_mean"] = None
+                    out["min"] = None
+                    out["max"] = None
+                try:
+                    flat = x.reshape(-1)
+                    n = int(min(int(sample_n), int(flat.numel())))
+                    samp = flat[:n]
+                    if samp.is_floating_point() or samp.is_complex():
+                        samp = samp.to(dtype=torch.float32)
+                    out["sample"] = [float(v) for v in samp.cpu().tolist()]
+                except Exception:
+                    out["sample"] = []
+                return out
+
+            def _pair_diff_max(t: object) -> float | None:
+                if not torch.is_tensor(t):
+                    return None
+                x = t.detach()
+                if x.dim() < 1 or int(x.shape[0]) < 2:
+                    return None
+                try:
+                    a = x[0]
+                    b = x[1]
+                    if not (a.is_floating_point() or a.is_complex()):
+                        a = a.to(dtype=torch.float32)
+                        b = b.to(dtype=torch.float32)
+                    else:
+                        a = a.to(dtype=torch.float32)
+                        b = b.to(dtype=torch.float32)
+                    return float((a - b).abs().max().item())
+                except Exception:
+                    return None
+
+            def _unwrap_for_stage_diag(m: object) -> torch.nn.Module | None:
+                if not isinstance(m, torch.nn.Module):
+                    return None
+                cur: torch.nn.Module = m
+                seen: set[int] = set()
+                for _ in range(16):
+                    cid = id(cur)
+                    if cid in seen:
+                        break
+                    seen.add(cid)
+                    nxt = None
+                    for attr in ("_orig_mod", "_original_module", "_uncompiled_module"):
+                        cand = getattr(cur, attr, None)
+                        if isinstance(cand, torch.nn.Module) and cand is not cur:
+                            nxt = cand
+                            break
+                    if nxt is None:
+                        cand = getattr(cur, "module", None)
+                        if isinstance(cand, torch.nn.Module) and cand is not cur:
+                            nxt = cand
+                    if nxt is None:
+                        break
+                    cur = nxt
+                return cur
+
+            def _dump_collapse_stage_diag(
+                *,
+                where: str,
+                Xi2: torch.Tensor,
+                seen_batches: int,
+                x_diff: float,
+                y_diff_cal: float,
+            ) -> None:
+                nonlocal collapse_stage_diag_done
+                if (not collapse_stage_diag_enabled) or collapse_stage_diag_done:
+                    return
+                if str(dev_type) != "cuda":
+                    return
+                try:
+                    m0 = _unwrap_for_stage_diag(locals().get("run_model_uncompiled", None))
+                    m1 = _unwrap_for_stage_diag(locals().get("run_model", None))
+                    mod = m0 if (m0 is not None and hasattr(m0, "_run_forward_core")) else m1
+                    if mod is None or (not hasattr(mod, "_run_forward_core")):
+                        return
+                    fn = getattr(mod, "_run_forward_core", None)
+                    if not callable(fn):
+                        return
+
+                    with torch.no_grad():
+                        pred_denorm, _st, p, assembled, enhanced, delta, tokens, refined = fn(
+                            Xi2,
+                            export=False,
+                            temporal_state=None,
+                            causal_mask=None,
+                            sanitize_nan=False,
+                            calibrate_output=False,
+                        )
+                        if p is None:
+                            y_hat = assembled + delta * 0.5
+                        else:
+                            y_hat = assembled + p.to(dtype=assembled.dtype) * delta
+
+                        out_shape = tuple(int(x) for x in (ops.out_shape or ()))
+                        out_dim = 1
+                        for d in out_shape:
+                            out_dim *= max(1, int(d))
+                        if bool(calibrate_pred_output):
+                            sc = getattr(mod, "scaler", None)
+                            if sc is not None and hasattr(sc, "calibrate") and hasattr(sc, "denormalize_y"):
+                                y_cal = sc.calibrate(y_hat)
+                                pred_runtime = sc.denormalize_y(y_cal).reshape(int(y_hat.shape[0]), *out_shape)
+                            else:
+                                pred_runtime = y_hat.reshape(int(y_hat.shape[0]), out_dim).reshape(int(y_hat.shape[0]), *out_shape)
+                        else:
+                            pred_runtime = y_hat.reshape(int(y_hat.shape[0]), out_dim).reshape(int(y_hat.shape[0]), *out_shape)
+
+                    diag: dict[str, object] = {
+                        "where": str(where),
+                        "rank": int(rank),
+                        "seen_batches": int(seen_batches),
+                        "x_diff": float(x_diff),
+                        "y_diff_calibrated": float(y_diff_cal),
+                        "calibrate_pred_output": bool(calibrate_pred_output),
+                        "broadcast_atol": float(broadcast_atol),
+                        "X": _tensor_diag(Xi2),
+                        "tokens": _tensor_diag(tokens),
+                        "context_z": _tensor_diag(assembled),
+                        "refined": _tensor_diag(refined),
+                        "delta_z": _tensor_diag(delta),
+                        "p": _tensor_diag(p) if torch.is_tensor(p) else {"type": "None"},
+                        "y_hat_z": _tensor_diag(y_hat),
+                        "pred_runtime": _tensor_diag(pred_runtime),
+                        "pred_denorm_uncal": _tensor_diag(pred_denorm),
+                        "diff_tokens": _pair_diff_max(tokens),
+                        "diff_context_z": _pair_diff_max(assembled),
+                        "diff_refined": _pair_diff_max(refined),
+                        "diff_delta_z": _pair_diff_max(delta),
+                        "diff_p": _pair_diff_max(p) if torch.is_tensor(p) else None,
+                        "diff_y_hat_z": _pair_diff_max(y_hat),
+                        "diff_pred_runtime": _pair_diff_max(pred_runtime),
+                        "diff_pred_denorm_uncal": _pair_diff_max(pred_denorm),
+                    }
+
+                    out_path = os.path.join(
+                        str(chunk_dir),
+                        f"collapse_stage_diag.rank{int(rank)}.batch{int(seen_batches):06d}.json",
+                    )
+                    with contextlib.suppress(Exception):
+                        os.makedirs(str(chunk_dir), exist_ok=True)
+                    collate.write_json(out_path, diag, indent=2)
+                    _LOGGER.warning(
+                        "[infer][collapse-stage] dumped stage diag to %s (diff_context=%.6g diff_refined=%.6g diff_y_hat=%.6g diff_pred=%.6g)",
+                        str(out_path),
+                        float(diag.get("diff_context_z") or 0.0),
+                        float(diag.get("diff_refined") or 0.0),
+                        float(diag.get("diff_y_hat_z") or 0.0),
+                        float(diag.get("diff_pred_runtime") or 0.0),
+                    )
+                    collapse_stage_diag_done = True
+                except Exception:
+                    return
             collapse_force_fp32 = bool(
                 env_bool("ENN_PRED_COLLAPSE_FORCE_FP32", default=True)
             )
@@ -3946,7 +4140,10 @@ def infer(
                                             sync_accelerator(dev_obj)
                                         if dev_type == "cuda":
                                             cudagraph_mark_step_begin()
-                                        pj = _td_predict(x1_buf, calibrate_output=True)
+                                        pj = _td_predict(
+                                            x1_buf,
+                                            calibrate_output=(bool(calibrate_pred_output) if "calibrate_pred_output" in locals() else None),
+                                        )
                                         if dev_type == "cuda":
                                             cudagraph_mark_step_end()
                                         if (
@@ -3982,6 +4179,13 @@ def infer(
                                                     )
                                                 _LOGGER.warning(
                                                     "[infer] outputs remain batch-broadcasted even after per-sample fallback; this indicates a model/preprocess collapse (not just cudagraph batching)."
+                                                )
+                                                _dump_collapse_stage_diag(
+                                                    where="broadcast_trigger",
+                                                    Xi2=Xi[:2].detach(),
+                                                    seen_batches=int(seen_batches),
+                                                    x_diff=float(x_diff.item()),
+                                                    y_diff_cal=float(ydiff2.item()),
                                                 )
                                                 if _maybe_enable_fp32_collapse_fallback():
                                                     preds_fix_fp32: torch.Tensor | None = None
