@@ -3034,7 +3034,33 @@ def infer(
         run_model.module if hasattr(run_model, "module") else run_model
     )
     distributed_sync(module_eval, device=dev_obj)
-    run_model_uncompiled = to_submodule(run_model) or run_model
+    def _unwrap_uncompiled_model_handle(m: torch.nn.Module) -> torch.nn.Module:
+        cur = m
+        seen: set[int] = set()
+        for _ in range(16):
+            cur_id = id(cur)
+            if cur_id in seen:
+                break
+            seen.add(cur_id)
+            next_m = None
+            for attr in ("_orig_mod", "_original_module", "_uncompiled_module"):
+                cand = getattr(cur, attr, None)
+                if isinstance(cand, torch.nn.Module) and cand is not cur:
+                    next_m = cand
+                    break
+            if next_m is None:
+                child = getattr(cur, "module", None)
+                if isinstance(child, torch.nn.Module) and child is not cur:
+                    next_m = child
+            if next_m is None:
+                break
+            cur = next_m
+        return cur
+
+    run_model_uncompiled_base = _unwrap_uncompiled_model_handle(run_model)
+    run_model_uncompiled = (
+        to_submodule(run_model_uncompiled_base) or run_model_uncompiled_base
+    )
     if run_model_uncompiled is not run_model:
         with contextlib.suppress(Exception):
             run_model_uncompiled.eval()
