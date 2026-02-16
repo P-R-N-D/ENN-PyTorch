@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import _thread
+import functools
 import contextlib
 import ctypes
 import gc
@@ -52,6 +53,38 @@ _ENN_MP_MAIN_STUB_PATH: Optional[str] = None
 _EMPTY_CACHE_LAST_CALL_S_BY_DEVICE: dict[Tuple[str, int], float] = {}
 _FP32_PRECISION_CACHE: dict[str, str] = {}
 _LOGGER = logging.getLogger(__name__)
+
+
+def _env_flag(key: str, default: bool = False) -> bool:
+    v = os.environ.get(key, None)
+    if v is None:
+        return bool(default)
+    s = str(v).strip().lower()
+    return s in ("1", "true", "t", "yes", "y", "on")
+
+
+@functools.lru_cache(maxsize=8)
+def _cuda_fp32_precision_api_choice(*, use_new_api: bool) -> str:
+    if not bool(use_new_api):
+        return "legacy_only"
+    try:
+        if hasattr(torch, "backends") and hasattr(torch.backends, "fp32_precision"):
+            return "new_api"
+    except Exception:
+        pass
+    try:
+        if callable(getattr(torch, "set_float32_matmul_precision", None)):
+            return "legacy_setter"
+    except Exception:
+        pass
+    return "legacy_only"
+
+
+def _clear_fp32_precision_api_cache() -> None:
+    with contextlib.suppress(Exception):
+        _cuda_fp32_precision_api_choice.cache_clear()  # type: ignore[attr-defined]
+
+
 _ENN_ORIG_SET_F32_MATMUL_PREC = getattr(
     torch, "set_float32_matmul_precision", None
 )
@@ -1160,22 +1193,13 @@ def set_float32_precision(
             use_tf32 = False
             break
 
-    has_backends = bool(hasattr(torch, "backends"))
-    new_api_available = bool(
-        has_backends
-        and hasattr(torch.backends, "fp32_precision")
-        and hasattr(torch.backends, "cuda")
-        and hasattr(torch.backends.cuda, "matmul")
-        and hasattr(torch.backends.cuda.matmul, "fp32_precision")
+    tf32_use_new_api = _env_flag("ENN_TF32_USE_NEW_API", default=False)
+    api_choice = _cuda_fp32_precision_api_choice(
+        use_new_api=bool(tf32_use_new_api)
     )
 
     with _mutex_lock("_FP32_PRECISION_LOCK"):
-        api_choice = _FP32_PRECISION_CACHE.get("cuda_fp32_precision_api", "")
-        if api_choice not in ("new", "old"):
-            api_choice = "new" if new_api_available else "old"
-            _FP32_PRECISION_CACHE["cuda_fp32_precision_api"] = api_choice
-
-        use_new_api = bool(api_choice == "new" and new_api_available)
+        use_new_api = bool(api_choice == "new_api")
 
         cache_key = (
             "cuda_fp32_precision_new"
@@ -1191,7 +1215,14 @@ def set_float32_precision(
             return
         _FP32_PRECISION_CACHE[cache_key] = cache_val
 
-    if use_new_api:
+    if api_choice == "legacy_only":
+        with contextlib.suppress(Exception):
+            torch.backends.cuda.matmul.allow_tf32 = bool(use_tf32)
+        with contextlib.suppress(Exception):
+            torch.backends.cudnn.allow_tf32 = bool(use_tf32)
+        return
+
+    if api_choice == "new_api":
         prec = "tf32" if use_tf32 else "ieee"
         with contextlib.suppress(Exception):
             torch.backends.fp32_precision = prec
@@ -1207,7 +1238,7 @@ def set_float32_precision(
     precision = "high" if use_tf32 else "highest"
     set_prec = getattr(torch, "set_float32_matmul_precision", None)
     used_set_prec = False
-    if callable(set_prec):
+    if api_choice == "legacy_setter" and callable(set_prec):
         with contextlib.suppress(Exception):
             set_prec(str(precision))
             used_set_prec = True
