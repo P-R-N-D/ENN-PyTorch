@@ -1168,11 +1168,19 @@ def set_float32_precision(
         and hasattr(torch.backends.cuda, "matmul")
         and hasattr(torch.backends.cuda.matmul, "fp32_precision")
     )
+    tf32_use_new_api = str(os.environ.get("ENN_TF32_USE_NEW_API", "0")).strip().lower() in (
+        "1",
+        "true",
+        "t",
+        "yes",
+        "y",
+        "on",
+    )
 
     with _mutex_lock("_FP32_PRECISION_LOCK"):
         api_choice = _FP32_PRECISION_CACHE.get("cuda_fp32_precision_api", "")
         if api_choice not in ("new", "old"):
-            api_choice = "new" if new_api_available else "old"
+            api_choice = "new" if (new_api_available and tf32_use_new_api) else "old"
             _FP32_PRECISION_CACHE["cuda_fp32_precision_api"] = api_choice
 
         use_new_api = bool(api_choice == "new" and new_api_available)
@@ -1190,6 +1198,13 @@ def set_float32_precision(
         if _FP32_PRECISION_CACHE.get(cache_key) == cache_val:
             return
         _FP32_PRECISION_CACHE[cache_key] = cache_val
+
+    if not tf32_use_new_api:
+        with contextlib.suppress(Exception):
+            torch.backends.cuda.matmul.allow_tf32 = bool(use_tf32)
+        with contextlib.suppress(Exception):
+            torch.backends.cudnn.allow_tf32 = bool(use_tf32)
+        return
 
     if use_new_api:
         prec = "tf32" if use_tf32 else "ieee"
