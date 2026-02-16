@@ -11,6 +11,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from ..core.compat import StochasticDepth
+from ..core.datatypes import env_bool
 from ..runtime.distributed import _from_hsdp_module
 from .activations import GeGLU
 from .graph import coerce_checkpoint, is_checkpoint, is_export_or_trace, is_symbolic, canonicalize_compile_mode
@@ -381,7 +382,25 @@ class Perceiver(nn.Module):
                 if j < len(self.self_blocks):
                     latents = self.self_blocks[j](latents)
                 j += 1
-        return self.norm(latents)
+        out = self.norm(latents)
+
+        if (not torch.is_grad_enabled()) and (getattr(out.device, "type", None) == "cuda"):
+            if env_bool("ENN_PRED_COLLAPSE_STAGE_DIAG", default=False):
+                with contextlib.suppress(Exception):
+                    def _pair_nonfinite(t: torch.Tensor) -> int:
+                        if not t.is_floating_point():
+                            return 0
+                        return int((~torch.isfinite(t[:2])).sum().item())
+                    self._enn_last_perceiver_diag = {
+                        "pre_norm_absmax": float(latents[:2].abs().max().item()),
+                        "pre_norm_nonfinite": _pair_nonfinite(latents),
+                        "post_norm_absmax": float(out[:2].abs().max().item()),
+                        "post_norm_nonfinite": _pair_nonfinite(out),
+                        "norm_w_absmax": float(self.norm.weight.detach().abs().max().item())
+                        if hasattr(self.norm, "weight") else None,
+                    }
+
+        return out
 
 
 class RetNet(nn.Module):

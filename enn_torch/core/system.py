@@ -52,6 +52,7 @@ _DEVICE_STATS_CACHE: dict[Tuple[str, int], "Device"] = {}
 _ENN_MP_MAIN_STUB_PATH: Optional[str] = None
 _EMPTY_CACHE_LAST_CALL_S_BY_DEVICE: dict[Tuple[str, int], float] = {}
 _FP32_PRECISION_CACHE: dict[str, str] = {}
+_FP32_API_CHOICE_CACHE_KEY = "__enn_tf32_api_choice__"
 _LOGGER = logging.getLogger(__name__)
 
 
@@ -78,6 +79,11 @@ def _cuda_fp32_precision_api_choice(*, use_new_api: bool) -> str:
     except Exception:
         pass
     return "legacy_only"
+
+
+def _cuda_fp32_precision_api_choice_from_env() -> str:
+    use_new_api = bool(env_bool("ENN_TF32_USE_NEW_API", default=False))
+    return _cuda_fp32_precision_api_choice(use_new_api=use_new_api)
 
 
 def _clear_fp32_precision_api_cache() -> None:
@@ -1193,70 +1199,80 @@ def set_float32_precision(
             use_tf32 = False
             break
 
-    tf32_use_new_api = _env_flag("ENN_TF32_USE_NEW_API", default=False)
-    api_choice = _cuda_fp32_precision_api_choice(
-        use_new_api=bool(tf32_use_new_api)
-    )
+    api_choice = _cuda_fp32_precision_api_choice_from_env()
+    dev = device if isinstance(device, torch.device) else torch.device(device)
+    dev_key = f"{dev.type}:{dev.index if dev.index is not None else -1}"
+    dt_key = str(dtype) if dtype is not None else ""
+    ac_key = str(autocast_dtype) if autocast_dtype is not None else ""
+    tf32_req = "" if enable_tf32 is None else ("1" if bool(enable_tf32) else "0")
+    cache_key = f"fp32_prec:{dev_key}:{dt_key}:{ac_key}:tf32={tf32_req}:api={api_choice}"
 
     with _mutex_lock("_FP32_PRECISION_LOCK"):
-        use_new_api = bool(api_choice == "new_api")
+        prev_choice = _FP32_PRECISION_CACHE.get(_FP32_API_CHOICE_CACHE_KEY)
+        if prev_choice != api_choice:
+            keep = {}
+            for k in ("legacy_matmul_shim_installed", "legacy_matmul_shim_installed_get"):
+                v = _FP32_PRECISION_CACHE.get(k)
+                if isinstance(v, str) and v:
+                    keep[k] = v
+            _FP32_PRECISION_CACHE.clear()
+            _FP32_PRECISION_CACHE.update(keep)
+            _FP32_PRECISION_CACHE[_FP32_API_CHOICE_CACHE_KEY] = str(api_choice)
 
-        cache_key = (
-            "cuda_fp32_precision_new"
-            if use_new_api
-            else "cuda_fp32_precision_old"
-        )
-        cache_val = (
-            "tf32"
-            if use_tf32
-            else ("ieee" if use_new_api else ("high" if use_tf32 else "highest"))
-        )
-        if _FP32_PRECISION_CACHE.get(cache_key) == cache_val:
+        if _FP32_PRECISION_CACHE.get(cache_key) == "1":
             return
-        _FP32_PRECISION_CACHE[cache_key] = cache_val
 
-    if api_choice == "legacy_only":
-        with contextlib.suppress(Exception):
-            torch.backends.cuda.matmul.allow_tf32 = bool(use_tf32)
-        with contextlib.suppress(Exception):
-            torch.backends.cudnn.allow_tf32 = bool(use_tf32)
-        return
-
-    if api_choice == "new_api":
-        prec = "tf32" if use_tf32 else "ieee"
-        with contextlib.suppress(Exception):
-            torch.backends.fp32_precision = prec
-        with contextlib.suppress(Exception):
-            torch.backends.cuda.matmul.fp32_precision = prec
-        cudnn = getattr(torch.backends, "cudnn", None)
-        if cudnn is not None and hasattr(cudnn, "fp32_precision"):
+    did_apply = False
+    try:
+        if api_choice == "legacy_only":
             with contextlib.suppress(Exception):
-                cudnn.fp32_precision = prec
-        _install_matmul_precision_legacy_shim_if_needed()
-        return
-
-    precision = "high" if use_tf32 else "highest"
-    set_prec = getattr(torch, "set_float32_matmul_precision", None)
-    used_set_prec = False
-    if api_choice == "legacy_setter" and callable(set_prec):
-        with contextlib.suppress(Exception):
-            set_prec(str(precision))
-            used_set_prec = True
-    else:
-        with contextlib.suppress(Exception):
-            torch.backends.cuda.matmul.allow_tf32 = bool(use_tf32)
-
-    if used_set_prec:
-        cudnn = getattr(torch.backends, "cudnn", None)
-        if cudnn is not None and hasattr(cudnn, "fp32_precision"):
+                torch.backends.cuda.matmul.allow_tf32 = bool(use_tf32)
             with contextlib.suppress(Exception):
-                cudnn.fp32_precision = ("tf32" if use_tf32 else "ieee")
+                torch.backends.cudnn.allow_tf32 = bool(use_tf32)
+            did_apply = True
+            return
+
+        if api_choice == "new_api":
+            prec = "tf32" if use_tf32 else "ieee"
+            with contextlib.suppress(Exception):
+                torch.backends.fp32_precision = prec
+            with contextlib.suppress(Exception):
+                torch.backends.cuda.matmul.fp32_precision = prec
+            cudnn = getattr(torch.backends, "cudnn", None)
+            if cudnn is not None and hasattr(cudnn, "fp32_precision"):
+                with contextlib.suppress(Exception):
+                    cudnn.fp32_precision = prec
+            _install_matmul_precision_legacy_shim_if_needed()
+            did_apply = True
+            return
+
+        precision = "high" if use_tf32 else "highest"
+        set_prec = getattr(torch, "set_float32_matmul_precision", None)
+        used_set_prec = False
+        if api_choice == "legacy_setter" and callable(set_prec):
+            with contextlib.suppress(Exception):
+                set_prec(str(precision))
+                used_set_prec = True
+        else:
+            with contextlib.suppress(Exception):
+                torch.backends.cuda.matmul.allow_tf32 = bool(use_tf32)
+
+        if used_set_prec:
+            cudnn = getattr(torch.backends, "cudnn", None)
+            if cudnn is not None and hasattr(cudnn, "fp32_precision"):
+                with contextlib.suppress(Exception):
+                    cudnn.fp32_precision = ("tf32" if use_tf32 else "ieee")
+            else:
+                with contextlib.suppress(Exception):
+                    torch.backends.cudnn.allow_tf32 = bool(use_tf32)
         else:
             with contextlib.suppress(Exception):
                 torch.backends.cudnn.allow_tf32 = bool(use_tf32)
-    else:
-        with contextlib.suppress(Exception):
-            torch.backends.cudnn.allow_tf32 = bool(use_tf32)
+        did_apply = True
+    finally:
+        if did_apply:
+            with _mutex_lock("_FP32_PRECISION_LOCK"):
+                _FP32_PRECISION_CACHE[cache_key] = "1"
 
 
 def timezone_from(name: Optional[str] = None) -> Optional[tzinfo]:
