@@ -1732,16 +1732,21 @@ class DotProductAttention(nn.Module):
             and self.hd
         )
         self._force_pt: bool = False
-        self._disable_te: bool = bool(env_bool("ENN_TE_MHA_DISABLE", False))
+        self._disable_te: bool = bool(env_bool("ENN_TE_DPA_DISABLE", False))
         self._auto_disable_te_on_zero: bool = bool(
-            env_bool("ENN_TE_MHA_AUTO_DISABLE_ON_ZERO", True)
+            env_bool("ENN_TE_DPA_AUTO_DISABLE_ON_ZERO", True)
         )
         self._auto_disable_te_check_every: int = max(
-            1,
-            _env_int("ENN_TE_MHA_AUTO_DISABLE_CHECK_EVERY", 128),
+            1, _env_int("ENN_TE_DPA_AUTO_DISABLE_CHECK_EVERY", 128)
         )
         self._auto_disable_te_check_count: int = 0
         self._auto_disable_te_logged: bool = False
+        self._te_require_contig: bool = bool(
+            env_bool("ENN_TE_DPA_REQUIRE_CONTIGUOUS", True)
+        )
+        self._te_force_contig: bool = bool(
+            env_bool("ENN_TE_DPA_FORCE_CONTIGUOUS", True)
+        )
         self._te_attn, self._te_mask_param, self._te_mask_type_param = (
             None,
             None,
@@ -1952,9 +1957,32 @@ class DotProductAttention(nn.Module):
                 ):
                     use_te = False
         if use_te:
-            q_te = q_bshd.transpose(1, 2).contiguous()
-            k_te = k_bshd.transpose(1, 2).contiguous()
-            v_te = v_bshd.transpose(1, 2).contiguous()
+            q_te = q_bshd.transpose(1, 2)
+            k_te = k_bshd.transpose(1, 2)
+            v_te = v_bshd.transpose(1, 2)
+            if self._te_require_contig:
+                ok = (
+                    q_te.is_contiguous()
+                    and k_te.is_contiguous()
+                    and v_te.is_contiguous()
+                    and int(q_te.stride(-1)) == 1
+                    and int(k_te.stride(-1)) == 1
+                    and int(v_te.stride(-1)) == 1
+                )
+                if (not ok) and self._te_force_contig:
+                    q_te = q_te.contiguous()
+                    k_te = k_te.contiguous()
+                    v_te = v_te.contiguous()
+                    ok = (
+                        q_te.is_contiguous()
+                        and k_te.is_contiguous()
+                        and v_te.is_contiguous()
+                        and int(q_te.stride(-1)) == 1
+                        and int(k_te.stride(-1)) == 1
+                        and int(v_te.stride(-1)) == 1
+                    )
+                if not ok:
+                    use_te = False
             te_kwargs: dict[str, Any] = {}
             if self._te_supports_attention_dropout:
                 te_kwargs["attention_dropout"] = dropout_val
@@ -1982,43 +2010,47 @@ class DotProductAttention(nn.Module):
             else:
                 out_te = out_te.transpose(1, 2).contiguous()
                 if (
-                    (not self._disable_te)
-                    and self._auto_disable_te_on_zero
+                    self._auto_disable_te_on_zero
                     and isinstance(out_te, torch.Tensor)
                     and out_te.numel() > 0
                     and getattr(out_te.device, "type", None) == "cuda"
                 ):
                     self._auto_disable_te_check_count += 1
-                    check_now = self._auto_disable_te_check_count == 1 or (
-                        self._auto_disable_te_check_count
-                        % self._auto_disable_te_check_every
-                    ) == 0
+                    check_now = (
+                        self._auto_disable_te_check_count == 1
+                        or (
+                            self._auto_disable_te_check_count
+                            % int(self._auto_disable_te_check_every)
+                        )
+                        == 0
+                    )
                     if check_now:
                         with contextlib.suppress(Exception):
                             out_abs = float(out_te.detach().abs().max().item())
                             if out_abs == 0.0:
-                                q_abs = float(q.detach().abs().max().item())
-                                k_abs = float(k.detach().abs().max().item())
-                                v_abs = float(v.detach().abs().max().item())
+                                q_abs = float(q_bshd.detach().abs().max().item())
+                                k_abs = float(k_bshd.detach().abs().max().item())
+                                v_abs = float(v_bshd.detach().abs().max().item())
                                 if max(q_abs, k_abs, v_abs) > 0.0:
                                     if not self._auto_disable_te_logged:
                                         self._auto_disable_te_logged = True
                                         warnings.warn(
-                                            "[ENN] TE MHA produced all-zero output on CUDA despite non-zero inputs; disabling TE MHA for this process and falling back to PyTorch attention.",
+                                            "[ENN] TE DPA produced all-zero output on CUDA despite non-zero inputs; "
+                                            "disabling TE DPA for this process and falling back to PyTorch attention.",
                                             UserWarning,
                                             stacklevel=2,
                                         )
                                     self._disable_te = True
                                     self._force_pt = True
                                     use_te = False
-                try:
-                    B_, H_, L_, D_ = q_bshd.shape
-                    flops = 4.0 * B_ * H_ * L_ * k_bshd.shape[2] * D_
-                    if FLOP_PROFILER is not None and not tracing:
-                        FLOP_PROFILER.add("DotProductAttention", float(flops))
-                except:
-                    pass
                 if use_te:
+                    try:
+                        B_, H_, L_, D_ = q_bshd.shape
+                        flops = 4.0 * B_ * H_ * L_ * k_bshd.shape[2] * D_
+                        if FLOP_PROFILER is not None and not tracing:
+                            FLOP_PROFILER.add("DotProductAttention", float(flops))
+                    except Exception:
+                        pass
                     return out_te
         final_mask: torch.Tensor | None = None
         sdpa_is_causal = bool(is_causal)
@@ -2108,19 +2140,27 @@ class DotProductAttention(nn.Module):
                     raise RuntimeError("Attn mask mismatch")
                 sdpa_kwargs["is_causal"] = False
             sdpa_out = None
-            backends = get_dpa_backends() or []
             try:
-                from torch.nn.attention import sdpa_kernel
+                from torch.nn.attention import SDPBackend, sdpa_kernel
 
-                if backends:
-                    with sdpa_kernel(backends):
-                        sdpa_out = (
-                            torch.nn.functional.scaled_dot_product_attention(
+                backend_order = [
+                    SDPBackend.FLASH_ATTENTION,
+                    SDPBackend.CUDNN_ATTENTION,
+                    SDPBackend.EFFICIENT_ATTENTION,
+                    SDPBackend.MATH,
+                ]
+                for be in backend_order:
+                    try:
+                        with sdpa_kernel([be]):
+                            sdpa_out = torch.nn.functional.scaled_dot_product_attention(
                                 q_bshd, k_bshd, v_bshd, **sdpa_kwargs
                             )
-                        )
+                        break
+                    except Exception:
+                        sdpa_out = None
+                        continue
             except Exception:
-                pass
+                sdpa_out = None
             if sdpa_out is None:
                 sdpa_out = torch.nn.functional.scaled_dot_product_attention(
                     q_bshd, k_bshd, v_bshd, **sdpa_kwargs
