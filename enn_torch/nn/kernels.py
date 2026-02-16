@@ -1732,6 +1732,11 @@ class DotProductAttention(nn.Module):
             and self.hd
         )
         self._force_pt: bool = False
+        self._disable_te: bool = bool(env_bool("ENN_TE_MHA_DISABLE", False))
+        self._auto_disable_te_on_zero: bool = bool(
+            env_bool("ENN_TE_MHA_AUTO_DISABLE_ON_ZERO", True)
+        )
+        self._auto_disable_te_logged: bool = False
         self._te_attn, self._te_mask_param, self._te_mask_type_param = (
             None,
             None,
@@ -1895,14 +1900,16 @@ class DotProductAttention(nn.Module):
             is_compiling = torch.compiler.is_compiling()
         except:
             is_compiling = False
+        d_type = str(getattr(q_bshd.device, "type", "cpu"))
         use_te = (
             self._te_ok
             and self.te_first
             and not self._force_pt
+            and not self._disable_te
             and self._te_attn is not None
             and not is_compiling
             and not tracing
-            and q_bshd.is_cuda
+            and d_type == "cuda"
             and q_bshd.dtype in (torch.float16, torch.bfloat16)
         )
         te_mask, te_mask_type = None, None
@@ -1969,6 +1976,30 @@ class DotProductAttention(nn.Module):
                 use_te = False
             else:
                 out_te = out_te.transpose(1, 2).contiguous()
+                if (
+                    (not self._disable_te)
+                    and self._auto_disable_te_on_zero
+                    and isinstance(out_te, torch.Tensor)
+                    and out_te.numel() > 0
+                    and getattr(out_te.device, "type", None) == "cuda"
+                ):
+                    with contextlib.suppress(Exception):
+                        out_abs = float(out_te.detach().abs().max().item())
+                        if out_abs == 0.0:
+                            q_abs = float(q.detach().abs().max().item())
+                            k_abs = float(k.detach().abs().max().item())
+                            v_abs = float(v.detach().abs().max().item())
+                            if max(q_abs, k_abs, v_abs) > 0.0:
+                                if not self._auto_disable_te_logged:
+                                    self._auto_disable_te_logged = True
+                                    warnings.warn(
+                                        "[ENN] TE MHA produced all-zero output on CUDA despite non-zero inputs; disabling TE MHA for this process and falling back to PyTorch attention.",
+                                        UserWarning,
+                                        stacklevel=2,
+                                    )
+                                self._disable_te = True
+                                self._force_pt = True
+                                use_te = False
                 try:
                     B_, H_, L_, D_ = q_bshd.shape
                     flops = 4.0 * B_ * H_ * L_ * k_bshd.shape[2] * D_
@@ -1976,7 +2007,8 @@ class DotProductAttention(nn.Module):
                         FLOP_PROFILER.add("DotProductAttention", float(flops))
                 except:
                     pass
-                return out_te
+                if use_te:
+                    return out_te
         final_mask: torch.Tensor | None = None
         sdpa_is_causal = bool(is_causal)
         if bias_float is None:
