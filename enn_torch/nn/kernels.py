@@ -1736,6 +1736,11 @@ class DotProductAttention(nn.Module):
         self._auto_disable_te_on_zero: bool = bool(
             env_bool("ENN_TE_MHA_AUTO_DISABLE_ON_ZERO", True)
         )
+        self._auto_disable_te_check_every: int = max(
+            1,
+            _env_int("ENN_TE_MHA_AUTO_DISABLE_CHECK_EVERY", 128),
+        )
+        self._auto_disable_te_check_count: int = 0
         self._auto_disable_te_logged: bool = False
         self._te_attn, self._te_mask_param, self._te_mask_type_param = (
             None,
@@ -1983,23 +1988,29 @@ class DotProductAttention(nn.Module):
                     and out_te.numel() > 0
                     and getattr(out_te.device, "type", None) == "cuda"
                 ):
-                    with contextlib.suppress(Exception):
-                        out_abs = float(out_te.detach().abs().max().item())
-                        if out_abs == 0.0:
-                            q_abs = float(q.detach().abs().max().item())
-                            k_abs = float(k.detach().abs().max().item())
-                            v_abs = float(v.detach().abs().max().item())
-                            if max(q_abs, k_abs, v_abs) > 0.0:
-                                if not self._auto_disable_te_logged:
-                                    self._auto_disable_te_logged = True
-                                    warnings.warn(
-                                        "[ENN] TE MHA produced all-zero output on CUDA despite non-zero inputs; disabling TE MHA for this process and falling back to PyTorch attention.",
-                                        UserWarning,
-                                        stacklevel=2,
-                                    )
-                                self._disable_te = True
-                                self._force_pt = True
-                                use_te = False
+                    self._auto_disable_te_check_count += 1
+                    check_now = self._auto_disable_te_check_count == 1 or (
+                        self._auto_disable_te_check_count
+                        % self._auto_disable_te_check_every
+                    ) == 0
+                    if check_now:
+                        with contextlib.suppress(Exception):
+                            out_abs = float(out_te.detach().abs().max().item())
+                            if out_abs == 0.0:
+                                q_abs = float(q.detach().abs().max().item())
+                                k_abs = float(k.detach().abs().max().item())
+                                v_abs = float(v.detach().abs().max().item())
+                                if max(q_abs, k_abs, v_abs) > 0.0:
+                                    if not self._auto_disable_te_logged:
+                                        self._auto_disable_te_logged = True
+                                        warnings.warn(
+                                            "[ENN] TE MHA produced all-zero output on CUDA despite non-zero inputs; disabling TE MHA for this process and falling back to PyTorch attention.",
+                                            UserWarning,
+                                            stacklevel=2,
+                                        )
+                                    self._disable_te = True
+                                    self._force_pt = True
+                                    use_te = False
                 try:
                     B_, H_, L_, D_ = q_bshd.shape
                     flops = 4.0 * B_ * H_ * L_ * k_bshd.shape[2] * D_
