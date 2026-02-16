@@ -1686,6 +1686,36 @@ class Fuser(nn.Module):
             device=all_tokens.device,
             dtype=all_tokens.dtype,
         )
+        if (not torch.is_grad_enabled()) and (getattr(all_tokens.device, "type", None) == "cuda"):
+            if env_bool("ENN_PRED_COLLAPSE_STAGE_DIAG", default=False):
+                with contextlib.suppress(Exception):
+                    def _pair_stats(t: torch.Tensor) -> dict[str, object]:
+                        tt = t.detach()
+                        b = int(tt.shape[0]) if tt.ndim > 0 else 1
+                        if b >= 2:
+                            d = (tt[0] - tt[1]).abs()
+                            diff = float(d.max().item())
+                        else:
+                            diff = 0.0
+                        sl = tt[: min(2, b)]
+                        finite = bool(torch.isfinite(sl).all().item()) if sl.is_floating_point() else True
+                        nonfinite = int((~torch.isfinite(sl)).sum().item()) if sl.is_floating_point() else 0
+                        absmax = float(sl.abs().max().item()) if sl.numel() else 0.0
+                        return {
+                            "shape": [int(x) for x in tt.shape],
+                            "dtype": str(tt.dtype),
+                            "device": str(tt.device),
+                            "pair_diff_max": diff,
+                            "pair_absmax": absmax,
+                            "pair_finite": finite,
+                            "pair_nonfinite": nonfinite,
+                        }
+
+                    self._enn_last_fuser_diag = {
+                        "all_tokens": _pair_stats(all_tokens),
+                        "attn_bias": (_pair_stats(attn_bias) if isinstance(attn_bias, torch.Tensor) else None),
+                        "task_count": int(len(token_sets)),
+                    }
         infer_cuda = bool(
             (not torch.is_grad_enabled())
             and (not self.training)
@@ -1717,6 +1747,22 @@ class Fuser(nn.Module):
                 fused_tokens = self.perceiver(all_tokens, attn_bias=attn_bias)
             graph_break()
             context = self.decode(fused_tokens, apply_norm=True)
+
+        if (not torch.is_grad_enabled()) and (getattr(fused_tokens.device, "type", None) == "cuda"):
+            if env_bool("ENN_PRED_COLLAPSE_STAGE_DIAG", default=False):
+                with contextlib.suppress(Exception):
+                    prev = getattr(self, "_enn_last_fuser_diag", None)
+                    if isinstance(prev, dict):
+                        prev["fused_tokens"] = {
+                            "pair_absmax": float(fused_tokens[:2].abs().max().item()),
+                            "pair_nonfinite": int((~torch.isfinite(fused_tokens[:2])).sum().item())
+                            if fused_tokens.is_floating_point() else 0,
+                        }
+                        prev["context"] = {
+                            "pair_absmax": float(context[:2].abs().max().item()),
+                            "pair_nonfinite": int((~torch.isfinite(context[:2])).sum().item())
+                            if context.is_floating_point() else 0,
+                        }
         if return_temporal_state:
             if state_is_map:
                 return fused_tokens, context, next_state_map

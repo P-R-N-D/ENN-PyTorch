@@ -52,6 +52,7 @@ _DEVICE_STATS_CACHE: dict[Tuple[str, int], "Device"] = {}
 _ENN_MP_MAIN_STUB_PATH: Optional[str] = None
 _EMPTY_CACHE_LAST_CALL_S_BY_DEVICE: dict[Tuple[str, int], float] = {}
 _FP32_PRECISION_CACHE: dict[str, str] = {}
+_FP32_LAST_API_CHOICE: str | None = None
 _LOGGER = logging.getLogger(__name__)
 
 
@@ -78,6 +79,11 @@ def _cuda_fp32_precision_api_choice(*, use_new_api: bool) -> str:
     except Exception:
         pass
     return "legacy_only"
+
+
+def _cuda_fp32_precision_api_choice_from_env() -> str:
+    use_new_api = bool(env_bool("ENN_TF32_USE_NEW_API", default=False))
+    return _cuda_fp32_precision_api_choice(use_new_api=use_new_api)
 
 
 def _clear_fp32_precision_api_cache() -> None:
@@ -1193,10 +1199,14 @@ def set_float32_precision(
             use_tf32 = False
             break
 
-    tf32_use_new_api = _env_flag("ENN_TF32_USE_NEW_API", default=False)
-    api_choice = _cuda_fp32_precision_api_choice(
-        use_new_api=bool(tf32_use_new_api)
-    )
+    api_choice = _cuda_fp32_precision_api_choice_from_env()
+    global _FP32_LAST_API_CHOICE
+    if _FP32_LAST_API_CHOICE is None:
+        _FP32_LAST_API_CHOICE = api_choice
+    elif _FP32_LAST_API_CHOICE != api_choice:
+        with contextlib.suppress(Exception):
+            _FP32_PRECISION_CACHE.clear()
+        _FP32_LAST_API_CHOICE = api_choice
 
     with _mutex_lock("_FP32_PRECISION_LOCK"):
         use_new_api = bool(api_choice == "new_api")

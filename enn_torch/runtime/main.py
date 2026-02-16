@@ -3511,6 +3511,43 @@ def infer(
                         "diff_pred_denorm_uncal": _pair_diff_max(pred_denorm),
                     }
 
+                    if env_bool("ENN_PRED_COLLAPSE_STAGE_DIAG", default=False):
+                        with contextlib.suppress(Exception):
+                            fdiag = None
+                            pdiag = None
+                            mm = run_model.module if hasattr(run_model, "module") else run_model
+                            fuser = getattr(mm, "fuser", None) or getattr(mm, "processor", None)
+                            if fuser is not None:
+                                fdiag = getattr(fuser, "_enn_last_fuser_diag", None)
+                                perceiver = getattr(fuser, "perceiver", None)
+                                if perceiver is not None:
+                                    pdiag = getattr(perceiver, "_enn_last_perceiver_diag", None)
+
+                            raw_stage = None
+                            with contextlib.suppress(Exception):
+                                core = getattr(mm, "_run_forward_core", None)
+                                if callable(core):
+                                    Xi_raw = Xi2[:2].detach()
+                                    _raw_pred, _raw_st, _raw_p, raw_assembled, _raw_enhanced, _raw_delta, raw_tokens, _raw_refined = core(
+                                        Xi_raw,
+                                        export=False,
+                                        sanitize_nan=False,
+                                        calibrate_output=bool(calibrate_pred_output),
+                                    )
+                                    raw_stage = {
+                                        "raw_tokens_nonfinite": int((~torch.isfinite(raw_tokens)).sum().item()) if raw_tokens.is_floating_point() else 0,
+                                        "raw_context_nonfinite": int((~torch.isfinite(raw_assembled)).sum().item()) if raw_assembled.is_floating_point() else 0,
+                                        "raw_tokens_absmax": float(raw_tokens.abs().max().item()) if raw_tokens.numel() else 0.0,
+                                        "raw_context_absmax": float(raw_assembled.abs().max().item()) if raw_assembled.numel() else 0.0,
+                                    }
+
+                            diag.setdefault("hooks", {})
+                            hooks = diag.get("hooks")
+                            if isinstance(hooks, dict):
+                                hooks["fuser"] = fdiag
+                                hooks["perceiver"] = pdiag
+                                hooks["raw_pass"] = raw_stage
+
                     with contextlib.suppress(Exception):
                         z2 = _try_normalize_x(Xi2)
                         if isinstance(z2, torch.Tensor):
