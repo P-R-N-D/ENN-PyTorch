@@ -7,6 +7,7 @@ import datetime
 import gc
 import glob
 import importlib
+import inspect
 import itertools
 import logging
 import math
@@ -3191,7 +3192,10 @@ def infer(
             collapse_stage_diag_enabled = bool(
                 env_bool("ENN_PRED_COLLAPSE_STAGE_DIAG", default=True)
             )
-            collapse_stage_diag_done = False
+            collapse_stage_diag_once = bool(
+                env_bool("ENN_PRED_COLLAPSE_STAGE_DIAG_ONCE", default=True)
+            )
+            _collapse_stage_diag_done = False
 
             def _tensor_diag(t: object, *, sample_n: int = 64) -> dict[str, object]:
                 if not torch.is_tensor(t):
@@ -3261,6 +3265,147 @@ def infer(
                 except Exception:
                     return None
 
+            def _brief_tensor(t: object, *, max_elems: int = 64) -> dict[str, object] | None:
+                try:
+                    if not isinstance(t, torch.Tensor):
+                        return None
+                    d: dict[str, object] = {}
+                    d["shape"] = [int(x) for x in t.shape]
+                    d["dtype"] = str(t.dtype)
+                    d["device"] = str(t.device)
+                    d["numel"] = int(t.numel())
+                    if t.numel() > 0:
+                        td = t.detach()
+                        if td.is_floating_point():
+                            with contextlib.suppress(Exception):
+                                d["finite"] = bool(torch.isfinite(td).all().item())
+                            with contextlib.suppress(Exception):
+                                d["abs_max"] = float(td.abs().max().item())
+                            with contextlib.suppress(Exception):
+                                d["min"] = float(td.min().item())
+                            with contextlib.suppress(Exception):
+                                d["max"] = float(td.max().item())
+                        flat = td.reshape(-1)
+                        n = int(min(int(max_elems), int(flat.numel())))
+                        with contextlib.suppress(Exception):
+                            d["sample"] = [float(x) for x in flat[:n].to("cpu")]
+                    return d
+                except Exception:
+                    return None
+
+            def _unwrap_to_model_core(m: object) -> object:
+                cur = m
+                seen: set[int] = set()
+                for _ in range(16):
+                    if cur is None:
+                        break
+                    cid = id(cur)
+                    if cid in seen:
+                        break
+                    seen.add(cid)
+                    nxt = getattr(cur, "module", None)
+                    if isinstance(nxt, torch.nn.Module) and nxt is not cur:
+                        cur = nxt
+                        continue
+                    break
+                return cur
+
+            def _dump_collapse_stage_diag_from_model(
+                Xi2: torch.Tensor,
+                *,
+                where: str,
+                x_diff: float,
+                y_diff_cal: float,
+            ) -> None:
+                nonlocal _collapse_stage_diag_done
+                if not collapse_stage_diag_enabled:
+                    return
+                if collapse_stage_diag_once and _collapse_stage_diag_done:
+                    return
+                if not isinstance(Xi2, torch.Tensor) or Xi2.ndim < 2 or int(Xi2.shape[0]) < 2:
+                    return
+                try:
+                    m0 = _unwrap_to_model_core(run_model_uncompiled if "run_model_uncompiled" in locals() else run_model)
+                    m0 = _unwrap_to_model_core(m0)
+                    fn = getattr(m0, "_run_forward_core", None)
+                    if not callable(fn):
+                        return
+                    base_dtype = None
+                    with contextlib.suppress(Exception):
+                        p0 = next(iter(m0.parameters()))
+                        if isinstance(p0, torch.Tensor):
+                            base_dtype = p0.dtype
+                    kwargs = dict(
+                        export=False,
+                        temporal_state=None,
+                        causal_mask=None,
+                        sanitize_nan=True,
+                        calibrate_output=bool(calibrate_pred_output),
+                        device=None,
+                        base_dtype=base_dtype,
+                    )
+                    with contextlib.suppress(Exception):
+                        sig = inspect.signature(fn)
+                        kwargs = {k: v for k, v in kwargs.items() if k in sig.parameters}
+                    with torch.no_grad():
+                        out = fn(Xi2, **kwargs)
+                    if not (isinstance(out, tuple) and len(out) >= 8):
+                        return
+                    pred, _next_state, p, assembled, enhanced, delta, tokens, refined = out[:8]
+                    y_hat = assembled + (delta * 0.5 if (p is None) else (p.to(dtype=assembled.dtype) * delta))
+                    pred_denorm_uncal = None
+                    with contextlib.suppress(Exception):
+                        scaler = getattr(m0, "scaler", None)
+                        if scaler is not None and hasattr(scaler, "denormalize_y"):
+                            pred_denorm_uncal = scaler.denormalize_y(y_hat).reshape(int(y_hat.shape[0]), *tuple(getattr(m0, "out_shape", ())))
+                    diag: dict[str, object] = {
+                        "where": str(where),
+                        "rank": int(rank),
+                        "seen_batches": int(seen_batches),
+                        "x_diff": float(x_diff),
+                        "y_diff_calibrated": float(y_diff_cal),
+                        "atol": float(broadcast_atol),
+                        "calibrate_pred_output": bool(calibrate_pred_output),
+                        "diff_tokens": float(_pair_diff_max(tokens) or 0.0),
+                        "diff_assembled_z": float(_pair_diff_max(assembled) or 0.0),
+                        "diff_refined": float(_pair_diff_max(refined) or 0.0),
+                        "diff_delta": float(_pair_diff_max(delta) or 0.0),
+                        "diff_p": float(_pair_diff_max(p) if isinstance(p, torch.Tensor) else 0.0),
+                        "diff_y_hat_z": float(_pair_diff_max(y_hat) or 0.0),
+                        "diff_pred_final": float(_pair_diff_max(pred) or 0.0),
+                        "diff_pred_denorm_uncal": float(_pair_diff_max(pred_denorm_uncal) if isinstance(pred_denorm_uncal, torch.Tensor) else 0.0),
+                        "X": _brief_tensor(Xi2),
+                        "tokens": _brief_tensor(tokens),
+                        "assembled_z": _brief_tensor(assembled),
+                        "refined": _brief_tensor(refined),
+                        "y_hat_z": _brief_tensor(y_hat),
+                        "pred_final": _brief_tensor(pred),
+                        "pred_denorm_uncal": _brief_tensor(pred_denorm_uncal),
+                    }
+                    fname = f"collapse_stage_diag.rank{int(rank)}.batch{int(seen_batches):06d}.json"
+                    out_path = os.path.join(str(chunk_dir), fname)
+                    with contextlib.suppress(Exception):
+                        os.makedirs(str(chunk_dir), exist_ok=True)
+                    collate.write_json(out_path, diag, indent=2)
+                    with contextlib.suppress(Exception):
+                        _maybe_write_diag_copy(fname, diag)
+                    _LOGGER.warning(
+                        "[infer][collapse-stage] where=%s diffs: tokens=%.6g assembled_z=%.6g refined=%.6g delta=%.6g p=%.6g y_hat_z=%.6g pred_final=%.6g pred_denorm_uncal=%.6g (saved %s)",
+                        str(where),
+                        float(diag["diff_tokens"]),
+                        float(diag["diff_assembled_z"]),
+                        float(diag["diff_refined"]),
+                        float(diag["diff_delta"]),
+                        float(diag["diff_p"]),
+                        float(diag["diff_y_hat_z"]),
+                        float(diag["diff_pred_final"]),
+                        float(diag["diff_pred_denorm_uncal"]),
+                        str(out_path),
+                    )
+                    _collapse_stage_diag_done = True
+                except Exception:
+                    return
+
             def _unwrap_for_stage_diag(m: object) -> torch.nn.Module | None:
                 if not isinstance(m, torch.nn.Module):
                     return None
@@ -3294,8 +3439,10 @@ def infer(
                 x_diff: float,
                 y_diff_cal: float,
             ) -> None:
-                nonlocal collapse_stage_diag_done
-                if (not collapse_stage_diag_enabled) or collapse_stage_diag_done:
+                nonlocal _collapse_stage_diag_done
+                if not collapse_stage_diag_enabled:
+                    return
+                if collapse_stage_diag_once and _collapse_stage_diag_done:
                     return
                 if str(dev_type) != "cuda":
                     return
@@ -3395,7 +3542,7 @@ def infer(
                         str(out_path),
                         str(_collapse_diag_out_dir),
                     )
-                    collapse_stage_diag_done = True
+                    _collapse_stage_diag_done = True
                 except Exception:
                     return
             collapse_force_fp32 = bool(
@@ -4128,6 +4275,12 @@ def infer(
                                 y1 = preds[1].detach()
                                 y_diff = (y0 - y1).abs().max()
                                 if float(y_diff.item()) <= float(broadcast_atol):
+                                    _dump_collapse_stage_diag_from_model(
+                                        Xi,
+                                        where="broadcast_trigger",
+                                        x_diff=float(x_diff.item()),
+                                        y_diff_cal=float(y_diff.item()),
+                                    )
                                     with contextlib.suppress(Exception):
                                         _diag_collapse_once(
                                             Xi2=Xi[:2].detach(),
