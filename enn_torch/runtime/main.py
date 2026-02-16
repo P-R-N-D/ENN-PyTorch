@@ -3364,6 +3364,12 @@ def infer(
                         "diff_pred_denorm_uncal": _pair_diff_max(pred_denorm),
                     }
 
+                    with contextlib.suppress(Exception):
+                        z2 = _try_normalize_x(Xi2)
+                        if isinstance(z2, torch.Tensor):
+                            diag["Z_norm"] = _tensor_diag(z2)
+                            diag["diff_z_norm"] = _pair_diff_max(z2)
+
                     out_path = os.path.join(
                         str(chunk_dir),
                         f"collapse_stage_diag.rank{int(rank)}.batch{int(seen_batches):06d}.json",
@@ -3371,13 +3377,23 @@ def infer(
                     with contextlib.suppress(Exception):
                         os.makedirs(str(chunk_dir), exist_ok=True)
                     collate.write_json(out_path, diag, indent=2)
+                    _maybe_write_diag_copy(
+                        f"collapse_stage_diag.rank{int(rank)}.batch{int(seen_batches):06d}.json",
+                        diag,
+                    )
                     _LOGGER.warning(
-                        "[infer][collapse-stage] dumped stage diag to %s (diff_context=%.6g diff_refined=%.6g diff_y_hat=%.6g diff_pred=%.6g)",
-                        str(out_path),
+                        "[infer][collapse-stage] diff: "
+                        "Z_norm=%.6g tokens=%.6g ctx_z=%.6g refined=%.6g y_hat_z=%.6g pred=%.6g pred_denorm_uncal=%.6g "
+                        "(dumped %s ; copy_dir=%s)",
+                        float(diag.get("diff_z_norm") or 0.0),
+                        float(diag.get("diff_tokens") or 0.0),
                         float(diag.get("diff_context_z") or 0.0),
                         float(diag.get("diff_refined") or 0.0),
                         float(diag.get("diff_y_hat_z") or 0.0),
                         float(diag.get("diff_pred_runtime") or 0.0),
+                        float(diag.get("diff_pred_denorm_uncal") or 0.0),
+                        str(out_path),
+                        str(_collapse_diag_out_dir),
                     )
                     collapse_stage_diag_done = True
                 except Exception:
@@ -3394,6 +3410,23 @@ def infer(
             collapse_diag_max_elems = int(env_int("ENN_PRED_COLLAPSE_DIAG_MAX_ELEMS", 64) or 64)
             collapse_diag_once = bool(env_bool("ENN_PRED_COLLAPSE_DIAG_ONCE", True))
             _collapse_diag_done = False
+
+            _collapse_diag_out_dir = (
+                str(os.environ.get("ENN_PRED_COLLAPSE_DIAG_DIR") or "").strip()
+            )
+            if not _collapse_diag_out_dir:
+                _collapse_diag_out_dir = str(os.environ.get("ENN_RETURN_DIR") or "").strip()
+            if not _collapse_diag_out_dir:
+                _collapse_diag_out_dir = os.path.join(tempfile.gettempdir(), "enn_collapse_diag")
+
+            def _maybe_write_diag_copy(filename: str, payload: dict[str, object]) -> None:
+                with contextlib.suppress(Exception):
+                    out_dir = str(_collapse_diag_out_dir or "").strip()
+                    if not out_dir:
+                        return
+                    os.makedirs(out_dir, exist_ok=True)
+                    out_path = os.path.join(out_dir, filename)
+                    collate.write_json(out_path, payload, indent=2)
 
             def _brief_stats(t: torch.Tensor) -> dict[str, object]:
                 try:
@@ -3526,9 +3559,11 @@ def infer(
                     if collapse_diag_save:
                         with contextlib.suppress(Exception):
                             os.makedirs(str(chunk_dir), exist_ok=True)
-                            fp = os.path.join(str(chunk_dir), f"collapse_diag.rank{int(rank)}.batch{int(seen_batches):06d}.json")
+                            fname = f"collapse_diag.rank{int(rank)}.batch{int(seen_batches):06d}.json"
+                            fp = os.path.join(str(chunk_dir), fname)
                             with open(fp, "w", encoding="utf-8") as f:
                                 json.dump(diag, f, ensure_ascii=False, indent=2)
+                            _maybe_write_diag_copy(fname, diag)
 
             collapse_switched_uncompiled = False
             calibrate_pred_output = bool(env_bool("ENN_PRED_CALIBRATE_OUTPUT", True))
