@@ -67,6 +67,7 @@ except Exception:
 
 try:
     _FLEX_KWARGS: set[str] = set()
+    _FLEX_KWARGS_LOCK = threading.Lock()
     from torch.nn.attention.flex_attention import (
         create_mask as _torch_create_mask,
     )
@@ -351,15 +352,17 @@ def _flex_retry_failed_enabled() -> bool:
     return bool(env_bool("ENN_FLEX_RETRY_FAILED", default=dbg))
 
 def _ensure_flex_kwargs_initialized() -> None:
-    global _FLEX_KWARGS
     if _FLEX_KWARGS:
         return
     if _torch_flex_attention is None:
         return
-    with contextlib.suppress(Exception):
-        _FLEX_KWARGS = set(
-            inspect.signature(_torch_flex_attention).parameters.keys()
-        )
+    with _FLEX_KWARGS_LOCK:
+        if _FLEX_KWARGS:
+            return
+        with contextlib.suppress(Exception):
+            _FLEX_KWARGS.update(
+                inspect.signature(_torch_flex_attention).parameters.keys()
+            )
     if (not _FLEX_KWARGS) and _flex_debug_enabled():
         _warn_once(
             "flexattn-debug-empty-kwargs",
@@ -2143,22 +2146,42 @@ class DotProductAttention(nn.Module):
             try:
                 from torch.nn.attention import SDPBackend, sdpa_kernel
 
-                backend_order = [
-                    SDPBackend.FLASH_ATTENTION,
-                    SDPBackend.CUDNN_ATTENTION,
-                    SDPBackend.EFFICIENT_ATTENTION,
-                    SDPBackend.MATH,
-                ]
-                for be in backend_order:
-                    try:
-                        with sdpa_kernel([be]):
-                            sdpa_out = torch.nn.functional.scaled_dot_product_attention(
-                                q_bshd, k_bshd, v_bshd, **sdpa_kwargs
-                            )
-                        break
-                    except Exception:
-                        sdpa_out = None
-                        continue
+                am = sdpa_kwargs.get("attn_mask", None)
+                if (
+                    env_bool("ENN_DPA_DROP_ALL_FALSE_MASK", default=True)
+                    and isinstance(am, torch.Tensor)
+                    and am.dtype == torch.bool
+                    and am.numel() > 0
+                ):
+                    with contextlib.suppress(Exception):
+                        if not bool(am.any().item()):
+                            q_abs = float(q_bshd.detach().abs().max().item())
+                            if q_abs > 0.0:
+                                warnings.warn(
+                                    "[ENN] DotProductAttention: attn_mask is all-False (no allowed positions). Dropping mask to avoid all-zero SDPA output. Check upstream key_padding_mask/attn_mask construction.",
+                                    UserWarning,
+                                    stacklevel=2,
+                                )
+                            sdpa_kwargs["attn_mask"] = None
+                            sdpa_kwargs["is_causal"] = bool(sdpa_is_causal)
+
+                backends = get_dpa_backends()
+                if backends and (sdpa_kwargs.get("attn_mask", None) is not None):
+                    backends = [be for be in backends if be != SDPBackend.FLASH_ATTENTION]
+                sdpa_ctx = sdpa_kernel(backends) if backends else contextlib.nullcontext()
+
+                with sdpa_ctx:
+                    with warnings.catch_warnings():
+                        if env_bool("ENN_SDPA_FILTER_WARNINGS", default=True):
+                            warnings.filterwarnings("ignore", message=".*Memory efficient kernel not used because:.*", category=UserWarning)
+                            warnings.filterwarnings("ignore", message=".*Memory Efficient attention has been runtime disabled.*", category=UserWarning)
+                            warnings.filterwarnings("ignore", message=".*Flash attention kernel not used because:.*", category=UserWarning)
+                            warnings.filterwarnings("ignore", message=".*Flash Attention does not support non-null attn_mask.*", category=UserWarning)
+                            warnings.filterwarnings("ignore", message=".*cuDNN attention kernel not used because:.*", category=UserWarning)
+                            warnings.filterwarnings("ignore", message=".*cuDNN attention has been runtime disabled.*", category=UserWarning)
+                        sdpa_out = torch.nn.functional.scaled_dot_product_attention(
+                            q_bshd, k_bshd, v_bshd, **sdpa_kwargs
+                        )
             except Exception:
                 sdpa_out = None
             if sdpa_out is None:
