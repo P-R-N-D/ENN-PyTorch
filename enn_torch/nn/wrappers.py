@@ -1663,7 +1663,10 @@ class Fuser(nn.Module):
                         causal_mask=causal_mask,
                     )
             else:
-                out_tokens = tmpl(x)
+                if isinstance(tmpl, Template):
+                    out_tokens = tmpl(x, causal_mask=causal_mask)
+                else:
+                    out_tokens = tmpl(x)
             if not isinstance(out_tokens, torch.Tensor):
                 raise TypeError(
                     f"Task '{name}' must return a torch.Tensor tokens (B,N,D); got {type(out_tokens)}"

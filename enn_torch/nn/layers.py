@@ -23,6 +23,7 @@ import torch.nn.functional as F
 from ..core.compat import StochasticDepth
 from ..core.concurrency import Mutex
 from ..core.datatypes import env_bool, env_int
+from ..core.policies import ATTENTION_POLICY, AttentionBackend
 from .activations import GeGLU
 from .graph import (
     is_checkpoint,
@@ -37,6 +38,7 @@ from .kernels import (
     FlexAttention,
     MultiHeadAttention,
     MultiScaleRetention,
+    _attention_math_bshd,
     _FLEX_KWARGS,
     _ensure_flex_kwargs_initialized,
 )
@@ -323,6 +325,60 @@ class _FlexDilatedScoreMod:
         neg = score.new_full((), torch.finfo(score.dtype).min)
         return torch.where(keep, score, neg)
 
+
+
+
+class _FlexKeyBiasScoreMod:
+    __slots__ = ("bias_bk", "per_batch")
+
+    def __init__(self: Self, bias_bk: torch.Tensor) -> None:
+        if (not torch.is_tensor(bias_bk)) or bias_bk.dim() != 2:
+            raise ValueError(f"bias_bk must be 2D (B_or_1,K); got {type(bias_bk)} {getattr(bias_bk,'shape',None)}")
+        self.bias_bk = bias_bk
+        self.per_batch = bool(int(bias_bk.shape[0]) > 1)
+
+    def set_bias(self: Self, bias_bk: torch.Tensor) -> None:
+        if (not torch.is_tensor(bias_bk)) or bias_bk.dim() != 2:
+            raise ValueError(f"bias_bk must be 2D (B_or_1,K); got {type(bias_bk)} {getattr(bias_bk,'shape',None)}")
+        self.bias_bk = bias_bk
+        self.per_batch = bool(int(bias_bk.shape[0]) > 1)
+
+    def __call__(
+        self: Self,
+        score: torch.Tensor,
+        b: torch.Tensor,
+        h: torch.Tensor,
+        q_idx: torch.Tensor,
+        kv_idx: torch.Tensor,
+    ) -> torch.Tensor:
+        del h, q_idx
+        if self.per_batch:
+            return score + self.bias_bk[b, kv_idx]
+        return score + self.bias_bk[0, kv_idx]
+
+
+def _coerce_attn_bias_to_bk(
+    attn_bias: torch.Tensor, *, B: int, K: int, like: torch.Tensor
+) -> torch.Tensor:
+    t = attn_bias
+    if t.dim() == 4:
+        if int(t.shape[-1]) != int(K):
+            raise RuntimeError(f"attn_bias K mismatch: {tuple(t.shape)} vs K={int(K)}")
+        b0 = int(t.shape[0])
+        if b0 not in (1, int(B)):
+            raise RuntimeError(f"attn_bias B mismatch: {tuple(t.shape)} vs B={int(B)}")
+        t = t.reshape(b0, int(K))
+    elif t.dim() == 2:
+        if int(t.shape[1]) != int(K) or int(t.shape[0]) not in (1, int(B)):
+            raise RuntimeError(f"attn_bias shape mismatch: {tuple(t.shape)} vs (1|B,K)=({int(B)},{int(K)})")
+    elif t.dim() == 1:
+        if int(t.numel()) != int(K):
+            raise RuntimeError(f"attn_bias len mismatch: {int(t.numel())} vs K={int(K)}")
+        t = t.view(1, int(K))
+    else:
+        raise RuntimeError(f"Unsupported attn_bias rank {int(t.dim())}: {tuple(t.shape)}")
+
+    return t.to(device=like.device, dtype=like.dtype, non_blocking=True).contiguous()
 
 class Retention(nn.Module):
     def __init__(
@@ -790,6 +846,8 @@ class Resampler(nn.Module):
         self.ffn = GeGLU(
             self.d_model, hid, out_dim=self.d_model, dropout=dropout
         )
+        self._disable_flex_bias_runtime: bool = False
+        self._flex_keybias_score_mod: Optional[_FlexKeyBiasScoreMod] = None
 
     def forward(
         self: Self,
@@ -817,14 +875,92 @@ class Resampler(nn.Module):
         q = self.q_proj(q_in).view(B, Lq, H, Dh).transpose(1, 2)
         k = self.k_proj(kv_in).view(B, Lk, H, Dh).transpose(1, 2)
         v = self.v_proj(kv_in).view(B, Lk, H, Dh).transpose(1, 2)
-        attn_out = self.attn(
-            q,
-            k,
-            v,
-            attn_mask=attn_bias,
-            dropout_p=(self.dropout_p if self.training else 0.0),
-            is_causal=False,
+        attn_out = None
+        exporting = bool(is_export_or_trace())
+        compiling = bool(is_compiling())
+        plan = ATTENTION_POLICY.plan(
+            q=q,
+            need_weights=False,
+            has_bias=attn_bias is not None,
+            exporting=exporting,
+            compiling=compiling,
         )
+        def _is_fp8_tensor(x: torch.Tensor) -> bool:
+            try:
+                if "float8" in str(x.dtype):
+                    return True
+                t = type(x)
+                mod = getattr(t, "__module__", "") or ""
+                name = getattr(t, "__name__", "") or ""
+                if "torchao" in mod and ("float8" in mod or "float8" in name.lower()):
+                    return True
+                if "Float8Tensor" in name:
+                    return True
+            except Exception:
+                pass
+            return False
+
+        force_no_flex = bool(q.dtype == torch.float64) or bool(_is_fp8_tensor(q))
+
+        if (
+            (not self._disable_flex_bias_runtime)
+            and (not force_no_flex)
+            and attn_bias is not None
+            and plan.backend == AttentionBackend.FLEX
+            and plan.use_score_mod_for_bias
+        ):
+            with contextlib.suppress(Exception):
+                if not _HAS_FLEX_ATTENTION:
+                    raise RuntimeError("FlexAttention not available")
+                _ensure_flex_kwargs_initialized()
+                if "score_mod" not in _FLEX_KWARGS:
+                    raise RuntimeError("FlexAttention score_mod not supported")
+                bias_bk = _coerce_attn_bias_to_bk(attn_bias, B=int(B), K=int(Lk), like=q)
+                sm = self._flex_keybias_score_mod
+                if sm is None:
+                    sm = _FlexKeyBiasScoreMod(bias_bk)
+                    self._flex_keybias_score_mod = sm
+                else:
+                    sm.set_bias(bias_bk)
+                attn_out = _FLEX_KERNEL(
+                    q,
+                    k,
+                    v,
+                    score_mod=sm,
+                    block_mask=None,
+                    scale=None,
+                    dropout_p=(self.dropout_p if self.training else 0.0),
+                    training=bool(self.training),
+                    is_causal=False,
+                )
+            if attn_out is None:
+                self._disable_flex_bias_runtime = True
+
+        if attn_out is None and attn_bias is not None and (q.dtype == torch.float64):
+            with contextlib.suppress(Exception):
+                bias_bk = _coerce_attn_bias_to_bk(attn_bias, B=int(B), K=int(Lk), like=q)
+                if int(bias_bk.shape[0]) == 1:
+                    bias_bk = bias_bk.expand(int(B), int(Lk))
+                bias4 = bias_bk.view(int(B), 1, 1, int(Lk)).expand(int(B), int(H), int(Lq), int(Lk)).contiguous()
+                attn_out = _attention_math_bshd(
+                    q,
+                    k,
+                    v,
+                    attn_mask=bias4,
+                    is_causal=False,
+                    dropout_p=(self.dropout_p if self.training else 0.0),
+                    training=bool(self.training),
+                )
+
+        if attn_out is None:
+            attn_out = self.attn(
+                q,
+                k,
+                v,
+                attn_mask=attn_bias,
+                dropout_p=(self.dropout_p if self.training else 0.0),
+                is_causal=False,
+            )
         if attn_out.dim() == 4:
             attn_out = attn_out.transpose(1, 2).contiguous().view(B, Lq, D)
         else:

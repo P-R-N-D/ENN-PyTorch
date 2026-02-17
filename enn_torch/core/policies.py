@@ -1533,3 +1533,127 @@ class DistributedPolicy:
             sync_state=sync_state,
             collective=CollectivePolicy.from_env(),
         )
+
+
+from enum import Enum
+import threading
+import inspect
+
+
+class AttentionBackend(str, Enum):
+    FLEX = "flex"
+    MHA = "mha"
+    DPA = "dpa"
+
+
+@dataclass(frozen=True)
+class AttentionPlan:
+    backend: AttentionBackend
+    use_score_mod_for_bias: bool = False
+    reason: str = ""
+
+
+class AttentionPolicy:
+    def __init__(self) -> None:
+        order = (env_str("ENN_ATTENTION_ORDER") or "flex,mha,dpa").strip().lower()
+        self.order: tuple[str, ...] = tuple(x.strip() for x in order.split(",") if x.strip())
+
+
+    @staticmethod
+    def _is_float8_dtype(dt: torch.dtype) -> bool:
+        return "float8" in str(dt)
+
+    @staticmethod
+    def _is_torchao_float8_tensor(x: torch.Tensor) -> bool:
+        try:
+            t = type(x)
+            mod = getattr(t, "__module__", "") or ""
+            name = getattr(t, "__name__", "") or ""
+            if "torchao" in mod and ("float8" in mod or "float8" in name.lower()):
+                return True
+            if "Float8Tensor" in name:
+                return True
+        except Exception:
+            pass
+        return False
+
+    @staticmethod
+    def _flex_has_score_mod() -> bool:
+        try:
+            from torch.nn.attention.flex_attention import flex_attention as _fa
+            kw = set(inspect.signature(_fa).parameters.keys())
+            return "score_mod" in kw
+        except Exception:
+            return False
+
+    def plan(
+        self,
+        *,
+        q: torch.Tensor,
+        need_weights: bool = False,
+        has_bias: bool = False,
+        exporting: bool = False,
+        compiling: bool = False,
+    ) -> AttentionPlan:
+        forced = (env_str("ENN_ATTENTION_BACKEND") or "").strip().lower()
+        if forced in {"flex", "mha", "dpa"}:
+            be = AttentionBackend(forced)
+            return AttentionPlan(
+                be,
+                use_score_mod_for_bias=bool(be is AttentionBackend.FLEX and has_bias),
+                reason="forced",
+            )
+
+        if q.dtype == torch.float64:
+            flex_ok = False
+        else:
+            allow_flex_fp8 = bool(env_bool("ENN_FLEX_ALLOW_FP8", False))
+            is_fp8 = self._is_float8_dtype(q.dtype) or self._is_torchao_float8_tensor(q)
+            allow_fp32 = bool(env_bool("ENN_FLEX_ALLOW_FP32", True))
+            flex_ok = (
+                (not env_bool("ENN_DISABLE_FLEX_ATTENTION", False))
+                and getattr(q, "is_cuda", False)
+                and (not exporting)
+                and (not compiling)
+                and (not need_weights)
+                and (not is_fp8 or allow_flex_fp8)
+                and (
+                    q.dtype in (torch.float16, torch.bfloat16)
+                    or (q.dtype == torch.float32 and allow_fp32)
+                )
+            )
+
+        flex_score_mod_ok = bool(self._flex_has_score_mod())
+        if has_bias and (not flex_score_mod_ok):
+            flex_ok = False
+
+        for be in self.order:
+            if be == "flex" and flex_ok:
+                return AttentionPlan(
+                    AttentionBackend.FLEX,
+                    use_score_mod_for_bias=bool(has_bias and flex_score_mod_ok),
+                    reason=("auto:flex(score_mod)" if has_bias else "auto:flex"),
+                )
+            if be == "mha":
+                return AttentionPlan(AttentionBackend.MHA, reason="auto:mha")
+            if be == "dpa":
+                return AttentionPlan(AttentionBackend.DPA, reason="auto:dpa")
+
+        return AttentionPlan(AttentionBackend.MHA, reason="auto:default")
+
+
+_ATTN_POLICY_LOCK = threading.Lock()
+_ATTN_POLICY: AttentionPolicy | None = None
+
+
+def get_attention_policy() -> AttentionPolicy:
+    global _ATTN_POLICY
+    if _ATTN_POLICY is not None:
+        return _ATTN_POLICY
+    with _ATTN_POLICY_LOCK:
+        if _ATTN_POLICY is None:
+            _ATTN_POLICY = AttentionPolicy()
+    return _ATTN_POLICY
+
+
+ATTENTION_POLICY = get_attention_policy()
