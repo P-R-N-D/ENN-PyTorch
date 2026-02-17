@@ -61,6 +61,7 @@ from .graph import (
     inference_mode,
     is_export_or_trace,
     is_symbolic,
+    torch_compiler_disable,
     torch_compiler_supported,
 )
 from .layers import Recorder, Scaler, SigmoidGate
@@ -777,6 +778,18 @@ class Template(nn.Module):
             state = state.to(device=device)
         return state.contiguous()
 
+    @torch_compiler_disable(
+        reason="Template.tokenizer can collapse under cudagraph/compile; keep eager",
+        recursive=False,
+    )
+    def _tokenize(self: Self, x: torch.Tensor) -> torch.Tensor:
+        B = x.size(0)
+        return (
+            self.tokenizer(x.contiguous())
+            .reshape(B, self.tokens, self.d_model)
+            .contiguous()
+        )
+
     def forward(
         self: Self,
         x: torch.Tensor,
@@ -787,12 +800,7 @@ class Template(nn.Module):
         **kwargs: Any,
     ) -> Any:
         del args, kwargs
-        B = x.size(0)
-        tokens = (
-            self.tokenizer(x)
-            .reshape(B, self.tokens, self.d_model)
-            .contiguous()
-        )
+        tokens = self._tokenize(x)
         m = str(self.mode)
         if m == "spatial":
             if state is not None:
