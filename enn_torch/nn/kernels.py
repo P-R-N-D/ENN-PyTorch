@@ -2141,24 +2141,24 @@ class DotProductAttention(nn.Module):
                 )
                 if not tracing and (bd not in (1, B) or hd not in (1, H)):
                     raise RuntimeError("Attn mask mismatch")
-                sdpa_kwargs["is_causal"] = False
+                sdpa_kwargs["is_causal"] = bool(sdpa_is_causal)
             sdpa_out = None
             try:
                 from torch.nn.attention import SDPBackend, sdpa_kernel
 
                 am = sdpa_kwargs.get("attn_mask", None)
                 if (
-                    env_bool("ENN_DPA_DROP_ALL_FALSE_MASK", default=True)
+                    env_bool("ENN_DPA_WARN_ALL_FALSE_MASK", default=False)
                     and isinstance(am, torch.Tensor)
                     and am.dtype == torch.bool
                     and am.numel() > 0
                 ):
                     with contextlib.suppress(Exception):
                         if not bool(am.any().item()):
-                            warnings.warn(
-                                "[ENN] DotProductAttention: attn_mask is all-False (no allowed positions). Preserving mask so SDPA keeps fully masked queries zeroed.",
-                                UserWarning,
-                                stacklevel=2,
+                            _warn_once(
+                                "dpa-all-false-mask",
+                                "[ENN] DotProductAttention: attn_mask is all-False (no allowed positions). "
+                                "Preserving mask so SDPA keeps fully masked queries zeroed.",
                             )
 
                 backends = get_dpa_backends()

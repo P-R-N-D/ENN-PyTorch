@@ -846,6 +846,8 @@ class Resampler(nn.Module):
         self.ffn = GeGLU(
             self.d_model, hid, out_dim=self.d_model, dropout=dropout
         )
+        self._disable_flex_bias_runtime: bool = False
+        self._flex_keybias_score_mod: Optional[_FlexKeyBiasScoreMod] = None
 
     def forward(
         self: Self,
@@ -900,7 +902,13 @@ class Resampler(nn.Module):
 
         force_no_flex = bool(q.dtype == torch.float64) or bool(_is_fp8_tensor(q))
 
-        if (not force_no_flex) and attn_bias is not None and plan.backend == AttentionBackend.FLEX and plan.use_score_mod_for_bias:
+        if (
+            (not self._disable_flex_bias_runtime)
+            and (not force_no_flex)
+            and attn_bias is not None
+            and plan.backend == AttentionBackend.FLEX
+            and plan.use_score_mod_for_bias
+        ):
             with contextlib.suppress(Exception):
                 if not _HAS_FLEX_ATTENTION:
                     raise RuntimeError("FlexAttention not available")
@@ -908,10 +916,10 @@ class Resampler(nn.Module):
                 if "score_mod" not in _FLEX_KWARGS:
                     raise RuntimeError("FlexAttention score_mod not supported")
                 bias_bk = _coerce_attn_bias_to_bk(attn_bias, B=int(B), K=int(Lk), like=q)
-                sm = getattr(self, "_flex_keybias_score_mod", None)
-                if sm is None or (not isinstance(sm, _FlexKeyBiasScoreMod)):
+                sm = self._flex_keybias_score_mod
+                if sm is None:
                     sm = _FlexKeyBiasScoreMod(bias_bk)
-                    setattr(self, "_flex_keybias_score_mod", sm)
+                    self._flex_keybias_score_mod = sm
                 else:
                     sm.set_bias(bias_bk)
                 attn_out = _FLEX_KERNEL(
@@ -925,6 +933,8 @@ class Resampler(nn.Module):
                     training=bool(self.training),
                     is_causal=False,
                 )
+            if attn_out is None:
+                self._disable_flex_bias_runtime = True
 
         if attn_out is None and attn_bias is not None and (q.dtype == torch.float64):
             with contextlib.suppress(Exception):
