@@ -2155,15 +2155,11 @@ class DotProductAttention(nn.Module):
                 ):
                     with contextlib.suppress(Exception):
                         if not bool(am.any().item()):
-                            q_abs = float(q_bshd.detach().abs().max().item())
-                            if q_abs > 0.0:
-                                warnings.warn(
-                                    "[ENN] DotProductAttention: attn_mask is all-False (no allowed positions). Dropping mask to avoid all-zero SDPA output. Check upstream key_padding_mask/attn_mask construction.",
-                                    UserWarning,
-                                    stacklevel=2,
-                                )
-                            sdpa_kwargs["attn_mask"] = None
-                            sdpa_kwargs["is_causal"] = bool(sdpa_is_causal)
+                            warnings.warn(
+                                "[ENN] DotProductAttention: attn_mask is all-False (no allowed positions). Preserving mask so SDPA keeps fully masked queries zeroed.",
+                                UserWarning,
+                                stacklevel=2,
+                            )
 
                 backends = get_dpa_backends()
                 if backends and (sdpa_kwargs.get("attn_mask", None) is not None):
