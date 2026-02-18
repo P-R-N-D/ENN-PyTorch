@@ -3361,11 +3361,19 @@ def infer(
                     tokenize_pre: dict[str, object] = {}
                     tokenize_post_blk0: dict[str, object] = {}
                     tokenize_meta: dict[str, object] = {}
+                    template_out: dict[str, object] = {}
+                    template_weight_raw: dict[str, object] = {}
+                    template_token_count: dict[str, object] = {}
+                    template_logit_bias: dict[str, object] = {}
+                    template_prior_mass: dict[str, object] = {}
+                    fuser_attn_bias_segments: dict[str, object] = {}
                     try:
                         fuser = getattr(m0, "fuser", None)
                         tasks = getattr(fuser, "tasks", None) if fuser is not None else None
                         if isinstance(tasks, torch.nn.ModuleDict):
                             B2 = int(Xi2.shape[0])
+                            import math as _math
+                            w_eff_map: dict[str, float] = {}
                             for name, tmpl in tasks.items():
                                 tok = getattr(tmpl, "tokenizer", None)
                                 t_tokens = getattr(tmpl, "tokens", None)
@@ -3402,6 +3410,68 @@ def infer(
                                             if isinstance(y0, tuple):
                                                 y0 = y0[0]
                                             tokenize_post_blk0[str(name)] = _brief_tensor(y0)
+                                    with contextlib.suppress(Exception):
+                                        kwt: dict[str, object] = {"causal_mask": None}
+                                        with contextlib.suppress(Exception):
+                                            ps_t = inspect.signature(tmpl.forward).parameters
+                                            if "state" in ps_t:
+                                                kwt["state"] = None
+                                            if "return_state" in ps_t:
+                                                kwt["return_state"] = False
+                                        with torch.no_grad():
+                                            tout = tmpl(Xi2, **kwt)
+                                        if isinstance(tout, tuple):
+                                            tout = tout[0]
+                                        if torch.is_tensor(tout):
+                                            template_out[str(name)] = _brief_tensor(tout)
+                                            n_tok = int(tout.shape[1]) if tout.dim() >= 2 else int(getattr(tmpl, "tokens", 1) or 1)
+                                            template_token_count[str(name)] = int(n_tok)
+                                            w = getattr(tmpl, "weight", None)
+                                            eps = getattr(tmpl, "eps", None)
+                                            wv = 1.0
+                                            ev = 1e-6
+                                            with contextlib.suppress(Exception):
+                                                if torch.is_tensor(w):
+                                                    wv = float(w.detach().float().item())
+                                            with contextlib.suppress(Exception):
+                                                if torch.is_tensor(eps):
+                                                    ev = float(eps.detach().float().item())
+                                            template_weight_raw[str(name)] = float(wv)
+                                            w_eff = max(float(wv), float(ev))
+                                            w_eff_map[str(name)] = w_eff
+                                            template_logit_bias[str(name)] = float(_math.log(w_eff / float(max(1, n_tok))))
+                            s = float(sum(w_eff_map.values())) if w_eff_map else 0.0
+                            if s > 0.0:
+                                for k, w_eff in w_eff_map.items():
+                                    template_prior_mass[k] = float(w_eff / s)
+                            with contextlib.suppress(Exception):
+                                if fuser is not None and callable(getattr(fuser, "_build_attn_bias", None)):
+                                    token_sets = []
+                                    names = []
+                                    for name, _ in tasks.items():
+                                        if name in template_out:
+                                            kwt = {"causal_mask": None}
+                                            with torch.no_grad():
+                                                tout = tasks[name](Xi2, **kwt)
+                                            if isinstance(tout, tuple):
+                                                tout = tout[0]
+                                            if torch.is_tensor(tout):
+                                                token_sets.append(tout)
+                                                names.append(str(name))
+                                    if token_sets:
+                                        am = fuser._build_attn_bias(token_sets)
+                                        if torch.is_tensor(am) and am.numel() > 0:
+                                            last = am.reshape(-1, am.shape[-1])[0]
+                                            off = 0
+                                            for nm, ts in zip(names, token_sets):
+                                                n_tok = int(ts.shape[1])
+                                                seg = last[off:off + n_tok]
+                                                off += n_tok
+                                                fuser_attn_bias_segments[nm] = {
+                                                    "min": float(seg.min().item()),
+                                                    "max": float(seg.max().item()),
+                                                    "mean": float(seg.mean().item()),
+                                                }
                     except Exception:
                         pass
                     diag: dict[str, object] = {
@@ -3424,6 +3494,12 @@ def infer(
                         "tokenize_pre": tokenize_pre,
                         "tokenize_meta": tokenize_meta,
                         "tokenize_post_blk0": tokenize_post_blk0,
+                        "template_out": template_out,
+                        "template_weight_raw": template_weight_raw,
+                        "template_token_count": template_token_count,
+                        "template_logit_bias": template_logit_bias,
+                        "template_prior_mass": template_prior_mass,
+                        "fuser_attn_bias_segments": fuser_attn_bias_segments,
                         "tokens": _brief_tensor(tokens),
                         "assembled_z": _brief_tensor(assembled),
                         "refined": _brief_tensor(refined),
