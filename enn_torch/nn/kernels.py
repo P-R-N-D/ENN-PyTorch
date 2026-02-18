@@ -87,6 +87,19 @@ except Exception:
     _FLEX_KWARGS = set()
     pass
 
+_FLEX_KERNEL_SINGLETON_LOCK = threading.Lock()
+_FLEX_KERNEL_SINGLETON = None
+
+
+def get_flex_kernel() -> "FlexAttention":
+    global _FLEX_KERNEL_SINGLETON
+    if _FLEX_KERNEL_SINGLETON is not None:
+        return _FLEX_KERNEL_SINGLETON
+    with _FLEX_KERNEL_SINGLETON_LOCK:
+        if _FLEX_KERNEL_SINGLETON is None:
+            _FLEX_KERNEL_SINGLETON = FlexAttention(prefer_torch=True)
+    return _FLEX_KERNEL_SINGLETON
+
 _HAS_TE = False
 te = None
 
@@ -360,9 +373,7 @@ def _ensure_flex_kwargs_initialized() -> None:
         if _FLEX_KWARGS:
             return
         with contextlib.suppress(Exception):
-            _FLEX_KWARGS.update(
-                inspect.signature(_torch_flex_attention).parameters.keys()
-            )
+            _FLEX_KWARGS.update(inspect.signature(_torch_flex_attention).parameters.keys())
     if (not _FLEX_KWARGS) and _flex_debug_enabled():
         _warn_once(
             "flexattn-debug-empty-kwargs",
@@ -2163,6 +2174,9 @@ class DotProductAttention(nn.Module):
 
                 backends = get_dpa_backends()
                 if backends and (sdpa_kwargs.get("attn_mask", None) is not None):
+                    backends = [be for be in backends if be != SDPBackend.FLASH_ATTENTION]
+                am2 = sdpa_kwargs.get("attn_mask", None)
+                if backends and isinstance(am2, torch.Tensor) and (am2.dtype != torch.bool):
                     backends = [be for be in backends if be != SDPBackend.FLASH_ATTENTION]
                 sdpa_ctx = sdpa_kernel(backends) if backends else contextlib.nullcontext()
 

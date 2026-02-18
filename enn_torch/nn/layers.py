@@ -35,12 +35,12 @@ from .graph import (
 )
 from .kernels import (
     DotProductAttention,
-    FlexAttention,
     MultiHeadAttention,
     MultiScaleRetention,
     _attention_math_bshd,
     _FLEX_KWARGS,
     _ensure_flex_kwargs_initialized,
+    get_flex_kernel,
 )
 try:
     from torch.nn.attention.flex_attention import create_block_mask
@@ -55,7 +55,6 @@ _DILATED_MASK_CACHE_MAX_L = env_int("ENN_DILATED_MASK_CACHE_MAX_L", 4096)
 _DILATED_MASK_CACHE_ENTRY_MAX_BYTES = env_int(
     "ENN_DILATED_MASK_CACHE_ENTRY_MAX_BYTES", 64 * 1024 * 1024
 )
-_FLEX_KERNEL = FlexAttention(prefer_torch=True)
 _FLEX_BLOCK_MASK_CACHE_MAX = 16
 _FLEX_BLOCK_MASK_CACHE_EST_MAX_BYTES = env_int(
     "ENN_FLEX_BLOCK_MASK_CACHE_EST_MAX_BYTES", 128 * 1024 * 1024
@@ -68,7 +67,7 @@ if env_bool("ENN_DISABLE_FLEX_ATTENTION", False):
     _HAS_FLEX_ATTENTION = False
 else:
     _HAS_FLEX_ATTENTION = (
-        _HAS_FLEX_ATTENTION_LIB and _FLEX_KERNEL.has_torch_backend
+        _HAS_FLEX_ATTENTION_LIB and get_flex_kernel().has_torch_backend
     )
 
 
@@ -699,7 +698,7 @@ class DilatedAttention(nn.Module):
             and (not return_attn_mask)
             and key_padding_mask is None
             and _HAS_FLEX_ATTENTION
-            and getattr(_FLEX_KERNEL, "has_torch_backend", False)
+            and getattr(get_flex_kernel(), "has_torch_backend", False)
             and (self._get_torch_mha() is not None)
             and (not is_export_or_trace())
             and (not is_compiling())
@@ -720,7 +719,7 @@ class DilatedAttention(nn.Module):
             if needs_mask and (not use_score_mod) and (block_mask is None):
                 use_flex = False
             if use_flex:
-                a = _FLEX_KERNEL(
+                a = get_flex_kernel()(
                     q,
                     k,
                     v,
@@ -846,6 +845,8 @@ class Resampler(nn.Module):
         self.ffn = GeGLU(
             self.d_model, hid, out_dim=self.d_model, dropout=dropout
         )
+        self._flex_bias_fail_count: int = 0
+        self._flex_bias_fail_max: int = max(0, int(env_int("ENN_RESAMPLER_FLEX_RETRY", 3)))
         self._disable_flex_bias_runtime: bool = False
         self._flex_keybias_score_mod: Optional[_FlexKeyBiasScoreMod] = None
 
@@ -902,6 +903,28 @@ class Resampler(nn.Module):
 
         force_no_flex = bool(q.dtype == torch.float64) or bool(_is_fp8_tensor(q))
 
+        def _classify_flex_failure(exc: BaseException) -> str:
+            msg = str(exc)
+            tname = type(exc).__name__
+            m = msg.lower()
+            if "flexattention not available" in m:
+                return "struct"
+            if "not available" in m and "flex" in m:
+                return "struct"
+            if "score_mod" in m and ("not supported" in m or "unsupported" in m):
+                return "struct"
+            if tname in ("TypeError", "ValueError"):
+                return "struct"
+            if ("shape" in m and "mismatch" in m) or ("attn_bias" in m and "mismatch" in m):
+                return "struct"
+            if exporting or compiling:
+                return "struct"
+            if "no valid triton configs" in m or "outofresources" in m or "out of resources" in m:
+                return "transient"
+            if "torch._dynamo" in m or "torch._inductor" in m or "compileerror" in m:
+                return "transient"
+            return "transient"
+
         if (
             (not self._disable_flex_bias_runtime)
             and (not force_no_flex)
@@ -909,7 +932,7 @@ class Resampler(nn.Module):
             and plan.backend == AttentionBackend.FLEX
             and plan.use_score_mod_for_bias
         ):
-            with contextlib.suppress(Exception):
+            try:
                 if not _HAS_FLEX_ATTENTION:
                     raise RuntimeError("FlexAttention not available")
                 _ensure_flex_kwargs_initialized()
@@ -922,7 +945,7 @@ class Resampler(nn.Module):
                     self._flex_keybias_score_mod = sm
                 else:
                     sm.set_bias(bias_bk)
-                attn_out = _FLEX_KERNEL(
+                attn_out = get_flex_kernel()(
                     q,
                     k,
                     v,
@@ -933,24 +956,31 @@ class Resampler(nn.Module):
                     training=bool(self.training),
                     is_causal=False,
                 )
-            if attn_out is None:
-                self._disable_flex_bias_runtime = True
+            except Exception as exc:
+                kind = _classify_flex_failure(exc)
+                self._flex_bias_fail_count += 1
+                if kind == "struct":
+                    self._disable_flex_bias_runtime = True
+                elif self._flex_bias_fail_max > 0 and self._flex_bias_fail_count >= self._flex_bias_fail_max:
+                    self._disable_flex_bias_runtime = True
 
-        if attn_out is None and attn_bias is not None and (q.dtype == torch.float64):
-            with contextlib.suppress(Exception):
-                bias_bk = _coerce_attn_bias_to_bk(attn_bias, B=int(B), K=int(Lk), like=q)
-                if int(bias_bk.shape[0]) == 1:
-                    bias_bk = bias_bk.expand(int(B), int(Lk))
-                bias4 = bias_bk.view(int(B), 1, 1, int(Lk)).expand(int(B), int(H), int(Lq), int(Lk)).contiguous()
-                attn_out = _attention_math_bshd(
-                    q,
-                    k,
-                    v,
-                    attn_mask=bias4,
-                    is_causal=False,
-                    dropout_p=(self.dropout_p if self.training else 0.0),
-                    training=bool(self.training),
-                )
+        if attn_out is None and attn_bias is not None:
+            fp32_math = bool(env_bool("ENN_RESAMPLER_FP32_BIAS_MATH_FALLBACK", True))
+            if q.dtype == torch.float64 or (q.dtype == torch.float32 and fp32_math and self._disable_flex_bias_runtime):
+                with contextlib.suppress(Exception):
+                    bias_bk = _coerce_attn_bias_to_bk(attn_bias, B=int(B), K=int(Lk), like=q)
+                    if int(bias_bk.shape[0]) == 1:
+                        bias_bk = bias_bk.expand(int(B), int(Lk))
+                    bias4 = bias_bk.view(int(B), 1, 1, int(Lk)).expand(int(B), int(H), int(Lq), int(Lk)).contiguous()
+                    attn_out = _attention_math_bshd(
+                        q,
+                        k,
+                        v,
+                        attn_mask=bias4,
+                        is_causal=False,
+                        dropout_p=(self.dropout_p if self.training else 0.0),
+                        training=bool(self.training),
+                    )
 
         if attn_out is None:
             attn_out = self.attn(
