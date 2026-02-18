@@ -3360,9 +3360,12 @@ def infer(
                             os.environ["ENN_PRED_COLLAPSE_STAGE_DIAG"] = _prev_diag_env
                     nonfinite_pre_sanitize = getattr(m0, "_enn_nonfinite_pre_sanitize", None)
                     fuser_diag = None
+                    perceiver_diag = None
                     with contextlib.suppress(Exception):
                         f0 = getattr(m0, "fuser", None)
                         fuser_diag = getattr(f0, "_enn_last_fuser_diag", None)
+                        p0 = getattr(f0, "perceiver", None)
+                        perceiver_diag = getattr(p0, "_enn_last_perceiver_diag", None)
                     if not (isinstance(out, tuple) and len(out) >= 8):
                         return
                     pred, _next_state, p, assembled, enhanced, delta, tokens, refined = out[:8]
@@ -3492,6 +3495,7 @@ def infer(
                         "where": str(where),
                         "nonfinite_pre_sanitize": nonfinite_pre_sanitize,
                         "fuser_diag": fuser_diag,
+                        "perceiver_diag": perceiver_diag,
                         "rank": int(rank),
                         "seen_batches": int(seen_batches),
                         "x_diff": float(x_diff),
