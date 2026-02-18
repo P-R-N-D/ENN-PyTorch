@@ -3347,8 +3347,22 @@ def infer(
                     with contextlib.suppress(Exception):
                         sig = inspect.signature(fn)
                         kwargs = {k: v for k, v in kwargs.items() if k in sig.parameters}
-                    with torch.no_grad():
-                        out = fn(Xi2, **kwargs)
+                    _prev_diag_env = os.environ.get("ENN_PRED_COLLAPSE_STAGE_DIAG", None)
+                    os.environ["ENN_PRED_COLLAPSE_STAGE_DIAG"] = "1"
+                    try:
+                        with torch.no_grad():
+                            out = fn(Xi2, **kwargs)
+                    finally:
+                        if _prev_diag_env is None:
+                            with contextlib.suppress(Exception):
+                                os.environ.pop("ENN_PRED_COLLAPSE_STAGE_DIAG", None)
+                        else:
+                            os.environ["ENN_PRED_COLLAPSE_STAGE_DIAG"] = _prev_diag_env
+                    nonfinite_pre_sanitize = getattr(m0, "_enn_nonfinite_pre_sanitize", None)
+                    fuser_diag = None
+                    with contextlib.suppress(Exception):
+                        f0 = getattr(m0, "fuser", None)
+                        fuser_diag = getattr(f0, "_enn_last_fuser_diag", None)
                     if not (isinstance(out, tuple) and len(out) >= 8):
                         return
                     pred, _next_state, p, assembled, enhanced, delta, tokens, refined = out[:8]
@@ -3459,7 +3473,7 @@ def infer(
                                                 token_sets.append(tout)
                                                 names.append(str(name))
                                     if token_sets:
-                                        am = fuser._build_attn_bias(token_sets)
+                                        am = fuser._build_attn_bias(names, token_sets, device=token_sets[0].device, dtype=token_sets[0].dtype)
                                         if torch.is_tensor(am) and am.numel() > 0:
                                             last = am.reshape(-1, am.shape[-1])[0]
                                             off = 0
@@ -3476,6 +3490,8 @@ def infer(
                         pass
                     diag: dict[str, object] = {
                         "where": str(where),
+                        "nonfinite_pre_sanitize": nonfinite_pre_sanitize,
+                        "fuser_diag": fuser_diag,
                         "rank": int(rank),
                         "seen_batches": int(seen_batches),
                         "x_diff": float(x_diff),
