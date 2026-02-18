@@ -2817,9 +2817,9 @@ class Model(nn.Module):
                 return
             with torch.no_grad():
                 fin = torch.isfinite(tt)
-                if bool(fin.all().item()):
-                    return
                 nonfinite = int((~fin).sum().item())
+                if nonfinite == 0:
+                    return
                 absmax = float(tt.detach().abs().amax().item())
                 dtype = str(getattr(tt, "dtype", ""))
                 shape = [int(x) for x in tt.shape]
