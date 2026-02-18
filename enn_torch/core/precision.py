@@ -429,9 +429,21 @@ class Autocast:
         device: torch.device,
         kind: str,
     ) -> Optional[str]:
+        ok_te = False
+        ok_ao = False
         if kind == "fp8":
-            order = ("te", "ao")
             ok, why = is_float8_supported(device)
+            r = str(why or "").lower()
+            ok_ao = bool(ok and ("fp8-ok:ao" in r))
+            ok_te = bool(ok and ("te-only" in r or "ao+te" in r))
+            if ok_te and ok_ao:
+                order = ("te", "ao")
+            elif ok_te:
+                order = ("te",)
+            elif ok_ao:
+                order = ("ao",)
+            else:
+                order = ()
         else:
             order = ("ao",)
             ok, why = is_int8_supported(device)
@@ -441,7 +453,7 @@ class Autocast:
                 if cls._try_load_backend(
                     "transformer_engine.pytorch",
                     "autocast",
-                    ok,
+                    (ok_te if kind == "fp8" else ok),
                     f"Autocast {kind.upper()} TE unavailable: {why}",
                 ):
                     setattr(cls, f"_preferred_{kind}_backend", "te")
@@ -455,7 +467,7 @@ class Autocast:
                 if cls._try_load_backend(
                     mod,
                     attr,
-                    ok,
+                    (ok_ao if kind == "fp8" else ok),
                     f"Autocast {kind.upper()} torchao unavailable: {why}",
                 ):
                     setattr(cls, f"_preferred_{kind}_backend", "ao")

@@ -1796,8 +1796,13 @@ def is_float8_supported(
                 return (False, f"te-selftest-failed:{str(exc)[:120]}")
 
         ok_ao, why_ao = _selftest_ao()
+        ok_te, why_te = (False, "te-skipped")
         if ok_ao:
-            out = (True, f"fp8-ok:ao:{why_ao}")
+            ok_te, why_te = _selftest_te()
+            if ok_te:
+                out = (True, f"fp8-ok:ao+te:{why_ao};{why_te}")
+            else:
+                out = (True, f"fp8-ok:ao-only:{why_ao};te={why_te}")
         else:
             ok_te, why_te = _selftest_te()
             if ok_te:
