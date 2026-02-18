@@ -3507,6 +3507,10 @@ def infer(
                         "pred_final": _brief_tensor(pred),
                         "pred_denorm_uncal": _brief_tensor(pred_denorm_uncal),
                     }
+                    with contextlib.suppress(Exception):
+                        nf = getattr(m0, "_enn_nonfinite_pre_sanitize", None)
+                        if isinstance(nf, list) and nf:
+                            diag["nonfinite_pre_sanitize"] = nf
                     fname = f"collapse_stage_diag.rank{int(rank)}.batch{int(seen_batches):06d}.json"
                     out_path = os.path.join(str(chunk_dir), fname)
                     with contextlib.suppress(Exception):

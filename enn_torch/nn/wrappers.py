@@ -2805,6 +2805,39 @@ class Model(nn.Module):
         torch.Tensor,
         torch.Tensor,
     ]:
+        self._enn_nonfinite_pre_sanitize = []
+
+        def _diag_nonfinite(tag: str, t: object) -> None:
+            if not bool(env_bool("ENN_DIAG_NONFINITE_PRE_SANITIZE", default=False)):
+                return
+            if not torch.is_tensor(t):
+                return
+            tt: torch.Tensor = t
+            if (not (tt.is_floating_point() or tt.is_complex())) or tt.numel() <= 0:
+                return
+            with torch.no_grad():
+                fin = torch.isfinite(tt)
+                nonfinite = int((~fin).sum().item())
+                if nonfinite == 0:
+                    return
+                absmax = float(tt.detach().abs().amax().item())
+                dtype = str(getattr(tt, "dtype", ""))
+                shape = [int(x) for x in tt.shape]
+                entry = {
+                    "tag": str(tag),
+                    "dtype": dtype,
+                    "shape": shape,
+                    "device": str(getattr(tt, "device", "")),
+                    "nonfinite": nonfinite,
+                    "absmax": absmax,
+                }
+                with contextlib.suppress(Exception):
+                    self._enn_nonfinite_pre_sanitize.append(entry)
+                if bool(env_bool("ENN_SANITIZE_NAN_STRICT", default=False)):
+                    raise RuntimeError(
+                        f"[ENN] nonfinite detected before sanitize in {tag}: nonfinite={nonfinite} absmax={absmax} dtype={dtype} shape={shape}"
+                    )
+
         x = self._cast_graph_safe(
             features, device or self._device, base_dtype or features.dtype
         )
@@ -2821,6 +2854,8 @@ class Model(nn.Module):
                 causal_mask=causal_mask,
             )
         if sanitize_nan:
+            _diag_nonfinite("fuser.tokens", tokens)
+            _diag_nonfinite("fuser.context", context)
             tokens = _coerce_tensor(tokens, enabled=True, inplace=not export)
             context = _coerce_tensor(context, enabled=True, inplace=not export)
         assembled = context.reshape(b, -1)
@@ -2844,9 +2879,11 @@ class Model(nn.Module):
         else:
             refined = self.temporal_token_collector.forward(tokens_centered)[0]
         if sanitize_nan:
+            _diag_nonfinite("collector.refined", refined)
             refined = _coerce_tensor(refined, enabled=True, inplace=not export)
         residual = self.fuser.decode(refined, apply_norm=True)
         if sanitize_nan:
+            _diag_nonfinite("fuser.residual", residual)
             residual = _coerce_tensor(
                 residual, enabled=True, inplace=not export
             )
