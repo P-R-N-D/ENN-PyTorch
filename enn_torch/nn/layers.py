@@ -1047,7 +1047,12 @@ class Resampler(nn.Module):
                     dropout_p=(self.dropout_p if self.training else 0.0),
                     training=bool(self.training),
                 )
-                attn_out = attn_out.to(dtype=q.dtype)
+                if env_bool("ENN_RESAMPLER_FALLBACK_SANITIZE_FP32", default=True):
+                    with contextlib.suppress(Exception):
+                        attn_out = torch.nan_to_num(
+                            attn_out, nan=0.0, posinf=0.0, neginf=0.0
+                        )
+                attn_out = attn_out.to(dtype=q.dtype, non_blocking=True)
         if attn_out.dim() == 4:
             attn_out = attn_out.transpose(1, 2).contiguous().view(B, Lq, D)
         else:
