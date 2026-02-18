@@ -340,6 +340,12 @@ class LatentTransformer(nn.Module):
                     training=bool(self.training),
                     is_causal=False,
                 )
+                if env_bool("ENN_LATENT_FALLBACK_ON_NONFINITE", default=True) and torch.is_tensor(attn_out) and attn_out.numel() > 0:
+                    with torch.no_grad():
+                        samp = attn_out.reshape(-1)[:1024]
+                        if not bool(torch.isfinite(samp).all().item()):
+                            self._disable_flex_runtime = True
+                            attn_out = None
             except Exception as exc:
                 kind = _classify(exc)
                 self._flex_fail_count += 1
