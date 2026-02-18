@@ -24,6 +24,7 @@ from ..core.datatypes import (
     default_underflow_action,
     env_bool,
     env_first_int,
+    env_int,
     env_float,
     env_str,
     normalize_underflow_action,
@@ -1112,7 +1113,7 @@ class ModelPolicy:
                 setattr(swapped, "__fp8_inference_te__", True)
                 if logger:
                     logger(
-                        f"[FP8][TE] swapped {n} modules; using te.fp8_autocast"
+                        f"[FP8][TE] swapped {n} modules; using te.autocast"
                     )
                 return (swapped, True, f"TE swap ({n})")
             return (model, False, "no eligible Linear (dims%16)")
@@ -1136,7 +1137,7 @@ class ModelPolicy:
             setattr(model, "__fp8_inference_te__", True)
             clear_model_cache(model)
             if logger:
-                logger("[FP8][TE] te.* already present; using te.fp8_autocast")
+                logger("[FP8][TE] te.* already present; using te.autocast")
             return (model, True, "TE present")
         return (model, False, "TE layers not present")
 
@@ -1179,15 +1180,30 @@ class ModelPolicy:
         if not ok:
             Autocast.configure(model, metadata=meta)
             return (model, False, reason)
+        if isinstance(reason, str) and ("te-only" in reason.lower()):
+            _log_info(
+                logger,
+                f"[FP8] TE-only fallback enabled (torchao missing): {reason}",
+            )
         if getattr(meta, "has_scale", False):
             float8_dtypes = Autocast.float8_formats()
+            p2 = env_int(
+                "ENN_FP8_SCALE_HEADROOM_POW2",
+                env_int("ENN_FP8_HEADROOM_POW2", 1),
+            )
+            try:
+                p2 = int(p2)
+            except Exception:
+                p2 = 1
+            p2 = max(0, min(30, int(p2)))
+            margin = float(2 ** p2)
             if not any(
-                is_scale_safe(dtype, meta, safety_margin=2.0)
+                is_scale_safe(dtype, meta, safety_margin=margin)
                 for dtype in float8_dtypes
             ):
                 _log_info(
                     logger,
-                    "[FP8] training disabled: data scale exceeds float8 range",
+                    f"[FP8] training disabled: data scale exceeds float8 range (headroom=2^{p2})",
                 )
                 Autocast.configure(model, metadata=meta)
                 return (model, False, "data scale")
@@ -1226,15 +1242,30 @@ class ModelPolicy:
         if not ok:
             Autocast.configure(model, metadata=meta)
             return (model, False, reason)
+        if isinstance(reason, str) and ("te-only" in reason.lower()):
+            _log_info(
+                logger,
+                f"[FP8] TE-only fallback enabled (torchao missing): {reason}",
+            )
         if getattr(meta, "has_scale", False):
             float8_dtypes = Autocast.float8_formats()
+            p2 = env_int(
+                "ENN_FP8_SCALE_HEADROOM_POW2",
+                env_int("ENN_FP8_HEADROOM_POW2", 1),
+            )
+            try:
+                p2 = int(p2)
+            except Exception:
+                p2 = 1
+            p2 = max(0, min(30, int(p2)))
+            margin = float(2 ** p2)
             if not any(
-                is_scale_safe(dtype, meta, safety_margin=2.0)
+                is_scale_safe(dtype, meta, safety_margin=margin)
                 for dtype in float8_dtypes
             ):
                 _log_info(
                     logger,
-                    "[FP8] inference disabled: data scale exceeds float8 range",
+                    f"[FP8] inference disabled: data scale exceeds float8 range (headroom=2^{p2})",
                 )
                 Autocast.configure(model, metadata=meta)
                 return (model, False, "data scale")

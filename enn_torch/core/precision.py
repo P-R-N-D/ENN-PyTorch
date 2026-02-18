@@ -429,24 +429,24 @@ class Autocast:
         device: torch.device,
         kind: str,
     ) -> Optional[str]:
-        order = ("ao", "te") if preferred == "ao" else ("te", "ao")
-        is_supported = (
-            is_float8_supported if kind == "fp8" else is_int8_supported
-        )
+        if kind == "fp8":
+            order = ("te", "ao")
+            ok, why = is_float8_supported(device)
+        else:
+            order = ("ao",)
+            ok, why = is_int8_supported(device)
 
         for backend in order:
             if backend == "te":
-                ok, why = is_supported(device)
                 if cls._try_load_backend(
                     "transformer_engine.pytorch",
-                    f"{kind}_autocast",
+                    "autocast",
                     ok,
                     f"Autocast {kind.upper()} TE unavailable: {why}",
                 ):
                     setattr(cls, f"_preferred_{kind}_backend", "te")
                     return "te"
             elif backend == "ao":
-                ok, why = is_supported(device)
                 mod, attr = (
                     ("torchao.float8", "fp8_autocast")
                     if kind == "fp8"
@@ -482,7 +482,8 @@ class Autocast:
         device: Optional[torch.device] = None,
         **kwargs: object,
     ) -> Optional[str]:
-        return cls._resolve_backend(pref, device or cls._device(None), "int")
+        cls._preferred_int_backend = "ao"
+        return "ao"
 
     @classmethod
     def _get_backend_context(
@@ -498,9 +499,21 @@ class Autocast:
     def _nvidia_float8(
         cls: type[Self], device: torch.device, enabled: bool
     ) -> List[AbstractContextManager[None]]:
-        return cls._get_backend_context(
-            "transformer_engine.pytorch", "fp8_autocast", enabled
-        )
+        if not enabled:
+            return []
+        mod = cls._try_load_backend("transformer_engine.pytorch", "autocast", True)
+        if mod is None:
+            return []
+        te_autocast = getattr(mod, "autocast", None)
+        if not callable(te_autocast):
+            return []
+        recipe = None
+        with contextlib.suppress(Exception):
+            from transformer_engine.common.recipe import DelayedScaling, Format
+            recipe = DelayedScaling(fp8_format=Format.HYBRID)
+        with contextlib.suppress(TypeError):
+            return [te_autocast(enabled=True, recipe=recipe)]
+        return [te_autocast(enabled=True)]
 
     @classmethod
     def _torchao_float8(
@@ -514,16 +527,9 @@ class Autocast:
     def _torchao_int8_backend(
         cls: type[Self], device: torch.device, enabled: bool
     ) -> List[AbstractContextManager[None]]:
-        backend = cls._preferred_int_backend
-        if backend == "te":
-            return cls._get_backend_context(
-                "transformer_engine.pytorch", "int8_autocast", enabled
-            )
-        if backend == "ao":
-            return cls._get_backend_context(
-                "torchao.quantization", "int8_autocast", enabled
-            )
-        return []
+        if cls._preferred_int_backend is None:
+            cls._preferred_int_backend = "ao"
+        return cls._get_backend_context("torchao.quantization", "int8_autocast", enabled)
 
     @classmethod
     def _torchao_int4(
