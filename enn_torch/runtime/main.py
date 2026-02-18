@@ -3358,6 +3358,22 @@ def infer(
                         scaler = getattr(m0, "scaler", None)
                         if scaler is not None and hasattr(scaler, "denormalize_y"):
                             pred_denorm_uncal = scaler.denormalize_y(y_hat).reshape(int(y_hat.shape[0]), *tuple(getattr(m0, "out_shape", ())))
+                    tokenize_pre: dict[str, object] = {}
+                    try:
+                        fuser = getattr(m0, "fuser", None)
+                        tasks = getattr(fuser, "tasks", None) if fuser is not None else None
+                        if isinstance(tasks, torch.nn.ModuleDict):
+                            B2 = int(Xi2.shape[0])
+                            for name, tmpl in tasks.items():
+                                tok = getattr(tmpl, "tokenizer", None)
+                                t_tokens = getattr(tmpl, "tokens", None)
+                                t_dmodel = getattr(tmpl, "d_model", None)
+                                if callable(tok) and isinstance(t_tokens, int) and isinstance(t_dmodel, int):
+                                    t = tok(Xi2.contiguous())
+                                    t = t.reshape(B2, int(t_tokens), int(t_dmodel)).contiguous()
+                                    tokenize_pre[str(name)] = _brief_tensor(t)
+                    except Exception:
+                        pass
                     diag: dict[str, object] = {
                         "where": str(where),
                         "rank": int(rank),
@@ -3375,6 +3391,7 @@ def infer(
                         "diff_pred_final": float(_pair_diff_max(pred) or 0.0),
                         "diff_pred_denorm_uncal": float(_pair_diff_max(pred_denorm_uncal) if isinstance(pred_denorm_uncal, torch.Tensor) else 0.0),
                         "X": _brief_tensor(Xi2),
+                        "tokenize_pre": tokenize_pre,
                         "tokens": _brief_tensor(tokens),
                         "assembled_z": _brief_tensor(assembled),
                         "refined": _brief_tensor(refined),

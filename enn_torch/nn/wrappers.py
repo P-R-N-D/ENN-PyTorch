@@ -683,6 +683,7 @@ class Template(nn.Module):
         self.drop_path = float(drop_path)
         self.norm_type = str(norm_type)
         self.tokenizer = nn.Linear(self.in_dim, self.tokens * self.d_model)
+        setattr(self.tokenizer, "_enn_no_ao_quant", True)
         drops = stochastic_depth_schedule(
             float(self.drop_path), int(self.depth)
         )
@@ -790,6 +791,14 @@ class Template(nn.Module):
             .contiguous()
         )
 
+    def _tokenize_export(self: Self, x: torch.Tensor) -> torch.Tensor:
+        B = x.size(0)
+        return (
+            self.tokenizer(x.contiguous())
+            .reshape(B, self.tokens, self.d_model)
+            .contiguous()
+        )
+
     def forward(
         self: Self,
         x: torch.Tensor,
@@ -800,7 +809,7 @@ class Template(nn.Module):
         **kwargs: Any,
     ) -> Any:
         del args, kwargs
-        tokens = self._tokenize(x)
+        tokens = self._tokenize_export(x) if is_export_or_trace() else self._tokenize(x)
         m = str(self.mode)
         if m == "spatial":
             if state is not None:
