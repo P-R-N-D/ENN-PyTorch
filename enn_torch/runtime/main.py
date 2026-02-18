@@ -3359,6 +3359,8 @@ def infer(
                         if scaler is not None and hasattr(scaler, "denormalize_y"):
                             pred_denorm_uncal = scaler.denormalize_y(y_hat).reshape(int(y_hat.shape[0]), *tuple(getattr(m0, "out_shape", ())))
                     tokenize_pre: dict[str, object] = {}
+                    tokenize_post_blk0: dict[str, object] = {}
+                    tokenize_meta: dict[str, object] = {}
                     try:
                         fuser = getattr(m0, "fuser", None)
                         tasks = getattr(fuser, "tasks", None) if fuser is not None else None
@@ -3369,9 +3371,37 @@ def infer(
                                 t_tokens = getattr(tmpl, "tokens", None)
                                 t_dmodel = getattr(tmpl, "d_model", None)
                                 if callable(tok) and isinstance(t_tokens, int) and isinstance(t_dmodel, int):
-                                    t = tok(Xi2.contiguous())
+                                    with torch.no_grad():
+                                        t = tok(Xi2.contiguous())
                                     t = t.reshape(B2, int(t_tokens), int(t_dmodel)).contiguous()
                                     tokenize_pre[str(name)] = _brief_tensor(t)
+                                    tokenize_meta[str(name)] = {
+                                        "mode": str(getattr(tmpl, "mode", "")),
+                                        "in_dim": int(getattr(tmpl, "in_dim", -1) or -1),
+                                        "tokens": int(getattr(tmpl, "tokens", -1) or -1),
+                                        "d_model": int(getattr(tmpl, "d_model", -1) or -1),
+                                        "nhead": int(getattr(tmpl, "nhead", -1) or -1),
+                                        "depth": int(getattr(tmpl, "depth", -1) or -1),
+                                    }
+                                    with contextlib.suppress(Exception):
+                                        blocks = getattr(tmpl, "blocks", None)
+                                        if isinstance(blocks, torch.nn.ModuleList) and len(blocks) > 0:
+                                            blk0 = blocks[0]
+                                            mode0 = str(getattr(tmpl, "mode", "spatial"))
+                                            kw0: dict[str, object] = {}
+                                            with contextlib.suppress(Exception):
+                                                ps = inspect.signature(blk0).parameters
+                                                if "causal_mask" in ps:
+                                                    kw0["causal_mask"] = None
+                                                if "state" in ps:
+                                                    kw0["state"] = None
+                                                if "mode" in ps:
+                                                    kw0["mode"] = mode0
+                                            with torch.no_grad():
+                                                y0 = blk0(t, **kw0)
+                                            if isinstance(y0, tuple):
+                                                y0 = y0[0]
+                                            tokenize_post_blk0[str(name)] = _brief_tensor(y0)
                     except Exception:
                         pass
                     diag: dict[str, object] = {
@@ -3392,6 +3422,8 @@ def infer(
                         "diff_pred_denorm_uncal": float(_pair_diff_max(pred_denorm_uncal) if isinstance(pred_denorm_uncal, torch.Tensor) else 0.0),
                         "X": _brief_tensor(Xi2),
                         "tokenize_pre": tokenize_pre,
+                        "tokenize_meta": tokenize_meta,
+                        "tokenize_post_blk0": tokenize_post_blk0,
                         "tokens": _brief_tensor(tokens),
                         "assembled_z": _brief_tensor(assembled),
                         "refined": _brief_tensor(refined),
