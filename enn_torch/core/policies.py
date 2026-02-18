@@ -1253,6 +1253,7 @@ class ModelPolicy:
             linear_total = 0
             float8_linear_weights = 0
             float8_param_tensors = 0
+            float8_buffer_tensors = 0
             for m in model.modules():
                 if isinstance(m, nn.Linear):
                     linear_total += 1
@@ -1269,7 +1270,11 @@ class ModelPolicy:
                 if _is_torchao_float8_tensor(p):
                     float8_param_tensors += 1
 
-            if wrapped == 0 and float8_param_tensors == 0:
+            for buf in model.buffers():
+                if _is_torchao_float8_tensor(buf):
+                    float8_buffer_tensors += 1
+
+            if wrapped == 0 and float8_param_tensors == 0 and float8_linear_weights == 0 and float8_buffer_tensors == 0:
                 return (
                     model,
                     False,
@@ -1293,6 +1298,7 @@ class ModelPolicy:
                 f"[FP8][AO] applied {cfg.__class__.__name__} "
                 f"(filtered={used_filter}, wrapped={wrapped}, linear_total={linear_total}, "
                 f"float8_linear_weights={float8_linear_weights}, float8_params={float8_param_tensors}, "
+                f"float8_buffers={float8_buffer_tensors}, "
                 f"frac={frac:.3f})",
             )
             return (model, True, "torchao")
