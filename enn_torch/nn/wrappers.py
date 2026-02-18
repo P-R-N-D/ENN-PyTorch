@@ -2808,7 +2808,7 @@ class Model(nn.Module):
         self._enn_nonfinite_pre_sanitize = []
 
         def _diag_nonfinite(tag: str, t: object) -> None:
-            if not bool(env_bool("ENN_DIAG_NONFINITE_PRE_SANITIZE", default=True)):
+            if not bool(env_bool("ENN_DIAG_NONFINITE_PRE_SANITIZE", default=False)):
                 return
             if not torch.is_tensor(t):
                 return
