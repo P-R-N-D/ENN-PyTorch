@@ -2885,7 +2885,39 @@ class MultiScaleRetention(nn.Module):
         )
         if use_triton:
             try:
-                return self._scan_causal_triton(v.contiguous(), lam_h)
+                out = self._scan_causal_triton(v.contiguous(), lam_h)
+                if env_bool("ENN_MSR_TRITON_FALLBACK_ON_ZERO", default=True):
+                    with contextlib.suppress(Exception):
+                        if out.numel() > 0:
+                            every = int(env_int("ENN_MSR_TRITON_ZERO_CHECK_EVERY", 0))
+                            cnt = int(getattr(self, "_triton_zero_check_count", 0) or 0)
+                            done = bool(getattr(self, "_triton_zero_check_done", False))
+                            do_check = False
+                            if not done:
+                                if cnt == 0:
+                                    do_check = True
+                                elif every > 0 and (cnt % every) == 0:
+                                    do_check = True
+                            setattr(self, "_triton_zero_check_count", cnt + 1)
+
+                            if do_check:
+                                out_abs = float(out.detach().abs().amax().item())
+                                if out_abs == 0.0:
+                                    v_abs = float(v.detach().abs().amax().item())
+                                    if v_abs > 0.0:
+                                        if not bool(getattr(self, "_triton_zero_warned", False)):
+                                            warnings.warn(
+                                                "[ENN] MultiScaleRetention: Triton scan produced all-zero output on CUDA despite non-zero inputs; "
+                                                "falling back to torch scan and disabling triton for this module.",
+                                                UserWarning,
+                                                stacklevel=2,
+                                            )
+                                            setattr(self, "_triton_zero_warned", True)
+                                        self._triton_ok = False
+                                        return self._scan_causal_torch(v, lam_h)
+                                if every <= 0 and out_abs != 0.0:
+                                    setattr(self, "_triton_zero_check_done", True)
+                return out
             except Exception:
                 pass
         return self._scan_causal_torch(v, lam_h)

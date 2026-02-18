@@ -1236,10 +1236,70 @@ class ModelPolicy:
                     )
                 quantize_(model, cfg)
 
+            def _is_torchao_float8_tensor(x: Any) -> bool:
+                try:
+                    t = type(x)
+                    mod = getattr(t, "__module__", "") or ""
+                    name = getattr(t, "__name__", "") or ""
+                    if "torchao" in mod and "float8" in f"{mod}.{name}".lower():
+                        return True
+                    if "Float8Tensor" in name:
+                        return True
+                except Exception:
+                    pass
+                return False
+
+            wrapped = 0
+            linear_total = 0
+            float8_linear_weights = 0
+            float8_param_tensors = 0
+            float8_buffer_tensors = 0
+            for m in model.modules():
+                if isinstance(m, nn.Linear):
+                    linear_total += 1
+                    with contextlib.suppress(Exception):
+                        w = getattr(m, "weight", None)
+                        if w is not None and _is_torchao_float8_tensor(w):
+                            float8_linear_weights += 1
+                modm = getattr(m.__class__, "__module__", "")
+                nm = m.__class__.__name__
+                if modm.startswith("torchao") or ("Float8" in nm):
+                    wrapped += 1
+
+            for p in model.parameters():
+                if _is_torchao_float8_tensor(p):
+                    float8_param_tensors += 1
+
+            for buf in model.buffers():
+                if _is_torchao_float8_tensor(buf):
+                    float8_buffer_tensors += 1
+
+            if wrapped == 0 and float8_param_tensors == 0 and float8_linear_weights == 0 and float8_buffer_tensors == 0:
+                return (
+                    model,
+                    False,
+                    "AO quantize produced no torchao float8 modules/tensors",
+                )
+
+            warn_min = int(env_int("ENN_FP8_AO_WRAPPED_WARN_MIN", 256))
+            warn_frac = float(env_float("ENN_FP8_AO_WRAPPED_WARN_FRAC", 0.90))
+            frac = (float(wrapped) / float(max(1, linear_total))) if linear_total > 0 else 0.0
+            if (wrapped >= warn_min) or (linear_total > 0 and frac >= warn_frac):
+                _log_info(
+                    logger,
+                    f"[FP8][AO] WARNING: high quantized coverage "
+                    f"(wrapped_modules={wrapped}, linear_total={linear_total}, frac={frac:.3f}); "
+                    "verify filter_fn criteria / skip flags.",
+                )
+
             setattr(model, "__fp8_inference_ao__", True)
             _log_info(
                 logger,
-                f"[FP8][AO] applied {cfg.__class__.__name__} (filtered={used_filter})",
+                f"[FP8][AO] applied {cfg.__class__.__name__} "
+                f"(filtered={used_filter}, wrapped={wrapped}, linear_total={linear_total}, "
+                f"float8_linear_weights={float8_linear_weights}, float8_params={float8_param_tensors}, "
+                f"float8_buffers={float8_buffer_tensors}, "
+                f"frac={frac:.3f})",
             )
             return (model, True, "torchao")
         except Exception as exc:
