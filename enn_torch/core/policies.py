@@ -1148,20 +1148,99 @@ class ModelPolicy:
         logger: Optional[Callable[[str], None]],
     ) -> Tuple[nn.Module, bool, str]:
         try:
+            dev = None
+            with contextlib.suppress(Exception):
+                for p in model.parameters():
+                    if isinstance(p, torch.Tensor):
+                        dev = p.device
+                        break
+            if dev is None:
+                dev = torch.device("cpu")
+            from .system import is_float8_supported
+
+            ok, reason = is_float8_supported(dev)
+            r = str(reason or "").lower()
+            if (not bool(ok)) or ("fp8-ok:ao" not in r):
+                return (
+                    model,
+                    False,
+                    f"AO skipped (fp8 not validated for AO): {reason}",
+                )
+
             from torchao.quantization import (
                 Float8DynamicActivationFloat8WeightConfig,
+                Float8WeightOnlyConfig,
+                quantize_,
             )
-            from torchao.quantization import Float8WeightOnlyConfig
-            from torchao.quantization import quantize_
 
             cfg = (
                 Float8DynamicActivationFloat8WeightConfig()
                 if dynamic_activations
                 else Float8WeightOnlyConfig()
             )
-            quantize_(model, cfg)
+
+            import inspect as _inspect
+
+            sig = None
+            with contextlib.suppress(Exception):
+                sig = _inspect.signature(quantize_)
+
+            def _eligible_linear(m: nn.Module) -> bool:
+                if getattr(m, "_enn_no_ao_quant", False):
+                    return False
+                if not isinstance(m, nn.Linear):
+                    return False
+                inf = getattr(m, "in_features", None)
+                outf = getattr(m, "out_features", None)
+                if inf is None or outf is None:
+                    return False
+                inf = int(inf)
+                outf = int(outf)
+                if inf < 16 or outf < 16:
+                    return False
+                if (inf % 16) != 0 or (outf % 16) != 0:
+                    return False
+                return True
+
+            used_filter = False
+            if sig is not None and ("filter_fn" in sig.parameters):
+
+                def filter_fn(mod: nn.Module, name: str) -> bool:
+                    del name
+                    return _eligible_linear(mod)
+
+                quantize_(model, cfg, filter_fn=filter_fn)
+                used_filter = True
+            else:
+                risky = False
+                for m in model.modules():
+                    if isinstance(m, nn.Linear):
+                        if getattr(m, "_enn_no_ao_quant", False):
+                            risky = True
+                            break
+                        inf = int(getattr(m, "in_features", 0) or 0)
+                        outf = int(getattr(m, "out_features", 0) or 0)
+                        if (
+                            inf < 16
+                            or outf < 16
+                            or (inf % 16) != 0
+                            or (outf % 16) != 0
+                        ):
+                            risky = True
+                            break
+                if risky:
+                    return (
+                        model,
+                        False,
+                        "AO skipped (quantize_ has no filter_fn; risky Linear present)",
+                    )
+                quantize_(model, cfg)
+
             setattr(model, "__fp8_inference_ao__", True)
-            _log_info(logger, f"[FP8][AO] applied {cfg.__class__.__name__}")
+            _log_info(
+                logger,
+                f"[FP8][AO] applied {cfg.__class__.__name__} (filtered={used_filter})",
+            )
             return (model, True, "torchao")
         except Exception as exc:
             return (model, False, f"AO failed: {exc}")

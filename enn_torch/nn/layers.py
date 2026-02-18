@@ -351,9 +351,23 @@ class _FlexKeyBiasScoreMod:
         kv_idx: torch.Tensor,
     ) -> torch.Tensor:
         del h, q_idx
-        if self.per_batch:
-            return score + self.bias_bk[b, kv_idx]
-        return score + self.bias_bk[0, kv_idx]
+        bias_bk = self.bias_bk
+        K = bias_bk.shape[1]
+        kv = kv_idx.to(torch.int64)
+        valid = (kv >= 0) & (kv < K)
+        kv_safe = kv.clamp(0, K - 1)
+        row = b.to(torch.int64)
+        if not bool(self.per_batch):
+            row = row * 0
+        else:
+            B0 = bias_bk.shape[0]
+            row = row.clamp(0, B0 - 1)
+        flat = (row * K + kv_safe).to(torch.int64)
+        bias_flat = bias_bk.reshape(-1).contiguous()
+        flat_1d = flat.reshape(-1)
+        bias = bias_flat.gather(0, flat_1d).reshape(flat.shape)
+        bias = torch.where(valid, bias, torch.zeros_like(bias))
+        return score + bias
 
 
 def _coerce_attn_bias_to_bk(
