@@ -1047,6 +1047,7 @@ class Resampler(nn.Module):
                     dropout_p=(self.dropout_p if self.training else 0.0),
                     training=bool(self.training),
                 )
+                attn_out = attn_out.to(dtype=q.dtype)
         if attn_out.dim() == 4:
             attn_out = attn_out.transpose(1, 2).contiguous().view(B, Lq, D)
         else:
