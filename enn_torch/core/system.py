@@ -1746,19 +1746,52 @@ def is_float8_supported(
                 return (True, "te-ok(no-selftest)")
             try:
                 import transformer_engine.pytorch as te
+
+                def _run_te_fp8_module(recipe_obj=None) -> Tuple[bool, str]:
+                    linear_ctor = getattr(te, "Linear", None)
+                    if not callable(linear_ctor):
+                        return (False, "te-linear-missing")
+                    try:
+                        mod = linear_ctor(
+                            64,
+                            64,
+                            bias=False,
+                            params_dtype=torch.float16,
+                            device=dev,
+                        )
+                    except TypeError:
+                        mod = linear_ctor(64, 64, bias=False)
+                        mod = mod.to(device=dev, dtype=torch.float16)
+                    x = torch.randn((8, 64), device=dev, dtype=torch.float16)
+                    try:
+                        if recipe_obj is None:
+                            with te.autocast(enabled=True):
+                                y = mod(x)
+                            return (
+                                (torch.is_tensor(y) and y.shape == (8, 64)),
+                                "te-selftest-ok:te.Linear+autocast",
+                            )
+                        with te.autocast(enabled=True, recipe=recipe_obj):
+                            y = mod(x)
+                        return (
+                            (torch.is_tensor(y) and y.shape == (8, 64)),
+                            "te-selftest-ok:te.Linear+autocast+recipe",
+                        )
+                    except Exception as exc:
+                        return (False, f"te-linear-forward-failed:{str(exc)[:120]}")
+
                 recipe = None
                 with contextlib.suppress(Exception):
                     from transformer_engine.common.recipe import DelayedScaling, Format
                     recipe = DelayedScaling(fp8_format=Format.HYBRID)
-                with contextlib.suppress(TypeError):
-                    with te.autocast(enabled=True, recipe=recipe):
-                        a = torch.randn((16, 16), device=dev, dtype=torch.float16)
-                        _ = a @ a.t()
-                        return (True, "te-selftest-ok:autocast+recipe")
-                with te.autocast(enabled=True):
-                    a = torch.randn((16, 16), device=dev, dtype=torch.float16)
-                    _ = a @ a.t()
-                return (True, "te-selftest-ok:autocast")
+                if recipe is not None:
+                    ok_recipe, why_recipe = _run_te_fp8_module(recipe)
+                    if ok_recipe:
+                        return (True, why_recipe)
+                ok_plain, why_plain = _run_te_fp8_module()
+                if ok_plain:
+                    return (True, why_plain)
+                return (False, why_plain if recipe is None else f"{why_recipe};{why_plain}")
             except Exception as exc:
                 return (False, f"te-selftest-failed:{str(exc)[:120]}")
 
