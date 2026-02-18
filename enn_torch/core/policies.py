@@ -1577,15 +1577,6 @@ class AttentionPolicy:
             pass
         return False
 
-    @staticmethod
-    def _flex_has_score_mod() -> bool:
-        try:
-            from torch.nn.attention.flex_attention import flex_attention as _fa
-            kw = set(inspect.signature(_fa).parameters.keys())
-            return "score_mod" in kw
-        except Exception:
-            return False
-
     def plan(
         self,
         *,
@@ -1612,6 +1603,7 @@ class AttentionPolicy:
             allow_fp32 = bool(env_bool("ENN_FLEX_ALLOW_FP32", True))
             flex_ok = (
                 (not env_bool("ENN_DISABLE_FLEX_ATTENTION", False))
+                and _HAS_TORCH_FLEX
                 and getattr(q, "is_cuda", False)
                 and (not exporting)
                 and (not compiling)
@@ -1623,15 +1615,14 @@ class AttentionPolicy:
                 )
             )
 
-        flex_score_mod_ok = bool(self._flex_has_score_mod())
-        if has_bias and (not flex_score_mod_ok):
+        if has_bias and (not _FLEX_HAS_SCORE_MOD):
             flex_ok = False
 
         for be in self.order:
             if be == "flex" and flex_ok:
                 return AttentionPlan(
                     AttentionBackend.FLEX,
-                    use_score_mod_for_bias=bool(has_bias and flex_score_mod_ok),
+                    use_score_mod_for_bias=bool(has_bias and _FLEX_HAS_SCORE_MOD),
                     reason=("auto:flex(score_mod)" if has_bias else "auto:flex"),
                 )
             if be == "mha":
@@ -1640,6 +1631,17 @@ class AttentionPolicy:
                 return AttentionPlan(AttentionBackend.DPA, reason="auto:dpa")
 
         return AttentionPlan(AttentionBackend.MHA, reason="auto:default")
+
+
+_FLEX_HAS_SCORE_MOD: bool = False
+_HAS_TORCH_FLEX: bool = False
+with contextlib.suppress(Exception):
+    from torch.nn.attention.flex_attention import flex_attention as _fa
+
+    _HAS_TORCH_FLEX = True
+    _FLEX_HAS_SCORE_MOD = "score_mod" in set(
+        inspect.signature(_fa).parameters.keys()
+    )
 
 
 _ATTN_POLICY_LOCK = threading.Lock()

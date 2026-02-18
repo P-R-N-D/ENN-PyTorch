@@ -11,11 +11,12 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from ..core.compat import StochasticDepth
-from ..core.datatypes import env_bool
+from ..core.datatypes import env_bool, env_int
+from ..core.policies import ATTENTION_POLICY, AttentionBackend
 from ..runtime.distributed import _from_hsdp_module
 from .activations import GeGLU
-from .graph import coerce_checkpoint, is_checkpoint, is_export_or_trace, is_symbolic, canonicalize_compile_mode
-from .kernels import DotProductAttention
+from .graph import coerce_checkpoint, is_checkpoint, is_export_or_trace, is_symbolic, canonicalize_compile_mode, is_compiling
+from .kernels import DotProductAttention, _ensure_flex_kwargs_initialized, get_flex_kernel
 from .layers import DilatedAttention, Resampler, Retention, norm_layer
 _LOGGER = logging.getLogger(__name__)
 _PRESET_ALIASES: dict[str, str] = {
@@ -268,9 +269,10 @@ class LatentTransformer(nn.Module):
         self.norm1 = norm_layer(norm_type=norm_type, dim=self.d_model, eps=eps)
         self.qkv = nn.Linear(self.d_model, 3 * self.d_model, bias=True)
         self.out_proj = nn.Linear(self.d_model, self.d_model, bias=True)
-        self.attn = DotProductAttention(
-            num_heads=self.nhead, head_dim=self.head_dim
-        )
+        self.attn = DotProductAttention(num_heads=self.nhead, head_dim=self.head_dim)
+        self._disable_flex_runtime: bool = False
+        self._flex_fail_count: int = 0
+        self._flex_fail_max: int = max(0, int(env_int("ENN_LATENT_FLEX_RETRY", 3)))
         self.dropout = nn.Dropout(dropout)
         self.drop_path = (
             StochasticDepth(drop_path) if drop_path > 0.0 else nn.Identity()
@@ -292,14 +294,64 @@ class LatentTransformer(nn.Module):
             .permute(2, 0, 3, 1, 4)
             .unbind(0)
         )
-        attn_out = self.attn(
-            q,
-            k,
-            v,
-            attn_mask=None,
-            is_causal=False,
-            dropout_p=self.dropout.p if self.training else 0.0,
+        attn_out = None
+        exporting = bool(is_export_or_trace())
+        compiling = bool(is_compiling())
+        plan = ATTENTION_POLICY.plan(
+            q=q,
+            need_weights=False,
+            has_bias=False,
+            exporting=exporting,
+            compiling=compiling,
         )
+        def _classify(exc: BaseException) -> str:
+            msg = str(exc)
+            tname = type(exc).__name__
+            if tname in ("TypeError", "ValueError"):
+                return "struct"
+            if exporting or compiling:
+                return "struct"
+            if "float8" in msg or "fp8" in msg:
+                return "struct"
+            if "No valid triton configs" in msg or "OutOfResources" in msg or "out of resources" in msg:
+                return "transient"
+            if "torch._dynamo" in msg or "torch._inductor" in msg or "CompileError" in msg:
+                return "transient"
+            return "transient"
+
+        if (not self._disable_flex_runtime) and plan.backend == AttentionBackend.FLEX:
+            try:
+                if getattr(q, "dtype", None) == torch.float64 or ("float8" in str(getattr(q, "dtype", ""))):
+                    raise RuntimeError("flex disabled for fp64/fp8")
+                _ensure_flex_kwargs_initialized()
+                attn_out = get_flex_kernel()(
+                    q,
+                    k,
+                    v,
+                    score_mod=None,
+                    block_mask=None,
+                    scale=None,
+                    dropout_p=self.dropout.p if self.training else 0.0,
+                    training=bool(self.training),
+                    is_causal=False,
+                )
+            except Exception as exc:
+                kind = _classify(exc)
+                self._flex_fail_count += 1
+                if kind == "struct":
+                    self._disable_flex_runtime = True
+                elif self._flex_fail_max > 0 and self._flex_fail_count >= self._flex_fail_max:
+                    self._disable_flex_runtime = True
+                attn_out = None
+        if attn_out is None:
+            attn_out = self.attn(
+                q,
+                k,
+                v,
+                attn_mask=None,
+                is_causal=False,
+                dropout_p=self.dropout.p if self.training else 0.0,
+            )
         attn_out = attn_out.transpose(1, 2).contiguous().view(B, K, D)
         attn_out = self.out_proj(attn_out)
         x = x + self.drop_path(self.dropout(attn_out))
