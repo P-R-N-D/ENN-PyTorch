@@ -53,6 +53,8 @@ _ENN_MP_MAIN_STUB_PATH: Optional[str] = None
 _EMPTY_CACHE_LAST_CALL_S_BY_DEVICE: dict[Tuple[str, int], float] = {}
 _FP32_PRECISION_CACHE: dict[str, str] = {}
 _FP32_API_CHOICE_CACHE_KEY = "__enn_tf32_api_choice__"
+_FP8_SUPPORT_CACHE: dict[tuple[str, int, int, int], tuple[bool, str]] = {}
+_FP8_SUPPORT_CACHE_LOCK = threading.Lock()
 _LOGGER = logging.getLogger(__name__)
 
 
@@ -1634,21 +1636,182 @@ def is_float8_supported(
 ) -> Tuple[bool, str]:
     try:
         dev = _device_from(device)
-        if dev.type == "cuda" and torch.cuda.is_available():
-            try:
-                import torch.cuda.amp as _tca
+        if not (dev.type == "cuda" and torch.cuda.is_available()):
+            return (False, "FP8 requires CUDA")
+        major, minor = cuda_compute_capability(dev)
+        if (int(major), int(minor)) < (8, 9):
+            return (False, "FP8 requires sm89+ (Ada) or sm90+ (Hopper)")
+        cache = globals().setdefault("_FP8_SUPPORT_CACHE", {})
+        lock = globals().setdefault("_FP8_SUPPORT_CACHE_LOCK", threading.Lock())
+        idx = getattr(dev, "index", None)
+        if idx is None:
+            with contextlib.suppress(Exception):
+                idx = int(torch.cuda.current_device())
+        idx_i = int(idx) if idx is not None else -1
+        key = ("cuda", idx_i, int(major), int(minor))
+        with lock:
+            cached = cache.get(key)
+        if cached is not None:
+            return cached
+        do_selftest = bool(env_bool("ENN_FP8_SELFTEST", default=True))
+        do_quant = bool(env_bool("ENN_FP8_SELFTEST_QUANTIZE", default=True))
 
+        def _has_torchao() -> bool:
+            with contextlib.suppress(Exception):
+                import torchao.float8
+                return True
+            return False
+
+        def _has_te() -> bool:
+            with contextlib.suppress(Exception):
+                import transformer_engine.pytorch as te
+                return callable(getattr(te, "autocast", None))
+            return False
+
+        def _selftest_ao() -> Tuple[bool, str]:
+            if not _has_torchao():
+                return (False, "torchao-missing")
+            if not do_selftest:
+                return (True, "ao-ok(no-selftest)")
+            try:
+                import torchao.float8 as ao_f8
+            except Exception as exc:
+                return (False, f"torchao-import-failed:{str(exc)[:120]}")
+            dts: list[torch.dtype] = []
+            for nm in ("float8_e4m3fn", "float8_e5m2"):
+                if hasattr(torch, nm):
+                    dts.append(getattr(torch, nm))
+            if not dts:
+                return (False, "torch-no-float8-dtypes")
+            last = ""
+            try:
+                with ao_f8.fp8_autocast(enabled=True):
+                    for dt in dts:
+                        try:
+                            x = torch.randn((16, 16), device=dev, dtype=torch.float16).to(dt)
+                            y = torch.randn((16, 16), device=dev, dtype=torch.float16).to(dt)
+                            _ = x @ y
+                            break
+                        except Exception as exc:
+                            last = str(exc)
+                            continue
+                    else:
+                        return (False, f"ao-matmul-failed:{last[:120]}")
+            except Exception as exc:
+                return (False, f"ao-autocast-failed:{str(exc)[:120]}")
+            if do_quant:
+                try:
+                    from torchao.quantization import quantize_
+                    from torchao.quantization import Float8WeightOnlyConfig
+                    try:
+                        from torchao.quantization import Float8DynamicActivationFloat8WeightConfig
+                        cfgs = [Float8DynamicActivationFloat8WeightConfig(), Float8WeightOnlyConfig()]
+                    except Exception:
+                        cfgs = [Float8WeightOnlyConfig()]
+                except Exception as exc:
+                    return (False, f"ao-quant-import-failed:{str(exc)[:120]}")
+                ok_any = False
+                last2 = ""
+                for cfg in cfgs:
+                    try:
+                        with ao_f8.fp8_autocast(enabled=True):
+                            lin = torch.nn.Linear(64, 64, bias=False, device=dev, dtype=torch.float16)
+                            x = torch.randn((8, 64), device=dev, dtype=torch.float16)
+                            quantize_(lin, cfg)
+                            wrapped = any(
+                                (
+                                    getattr(m.__class__, "__module__", "").startswith("torchao")
+                                    or "Float8" in m.__class__.__name__
+                                )
+                                for m in lin.modules()
+                            )
+                            if not wrapped:
+                                raise RuntimeError("ao-quantize-produced-no-torchao-modules")
+                            y = lin(x)
+                            if not torch.is_tensor(y):
+                                raise RuntimeError("ao-quant-forward-non-tensor")
+                        ok_any = True
+                        break
+                    except Exception as exc:
+                        last2 = str(exc)
+                        continue
+                if not ok_any:
+                    return (False, f"ao-quant-selftest-failed:{last2[:120]}")
+            return (True, "ao-selftest-ok")
+
+        def _selftest_te() -> Tuple[bool, str]:
+            if not _has_te():
+                return (False, "te-missing")
+            if not do_selftest:
+                return (True, "te-ok(no-selftest)")
+            try:
+                import transformer_engine.pytorch as te
+
+                def _run_te_fp8_module(recipe_obj=None) -> Tuple[bool, str]:
+                    linear_ctor = getattr(te, "Linear", None)
+                    if not callable(linear_ctor):
+                        return (False, "te-linear-missing")
+                    try:
+                        mod = linear_ctor(
+                            64,
+                            64,
+                            bias=False,
+                            params_dtype=torch.float16,
+                            device=dev,
+                        )
+                    except TypeError:
+                        mod = linear_ctor(64, 64, bias=False)
+                        mod = mod.to(device=dev, dtype=torch.float16)
+                    x = torch.randn((8, 64), device=dev, dtype=torch.float16)
+                    try:
+                        if recipe_obj is None:
+                            with te.autocast(enabled=True):
+                                y = mod(x)
+                            return (
+                                (torch.is_tensor(y) and y.shape == (8, 64)),
+                                "te-selftest-ok:te.Linear+autocast",
+                            )
+                        with te.autocast(enabled=True, recipe=recipe_obj):
+                            y = mod(x)
+                        return (
+                            (torch.is_tensor(y) and y.shape == (8, 64)),
+                            "te-selftest-ok:te.Linear+autocast+recipe",
+                        )
+                    except Exception as exc:
+                        return (False, f"te-linear-forward-failed:{str(exc)[:120]}")
+
+                recipe = None
                 with contextlib.suppress(Exception):
-                    if getattr(_tca, "is_float8_available", None) is not None:
-                        ok, reason = _tca.is_float8_available()
-                        return (bool(ok), str(reason))
-            except Exception:
-                pass
-            major, _minor = cuda_compute_capability(dev)
-            if major >= 9:
-                return (True, "Hopper+ supports FP8")
-            return (False, "FP8 requires sm90+")
-        return (False, "FP8 requires CUDA sm90+ and torch.cuda")
+                    from transformer_engine.common.recipe import DelayedScaling, Format
+                    recipe = DelayedScaling(fp8_format=Format.HYBRID)
+                if recipe is not None:
+                    ok_recipe, why_recipe = _run_te_fp8_module(recipe)
+                    if ok_recipe:
+                        return (True, why_recipe)
+                ok_plain, why_plain = _run_te_fp8_module()
+                if ok_plain:
+                    return (True, why_plain)
+                return (False, why_plain if recipe is None else f"{why_recipe};{why_plain}")
+            except Exception as exc:
+                return (False, f"te-selftest-failed:{str(exc)[:120]}")
+
+        ok_ao, why_ao = _selftest_ao()
+        ok_te, why_te = (False, "te-skipped")
+        if ok_ao:
+            ok_te, why_te = _selftest_te()
+            if ok_te:
+                out = (True, f"fp8-ok:ao+te:{why_ao};{why_te}")
+            else:
+                out = (True, f"fp8-ok:ao-only:{why_ao};te={why_te}")
+        else:
+            ok_te, why_te = _selftest_te()
+            if ok_te:
+                out = (True, f"fp8-ok:te-only:{why_te}")
+            else:
+                out = (False, f"fp8-unavailable:ao={why_ao},te={why_te}")
+        with lock:
+            cache[key] = out
+        return out
     except Exception:
         return (False, "Unknown float8 support")
 
