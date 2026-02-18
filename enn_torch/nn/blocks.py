@@ -307,15 +307,20 @@ class LatentTransformer(nn.Module):
         def _classify(exc: BaseException) -> str:
             msg = str(exc)
             tname = type(exc).__name__
+            m = msg.lower()
+            if "flexattention not available" in m:
+                return "struct"
+            if "not available" in m and "flex" in m:
+                return "struct"
             if tname in ("TypeError", "ValueError"):
                 return "struct"
             if exporting or compiling:
                 return "struct"
-            if "float8" in msg or "fp8" in msg:
+            if "float8" in m or "fp8" in m:
                 return "struct"
-            if "No valid triton configs" in msg or "OutOfResources" in msg or "out of resources" in msg:
+            if "no valid triton configs" in m or "outofresources" in m or "out of resources" in m:
                 return "transient"
-            if "torch._dynamo" in msg or "torch._inductor" in msg or "CompileError" in msg:
+            if "torch._dynamo" in m or "torch._inductor" in m or "compileerror" in m:
                 return "transient"
             return "transient"
 
