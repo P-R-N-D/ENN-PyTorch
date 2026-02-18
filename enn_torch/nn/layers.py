@@ -363,7 +363,7 @@ class _FlexKeyBiasScoreMod:
             B0 = bias_bk.shape[0]
             row = row.clamp(0, B0 - 1)
         flat = (row * K + kv_safe).to(torch.int64)
-        bias_flat = bias_bk.reshape(-1)
+        bias_flat = bias_bk.reshape(-1).contiguous()
         flat_1d = flat.reshape(-1)
         bias = bias_flat.gather(0, flat_1d).reshape(flat.shape)
         bias = torch.where(valid, bias, torch.zeros_like(bias))
