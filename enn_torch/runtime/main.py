@@ -3361,6 +3361,9 @@ def infer(
                     tokenize_pre: dict[str, object] = {}
                     tokenize_post_blk0: dict[str, object] = {}
                     tokenize_meta: dict[str, object] = {}
+                    template_out: dict[str, object] = {}
+                    template_weight: dict[str, object] = {}
+                    template_out_weighted: dict[str, object] = {}
                     try:
                         fuser = getattr(m0, "fuser", None)
                         tasks = getattr(fuser, "tasks", None) if fuser is not None else None
@@ -3402,6 +3405,31 @@ def infer(
                                             if isinstance(y0, tuple):
                                                 y0 = y0[0]
                                             tokenize_post_blk0[str(name)] = _brief_tensor(y0)
+                                    with contextlib.suppress(Exception):
+                                        kwt: dict[str, object] = {"causal_mask": None}
+                                        with contextlib.suppress(Exception):
+                                            ps_t = inspect.signature(tmpl.forward).parameters
+                                            if "state" in ps_t:
+                                                kwt["state"] = None
+                                            if "return_state" in ps_t:
+                                                kwt["return_state"] = False
+                                        with torch.no_grad():
+                                            tout = tmpl(Xi2, **kwt)
+                                        if isinstance(tout, tuple):
+                                            tout = tout[0]
+                                        if torch.is_tensor(tout):
+                                            template_out[str(name)] = _brief_tensor(tout)
+                                            w = getattr(tmpl, "weight", None)
+                                            if torch.is_tensor(w):
+                                                try:
+                                                    template_weight[str(name)] = float(w.detach().float().item())
+                                                except Exception:
+                                                    template_weight[str(name)] = str(w)
+                                            try:
+                                                ww = float(template_weight.get(str(name), 1.0))
+                                                template_out_weighted[str(name)] = _brief_tensor(tout * ww)
+                                            except Exception:
+                                                pass
                     except Exception:
                         pass
                     diag: dict[str, object] = {
@@ -3424,6 +3452,9 @@ def infer(
                         "tokenize_pre": tokenize_pre,
                         "tokenize_meta": tokenize_meta,
                         "tokenize_post_blk0": tokenize_post_blk0,
+                        "template_out": template_out,
+                        "template_weight": template_weight,
+                        "template_out_weighted": template_out_weighted,
                         "tokens": _brief_tensor(tokens),
                         "assembled_z": _brief_tensor(assembled),
                         "refined": _brief_tensor(refined),
