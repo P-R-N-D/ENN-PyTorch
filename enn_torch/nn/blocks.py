@@ -285,6 +285,7 @@ class LatentTransformer(nn.Module):
             nn.Linear(inner_dim, self.d_model, bias=True),
         )
         self.register_load_state_dict_pre_hook(self._map_legacy_state_dict_keys)
+        self.register_state_dict_post_hook(self._export_legacy_state_dict_keys)
 
     @staticmethod
     def _map_legacy_state_dict_keys(
@@ -308,6 +309,28 @@ class LatentTransformer(nn.Module):
                     new_key = f"{mapped_key}.{suffix}"
                     if new_key not in state_dict:
                         state_dict[new_key] = state_dict[key]
+                    del state_dict[key]
+
+    @staticmethod
+    def _export_legacy_state_dict_keys(
+        module: nn.Module,
+        state_dict: Dict[str, torch.Tensor],
+        prefix: str,
+        local_metadata: Dict[str, Any],
+    ) -> None:
+        del module, local_metadata
+        if not env_bool("ENN_STATE_DICT_LEGACY_KEYS", default=True):
+            return
+        legacy_roots = ("norm1", "qkv", "out_proj")
+        for root in legacy_roots:
+            new_prefix = f"{prefix}attn.{root}."
+            old_prefix = f"{prefix}{root}."
+            for key in list(state_dict.keys()):
+                if key.startswith(new_prefix):
+                    suffix = key[len(new_prefix) :]
+                    legacy_key = f"{old_prefix}{suffix}"
+                    if legacy_key not in state_dict:
+                        state_dict[legacy_key] = state_dict[key]
                     del state_dict[key]
 
     def forward(self: Self, x: torch.Tensor) -> torch.Tensor:
@@ -363,6 +386,7 @@ class Resampler(nn.Module):
             self.d_model, hid, out_dim=self.d_model, dropout=dropout
         )
         self.register_load_state_dict_pre_hook(self._map_legacy_state_dict_keys)
+        self.register_state_dict_post_hook(self._export_legacy_state_dict_keys)
 
     @staticmethod
     def _map_legacy_state_dict_keys(
@@ -393,6 +417,35 @@ class Resampler(nn.Module):
                     new_key = f"{mapped_key}.{suffix}"
                     if new_key not in state_dict:
                         state_dict[new_key] = state_dict[key]
+                    del state_dict[key]
+
+    @staticmethod
+    def _export_legacy_state_dict_keys(
+        module: nn.Module,
+        state_dict: Dict[str, torch.Tensor],
+        prefix: str,
+        local_metadata: Dict[str, Any],
+    ) -> None:
+        del module, local_metadata
+        if not env_bool("ENN_STATE_DICT_LEGACY_KEYS", default=True):
+            return
+        legacy_roots = (
+            "q_proj",
+            "k_proj",
+            "v_proj",
+            "out_proj",
+            "norm_q",
+            "norm_kv",
+        )
+        for root in legacy_roots:
+            new_prefix = f"{prefix}cross_attn.{root}."
+            old_prefix = f"{prefix}{root}."
+            for key in list(state_dict.keys()):
+                if key.startswith(new_prefix):
+                    suffix = key[len(new_prefix) :]
+                    legacy_key = f"{old_prefix}{suffix}"
+                    if legacy_key not in state_dict:
+                        state_dict[legacy_key] = state_dict[key]
                     del state_dict[key]
 
     def forward(
