@@ -608,7 +608,7 @@ class DilatedAttention(nn.Module):
         out_proj = torch_mha.out_proj
         return q, k, v, out_proj
 
-    def _get_mask(self, L: int, device: torch.device) -> torch.Tensor:
+    def _get_mask(self, L: int | torch.SymInt, device: torch.device) -> torch.Tensor:
         if (
             self._mask_cache is None
             or self._mask_cache_len != L
@@ -799,7 +799,7 @@ class DilatedAttention(nn.Module):
                     if self.dilation == 1 and self.window_size is None:
                         use_is_causal = bool(self.causal)
                     else:
-                        mask_keep = self._get_mask(int(L), device)
+                        mask_keep = self._get_mask(L, device)
                     a = self.dpa(
                         q,
                         k,
@@ -821,7 +821,7 @@ class DilatedAttention(nn.Module):
                 if self.dilation == 1 and self.window_size is None:
                     use_is_causal = bool(self.causal)
                 else:
-                    attn_mask_keep = self._get_mask(int(L), device)
+                    attn_mask_keep = self._get_mask(L, device)
                     attn_mask = ~attn_mask_keep
 
                 attn_out, attn_weights = self.mha(
@@ -861,7 +861,7 @@ class DilatedAttention(nn.Module):
             if self.dilation == 1 and self.window_size is None:
                 use_is_causal = bool(self.causal)
             else:
-                attn_mask_keep = self._get_mask(int(L), device)
+                attn_mask_keep = self._get_mask(L, device)
                 attn_mask = ~attn_mask_keep
             attn_out, attn_weights = self.mha(
                 x_norm,
@@ -885,7 +885,7 @@ class DilatedAttention(nn.Module):
 
         if return_attn_mask:
             if attn_mask_keep is None:
-                attn_mask_keep = self._get_mask(int(L), device)
+                attn_mask_keep = self._get_mask(L, device)
             return x, attn_weights, attn_mask_keep
         return x, attn_weights
 
