@@ -1,0 +1,978 @@
+--- a/enn_torch/core/policies.py
++++ b/enn_torch/core/policies.py
+@@ -1791,16 +1791,16 @@
+         has_bias: bool = False,
+         exporting: bool = False,
+         compiling: bool = False,
++        allow_flex: bool = True,
++        allow_mha: bool = True,
++        allow_dpa: bool = True,
+     ) -> AttentionPlan:
+         forced = (env_str("ENN_ATTENTION_BACKEND") or "").strip().lower()
++        forced_be: AttentionBackend | None = None
+         if forced in {"flex", "mha", "dpa"}:
+-            be = AttentionBackend(forced)
+-            return AttentionPlan(
+-                be,
+-                use_score_mod_for_bias=bool(be is AttentionBackend.FLEX and has_bias),
+-                reason="forced",
+-            )
++            forced_be = AttentionBackend(forced)
+ 
++        # Flex feasibility, then apply per-call constraints.
+         if q.dtype == torch.float64:
+             flex_ok = False
+         else:
+@@ -1808,7 +1808,8 @@
+             is_fp8 = self._is_float8_dtype(q.dtype) or self._is_torchao_float8_tensor(q)
+             allow_fp32 = bool(env_bool("ENN_FLEX_ALLOW_FP32", True))
+             flex_ok = (
+-                (not env_bool("ENN_DISABLE_FLEX_ATTENTION", False))
++                bool(allow_flex)
++                and (not env_bool("ENN_DISABLE_FLEX_ATTENTION", False))
+                 and _HAS_TORCH_FLEX
+                 and getattr(q, "is_cuda", False)
+                 and (not exporting)
+@@ -1824,21 +1825,54 @@
+         if has_bias and (not _FLEX_HAS_SCORE_MOD):
+             flex_ok = False
+ 
+-        for be in self.order:
+-            if be == "flex" and flex_ok:
++        mha_ok = bool(allow_mha)
++        dpa_ok = bool(allow_dpa)
++
++        def _auto() -> AttentionPlan:
++            for be in self.order:
++                if be == "flex" and flex_ok:
++                    return AttentionPlan(
++                        AttentionBackend.FLEX,
++                        use_score_mod_for_bias=bool(has_bias and _FLEX_HAS_SCORE_MOD),
++                        reason=("auto:flex(score_mod)" if has_bias else "auto:flex"),
++                    )
++                if be == "mha" and mha_ok:
++                    return AttentionPlan(AttentionBackend.MHA, reason="auto:mha")
++                if be == "dpa" and dpa_ok:
++                    return AttentionPlan(AttentionBackend.DPA, reason="auto:dpa")
++
++            # Last resort: pick any allowed backend (should be rare).
++            if flex_ok:
+                 return AttentionPlan(
+                     AttentionBackend.FLEX,
+                     use_score_mod_for_bias=bool(has_bias and _FLEX_HAS_SCORE_MOD),
+                     reason=("auto:flex(score_mod)" if has_bias else "auto:flex"),
+                 )
+-            if be == "mha":
+-                return AttentionPlan(AttentionBackend.MHA, reason="auto:mha")
+-            if be == "dpa":
+-                return AttentionPlan(AttentionBackend.DPA, reason="auto:dpa")
+-
+-        return AttentionPlan(AttentionBackend.MHA, reason="auto:default")
++            if mha_ok:
++                return AttentionPlan(AttentionBackend.MHA, reason="auto:default")
++            if dpa_ok:
++                return AttentionPlan(AttentionBackend.DPA, reason="auto:default")
++            return AttentionPlan(AttentionBackend.MHA, reason="auto:default(disallowed)")
+ 
++        if forced_be is not None:
++            if forced_be is AttentionBackend.FLEX and flex_ok:
++                return AttentionPlan(
++                    AttentionBackend.FLEX,
++                    use_score_mod_for_bias=bool(has_bias and _FLEX_HAS_SCORE_MOD),
++                    reason="forced:flex",
++                )
++            if forced_be is AttentionBackend.MHA and mha_ok:
++                return AttentionPlan(AttentionBackend.MHA, reason="forced:mha")
++            if forced_be is AttentionBackend.DPA and dpa_ok:
++                return AttentionPlan(AttentionBackend.DPA, reason="forced:dpa")
++            auto = _auto()
++            return AttentionPlan(
++                auto.backend,
++                use_score_mod_for_bias=auto.use_score_mod_for_bias,
++                reason=f"forced({forced})-disallowed->{auto.reason}",
++            )
+ 
++        return _auto()
+ _FLEX_HAS_SCORE_MOD: bool = False
+ _HAS_TORCH_FLEX: bool = False
+ with contextlib.suppress(Exception):
+
+--- a/enn_torch/nn/blocks.py
++++ b/enn_torch/nn/blocks.py
+@@ -4,6 +4,7 @@
+ import contextlib
+ import logging
+ import os
++import warnings
+ from importlib import import_module
+ from typing import Any, Callable, List, Optional, Self, Sequence, Tuple
+ 
+@@ -16,7 +17,7 @@
+ from ..runtime.distributed import _from_hsdp_module
+ from .activations import GeGLU
+ from .graph import coerce_checkpoint, is_checkpoint, is_export_or_trace, is_symbolic, canonicalize_compile_mode, is_compiling
+-from .kernels import DotProductAttention, _ensure_flex_kwargs_initialized, get_flex_kernel
++from .kernels import DotProductAttention, _attention_math_bshd, _ensure_flex_kwargs_initialized, get_flex_kernel
+ from .layers import DilatedAttention, Resampler, Retention, norm_layer
+ _LOGGER = logging.getLogger(__name__)
+ _PRESET_ALIASES: dict[str, str] = {
+@@ -288,22 +289,32 @@
+     def forward(self, x: torch.Tensor) -> torch.Tensor:
+         B, K, D = x.shape
+         y = self.norm1(x)
++
++        # Precompute projections in BSHD for FLEX/DPA (and for non-finite fallback).
+         qkv = self.qkv(y)
+         q, k, v = (
+             qkv.view(B, K, 3, self.nhead, self.head_dim)
+             .permute(2, 0, 3, 1, 4)
+             .unbind(0)
+         )
+-        attn_out = None
++
+         exporting = bool(is_export_or_trace())
+         compiling = bool(is_compiling())
++        allow_flex = not self._disable_flex_runtime
++        allow_mha = True
++        allow_dpa = True
++
+         plan = ATTENTION_POLICY.plan(
+             q=q,
+             need_weights=False,
+             has_bias=False,
+             exporting=exporting,
+             compiling=compiling,
++            allow_flex=allow_flex,
++            allow_mha=allow_mha,
++            allow_dpa=allow_dpa,
+         )
++
+         def _classify(exc: BaseException) -> str:
+             msg = str(exc)
+             tname = type(exc).__name__
+@@ -318,18 +329,31 @@
+                 return "struct"
+             if "float8" in m or "fp8" in m:
+                 return "struct"
+-            if "no valid triton configs" in m or "outofresources" in m or "out of resources" in m:
++            if (
++                "no valid triton configs" in m
++                or "outofresources" in m
++                or "out of resources" in m
++            ):
+                 return "transient"
+-            if "torch._dynamo" in m or "torch._inductor" in m or "compileerror" in m:
++            if (
++                "torch._dynamo" in m
++                or "torch._inductor" in m
++                or "compileerror" in m
++            ):
+                 return "transient"
+             return "transient"
+ 
+-        if (not self._disable_flex_runtime) and plan.backend == AttentionBackend.FLEX:
++        attn_proj: torch.Tensor | None = None
++
++        if plan.backend == AttentionBackend.FLEX and allow_flex:
+             try:
+-                if getattr(q, "dtype", None) == torch.float64 or ("float8" in str(getattr(q, "dtype", ""))):
++                # Extra defensive guard (plan should already avoid these).
++                if getattr(q, "dtype", None) == torch.float64 or (
++                    "float8" in str(getattr(q, "dtype", ""))
++                ):
+                     raise RuntimeError("flex disabled for fp64/fp8")
+                 _ensure_flex_kwargs_initialized()
+-                attn_out = get_flex_kernel()(
++                attn_out = get_flex_kernel()(  # (B,H,K,Dh)
+                     q,
+                     k,
+                     v,
+@@ -340,12 +364,8 @@
+                     training=bool(self.training),
+                     is_causal=False,
+                 )
+-                if env_bool("ENN_LATENT_FALLBACK_ON_NONFINITE", default=True) and torch.is_tensor(attn_out) and attn_out.numel() > 0:
+-                    with torch.no_grad():
+-                        samp = attn_out.reshape(-1)[:1024]
+-                        if not bool(torch.isfinite(samp).all().item()):
+-                            self._disable_flex_runtime = True
+-                            attn_out = None
++                attn_out = attn_out.transpose(1, 2).contiguous().view(B, K, D)
++                attn_proj = self.out_proj(attn_out)
+             except Exception as exc:
+                 kind = _classify(exc)
+                 self._flex_fail_count += 1
+@@ -353,8 +373,68 @@
+                     self._disable_flex_runtime = True
+                 elif self._flex_fail_max > 0 and self._flex_fail_count >= self._flex_fail_max:
+                     self._disable_flex_runtime = True
+-                attn_out = None
+-        if attn_out is None:
++                # Re-plan without FLEX.
++                plan = ATTENTION_POLICY.plan(
++                    q=q,
++                    need_weights=False,
++                    has_bias=False,
++                    exporting=exporting,
++                    compiling=compiling,
++                    allow_flex=False,
++                    allow_mha=allow_mha,
++                    allow_dpa=allow_dpa,
++                )
++                attn_proj = None
++
++        if attn_proj is None and plan.backend == AttentionBackend.MHA and allow_mha:
++            try:
++                # Use PyTorch MHA functional to respect the policy selection.
++                # Functional expects (L,B,E) tensors.
++                y_seq = y.transpose(0, 1)  # (K,B,D)
++                attn_out, _ = F.multi_head_attention_forward(
++                    y_seq,
++                    y_seq,
++                    y_seq,
++                    embed_dim_to_check=int(D),
++                    num_heads=int(self.nhead),
++                    in_proj_weight=self.qkv.weight,
++                    in_proj_bias=self.qkv.bias,
++                    bias_k=None,
++                    bias_v=None,
++                    add_zero_attn=False,
++                    dropout_p=self.dropout.p if self.training else 0.0,
++                    out_proj_weight=self.out_proj.weight,
++                    out_proj_bias=self.out_proj.bias,
++                    training=bool(self.training),
++                    key_padding_mask=None,
++                    need_weights=False,
++                    attn_mask=None,
++                    use_separate_proj_weight=False,
++                    q_proj_weight=None,
++                    k_proj_weight=None,
++                    v_proj_weight=None,
++                    static_k=None,
++                    static_v=None,
++                    average_attn_weights=False,
++                    is_causal=False,
++                )
++                attn_proj = attn_out.transpose(0, 1)  # (B,K,D)
++            except Exception:
++                # If MHA fails unexpectedly, fall back to DPA.
++                plan = ATTENTION_POLICY.plan(
++                    q=q,
++                    need_weights=False,
++                    has_bias=False,
++                    exporting=exporting,
++                    compiling=compiling,
++                    allow_flex=False,
++                    allow_mha=False,
++                    allow_dpa=allow_dpa,
++                )
++                attn_proj = None
++
++        if attn_proj is None:
++            # DPA path (bshd) honors masks/bias if needed.
+             attn_out = self.attn(
+                 q,
+                 k,
+@@ -362,14 +442,75 @@
+                 attn_mask=None,
+                 is_causal=False,
+                 dropout_p=self.dropout.p if self.training else 0.0,
++                training=bool(self.training),
+             )
+-        attn_out = attn_out.transpose(1, 2).contiguous().view(B, K, D)
+-        attn_out = self.out_proj(attn_out)
+-        x = x + self.drop_path(self.dropout(attn_out))
++            attn_out = attn_out.transpose(1, 2).contiguous().view(B, K, D)
++            attn_proj = self.out_proj(attn_out)
++
++        # Non-finite fallback for any backend.
++        if (
++            (not exporting)
++            and (not compiling)
++            and env_bool("ENN_LATENT_FALLBACK_ON_NONFINITE", default=True)
++            and isinstance(attn_proj, torch.Tensor)
++            and attn_proj.is_floating_point()
++            and attn_proj.numel() > 0
++        ):
++            with torch.no_grad():
++                samp = attn_proj.reshape(-1)[:1024]
++                bad = not bool(torch.isfinite(samp).all().item())
++            if bad:
++                # Disable FLEX for this module once we've observed non-finite outputs.
++                self._disable_flex_runtime = True
++                if not bool(getattr(self, "_enn_nonfinite_warned", False)):
++                    warnings.warn(
++                        "[ENN] LatentTransformer: attention produced NaN/Inf; rerunning attention math with AMP disabled (policy fallback).",
++                        UserWarning,
++                        stacklevel=2,
++                    )
++                    setattr(self, "_enn_nonfinite_warned", True)
++
++                from ..core.precision import Autocast
++                from ..core.policies import PrecisionPolicy
++
++                meta = Autocast.metadata()
++                master = PrecisionPolicy.from_metadata(
++                    device=q.device, metadata=meta
++                ).master_float
++                math_dtype = (
++                    torch.promote_types(q.dtype, master)
++                    if q.is_floating_point()
++                    else master
++                )
++                with Autocast.suspend(q.device):
++                    qh = q.to(dtype=math_dtype)
++                    kh = k.to(dtype=math_dtype)
++                    vh = v.to(dtype=math_dtype)
++                    attn_math = _attention_math_bshd(
++                        qh,
++                        kh,
++                        vh,
++                        attn_mask=None,
++                        is_causal=False,
++                        dropout_p=self.dropout.p if self.training else 0.0,
++                        training=bool(self.training),
++                    )
++                    attn_math = attn_math.transpose(1, 2).contiguous().view(B, K, D)
++                    # Ensure dtype matches projection weights under suspended autocast.
++                    wdt = getattr(self.out_proj.weight, "dtype", attn_math.dtype)
++                    if attn_math.dtype != wdt:
++                        attn_math = attn_math.to(dtype=wdt)
++                    attn_proj = self.out_proj(attn_math)
++                    if env_bool("ENN_LATENT_FALLBACK_SANITIZE", default=True):
++                        with contextlib.suppress(Exception):
++                            attn_proj = torch.nan_to_num(
++                                attn_proj, nan=0.0, posinf=0.0, neginf=0.0
++                            )
++
++        x = x + self.drop_path(self.dropout(attn_proj))
+         x = x + self.drop_path(self.ff(self.norm2(x)))
+         return x
+ 
+-
+ class Perceiver(nn.Module):
+     def __init__(
+         self: Self,
+
+--- a/enn_torch/nn/layers.py
++++ b/enn_torch/nn/layers.py
+@@ -558,6 +558,7 @@
+             bias=bias,
+             batch_first=self.batch_first,
+         )
++        self.dpa = DotProductAttention(num_heads=self.nhead, head_dim=self.head_dim)
+         if mlp_ratio is not None:
+             ffn_ratio = mlp_ratio
+         hidden = int(self.embed_dim * float(ffn_ratio))
+@@ -699,59 +700,175 @@
+             if context is not None:
+                 context = context.transpose(0, 1)
+             transposed = True
++
+         B, L, _ = x.shape
+         device = x.device
++        exporting = bool(is_export_or_trace())
++        compiling = bool(is_compiling())
++
+         x_norm = self.norm1(x)
+         kv = x_norm if context is None else self.norm1(context)
++
+         q_pad = key_padding_mask
+         if context is not None:
+             q_pad = None
+-        use_flex = (
+-            context is None
+-            and (not need_weights)
+-            and (not return_attn_mask)
+-            and key_padding_mask is None
+-            and _HAS_FLEX_ATTENTION
++
++        torch_mha = self._get_torch_mha()
++        flex_kernel_ok = bool(
++            _HAS_FLEX_ATTENTION
+             and getattr(get_flex_kernel(), "has_torch_backend", False)
+-            and (self._get_torch_mha() is not None)
+-            and (not is_export_or_trace())
+-            and (not is_compiling())
++            and (create_block_mask is not None)
+         )
+-        attn_mask_keep: Optional[torch.Tensor] = None
+-        attn_weights = None
+-        if use_flex:
+-            q, k, v, out_proj = self._project_qkv_for_flex(x_norm)
++
++        # Determine whether FLEX/DPA are possible for this call site.
++        # - FLEX/DPA are only implemented for self-attention (context is None)
++        # - need_weights requires MHA (FLEX/DPA don't return weights)
++        # - key_padding_mask requires MHA (unless we implement extra masking logic)
++        allow_mha = True
++        allow_dpa = bool(
++            (context is None)
++            and (not need_weights)
++            and (key_padding_mask is None)
++            and (torch_mha is not None)
++        )
++
++        allow_flex = False
++        if (
++            (context is None)
++            and (not need_weights)
++            and (key_padding_mask is None)
++            and (torch_mha is not None)
++            and flex_kernel_ok
++            and (not exporting)
++            and (not compiling)
++        ):
+             _ensure_flex_kwargs_initialized()
+             flex_supports_score_mod = "score_mod" in _FLEX_KWARGS
+             flex_supports_block_mask = "block_mask" in _FLEX_KWARGS
+-            use_score_mod = bool(q.is_cuda and flex_supports_score_mod)
+-            score_mod = self._get_flex_score_mod(int(L)) if use_score_mod else None
+-            block_mask = None
+-            if (not use_score_mod) and flex_supports_block_mask:
+-                block_mask = self._get_flex_block_mask(int(L), int(B), device)
+             needs_mask = bool(self.causal) or (self.window_size is not None) or (int(self.dilation) != 1)
+-            if needs_mask and (not use_score_mod) and (block_mask is None):
+-                use_flex = False
+-            if use_flex:
+-                a = get_flex_kernel()(
+-                    q,
+-                    k,
+-                    v,
+-                    score_mod=score_mod,
+-                    block_mask=block_mask,
+-                    scale=None,
+-                    dropout_p=self.dropout_p if self.training else 0.0,
+-                    training=bool(self.training),
++            use_score_mod = bool(x_norm.is_cuda and flex_supports_score_mod)
++            block_mask_ok = bool(flex_supports_block_mask)
++            allow_flex = (not needs_mask) or use_score_mod or block_mask_ok
++
++        plan = ATTENTION_POLICY.plan(
++            q=x_norm,
++            need_weights=bool(need_weights),
++            has_bias=False,
++            exporting=exporting,
++            compiling=compiling,
++            allow_flex=allow_flex,
++            allow_mha=allow_mha,
++            allow_dpa=allow_dpa,
++        )
++
++        attn_mask_keep: Optional[torch.Tensor] = None
++        attn_weights = None
++        attn_out: torch.Tensor | None = None
++
++        # Execute the planned backend, with graceful downgrade on failure.
++        for _ in range(3):
++            try:
++                if plan.backend == AttentionBackend.FLEX and allow_flex:
++                    q, k, v, out_proj = self._project_qkv_for_flex(x_norm)
++                    _ensure_flex_kwargs_initialized()
++                    flex_supports_score_mod = "score_mod" in _FLEX_KWARGS
++                    flex_supports_block_mask = "block_mask" in _FLEX_KWARGS
++                    needs_mask = bool(self.causal) or (self.window_size is not None) or (int(self.dilation) != 1)
++                    use_score_mod = bool(q.is_cuda and flex_supports_score_mod)
++                    score_mod = self._get_flex_score_mod(int(L)) if (needs_mask and use_score_mod) else None
++                    block_mask = None
++                    if needs_mask and (score_mod is None):
++                        if flex_supports_block_mask:
++                            block_mask = self._get_flex_block_mask(int(L), int(B), device)
++                        if block_mask is None:
++                            raise RuntimeError("Flex needs mask (causal/window/dilation) but no score_mod/block_mask available")
++                    a = get_flex_kernel()(
++                        q,
++                        k,
++                        v,
++                        score_mod=score_mod,
++                        block_mask=block_mask,
++                        scale=None,
++                        dropout_p=self.dropout_p if self.training else 0.0,
++                        training=bool(self.training),
++                    )
++                    a = a.transpose(1, 2).contiguous().view(B, L, self.embed_dim)
++                    attn_out = out_proj(a)
++                    attn_weights = None
++                    break
++
++                if plan.backend == AttentionBackend.DPA and allow_dpa:
++                    q, k, v, out_proj = self._project_qkv_for_flex(x_norm)
++                    use_is_causal = False
++                    mask_keep = None
++                    if self.dilation == 1 and self.window_size is None:
++                        use_is_causal = bool(self.causal)
++                    else:
++                        mask_keep = self._get_mask(int(L), device)
++                    a = self.dpa(
++                        q,
++                        k,
++                        v,
++                        attn_mask=mask_keep,
++                        is_causal=use_is_causal,
++                        dropout_p=self.dropout_p if self.training else 0.0,
++                        training=bool(self.training),
++                    )
++                    a = a.transpose(1, 2).contiguous().view(B, L, self.embed_dim)
++                    attn_out = out_proj(a)
++                    attn_weights = None
++                    if mask_keep is not None:
++                        attn_mask_keep = mask_keep
++                    break
++
++                # MHA backend
++                use_is_causal = False
++                attn_mask = None
++                if self.dilation == 1 and self.window_size is None:
++                    use_is_causal = bool(self.causal)
++                else:
++                    attn_mask_keep = self._get_mask(int(L), device)
++                    attn_mask = ~attn_mask_keep
++
++                attn_out, attn_weights = self.mha(
++                    x_norm,
++                    kv,
++                    kv,
++                    key_padding_mask=key_padding_mask,
++                    attn_mask=attn_mask,
++                    need_weights=need_weights,
++                    average_attn_weights=average_attn_weights,
++                    is_causal=use_is_causal,
++                )
++                break
++
++            except Exception:
++                if plan.backend == AttentionBackend.FLEX:
++                    allow_flex = False
++                elif plan.backend == AttentionBackend.DPA:
++                    allow_dpa = False
++                else:
++                    allow_mha = False
++                plan = ATTENTION_POLICY.plan(
++                    q=x_norm,
++                    need_weights=bool(need_weights),
++                    has_bias=False,
++                    exporting=exporting,
++                    compiling=compiling,
++                    allow_flex=allow_flex,
++                    allow_mha=allow_mha,
++                    allow_dpa=allow_dpa,
+                 )
+-                a = a.transpose(1, 2).contiguous().view(B, L, self.embed_dim)
+-                attn_out = out_proj(a)
+-        if not use_flex:
++                attn_out = None
++
++        if attn_out is None:
++            # Last resort: MHA.
+             use_is_causal = False
+             attn_mask = None
+             if self.dilation == 1 and self.window_size is None:
+                 use_is_causal = bool(self.causal)
+             else:
+-                attn_mask_keep = self._get_mask(L, device)
++                attn_mask_keep = self._get_mask(int(L), device)
+                 attn_mask = ~attn_mask_keep
+             attn_out, attn_weights = self.mha(
+                 x_norm,
+@@ -763,20 +880,25 @@
+                 average_attn_weights=average_attn_weights,
+                 is_causal=use_is_causal,
+             )
++
+         if q_pad is not None:
+             attn_out = attn_out.masked_fill(q_pad.unsqueeze(-1), 0.0)
++
+         x = x + self.drop_path(self.dropout(attn_out))
+         x = x + self.drop_path(self.ffn(self.norm2(x)))
++
+         if transposed:
+             x = x.transpose(0, 1)
++
+         if return_attn_mask:
+             if attn_mask_keep is None:
+-                attn_mask_keep = self._get_mask(L, device)
++                attn_mask_keep = self._get_mask(int(L), device)
+             return x, attn_weights, attn_mask_keep
+         return x, attn_weights
+ 
+ 
+ 
++
+ class Resampler(nn.Module):
+     def __init__(
+         self: Self,
+@@ -841,29 +963,26 @@
+             )
+         B, Lq, D = latents.shape
+         _, Lk, Dk = tokens.shape
+-        if (latents.size(-1) != self.d_model) or (
+-            tokens.size(-1) != self.d_model
+-        ):
++        if (latents.size(-1) != self.d_model) or (tokens.size(-1) != self.d_model):
+             raise ValueError(
+                 f"Resampler expects last dim D={self.d_model}, got latents D={D} tokens D={Dk}"
+             )
++
+         q_in = self.norm_q(latents)
+         kv_in = self.norm_kv(tokens)
++
+         H = int(self.nhead)
+         Dh = int(self.head_dim)
++
++        # Precompute BSHD projections for FLEX/DPA (and non-finite fallback).
+         q = self.q_proj(q_in).view(B, Lq, H, Dh).transpose(1, 2)
+         k = self.k_proj(kv_in).view(B, Lk, H, Dh).transpose(1, 2)
+         v = self.v_proj(kv_in).view(B, Lk, H, Dh).transpose(1, 2)
+-        attn_out = None
++
+         exporting = bool(is_export_or_trace())
+         compiling = bool(is_compiling())
+-        plan = ATTENTION_POLICY.plan(
+-            q=q,
+-            need_weights=False,
+-            has_bias=attn_bias is not None,
+-            exporting=exporting,
+-            compiling=compiling,
+-        )
++        has_bias = attn_bias is not None
++
+         def _is_fp8_tensor(x: torch.Tensor) -> bool:
+             try:
+                 if "float8" in str(x.dtype):
+@@ -903,64 +1022,154 @@
+                 return "transient"
+             return "transient"
+ 
+-        if (
+-            (not self._disable_flex_bias_runtime)
+-            and (not force_no_flex)
+-            and attn_bias is not None
+-            and plan.backend == AttentionBackend.FLEX
+-            and plan.use_score_mod_for_bias
+-        ):
+-            try:
+-                if not _HAS_FLEX_ATTENTION:
+-                    raise RuntimeError("FlexAttention not available")
+-                _ensure_flex_kwargs_initialized()
+-                if "score_mod" not in _FLEX_KWARGS:
+-                    raise RuntimeError("FlexAttention score_mod not supported")
+-                bias_bk = _coerce_attn_bias_to_bk(attn_bias, B=int(B), K=int(Lk), like=q)
+-                sm = self._flex_keybias_score_mod
+-                if sm is None:
+-                    sm = _FlexKeyBiasScoreMod(bias_bk)
+-                    self._flex_keybias_score_mod = sm
+-                else:
+-                    sm.set_bias(bias_bk)
+-                attn_out = get_flex_kernel()(
+-                    q,
+-                    k,
+-                    v,
+-                    score_mod=sm,
+-                    block_mask=None,
+-                    scale=None,
+-                    dropout_p=(self.dropout_p if self.training else 0.0),
+-                    training=bool(self.training),
+-                    is_causal=False,
+-                )
+-            except Exception as exc:
+-                kind = _classify_flex_failure(exc)
+-                self._flex_bias_fail_count += 1
+-                if kind == "struct":
+-                    self._disable_flex_bias_runtime = True
+-                elif self._flex_bias_fail_max > 0 and self._flex_bias_fail_count >= self._flex_bias_fail_max:
+-                    self._disable_flex_bias_runtime = True
++        # Per-call allow flags for the policy (Flex > MHA > DPA by default).
++        allow_flex = (not force_no_flex) and (not exporting) and (not compiling) and _HAS_FLEX_ATTENTION
++        if allow_flex and has_bias:
++            # Bias support on FLEX requires score_mod.
++            _ensure_flex_kwargs_initialized()
++            allow_flex = (not self._disable_flex_bias_runtime) and ("score_mod" in _FLEX_KWARGS)
+ 
+-        if attn_out is None and attn_bias is not None:
+-            fp32_math = bool(env_bool("ENN_RESAMPLER_FP32_BIAS_MATH_FALLBACK", True))
+-            if q.dtype == torch.float64 or (q.dtype == torch.float32 and fp32_math and self._disable_flex_bias_runtime):
+-                with contextlib.suppress(Exception):
+-                    bias_bk = _coerce_attn_bias_to_bk(attn_bias, B=int(B), K=int(Lk), like=q)
+-                    if int(bias_bk.shape[0]) == 1:
+-                        bias_bk = bias_bk.expand(int(B), int(Lk))
+-                    bias4 = bias_bk.view(int(B), 1, 1, int(Lk)).expand(int(B), int(H), int(Lq), int(Lk)).contiguous()
+-                    attn_out = _attention_math_bshd(
++        allow_mha = True
++        allow_dpa = True
++
++        plan = ATTENTION_POLICY.plan(
++            q=q,
++            need_weights=False,
++            has_bias=has_bias,
++            exporting=exporting,
++            compiling=compiling,
++            allow_flex=allow_flex,
++            allow_mha=allow_mha,
++            allow_dpa=allow_dpa,
++        )
++
++        attn_proj: torch.Tensor | None = None
++
++        # Try the planned backend, with graceful downgrade on failure.
++        for _ in range(3):
++            try:
++                if plan.backend == AttentionBackend.FLEX and allow_flex:
++                    _ensure_flex_kwargs_initialized()
++                    score_mod = None
++                    if has_bias:
++                        bias_bk = _coerce_attn_bias_to_bk(attn_bias, B=int(B), K=int(Lk), like=q)
++                        sm = self._flex_keybias_score_mod
++                        if sm is None:
++                            sm = _FlexKeyBiasScoreMod(bias_bk)
++                            self._flex_keybias_score_mod = sm
++                        else:
++                            sm.set_bias(bias_bk)
++                        score_mod = sm
++                    attn_out = get_flex_kernel()(  # (B,H,Lq,Dh)
+                         q,
+                         k,
+                         v,
+-                        attn_mask=bias4,
++                        score_mod=score_mod,
++                        block_mask=None,
++                        scale=None,
++                        dropout_p=(self.dropout_p if self.training else 0.0),
++                        training=bool(self.training),
+                         is_causal=False,
++                    )
++                    attn_out = attn_out.transpose(1, 2).contiguous().view(B, Lq, D)
++                    attn_proj = self.out_proj(attn_out)
++
++                elif plan.backend == AttentionBackend.MHA and allow_mha:
++                    # Use PyTorch MHA functional with separate projections.
++                    q_seq = q_in.transpose(0, 1)  # (Lq,B,D)
++                    kv_seq = kv_in.transpose(0, 1)  # (Lk,B,D)
++
++                    in_proj_bias = None
++                    if (self.q_proj.bias is not None) and (self.k_proj.bias is not None) and (self.v_proj.bias is not None):
++                        in_proj_bias = torch.cat(
++                            [self.q_proj.bias, self.k_proj.bias, self.v_proj.bias], dim=0
++                        )
++
++                    attn_mask = None
++                    if has_bias:
++                        bias_bk = _coerce_attn_bias_to_bk(attn_bias, B=int(B), K=int(Lk), like=q_in)
++                        if int(bias_bk.shape[0]) == 1:
++                            bias_bk = bias_bk.expand(int(B), int(Lk))
++                        bias4 = (
++                            bias_bk.view(int(B), 1, 1, int(Lk))
++                            .expand(int(B), int(H), int(Lq), int(Lk))
++                            .contiguous()
++                        )
++                        attn_mask = bias4.view(int(B) * int(H), int(Lq), int(Lk)).to(dtype=q_in.dtype)
++
++                    attn_out, _ = F.multi_head_attention_forward(
++                        q_seq,
++                        kv_seq,
++                        kv_seq,
++                        embed_dim_to_check=int(self.d_model),
++                        num_heads=int(self.nhead),
++                        in_proj_weight=None,
++                        in_proj_bias=in_proj_bias,
++                        bias_k=None,
++                        bias_v=None,
++                        add_zero_attn=False,
+                         dropout_p=(self.dropout_p if self.training else 0.0),
++                        out_proj_weight=self.out_proj.weight,
++                        out_proj_bias=self.out_proj.bias,
+                         training=bool(self.training),
++                        key_padding_mask=None,
++                        need_weights=False,
++                        attn_mask=attn_mask,
++                        use_separate_proj_weight=True,
++                        q_proj_weight=self.q_proj.weight,
++                        k_proj_weight=self.k_proj.weight,
++                        v_proj_weight=self.v_proj.weight,
++                        static_k=None,
++                        static_v=None,
++                        average_attn_weights=False,
++                        is_causal=False,
+                     )
++                    attn_proj = attn_out.transpose(0, 1)  # (B,Lq,D) already out-projected
+ 
+-        if attn_out is None:
++                else:
++                    # DPA backend (DotProductAttention)
++                    attn_out = self.attn(
++                        q,
++                        k,
++                        v,
++                        attn_mask=attn_bias,
++                        dropout_p=(self.dropout_p if self.training else 0.0),
++                        is_causal=False,
++                    )
++                    attn_out = attn_out.transpose(1, 2).contiguous().view(B, Lq, D)
++                    attn_proj = self.out_proj(attn_out)
++
++                break
++
++            except Exception as exc:
++                # Disable the failing backend for this call, and re-plan.
++                if plan.backend == AttentionBackend.FLEX:
++                    kind = _classify_flex_failure(exc)
++                    self._flex_bias_fail_count += 1
++                    if kind == "struct":
++                        self._disable_flex_bias_runtime = True
++                    elif self._flex_bias_fail_max > 0 and self._flex_bias_fail_count >= self._flex_bias_fail_max:
++                        self._disable_flex_bias_runtime = True
++                    allow_flex = False
++                elif plan.backend == AttentionBackend.MHA:
++                    allow_mha = False
++                else:
++                    allow_dpa = False
++
++                plan = ATTENTION_POLICY.plan(
++                    q=q,
++                    need_weights=False,
++                    has_bias=has_bias,
++                    exporting=exporting,
++                    compiling=compiling,
++                    allow_flex=allow_flex,
++                    allow_mha=allow_mha,
++                    allow_dpa=allow_dpa,
++                )
++                attn_proj = None
++
++        if attn_proj is None:
++            # Last resort: DPA.
+             attn_out = self.attn(
+                 q,
+                 k,
+@@ -969,47 +1178,46 @@
+                 dropout_p=(self.dropout_p if self.training else 0.0),
+                 is_causal=False,
+             )
++            attn_out = attn_out.transpose(1, 2).contiguous().view(B, Lq, D)
++            attn_proj = self.out_proj(attn_out)
+ 
++        # Non-finite fallback for any backend.
+         if (
+-            isinstance(attn_out, torch.Tensor)
+-            and attn_out.numel() > 0
++            isinstance(attn_proj, torch.Tensor)
++            and attn_proj.numel() > 0
+             and env_bool("ENN_RESAMPLER_FALLBACK_ON_NONFINITE", default=True)
+             and (not exporting)
+             and (not compiling)
+         ):
+             with torch.no_grad():
+-                samp = attn_out.reshape(-1)[:1024]
++                samp = attn_proj.reshape(-1)[:1024]
+                 bad = not bool(torch.isfinite(samp).all().item())
+             if bad:
+                 if not bool(getattr(self, "_nonfinite_warned", False)):
+                     warnings.warn(
+-                        "[ENN] Resampler: attention produced NaN/Inf; rerunning with AMP disabled attention math and disabling flex-bias path for this module.",
++                        "[ENN] Resampler: attention produced NaN/Inf; rerunning with AMP disabled attention math.",
+                         UserWarning,
+                         stacklevel=2,
+                     )
+                     setattr(self, "_nonfinite_warned", True)
+-                self._disable_flex_bias_runtime = True
++                # Bias FLEX path is the most fragile; disable it for this module.
++                if has_bias:
++                    self._disable_flex_bias_runtime = True
++
+                 from ..core.precision import Autocast
+                 from ..core.policies import PrecisionPolicy
+ 
+                 meta = Autocast.metadata()
+-                master = PrecisionPolicy.from_metadata(
+-                    device=q.device, metadata=meta
+-                ).master_float
+-                math_dtype = (
+-                    torch.promote_types(q.dtype, master)
+-                    if q.is_floating_point()
+-                    else master
+-                )
++                master = PrecisionPolicy.from_metadata(device=q.device, metadata=meta).master_float
++                math_dtype = torch.promote_types(q.dtype, master) if q.is_floating_point() else master
++
+                 with Autocast.suspend(q.device):
+                     qh = q.to(dtype=math_dtype)
+                     kh = k.to(dtype=math_dtype)
+                     vh = v.to(dtype=math_dtype)
+                     fm = None
+-                    if attn_bias is not None:
+-                        bias_bk = _coerce_attn_bias_to_bk(
+-                            attn_bias, B=int(B), K=int(Lk), like=qh
+-                        )
++                    if has_bias:
++                        bias_bk = _coerce_attn_bias_to_bk(attn_bias, B=int(B), K=int(Lk), like=qh)
+                         if int(bias_bk.shape[0]) == 1:
+                             bias_bk = bias_bk.expand(int(B), int(Lk))
+                         fm = (
+@@ -1017,7 +1225,7 @@
+                             .expand(int(B), int(H), int(Lq), int(Lk))
+                             .contiguous()
+                         )
+-                    attn_out = _attention_math_bshd(
++                    attn_math = _attention_math_bshd(
+                         qh,
+                         kh,
+                         vh,
+@@ -1026,29 +1234,21 @@
+                         dropout_p=(self.dropout_p if self.training else 0.0),
+                         training=bool(self.training),
+                     )
++                    attn_math = attn_math.transpose(1, 2).contiguous().view(B, Lq, D)
++                    wdt = getattr(self.out_proj.weight, "dtype", attn_math.dtype)
++                    if attn_math.dtype != wdt:
++                        attn_math = attn_math.to(dtype=wdt)
++                    attn_proj = self.out_proj(attn_math)
+                     sanitize = env_bool(
+                         "ENN_RESAMPLER_FALLBACK_SANITIZE",
+-                        default=env_bool(
+-                            "ENN_RESAMPLER_FALLBACK_SANITIZE_FP32", default=True
+-                        ),
++                        default=env_bool("ENN_RESAMPLER_FALLBACK_SANITIZE_FP32", default=True),
+                     )
+                     if sanitize:
+                         with contextlib.suppress(Exception):
+-                            attn_out = torch.nan_to_num(
+-                                attn_out, nan=0.0, posinf=0.0, neginf=0.0
+-                            )
+-        if attn_out.dim() == 4:
+-            attn_out = attn_out.transpose(1, 2).contiguous().view(B, Lq, D)
+-        else:
+-            raise RuntimeError(
+-                f"Resampler attention returned unexpected shape {tuple(attn_out.shape)}"
+-            )
+-        latents = latents + self.drop_path(
+-            self.dropout(self.out_proj(attn_out))
+-        )
+-        latents = latents + self.drop_path(
+-            self.dropout(self.ffn(self.norm_ffn(latents)))
+-        )
++                            attn_proj = torch.nan_to_num(attn_proj, nan=0.0, posinf=0.0, neginf=0.0)
++
++        latents = latents + self.drop_path(self.dropout(attn_proj))
++        latents = latents + self.drop_path(self.dropout(self.ffn(self.norm_ffn(latents))))
+         return latents
+ 
+ 
+
+--- a/enn_torch/nn/wrappers.py
++++ b/enn_torch/nn/wrappers.py
+@@ -1783,8 +1783,13 @@
+                 return False
+             if t.numel() == 0:
+                 return False
+-            sl = t[:2]
+-            return not bool(torch.isfinite(sl).all().item())
++            # Check the whole batch/tensor, not just the first two samples.
++            with torch.no_grad():
++                try:
++                    a = t.detach().abs().amax()
++                    return not bool(torch.isfinite(a).item())
++                except Exception:
++                    return not bool(torch.isfinite(t).all().item())
+ 
+         if runtime_skip_perceiver:
+             fused_tokens = _fallback_fused_from_all()
+
