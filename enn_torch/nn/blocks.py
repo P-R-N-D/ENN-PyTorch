@@ -5,7 +5,7 @@ import contextlib
 import logging
 import os
 from importlib import import_module
-from typing import Any, Callable, List, Optional, Self, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Optional, Self, Sequence, Tuple
 
 import torch
 import torch.nn as nn
@@ -284,6 +284,31 @@ class LatentTransformer(nn.Module):
             nn.Dropout(dropout),
             nn.Linear(inner_dim, self.d_model, bias=True),
         )
+        self.register_load_state_dict_pre_hook(self._map_legacy_state_dict_keys)
+
+    @staticmethod
+    def _map_legacy_state_dict_keys(
+        module: nn.Module,
+        state_dict: Dict[str, torch.Tensor],
+        prefix: str,
+        *args: Any,
+    ) -> None:
+        del module, args
+        legacy_roots = ("norm1", "qkv", "out_proj")
+        for root in legacy_roots:
+            legacy_key = f"{prefix}{root}"
+            mapped_key = f"{prefix}attn.{root}"
+            legacy_direct = legacy_key
+            if legacy_direct in state_dict and mapped_key not in state_dict:
+                state_dict[mapped_key] = state_dict.pop(legacy_direct)
+            legacy_prefix = legacy_key + "."
+            for key in list(state_dict.keys()):
+                if key.startswith(legacy_prefix):
+                    suffix = key[len(legacy_prefix) :]
+                    new_key = f"{mapped_key}.{suffix}"
+                    if new_key not in state_dict:
+                        state_dict[new_key] = state_dict[key]
+                    del state_dict[key]
 
     def forward(self: Self, x: torch.Tensor) -> torch.Tensor:
         attn_proj = self.attn(x)
@@ -337,6 +362,38 @@ class Resampler(nn.Module):
         self.ffn = GeGLU(
             self.d_model, hid, out_dim=self.d_model, dropout=dropout
         )
+        self.register_load_state_dict_pre_hook(self._map_legacy_state_dict_keys)
+
+    @staticmethod
+    def _map_legacy_state_dict_keys(
+        module: nn.Module,
+        state_dict: Dict[str, torch.Tensor],
+        prefix: str,
+        *args: Any,
+    ) -> None:
+        del module, args
+        legacy_roots = (
+            "q_proj",
+            "k_proj",
+            "v_proj",
+            "out_proj",
+            "norm_q",
+            "norm_kv",
+        )
+        for root in legacy_roots:
+            legacy_key = f"{prefix}{root}"
+            mapped_key = f"{prefix}cross_attn.{root}"
+            legacy_direct = legacy_key
+            if legacy_direct in state_dict and mapped_key not in state_dict:
+                state_dict[mapped_key] = state_dict.pop(legacy_direct)
+            legacy_prefix = legacy_key + "."
+            for key in list(state_dict.keys()):
+                if key.startswith(legacy_prefix):
+                    suffix = key[len(legacy_prefix) :]
+                    new_key = f"{mapped_key}.{suffix}"
+                    if new_key not in state_dict:
+                        state_dict[new_key] = state_dict[key]
+                    del state_dict[key]
 
     def forward(
         self: Self,
