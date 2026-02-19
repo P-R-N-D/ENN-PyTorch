@@ -1783,8 +1783,12 @@ class Fuser(nn.Module):
                 return False
             if t.numel() == 0:
                 return False
-            sl = t[:2]
-            return not bool(torch.isfinite(sl).all().item())
+            with torch.no_grad():
+                try:
+                    a = t.detach().abs().amax()
+                    return not bool(torch.isfinite(a).item())
+                except Exception:
+                    return not bool(torch.isfinite(t).all().item())
 
         if runtime_skip_perceiver:
             fused_tokens = _fallback_fused_from_all()

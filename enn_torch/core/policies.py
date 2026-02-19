@@ -1791,15 +1791,14 @@ class AttentionPolicy:
         has_bias: bool = False,
         exporting: bool = False,
         compiling: bool = False,
+        allow_flex: bool = True,
+        allow_mha: bool = True,
+        allow_dpa: bool = True,
     ) -> AttentionPlan:
         forced = (env_str("ENN_ATTENTION_BACKEND") or "").strip().lower()
+        forced_be: AttentionBackend | None = None
         if forced in {"flex", "mha", "dpa"}:
-            be = AttentionBackend(forced)
-            return AttentionPlan(
-                be,
-                use_score_mod_for_bias=bool(be is AttentionBackend.FLEX and has_bias),
-                reason="forced",
-            )
+            forced_be = AttentionBackend(forced)
 
         if q.dtype == torch.float64:
             flex_ok = False
@@ -1808,7 +1807,8 @@ class AttentionPolicy:
             is_fp8 = self._is_float8_dtype(q.dtype) or self._is_torchao_float8_tensor(q)
             allow_fp32 = bool(env_bool("ENN_FLEX_ALLOW_FP32", True))
             flex_ok = (
-                (not env_bool("ENN_DISABLE_FLEX_ATTENTION", False))
+                bool(allow_flex)
+                and (not env_bool("ENN_DISABLE_FLEX_ATTENTION", False))
                 and _HAS_TORCH_FLEX
                 and getattr(q, "is_cuda", False)
                 and (not exporting)
@@ -1824,21 +1824,53 @@ class AttentionPolicy:
         if has_bias and (not _FLEX_HAS_SCORE_MOD):
             flex_ok = False
 
-        for be in self.order:
-            if be == "flex" and flex_ok:
+        mha_ok = bool(allow_mha)
+        dpa_ok = bool(allow_dpa)
+
+        def _auto() -> AttentionPlan:
+            for be in self.order:
+                if be == "flex" and flex_ok:
+                    return AttentionPlan(
+                        AttentionBackend.FLEX,
+                        use_score_mod_for_bias=bool(has_bias and _FLEX_HAS_SCORE_MOD),
+                        reason=("auto:flex(score_mod)" if has_bias else "auto:flex"),
+                    )
+                if be == "mha" and mha_ok:
+                    return AttentionPlan(AttentionBackend.MHA, reason="auto:mha")
+                if be == "dpa" and dpa_ok:
+                    return AttentionPlan(AttentionBackend.DPA, reason="auto:dpa")
+
+            if flex_ok:
                 return AttentionPlan(
                     AttentionBackend.FLEX,
                     use_score_mod_for_bias=bool(has_bias and _FLEX_HAS_SCORE_MOD),
                     reason=("auto:flex(score_mod)" if has_bias else "auto:flex"),
                 )
-            if be == "mha":
-                return AttentionPlan(AttentionBackend.MHA, reason="auto:mha")
-            if be == "dpa":
-                return AttentionPlan(AttentionBackend.DPA, reason="auto:dpa")
+            if mha_ok:
+                return AttentionPlan(AttentionBackend.MHA, reason="auto:default")
+            if dpa_ok:
+                return AttentionPlan(AttentionBackend.DPA, reason="auto:default")
+            return AttentionPlan(AttentionBackend.MHA, reason="auto:default(disallowed)")
 
-        return AttentionPlan(AttentionBackend.MHA, reason="auto:default")
+        if forced_be is not None:
+            if forced_be is AttentionBackend.FLEX and flex_ok:
+                return AttentionPlan(
+                    AttentionBackend.FLEX,
+                    use_score_mod_for_bias=bool(has_bias and _FLEX_HAS_SCORE_MOD),
+                    reason="forced:flex",
+                )
+            if forced_be is AttentionBackend.MHA and mha_ok:
+                return AttentionPlan(AttentionBackend.MHA, reason="forced:mha")
+            if forced_be is AttentionBackend.DPA and dpa_ok:
+                return AttentionPlan(AttentionBackend.DPA, reason="forced:dpa")
+            auto = _auto()
+            return AttentionPlan(
+                auto.backend,
+                use_score_mod_for_bias=auto.use_score_mod_for_bias,
+                reason=f"forced({forced})-disallowed->{auto.reason}",
+            )
 
-
+        return _auto()
 _FLEX_HAS_SCORE_MOD: bool = False
 _HAS_TORCH_FLEX: bool = False
 with contextlib.suppress(Exception):
