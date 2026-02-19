@@ -5644,12 +5644,19 @@ def process(*args: Any, **kwargs: Any) -> object:
                 enable_tf32=enable_tf32,
             )
         fp8_infer_ok, fp8_infer_reason = Dataset.is_float8_supported(device)
+        fp8_enabled = False
+        fp8_backend = None
+        disable_note = None
         if fp8_infer_ok:
-            model, _, _ = ModelPolicy.enable_float8_prediction(
+            model, fp8_enabled, fp8_backend = ModelPolicy.enable_float8_prediction(
                 model, metadata=metadata, logger=_float8_log
             )
+            if not fp8_enabled:
+                disable_note = fp8_backend or fp8_infer_reason
         else:
-            _float8_log(f"[FP8] disabled: {fp8_infer_reason}")
+            disable_note = fp8_infer_reason
+        if disable_note:
+            _float8_log(f"[FP8] disabled: {disable_note}")
         if ops.sources is None:
             raise RuntimeError("RuntimeConfig.sources is required but None")
         model.eval()

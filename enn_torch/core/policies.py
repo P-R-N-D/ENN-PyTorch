@@ -1315,6 +1315,9 @@ class ModelPolicy:
 
         meta = ModelPolicy._coerce_metadata(model, metadata)
         device = torch.device(meta.device)
+        if env_bool("ENN_DISABLE_FP8", default=False):
+            Autocast.configure(model, metadata=meta)
+            return (model, False, "disabled by ENN_DISABLE_FP8")
         ok, reason = Dataset.is_float8_supported(device)
         if not ok:
             Autocast.configure(model, metadata=meta)
@@ -1347,7 +1350,14 @@ class ModelPolicy:
                 Autocast.configure(model, metadata=meta)
                 return (model, False, "data scale")
         params_dtype = ModelPolicy.negotiate(device, metadata=meta)
-        for backend in ("te", "torchao"):
+        allow_ao = bool(
+            env_bool(
+                "ENN_FP8_ALLOW_AO_TRAINING",
+                default=env_bool("ENN_FP8_ALLOW_AO", default=False),
+            )
+        )
+        backends = ("te", "torchao") if allow_ao else ("te",)
+        for backend in backends:
             if backend == "te":
                 m2, ok2, why = ModelPolicy._enable_nvidia_training(
                     model, params_dtype, logger
@@ -1365,7 +1375,11 @@ class ModelPolicy:
             else:
                 _log_debug(logger, f"[FP8] {backend} path skipped: {why}")
         Autocast.configure(model, metadata=meta)
-        return (model, False, "No usable FP8 backend")
+        return (
+            model,
+            False,
+            "No usable FP8 backend" + (" (torchao disabled)" if not allow_ao else ""),
+        )
 
     @staticmethod
     def enable_float8_prediction(
@@ -1377,6 +1391,9 @@ class ModelPolicy:
 
         meta = ModelPolicy._coerce_metadata(model, metadata)
         device = torch.device(meta.device)
+        if env_bool("ENN_DISABLE_FP8", default=False):
+            Autocast.configure(model, metadata=meta)
+            return (model, False, "disabled by ENN_DISABLE_FP8")
         ok, reason = Dataset.is_float8_supported(device)
         if not ok:
             Autocast.configure(model, metadata=meta)
@@ -1413,7 +1430,17 @@ class ModelPolicy:
             getattr(meta, "has_scale", False)
             and getattr(meta, "scale_is_integral", None) is True
         )
-        order = ("te_swap", "te_present", "ao")
+        allow_ao = bool(
+            env_bool(
+                "ENN_FP8_ALLOW_AO_INFERENCE",
+                default=env_bool("ENN_FP8_ALLOW_AO", default=False),
+            )
+        )
+        order = (
+            ("te_swap", "te_present", "ao")
+            if allow_ao
+            else ("te_swap", "te_present")
+        )
         for step in order:
             if step == "te_swap":
                 m2, ok2, why = ModelPolicy._enable_nvidia_inference(
@@ -1434,7 +1461,11 @@ class ModelPolicy:
             else:
                 _log_debug(logger, f"[FP8] {step} skipped: {why}")
         Autocast.configure(model, metadata=meta)
-        return (model, False, "No usable FP8 backend")
+        return (
+            model,
+            False,
+            "No usable FP8 backend" + (" (torchao disabled)" if not allow_ao else ""),
+        )
 
     @staticmethod
     def enable_int8_training(

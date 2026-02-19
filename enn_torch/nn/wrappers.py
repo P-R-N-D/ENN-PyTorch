@@ -1753,20 +1753,97 @@ class Fuser(nn.Module):
                     getattr(get_runtime_cfg(), "compile_cudagraphs", False)
                 )
         cg_ok = bool(compile_cg_enabled and (not disable_pred_cg))
-        bg = getattr(self, "_backbone_graph", None)
-        if isinstance(bg, nn.Module) and cg_ok:
-            fused_tokens, context = cast(
-                tuple[torch.Tensor, torch.Tensor], bg(all_tokens, attn_bias)
-            )
-        else:
-            if cg_ok:
-                cudagraph_mark_step_begin()
-                fused_tokens = self.perceiver(all_tokens, attn_bias=attn_bias)
-                cudagraph_mark_step_end()
-            else:
-                fused_tokens = self.perceiver(all_tokens, attn_bias=attn_bias)
+        fallback_enabled = bool(
+            infer_cuda and env_bool("ENN_FUSER_NONFINITE_FALLBACK", default=True)
+        )
+        runtime_skip_perceiver = bool(
+            fallback_enabled and bool(getattr(self, "_disable_perceiver_runtime", False))
+        )
+
+        def _fallback_fused_from_all() -> torch.Tensor:
+            try:
+                tgt = int(self.fused_tokens)
+            except Exception:
+                tgt = int(getattr(self, "fused_tokens", all_tokens.shape[1]))
+            if tgt <= 0:
+                tgt = int(all_tokens.shape[1])
+            n = int(all_tokens.shape[1])
+            if n == tgt:
+                return all_tokens
+            if n > tgt:
+                return all_tokens[:, :tgt, :]
+            pad = tgt - n
+            if pad <= 0:
+                return all_tokens
+            z = all_tokens.new_zeros((all_tokens.shape[0], pad, all_tokens.shape[2]))
+            return torch.cat((all_tokens, z), dim=1)
+
+        def _pair_has_nonfinite(t: torch.Tensor) -> bool:
+            if (not isinstance(t, torch.Tensor)) or (not t.is_floating_point()):
+                return False
+            if t.numel() == 0:
+                return False
+            sl = t[:2]
+            return not bool(torch.isfinite(sl).all().item())
+
+        if runtime_skip_perceiver:
+            fused_tokens = _fallback_fused_from_all()
             graph_break()
             context = self.decode(fused_tokens, apply_norm=True)
+        else:
+            bg = getattr(self, "_backbone_graph", None)
+            if isinstance(bg, nn.Module) and cg_ok:
+                fused_tokens, context = cast(
+                    tuple[torch.Tensor, torch.Tensor], bg(all_tokens, attn_bias)
+                )
+            else:
+                if cg_ok:
+                    cudagraph_mark_step_begin()
+                    fused_tokens = self.perceiver(all_tokens, attn_bias=attn_bias)
+                    cudagraph_mark_step_end()
+                else:
+                    fused_tokens = self.perceiver(all_tokens, attn_bias=attn_bias)
+                graph_break()
+                if fallback_enabled and _pair_has_nonfinite(fused_tokens):
+                    setattr(self, "_disable_perceiver_runtime", True)
+                    if not bool(getattr(self, "_nonfinite_fallback_warned", False)):
+                        _LOGGER.warning(
+                            "[ENN] Fuser: perceiver produced non-finite fused_tokens; "
+                            "falling back to raw template tokens (all_tokens). "
+                            "Set ENN_FUSER_NONFINITE_FALLBACK=0 to disable this."
+                        )
+                        setattr(self, "_nonfinite_fallback_warned", True)
+
+                    if env_bool("ENN_FUSER_DIAG_NONFINITE_PARAMS", default=True):
+                        with contextlib.suppress(Exception):
+                            bad: list[str] = []
+                            for pn, pv in self.perceiver.named_parameters():
+                                if pv is None or (not isinstance(pv, torch.Tensor)):
+                                    continue
+                                if pv.is_floating_point() and (not torch.isfinite(pv).all()):
+                                    bad.append(str(pn))
+                                    if len(bad) >= 8:
+                                        break
+                            if bad:
+                                _LOGGER.error(
+                                    "[ENN] Fuser: non-finite parameters detected in perceiver: %s",
+                                    ", ".join(bad),
+                                )
+
+                    fused_tokens = _fallback_fused_from_all()
+                context = self.decode(fused_tokens, apply_norm=True)
+
+            if fallback_enabled and (_pair_has_nonfinite(fused_tokens) or _pair_has_nonfinite(context)):
+                setattr(self, "_disable_perceiver_runtime", True)
+                if not bool(getattr(self, "_nonfinite_fallback_warned", False)):
+                    _LOGGER.warning(
+                        "[ENN] Fuser: non-finite outputs detected (tokens/context); "
+                        "falling back to raw template tokens (all_tokens)."
+                    )
+                    setattr(self, "_nonfinite_fallback_warned", True)
+                fused_tokens = _fallback_fused_from_all()
+                graph_break()
+                context = self.decode(fused_tokens, apply_norm=True)
 
         if (not torch.is_grad_enabled()) and (getattr(fused_tokens.device, "type", None) == "cuda"):
             if env_bool("ENN_PRED_COLLAPSE_STAGE_DIAG", default=False):
