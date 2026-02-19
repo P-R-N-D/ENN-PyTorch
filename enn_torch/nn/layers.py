@@ -72,7 +72,7 @@ else:
 
 
 def _get_dilated_mask(
-    seq_len: int,
+    seq_len: int | torch.SymInt,
     *args: Any,
     device: Optional[torch.device] = None,
     dilation: int = 1,
@@ -92,7 +92,10 @@ def _get_dilated_mask(
             tracing = bool(torch.jit.is_tracing() or torch.jit.is_scripting())
         except Exception:
             tracing = False
-    L = seq_len if tracing else int(seq_len)
+    is_symint = False
+    with contextlib.suppress(Exception):
+        is_symint = isinstance(seq_len, torch.SymInt)
+    L = seq_len if (tracing or is_symint) else int(seq_len)
     device = torch.device("cpu") if device is None else torch.device(device)
     i = torch.arange(L, device=device).unsqueeze(1).expand(L, L)
     j = torch.arange(L, device=device).unsqueeze(0).expand(L, L)
@@ -610,6 +613,20 @@ class DilatedAttention(nn.Module):
 
     def _get_mask(self, L: int | torch.SymInt, device: torch.device) -> torch.Tensor:
         if (
+            (not isinstance(L, int))
+            or bool(is_export_or_trace())
+            or bool(is_compiling())
+            or bool(is_symbolic())
+        ):
+            return _get_dilated_mask(
+                L,
+                dilation=self.dilation,
+                window_size=self.window_size,
+                causal=self.causal,
+                device=device,
+            )
+
+        if (
             self._mask_cache is None
             or self._mask_cache_len != L
             or self._mask_cache_device != device
@@ -800,11 +817,18 @@ class DilatedAttention(nn.Module):
                         use_is_causal = bool(self.causal)
                     else:
                         mask_keep = self._get_mask(L, device)
+                    dpa_mask = mask_keep
+                    if (
+                        dpa_mask is not None
+                        and dpa_mask.dim() == 2
+                        and (exporting or compiling or bool(is_symbolic()))
+                    ):
+                        dpa_mask = dpa_mask.view(1, 1, L, L)
                     a = self.dpa(
                         q,
                         k,
                         v,
-                        attn_mask=mask_keep,
+                        attn_mask=dpa_mask,
                         is_causal=use_is_causal,
                         dropout_p=self.dropout_p if self.training else 0.0,
                         training=bool(self.training),
