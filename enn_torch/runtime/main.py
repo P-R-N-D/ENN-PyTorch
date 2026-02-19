@@ -5050,26 +5050,31 @@ def process(*args: Any, **kwargs: Any) -> object:
             autocast_dtype=precision.amp_float or param_dtype,
             enable_tf32=enable_tf32,
         )
-        fp8_ok, fp8_reason = Dataset.is_float8_supported(device)
+        fp8_quantize = env_bool("ENN_ENABLE_FP8_QUANTIZE", default=False)
         fp8_enabled = False
         fp8_backend = None
         disable_note = None
-        if param_dtype is torch.float64:
-            disable_note = "master dtype is float64"
-        elif fp8_ok:
-            model, fp8_enabled, fp8_backend = (
-                ModelPolicy.enable_float8_training(
-                    model, metadata=metadata, logger=_float8_log
+        if fp8_quantize:
+            fp8_ok, fp8_reason = Dataset.is_float8_supported(device)
+            if param_dtype is torch.float64:
+                disable_note = "master dtype is float64"
+            elif fp8_ok:
+                model, fp8_enabled, fp8_backend = (
+                    ModelPolicy.quantize_for_float8_training(
+                        model, metadata=metadata, logger=_float8_log
+                    )
                 )
-            )
-            if not fp8_enabled:
-                disable_note = fp8_backend or fp8_reason
+                if not fp8_enabled:
+                    disable_note = fp8_backend or fp8_reason
+            else:
+                disable_note = fp8_reason
+            if disable_note:
+                _float8_log(f"[FP8][quantize] disabled: {disable_note}")
         else:
-            disable_note = fp8_reason
-        if not fp8_enabled:
-            Autocast.configure(model, metadata=metadata)
-        if disable_note:
-            _float8_log(f"[FP8] disabled: {disable_note}")
+            _float8_log(
+                "[FP8][quantize] skipped (default AMP-only). "
+                "Set ENN_ENABLE_FP8_QUANTIZE=1 to run model quantization."
+            )
         model.train()
         fsdp_mp_dtype = precision.fsdp_reduce_dtype
         if device.type == "cpu" and fsdp_mp_dtype is not torch.float64:
@@ -5643,20 +5648,27 @@ def process(*args: Any, **kwargs: Any) -> object:
                 autocast_dtype=param_dtype,
                 enable_tf32=enable_tf32,
             )
-        fp8_infer_ok, fp8_infer_reason = Dataset.is_float8_supported(device)
+        fp8_quantize = env_bool("ENN_ENABLE_FP8_QUANTIZE", default=False)
         fp8_enabled = False
         fp8_backend = None
         disable_note = None
-        if fp8_infer_ok:
-            model, fp8_enabled, fp8_backend = ModelPolicy.enable_float8_prediction(
-                model, metadata=metadata, logger=_float8_log
-            )
-            if not fp8_enabled:
-                disable_note = fp8_backend or fp8_infer_reason
+        if fp8_quantize:
+            fp8_infer_ok, fp8_infer_reason = Dataset.is_float8_supported(device)
+            if fp8_infer_ok:
+                model, fp8_enabled, fp8_backend = ModelPolicy.quantize_for_float8_prediction(
+                    model, metadata=metadata, logger=_float8_log
+                )
+                if not fp8_enabled:
+                    disable_note = fp8_backend or fp8_infer_reason
+            else:
+                disable_note = fp8_infer_reason
+            if disable_note:
+                _float8_log(f"[FP8][quantize] disabled: {disable_note}")
         else:
-            disable_note = fp8_infer_reason
-        if disable_note:
-            _float8_log(f"[FP8] disabled: {disable_note}")
+            _float8_log(
+                "[FP8][quantize] skipped (default AMP-only). "
+                "Set ENN_ENABLE_FP8_QUANTIZE=1 to run model quantization."
+            )
         if ops.sources is None:
             raise RuntimeError("RuntimeConfig.sources is required but None")
         model.eval()

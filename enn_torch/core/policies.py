@@ -1310,7 +1310,7 @@ class ModelPolicy:
             return (model, False, f"AO failed: {exc}")
 
     @staticmethod
-    def enable_float8_training(
+    def quantize_for_float8_training(
         model: nn.Module,
         metadata: Optional[Dataset[Any]] = None,
         logger: Optional[Callable[[str], None]] = None,
@@ -1329,7 +1329,7 @@ class ModelPolicy:
         if isinstance(reason, str) and ("te-only" in reason.lower()):
             _log_info(
                 logger,
-                f"[FP8] TE-only fallback enabled (torchao missing): {reason}",
+                f"[FP8][quantize] TE-only fallback enabled (torchao missing): {reason}",
             )
         if getattr(meta, "has_scale", False):
             float8_dtypes = Autocast.float8_formats()
@@ -1349,7 +1349,7 @@ class ModelPolicy:
             ):
                 _log_info(
                     logger,
-                    f"[FP8] training disabled: data scale exceeds float8 range (headroom=2^{p2})",
+                    f"[FP8][quantize] training disabled: data scale exceeds float8 range (headroom=2^{p2})",
                 )
                 Autocast.configure(model, metadata=meta)
                 return (model, False, "data scale")
@@ -1372,7 +1372,7 @@ class ModelPolicy:
                 )
             if ok2:
                 _log_info(
-                    logger, f"[FP8] training enabled via {why} ({reason})"
+                    logger, f"[FP8][quantize] training enabled via {why} ({reason})"
                 )
                 Autocast.configure(m2, metadata=meta)
                 return (m2, True, why)
@@ -1386,7 +1386,7 @@ class ModelPolicy:
         )
 
     @staticmethod
-    def enable_float8_prediction(
+    def quantize_for_float8_prediction(
         model: nn.Module,
         metadata: Optional[Dataset[Any]] = None,
         logger: Optional[Callable[[str], None]] = None,
@@ -1405,7 +1405,7 @@ class ModelPolicy:
         if isinstance(reason, str) and ("te-only" in reason.lower()):
             _log_info(
                 logger,
-                f"[FP8] TE-only fallback enabled (torchao missing): {reason}",
+                f"[FP8][quantize] TE-only fallback enabled (torchao missing): {reason}",
             )
         if getattr(meta, "has_scale", False):
             float8_dtypes = Autocast.float8_formats()
@@ -1472,7 +1472,7 @@ class ModelPolicy:
         )
 
     @staticmethod
-    def enable_int8_training(
+    def quantize_for_int8_training(
         model: nn.Module,
         metadata: Optional[Dataset[Any]] = None,
         logger: Optional[Callable[[str], None]] = None,
@@ -1496,7 +1496,7 @@ class ModelPolicy:
         return (m2, ok, why)
 
     @staticmethod
-    def enable_int8_prediction(
+    def quantize_for_int8_prediction(
         model: nn.Module,
         metadata: Optional[Dataset[Any]] = None,
         logger: Optional[Callable[[str], None]] = None,

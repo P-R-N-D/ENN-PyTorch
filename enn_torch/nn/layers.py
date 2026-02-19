@@ -806,10 +806,13 @@ class CrossAttention(nn.Module):
     def forward(
         self: Self, q_tokens: torch.Tensor, kv_tokens: torch.Tensor
     ) -> torch.Tensor:
-        qn = self.norm_q(q_tokens)
-        kvn = self.norm_kv(kv_tokens)
-        ctx, _ = self.attn(qn, kvn, kvn, need_weights=False)
-        ctx = self.out_proj(ctx)
+        from ..core.precision import Autocast
+
+        with Autocast.suspend(q_tokens.device):
+            qn = self.norm_q(q_tokens)
+            kvn = self.norm_kv(kv_tokens)
+            ctx, _ = self.attn(qn, kvn, kvn, need_weights=False)
+            ctx = self.out_proj(ctx)
         return q_tokens + self.drop_path(self.dropout(ctx))
 
 
@@ -1019,40 +1022,60 @@ class Resampler(nn.Module):
             if bad:
                 if not bool(getattr(self, "_nonfinite_warned", False)):
                     warnings.warn(
-                        "[ENN] Resampler: attention produced NaN/Inf; rerunning with fp32 math attention and disabling flex-bias path for this module.",
+                        "[ENN] Resampler: attention produced NaN/Inf; rerunning with AMP disabled attention math and disabling flex-bias path for this module.",
                         UserWarning,
                         stacklevel=2,
                     )
                     setattr(self, "_nonfinite_warned", True)
                 self._disable_flex_bias_runtime = True
-                q32 = q.to(dtype=torch.float32)
-                k32 = k.to(dtype=torch.float32)
-                v32 = v.to(dtype=torch.float32)
-                fm = None
-                if attn_bias is not None:
-                    bias_bk = _coerce_attn_bias_to_bk(attn_bias, B=int(B), K=int(Lk), like=q32)
-                    if int(bias_bk.shape[0]) == 1:
-                        bias_bk = bias_bk.expand(int(B), int(Lk))
-                    fm = (
-                        bias_bk.view(int(B), 1, 1, int(Lk))
-                        .expand(int(B), int(H), int(Lq), int(Lk))
-                        .contiguous()
-                    )
-                attn_out = _attention_math_bshd(
-                    q32,
-                    k32,
-                    v32,
-                    attn_mask=fm,
-                    is_causal=False,
-                    dropout_p=(self.dropout_p if self.training else 0.0),
-                    training=bool(self.training),
+                from ..core.precision import Autocast
+                from ..core.policies import PrecisionPolicy
+
+                meta = Autocast.metadata()
+                master = PrecisionPolicy.from_metadata(
+                    device=q.device, metadata=meta
+                ).master_float
+                math_dtype = (
+                    torch.promote_types(q.dtype, master)
+                    if q.is_floating_point()
+                    else master
                 )
-                if env_bool("ENN_RESAMPLER_FALLBACK_SANITIZE_FP32", default=True):
-                    with contextlib.suppress(Exception):
-                        attn_out = torch.nan_to_num(
-                            attn_out, nan=0.0, posinf=0.0, neginf=0.0
+                with Autocast.suspend(q.device):
+                    qh = q.to(dtype=math_dtype)
+                    kh = k.to(dtype=math_dtype)
+                    vh = v.to(dtype=math_dtype)
+                    fm = None
+                    if attn_bias is not None:
+                        bias_bk = _coerce_attn_bias_to_bk(
+                            attn_bias, B=int(B), K=int(Lk), like=qh
                         )
-                attn_out = attn_out.to(dtype=q.dtype, non_blocking=True)
+                        if int(bias_bk.shape[0]) == 1:
+                            bias_bk = bias_bk.expand(int(B), int(Lk))
+                        fm = (
+                            bias_bk.view(int(B), 1, 1, int(Lk))
+                            .expand(int(B), int(H), int(Lq), int(Lk))
+                            .contiguous()
+                        )
+                    attn_out = _attention_math_bshd(
+                        qh,
+                        kh,
+                        vh,
+                        attn_mask=fm,
+                        is_causal=False,
+                        dropout_p=(self.dropout_p if self.training else 0.0),
+                        training=bool(self.training),
+                    )
+                    sanitize = env_bool(
+                        "ENN_RESAMPLER_FALLBACK_SANITIZE",
+                        default=env_bool(
+                            "ENN_RESAMPLER_FALLBACK_SANITIZE_FP32", default=True
+                        ),
+                    )
+                    if sanitize:
+                        with contextlib.suppress(Exception):
+                            attn_out = torch.nan_to_num(
+                                attn_out, nan=0.0, posinf=0.0, neginf=0.0
+                            )
         if attn_out.dim() == 4:
             attn_out = attn_out.transpose(1, 2).contiguous().view(B, Lq, D)
         else:
