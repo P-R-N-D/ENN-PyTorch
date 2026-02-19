@@ -1019,7 +1019,8 @@ class ModelPolicy:
             return (model, False, "transformer_engine not installed")
         te_backend = getattr(te, "__name__", "transformer_engine.pytorch")
         fp8_ok, why = Dataset.is_float8_supported(dev)
-        if env_bool("ENN_DISABLE_FP8", default=False):
+        fp8_disabled = env_bool("ENN_DISABLE_FP8", default=False)
+        if fp8_disabled:
             with contextlib.suppress(Exception):
                 if hasattr(model, "__te_fp8_default__"):
                     delattr(model, "__te_fp8_default__")
@@ -1047,12 +1048,12 @@ class ModelPolicy:
         n_total = (n_layers or 0) + (attn_swapped or 0)
         _log_info(
             logger,
-            f"[TE] swapped {n_total} modules (layers:{n_layers}, attn:{attn_swapped}); params_dtype={str(params_dtype).split('.')[-1]}, fp8={('on' if fp8_ok else 'off')} ({(why if fp8_ok else '')}), backend={te_backend}",
+            f"[TE] swapped {n_total} modules (layers:{n_layers}, attn:{attn_swapped}); params_dtype={str(params_dtype).split('.')[-1]}, fp8={('on' if (fp8_ok and (not fp8_disabled)) else 'off')} ({(why if fp8_ok and (not fp8_disabled) else ('disabled by ENN_DISABLE_FP8' if fp8_disabled else ''))}), backend={te_backend}",
         )
         return (
             model,
             n_total > 0,
-            f"TE applied (swapped {n_total}, layers={n_layers}, attn={attn_swapped}, dtype={params_dtype}, fp8={('on' if fp8_ok else 'off')}, backend={te_backend})",
+            f"TE applied (swapped {n_total}, layers={n_layers}, attn={attn_swapped}, dtype={params_dtype}, fp8={('on' if (fp8_ok and (not fp8_disabled)) else 'off')}, backend={te_backend})",
         )
 
     @staticmethod
