@@ -436,19 +436,16 @@ class Perceiver(nn.Module):
             raise ValueError(
                 f"Perceiver expects tokens (B,N,D), got shape {tuple(tokens.shape)}"
             )
-        from ..core.precision import Autocast
-
-        with Autocast.suspend(tokens.device):
-            B = tokens.size(0)
-            latents = self.latents.unsqueeze(0).expand(B, -1, -1)
-            j = 0
-            for i in range(int(self.depth)):
-                latents = self.cross[i](latents, tokens, attn_bias=attn_bias)
-                for _ in range(int(self.self_attn_layers)):
-                    if j < len(self.self_blocks):
-                        latents = self.self_blocks[j](latents)
-                    j += 1
-            out = self.norm(latents)
+        B = tokens.size(0)
+        latents = self.latents.unsqueeze(0).expand(B, -1, -1)
+        j = 0
+        for i in range(int(self.depth)):
+            latents = self.cross[i](latents, tokens, attn_bias=attn_bias)
+            for _ in range(int(self.self_attn_layers)):
+                if j < len(self.self_blocks):
+                    latents = self.self_blocks[j](latents)
+                j += 1
+        out = self.norm(latents)
 
         if (not torch.is_grad_enabled()) and (getattr(out.device, "type", None) == "cuda"):
             if env_bool("ENN_PRED_COLLAPSE_STAGE_DIAG", default=False):
