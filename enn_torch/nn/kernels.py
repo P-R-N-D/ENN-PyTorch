@@ -577,6 +577,8 @@ def _call_with_flex_warn_guard(fn: Callable[[], Any]) -> tuple[Any, bool]:
 def _flex_ckpt_always_clone_enabled(out: Any) -> bool:
     if not bool(is_checkpoint()):
         return False
+    if bool(torch.is_grad_enabled()) and (not env_bool("ENN_CKPT_CUDAGRAPH_CLONE_RECOMPUTE", default=False)):
+        return False
     if _flex_attention_compile_mode() not in {"max-autotune", "reduce-overhead"}:
         return False
     t0 = None
