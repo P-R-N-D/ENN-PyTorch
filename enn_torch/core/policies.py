@@ -1316,7 +1316,7 @@ class ModelPolicy:
         meta = ModelPolicy._coerce_metadata(model, metadata)
         device = torch.device(meta.device)
         if env_bool("ENN_DISABLE_FP8", default=False):
-            Autocast.configure(model, metadata=meta)
+            Autocast.configure(model, fp8_backend="off", metadata=meta)
             return (model, False, "disabled by ENN_DISABLE_FP8")
         ok, reason = Dataset.is_float8_supported(device)
         if not ok:
@@ -1392,7 +1392,7 @@ class ModelPolicy:
         meta = ModelPolicy._coerce_metadata(model, metadata)
         device = torch.device(meta.device)
         if env_bool("ENN_DISABLE_FP8", default=False):
-            Autocast.configure(model, metadata=meta)
+            Autocast.configure(model, fp8_backend="off", metadata=meta)
             return (model, False, "disabled by ENN_DISABLE_FP8")
         ok, reason = Dataset.is_float8_supported(device)
         if not ok:

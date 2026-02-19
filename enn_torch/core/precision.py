@@ -484,6 +484,13 @@ class Autocast:
         device: Optional[torch.device] = None,
         **kwargs: object,
     ) -> Optional[str]:
+        if isinstance(pref, str) and pref.strip().lower() in {
+            "off",
+            "none",
+            "disabled",
+            "false",
+        }:
+            return None
         return cls._resolve_backend(pref, device or cls._device(None), "fp8")
 
     @classmethod
