@@ -1008,7 +1008,17 @@ class Autocast:
             with contextlib.suppress(Exception):
                 stack.enter_context(
                     torch.amp.autocast(device_type=dev.type, enabled=False)
-                ) or stack.enter_context(contextlib.nullcontext())
+                )
+            with contextlib.suppress(Exception):
+                mod = importlib.import_module("transformer_engine.pytorch")
+                te_autocast = getattr(mod, "autocast", None)
+                if callable(te_autocast):
+                    stack.enter_context(te_autocast(enabled=False))
+            with contextlib.suppress(Exception):
+                mod = importlib.import_module("torchao.float8")
+                fp8_ac = getattr(mod, "fp8_autocast", None)
+                if callable(fp8_ac):
+                    stack.enter_context(fp8_ac(enabled=False))
             yield
 
     @classmethod
