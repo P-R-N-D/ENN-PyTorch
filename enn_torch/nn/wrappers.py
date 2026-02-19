@@ -1860,6 +1860,74 @@ class Fuser(nn.Module):
                             "pair_nonfinite": int((~torch.isfinite(context[:2])).sum().item())
                             if context.is_floating_point() else 0,
                         }
+
+        if env_bool("ENN_FUSER_NONFINITE_FALLBACK", default=True):
+            allow_train = env_bool("ENN_FUSER_NONFINITE_FALLBACK_TRAINING", default=False)
+            if (not torch.is_grad_enabled()) or allow_train:
+                has_nonfinite = False
+                if isinstance(fused_tokens, torch.Tensor) and fused_tokens.is_floating_point():
+                    with torch.no_grad():
+                        try:
+                            ft_absmax = fused_tokens.detach().abs().amax()
+                            has_nonfinite = not bool(torch.isfinite(ft_absmax).item())
+                        except Exception:
+                            has_nonfinite = not bool(torch.isfinite(fused_tokens).all().item())
+                if (not has_nonfinite) and isinstance(context, torch.Tensor) and context.is_floating_point():
+                    with torch.no_grad():
+                        try:
+                            ctx_absmax = context.detach().abs().amax()
+                            has_nonfinite = not bool(torch.isfinite(ctx_absmax).item())
+                        except Exception:
+                            has_nonfinite = not bool(torch.isfinite(context).all().item())
+                if has_nonfinite:
+                    if not getattr(self, "_enn_nonfinite_fallback_logged", False):
+                        _LOGGER.warning(
+                            "[ENN] Fuser perceiver produced non-finite output; "
+                            "falling back to pre-perceiver tokens (set ENN_FUSER_NONFINITE_FALLBACK=0 to disable)."
+                        )
+                        setattr(self, "_enn_nonfinite_fallback_logged", True)
+                    fb = all_tokens
+                    try:
+                        want_n = int(fused_tokens.shape[1])
+                        have_n = int(fb.shape[1])
+                        if have_n > want_n:
+                            fb = fb[:, :want_n]
+                        elif have_n < want_n:
+                            if have_n <= 0:
+                                fb = fb.new_zeros((int(fb.shape[0]), want_n, int(fb.shape[-1])))
+                            else:
+                                reps = int(math.ceil(float(want_n) / float(have_n)))
+                                fb = fb.repeat(1, reps, 1)[:, :want_n]
+                    except Exception:
+                        pass
+                    fused_tokens = fb.to(dtype=fused_tokens.dtype, device=fused_tokens.device)
+                    graph_break()
+                    context = self.decode(fused_tokens, apply_norm=True)
+                    if env_bool("ENN_FUSER_DIAG_NONFINITE_PARAMS", default=False) and not getattr(
+                        self, "_enn_nonfinite_params_logged", False
+                    ):
+                        bad_params: list[str] = []
+                        with torch.no_grad():
+                            for n, p in self.perceiver.named_parameters(recurse=True):
+                                if not isinstance(p, torch.Tensor) or (not p.is_floating_point()):
+                                    continue
+                                try:
+                                    a = p.detach().abs().amax()
+                                    if not bool(torch.isfinite(a).item()):
+                                        bad_params.append(str(n))
+                                except Exception:
+                                    with contextlib.suppress(Exception):
+                                        if not bool(torch.isfinite(p).all().item()):
+                                            bad_params.append(str(n))
+                        if bad_params:
+                            head = ", ".join(bad_params[:20])
+                            more = "" if len(bad_params) <= 20 else f" (+{len(bad_params)-20} more)"
+                            _LOGGER.warning(
+                                "[ENN] Perceiver parameters include non-finite values: %s%s",
+                                head,
+                                more,
+                            )
+                        setattr(self, "_enn_nonfinite_params_logged", True)
         if return_temporal_state:
             if state_is_map:
                 return fused_tokens, context, next_state_map

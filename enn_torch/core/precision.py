@@ -7,6 +7,7 @@ import io
 import json
 import logging
 import math
+import os
 import threading
 from collections import OrderedDict
 from contextlib import AbstractContextManager
@@ -36,6 +37,13 @@ _PTQ_IMPL = None
 _TORCHAO_IMPORT_LOCK = Mutex()
 _TORCHAO_IMPORT_TRIED = False
 _qp = None
+
+
+def _env_disable_fp8() -> bool:
+    v = os.getenv("ENN_DISABLE_FP8")
+    if v is None:
+        return False
+    return v.strip().lower() in ("1", "true", "yes", "y", "on")
 
 
 def __getattr__(name: str) -> Any:
@@ -484,6 +492,8 @@ class Autocast:
         device: Optional[torch.device] = None,
         **kwargs: object,
     ) -> Optional[str]:
+        if _env_disable_fp8():
+            return None
         if isinstance(pref, str) and pref.strip().lower() in {
             "off",
             "none",
@@ -670,6 +680,8 @@ class Autocast:
         metadata: Any | None = None,
     ) -> None:
         backend = fp8_backend
+        if _env_disable_fp8():
+            backend = "off"
         int_b = int_backend or (
             "ao"
             if isinstance(model, nn.Module)

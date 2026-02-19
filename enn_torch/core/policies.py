@@ -1019,7 +1019,11 @@ class ModelPolicy:
             return (model, False, "transformer_engine not installed")
         te_backend = getattr(te, "__name__", "transformer_engine.pytorch")
         fp8_ok, why = Dataset.is_float8_supported(dev)
-        if fp8_ok:
+        if env_bool("ENN_DISABLE_FP8", default=False):
+            with contextlib.suppress(Exception):
+                if hasattr(model, "__te_fp8_default__"):
+                    delattr(model, "__te_fp8_default__")
+        elif fp8_ok:
             setattr(model, "__te_fp8_default__", True)
         params_dtype = kwargs.pop("params_dtype", None)
         if not isinstance(params_dtype, torch.dtype):
