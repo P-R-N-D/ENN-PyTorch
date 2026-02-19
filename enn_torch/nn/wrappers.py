@@ -1753,20 +1753,97 @@ class Fuser(nn.Module):
                     getattr(get_runtime_cfg(), "compile_cudagraphs", False)
                 )
         cg_ok = bool(compile_cg_enabled and (not disable_pred_cg))
-        bg = getattr(self, "_backbone_graph", None)
-        if isinstance(bg, nn.Module) and cg_ok:
-            fused_tokens, context = cast(
-                tuple[torch.Tensor, torch.Tensor], bg(all_tokens, attn_bias)
-            )
-        else:
-            if cg_ok:
-                cudagraph_mark_step_begin()
-                fused_tokens = self.perceiver(all_tokens, attn_bias=attn_bias)
-                cudagraph_mark_step_end()
-            else:
-                fused_tokens = self.perceiver(all_tokens, attn_bias=attn_bias)
+        fallback_enabled = bool(
+            infer_cuda and env_bool("ENN_FUSER_NONFINITE_FALLBACK", default=True)
+        )
+        runtime_skip_perceiver = bool(
+            fallback_enabled and bool(getattr(self, "_disable_perceiver_runtime", False))
+        )
+
+        def _fallback_fused_from_all() -> torch.Tensor:
+            try:
+                tgt = int(self.fused_tokens)
+            except Exception:
+                tgt = int(getattr(self, "fused_tokens", all_tokens.shape[1]))
+            if tgt <= 0:
+                tgt = int(all_tokens.shape[1])
+            n = int(all_tokens.shape[1])
+            if n == tgt:
+                return all_tokens
+            if n > tgt:
+                return all_tokens[:, :tgt, :]
+            pad = tgt - n
+            if pad <= 0:
+                return all_tokens
+            z = all_tokens.new_zeros((all_tokens.shape[0], pad, all_tokens.shape[2]))
+            return torch.cat((all_tokens, z), dim=1)
+
+        def _pair_has_nonfinite(t: torch.Tensor) -> bool:
+            if (not isinstance(t, torch.Tensor)) or (not t.is_floating_point()):
+                return False
+            if t.numel() == 0:
+                return False
+            sl = t[:2]
+            return not bool(torch.isfinite(sl).all().item())
+
+        if runtime_skip_perceiver:
+            fused_tokens = _fallback_fused_from_all()
             graph_break()
             context = self.decode(fused_tokens, apply_norm=True)
+        else:
+            bg = getattr(self, "_backbone_graph", None)
+            if isinstance(bg, nn.Module) and cg_ok:
+                fused_tokens, context = cast(
+                    tuple[torch.Tensor, torch.Tensor], bg(all_tokens, attn_bias)
+                )
+            else:
+                if cg_ok:
+                    cudagraph_mark_step_begin()
+                    fused_tokens = self.perceiver(all_tokens, attn_bias=attn_bias)
+                    cudagraph_mark_step_end()
+                else:
+                    fused_tokens = self.perceiver(all_tokens, attn_bias=attn_bias)
+                graph_break()
+                if fallback_enabled and _pair_has_nonfinite(fused_tokens):
+                    setattr(self, "_disable_perceiver_runtime", True)
+                    if not bool(getattr(self, "_nonfinite_fallback_warned", False)):
+                        _LOGGER.warning(
+                            "[ENN] Fuser: perceiver produced non-finite fused_tokens; "
+                            "falling back to raw template tokens (all_tokens). "
+                            "Set ENN_FUSER_NONFINITE_FALLBACK=0 to disable this."
+                        )
+                        setattr(self, "_nonfinite_fallback_warned", True)
+
+                    if env_bool("ENN_FUSER_DIAG_NONFINITE_PARAMS", default=True):
+                        with contextlib.suppress(Exception):
+                            bad: list[str] = []
+                            for pn, pv in self.perceiver.named_parameters():
+                                if pv is None or (not isinstance(pv, torch.Tensor)):
+                                    continue
+                                if pv.is_floating_point() and (not torch.isfinite(pv).all()):
+                                    bad.append(str(pn))
+                                    if len(bad) >= 8:
+                                        break
+                            if bad:
+                                _LOGGER.error(
+                                    "[ENN] Fuser: non-finite parameters detected in perceiver: %s",
+                                    ", ".join(bad),
+                                )
+
+                    fused_tokens = _fallback_fused_from_all()
+                context = self.decode(fused_tokens, apply_norm=True)
+
+            if fallback_enabled and (_pair_has_nonfinite(fused_tokens) or _pair_has_nonfinite(context)):
+                setattr(self, "_disable_perceiver_runtime", True)
+                if not bool(getattr(self, "_nonfinite_fallback_warned", False)):
+                    _LOGGER.warning(
+                        "[ENN] Fuser: non-finite outputs detected (tokens/context); "
+                        "falling back to raw template tokens (all_tokens)."
+                    )
+                    setattr(self, "_nonfinite_fallback_warned", True)
+                fused_tokens = _fallback_fused_from_all()
+                graph_break()
+                context = self.decode(fused_tokens, apply_norm=True)
 
         if (not torch.is_grad_enabled()) and (getattr(fused_tokens.device, "type", None) == "cuda"):
             if env_bool("ENN_PRED_COLLAPSE_STAGE_DIAG", default=False):
@@ -1783,6 +1860,74 @@ class Fuser(nn.Module):
                             "pair_nonfinite": int((~torch.isfinite(context[:2])).sum().item())
                             if context.is_floating_point() else 0,
                         }
+
+        if env_bool("ENN_FUSER_NONFINITE_FALLBACK", default=True):
+            allow_train = env_bool("ENN_FUSER_NONFINITE_FALLBACK_TRAINING", default=False)
+            if (not torch.is_grad_enabled()) or allow_train:
+                has_nonfinite = False
+                if isinstance(fused_tokens, torch.Tensor) and fused_tokens.is_floating_point():
+                    with torch.no_grad():
+                        try:
+                            ft_absmax = fused_tokens.detach().abs().amax()
+                            has_nonfinite = not bool(torch.isfinite(ft_absmax).item())
+                        except Exception:
+                            has_nonfinite = not bool(torch.isfinite(fused_tokens).all().item())
+                if (not has_nonfinite) and isinstance(context, torch.Tensor) and context.is_floating_point():
+                    with torch.no_grad():
+                        try:
+                            ctx_absmax = context.detach().abs().amax()
+                            has_nonfinite = not bool(torch.isfinite(ctx_absmax).item())
+                        except Exception:
+                            has_nonfinite = not bool(torch.isfinite(context).all().item())
+                if has_nonfinite:
+                    if not getattr(self, "_enn_nonfinite_fallback_logged", False):
+                        _LOGGER.warning(
+                            "[ENN] Fuser perceiver produced non-finite output; "
+                            "falling back to pre-perceiver tokens (set ENN_FUSER_NONFINITE_FALLBACK=0 to disable)."
+                        )
+                        setattr(self, "_enn_nonfinite_fallback_logged", True)
+                    fb = all_tokens
+                    try:
+                        want_n = int(fused_tokens.shape[1])
+                        have_n = int(fb.shape[1])
+                        if have_n > want_n:
+                            fb = fb[:, :want_n]
+                        elif have_n < want_n:
+                            if have_n <= 0:
+                                fb = fb.new_zeros((int(fb.shape[0]), want_n, int(fb.shape[-1])))
+                            else:
+                                reps = int(math.ceil(float(want_n) / float(have_n)))
+                                fb = fb.repeat(1, reps, 1)[:, :want_n]
+                    except Exception:
+                        pass
+                    fused_tokens = fb.to(dtype=fused_tokens.dtype, device=fused_tokens.device)
+                    graph_break()
+                    context = self.decode(fused_tokens, apply_norm=True)
+                    if env_bool("ENN_FUSER_DIAG_NONFINITE_PARAMS", default=False) and not getattr(
+                        self, "_enn_nonfinite_params_logged", False
+                    ):
+                        bad_params: list[str] = []
+                        with torch.no_grad():
+                            for n, p in self.perceiver.named_parameters(recurse=True):
+                                if not isinstance(p, torch.Tensor) or (not p.is_floating_point()):
+                                    continue
+                                try:
+                                    a = p.detach().abs().amax()
+                                    if not bool(torch.isfinite(a).item()):
+                                        bad_params.append(str(n))
+                                except Exception:
+                                    with contextlib.suppress(Exception):
+                                        if not bool(torch.isfinite(p).all().item()):
+                                            bad_params.append(str(n))
+                        if bad_params:
+                            head = ", ".join(bad_params[:20])
+                            more = "" if len(bad_params) <= 20 else f" (+{len(bad_params)-20} more)"
+                            _LOGGER.warning(
+                                "[ENN] Perceiver parameters include non-finite values: %s%s",
+                                head,
+                                more,
+                            )
+                        setattr(self, "_enn_nonfinite_params_logged", True)
         if return_temporal_state:
             if state_is_map:
                 return fused_tokens, context, next_state_map
