@@ -776,45 +776,6 @@ class DilatedAttention(nn.Module):
         return x, attn_weights
 
 
-class CrossAttention(nn.Module):
-    def __init__(
-        self: Self,
-        d_model: int,
-        nhead: int,
-        *args: Any,
-        dropout: float = 0.0,
-        norm_type: str = "layernorm",
-        drop_path: float = 0.0,
-        **kwargs: Any,
-    ) -> None:
-        super().__init__()
-        self.d_model = int(d_model)
-        self.nhead = int(nhead)
-        self.norm_q = norm_layer(norm_type, self.d_model)
-        self.norm_kv = norm_layer(norm_type, self.d_model)
-        self.attn = MultiHeadAttention(
-            embed_dim=self.d_model,
-            num_heads=self.nhead,
-            dropout=dropout,
-            batch_first=True,
-            bias=True,
-        )
-        self.out_proj = nn.Linear(self.d_model, self.d_model)
-        self.dropout = nn.Dropout(dropout)
-        self.drop_path = StochasticDepth(p=drop_path, mode="row")
-
-    def forward(
-        self: Self, q_tokens: torch.Tensor, kv_tokens: torch.Tensor
-    ) -> torch.Tensor:
-        from ..core.precision import Autocast
-
-        with Autocast.suspend(q_tokens.device):
-            qn = self.norm_q(q_tokens)
-            kvn = self.norm_kv(kv_tokens)
-            ctx, _ = self.attn(qn, kvn, kvn, need_weights=False)
-            ctx = self.out_proj(ctx)
-        return q_tokens + self.drop_path(self.dropout(ctx))
-
 
 class Resampler(nn.Module):
     def __init__(
