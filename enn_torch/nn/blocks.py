@@ -4,7 +4,6 @@ from __future__ import annotations
 import contextlib
 import logging
 import os
-import warnings
 from importlib import import_module
 from typing import Any, Callable, List, Optional, Self, Sequence, Tuple
 
@@ -13,12 +12,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 from ..core.compat import StochasticDepth
 from ..core.datatypes import env_bool, env_int
-from ..core.policies import ATTENTION_POLICY, AttentionBackend
 from ..runtime.distributed import _from_hsdp_module
 from .activations import GeGLU
-from .graph import coerce_checkpoint, is_checkpoint, is_export_or_trace, is_symbolic, canonicalize_compile_mode, is_compiling
-from .kernels import DotProductAttention, _attention_math_bshd, _ensure_flex_kwargs_initialized, get_flex_kernel
-from .layers import DilatedAttention, Resampler, Retention, norm_layer
+from .graph import coerce_checkpoint, is_checkpoint, is_export_or_trace, is_symbolic, canonicalize_compile_mode
+from .layers import CrossAttention, DilatedAttention, LatentAttention, Retention, norm_layer
 _LOGGER = logging.getLogger(__name__)
 _PRESET_ALIASES: dict[str, str] = {
     "ss": "spatial",
@@ -66,7 +63,9 @@ def _enn_longnet_ckpt_clone_if_needed(t: torch.Tensor) -> torch.Tensor:
         return t
     if not bool(getattr(t.device, "type", None) == "cuda"):
         return t
-    if not bool(torch.is_grad_enabled() or is_checkpoint()):
+    if not bool(is_checkpoint()):
+        return t
+    if bool(torch.is_grad_enabled()) and (not env_bool("ENN_CKPT_CUDAGRAPH_CLONE_RECOMPUTE", default=False)):
         return t
     try:
         from ..core.system import get_runtime_cfg
@@ -260,20 +259,20 @@ class LatentTransformer(nn.Module):
         drop_path: float,
     ) -> None:
         super().__init__()
+        del args
         if d_model % nhead != 0:
             raise ValueError(
                 f"d_model ({d_model}) must be divisible by nhead ({nhead})"
             )
         self.d_model = int(d_model)
         self.nhead = int(nhead)
-        self.head_dim = self.d_model // self.nhead
-        self.norm1 = norm_layer(norm_type=norm_type, dim=self.d_model, eps=eps)
-        self.qkv = nn.Linear(self.d_model, 3 * self.d_model, bias=True)
-        self.out_proj = nn.Linear(self.d_model, self.d_model, bias=True)
-        self.attn = DotProductAttention(num_heads=self.nhead, head_dim=self.head_dim)
-        self._disable_flex_runtime: bool = False
-        self._flex_fail_count: int = 0
-        self._flex_fail_max: int = max(0, int(env_int("ENN_LATENT_FLEX_RETRY", 3)))
+        self.attn = LatentAttention(
+            d_model=self.d_model,
+            nhead=self.nhead,
+            norm_type=str(norm_type),
+            eps=float(eps),
+            dropout=float(dropout),
+        )
         self.dropout = nn.Dropout(dropout)
         self.drop_path = (
             StochasticDepth(drop_path) if drop_path > 0.0 else nn.Identity()
@@ -286,220 +285,71 @@ class LatentTransformer(nn.Module):
             nn.Linear(inner_dim, self.d_model, bias=True),
         )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        B, K, D = x.shape
-        y = self.norm1(x)
-
-        qkv = self.qkv(y)
-        q, k, v = (
-            qkv.view(B, K, 3, self.nhead, self.head_dim)
-            .permute(2, 0, 3, 1, 4)
-            .unbind(0)
-        )
-
-        exporting = bool(is_export_or_trace())
-        compiling = bool(is_compiling())
-        allow_flex = not self._disable_flex_runtime
-        allow_mha = True
-        allow_dpa = True
-
-        plan = ATTENTION_POLICY.plan(
-            q=q,
-            need_weights=False,
-            has_bias=False,
-            exporting=exporting,
-            compiling=compiling,
-            allow_flex=allow_flex,
-            allow_mha=allow_mha,
-            allow_dpa=allow_dpa,
-        )
-
-        def _classify(exc: BaseException) -> str:
-            msg = str(exc)
-            tname = type(exc).__name__
-            m = msg.lower()
-            if "flexattention not available" in m:
-                return "struct"
-            if "not available" in m and "flex" in m:
-                return "struct"
-            if tname in ("TypeError", "ValueError"):
-                return "struct"
-            if exporting or compiling:
-                return "struct"
-            if "float8" in m or "fp8" in m:
-                return "struct"
-            if (
-                "no valid triton configs" in m
-                or "outofresources" in m
-                or "out of resources" in m
-            ):
-                return "transient"
-            if (
-                "torch._dynamo" in m
-                or "torch._inductor" in m
-                or "compileerror" in m
-            ):
-                return "transient"
-            return "transient"
-
-        attn_proj: torch.Tensor | None = None
-
-        if plan.backend == AttentionBackend.FLEX and allow_flex:
-            try:
-                if getattr(q, "dtype", None) == torch.float64 or (
-                    "float8" in str(getattr(q, "dtype", ""))
-                ):
-                    raise RuntimeError("flex disabled for fp64/fp8")
-                _ensure_flex_kwargs_initialized()
-                attn_out = get_flex_kernel()(
-                    q,
-                    k,
-                    v,
-                    score_mod=None,
-                    block_mask=None,
-                    scale=None,
-                    dropout_p=self.dropout.p if self.training else 0.0,
-                    training=bool(self.training),
-                    is_causal=False,
-                )
-                attn_out = attn_out.transpose(1, 2).contiguous().view(B, K, D)
-                attn_proj = self.out_proj(attn_out)
-            except Exception as exc:
-                kind = _classify(exc)
-                self._flex_fail_count += 1
-                if kind == "struct":
-                    self._disable_flex_runtime = True
-                elif self._flex_fail_max > 0 and self._flex_fail_count >= self._flex_fail_max:
-                    self._disable_flex_runtime = True
-                plan = ATTENTION_POLICY.plan(
-                    q=q,
-                    need_weights=False,
-                    has_bias=False,
-                    exporting=exporting,
-                    compiling=compiling,
-                    allow_flex=False,
-                    allow_mha=allow_mha,
-                    allow_dpa=allow_dpa,
-                )
-                attn_proj = None
-
-        if attn_proj is None and plan.backend == AttentionBackend.MHA and allow_mha:
-            try:
-                y_seq = y.transpose(0, 1)
-                attn_out, _ = F.multi_head_attention_forward(
-                    y_seq,
-                    y_seq,
-                    y_seq,
-                    embed_dim_to_check=int(D),
-                    num_heads=int(self.nhead),
-                    in_proj_weight=self.qkv.weight,
-                    in_proj_bias=self.qkv.bias,
-                    bias_k=None,
-                    bias_v=None,
-                    add_zero_attn=False,
-                    dropout_p=self.dropout.p if self.training else 0.0,
-                    out_proj_weight=self.out_proj.weight,
-                    out_proj_bias=self.out_proj.bias,
-                    training=bool(self.training),
-                    key_padding_mask=None,
-                    need_weights=False,
-                    attn_mask=None,
-                    use_separate_proj_weight=False,
-                    q_proj_weight=None,
-                    k_proj_weight=None,
-                    v_proj_weight=None,
-                    static_k=None,
-                    static_v=None,
-                    average_attn_weights=False,
-                    is_causal=False,
-                )
-                attn_proj = attn_out.transpose(0, 1)
-            except Exception:
-                plan = ATTENTION_POLICY.plan(
-                    q=q,
-                    need_weights=False,
-                    has_bias=False,
-                    exporting=exporting,
-                    compiling=compiling,
-                    allow_flex=False,
-                    allow_mha=False,
-                    allow_dpa=allow_dpa,
-                )
-                attn_proj = None
-
-        if attn_proj is None:
-            attn_out = self.attn(
-                q,
-                k,
-                v,
-                attn_mask=None,
-                is_causal=False,
-                dropout_p=self.dropout.p if self.training else 0.0,
-                training=bool(self.training),
-            )
-            attn_out = attn_out.transpose(1, 2).contiguous().view(B, K, D)
-            attn_proj = self.out_proj(attn_out)
-
-        if (
-            (not exporting)
-            and (not compiling)
-            and env_bool("ENN_LATENT_FALLBACK_ON_NONFINITE", default=True)
-            and isinstance(attn_proj, torch.Tensor)
-            and attn_proj.is_floating_point()
-            and attn_proj.numel() > 0
-        ):
-            with torch.no_grad():
-                samp = attn_proj.reshape(-1)[:1024]
-                bad = not bool(torch.isfinite(samp).all().item())
-            if bad:
-                self._disable_flex_runtime = True
-                if not bool(getattr(self, "_enn_nonfinite_warned", False)):
-                    warnings.warn(
-                        "[ENN] LatentTransformer: attention produced NaN/Inf; rerunning attention math with AMP disabled (policy fallback).",
-                        UserWarning,
-                        stacklevel=2,
-                    )
-                    setattr(self, "_enn_nonfinite_warned", True)
-
-                from ..core.precision import Autocast
-                from ..core.policies import PrecisionPolicy
-
-                meta = Autocast.metadata()
-                master = PrecisionPolicy.from_metadata(
-                    device=q.device, metadata=meta
-                ).master_float
-                math_dtype = (
-                    torch.promote_types(q.dtype, master)
-                    if q.is_floating_point()
-                    else master
-                )
-                with Autocast.suspend(q.device):
-                    qh = q.to(dtype=math_dtype)
-                    kh = k.to(dtype=math_dtype)
-                    vh = v.to(dtype=math_dtype)
-                    attn_math = _attention_math_bshd(
-                        qh,
-                        kh,
-                        vh,
-                        attn_mask=None,
-                        is_causal=False,
-                        dropout_p=self.dropout.p if self.training else 0.0,
-                        training=bool(self.training),
-                    )
-                    attn_math = attn_math.transpose(1, 2).contiguous().view(B, K, D)
-                    wdt = getattr(self.out_proj.weight, "dtype", attn_math.dtype)
-                    if attn_math.dtype != wdt:
-                        attn_math = attn_math.to(dtype=wdt)
-                    attn_proj = self.out_proj(attn_math)
-                    if env_bool("ENN_LATENT_FALLBACK_SANITIZE", default=True):
-                        with contextlib.suppress(Exception):
-                            attn_proj = torch.nan_to_num(
-                                attn_proj, nan=0.0, posinf=0.0, neginf=0.0
-                            )
-
+    def forward(self: Self, x: torch.Tensor) -> torch.Tensor:
+        attn_proj = self.attn(x)
         x = x + self.drop_path(self.dropout(attn_proj))
         x = x + self.drop_path(self.ff(self.norm2(x)))
         return x
+
+
+class Resampler(nn.Module):
+    def __init__(
+        self: Self,
+        d_model: int,
+        nhead: int,
+        *args: Any,
+        dropout: float = 0.0,
+        mlp_ratio: float = 4.0,
+        drop_path: float = 0.0,
+        norm_type: str = "layernorm",
+        bias: bool = True,
+        **kwargs: Any,
+    ) -> None:
+        super().__init__()
+        del args, kwargs
+        self.d_model = int(d_model)
+        self.nhead = int(nhead)
+        if self.d_model % max(1, self.nhead) != 0:
+            raise ValueError(
+                f"d_model {self.d_model} must be divisible by nhead {self.nhead}"
+            )
+        self.dropout_p = float(dropout)
+
+        self.cross_attn = CrossAttention(
+            d_model=self.d_model,
+            nhead=self.nhead,
+            dropout=float(dropout),
+            norm_type=str(norm_type),
+            bias=bool(bias),
+        )
+
+        self.dropout = nn.Dropout(self.dropout_p)
+        self.drop_path = StochasticDepth(p=float(drop_path), mode="row")
+
+        def _norm() -> nn.Module:
+            nt = str(norm_type or "layernorm").strip().lower()
+            if nt in {"rms", "rmsnorm"} and hasattr(nn, "RMSNorm"):
+                return nn.RMSNorm(self.d_model)
+            return nn.LayerNorm(self.d_model)
+
+        self.norm_ffn = _norm()
+        hid = int(self.d_model * float(mlp_ratio) * (2.0 / 3.0))
+        self.ffn = GeGLU(
+            self.d_model, hid, out_dim=self.d_model, dropout=dropout
+        )
+
+    def forward(
+        self: Self,
+        latents: torch.Tensor,
+        tokens: torch.Tensor,
+        attn_bias: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        attn_proj = self.cross_attn(latents, tokens, attn_bias=attn_bias)
+        latents = latents + self.drop_path(self.dropout(attn_proj))
+        latents = latents + self.drop_path(
+            self.dropout(self.ffn(self.norm_ffn(latents)))
+        )
+        return latents
 
 class Perceiver(nn.Module):
     def __init__(
