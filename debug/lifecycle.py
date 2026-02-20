@@ -265,6 +265,67 @@ def monitor_run(fn: Callable[[], T]) -> tuple[T, dict[str, object]]:
     }
 
 
+def summarize_x_y_distribution(
+    td_train: TensorDict,
+    group_keys: Sequence[Tuple[int, int, int]],
+    s_orig: int,
+    t_orig: int,
+) -> None:
+    x_np = td_train["X"].detach().cpu().numpy()
+    y_np = td_train["Y"].detach().cpu().numpy()[:, :s_orig, :t_orig]
+
+    y_flat = y_np.reshape(y_np.shape[0], -1)
+    print("[analysis] global Y distribution")
+    print(
+        "  mean=%.4f std=%.4f min=%.4f q25=%.4f median=%.4f q75=%.4f max=%.4f"
+        % (
+            float(np.mean(y_flat)),
+            float(np.std(y_flat)),
+            float(np.min(y_flat)),
+            float(np.percentile(y_flat, 25)),
+            float(np.percentile(y_flat, 50)),
+            float(np.percentile(y_flat, 75)),
+            float(np.max(y_flat)),
+        )
+    )
+
+    x_names = ["month", "weekday_type", "direction"]
+    for i, name in enumerate(x_names):
+        values = sorted(set(int(v) for v in x_np[:, i]))
+        print(f"[analysis] Y distribution by X.{name}")
+        for v in values:
+            mask = x_np[:, i] == v
+            y_grp = y_flat[mask]
+            print(
+                "  X.%s=%d -> n=%d, mean=%.4f, std=%.4f, median=%.4f"
+                % (
+                    name,
+                    v,
+                    int(mask.sum()),
+                    float(np.mean(y_grp)),
+                    float(np.std(y_grp)),
+                    float(np.median(y_grp)),
+                )
+            )
+
+    pair_dists: list[tuple[tuple[int, int], float]] = []
+    for i in range(y_flat.shape[0]):
+        for j in range(i + 1, y_flat.shape[0]):
+            diff_x = np.sum(x_np[i] != x_np[j])
+            if diff_x == 1:
+                dist = float(np.mean(np.abs(y_flat[i] - y_flat[j])))
+                pair_dists.append(((i, j), dist))
+
+    if pair_dists:
+        pair_dists.sort(key=lambda x: x[1], reverse=True)
+        print("[analysis] top 5 pairs where X differs by exactly one feature (mean |ΔY|)")
+        for (i, j), dist in pair_dists[:5]:
+            print(
+                "  idx(%d,%d) X=%s vs %s -> mean|ΔY|=%.4f"
+                % (i, j, tuple(map(int, group_keys[i])), tuple(map(int, group_keys[j])), dist)
+            )
+
+
 def main() -> None:
     print("PYTHON_GIL env:", os.environ.get("PYTHON_GIL"))
     print("sys._is_gil_enabled available:", hasattr(sys, "_is_gil_enabled"))
@@ -285,6 +346,7 @@ def main() -> None:
     print(
         f"td_train batch_size={td_train.batch_size}, X shape={tuple(td_train['X'].shape)}, Y shape={tuple(td_train['Y'].shape)}"
     )
+    summarize_x_y_distribution(td_train, info["group_keys"], S_orig, T_orig)
     device = get_device()
     print("Device:", device)
     patch = PatchConfig(
@@ -320,17 +382,27 @@ def main() -> None:
     print(
         "[train] starting... (elastic_launch inside enn_torch.runtime.workflows.train)"
     )
-    trained_model, train_metrics = monitor_run(
-        lambda: train(
-            model,
-            td_train,
-            epochs=train_epochs,
-            base_lr=3e-3,
-            weight_decay=1e-4,
-            val_frac=0.1,
-            max_nodes=1,
+    try:
+        trained_model, train_metrics = monitor_run(
+            lambda: train(
+                model,
+                td_train,
+                epochs=train_epochs,
+                base_lr=3e-3,
+                weight_decay=1e-4,
+                val_frac=0.1,
+                max_nodes=1,
+            )
         )
-    )
+    except Exception as e:
+        print("[train] failed:", repr(e))
+        print(
+            "[train] dataset-level X/Y distribution was already reported above; "
+            "stopping before predict."
+        )
+        print("[done]")
+        return
+
     print("[train] done")
     print("train duration (s):", train_metrics["duration_s"])
     print("train CPU avg per core:", train_metrics["cpu_avg"])
