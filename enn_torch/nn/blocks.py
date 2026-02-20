@@ -246,222 +246,231 @@ def stochastic_depth_schedule(drop_path: float, depth: int) -> List[float]:
     ]
 
 
-class LatentTransformer(nn.Module):
-    def __init__(
-        self,
-        *args: Any,
-        d_model: int,
-        nhead: int,
-        mlp_ratio: float,
-        norm_type: str,
-        eps: float = 1e-6,
-        dropout: float,
-        drop_path: float,
-    ) -> None:
-        super().__init__()
-        del args
-        if d_model % nhead != 0:
-            raise ValueError(
-                f"d_model ({d_model}) must be divisible by nhead ({nhead})"
-            )
-        self.d_model = int(d_model)
-        self.nhead = int(nhead)
-        self.attn = LatentAttention(
-            d_model=self.d_model,
-            nhead=self.nhead,
-            norm_type=str(norm_type),
-            eps=float(eps),
-            dropout=float(dropout),
-        )
-        self.dropout = nn.Dropout(dropout)
-        self.drop_path = (
-            StochasticDepth(drop_path) if drop_path > 0.0 else nn.Identity()
-        )
-        self.norm2 = norm_layer(norm_type=norm_type, dim=self.d_model, eps=eps)
-        inner_dim = int(self.d_model * mlp_ratio)
-        self.ff = nn.Sequential(
-            GeGLU(self.d_model, inner_dim, out_dim=inner_dim, bias=True),
-            nn.Dropout(dropout),
-            nn.Linear(inner_dim, self.d_model, bias=True),
-        )
-        self.register_load_state_dict_pre_hook(self._map_legacy_state_dict_keys)
-        self.register_state_dict_post_hook(self._export_legacy_state_dict_keys)
-
-    @staticmethod
-    def _map_legacy_state_dict_keys(
-        module: nn.Module,
-        state_dict: Dict[str, torch.Tensor],
-        prefix: str,
-        *args: Any,
-    ) -> None:
-        del module, args
-        legacy_roots = ("norm1", "qkv", "out_proj")
-        for root in legacy_roots:
-            legacy_key = f"{prefix}{root}"
-            mapped_key = f"{prefix}attn.{root}"
-            legacy_direct = legacy_key
-            if legacy_direct in state_dict and mapped_key not in state_dict:
-                state_dict[mapped_key] = state_dict.pop(legacy_direct)
-            legacy_prefix = legacy_key + "."
-            for key in list(state_dict.keys()):
-                if key.startswith(legacy_prefix):
-                    suffix = key[len(legacy_prefix) :]
-                    new_key = f"{mapped_key}.{suffix}"
-                    if new_key not in state_dict:
-                        state_dict[new_key] = state_dict[key]
-                    del state_dict[key]
-
-    @staticmethod
-    def _export_legacy_state_dict_keys(
-        module: nn.Module,
-        state_dict: Dict[str, torch.Tensor],
-        prefix: str,
-        local_metadata: Dict[str, Any],
-    ) -> None:
-        del module, local_metadata
-        if not env_bool("ENN_STATE_DICT_LEGACY_KEYS", default=True):
-            return
-        legacy_roots = ("norm1", "qkv", "out_proj")
-        for root in legacy_roots:
-            new_prefix = f"{prefix}attn.{root}."
-            old_prefix = f"{prefix}{root}."
-            for key in list(state_dict.keys()):
-                if key.startswith(new_prefix):
-                    suffix = key[len(new_prefix) :]
-                    legacy_key = f"{old_prefix}{suffix}"
-                    if legacy_key not in state_dict:
-                        state_dict[legacy_key] = state_dict[key]
-                    del state_dict[key]
-
-    def forward(self: Self, x: torch.Tensor) -> torch.Tensor:
-        attn_proj = self.attn(x)
-        x = x + self.drop_path(self.dropout(attn_proj))
-        x = x + self.drop_path(self.ff(self.norm2(x)))
-        return x
-
-
-class Resampler(nn.Module):
-    def __init__(
-        self: Self,
-        d_model: int,
-        nhead: int,
-        *args: Any,
-        dropout: float = 0.0,
-        mlp_ratio: float = 4.0,
-        drop_path: float = 0.0,
-        norm_type: str = "layernorm",
-        bias: bool = True,
-        **kwargs: Any,
-    ) -> None:
-        super().__init__()
-        del args, kwargs
-        self.d_model = int(d_model)
-        self.nhead = int(nhead)
-        if self.d_model % max(1, self.nhead) != 0:
-            raise ValueError(
-                f"d_model {self.d_model} must be divisible by nhead {self.nhead}"
-            )
-        self.dropout_p = float(dropout)
-
-        self.cross_attn = CrossAttention(
-            d_model=self.d_model,
-            nhead=self.nhead,
-            dropout=float(dropout),
-            norm_type=str(norm_type),
-            bias=bool(bias),
-        )
-
-        self.dropout = nn.Dropout(self.dropout_p)
-        self.drop_path = StochasticDepth(p=float(drop_path), mode="row")
-
-        def _norm() -> nn.Module:
-            nt = str(norm_type or "layernorm").strip().lower()
-            if nt in {"rms", "rmsnorm"} and hasattr(nn, "RMSNorm"):
-                return nn.RMSNorm(self.d_model)
-            return nn.LayerNorm(self.d_model)
-
-        self.norm_ffn = _norm()
-        hid = int(self.d_model * float(mlp_ratio) * (2.0 / 3.0))
-        self.ffn = GeGLU(
-            self.d_model, hid, out_dim=self.d_model, dropout=dropout
-        )
-        self.register_load_state_dict_pre_hook(self._map_legacy_state_dict_keys)
-        self.register_state_dict_post_hook(self._export_legacy_state_dict_keys)
-
-    @staticmethod
-    def _map_legacy_state_dict_keys(
-        module: nn.Module,
-        state_dict: Dict[str, torch.Tensor],
-        prefix: str,
-        *args: Any,
-    ) -> None:
-        del module, args
-        legacy_roots = (
-            "q_proj",
-            "k_proj",
-            "v_proj",
-            "out_proj",
-            "norm_q",
-            "norm_kv",
-        )
-        for root in legacy_roots:
-            legacy_key = f"{prefix}{root}"
-            mapped_key = f"{prefix}cross_attn.{root}"
-            legacy_direct = legacy_key
-            if legacy_direct in state_dict and mapped_key not in state_dict:
-                state_dict[mapped_key] = state_dict.pop(legacy_direct)
-            legacy_prefix = legacy_key + "."
-            for key in list(state_dict.keys()):
-                if key.startswith(legacy_prefix):
-                    suffix = key[len(legacy_prefix) :]
-                    new_key = f"{mapped_key}.{suffix}"
-                    if new_key not in state_dict:
-                        state_dict[new_key] = state_dict[key]
-                    del state_dict[key]
-
-    @staticmethod
-    def _export_legacy_state_dict_keys(
-        module: nn.Module,
-        state_dict: Dict[str, torch.Tensor],
-        prefix: str,
-        local_metadata: Dict[str, Any],
-    ) -> None:
-        del module, local_metadata
-        if not env_bool("ENN_STATE_DICT_LEGACY_KEYS", default=True):
-            return
-        legacy_roots = (
-            "q_proj",
-            "k_proj",
-            "v_proj",
-            "out_proj",
-            "norm_q",
-            "norm_kv",
-        )
-        for root in legacy_roots:
-            new_prefix = f"{prefix}cross_attn.{root}."
-            old_prefix = f"{prefix}{root}."
-            for key in list(state_dict.keys()):
-                if key.startswith(new_prefix):
-                    suffix = key[len(new_prefix) :]
-                    legacy_key = f"{old_prefix}{suffix}"
-                    if legacy_key not in state_dict:
-                        state_dict[legacy_key] = state_dict[key]
-                    del state_dict[key]
-
-    def forward(
-        self: Self,
-        latents: torch.Tensor,
-        tokens: torch.Tensor,
-        attn_bias: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        attn_proj = self.cross_attn(latents, tokens, attn_bias=attn_bias)
-        latents = latents + self.drop_path(self.dropout(attn_proj))
-        latents = latents + self.drop_path(
-            self.dropout(self.ffn(self.norm_ffn(latents)))
-        )
-        return latents
-
 class Perceiver(nn.Module):
+    class _LatentTransformer(nn.Module):
+        def __init__(
+            self,
+            *args: Any,
+            d_model: int,
+            nhead: int,
+            mlp_ratio: float,
+            norm_type: str,
+            eps: float = 1e-6,
+            dropout: float,
+            drop_path: float,
+        ) -> None:
+            super().__init__()
+            del args
+            if d_model % nhead != 0:
+                raise ValueError(
+                    f"d_model ({d_model}) must be divisible by nhead ({nhead})"
+                )
+            self.d_model = int(d_model)
+            self.nhead = int(nhead)
+            self.attn = LatentAttention(
+                d_model=self.d_model,
+                nhead=self.nhead,
+                norm_type=str(norm_type),
+                eps=float(eps),
+                dropout=float(dropout),
+            )
+            self.dropout = nn.Dropout(dropout)
+            self.drop_path = (
+                StochasticDepth(drop_path) if drop_path > 0.0 else nn.Identity()
+            )
+            self.norm2 = norm_layer(
+                norm_type=norm_type, dim=self.d_model, eps=eps
+            )
+            inner_dim = int(self.d_model * mlp_ratio)
+            self.ff = nn.Sequential(
+                GeGLU(self.d_model, inner_dim, out_dim=inner_dim, bias=True),
+                nn.Dropout(dropout),
+                nn.Linear(inner_dim, self.d_model, bias=True),
+            )
+            self.register_load_state_dict_pre_hook(
+                self._map_legacy_state_dict_keys
+            )
+            self.register_state_dict_post_hook(
+                self._export_legacy_state_dict_keys
+            )
+
+        @staticmethod
+        def _map_legacy_state_dict_keys(
+            module: nn.Module,
+            state_dict: Dict[str, torch.Tensor],
+            prefix: str,
+            *args: Any,
+        ) -> None:
+            del module, args
+            legacy_roots = ("norm1", "qkv", "out_proj")
+            for root in legacy_roots:
+                legacy_key = f"{prefix}{root}"
+                mapped_key = f"{prefix}attn.{root}"
+                legacy_direct = legacy_key
+                if legacy_direct in state_dict and mapped_key not in state_dict:
+                    state_dict[mapped_key] = state_dict.pop(legacy_direct)
+                legacy_prefix = legacy_key + "."
+                for key in list(state_dict.keys()):
+                    if key.startswith(legacy_prefix):
+                        suffix = key[len(legacy_prefix) :]
+                        new_key = f"{mapped_key}.{suffix}"
+                        if new_key not in state_dict:
+                            state_dict[new_key] = state_dict[key]
+                        del state_dict[key]
+
+        @staticmethod
+        def _export_legacy_state_dict_keys(
+            module: nn.Module,
+            state_dict: Dict[str, torch.Tensor],
+            prefix: str,
+            local_metadata: Dict[str, Any],
+        ) -> None:
+            del module, local_metadata
+            if not env_bool("ENN_STATE_DICT_LEGACY_KEYS", default=True):
+                return
+            legacy_roots = ("norm1", "qkv", "out_proj")
+            for root in legacy_roots:
+                new_prefix = f"{prefix}attn.{root}."
+                old_prefix = f"{prefix}{root}."
+                for key in list(state_dict.keys()):
+                    if key.startswith(new_prefix):
+                        suffix = key[len(new_prefix) :]
+                        legacy_key = f"{old_prefix}{suffix}"
+                        if legacy_key not in state_dict:
+                            state_dict[legacy_key] = state_dict[key]
+                        del state_dict[key]
+
+        def forward(self: Self, x: torch.Tensor) -> torch.Tensor:
+            attn_proj = self.attn(x)
+            x = x + self.drop_path(self.dropout(attn_proj))
+            x = x + self.drop_path(self.ff(self.norm2(x)))
+            return x
+
+    class _CrossTransformer(nn.Module):
+        def __init__(
+            self: Self,
+            d_model: int,
+            nhead: int,
+            *args: Any,
+            dropout: float = 0.0,
+            mlp_ratio: float = 4.0,
+            drop_path: float = 0.0,
+            norm_type: str = "layernorm",
+            bias: bool = True,
+            **kwargs: Any,
+        ) -> None:
+            super().__init__()
+            del args, kwargs
+            self.d_model = int(d_model)
+            self.nhead = int(nhead)
+            if self.d_model % max(1, self.nhead) != 0:
+                raise ValueError(
+                    f"d_model {self.d_model} must be divisible by nhead {self.nhead}"
+                )
+            self.dropout_p = float(dropout)
+
+            self.cross_attn = CrossAttention(
+                d_model=self.d_model,
+                nhead=self.nhead,
+                dropout=float(dropout),
+                norm_type=str(norm_type),
+                bias=bool(bias),
+            )
+
+            self.dropout = nn.Dropout(self.dropout_p)
+            self.drop_path = StochasticDepth(p=float(drop_path), mode="row")
+
+            def _norm() -> nn.Module:
+                nt = str(norm_type or "layernorm").strip().lower()
+                if nt in {"rms", "rmsnorm"} and hasattr(nn, "RMSNorm"):
+                    return nn.RMSNorm(self.d_model)
+                return nn.LayerNorm(self.d_model)
+
+            self.norm_ffn = _norm()
+            hid = int(self.d_model * float(mlp_ratio) * (2.0 / 3.0))
+            self.ffn = GeGLU(
+                self.d_model, hid, out_dim=self.d_model, dropout=dropout
+            )
+            self.register_load_state_dict_pre_hook(
+                self._map_legacy_state_dict_keys
+            )
+            self.register_state_dict_post_hook(
+                self._export_legacy_state_dict_keys
+            )
+
+        @staticmethod
+        def _map_legacy_state_dict_keys(
+            module: nn.Module,
+            state_dict: Dict[str, torch.Tensor],
+            prefix: str,
+            *args: Any,
+        ) -> None:
+            del module, args
+            legacy_roots = (
+                "q_proj",
+                "k_proj",
+                "v_proj",
+                "out_proj",
+                "norm_q",
+                "norm_kv",
+            )
+            for root in legacy_roots:
+                legacy_key = f"{prefix}{root}"
+                mapped_key = f"{prefix}cross_attn.{root}"
+                legacy_direct = legacy_key
+                if legacy_direct in state_dict and mapped_key not in state_dict:
+                    state_dict[mapped_key] = state_dict.pop(legacy_direct)
+                legacy_prefix = legacy_key + "."
+                for key in list(state_dict.keys()):
+                    if key.startswith(legacy_prefix):
+                        suffix = key[len(legacy_prefix) :]
+                        new_key = f"{mapped_key}.{suffix}"
+                        if new_key not in state_dict:
+                            state_dict[new_key] = state_dict[key]
+                        del state_dict[key]
+
+        @staticmethod
+        def _export_legacy_state_dict_keys(
+            module: nn.Module,
+            state_dict: Dict[str, torch.Tensor],
+            prefix: str,
+            local_metadata: Dict[str, Any],
+        ) -> None:
+            del module, local_metadata
+            if not env_bool("ENN_STATE_DICT_LEGACY_KEYS", default=True):
+                return
+            legacy_roots = (
+                "q_proj",
+                "k_proj",
+                "v_proj",
+                "out_proj",
+                "norm_q",
+                "norm_kv",
+            )
+            for root in legacy_roots:
+                new_prefix = f"{prefix}cross_attn.{root}."
+                old_prefix = f"{prefix}{root}."
+                for key in list(state_dict.keys()):
+                    if key.startswith(new_prefix):
+                        suffix = key[len(new_prefix) :]
+                        legacy_key = f"{old_prefix}{suffix}"
+                        if legacy_key not in state_dict:
+                            state_dict[legacy_key] = state_dict[key]
+                        del state_dict[key]
+
+        def forward(
+            self: Self,
+            latents: torch.Tensor,
+            tokens: torch.Tensor,
+            attn_bias: Optional[torch.Tensor] = None,
+        ) -> torch.Tensor:
+            attn_proj = self.cross_attn(latents, tokens, attn_bias=attn_bias)
+            latents = latents + self.drop_path(self.dropout(attn_proj))
+            latents = latents + self.drop_path(
+                self.dropout(self.ffn(self.norm_ffn(latents)))
+            )
+            return latents
+
     def __init__(
         self: Self,
         d_model: int,
@@ -492,7 +501,7 @@ class Perceiver(nn.Module):
         dp_it = iter(drops)
         self.cross = nn.ModuleList(
             [
-                Resampler(
+                self._CrossTransformer(
                     d_model=self.d_model,
                     nhead=self.nhead,
                     dropout=float(dropout),
@@ -505,7 +514,7 @@ class Perceiver(nn.Module):
         )
         self.self_blocks = nn.ModuleList(
             [
-                LatentTransformer(
+                self._LatentTransformer(
                     d_model=self.d_model,
                     nhead=self.nhead,
                     mlp_ratio=float(mlp_ratio),
@@ -538,9 +547,12 @@ class Perceiver(nn.Module):
                 j += 1
         out = self.norm(latents)
 
-        if (not torch.is_grad_enabled()) and (getattr(out.device, "type", None) == "cuda"):
+        if (not torch.is_grad_enabled()) and (
+            getattr(out.device, "type", None) == "cuda"
+        ):
             if env_bool("ENN_PRED_COLLAPSE_STAGE_DIAG", default=False):
                 with contextlib.suppress(Exception):
+
                     def _pair_nonfinite(t: torch.Tensor) -> int:
                         if not t.is_floating_point():
                             return 0
@@ -550,8 +562,11 @@ class Perceiver(nn.Module):
                         "pre_norm_nonfinite": _pair_nonfinite(latents),
                         "post_norm_absmax": float(out[:2].abs().max().item()),
                         "post_norm_nonfinite": _pair_nonfinite(out),
-                        "norm_w_absmax": float(self.norm.weight.detach().abs().max().item())
-                        if hasattr(self.norm, "weight") else None,
+                        "norm_w_absmax": float(
+                            self.norm.weight.detach().abs().max().item()
+                        )
+                        if hasattr(self.norm, "weight")
+                        else None,
                     }
 
         return out
