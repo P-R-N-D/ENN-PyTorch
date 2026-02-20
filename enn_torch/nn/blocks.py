@@ -4,6 +4,7 @@ from __future__ import annotations
 import contextlib
 import logging
 import os
+import warnings
 from importlib import import_module
 from typing import Any, Callable, Dict, List, Optional, Self, Sequence, Tuple
 
@@ -40,6 +41,24 @@ _PRESET_ALIASES: dict[str, str] = {
 _ENN_HAS_FLEX_ATTENTION = getattr(
     import_module(".layers", __package__), "_HAS_FLEX_ATTENTION", False
 )
+
+_ENN_PERCEIVER_LEGACY_REMAP_WARNED = False
+_ENN_PERCEIVER_PARTIAL_LOAD_WARNED = False
+
+
+def _warn_perceiver_legacy_remap(prefix: str) -> None:
+    global _ENN_PERCEIVER_LEGACY_REMAP_WARNED
+    if _ENN_PERCEIVER_LEGACY_REMAP_WARNED:
+        return
+    p = prefix[:-1] if prefix.endswith(".") else prefix
+    where = p if p else "<root>"
+    warnings.warn(
+        f"[ENN] Perceiver loaded legacy state_dict keys under '{where}' and remapped them "
+        "to the new namespaces (attn.* / cross_attn.*). Consider re-saving the checkpoint.",
+        stacklevel=3,
+    )
+    _ENN_PERCEIVER_LEGACY_REMAP_WARNED = True
+
 
 
 def _safe_norm(norm: nn.Module, x: torch.Tensor) -> torch.Tensor:
@@ -298,13 +317,18 @@ class Perceiver(nn.Module):
             prefix: str,
             *args: Any,
         ) -> None:
-            del module, args
+            del args
+            did_remap = False
             legacy_roots = ("norm1", "qkv", "out_proj")
             for root in legacy_roots:
                 legacy_key = f"{prefix}{root}"
                 mapped_key = f"{prefix}attn.{root}"
-                if legacy_key in state_dict and mapped_key not in state_dict:
-                    state_dict[mapped_key] = state_dict.pop(legacy_key)
+                if legacy_key in state_dict:
+                    if mapped_key not in state_dict:
+                        state_dict[mapped_key] = state_dict.pop(legacy_key)
+                    else:
+                        del state_dict[legacy_key]
+                    did_remap = True
                 legacy_prefix = legacy_key + "."
                 for key in list(state_dict.keys()):
                     if key.startswith(legacy_prefix):
@@ -313,6 +337,10 @@ class Perceiver(nn.Module):
                         if new_key not in state_dict:
                             state_dict[new_key] = state_dict[key]
                         del state_dict[key]
+                        did_remap = True
+            if did_remap:
+                setattr(module, "_enn_legacy_state_dict_remap", True)
+                _warn_perceiver_legacy_remap(prefix)
 
         def forward(self: Self, x: torch.Tensor) -> torch.Tensor:
             attn_proj = self.attn(x)
@@ -376,7 +404,8 @@ class Perceiver(nn.Module):
             prefix: str,
             *args: Any,
         ) -> None:
-            del module, args
+            del args
+            did_remap = False
             legacy_roots = (
                 "q_proj",
                 "k_proj",
@@ -388,8 +417,12 @@ class Perceiver(nn.Module):
             for root in legacy_roots:
                 legacy_key = f"{prefix}{root}"
                 mapped_key = f"{prefix}cross_attn.{root}"
-                if legacy_key in state_dict and mapped_key not in state_dict:
-                    state_dict[mapped_key] = state_dict.pop(legacy_key)
+                if legacy_key in state_dict:
+                    if mapped_key not in state_dict:
+                        state_dict[mapped_key] = state_dict.pop(legacy_key)
+                    else:
+                        del state_dict[legacy_key]
+                    did_remap = True
                 legacy_prefix = legacy_key + "."
                 for key in list(state_dict.keys()):
                     if key.startswith(legacy_prefix):
@@ -398,6 +431,10 @@ class Perceiver(nn.Module):
                         if new_key not in state_dict:
                             state_dict[new_key] = state_dict[key]
                         del state_dict[key]
+                        did_remap = True
+            if did_remap:
+                setattr(module, "_enn_legacy_state_dict_remap", True)
+                _warn_perceiver_legacy_remap(prefix)
 
         def forward(
             self: Self,
@@ -411,6 +448,62 @@ class Perceiver(nn.Module):
                 self.dropout(self.ffn(self.norm_ffn(latents)))
             )
             return latents
+
+    @staticmethod
+    def _capture_load_state_dict_context(
+        module: nn.Module,
+        state_dict: Dict[str, torch.Tensor],
+        prefix: str,
+        *args: Any,
+    ) -> None:
+        del state_dict
+        setattr(module, "_enn_load_prefix", prefix)
+        strict: Optional[bool] = None
+        if len(args) >= 2 and isinstance(args[1], bool):
+            strict = args[1]
+        elif len(args) >= 1 and isinstance(args[0], bool):
+            strict = args[0]
+        if strict is not None:
+            setattr(module, "_enn_load_strict", strict)
+
+    @staticmethod
+    def _warn_on_partial_load(
+        module: nn.Module,
+        incompatible_keys: Any,
+    ) -> None:
+        if getattr(module, "_enn_load_strict", True):
+            return
+        prefix = getattr(module, "_enn_load_prefix", "")
+        missing_all = getattr(incompatible_keys, "missing_keys", []) or []
+        unexpected_all = getattr(incompatible_keys, "unexpected_keys", []) or []
+        if prefix:
+            missing = [k for k in missing_all if k.startswith(prefix)]
+            unexpected = [k for k in unexpected_all if k.startswith(prefix)]
+        else:
+            missing = list(missing_all)
+            unexpected = list(unexpected_all)
+        if not missing and not unexpected:
+            return
+
+        def _short(k: str) -> str:
+            return k[len(prefix) :] if prefix and k.startswith(prefix) else k
+
+        show_missing = [_short(k) for k in missing[:8]]
+        show_unexpected = [_short(k) for k in unexpected[:8]]
+        p = prefix[:-1] if prefix.endswith(".") else prefix
+        where = p if p else "<root>"
+        msg = (
+            f"[ENN] Perceiver loaded with strict=False and has {len(missing)} missing / "
+            f"{len(unexpected)} unexpected keys under '{where}'. This can leave Perceiver "
+            "weights randomly initialized (degraded results likely). "
+            f"Example missing: {show_missing} | Example unexpected: {show_unexpected}"
+        )
+        if env_bool("ENN_FAIL_ON_PARTIAL_LOAD", default=False):
+            raise RuntimeError(msg)
+        global _ENN_PERCEIVER_PARTIAL_LOAD_WARNED
+        if not _ENN_PERCEIVER_PARTIAL_LOAD_WARNED:
+            warnings.warn(msg, stacklevel=2)
+            _ENN_PERCEIVER_PARTIAL_LOAD_WARNED = True
 
     def __init__(
         self: Self,
@@ -467,6 +560,8 @@ class Perceiver(nn.Module):
             ]
         )
         self.norm = norm_layer(str(norm_type), self.d_model)
+        self.register_load_state_dict_pre_hook(self._capture_load_state_dict_context)
+        self.register_load_state_dict_post_hook(self._warn_on_partial_load)
 
     def forward(
         self: Self,
