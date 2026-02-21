@@ -1063,7 +1063,7 @@ class SubFuser(nn.Module):
             target = my_name
         else:
             target = str(node_spec)
-        fn = getattr(owner, "_children", None)
+        fn = getattr(owner, "children", None)
         if callable(fn):
             return list(fn(target))
         return []
@@ -1072,9 +1072,10 @@ class SubFuser(nn.Module):
         owner, my_name = self._owner_and_name()
         topo: list[str] = []
         seen: set[str] = set()
+        owner_children = getattr(owner, "children", None)
 
         def _post(n: str) -> None:
-            for c in list(getattr(owner, "_children", lambda _x: [])(n) or []):
+            for c in list(owner_children(n) if callable(owner_children) else []):
                 cs = str(c)
                 if cs in seen:
                     continue
@@ -1361,6 +1362,46 @@ class Fuser(nn.Module):
         self._user_submodels = {}
         self._topology_lock = Mutex(reentrant=True)
         self._exec_plan = None
+        self._topology_version = int(getattr(self, "_topology_version", 0) or 0)
+        if not isinstance(getattr(self, "_root_children", None), list):
+            self._root_children = []
+        if not isinstance(getattr(self, "_parent", None), dict):
+            self._parent = {}
+        with contextlib.suppress(Exception):
+            self._root_reduction = SubFuser._coerce_reduction(
+                str(getattr(self, "_root_reduction", "mean") or "mean")
+            )
+        if not isinstance(getattr(self, "_root_reduction", None), str):
+            self._root_reduction = "mean"
+
+        task_names = [str(n) for n in getattr(self, "tasks", {}).keys()]
+        if task_names:
+            sanitized_roots: list[str] = []
+            seen_roots: set[str] = set()
+            for name in self._root_children:
+                nm = str(name)
+                if nm in self.tasks and nm not in seen_roots:
+                    sanitized_roots.append(nm)
+                    seen_roots.add(nm)
+            self._root_children = sanitized_roots
+
+            normalized_parent: dict[str, Optional[str]] = {}
+            for nm in task_names:
+                raw_parent = self._parent.get(nm)
+                if raw_parent is None or (not str(raw_parent).strip()):
+                    normalized_parent[nm] = None
+                    continue
+                pk = str(raw_parent).strip()
+                if pk == nm or pk not in self.tasks:
+                    normalized_parent[nm] = None
+                else:
+                    normalized_parent[nm] = pk
+            self._parent = normalized_parent
+
+            for nm in task_names:
+                if self._parent.get(nm) is None and nm not in self._root_children:
+                    self._root_children.append(nm)
+
         with contextlib.suppress(Exception):
             for n, m in getattr(self, 'tasks', {}).items():
                 if isinstance(m, SubFuser):
@@ -1702,7 +1743,7 @@ class Fuser(nn.Module):
             with self._topology_guard():
                 return list(self._root_children)
         key = self.resolve_task_name(str(node_spec))
-        mod = self.tasks.get(key)
+        mod = self.tasks[key] if key in self.tasks else None
         if isinstance(mod, SubFuser):
             return list(getattr(mod, "_children", []) or [])
         return []
