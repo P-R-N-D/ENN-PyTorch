@@ -3056,7 +3056,7 @@ class Fuser(nn.Module):
             and env_bool("ENN_PRED_DISABLE_CUDAGRAPHS", default=True)
         )
         compile_cg_enabled = bool(getattr(self, "_compile_cudagraphs", False))
-        if not compile_cg_enabled:
+        if (not compile_cg_enabled) and (not is_export_or_trace()):
             with contextlib.suppress(Exception):
                 compile_cg_enabled = bool(
                     getattr(get_runtime_cfg(), "compile_cudagraphs", False)
@@ -3174,7 +3174,7 @@ class Fuser(nn.Module):
                             if context.is_floating_point() else 0,
                         }
 
-        if env_bool("ENN_FUSER_NONFINITE_FALLBACK", default=True):
+        if (not is_export_or_trace()) and env_bool("ENN_FUSER_NONFINITE_FALLBACK", default=True):
             allow_train = env_bool("ENN_FUSER_NONFINITE_FALLBACK_TRAINING", default=False)
             if (not torch.is_grad_enabled()) or allow_train:
                 has_nonfinite = False
@@ -4833,7 +4833,7 @@ class Model(nn.Module):
             and env_bool("ENN_PRED_DISABLE_CUDAGRAPHS", default=True)
         )
         compile_cg_enabled = bool(getattr(self, "_compile_cudagraphs", False))
-        if not compile_cg_enabled:
+        if (not compile_cg_enabled) and (not is_export_or_trace()):
             with contextlib.suppress(Exception):
                 compile_cg_enabled = bool(
                     getattr(get_runtime_cfg(), "compile_cudagraphs", False)

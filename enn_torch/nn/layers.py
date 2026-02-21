@@ -82,19 +82,17 @@ def _get_dilated_mask(
 ) -> torch.Tensor:
     if dilation < 1:
         raise ValueError(f"dilation must be >= 1, got {dilation}")
-    tracing = False
-    try:
-        tracing = bool(is_symbolic())
-    except Exception:
-        tracing = False
+    tracing = bool(is_symbolic())
     if not tracing:
-        try:
-            tracing = bool(torch.jit.is_tracing() or torch.jit.is_scripting())
-        except Exception:
-            tracing = False
-    is_symint = False
-    with contextlib.suppress(Exception):
-        is_symint = isinstance(seq_len, torch.SymInt)
+        jit = getattr(torch, "jit", None)
+        is_tracing_fn = getattr(jit, "is_tracing", None) if jit is not None else None
+        is_scripting_fn = getattr(jit, "is_scripting", None) if jit is not None else None
+        tracing = bool(
+            (is_tracing_fn() if callable(is_tracing_fn) else False)
+            or (is_scripting_fn() if callable(is_scripting_fn) else False)
+        )
+    SymInt = getattr(torch, "SymInt", None)
+    is_symint = bool(SymInt is not None and isinstance(seq_len, SymInt))
     L = seq_len if (tracing or is_symint) else int(seq_len)
     device = torch.device("cpu") if device is None else torch.device(device)
     i = torch.arange(L, device=device).unsqueeze(1).expand(L, L)

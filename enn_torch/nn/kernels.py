@@ -1434,11 +1434,7 @@ def reshape_for_mha(
         raise ValueError(
             f"reshape_for_mha expects a 3D tensor (B,N,E), got shape={tuple(x.shape)}"
         )
-    return (
-        x.reshape(int(batch), -1, int(heads), int(head_dim))
-        .transpose(1, 2)
-        .contiguous()
-    )
+    return x.reshape(batch, -1, heads, head_dim).transpose(1, 2).contiguous()
 
 
 class _MultiHeadAttentionNvidia(nn.Module):
