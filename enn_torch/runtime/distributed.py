@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
+import tempfile
 import contextlib
 import sys
 import ctypes
@@ -723,6 +724,23 @@ _LANE_GROUPS_LOCK = threading.Lock()
 _ACCEL_BACKEND: str | None = None
 
 
+def _reset_lane_process_groups() -> None:
+    global _CPU_GROUP, _ACCEL_GROUP, _LANE_GROUPS_INITED, _ACCEL_BACKEND
+    with _LANE_GROUPS_LOCK:
+        cpu_pg = _CPU_GROUP
+        accel_pg = _ACCEL_GROUP
+        _CPU_GROUP = None
+        _ACCEL_GROUP = None
+        _ACCEL_BACKEND = None
+        _LANE_GROUPS_INITED = False
+    with contextlib.suppress(Exception):
+        if dist.is_available() and dist.is_initialized():
+            if accel_pg is not None:
+                dist.destroy_process_group(accel_pg)
+            if cpu_pg is not None:
+                dist.destroy_process_group(cpu_pg)
+
+
 def init_lane_process_groups(
     device: torch.device | None = None,
 ) -> tuple[ProcessGroup | None, ProcessGroup | None]:
@@ -737,8 +755,6 @@ def init_lane_process_groups(
         if _LANE_GROUPS_INITED:
             return (_CPU_GROUP, _ACCEL_GROUP)
 
-        _CPU_GROUP = None
-
         dev = device
         if dev is None:
             with contextlib.suppress(Exception):
@@ -746,9 +762,26 @@ def init_lane_process_groups(
         if dev is None:
             dev = torch.device("cpu")
 
+        world = 1
+        with contextlib.suppress(Exception):
+            world = int(dist.get_world_size())
+
+        _CPU_GROUP = None
+        if world > 1 and not env_bool(
+            ("ENN_DISABLE_LANE_CPU_GROUP", "ENN_DISABLE_CPU_LANE_GROUP"),
+            default=False,
+        ):
+            try:
+                _CPU_GROUP = dist.new_group(backend="gloo")
+            except Exception:
+                _CPU_GROUP = None
+
         be = _accel_backend_for_device(dev)
         _ACCEL_BACKEND = be
-        if be is not None and be != "gloo":
+        if world > 1 and be is not None and be != "gloo" and not env_bool(
+            ("ENN_DISABLE_LANE_ACCEL_GROUP", "ENN_DISABLE_ACCEL_LANE_GROUP"),
+            default=False,
+        ):
             try:
                 _ACCEL_GROUP = dist.new_group(backend=str(be))
             except Exception:
@@ -1540,6 +1573,83 @@ def is_distributed() -> bool:
         return False
 
 
+
+
+@contextlib.contextmanager
+def ensure_dcp_process_group(
+    device: torch.device | None = None,
+    *,
+    backend: str | None = None,
+):
+    if is_distributed():
+        with contextlib.suppress(Exception):
+            init_lane_process_groups(device)
+        yield dist.group.WORLD
+        return
+
+    if not dist.is_available():
+        yield None
+        return
+
+    dev = device
+    if dev is None:
+        with contextlib.suppress(Exception):
+            dev = get_device()
+    dev = torch.device(dev) if dev is not None else torch.device("cpu")
+
+    be = (backend or "").strip().lower() if backend is not None else ""
+    if not be:
+        if dev.type == "cuda" and getattr(torch, "cuda", None) is not None and torch.cuda.is_available():
+            be = "cpu:gloo,cuda:nccl"
+        elif dev.type == "xpu" and getattr(torch, "xpu", None) is not None and callable(getattr(torch.xpu, "is_available", None)) and torch.xpu.is_available():
+            be = "cpu:gloo,xpu:xccl"
+        else:
+            be = "gloo"
+
+    fd, tmp_path = tempfile.mkstemp(prefix="enn_dcp_pg_", suffix=".tmp")
+    os.close(fd)
+    init_method = f"file://{tmp_path}"
+
+    dev_id = None
+    be_l = str(be).lower()
+    if dev.type in {"cuda", "xpu"} and any(x in be_l for x in ("nccl", "xccl", "hccl", "rccl")):
+        idx = dev.index
+        if idx is None:
+            with contextlib.suppress(Exception):
+                if dev.type == "cuda" and torch.cuda.is_available():
+                    idx = int(torch.cuda.current_device())
+                elif dev.type == "xpu" and hasattr(torch, "xpu"):
+                    idx = int(torch.xpu.current_device())
+        with contextlib.suppress(Exception):
+            dev_id = torch.device(dev.type, int(idx or 0))
+        if dev_id is None:
+            dev_id = int(idx or 0)
+
+    kwargs: dict[str, object] = {
+        "backend": be,
+        "init_method": init_method,
+        "rank": 0,
+        "world_size": 1,
+    }
+    if dev_id is not None:
+        kwargs["device_id"] = dev_id
+
+    try:
+        try:
+            dist.init_process_group(**kwargs)
+        except TypeError:
+            kwargs.pop("device_id", None)
+            dist.init_process_group(**kwargs)
+        with contextlib.suppress(Exception):
+            init_lane_process_groups(dev)
+        yield dist.group.WORLD
+    finally:
+        with contextlib.suppress(Exception):
+            dist.destroy_process_group()
+        with contextlib.suppress(Exception):
+            os.remove(tmp_path)
+
+
 def get_rank(default: int | None = None) -> int | None:
     if not is_distributed():
         return default
@@ -2090,6 +2200,10 @@ class ProcessBroker:
                     dist.destroy_process_group()
         except Exception:
             pass
+        with contextlib.suppress(Exception):
+            _reset_lane_process_groups()
+        with contextlib.suppress(Exception):
+            _GLOOX_GLOO_PG_CACHE.clear()
 
     @classmethod
     def set_seed(cls, seed_value: int | None) -> None:
@@ -2584,6 +2698,7 @@ class ProcessBroker:
             with contextlib.suppress(Exception):
                 bar.update(inc)
 
+
 @dataclasses.dataclass
 class _PendingOp:
     kind: str
@@ -2925,6 +3040,8 @@ class Checkpointer:
                     save_optimizer=save_optimizer,
                     extra_state=extra_state,
                     block_if_busy=block_if_busy,
+                    process_group=pg,
+                    use_collectives=True,
                     **kwargs,
                 )
                 else 0
@@ -3173,26 +3290,62 @@ class Checkpointer:
                 overwrite=True,
             )
 
+        if use_collectives is None:
+            use_collectives = bool(int(getattr(self, "_world", 1) or 1) > 1)
+
+        dev = getattr(self, "_device", None)
+        if dev is None:
+            with contextlib.suppress(Exception):
+                dev = get_device()
+        dev = torch.device(dev) if dev is not None else torch.device("cpu")
+
+        pg_arg: object | None = process_group if (process_group is not None and is_process_group(process_group)) else None
+        if pg_arg is None and bool(use_collectives):
+            lane_env = (
+                os.environ.get("ENN_DCP_DEFAULT_LANE")
+                or os.environ.get("ENN_CKPT_DEFAULT_LANE")
+                or os.environ.get("ENN_DCP_LANE")
+                or os.environ.get("ENN_CKPT_LANE")
+                or "control"
+            )
+            lane_s = str(lane_env).strip().lower()
+            with contextlib.suppress(Exception):
+                init_lane_process_groups(dev)
+
+            accel_lanes = {"accelerator", "accel", "cuda", "nccl", "xpu", "xccl", "hpu", "hccl", "npu"}
+            control_lanes = {"control", "cpu", "gloo"}
+            auto_lanes = {"auto", ""}
+
+            if lane_s in accel_lanes:
+                pg_arg = get_accel_process_group(dev)
+            elif lane_s in auto_lanes:
+                if getattr(dev, "type", "cpu") != "cpu":
+                    pg_arg = get_accel_process_group(dev)
+                if pg_arg is None:
+                    pg_arg = get_control_process_group(None)
+            elif lane_s in control_lanes:
+                pg_arg = get_control_process_group(None)
+            else:
+                pg_arg = get_control_process_group(None)
+
+            if pg_arg is None:
+                with contextlib.suppress(Exception):
+                    pg_arg = dist.group.WORLD
+
         if not self.use_async:
-            try:
-                if storage_writer is not None:
-                    try:
-                        dcp.save(
-                            state,
-                            checkpoint_id=str(epoch_dir),
-                            storage_writer=storage_writer,
-                            planner=planner,
-                        )
-                    except TypeError:
-                        dcp.save(
-                            state,
-                            checkpoint_id=str(epoch_dir),
-                            storage_writer=storage_writer,
-                        )
-                else:
-                    dcp.save(state, checkpoint_id=str(epoch_dir))
-            except TypeError:
-                dcp.save(state, checkpoint_id=str(epoch_dir))
+            fn_save = getattr(dcp, "save", None)
+            if not callable(fn_save):
+                raise RuntimeError("torch.distributed.checkpoint.save is not available")
+            save_kw: dict[str, Any] = {
+                "checkpoint_id": str(epoch_dir),
+                "storage_writer": storage_writer,
+                "planner": planner,
+                "process_group": pg_arg,
+                "use_collectives": bool(use_collectives),
+            }
+            save_kw = {k: v for k, v in save_kw.items() if v is not None or k in {"use_collectives"}}
+            save_kw = self._filter_kwargs(fn_save, save_kw)
+            fn_save(state, **save_kw)
             if self._rank == 0:
                 with contextlib.suppress(Exception):
                     self._done_file(epoch_dir).write_text("ok\\n", encoding="utf-8")
@@ -3200,15 +3353,13 @@ class Checkpointer:
             return True
 
         async_type = self._resolve_async_checkpointer_type()
-        if use_collectives is None:
-            use_collectives = bool(self._is_distributed())
         call_kw: dict[str, Any] = {
             "checkpoint_id": str(epoch_dir),
             "storage_writer": storage_writer,
             "planner": planner,
             "async_stager": stager,
             "async_checkpointer_type": async_type,
-            "process_group": process_group,
+            "process_group": pg_arg,
             "use_collectives": bool(use_collectives),
         }
         call_kw = {k: v for k, v in call_kw.items() if v is not None or k in {"use_collectives"}}

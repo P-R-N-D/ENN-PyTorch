@@ -68,6 +68,7 @@ from ..nn.wrappers import Model
 from .distributed import (
     ProcessBroker,
     _coerce_dcp_keys,
+    ensure_dcp_process_group,
     get_available_host,
     get_preferred_ip,
     init_master_addr,
@@ -448,17 +449,18 @@ def _dcp_load_model_state(
     model_state: dict[str, Any],
     planner: object | None,
 ) -> None:
-    if planner is not None:
-        try:
-            load(
-                state_dict={"model": model_state},
-                storage_reader=reader,
-                planner=planner,
-            )
-            return
-        except TypeError:
-            pass
-    load(state_dict={"model": model_state}, storage_reader=reader)
+    with ensure_dcp_process_group(torch.device("cpu")):
+        if planner is not None:
+            try:
+                load(
+                    state_dict={"model": model_state},
+                    storage_reader=reader,
+                    planner=planner,
+                )
+                return
+            except TypeError:
+                pass
+        load(state_dict={"model": model_state}, storage_reader=reader)
 
 
 def _raise_if_empty_dcp_model_state(
@@ -522,7 +524,9 @@ def _try_load_dir_checkpoint_fallback_pt(
     sd = _coerce_state_dict(sd)
     with contextlib.suppress(Exception):
         resize_scaler_buffer(model, sd)
-    model.load_state_dict(sd, strict=False)
+    if _model_has_meta_or_fake_tensors(model):
+        _materialize_module_to_device(model, map_location or "cpu")
+    _load_state_dict_compat(model, sd, strict=False)
     return True
 
 
@@ -573,6 +577,48 @@ def _coerce_seed(seed: int) -> Optional[int]:
         return None
 
 
+
+
+def _model_has_meta_or_fake_tensors(m: torch.nn.Module) -> bool:
+    try:
+        for t in m.parameters(recurse=True):
+            if is_meta_or_fake_tensor(t):
+                return True
+        for t in m.buffers(recurse=True):
+            if is_meta_or_fake_tensor(t):
+                return True
+    except Exception:
+        return False
+    return False
+
+
+def _materialize_module_to_device(m: torch.nn.Module, device: object = "cpu") -> None:
+    dev = device
+    try:
+        if not isinstance(dev, torch.device):
+            dev = torch.device(dev)
+    except Exception:
+        dev = torch.device("cpu")
+    if hasattr(m, "to_empty"):
+        try:
+            m.to_empty(device=dev)
+            return
+        except TypeError:
+            m.to_empty(dev)
+            return
+    raise RuntimeError(
+        "Model contains meta/fake tensors but Module.to_empty() is unavailable. "
+        "Upgrade PyTorch or avoid moving the parent model to meta before load."
+    )
+
+
+def _load_state_dict_compat(m: torch.nn.Module, sd: Mapping[str, Any], *, strict: bool) -> None:
+    try:
+        m.load_state_dict(sd, strict=bool(strict), assign=True)
+    except TypeError:
+        m.load_state_dict(sd, strict=bool(strict))
+
+
 def _save_model_checkpoint(
     model: Model,
     out_dir: PathLike,
@@ -595,14 +641,31 @@ def _save_model_checkpoint(
                     full_state_dict=False, cpu_offload=bool(dcp_cpu_offload)
                 ),
             )
-            save(
-                state_dict={"model": m_sd},
-                storage_writer=FileSystemWriter(
-                    out_dir,
-                    sync_files=bool(dcp_sync_files),
-                    overwrite=bool(overwrite),
-                ),
-            )
+            use_collectives = False
+            with contextlib.suppress(Exception):
+                import torch.distributed as _dist
+                if _dist.is_available() and _dist.is_initialized():
+                    use_collectives = int(_dist.get_world_size()) > 1
+            with ensure_dcp_process_group(torch.device("cpu")):
+                try:
+                    save(
+                        state_dict={"model": m_sd},
+                        storage_writer=FileSystemWriter(
+                            out_dir,
+                            sync_files=bool(dcp_sync_files),
+                            overwrite=bool(overwrite),
+                        ),
+                        use_collectives=bool(use_collectives),
+                    )
+                except TypeError:
+                    save(
+                        state_dict={"model": m_sd},
+                        storage_writer=FileSystemWriter(
+                            out_dir,
+                            sync_files=bool(dcp_sync_files),
+                            overwrite=bool(overwrite),
+                        ),
+                    )
     if save_pt:
         if m_sd is not None:
             pt_state = dict(m_sd)
@@ -1135,6 +1198,8 @@ def load_weights(
     p = Path(_normalize_windows_paste(checkpoint_path))
 
     if p.is_dir():
+        if _model_has_meta_or_fake_tensors(model):
+            _materialize_module_to_device(model, map_location or "cpu")
         meta = _parse_meta(p)
         if rebuild_tasks and isinstance(meta, dict):
             with contextlib.suppress(Exception):
@@ -1219,7 +1284,9 @@ def load_weights(
         sd = load_tensors(str(p), device=dev)
         sd = _coerce_state_dict(sd)
         resize_scaler_buffer(model, sd)
-        model.load_state_dict(sd, strict=False)
+        if _model_has_meta_or_fake_tensors(model):
+            _materialize_module_to_device(model, dev)
+        _load_state_dict_compat(model, sd, strict=False)
         return meta if isinstance(meta, dict) else None
 
     if suffix and suffix not in (".pt", ".pth"):
@@ -1258,7 +1325,9 @@ def load_weights(
     sd = _coerce_state_dict(sd) if isinstance(sd, dict) else sd
     with contextlib.suppress(Exception):
         resize_scaler_buffer(model, sd)
-    model.load_state_dict(sd, strict=False)
+    if _model_has_meta_or_fake_tensors(model):
+        _materialize_module_to_device(model, map_location or "cpu")
+    _load_state_dict_compat(model, sd, strict=False)
     return meta
 
 
@@ -1300,6 +1369,8 @@ def load_model(
                 "Loading from a checkpoint directory requires in_dim and out_shape, or a valid meta.json inside the directory."
             )
         model = new_model(use_in_dim, use_out_shape, use_config)
+        if _model_has_meta_or_fake_tensors(model):
+            _materialize_module_to_device(model, load_dev)
         with contextlib.suppress(Exception):
             tasks = meta.get("tasks") if isinstance(meta, dict) else None
             if tasks:
@@ -1403,7 +1474,9 @@ def load_model(
         sd = load_tensors(str(p), device=dev)
         sd = _coerce_state_dict(sd)
         resize_scaler_buffer(model, sd)
-        model.load_state_dict(sd, strict=False)
+        if _model_has_meta_or_fake_tensors(model):
+            _materialize_module_to_device(model, dev)
+        _load_state_dict_compat(model, sd, strict=False)
         return model
 
     if suffix and suffix not in (".pt", ".pth"):
@@ -1477,7 +1550,9 @@ def load_model(
     sd = _coerce_state_dict(sd) if isinstance(sd, dict) else sd
     with contextlib.suppress(Exception):
         resize_scaler_buffer(model, sd)
-    model.load_state_dict(sd, strict=False)
+    if _model_has_meta_or_fake_tensors(model):
+        _materialize_module_to_device(model, load_dev)
+    _load_state_dict_compat(model, sd, strict=False)
     return model
 
 
@@ -1822,10 +1897,11 @@ def train(
                         allowed_keys.add(key)
                 if allowed_keys:
                     m_sd = {k: v for k, v in m_sd.items() if k in allowed_keys}
-            load(
-                state_dict={"model": m_sd},
-                storage_reader=reader,
-            )
+            with ensure_dcp_process_group(torch.device("cpu")):
+                load(
+                    state_dict={"model": m_sd},
+                    storage_reader=reader,
+                )
             resize_scaler_buffer(model, m_sd)
             set_model_state_dict(
                 model, m_sd, options=StateDictOptions(full_state_dict=False, strict=False)
