@@ -44,6 +44,20 @@ from torch import nn
 from torch.optim import Optimizer
 
 
+def _maybe_patch_object_collectives_pickler() -> None:
+    if sys.version_info < (3, 14):
+        return
+    try:
+        import cloudpickle
+        import torch.distributed.distributed_c10d as c10d
+
+        if getattr(c10d, "_pickler", None) is not cloudpickle.CloudPickler:
+            c10d._pickler = cloudpickle.CloudPickler
+    except Exception:
+        return
+
+
+
 def _is_tmpfs_path(path: str) -> bool:
     if not os.path.exists("/proc/mounts"):
         return False
@@ -1641,6 +1655,8 @@ def ensure_dcp_process_group(
             kwargs.pop("device_id", None)
             dist.init_process_group(**kwargs)
         with contextlib.suppress(Exception):
+            _maybe_patch_object_collectives_pickler()
+        with contextlib.suppress(Exception):
             init_lane_process_groups(dev)
         yield dist.group.WORLD
     finally:
@@ -2528,6 +2544,8 @@ class ProcessBroker:
             if str(backend_pg) == str(backend):
                 raise
             _init_with(backend)
+        with contextlib.suppress(Exception):
+            _maybe_patch_object_collectives_pickler()
         with contextlib.suppress(Exception):
             init_lane_process_groups(device)
 
