@@ -3056,7 +3056,7 @@ class Fuser(nn.Module):
             and env_bool("ENN_PRED_DISABLE_CUDAGRAPHS", default=True)
         )
         compile_cg_enabled = bool(getattr(self, "_compile_cudagraphs", False))
-        if not compile_cg_enabled:
+        if (not compile_cg_enabled) and (not is_export_or_trace()):
             with contextlib.suppress(Exception):
                 compile_cg_enabled = bool(
                     getattr(get_runtime_cfg(), "compile_cudagraphs", False)
@@ -3174,7 +3174,7 @@ class Fuser(nn.Module):
                             if context.is_floating_point() else 0,
                         }
 
-        if env_bool("ENN_FUSER_NONFINITE_FALLBACK", default=True):
+        if (not is_export_or_trace()) and env_bool("ENN_FUSER_NONFINITE_FALLBACK", default=True):
             allow_train = env_bool("ENN_FUSER_NONFINITE_FALLBACK_TRAINING", default=False)
             if (not torch.is_grad_enabled()) or allow_train:
                 has_nonfinite = False
@@ -3248,12 +3248,130 @@ class Fuser(nn.Module):
         return fused_tokens, context
 
     def forward_export(
-        self: Self, x: torch.Tensor
+        self: Self,
+        x: torch.Tensor,
+        *args: Any,
+        causal_mask: Optional[torch.Tensor] = None,
+        **kwargs: Any,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        tokens, ctx = self.forward(
-            x, temporal_state=None, return_temporal_state=False
-        )
-        return cast(torch.Tensor, tokens), cast(torch.Tensor, ctx)
+        del args, kwargs
+        plan = getattr(self, "_exec_plan", None)
+        if not isinstance(plan, dict):
+            plan = self._build_exec_plan_unlocked()
+
+        roots = [str(r) for r in (plan.get("roots") or []) if str(r) in self.tasks]
+        order = [str(n) for n in (plan.get("order") or []) if str(n) in self.tasks]
+        if not roots:
+            roots = [str(k) for k in self.tasks.keys()]
+        if not order:
+            order = [str(k) for k in self.tasks.keys()]
+
+        token_cache: dict[str, torch.Tensor] = {}
+
+        def _linear_fuse(
+            child_names: Sequence[str],
+            child_tokens: Sequence[torch.Tensor],
+        ) -> torch.Tensor:
+            if not child_tokens:
+                raise RuntimeError("linear reduction requires at least one child")
+            tok0 = child_tokens[0]
+            B = tok0.size(0)
+            latents = self.perceiver.latents.unsqueeze(0).expand(B, -1, -1)
+            if latents.dtype != tok0.dtype:
+                latents = latents.to(dtype=tok0.dtype)
+            if latents.device != tok0.device:
+                latents = latents.to(device=tok0.device)
+            j = 0
+            for i in range(int(getattr(self.perceiver, "depth", 1))):
+                base = latents
+                delta_sum = torch.zeros_like(base)
+                for nm, toks in zip(child_names, child_tokens):
+                    mod = self.tasks[nm] if nm in self.tasks else None
+                    w = getattr(mod, "weight", None)
+                    e = getattr(mod, "eps", None)
+                    if not isinstance(w, torch.Tensor):
+                        w = torch.as_tensor(1.0, dtype=torch.float32, device=tok0.device)
+                    if not isinstance(e, torch.Tensor):
+                        e = torch.as_tensor(1e-6, dtype=torch.float32, device=tok0.device)
+                    coef = w.to(device=tok0.device, dtype=base.dtype).reshape(())
+                    eps_t = e.to(device=tok0.device, dtype=base.dtype).reshape(())
+                    coef = torch.where(coef == 0, eps_t, coef)
+                    out = self.perceiver.cross[i](base, toks, attn_bias=None)
+                    delta_sum = delta_sum + coef * (out - base)
+                latents = base + delta_sum
+                for _ in range(int(getattr(self.perceiver, "self_attn_layers", 0))):
+                    if j < len(self.perceiver.self_blocks):
+                        latents = self.perceiver.self_blocks[j](latents)
+                    j += 1
+            return self.perceiver.norm(latents)
+
+        for name in order:
+            mod = self.tasks[name]
+            if isinstance(mod, SubFuser):
+                child_names = [str(c) for c in list(getattr(mod, "_children", []) or [])]
+                child_names = [c for c in child_names if c in token_cache]
+                if not child_names:
+                    raise RuntimeError(f"Taskset '{name}' has no executed children")
+                child_tokens = [token_cache[c] for c in child_names]
+                red = str(getattr(mod, "reduction", "mean"))
+                if red == "mean":
+                    all_tokens = child_tokens[0] if len(child_tokens) == 1 else torch.cat(child_tokens, dim=1)
+                    attn_bias = self._build_attn_bias(
+                        child_names,
+                        child_tokens,
+                        device=all_tokens.device,
+                        dtype=all_tokens.dtype,
+                    )
+                    token_cache[name] = self.perceiver(all_tokens, attn_bias=attn_bias)
+                elif red == "linear":
+                    token_cache[name] = _linear_fuse(child_names, child_tokens)
+                else:
+                    raise ValueError(f"Unknown taskset reduction '{red}'")
+                continue
+
+            out_tokens: Any
+            if isinstance(mod, Template) and str(getattr(mod, "mode", "")) == "temporal":
+                out_tokens = mod(
+                    x,
+                    state=None,
+                    return_state=False,
+                    causal_mask=causal_mask,
+                )
+            else:
+                out_tokens = mod(x, causal_mask=causal_mask) if isinstance(mod, Template) else mod(x)
+
+            if not isinstance(out_tokens, torch.Tensor):
+                raise TypeError(f"Task '{name}' must return a torch.Tensor")
+            sm = self._user_submodels.get(str(name))
+            if sm is not None:
+                out_tokens = sm(out_tokens)
+                if not isinstance(out_tokens, torch.Tensor):
+                    raise TypeError(
+                        f"BYOM for task '{name}' must return torch.Tensor; got {type(out_tokens)}"
+                    )
+            token_cache[name] = out_tokens
+
+        token_sets = [token_cache[r] for r in roots if r in token_cache]
+        if not token_sets:
+            raise RuntimeError("No root nodes produced tokens")
+
+        root_reduction = str(getattr(self, "_root_reduction", "mean"))
+        if root_reduction == "linear":
+            fused_tokens = _linear_fuse(roots, token_sets)
+        elif root_reduction == "mean":
+            all_tokens = token_sets[0] if len(token_sets) == 1 else torch.cat(token_sets, dim=1)
+            attn_bias = self._build_attn_bias(
+                roots,
+                token_sets,
+                device=all_tokens.device,
+                dtype=all_tokens.dtype,
+            )
+            fused_tokens = self.perceiver(all_tokens, attn_bias=attn_bias)
+        else:
+            raise ValueError(f"Unknown root reduction '{root_reduction}'")
+
+        context = self.decode(fused_tokens, apply_norm=True)
+        return cast(torch.Tensor, fused_tokens), cast(torch.Tensor, context)
 
     def decode(
         self: Self, tokens: torch.Tensor, *args: Any, apply_norm: bool = True
@@ -4311,10 +4429,18 @@ class Model(nn.Module):
         torch.Tensor,
         torch.Tensor,
     ]:
-        self._enn_nonfinite_pre_sanitize = []
+        diag_pre = bool((not export) and sanitize_nan and env_bool(
+            "ENN_DIAG_NONFINITE_PRE_SANITIZE", default=False
+        ))
+        strict_pre = bool(diag_pre and env_bool("ENN_SANITIZE_NAN_STRICT", default=False))
+        nonfinite_log: list[dict[str, object]] | None = None
+        if diag_pre:
+            nonfinite_log = []
+            with contextlib.suppress(Exception):
+                self._enn_nonfinite_pre_sanitize = nonfinite_log
 
         def _diag_nonfinite(tag: str, t: object) -> None:
-            if not bool(env_bool("ENN_DIAG_NONFINITE_PRE_SANITIZE", default=False)):
+            if not diag_pre or nonfinite_log is None:
                 return
             if not torch.is_tensor(t):
                 return
@@ -4337,9 +4463,8 @@ class Model(nn.Module):
                     "nonfinite": nonfinite,
                     "absmax": absmax,
                 }
-                with contextlib.suppress(Exception):
-                    self._enn_nonfinite_pre_sanitize.append(entry)
-                if bool(env_bool("ENN_SANITIZE_NAN_STRICT", default=False)):
+                nonfinite_log.append(entry)
+                if strict_pre:
                     raise RuntimeError(
                         f"[ENN] nonfinite detected before sanitize in {tag}: nonfinite={nonfinite} absmax={absmax} dtype={dtype} shape={shape}"
                     )
@@ -4833,7 +4958,7 @@ class Model(nn.Module):
             and env_bool("ENN_PRED_DISABLE_CUDAGRAPHS", default=True)
         )
         compile_cg_enabled = bool(getattr(self, "_compile_cudagraphs", False))
-        if not compile_cg_enabled:
+        if (not compile_cg_enabled) and (not is_export_or_trace()):
             with contextlib.suppress(Exception):
                 compile_cg_enabled = bool(
                     getattr(get_runtime_cfg(), "compile_cudagraphs", False)

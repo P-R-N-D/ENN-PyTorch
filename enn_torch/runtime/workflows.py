@@ -258,6 +258,7 @@ def _resize_scaler_buffers_for_shape(
         if x_numel and x_numel > 0:
             _resize_buffer(module, "x_mean", (x_numel,))
             _resize_buffer(module, "x_std", (x_numel,))
+            _resize_buffer(module, "pw_x", (x_numel,))
         if y_numel and y_numel > 0:
             for name in (
                 "y_mean",
@@ -268,9 +269,10 @@ def _resize_scaler_buffers_for_shape(
                 "y_q_high",
                 "affine_a",
                 "affine_b",
+                "pw_y",
             ):
                 _resize_buffer(module, name, (y_numel,))
-        return
+        continue
 
 
 def _resize_scaler_buffers_from_metadata(
@@ -280,7 +282,7 @@ def _resize_scaler_buffers_from_metadata(
     if metadata is None:
         return False
     state_meta = getattr(metadata, "state_dict_metadata", None)
-    if not isinstance(state_meta, dict):
+    if not isinstance(state_meta, Mapping):
         return False
     suffix_map = {
         "scaler.x_mean": "x_mean",
@@ -293,6 +295,8 @@ def _resize_scaler_buffers_from_metadata(
         "scaler.y_q_high": "y_q_high",
         "scaler.affine_a": "affine_a",
         "scaler.affine_b": "affine_b",
+        "scaler.pw_x": "pw_x",
+        "scaler.pw_y": "pw_y",
     }
 
     def _resize_buffer(
@@ -303,27 +307,173 @@ def _resize_scaler_buffers_from_metadata(
             return
         if tuple(buf.shape) == tuple(shape):
             return
+        old_shape = tuple(buf.shape)
         try:
             buf.resize_(shape)
         except Exception:
             module._buffers[name] = buf.detach().new_zeros(shape)
+        logger.debug("scaler pre-load resize: %s %s -> %s", name, old_shape, tuple(shape))
 
-    resized = False
+    resized_any = False
     for module in model.modules():
         if not isinstance(module, Scaler):
             continue
+        resized_local = False
         for key, value in state_meta.items():
+            k = str(key)
             for suffix, buf_name in suffix_map.items():
-                if not key.endswith(suffix):
+                if not k.endswith(suffix):
                     continue
                 size = getattr(value, "size", None)
                 if size is None:
                     continue
-                shape = tuple(int(dim) for dim in size)
+                try:
+                    shape = tuple(int(dim) for dim in size)
+                except Exception:
+                    continue
                 _resize_buffer(module, buf_name, shape)
-                resized = True
-        return resized
-    return False
+                resized_local = True
+        resized_any = resized_any or resized_local
+    return resized_any
+
+
+def _coerce_scaler_buffers_to_shape(
+    model: torch.nn.Module,
+    in_dim: int | None,
+    label_shape: Sequence[int] | tuple[int, ...],
+) -> bool:
+    if not env_bool("ENN_SCALER_COMPAT_RESIZE", default=True):
+        return False
+    if in_dim is None and not label_shape:
+        return False
+
+    x_numel = int(in_dim) if in_dim is not None else None
+    y_numel = int(numpy.prod(label_shape)) if label_shape else None
+    if (not x_numel or x_numel <= 0) and (not y_numel or y_numel <= 0):
+        return False
+
+    nonscalar_default = env_bool("ENN_SCALER_COMPAT_RESIZE_NONSCALAR", default=False)
+    x_allow_nonscalar = env_bool("ENN_SCALER_COMPAT_RESIZE_X_NONSCALAR", default=nonscalar_default)
+    y_allow_nonscalar = env_bool("ENN_SCALER_COMPAT_RESIZE_Y_NONSCALAR", default=nonscalar_default)
+
+    fill_default = (os.environ.get("ENN_SCALER_COMPAT_RESIZE_FILL") or "edge").strip().lower()
+    x_fill = (os.environ.get("ENN_SCALER_COMPAT_RESIZE_X_FILL") or fill_default).strip().lower()
+    y_fill = (os.environ.get("ENN_SCALER_COMPAT_RESIZE_Y_FILL") or fill_default).strip().lower()
+    allowed_fill = {"edge", "mean", "zero", "tile"}
+    if x_fill not in allowed_fill:
+        x_fill = "edge"
+    if y_fill not in allowed_fill:
+        y_fill = "edge"
+
+    name_by_module: dict[object, str] = {}
+    with contextlib.suppress(Exception):
+        name_by_module = {m: n for n, m in model.named_modules()}
+
+    def _qual(module: Scaler, buf_name: str) -> str:
+        prefix = name_by_module.get(module, "") or ""
+        if prefix:
+            return f"{prefix}.{buf_name}"
+        return buf_name
+
+    def _make_new_1d_like(src: torch.Tensor, n: int) -> torch.Tensor:
+        return src.detach().reshape(-1).new_empty((int(n),))
+
+    def _fill_tail(dst: torch.Tensor, src_flat: torch.Tensor, start: int, mode: str) -> None:
+        if start >= dst.numel():
+            return
+        if mode == "zero":
+            dst[start:] = 0
+            return
+        if src_flat.numel() <= 0:
+            dst[start:] = 0
+            return
+        if mode == "mean":
+            dst[start:] = src_flat.mean()
+            return
+        if mode == "tile":
+            reps = int((dst.numel() + src_flat.numel() - 1) // src_flat.numel())
+            tiled = src_flat.repeat(reps)[: dst.numel()]
+            dst[start:] = tiled[start:]
+            return
+        dst[start:] = src_flat[-1]
+
+    def _coerce_one(
+        module: Scaler,
+        name: str,
+        target_numel: int,
+        *,
+        allow_nonscalar: bool,
+        fill_mode: str,
+    ) -> bool:
+        buf = getattr(module, name, None)
+        if not isinstance(buf, torch.Tensor):
+            return False
+        if is_meta_or_fake_tensor(buf):
+            return False
+        tgt = int(target_numel)
+        if tgt <= 0:
+            return False
+        cur_shape = tuple(buf.shape)
+        cur = int(buf.numel())
+        if cur == tgt:
+            if int(buf.ndim) == 1:
+                return False
+            try:
+                new = buf.detach().reshape(-1).contiguous()
+                module._buffers[name] = new
+                logger.debug("scaler post-load compat: %s %s -> %s (reshape)", _qual(module, name), cur_shape, tuple(new.shape))
+                return True
+            except Exception:
+                return False
+
+        src_flat = buf.detach().reshape(-1).contiguous()
+        if cur == 1 and tgt > 1:
+            new = _make_new_1d_like(src_flat, tgt)
+            new[:] = src_flat[0]
+            module._buffers[name] = new
+            logger.debug(
+                "scaler post-load compat: %s %s -> %s (scalar->vec fill=scalar)",
+                _qual(module, name), cur_shape, tuple(new.shape)
+            )
+            return True
+
+        if not allow_nonscalar:
+            return False
+
+        new = _make_new_1d_like(src_flat, tgt)
+        copy_n = min(int(src_flat.numel()), int(new.numel()))
+        if copy_n > 0:
+            new[:copy_n] = src_flat[:copy_n]
+        _fill_tail(new, src_flat, copy_n, fill_mode)
+        module._buffers[name] = new
+        logger.debug(
+            "scaler post-load compat: %s %s -> %s (nonscalar copy=%d fill=%s)",
+            _qual(module, name), cur_shape, tuple(new.shape), copy_n, fill_mode
+        )
+        return True
+
+    changed = False
+    x_names = ("x_mean", "x_std", "pw_x")
+    y_names = ("y_mean", "y_std", "y_min", "y_max", "y_q_low", "y_q_high", "affine_a", "affine_b", "pw_y")
+    with torch.no_grad():
+        for module in model.modules():
+            if not isinstance(module, Scaler):
+                continue
+            if x_numel and x_numel > 0:
+                for n in x_names:
+                    changed = _coerce_one(
+                        module, n, int(x_numel),
+                        allow_nonscalar=bool(x_allow_nonscalar),
+                        fill_mode=str(x_fill),
+                    ) or changed
+            if y_numel and y_numel > 0:
+                for n in y_names:
+                    changed = _coerce_one(
+                        module, n, int(y_numel),
+                        allow_nonscalar=bool(y_allow_nonscalar),
+                        fill_mode=str(y_fill),
+                    ) or changed
+    return changed
 
 
 def _parse_meta(p: PathLike) -> Mapping[str, Any]:
@@ -527,6 +677,12 @@ def _try_load_dir_checkpoint_fallback_pt(
     if _model_has_meta_or_fake_tensors(model):
         _materialize_module_to_device(model, map_location or "cpu")
     _load_state_dict_compat(model, sd, strict=False)
+    with contextlib.suppress(Exception):
+        _coerce_scaler_buffers_to_shape(
+            model,
+            getattr(model, "in_dim", None),
+            getattr(model, "out_shape", ()) or (),
+        )
     return True
 
 
@@ -1212,8 +1368,9 @@ def load_weights(
                     model.rebuild_tasks_from_specs(tasks)
         reader = FileSystemReader(str(p))
         meta_data = None
-        with contextlib.suppress(Exception):
-            meta_data = reader.read_metadata()
+        with ensure_dcp_process_group(torch.device("cpu")):
+            with contextlib.suppress(Exception):
+                meta_data = reader.read_metadata()
         if not _resize_scaler_buffers_from_metadata(model, meta_data):
             _resize_scaler_buffers_for_shape(
                 model,
@@ -1253,6 +1410,12 @@ def load_weights(
                 m_sd,
                 options=StateDictOptions(full_state_dict=False, strict=False),
             )
+        with contextlib.suppress(Exception):
+            _coerce_scaler_buffers_to_shape(
+                model,
+                getattr(model, "in_dim", None),
+                getattr(model, "out_shape", ()) or (),
+            )
         return meta if isinstance(meta, dict) else None
 
     if not p.exists():
@@ -1291,6 +1454,10 @@ def load_weights(
         if _model_has_meta_or_fake_tensors(model):
             _materialize_module_to_device(model, dev)
         _load_state_dict_compat(model, sd, strict=False)
+        with contextlib.suppress(Exception):
+            _coerce_scaler_buffers_to_shape(
+                model, getattr(model, "in_dim", None), getattr(model, "out_shape", ()) or ()
+            )
         return meta if isinstance(meta, dict) else None
 
     if suffix and suffix not in (".pt", ".pth"):
@@ -1332,6 +1499,10 @@ def load_weights(
     if _model_has_meta_or_fake_tensors(model):
         _materialize_module_to_device(model, map_location or "cpu")
     _load_state_dict_compat(model, sd, strict=False)
+    with contextlib.suppress(Exception):
+        _coerce_scaler_buffers_to_shape(
+            model, getattr(model, "in_dim", None), getattr(model, "out_shape", ()) or ()
+        )
     return meta
 
 
@@ -1381,8 +1552,9 @@ def load_model(
                 model.rebuild_tasks_from_specs(tasks)
         reader = FileSystemReader(str(p))
         meta_data = None
-        with contextlib.suppress(Exception):
-            meta_data = reader.read_metadata()
+        with ensure_dcp_process_group(torch.device("cpu")):
+            with contextlib.suppress(Exception):
+                meta_data = reader.read_metadata()
         if not _resize_scaler_buffers_from_metadata(model, meta_data):
             _resize_scaler_buffers_for_shape(model, use_in_dim, use_out_shape)
         opts = StateDictOptions(full_state_dict=False)
@@ -1418,6 +1590,8 @@ def load_model(
                 m_sd,
                 options=StateDictOptions(full_state_dict=False, strict=False),
             )
+        with contextlib.suppress(Exception):
+            _coerce_scaler_buffers_to_shape(model, use_in_dim, use_out_shape)
         return model
     if not p.exists():
         raise FileNotFoundError(f"Checkpoint file not found: {str(p)!r}")
@@ -1481,6 +1655,8 @@ def load_model(
         if _model_has_meta_or_fake_tensors(model):
             _materialize_module_to_device(model, dev)
         _load_state_dict_compat(model, sd, strict=False)
+        with contextlib.suppress(Exception):
+            _coerce_scaler_buffers_to_shape(model, use_in_dim, use_out_shape)
         return model
 
     if suffix and suffix not in (".pt", ".pth"):
@@ -1557,6 +1733,8 @@ def load_model(
     if _model_has_meta_or_fake_tensors(model):
         _materialize_module_to_device(model, load_dev)
     _load_state_dict_compat(model, sd, strict=False)
+    with contextlib.suppress(Exception):
+        _coerce_scaler_buffers_to_shape(model, use_in_dim, use_out_shape)
     return model
 
 
@@ -1877,8 +2055,9 @@ def train(
             dcp_dir = _find_latest_dcp_epoch_dir(ckpt_dir) or ckpt_dir
             reader = FileSystemReader(dcp_dir)
             meta = None
-            with contextlib.suppress(Exception):
-                meta = reader.read_metadata()
+            with ensure_dcp_process_group(torch.device("cpu")):
+                with contextlib.suppress(Exception):
+                    meta = reader.read_metadata()
             if not _resize_scaler_buffers_from_metadata(model, meta):
                 _resize_scaler_buffers_for_shape(
                     model, first_in_dim, label_shape
@@ -1892,7 +2071,7 @@ def train(
                 )
             )
             state_meta = getattr(meta, "state_dict_metadata", None)
-            if isinstance(state_meta, dict) and state_meta:
+            if isinstance(state_meta, Mapping) and state_meta:
                 allowed_keys: set[str] = set()
                 for key in state_meta.keys():
                     if key.startswith("model."):
@@ -1910,6 +2089,8 @@ def train(
             set_model_state_dict(
                 model, m_sd, options=StateDictOptions(full_state_dict=False, strict=False)
             )
+            with contextlib.suppress(Exception):
+                _coerce_scaler_buffers_to_shape(model, first_in_dim, label_shape)
         _update_history(model, ckpt_dir, epochs, val_frac, num_samples_dataset)
         if export_path is not None and isinstance(model, torch.nn.Module):
             export_meta: dict[str, Any] = {
