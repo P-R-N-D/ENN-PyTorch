@@ -1057,38 +1057,42 @@ class SubFuser(nn.Module):
             return getter(node_spec, default=default)
         return default
 
-    def children(self: Self, node_spec: Optional[str] = None) -> list[str]:
+    def node_name(self: Self) -> str:
+        _, my_name = self._owner_and_name()
+        return str(my_name)
+
+    def get_children(
+        self: Self, node_spec: Optional[str] = None
+    ) -> list[nn.Module]:
         owner, my_name = self._owner_and_name()
-        if node_spec is None or (not str(node_spec).strip()):
-            target = my_name
-        else:
-            target = str(node_spec)
-        fn = getattr(owner, "children", None)
+        target = (
+            my_name if node_spec is None or (not str(node_spec).strip()) else str(node_spec)
+        )
+        fn = getattr(owner, "get_children", None)
         if callable(fn):
             return list(fn(target))
         return []
 
-    def list(self: Self, by: str = "name") -> list[str]:
+    def get_parent(
+        self: Self, node_spec: Optional[str] = None
+    ) -> Optional[nn.Module]:
         owner, my_name = self._owner_and_name()
-        topo: list[str] = []
-        seen: set[str] = set()
-        owner_children = getattr(owner, "children", None)
+        target = (
+            my_name if node_spec is None or (not str(node_spec).strip()) else str(node_spec)
+        )
+        fn = getattr(owner, "get_parent", None)
+        if callable(fn):
+            return fn(target)
+        return None
 
-        def _post(n: str) -> None:
-            for c in list(owner_children(n) if callable(owner_children) else []):
-                cs = str(c)
-                if cs in seen:
-                    continue
-                _post(cs)
-            seen.add(n)
-            topo.append(n)
-
-        _post(my_name)
-        desc = [x for x in topo if x != my_name]
-        mode = str(by or "name").strip().lower()
-        if mode in {"topo", "topological", "tree"}:
-            return desc
-        return sorted(set(desc))
+    def get_subtree(
+        self: Self, by: str = "name", include_self: bool = False
+    ) -> list[str]:
+        owner, my_name = self._owner_and_name()
+        fn = getattr(owner, "get_subtree", None)
+        if callable(fn):
+            return list(fn(my_name, by=by, include_self=include_self))
+        return []
 
     def new(self: Self, name: Optional[str] = None, *args: Any, parent: Optional[str] = None, **kwargs: Any) -> str:
         owner, my_name = self._owner_and_name()
@@ -1131,39 +1135,6 @@ class SubFuser(nn.Module):
         if not callable(fn):
             raise RuntimeError("Owning Fuser does not support remove()")
         fn(target, *args, **kwargs)
-
-    def train(self: Self, mode: bool = True) -> Self:
-        self.training = bool(mode)
-        for m in nn.Module.children(self):
-            m.train(mode)
-        return self
-
-    def apply(self: Self, fn: Callable[[nn.Module], Any]) -> Self:
-        for m in nn.Module.children(self):
-            m.apply(fn)
-        fn(self)
-        return self
-
-    def _apply(self: Self, fn: Callable[[torch.Tensor], torch.Tensor]) -> Self:
-        for m in nn.Module.children(self):
-            m._apply(fn)
-        for key, param in list(self._parameters.items()):
-            if param is None:
-                continue
-            with torch.no_grad():
-                applied = fn(param)
-            if applied is not param:
-                self._parameters[key] = torch.nn.Parameter(
-                    applied, requires_grad=param.requires_grad
-                )
-            if param.grad is not None:
-                with torch.no_grad():
-                    param.grad = fn(param.grad)
-        for key, buf in list(self._buffers.items()):
-            if buf is None:
-                continue
-            self._buffers[key] = fn(buf)
-        return self
 
     def forward(self: Self, *args: Any, **kwargs: Any) -> Any:
         del args, kwargs
@@ -1376,15 +1347,6 @@ class Fuser(nn.Module):
 
         task_names = [str(n) for n in getattr(self, "tasks", {}).keys()]
         if task_names:
-            sanitized_roots: list[str] = []
-            seen_roots: set[str] = set()
-            for name in self._root_children:
-                nm = str(name)
-                if nm in self.tasks and nm not in seen_roots:
-                    sanitized_roots.append(nm)
-                    seen_roots.add(nm)
-            self._root_children = sanitized_roots
-
             normalized_parent: dict[str, Optional[str]] = {}
             for nm in task_names:
                 raw_parent = self._parent.get(nm)
@@ -1392,55 +1354,71 @@ class Fuser(nn.Module):
                     normalized_parent[nm] = None
                     continue
                 pk = str(raw_parent).strip()
-                if pk == nm or pk not in self.tasks:
+                if (
+                    pk == nm
+                    or pk not in self.tasks
+                    or (not isinstance(self.tasks[pk], SubFuser))
+                ):
                     normalized_parent[nm] = None
                 else:
                     normalized_parent[nm] = pk
             self._parent = normalized_parent
 
+            sanitized_roots: list[str] = []
+            seen_roots: set[str] = set()
+            for name in list(getattr(self, "_root_children", []) or []):
+                nm = str(name)
+                if (
+                    nm in self.tasks
+                    and nm not in seen_roots
+                    and (self._parent.get(nm) is None)
+                ):
+                    sanitized_roots.append(nm)
+                    seen_roots.add(nm)
             for nm in task_names:
-                if self._parent.get(nm) is None and nm not in self._root_children:
-                    self._root_children.append(nm)
+                if (self._parent.get(nm) is None) and (nm not in seen_roots):
+                    sanitized_roots.append(nm)
+                    seen_roots.add(nm)
+            self._root_children = sanitized_roots
+
+            with contextlib.suppress(Exception):
+                parent_to_children: dict[str, list[str]] = {}
+                for child, parent in self._parent.items():
+                    if parent is None:
+                        continue
+                    p = str(parent)
+                    parent_to_children.setdefault(p, []).append(str(child))
+
+                for p_name, mod in getattr(self, "tasks", {}).items():
+                    if not isinstance(mod, SubFuser):
+                        continue
+                    wanted = parent_to_children.get(str(p_name), [])
+                    existing = [
+                        str(c) for c in list(getattr(mod, "_children", []) or [])
+                    ]
+                    merged: list[str] = []
+                    seen: set[str] = set()
+                    for c in existing:
+                        if (
+                            c in wanted
+                            and c in self.tasks
+                            and c not in seen
+                            and c != str(p_name)
+                        ):
+                            merged.append(c)
+                            seen.add(c)
+                    for c in wanted:
+                        if c in self.tasks and c not in seen and c != str(p_name):
+                            merged.append(c)
+                            seen.add(c)
+                    mod._children = merged
 
         with contextlib.suppress(Exception):
-            for n, m in getattr(self, 'tasks', {}).items():
+            for n, m in getattr(self, "tasks", {}).items():
                 if isinstance(m, SubFuser):
                     m._bind(self, str(n))
 
 
-
-    def train(self: Self, mode: bool = True) -> Self:
-        self.training = bool(mode)
-        for m in nn.Module.children(self):
-            m.train(mode)
-        return self
-
-    def apply(self: Self, fn: Callable[[nn.Module], Any]) -> Self:
-        for m in nn.Module.children(self):
-            m.apply(fn)
-        fn(self)
-        return self
-
-    def _apply(self: Self, fn: Callable[[torch.Tensor], torch.Tensor]) -> Self:
-        for m in nn.Module.children(self):
-            m._apply(fn)
-        for key, param in list(self._parameters.items()):
-            if param is None:
-                continue
-            with torch.no_grad():
-                applied = fn(param)
-            if applied is not param:
-                self._parameters[key] = torch.nn.Parameter(
-                    applied, requires_grad=param.requires_grad
-                )
-            if param.grad is not None:
-                with torch.no_grad():
-                    param.grad = fn(param.grad)
-        for key, buf in list(self._buffers.items()):
-            if buf is None:
-                continue
-            self._buffers[key] = fn(buf)
-        return self
 
     def _init_default_tasks(
         self: Self, config: Optional[ModelConfig] = None
@@ -1738,15 +1716,114 @@ class Fuser(nn.Module):
     def resolve_task_id(self: Self, task_spec: str) -> str:
         return self.resolve_task_name(task_spec)
 
-    def children(self: Self, node_spec: Optional[str] = None) -> list[str]:
-        if node_spec is None or (not str(node_spec).strip()):
+    def node_name(self: Self, node_spec: Optional[object] = None) -> str:
+        if node_spec is None:
+            return ""
+        if isinstance(node_spec, str):
+            if not node_spec.strip():
+                return ""
+            return self.resolve_task_name(node_spec)
+        if node_spec is self:
+            return ""
+        if isinstance(node_spec, SubFuser):
+            pair = _SUBFUSER_BINDINGS.get(node_spec)
+            if pair:
+                owner_ref, name = pair
+                owner = owner_ref() if callable(owner_ref) else None
+                if owner is self:
+                    return str(name)
+        for k, m in getattr(self, "tasks", {}).items():
+            if m is node_spec:
+                return str(k)
+        raise KeyError(
+            f"Unknown node {type(node_spec)}. Known nodes: {sorted(self.tasks.keys())}"
+        )
+
+    def get_children(self: Self, node_spec: Optional[object] = None) -> list[nn.Module]:
+        try:
+            key = self.node_name(node_spec)
+        except KeyError:
+            return []
+
+        if not key:
             with self._topology_guard():
-                return list(self._root_children)
-        key = self.resolve_task_name(str(node_spec))
-        mod = self.tasks[key] if key in self.tasks else None
-        if isinstance(mod, SubFuser):
-            return list(getattr(mod, "_children", []) or [])
-        return []
+                names = list(self._root_children)
+        else:
+            mod = self.tasks[key] if key in self.tasks else None
+            if isinstance(mod, SubFuser):
+                names = list(getattr(mod, "_children", []) or [])
+            else:
+                names = []
+
+        out: list[nn.Module] = []
+        for nm in names:
+            if nm in self.tasks:
+                out.append(self.tasks[nm])
+        return out
+
+    def get_parent(
+        self: Self, node_spec: Optional[object] = None
+    ) -> Optional[nn.Module]:
+        try:
+            key = self.node_name(node_spec)
+        except KeyError:
+            return None
+        if not key:
+            return None
+        with self._topology_guard():
+            p = self._parent.get(key)
+        if p is None or (not str(p).strip()) or (p not in self.tasks):
+            return None
+        return self.tasks[str(p)]
+
+    def get_subtree(
+        self: Self,
+        node_spec: Optional[object] = None,
+        *args: Any,
+        by: str = "name",
+        include_self: bool = False,
+        **kwargs: Any,
+    ) -> list[str]:
+        del args, kwargs
+        if node_spec is None or node_spec is self or (
+            isinstance(node_spec, str) and not node_spec.strip()
+        ):
+            plan = self._get_exec_plan()
+            order = [str(x) for x in (plan.get("order") or [])]
+            if str(by or "name").strip().lower() in {"topo", "topological", "tree"}:
+                return order
+            return sorted(set(order))
+
+        try:
+            root = self.node_name(node_spec)
+        except KeyError:
+            return []
+        if not root or root not in self.tasks:
+            return []
+
+        topo: list[str] = []
+        seen: set[str] = set()
+
+        def _post(n: str) -> None:
+            if n in seen:
+                return
+            mod = self.tasks[n] if n in self.tasks else None
+            if isinstance(mod, SubFuser):
+                for c in list(getattr(mod, "_children", []) or []):
+                    cs = str(c)
+                    if cs in seen:
+                        continue
+                    _post(cs)
+            seen.add(n)
+            topo.append(n)
+
+        _post(str(root))
+        if not include_self:
+            topo = [x for x in topo if x != str(root)]
+        mode = str(by or "name").strip().lower()
+        if mode in {"topo", "topological", "tree"}:
+            return topo
+        return sorted(set(topo))
 
     def attach(self: Self, node_spec: str, parent: Optional[str] = None) -> str:
         key = self.resolve_task_name(node_spec)
@@ -1786,7 +1863,7 @@ class Fuser(nn.Module):
                 if parent is not None and str(parent).strip():
                     with contextlib.suppress(Exception):
                         pkey = self.resolve_task_name(str(parent))
-                        pmod = self.tasks.get(pkey)
+                        pmod = self.tasks[pkey] if pkey in self.tasks else None
                         if isinstance(pmod, SubFuser):
                             inherited = str(
                                 getattr(pmod, "reduction", inherited) or inherited
@@ -1837,14 +1914,10 @@ class Fuser(nn.Module):
         return self.remove_task(node_spec, strict=strict)
 
     def list_tasks(self: Self, by: str = "name") -> list[str]:
-        return self.list(by=by)
+        return self.get_subtree(by=by)
 
     def list(self: Self, by: str = "name") -> list[str]:
-        plan = self._get_exec_plan()
-        order = [str(x) for x in (plan.get("order") or [])]
-        if str(by or "name").strip().lower() in {"topo", "topological", "tree"}:
-            return order
-        return sorted(set(order))
+        return self.get_subtree(by=by)
 
     def spec(self: Self) -> list[Dict[str, Any]]:
         plan = self._get_exec_plan()
@@ -2241,11 +2314,15 @@ class Fuser(nn.Module):
     def remove_task(
         self: Self, task_name: str, *args: Any, strict: bool = False
     ) -> None:
+        del args
         if strict and not self.tasks:
             raise KeyError("No tasks are configured")
-        key = self.resolve_task_name(task_name)
-        if strict and key not in self.tasks:
-            raise KeyError(f"Unknown task '{task_name}'.")
+        try:
+            key = self.resolve_task_name(task_name)
+        except KeyError:
+            if strict:
+                raise
+            return
         if key in self.tasks and isinstance(self.tasks[key], SubFuser):
             raise TypeError(
                 "remove_task() cannot remove a taskset; use remove_taskset()"
@@ -2445,9 +2522,12 @@ class Fuser(nn.Module):
         del args, kwargs
         if strict and not self.tasks:
             raise KeyError("No tasks are configured")
-        key = self.resolve_task_name(taskset_name)
-        if strict and key not in self.tasks:
-            raise KeyError(f"Unknown taskset '{taskset_name}'.")
+        try:
+            key = self.resolve_task_name(taskset_name)
+        except KeyError:
+            if strict:
+                raise
+            return
         if key not in self.tasks:
             return
         node = self.tasks[key]
@@ -5579,19 +5659,41 @@ class Model(nn.Module):
         return super().load_state_dict(state_dict, *args, **kwargs)
 
     def list_tasks(self: Self, *args: Any, by: str = "name") -> list[str]:
-        return self.fuser.list(by=by)
+        del args
+        return self.fuser.get_subtree(by=by)
 
     def list(self: Self, *args: Any, by: str = "name") -> list[str]:
         del args
-        return self.fuser.list(by=by)
+        return self.fuser.get_subtree(by=by)
 
     def get(
         self: Self, task_spec: str, default: Optional[nn.Module] = None
     ) -> Optional[nn.Module]:
         return self.fuser.get(task_spec, default=default)
 
-    def children(self: Self, node_spec: Optional[str] = None) -> list[str]:
-        return self.fuser.children(node_spec)
+    def node_name(self: Self, node_spec: Optional[object] = None) -> str:
+        return self.fuser.node_name(node_spec)
+
+    def get_children(
+        self: Self, node_spec: Optional[object] = None
+    ) -> list[nn.Module]:
+        return self.fuser.get_children(node_spec)
+
+    def get_parent(
+        self: Self, node_spec: Optional[object] = None
+    ) -> Optional[nn.Module]:
+        return self.fuser.get_parent(node_spec)
+
+    def get_subtree(
+        self: Self,
+        node_spec: Optional[object] = None,
+        *args: Any,
+        by: str = "name",
+        include_self: bool = False,
+        **kwargs: Any,
+    ) -> list[str]:
+        del args, kwargs
+        return self.fuser.get_subtree(node_spec, by=by, include_self=include_self)
 
     def attach(self: Self, node_spec: str, parent: Optional[str] = None) -> str:
         return self.fuser.attach(node_spec, parent=parent)

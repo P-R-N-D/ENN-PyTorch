@@ -100,7 +100,7 @@ def _build_model_and_sample(
     ):
         with contextlib.suppress(Exception):
             model.add_task("debug_extra", mode="spatial", weight=0.25)
-    print("[debug] tasks:", model.list_tasks())
+    print("[debug] nodes:", model.get_subtree())
     sample = td_train["X"][:4].to(device)
     return data, td_train, model, sample
 

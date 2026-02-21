@@ -377,7 +377,7 @@ def main() -> None:
     with contextlib.suppress(Exception):
         model.add_task("extra_spatial", mode="spatial", weight=0.25)
         model.update_task("extra_spatial", weight=0.5)
-        print("[lifecycle] tasks:", model.list_tasks())
+        print("[lifecycle] nodes:", model.get_subtree())
     train_epochs = 6
     print(
         "[train] starting... (elastic_launch inside enn_torch.runtime.workflows.train)"
