@@ -415,9 +415,9 @@ def _coerce_scaler_buffers_to_shape(
             return False
         cur_shape = tuple(buf.shape)
         cur = int(buf.numel())
-        if cur == tgt and tuple(buf.reshape(-1).shape) == (tgt,):
-            return False
         if cur == tgt:
+            if int(buf.ndim) == 1:
+                return False
             try:
                 new = buf.detach().reshape(-1).contiguous()
                 module._buffers[name] = new
