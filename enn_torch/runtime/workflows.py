@@ -613,10 +613,14 @@ def _materialize_module_to_device(m: torch.nn.Module, device: object = "cpu") ->
 
 
 def _load_state_dict_compat(m: torch.nn.Module, sd: Mapping[str, Any], *, strict: bool) -> None:
-    try:
-        m.load_state_dict(sd, strict=bool(strict), assign=True)
-    except TypeError:
-        m.load_state_dict(sd, strict=bool(strict))
+    strict_b = bool(strict)
+    if _model_has_meta_or_fake_tensors(m):
+        try:
+            m.load_state_dict(sd, strict=strict_b, assign=True)
+            return
+        except TypeError:
+            pass
+    m.load_state_dict(sd, strict=strict_b)
 
 
 def _save_model_checkpoint(
