@@ -37,11 +37,23 @@ DIR_UP = "상행"
 HOUR_SUFFIX = "시"
 T = TypeVar("T")
 
+def _normalize_pasted_text(val: object) -> str:
+    return (
+        str(val)
+        .replace("\r\n", "\n")
+        .replace("\r", "\n")
+        .replace("\\r\\n", "\n")
+        .replace("\\n", "\n")
+        .replace("\n", " ")
+        .strip()
+    )
+
 
 def _canonical_section(val: object) -> str:
-    parts = [p.strip() for p in str(val).split("-") if str(p).strip()]
+    clean = _normalize_pasted_text(val)
+    parts = [p.strip() for p in clean.split("-") if p.strip()]
     if len(parts) <= 1:
-        return str(val).strip()
+        return clean
     parts.sort()
     return "-".join(parts)
 
@@ -61,18 +73,19 @@ def _require_tabular_deps() -> tuple[ModuleType, Callable[..., object]]:
 
 
 def parse_sheet_name(name: str) -> tuple[int, str]:
-    m = re.search(r"(\d+)\uc6d4", name)
+    cleaned_name = _normalize_pasted_text(name)
+    m = re.search(r"(\d+)\uc6d4", cleaned_name)
     if not m:
-        raise ValueError(f"Could not find month in sheet name: {name}")
+        raise ValueError(f"Could not find month in sheet name: {cleaned_name}")
     month = int(m.group(1))
-    name_clean = name.replace(m.group(0), "")
+    name_clean = cleaned_name.replace(m.group(0), "")
     day_kind = None
     for k in DAY_MAP.keys():
         if k in name_clean:
             day_kind = k
             break
     if day_kind is None:
-        raise ValueError(f"Could not find weekday in sheet name: {name}")
+        raise ValueError(f"Could not find weekday in sheet name: {cleaned_name}")
     return month, day_kind
 
 
@@ -85,7 +98,7 @@ def build_dataset(xlsx_path: str) -> Dict[str, Any]:
     frames: list[pd.DataFrame] = []
     for sh in sheet_names:
         df = pd.read_excel(xlsx_path, sheet_name=sh)
-        df.rename(columns=lambda c: str(c).strip(), inplace=True)
+        df.rename(columns=lambda c: _normalize_pasted_text(c), inplace=True)
         required = {COL_SECTION, COL_DIR}
         if not required.issubset(df.columns):
             print(f"[warn] skipping sheet missing required columns: {sh}")
@@ -101,6 +114,9 @@ def build_dataset(xlsx_path: str) -> Dict[str, Any]:
             continue
         if COL_ROUTE not in df.columns:
             df[COL_ROUTE] = "수도권제1순환선"
+        df[COL_ROUTE] = df[COL_ROUTE].map(_normalize_pasted_text)
+        df[COL_SECTION] = df[COL_SECTION].map(_normalize_pasted_text)
+        df[COL_DIR] = df[COL_DIR].map(_normalize_pasted_text)
         df.insert(0, "row_in_sheet", np.arange(len(df), dtype=np.int64))
         long_df = (
             df.melt(
