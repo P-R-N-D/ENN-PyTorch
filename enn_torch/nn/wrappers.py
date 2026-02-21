@@ -4172,9 +4172,22 @@ class Model(nn.Module):
         fn(self)
         return self
 
-    def _apply(self: Self, fn: Callable[[torch.Tensor], torch.Tensor]) -> "Model":
-        for m in nn.Module.children(self):
-            m._apply(fn)
+    def _apply(
+        self: Self,
+        fn: Callable[[torch.Tensor], torch.Tensor],
+        *args: Any,
+        **kwargs: Any,
+    ) -> "Model":
+        recurse = kwargs.pop("recurse", True)
+        if args:
+            with contextlib.suppress(Exception):
+                recurse = bool(args[0])
+        if recurse:
+            for m in nn.Module.children(self):
+                with contextlib.suppress(TypeError):
+                    m._apply(fn, recurse=recurse)
+                    continue
+                m._apply(fn)
         for key, param in list(self._parameters.items()):
             if param is None:
                 continue
