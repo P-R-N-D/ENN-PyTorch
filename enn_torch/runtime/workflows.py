@@ -604,7 +604,7 @@ def _materialize_module_to_device(m: torch.nn.Module, device: object = "cpu") ->
             m.to_empty(device=dev)
             return
         except TypeError:
-            m.to_empty(dev)
+            m.to_empty(device=dev)
             return
     raise RuntimeError(
         "Model contains meta/fake tensors but Module.to_empty() is unavailable. "
