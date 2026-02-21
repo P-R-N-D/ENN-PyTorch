@@ -2717,11 +2717,41 @@ class Checkpointer:
         try:
             sig = inspect.signature(fn)  # type: ignore[arg-type]
             params = getattr(sig, "parameters", None)
-            if isinstance(params, dict) and params:
+            if params:
+                with contextlib.suppress(Exception):
+                    if any(
+                        getattr(p, "kind", None) is inspect.Parameter.VAR_KEYWORD
+                        for p in params.values()
+                    ):
+                        return kwargs
                 return {k: v for k, v in kwargs.items() if k in params}
         except Exception:
             pass
         return kwargs
+
+    @staticmethod
+    def _call_with_typeerror_kw_fallback(fn: object, call_args: tuple[Any, ...], kwargs: dict[str, Any], drop_order: tuple[str, ...]) -> Any:
+        if not callable(fn):
+            raise RuntimeError("target function is not callable")
+        kw = dict(kwargs)
+        try:
+            return fn(*call_args, **kw)
+        except TypeError as exc:
+            msg = str(exc).lower()
+            if "unexpected keyword" not in msg:
+                raise
+            last_exc: TypeError = exc
+            for key in drop_order:
+                if key not in kw:
+                    continue
+                kw.pop(key, None)
+                try:
+                    return fn(*call_args, **kw)
+                except TypeError as retry_exc:
+                    last_exc = retry_exc
+                    if "unexpected keyword" not in str(retry_exc).lower():
+                        raise
+            raise last_exc
 
     def _resolve_async_checkpointer_type(self) -> object | None:
         mode = (
@@ -3345,7 +3375,12 @@ class Checkpointer:
             }
             save_kw = {k: v for k, v in save_kw.items() if v is not None or k in {"use_collectives"}}
             save_kw = self._filter_kwargs(fn_save, save_kw)
-            fn_save(state, **save_kw)
+            self._call_with_typeerror_kw_fallback(
+                fn_save,
+                (state,),
+                save_kw,
+                ("planner", "process_group", "use_collectives"),
+            )
             if self._rank == 0:
                 with contextlib.suppress(Exception):
                     self._done_file(epoch_dir).write_text("ok\\n", encoding="utf-8")
