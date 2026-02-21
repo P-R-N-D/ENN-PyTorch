@@ -2407,9 +2407,19 @@ class Scaler(nn.Module):
             self._y_stats_cache.clear()
 
     def _apply(
-        self: Self, fn: Callable[[torch.Tensor], torch.Tensor]
+        self: Self,
+        fn: Callable[[torch.Tensor], torch.Tensor],
+        *args: Any,
+        **kwargs: Any,
     ) -> "Scaler":
-        super()._apply(fn)
+        recurse = kwargs.pop("recurse", True)
+        if args:
+            with contextlib.suppress(Exception):
+                recurse = bool(args[0])
+        try:
+            super()._apply(fn, recurse=recurse)
+        except TypeError:
+            super()._apply(fn)
         with contextlib.suppress(Exception):
             for name in (
                 "scale",
@@ -2993,8 +3003,20 @@ class Recorder(nn.Module):
         self._records: List[Dict[str, Any]] = []
         self.max_history_steps: int = 0
 
-    def _apply(self: Self, fn: Callable[[torch.Tensor], torch.Tensor]) -> Self:
-        out = super()._apply(fn)
+    def _apply(
+        self: Self,
+        fn: Callable[[torch.Tensor], torch.Tensor],
+        *args: Any,
+        **kwargs: Any,
+    ) -> Self:
+        recurse = kwargs.pop("recurse", True)
+        if args:
+            with contextlib.suppress(Exception):
+                recurse = bool(args[0])
+        try:
+            out = super()._apply(fn, recurse=recurse)
+        except TypeError:
+            out = super()._apply(fn)
         with torch.no_grad():
             for name, buf in list(getattr(self, "_buffers", {}).items()):
                 if not isinstance(buf, torch.Tensor):
@@ -3320,9 +3342,19 @@ class Recorder(nn.Module):
         self._global_step = 0
 
     def _apply(
-        self: Self, fn: Callable[[torch.Tensor], torch.Tensor]
+        self: Self,
+        fn: Callable[[torch.Tensor], torch.Tensor],
+        *args: Any,
+        **kwargs: Any,
     ) -> "Recorder":
-        super()._apply(fn)
+        recurse = kwargs.pop("recurse", True)
+        if args:
+            with contextlib.suppress(Exception):
+                recurse = bool(args[0])
+        try:
+            super()._apply(fn, recurse=recurse)
+        except TypeError:
+            super()._apply(fn)
         with contextlib.suppress(Exception):
             for name, buf in self._buffers.items():
                 if buf is None or (not isinstance(buf, torch.Tensor)):
