@@ -1530,9 +1530,7 @@ def validate_model_dtype_unity(
             ("weight", getattr(module, "weight", None)),
             ("bias", getattr(module, "bias", None)),
         ]
-        expected: torch.dtype | None = (
-            get_layernorm_dtype(device) if device.type == "cpu" else None
-        )
+        expected: torch.dtype | None = None
 
         for label, tensor in tensors:
             if (

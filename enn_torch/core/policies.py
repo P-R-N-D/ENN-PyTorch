@@ -1557,15 +1557,14 @@ class PrecisionPolicy:
             setattr(meta, "underflow_action", action)
 
         has_scale = bool(getattr(meta, "has_scale", False))
-        is_negotiable = bool(getattr(meta, "is_negotiable", False)) and has_scale
+        raw_neg = getattr(meta, "is_negotiable", None)
         safety = float(safety_margin)
         amp_dtype: Optional[torch.dtype] = None
-        master_float = (
-            torch.float32
-            if is_negotiable
-            and is_scale_safe(torch.float32, meta, safety_margin=safety)
-            else torch.float64
+        fp32_safe = bool(has_scale) and is_scale_safe(
+            torch.float32, meta, safety_margin=safety
         )
+        negotiable = bool(fp32_safe) and (raw_neg is not False)
+        master_float = torch.float32 if negotiable else torch.float64
         match dev.type:
             case "cuda":
                 if master_float == torch.float32:
