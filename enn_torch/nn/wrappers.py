@@ -26,7 +26,7 @@ import torch.nn.functional as F
 from ..core.concurrency import Mutex, is_gil_enabled
 from ..core.config import ModelConfig
 from ..core.datatypes import env_bool, env_first_int, env_int, env_str
-from ..core.policies import LossWeightPolicy
+from ..core.policies import LossWeightPolicy, PrecisionPolicy
 from ..core.precision import AutocastState, StatefulAutocast, StatelessAutocast
 from ..core.system import (
     CPU,
@@ -5429,8 +5429,29 @@ class Model(nn.Module):
             z_true: Optional[torch.Tensor] = None
             if labels_flat is not None and not is_cls_loss:
                 y_true_raw = labels_flat.to(device=assembled.device)
+                try:
+                    y_master_float = PrecisionPolicy.from_metadata(
+                        device=device, metadata=meta, logger=_LOGGER
+                    ).master_float
+                except Exception:
+                    y_master_float = torch.float64
+
                 if not y_true_raw.is_floating_point():
-                    y_true_raw = y_true_raw.to(dtype=master_dtype)
+                    y_true_raw = y_true_raw.to(dtype=y_master_float)
+                else:
+                    try:
+                        if (
+                            torch.finfo(y_true_raw.dtype).bits
+                            < torch.finfo(y_master_float).bits
+                        ):
+                            y_true_raw = y_true_raw.to(dtype=y_master_float)
+                        elif (
+                            y_true_raw.dtype != y_master_float
+                            and y_master_float is torch.float64
+                        ):
+                            y_true_raw = y_true_raw.to(dtype=y_master_float)
+                    except Exception:
+                        y_true_raw = y_true_raw.to(dtype=y_master_float)
                 z_true = self.scaler.normalize_y(y_true_raw).to(
                     device=assembled.device, dtype=assembled.dtype
                 )
