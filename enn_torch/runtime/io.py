@@ -742,6 +742,7 @@ def _pad_sample(
 
 
 def _onnx_options(kwargs: object, *args: Any, target: str = "onnx") -> object:
+    del args
     target_l = str(target or "onnx").strip().lower()
     defaults = {
         "tensorrt": (18, True, True, True, []),
@@ -754,6 +755,28 @@ def _onnx_options(kwargs: object, *args: Any, target: str = "onnx") -> object:
     d_opset, d_dyn, d_pref, d_simp, d_fb = defaults.get(
         target_l, defaults.get(key, defaults["default"])
     )
+    if not isinstance(kwargs, dict):
+        kw: dict[str, Any] = {}
+        for k in (
+            "sample_input",
+            "opset_version",
+            "opset_fallback",
+            "dynamic_batch",
+            "prefer_dynamo",
+            "dynamo",
+            "simplify_onnx",
+            "onnx_simplify",
+            "optimize_onnx",
+            "onnx_optimize",
+            "onnxoptimizer_passes",
+            "onnx_optimizer_passes",
+        ):
+            with contextlib.suppress(Exception):
+                v = getattr(kwargs, k, None)
+                if v is not None:
+                    kw[k] = v
+        kwargs = kw
+
     opset = int(kwargs.get("opset_version", d_opset))
     fb = kwargs.get("opset_fallback", d_fb)
     if not fb:
@@ -771,20 +794,24 @@ def _onnx_options(kwargs: object, *args: Any, target: str = "onnx") -> object:
             continue
         if iv not in clean_fb:
             clean_fb.append(iv)
+    dyn_batch = bool(kwargs.get("dynamic_batch", d_dyn))
+    prefer_dynamo = kwargs.get("prefer_dynamo", kwargs.get("dynamo", d_pref))
+    simplify = kwargs.get(
+        "simplify_onnx", kwargs.get("onnx_simplify", d_simp)
+    )
+    opt_kw = kwargs.get("optimize_onnx", kwargs.get("onnx_optimize", None))
+    if opt_kw is None:
+        optimize_onnx = bool(False if dyn_batch else True)
+    else:
+        optimize_onnx = bool(opt_kw)
     return {
         "sample_input": kwargs.get("sample_input"),
         "opset_version": opset,
         "opset_fallback": clean_fb,
-        "dynamic_batch": kwargs.get("dynamic_batch", d_dyn),
-        "prefer_dynamo": kwargs.get(
-            "prefer_dynamo", kwargs.get("dynamo", d_pref)
-        ),
-        "simplify": kwargs.get(
-            "simplify_onnx", kwargs.get("onnx_simplify", d_simp)
-        ),
-        "optimize_onnx": kwargs.get(
-            "optimize_onnx", kwargs.get("onnx_optimize", True)
-        ),
+        "dynamic_batch": dyn_batch,
+        "prefer_dynamo": prefer_dynamo,
+        "simplify": simplify,
+        "optimize_onnx": optimize_onnx,
         "onnxoptimizer_passes": kwargs.get(
             "onnxoptimizer_passes", kwargs.get("onnx_optimizer_passes")
         ),
@@ -1386,6 +1413,16 @@ class _ORTBuilder:
             optimized_onnx_path = ort_path.with_suffix(".optimized.onnx")
             try:
                 so_onnx = ort.SessionOptions()
+                with contextlib.suppress(Exception):
+                    so_onnx.intra_op_num_threads = int(
+                        os.environ.get("ENN_ORT_INTRA_OP_THREADS", "1").strip() or "1"
+                    )
+                with contextlib.suppress(Exception):
+                    so_onnx.inter_op_num_threads = int(
+                        os.environ.get("ENN_ORT_INTER_OP_THREADS", "1").strip() or "1"
+                    )
+                with contextlib.suppress(Exception):
+                    so_onnx.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
                 so_onnx.optimized_model_filepath = str(optimized_onnx_path)
                 so_onnx.graph_optimization_level = level
                 if optimization_style.lower() == "runtime":
@@ -1426,6 +1463,16 @@ class _ORTBuilder:
         for lvl in levels_to_try:
             try:
                 so = ort.SessionOptions()
+                with contextlib.suppress(Exception):
+                    so.intra_op_num_threads = int(
+                        os.environ.get("ENN_ORT_INTRA_OP_THREADS", "1").strip() or "1"
+                    )
+                with contextlib.suppress(Exception):
+                    so.inter_op_num_threads = int(
+                        os.environ.get("ENN_ORT_INTER_OP_THREADS", "1").strip() or "1"
+                    )
+                with contextlib.suppress(Exception):
+                    so.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
                 so.optimized_model_filepath = str(ort_path)
                 so.graph_optimization_level = lvl
                 so.add_session_config_entry("session.save_model_format", "ORT")
@@ -1782,7 +1829,14 @@ class ORT(Format):
                 onnx_path,
                 dst,
                 optimization_level=str(
-                    kwargs.get("optimization_level", "all")
+                    kwargs.get(
+                        "optimization_level",
+                        (
+                            "basic"
+                            if bool(kwargs.get("dynamic_batch", False))
+                            else "all"
+                        ),
+                    )
                 ),
                 optimization_style=str(
                     kwargs.get("optimization_style", "fixed")

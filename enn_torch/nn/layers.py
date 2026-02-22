@@ -394,6 +394,49 @@ def _coerce_attn_bias_to_bk(
 
     return t.to(device=like.device, dtype=like.dtype, non_blocking=True).contiguous()
 
+
+def _coerce_attn_bias_to_b11k(
+    attn_bias: torch.Tensor, *, B: object, K: object, like: torch.Tensor
+) -> torch.Tensor:
+    t = attn_bias
+    exporting = bool(is_export_or_trace() or is_compiling() or is_symbolic())
+    if t.dim() == 4:
+        if not exporting:
+            if int(t.shape[-1]) != int(K):
+                raise RuntimeError(
+                    f"attn_bias K mismatch: {tuple(t.shape)} vs K={int(K)}"
+                )
+            b0 = int(t.shape[0])
+            if b0 not in (1, int(B)):
+                raise RuntimeError(
+                    f"attn_bias B mismatch: {tuple(t.shape)} vs B={int(B)}"
+                )
+        return (
+            t.to(device=like.device, dtype=like.dtype, non_blocking=True)
+            .contiguous()
+        )
+
+    if t.dim() == 2:
+        t2 = t
+    elif t.dim() == 1:
+        t2 = t.reshape(1, t.shape[0])
+    else:
+        raise RuntimeError(
+            f"Unsupported attn_bias rank {int(t.dim())}: {tuple(t.shape)}"
+        )
+
+    if not exporting:
+        if int(t2.shape[1]) != int(K) or int(t2.shape[0]) not in (1, int(B)):
+            raise RuntimeError(
+                f"attn_bias shape mismatch: {tuple(t2.shape)} vs (1|B,K)=({int(B)},{int(K)})"
+            )
+
+    t4 = t2.reshape(t2.shape[0], 1, 1, t2.shape[1])
+    return (
+        t4.to(device=like.device, dtype=like.dtype, non_blocking=True)
+        .contiguous()
+    )
+
 class Retention(nn.Module):
     def __init__(
         self: Self,
@@ -718,8 +761,8 @@ class DilatedAttention(nn.Module):
 
         B, L, _ = x.shape
         device = x.device
-        exporting = bool(is_export_or_trace())
         compiling = bool(is_compiling())
+        exporting = bool(is_export_or_trace()) and (not compiling)
 
         x_norm = self.norm1(x)
         kv = x_norm if context is None else self.norm1(context)
@@ -735,7 +778,7 @@ class DilatedAttention(nn.Module):
             and (create_block_mask is not None)
         )
 
-        allow_mha = True
+        allow_mha = not (exporting or compiling)
         allow_dpa = bool(
             (context is None)
             and (not need_weights)
@@ -969,8 +1012,11 @@ class CrossAttention(nn.Module):
                 "CrossAttention expects latents (B,Lq,D) and tokens (B,Lk,D), "
                 f"got {tuple(latents.shape)} and {tuple(tokens.shape)}"
             )
-        B, Lq, D = latents.shape
-        _, Lk, Dk = tokens.shape
+        B = latents.size(0)
+        Lq = latents.size(1)
+        D = latents.size(2)
+        Lk = tokens.size(1)
+        Dk = tokens.size(2)
         if (latents.size(-1) != self.d_model) or (tokens.size(-1) != self.d_model):
             raise ValueError(
                 f"CrossAttention expects last dim D={self.d_model}, got latents D={D} tokens D={Dk}"
@@ -982,12 +1028,12 @@ class CrossAttention(nn.Module):
         H = int(self.nhead)
         Dh = int(self.head_dim)
 
-        q = self.q_proj(q_in).view(B, Lq, H, Dh).transpose(1, 2)
-        k = self.k_proj(kv_in).view(B, Lk, H, Dh).transpose(1, 2)
-        v = self.v_proj(kv_in).view(B, Lk, H, Dh).transpose(1, 2)
+        q = self.q_proj(q_in).reshape(B, Lq, H, Dh).transpose(1, 2)
+        k = self.k_proj(kv_in).reshape(B, Lk, H, Dh).transpose(1, 2)
+        v = self.v_proj(kv_in).reshape(B, Lk, H, Dh).transpose(1, 2)
 
-        exporting = bool(is_export_or_trace())
         compiling = bool(is_compiling())
+        exporting = bool(is_export_or_trace()) and (not compiling)
         has_bias = attn_bias is not None
 
         def _is_fp8_tensor(x: torch.Tensor) -> bool:
@@ -1041,7 +1087,7 @@ class CrossAttention(nn.Module):
             _ensure_flex_kwargs_initialized()
             allow_flex = (not self._disable_flex_bias_runtime) and ("score_mod" in _FLEX_KWARGS)
 
-        allow_mha = True
+        allow_mha = not (exporting or compiling)
         allow_dpa = True
 
         plan = ATTENTION_POLICY.plan(
@@ -1063,7 +1109,7 @@ class CrossAttention(nn.Module):
                     score_mod = None
                     if has_bias:
                         bias_bk = _coerce_attn_bias_to_bk(
-                            attn_bias, B=int(B), K=int(Lk), like=q
+                            attn_bias, B=B, K=Lk, like=q
                         )
                         sm = self._flex_keybias_score_mod
                         if sm is None:
@@ -1167,7 +1213,7 @@ class CrossAttention(nn.Module):
                     k,
                     v,
                     attn_mask=_coerce_attn_bias_to_b11k(
-                        attn_bias, B=int(B), K=int(Lk), like=q
+                        attn_bias, B=B, K=Lk, like=q
                     ) if has_bias else None,
                     is_causal=False,
                     dropout_p=self.dropout_p if self.training else 0.0,
@@ -1199,7 +1245,7 @@ class CrossAttention(nn.Module):
                 q,
                 k,
                 v,
-                attn_mask=_coerce_attn_bias_to_b11k(attn_bias, B=int(B), K=int(Lk), like=q)
+                attn_mask=_coerce_attn_bias_to_b11k(attn_bias, B=B, K=Lk, like=q)
                 if has_bias
                 else None,
                 is_causal=False,
@@ -1342,10 +1388,10 @@ class LatentAttention(nn.Module):
             .unbind(0)
         )
 
-        exporting = bool(is_export_or_trace())
         compiling = bool(is_compiling())
+        exporting = bool(is_export_or_trace()) and (not compiling)
         allow_flex = not self._disable_flex_runtime
-        allow_mha = True
+        allow_mha = not (exporting or compiling)
         allow_dpa = True
 
         plan = ATTENTION_POLICY.plan(
