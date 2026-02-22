@@ -5612,40 +5612,61 @@ def process(*args: Any, **kwargs: Any) -> object:
             map_location="cpu",
         )
         model.to(device, non_blocking=device.type in ("cuda", "xpu")).eval()
+        if ops.sources is None:
+            raise RuntimeError("RuntimeConfig.sources is required but None")
+        expanded_sources = collate.expand_source(ops.sources)
+        if expanded_sources is not ops.sources:
+            ops = replace(ops, sources=expanded_sources)
         metadata = Dataset.for_device(device)
-        model, _, _ = ModelPolicy.use_nvidia_layers(model, device=device)
+        meta_info = collate.merge_meta_info(ops.sources)
+        metadata.has_scale = bool(
+            meta_info.get("has_scale", False)
+            or meta_info.get("scale_max_abs") is not None
+            or meta_info.get("scale_min_value") is not None
+            or (meta_info.get("scale_max_value") is not None)
+            or (meta_info.get("scale_min_positive") is not None)
+            or (meta_info.get("scale_min_abs") is not None)
+        )
+        metadata.has_nonfinite = bool(meta_info.get("has_nonfinite", False))
+        metadata.scale_max_abs = meta_info.get("scale_max_abs")
+        metadata.scale_min_value = meta_info.get("scale_min_value")
+        metadata.scale_max_value = meta_info.get("scale_max_value")
+        metadata.scale_min_positive = meta_info.get(
+            "scale_min_positive"
+        ) or meta_info.get("scale_min_abs")
+        metadata.scale_is_integral = meta_info.get("scale_is_integral")
+        if meta_info.get("is_negotiable") is not None:
+            metadata.is_negotiable = bool(meta_info.get("is_negotiable"))
+        if meta_info.get("underflow_action") is not None:
+            metadata.underflow_action = str(meta_info.get("underflow_action"))
+        feat_dtype_name = str(meta_info.get("features_dtype", "")).lower()
+        lab_dtype_name = str(meta_info.get("labels_dtype", "")).lower()
+        if "float64" in feat_dtype_name or "float64" in lab_dtype_name:
+            metadata.is_negotiable = False
+        precision = PrecisionPolicy.from_metadata(
+            device=device, metadata=metadata, logger=_LOGGER
+        )
+        param_dtype = precision.master_float
+        model, _, _ = ModelPolicy.use_nvidia_layers(
+            model,
+            device=device,
+            metadata=metadata,
+            params_dtype=param_dtype,
+        )
         _m_eval = model.module if hasattr(model, "module") else model
         _preload_layers(_m_eval, device)
+        _cast_float_dtype(model, param_dtype)
         _validate_model_dtype_unity(_m_eval, device)
         _validate_no_meta_tensors(_m_eval)
         _validate_no_fake_dtensor(_m_eval)
         _enable_meta_monitor(_m_eval)
-        _unify_model_dtype(
-            model,
-            prefer=(
-                torch.bfloat16
-                if getattr(device, "type", None) == "cuda"
-                and is_cuda_bf16_supported(device)
-                else None
-            ),
-        )
         StatelessAutocast.configure(model, metadata=metadata)
         enable_tf32 = bool(getattr(ops, "enable_tf32", True))
-        with contextlib.suppress(Exception):
-            param_dtype = next(
-                (
-                    p.dtype
-                    for p in (
-                        model.module if hasattr(model, "module") else model
-                    ).parameters()
-                ),
-                None,
-            )
         with contextlib.suppress(Exception):
             set_float32_precision(
                 device=device,
                 dtype=param_dtype,
-                autocast_dtype=param_dtype,
+                autocast_dtype=precision.amp_float or param_dtype,
                 enable_tf32=enable_tf32,
             )
         fp8_quantize = env_bool("ENN_ENABLE_FP8_QUANTIZE", default=False)
@@ -5669,8 +5690,6 @@ def process(*args: Any, **kwargs: Any) -> object:
                 "[FP8][quantize] skipped (default AMP-only). "
                 "Set ENN_ENABLE_FP8_QUANTIZE=1 to run model quantization."
             )
-        if ops.sources is None:
-            raise RuntimeError("RuntimeConfig.sources is required but None")
         model.eval()
         with contextlib.suppress(Exception):
             _get_sample_size(
@@ -5680,9 +5699,6 @@ def process(*args: Any, **kwargs: Any) -> object:
                 dataset=metadata,
                 with_backward=False,
             )
-        expanded_sources = collate.expand_source(ops.sources)
-        if expanded_sources is not ops.sources:
-            ops = replace(ops, sources=expanded_sources)
         session = None
         session = Session(
             sources=ops.sources,

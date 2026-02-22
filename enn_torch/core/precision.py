@@ -15,7 +15,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Mapping, Optional, Self, Tuple, Union
 
 import torch
-from ..core.datatypes import default_underflow_action, normalize_underflow_action
+from ..core.datatypes import default_underflow_action, normalize_underflow_action, env_bool
 from ..nn.graph import clear_model_cache
 from .concurrency import Mutex
 from .system import (
@@ -1405,6 +1405,14 @@ def get_layernorm_dtype(device: torch.device | str) -> torch.dtype:
     )
     try:
         meta = StatelessAutocast.coerce_metadata(device)
+        with contextlib.suppress(Exception):
+            from .policies import PrecisionPolicy
+
+            mf = PrecisionPolicy.from_metadata(
+                device=device, metadata=meta, logger=_LOGGER
+            ).master_float
+            if mf == torch.float64:
+                return torch.float64
         cands = (
             tuple(getattr(meta, "float_dtypes", ()))
             if meta is not None
@@ -1522,9 +1530,7 @@ def validate_model_dtype_unity(
             ("weight", getattr(module, "weight", None)),
             ("bias", getattr(module, "bias", None)),
         ]
-        expected: torch.dtype | None = (
-            get_layernorm_dtype(device) if device.type == "cpu" else None
-        )
+        expected: torch.dtype | None = None
 
         for label, tensor in tensors:
             if (
@@ -1569,10 +1575,8 @@ def unify_model_dtype(
 
     if prefer is not None:
         tgt = prefer
-    elif torch.bfloat16 in dtypes:
-        tgt = torch.bfloat16
-    elif torch.float16 in dtypes:
-        tgt = torch.float16
+    elif torch.float64 in dtypes:
+        tgt = torch.float64
     else:
         tgt = torch.float32
 
@@ -1776,13 +1780,14 @@ class StatefulAutocast:
         with self.state._lock:
             self.state.record_failure()
 
-        with contextlib.suppress(Exception):
-            self.logger.warning(
-                "[stateful-autocast] nonfinite in %s -> rerun AMP off (policy=%s, failures=%d)",
-                self.name or getattr(fn, "__name__", "fn"),
-                str(self.state.policy),
-                int(self.state.failures),
-            )
+        if env_bool("ENN_LOG_STATEFUL_AUTOCAST", default=False):
+            with contextlib.suppress(Exception):
+                self.logger.warning(
+                    "[stateful-autocast] nonfinite in %s -> rerun AMP off (policy=%s, failures=%d)",
+                    self.name or getattr(fn, "__name__", "fn"),
+                    str(self.state.policy),
+                    int(self.state.failures),
+                )
 
         return _run_no_amp()
 

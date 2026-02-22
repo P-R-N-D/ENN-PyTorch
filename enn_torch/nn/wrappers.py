@@ -2698,11 +2698,34 @@ class Fuser(nn.Module):
             (p for p in self.perceiver.parameters() if torch.is_tensor(p)), None
         )
         if torch.is_tensor(p0):
-            return p0.dtype
-        p0 = next((p for p in self.parameters() if torch.is_tensor(p)), None)
-        if torch.is_tensor(p0):
-            return p0.dtype
-        return torch.get_default_dtype()
+            dev = p0.device
+        else:
+            p0 = next((p for p in self.parameters() if torch.is_tensor(p)), None)
+            dev = p0.device if torch.is_tensor(p0) else get_device()
+
+        key = (
+            str(getattr(dev, "type", "cpu")),
+            int(getattr(dev, "index", -1) or -1),
+        )
+        cache = getattr(self, "_perceiver_master_dtype_cache", None)
+        if isinstance(cache, dict):
+            cached = cache.get(key, None)
+            if isinstance(cached, torch.dtype):
+                return cached
+
+        meta = StatelessAutocast.coerce_metadata(dev)
+        try:
+            md = PrecisionPolicy.from_metadata(
+                device=dev, metadata=meta, logger=_LOGGER
+            ).master_float
+        except Exception:
+            md = torch.float32
+
+        if not isinstance(cache, dict):
+            cache = {}
+            setattr(self, "_perceiver_master_dtype_cache", cache)
+        cache[key] = md
+        return md
 
     def _call_perceiver(
         self,
@@ -2731,6 +2754,7 @@ class Fuser(nn.Module):
                 attn_bias=attn_bias,
                 device=all_tokens.device,
                 master_dtype=master,
+                retry_master_dtype=master,
                 validate=self._tensor_has_nonfinite,
             ),
         )
@@ -2762,6 +2786,7 @@ class Fuser(nn.Module):
                 list(child_tokens),
                 device=device,
                 master_dtype=master,
+                retry_master_dtype=master,
                 validate=self._tensor_has_nonfinite,
             ),
         )
@@ -3226,7 +3251,7 @@ class Fuser(nn.Module):
                         )
                         setattr(self, "_nonfinite_fallback_warned", True)
 
-                    if env_bool("ENN_FUSER_DIAG_NONFINITE_PARAMS", default=True):
+                    if env_bool("ENN_FUSER_DIAG_NONFINITE_PARAMS", default=True) and (not bool(getattr(self, "_nonfinite_params_warned", False))):
                         with contextlib.suppress(Exception):
                             bad: list[str] = []
                             for pn, pv in self.perceiver.named_parameters():
@@ -3241,6 +3266,7 @@ class Fuser(nn.Module):
                                     "[ENN] Fuser: non-finite parameters detected in perceiver: %s",
                                     ", ".join(bad),
                                 )
+                                setattr(self, "_nonfinite_params_warned", True)
 
                     fused_tokens = _fallback_fused_from_all()
                 context = self.decode(fused_tokens, apply_norm=True)
