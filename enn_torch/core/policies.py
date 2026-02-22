@@ -1555,34 +1555,32 @@ class PrecisionPolicy:
         )
         with contextlib.suppress(Exception):
             setattr(meta, "underflow_action", action)
-        is_negotiable = bool(getattr(meta, "is_negotiable", False))
+
+        has_scale = bool(getattr(meta, "has_scale", False))
+        is_negotiable = bool(getattr(meta, "is_negotiable", False)) and has_scale
         safety = float(safety_margin)
         amp_dtype: Optional[torch.dtype] = None
         master_float = (
             torch.float32
             if is_negotiable
-            or (
-                dev.type not in ("cpu", "xpu", "mps")
-                and is_scale_safe(torch.float32, meta, safety_margin=safety)
-            )
+            and is_scale_safe(torch.float32, meta, safety_margin=safety)
             else torch.float64
         )
         match dev.type:
             case "cuda":
-                if is_negotiable and is_scale_safe(
-                    torch.float32, meta, safety_margin=safety
-                ):
-                    master_float = torch.float32
-                if is_cuda_bf16_supported(dev) and is_scale_safe(
-                    torch.bfloat16, meta, safety_margin=safety
-                ):
-                    amp_dtype = torch.bfloat16
-                elif is_scale_safe(torch.float16, meta, safety_margin=safety):
-                    amp_dtype = torch.float16
+                if master_float == torch.float32:
+                    if is_cuda_bf16_supported(dev) and is_scale_safe(
+                        torch.bfloat16, meta, safety_margin=safety
+                    ):
+                        amp_dtype = torch.bfloat16
+                    elif is_scale_safe(torch.float16, meta, safety_margin=safety):
+                        amp_dtype = torch.float16
             case "xpu":
-                amp_dtype = torch.bfloat16
+                if master_float == torch.float32:
+                    amp_dtype = torch.bfloat16
             case "mps":
-                amp_dtype = torch.float16
+                if master_float == torch.float32:
+                    amp_dtype = torch.float16
         fsdp_dt = (
             amp_dtype
             if master_float == torch.float32 and amp_dtype

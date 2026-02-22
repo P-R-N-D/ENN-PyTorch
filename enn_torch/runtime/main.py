@@ -5613,39 +5613,30 @@ def process(*args: Any, **kwargs: Any) -> object:
         )
         model.to(device, non_blocking=device.type in ("cuda", "xpu")).eval()
         metadata = Dataset.for_device(device)
-        model, _, _ = ModelPolicy.use_nvidia_layers(model, device=device)
+        precision = PrecisionPolicy.from_metadata(
+            device=device, metadata=metadata, logger=_LOGGER
+        )
+        param_dtype = precision.master_float
+        model, _, _ = ModelPolicy.use_nvidia_layers(
+            model,
+            device=device,
+            metadata=metadata,
+            params_dtype=param_dtype,
+        )
         _m_eval = model.module if hasattr(model, "module") else model
         _preload_layers(_m_eval, device)
+        _cast_float_dtype(model, param_dtype)
         _validate_model_dtype_unity(_m_eval, device)
         _validate_no_meta_tensors(_m_eval)
         _validate_no_fake_dtensor(_m_eval)
         _enable_meta_monitor(_m_eval)
-        _unify_model_dtype(
-            model,
-            prefer=(
-                torch.bfloat16
-                if getattr(device, "type", None) == "cuda"
-                and is_cuda_bf16_supported(device)
-                else None
-            ),
-        )
         StatelessAutocast.configure(model, metadata=metadata)
         enable_tf32 = bool(getattr(ops, "enable_tf32", True))
-        with contextlib.suppress(Exception):
-            param_dtype = next(
-                (
-                    p.dtype
-                    for p in (
-                        model.module if hasattr(model, "module") else model
-                    ).parameters()
-                ),
-                None,
-            )
         with contextlib.suppress(Exception):
             set_float32_precision(
                 device=device,
                 dtype=param_dtype,
-                autocast_dtype=param_dtype,
+                autocast_dtype=precision.amp_float or param_dtype,
                 enable_tf32=enable_tf32,
             )
         fp8_quantize = env_bool("ENN_ENABLE_FP8_QUANTIZE", default=False)
