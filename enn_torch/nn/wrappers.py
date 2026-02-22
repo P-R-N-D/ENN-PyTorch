@@ -2694,14 +2694,14 @@ class Fuser(nn.Module):
                 return not bool(torch.isfinite(t).all().item())
 
     def _perceiver_master_dtype(self) -> torch.dtype:
-        with contextlib.suppress(StopIteration):
-            p0 = next((p for p in self.perceiver.parameters() if torch.is_tensor(p)), None)
-            if torch.is_tensor(p0):
-                return p0.dtype
-        with contextlib.suppress(StopIteration):
-            p0 = next((p for p in self.parameters() if torch.is_tensor(p)), None)
-            if torch.is_tensor(p0):
-                return p0.dtype
+        p0 = next(
+            (p for p in self.perceiver.parameters() if torch.is_tensor(p)), None
+        )
+        if torch.is_tensor(p0):
+            return p0.dtype
+        p0 = next((p for p in self.parameters() if torch.is_tensor(p)), None)
+        if torch.is_tensor(p0):
+            return p0.dtype
         return torch.get_default_dtype()
 
     def _call_perceiver(
@@ -2710,8 +2710,18 @@ class Fuser(nn.Module):
         *,
         attn_bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        if not bool(getattr(self, "_perceiver_stateful_autocast_enabled", False)):
+        if bool(is_export_or_trace()):
             return cast(torch.Tensor, self.perceiver(all_tokens, attn_bias=attn_bias))
+        if (
+            hasattr(torch, "compiler")
+            and hasattr(torch.compiler, "is_compiling")
+            and bool(torch.compiler.is_compiling())
+        ):
+            return cast(torch.Tensor, self.perceiver(all_tokens, attn_bias=attn_bias))
+        if not bool(getattr(self, "_perceiver_stateful_autocast_enabled", False)):
+            return cast(
+                torch.Tensor, self.perceiver(all_tokens, attn_bias=attn_bias)
+            )
         master = self._perceiver_master_dtype()
         return cast(
             torch.Tensor,
@@ -2733,6 +2743,14 @@ class Fuser(nn.Module):
         *,
         device: torch.device,
     ) -> torch.Tensor:
+        if bool(is_export_or_trace()):
+            return fuse_fn(child_names, child_tokens)
+        if (
+            hasattr(torch, "compiler")
+            and hasattr(torch.compiler, "is_compiling")
+            and bool(torch.compiler.is_compiling())
+        ):
+            return fuse_fn(child_names, child_tokens)
         if not bool(getattr(self, "_perceiver_stateful_autocast_enabled", False)):
             return fuse_fn(child_names, child_tokens)
         master = self._perceiver_master_dtype()

@@ -131,7 +131,8 @@ def _run_isolated_export(
     timeout_s = 120
     if str(fmt_name).strip().lower() in ("onnx", "ort"):
         timeout_s = 600
-        env.setdefault("ENN_ONNX_TRY_DYNAMO", "0")
+        env.setdefault("ENN_ONNX_PREFER_DYNAMO", "auto")
+        env.setdefault("ENN_ONNX_TRY_DYNAMO", "1")
     with contextlib.suppress(Exception):
         timeout_s = int(
             os.environ.get(
@@ -505,10 +506,13 @@ def _export_only_main(fmt_name: str, out_path: str, state_path: str) -> int:
             "tensorflow",
             "litert",
         }:
-            save_kw["prefer_dynamo"] = bool(
-                os.environ.get("ENN_ONNX_PREFER_DYNAMO", "0").strip().lower()
-                in ("1", "true", "yes", "y", "on")
-            )
+            pref = str(os.environ.get("ENN_ONNX_PREFER_DYNAMO", "auto") or "auto").strip().lower()
+            if pref in ("1", "true", "yes", "y", "on"):
+                save_kw["prefer_dynamo"] = True
+            elif pref in ("0", "false", "no", "n", "off"):
+                save_kw["prefer_dynamo"] = False
+            else:
+                save_kw["prefer_dynamo"] = bool(save_kw.get("dynamic_batch", False))
         t0 = time.time()
         fmt.save(model, out_path, **save_kw)
         dt = time.time() - t0
