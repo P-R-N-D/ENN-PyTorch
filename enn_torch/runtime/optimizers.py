@@ -26,7 +26,7 @@ from typing import (
 import torch
 from ..core.concurrency import Mutex
 from ..core.policies import ModelPolicy, PrecisionPolicy
-from ..core.precision import Autocast, is_scale_safe
+from ..core.precision import StatelessAutocast, is_scale_safe
 from ..core.system import get_device, optimal_optimizer_params
 from ..data.pipeline import Dataset
 from torch import nn, optim
@@ -164,7 +164,7 @@ def _dataset_for_device(
         if metadata
         else ref_tensor.device if ref_tensor is not None else get_device()
     )
-    meta = Autocast.coerce_metadata(dev, metadata=metadata)
+    meta = StatelessAutocast.coerce_metadata(dev, metadata=metadata)
     return torch.device(meta.device), meta
 
 
@@ -457,7 +457,7 @@ class AdamW:
             if selected_opt:
                 selected_name = "te.FusedAdam"
         if not selected_opt and mode == "float" and dev.type == "cuda":
-            float8_dtypes = Autocast.float8_formats()
+            float8_dtypes = StatelessAutocast.float8_formats()
             safe_fp8 = not getattr(meta, "has_scale", False) or any(
                 is_scale_safe(dtype, meta, safety_margin=2.0)
                 for dtype in float8_dtypes
@@ -596,7 +596,7 @@ class ExponentialMovingAverage(nn.Module):
         )
         meta = metadata if isinstance(metadata, Dataset) else None
         dev = torch.device(
-            Autocast.coerce_metadata(get_device(), metadata=meta).device
+            StatelessAutocast.coerce_metadata(get_device(), metadata=meta).device
         )
         self.master_float, self.master_int = _master_cpu_dtypes(dev, meta)
         self.shadow: Dict[str, torch.Tensor] = {}
@@ -781,7 +781,7 @@ class StochasticWeightAverage(nn.Module):
         self._has_bn = _has_batchnorm_modules(model)
         meta = metadata if isinstance(metadata, Dataset) else None
         dev = torch.device(
-            Autocast.coerce_metadata(get_device(), metadata=meta).device
+            StatelessAutocast.coerce_metadata(get_device(), metadata=meta).device
         )
         self._model_device = dev
         self._master_float, self._master_int = _master_cpu_dtypes(dev, meta)

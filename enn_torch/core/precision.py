@@ -11,8 +11,8 @@ import os
 import threading
 from collections import OrderedDict
 from contextlib import AbstractContextManager
-from dataclasses import dataclass
-from typing import Any, Callable, Dict, List, Optional, Self, Tuple, Union
+from dataclasses import dataclass, field
+from typing import Any, Callable, Dict, List, Mapping, Optional, Self, Tuple, Union
 
 import torch
 from ..core.datatypes import default_underflow_action, normalize_underflow_action
@@ -383,7 +383,7 @@ class DeviceMeta:
         )
 
 
-class Autocast:
+class StatelessAutocast:
     _preferred_fp8_backend: Optional[str] = None
     _preferred_int_backend: Optional[str] = None
     _last_float_dtype: torch.dtype = torch.float32
@@ -746,24 +746,30 @@ class Autocast:
         def _parse_margin() -> tuple[float, int]:
             p2 = kwargs.pop("safety_margin_pow2", None)
             if p2 is not None:
-                return float(2 ** max(0, min(30, int(p2 or 3)))), int(p2 or 3)
+                p2i = max(0, min(30, int(p2 or 3)))
+                return float(2**p2i), int(p2i)
             margin = float(kwargs.pop("safety_margin", 8.0))
-            return (
-                (margin, int(round(math.log2(margin))))
-                if margin > 0
-                else (8.0, 3)
-            )
+            if margin > 0:
+                p = int(round(math.log2(margin)))
+                return float(margin), int(p)
+            return 8.0, 3
 
+        del args
         safety_margin, safety_margin_pow2 = _parse_margin()
         underflow_override = normalize_underflow_action(
             kwargs.pop("underflow_action", kwargs.pop("underflow", None)),
             default=default_underflow_action(),
         )
-        collect_checks = logger and (
-            logger.isEnabledFor(logging.DEBUG)
-            or logger.isEnabledFor(logging.INFO)
+        collect_checks = bool(
+            logger
+            and (
+                logger.isEnabledFor(logging.DEBUG)
+                or logger.isEnabledFor(logging.INFO)
+            )
         )
-        checks, selected, selected_from = [], None, "candidate"
+        checks: list[dict[str, object]] = []
+        selected: torch.dtype | None = None
+        selected_from = "candidate"
 
         for dt in candidates:
             ok, why = _validate_dtype_safety(
@@ -787,11 +793,42 @@ class Autocast:
         fallback_order: Tuple[torch.dtype, ...] = ()
         if selected is None:
             selected_from = "fallback"
-            fallback_order = (
-                (fallback, torch.float32, torch.float64)
-                if getattr(fallback, "is_floating_point", False)
-                else (fallback, torch.int64, torch.float32, torch.float64)
-            )
+            seen: set[torch.dtype] = set()
+            ordered: list[torch.dtype] = []
+
+            def _add(dt: Any) -> None:
+                nonlocal ordered, seen
+                if not isinstance(dt, torch.dtype):
+                    return
+                if dt in seen:
+                    return
+                seen.add(dt)
+                ordered.append(dt)
+
+            _add(fallback)
+
+            if meta is not None:
+                try:
+                    if getattr(fallback, "is_floating_point", False):
+                        for x in tuple(getattr(meta, "float_dtypes", ()) or ()):
+                            _add(_coerce_torch_dtype(x, fallback))
+                    else:
+                        for x in tuple(getattr(meta, "int_dtypes", ()) or ()):
+                            _add(_coerce_torch_dtype(x, cls._last_int_dtype))
+                        for x in tuple(getattr(meta, "float_dtypes", ()) or ()):
+                            _add(_coerce_torch_dtype(x, torch.get_default_dtype()))
+                except Exception:
+                    pass
+
+            if getattr(fallback, "is_floating_point", False):
+                _add(cls._last_float_dtype)
+                _add(torch.get_default_dtype())
+            else:
+                _add(cls._last_int_dtype)
+                _add(cls._last_float_dtype)
+                _add(torch.get_default_dtype())
+
+            fallback_order = tuple(ordered)
             for dt in fallback_order:
                 ok, why = _validate_dtype_safety(
                     dt,
@@ -813,6 +850,9 @@ class Autocast:
             if selected is None:
                 selected, selected_from = fallback, "unsafe-fallback"
 
+        if selected is None:
+            selected = fallback
+
         if logger is not None:
             level = "info" if selected_from != "candidate" else "debug"
             if logger.isEnabledFor(
@@ -833,15 +873,20 @@ class Autocast:
                         _parse_dtype(fallback),
                         scale_key,
                         float(safety_margin),
+                        int(safety_margin_pow2),
                     )
 
-                payload = {
+                payload: dict[str, object] = {
                     "context": str(context),
                     "device": str(device),
                     "selected": _parse_dtype(selected),
                     "selected_from": selected_from,
                     "scale": _get_meta_stats(meta),
                 }
+                if fallback_order:
+                    payload["fallback_order"] = [
+                        _parse_dtype(x) for x in fallback_order
+                    ]
                 if collect_checks:
                     payload["checks"] = checks
                 _log_negotiation(logger, decision_key, payload, level=level)
@@ -898,13 +943,15 @@ class Autocast:
         dev = cls._device(device)
         meta = cls.coerce_metadata(dev, metadata=metadata)
         amp_candidates = (
-            tuple(getattr(meta, "float_dtypes", ()))
-            if getattr(meta, "float_dtypes", ())
-            else (torch.float32,)
+            tuple(getattr(meta, "float_dtypes", ()) or ())
+            if meta is not None
+            else ()
         )
+        if not amp_candidates:
+            amp_candidates = (cls._last_float_dtype,)
         amp_dtype = cls.negotiate(
-            amp_candidates,
-            fallback=torch.float64,
+            tuple(amp_candidates),
+            fallback=cls._last_float_dtype,
             logger=_LOGGER,
             context="float",
             device=dev,
@@ -973,7 +1020,7 @@ class Autocast:
                     )
                 )
             except (RuntimeError, ValueError) as exc:
-                _LOGGER.debug("Autocast.float torch.amp fallback: %s", exc)
+                _LOGGER.debug("StatelessAutocast.float torch.amp fallback: %s", exc)
                 contexts.append(contextlib.nullcontext())
             cls._last_float_dtype = requested_dtype
 
@@ -981,7 +1028,7 @@ class Autocast:
         if _LOGGER.isEnabledFor(logging.DEBUG):
             with contextlib.suppress(Exception):
                 _LOGGER.debug(
-                    "Autocast.context(float): %s",
+                    "StatelessAutocast.context(float): %s",
                     json.dumps(
                         {
                             "device": str(dev),
@@ -1076,7 +1123,7 @@ class Autocast:
             if _LOGGER.isEnabledFor(logging.DEBUG):
                 with contextlib.suppress(Exception):
                     _LOGGER.debug(
-                        "Autocast.context(int): %s",
+                        "StatelessAutocast.context(int): %s",
                         json.dumps(
                             {
                                 "device": str(dev),
@@ -1357,24 +1404,24 @@ def get_layernorm_dtype(device: torch.device | str) -> torch.dtype:
         else device
     )
     try:
-        meta = Autocast.coerce_metadata(device)
+        meta = StatelessAutocast.coerce_metadata(device)
         cands = (
             tuple(getattr(meta, "float_dtypes", ()))
             if meta is not None
             else ()
         )
         if not cands:
-            cands = (torch.float32,)
-        chosen = Autocast.negotiate(
+            cands = (torch.get_default_dtype(),)
+        chosen = StatelessAutocast.negotiate(
             tuple(cands),
-            fallback=torch.float64,
+            fallback=torch.get_default_dtype(),
             context="cpu.layernorm",
             device=device,
             meta=meta,
         )
-        return torch.float64 if chosen == torch.float64 else torch.float32
+        return torch.float64 if chosen == torch.float64 else torch.get_default_dtype()
     except Exception:
-        return torch.float32
+        return torch.get_default_dtype()
 
 
 def preload_layers(model: nn.Module, device: torch.device | str) -> None:
@@ -1541,3 +1588,204 @@ def unify_model_dtype(
             )
 
     return tgt
+
+
+def _is_compiling() -> bool:
+    with contextlib.suppress(Exception):
+        import torch._dynamo  # type: ignore
+
+        if bool(getattr(torch._dynamo, "is_compiling", lambda: False)()):
+            return True
+    with contextlib.suppress(Exception):
+        comp = getattr(torch, "compiler", None)
+        if comp is not None and bool(getattr(comp, "is_compiling", lambda: False)()):
+            return True
+    return False
+
+
+def _iter_tensors(x: Any):
+    if torch.is_tensor(x):
+        yield x
+        return
+    if isinstance(x, Mapping):
+        for v in x.values():
+            yield from _iter_tensors(v)
+        return
+    if isinstance(x, (tuple, list)):
+        for v in x:
+            yield from _iter_tensors(v)
+        return
+
+
+def _cast_tree_to_dtype(x: Any, dtype: torch.dtype) -> Any:
+    if torch.is_tensor(x):
+        if (x.is_floating_point() or x.is_complex()) and x.dtype != dtype:
+            return x.to(dtype=dtype)
+        return x
+    if isinstance(x, tuple):
+        return tuple(_cast_tree_to_dtype(v, dtype) for v in x)
+    if isinstance(x, list):
+        return [_cast_tree_to_dtype(v, dtype) for v in x]
+    if isinstance(x, Mapping):
+        return {k: _cast_tree_to_dtype(v, dtype) for k, v in x.items()}
+    return x
+
+
+def _has_nonfinite_tree(x: Any) -> bool:
+    for t in _iter_tensors(x):
+        if not (t.is_floating_point() or t.is_complex()):
+            continue
+        if t.numel() <= 0:
+            continue
+        with torch.no_grad():
+            try:
+                a = t.detach().abs().amax()
+                if not bool(torch.isfinite(a).item()):
+                    return True
+            except Exception:
+                if not bool(torch.isfinite(t).all().item()):
+                    return True
+    return False
+
+
+def _ddp_any_true(flag: bool, device: torch.device) -> bool:
+    if not (torch.distributed.is_available() and torch.distributed.is_initialized()):
+        return bool(flag)
+    try:
+        t = torch.tensor([1 if flag else 0], device=device, dtype=torch.int32)
+        torch.distributed.all_reduce(t, op=torch.distributed.ReduceOp.MAX)
+        return bool(int(t.item()) != 0)
+    except Exception:
+        return bool(flag)
+
+
+def _rng_snapshot(device: torch.device) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    cpu = torch.random.get_rng_state()
+    cuda = None
+    if device.type == "cuda" and torch.cuda.is_available():
+        with contextlib.suppress(Exception):
+            cuda = torch.cuda.get_rng_state(device)
+    return cpu, cuda
+
+
+def _rng_restore(snap: Tuple[torch.Tensor, Optional[torch.Tensor]], device: torch.device) -> None:
+    cpu, cuda = snap
+    with contextlib.suppress(Exception):
+        torch.random.set_rng_state(cpu)
+    if cuda is not None and device.type == "cuda" and torch.cuda.is_available():
+        with contextlib.suppress(Exception):
+            torch.cuda.set_rng_state(cuda, device)
+
+
+@dataclass
+class AutocastState:
+    policy: str = "sticky"
+    cooldown_steps: int = 0
+    max_retries: int = 1
+    step: int = 0
+    failures: int = 0
+    _disabled: bool = False
+    _disable_until: int = 0
+    _lock: Mutex = field(default_factory=lambda: Mutex(reentrant=True), repr=False)
+
+    def __getstate__(self) -> dict[str, object]:
+        d = self.__dict__.copy()
+        d.pop("_lock", None)
+        return d
+
+    def __setstate__(self, state: dict[str, object]) -> None:
+        self.__dict__.update(state)
+        self._lock = Mutex(reentrant=True)
+
+    def _norm_policy(self) -> str:
+        p = str(self.policy or "").strip().lower()
+        if p in ("cooldown", "cd"):
+            return "cooldown"
+        return "sticky"
+
+    def tick(self) -> None:
+        self.step = int(self.step) + 1
+        if self._norm_policy() == "cooldown":
+            if int(self._disable_until) > 0 and int(self.step) >= int(self._disable_until):
+                self._disabled = False
+                self._disable_until = 0
+
+    def should_disable_amp(self) -> bool:
+        if self._norm_policy() == "sticky":
+            return bool(self._disabled)
+        return bool(self._disabled and int(self._disable_until) > int(self.step))
+
+    def record_failure(self) -> None:
+        self.failures = int(self.failures) + 1
+        self._disabled = True
+        if self._norm_policy() == "cooldown":
+            cd = max(0, int(self.cooldown_steps))
+            self._disable_until = int(self.step) + cd
+
+
+class StatefulAutocast:
+    def __init__(self, state: AutocastState, *, name: str = "", logger: logging.Logger | None = None) -> None:
+        self.state = state
+        self.name = str(name or "")
+        self.logger = logger or _LOGGER
+
+    def call(
+        self,
+        fn: Callable[..., Any],
+        *args: Any,
+        device: torch.device,
+        master_dtype: torch.dtype,
+        validate: Callable[[Any], bool] | None = None,
+        retry_fn: Callable[..., Any] | None = None,
+        retry_master_dtype: torch.dtype | None = None,
+        **kwargs: Any,
+    ) -> Any:
+        if _is_compiling() or torch.jit.is_tracing():
+            return fn(*args, **kwargs)
+
+        dev = torch.device(device)
+        md = master_dtype
+        md_retry = retry_master_dtype if isinstance(retry_master_dtype, torch.dtype) else md
+
+        with self.state._lock:
+            self.state.tick()
+            disable_amp = self.state.should_disable_amp()
+
+        def _run_no_amp() -> Any:
+            a2 = _cast_tree_to_dtype(args, md_retry)
+            k2 = _cast_tree_to_dtype(kwargs, md_retry)
+            with StatelessAutocast.suspend(dev):
+                f = retry_fn or fn
+                return f(*a2, **k2)
+
+        if disable_amp:
+            return _run_no_amp()
+
+        snap = _rng_snapshot(dev) if torch.is_grad_enabled() else None
+        out = fn(*args, **kwargs)
+
+        bad = bool(validate(out) if callable(validate) else _has_nonfinite_tree(out))
+        bad = _ddp_any_true(bad, dev)
+
+        if (not bad) or (not torch.is_autocast_enabled()) or int(self.state.max_retries) <= 0:
+            return out
+
+        if snap is not None:
+            _rng_restore(snap, dev)
+
+        with self.state._lock:
+            self.state.record_failure()
+
+        with contextlib.suppress(Exception):
+            self.logger.warning(
+                "[stateful-autocast] nonfinite in %s -> rerun AMP off (policy=%s, failures=%d)",
+                self.name or getattr(fn, "__name__", "fn"),
+                str(self.state.policy),
+                int(self.state.failures),
+            )
+
+        return _run_no_amp()
+
+
+
+Autocast = StatelessAutocast

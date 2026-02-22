@@ -59,7 +59,7 @@ from ..core.datatypes import (
 )
 from ..core.policies import DistributedPolicy, ModelPolicy, PrecisionPolicy
 from ..core.precision import (
-    Autocast,
+    StatelessAutocast,
     cast_batchnorm_buffers_dtype as _cast_batchnorm_buffers_dtype,
     cast_float_dtype as _cast_float_dtype,
     preload_layers as _preload_layers,
@@ -603,7 +603,7 @@ def epochs(
     with contextlib.suppress(Exception):
         import inspect
 
-        f = getattr(Autocast, "resolve_float_dtype", None)
+        f = getattr(StatelessAutocast, "resolve_float_dtype", None)
         if callable(f):
             try:
                 sig = inspect.signature(f)
@@ -1247,7 +1247,7 @@ def epochs(
                                     if getattr(device, "type", None) == "cuda":
                                         cudagraph_mark_step_begin()
                                         mark_cudagraph = True
-                                    with Autocast.float(device):
+                                    with StatelessAutocast.float(device):
                                         Y_flat = Y.reshape(Y.shape[0], -1)
                                         if (
                                             Y_flat.device != device
@@ -2129,7 +2129,7 @@ def epochs(
             if val_loader is not None and flop_counter_val is not None:
                 with flop_counter_val:
                     model.eval()
-                    with inference_mode(model), Autocast.float(device):
+                    with inference_mode(model), StatelessAutocast.float(device):
                         t_fetch_start = time.perf_counter_ns()
                         for _vstep, _raw in enumerate(val_loader):
                             while True:
@@ -2184,7 +2184,7 @@ def epochs(
                                         if getattr(device, "type", None) == "cuda":
                                             cudagraph_mark_step_begin()
                                             mark_cudagraph = True
-                                        with Autocast.float(device):
+                                        with StatelessAutocast.float(device):
                                             Yv_flat = Y.reshape(
                                                 Y.shape[0], -1
                                             ).to(
@@ -2616,7 +2616,7 @@ def epochs(
         sum_x, sum_y, sum_x2, sum_xy, total_n: int, seen_batches: int, seen_samples: int
     ):
         model.eval()
-        with inference_mode(model), Autocast.float(device):
+        with inference_mode(model), StatelessAutocast.float(device):
             for batch in _iter_raw(calib_src):
                 if int(max_batches) > 0 and int(seen_batches) >= int(max_batches):
                     break
@@ -3175,7 +3175,7 @@ def infer(
         make_fence_event=make_fence_event,
     )
     try:
-        with inference_mode(run_model), Autocast.float(device):
+        with inference_mode(run_model), StatelessAutocast.float(device):
             td_cg_active = False
             td_cg_disabled = not bool(td_cg_candidate)
             td_cg_mb = None
@@ -3948,7 +3948,7 @@ def infer(
             ):
                 m = _select_pred_model(bool(use_uncompiled))
                 if bool(force_fp32) or bool(collapse_fp32_active):
-                    with Autocast.suspend(device):
+                    with StatelessAutocast.suspend(device):
                         x_fp32 = x
                         if torch.is_tensor(x_fp32) and x_fp32.dtype != torch.float32:
                             x_fp32 = x_fp32.to(dtype=torch.float32)
@@ -5044,7 +5044,7 @@ def process(*args: Any, **kwargs: Any) -> object:
             params_dtype=param_dtype,
             verbose=verbose,
         )
-        Autocast.configure(model, metadata=metadata)
+        StatelessAutocast.configure(model, metadata=metadata)
         set_float32_precision(
             device=device,
             autocast_dtype=precision.amp_float or param_dtype,
@@ -5629,7 +5629,7 @@ def process(*args: Any, **kwargs: Any) -> object:
                 else None
             ),
         )
-        Autocast.configure(model, metadata=metadata)
+        StatelessAutocast.configure(model, metadata=metadata)
         enable_tf32 = bool(getattr(ops, "enable_tf32", True))
         with contextlib.suppress(Exception):
             param_dtype = next(

@@ -25,9 +25,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 from ..core.concurrency import Mutex, is_gil_enabled
 from ..core.config import ModelConfig
-from ..core.datatypes import env_bool, env_first_int, env_int
-from ..core.policies import LossWeightPolicy
-from ..core.precision import Autocast
+from ..core.datatypes import env_bool, env_first_int, env_int, env_str
+from ..core.policies import LossWeightPolicy, PrecisionPolicy
+from ..core.precision import AutocastState, StatefulAutocast, StatelessAutocast
 from ..core.system import (
     CPU,
     empty_device_cache,
@@ -635,9 +635,9 @@ class Collector(nn.Module):
 
         def runner(chunk: torch.Tensor) -> torch.Tensor:
             with (
-                Autocast.float(device, metadata=meta)
+                StatelessAutocast.float(device, metadata=meta)
                 if amp_enabled
-                else Autocast.suspend(device)
+                else StatelessAutocast.suspend(device)
             ):
                 out, _ = backbone(chunk)
             return cast(torch.Tensor, out)
@@ -1218,6 +1218,20 @@ class Fuser(nn.Module):
             dropout=self.dropout,
             drop_path=self.drop_path,
             norm_type=self.norm_type,
+        )
+        self._perceiver_stateful_autocast_enabled = bool(
+            env_bool("ENN_FUSER_PERCEIVER_STATEFUL_AUTOCAST", True)
+        )
+        pol = str(env_str("ENN_FUSER_PERCEIVER_AUTOCAST_POLICY") or "sticky").strip()
+        cd = int(env_int("ENN_FUSER_PERCEIVER_AUTOCAST_COOLDOWN_STEPS", 64) or 64)
+        mr = int(env_int("ENN_FUSER_PERCEIVER_AUTOCAST_MAX_RETRIES", 1) or 1)
+        self._perceiver_autocast_state = AutocastState(
+            policy=pol,
+            cooldown_steps=cd,
+            max_retries=mr,
+        )
+        self._perceiver_autocast = StatefulAutocast(
+            self._perceiver_autocast_state, name="Fuser.perceiver", logger=_LOGGER
         )
         hid = int(self.d_model * max(1.0, self.mlp_ratio))
         self.norm = norm_layer(self.norm_type, self.d_model)
@@ -2666,6 +2680,74 @@ class Fuser(nn.Module):
             )
         return bias_vec.view(1, 1, 1, -1)
 
+    @staticmethod
+    def _tensor_has_nonfinite(t: torch.Tensor) -> bool:
+        if (not isinstance(t, torch.Tensor)) or (not (t.is_floating_point() or t.is_complex())):
+            return False
+        if t.numel() == 0:
+            return False
+        with torch.no_grad():
+            try:
+                a = t.detach().abs().amax()
+                return not bool(torch.isfinite(a).item())
+            except Exception:
+                return not bool(torch.isfinite(t).all().item())
+
+    def _perceiver_master_dtype(self) -> torch.dtype:
+        with contextlib.suppress(StopIteration):
+            p0 = next((p for p in self.perceiver.parameters() if torch.is_tensor(p)), None)
+            if torch.is_tensor(p0):
+                return p0.dtype
+        with contextlib.suppress(StopIteration):
+            p0 = next((p for p in self.parameters() if torch.is_tensor(p)), None)
+            if torch.is_tensor(p0):
+                return p0.dtype
+        return torch.get_default_dtype()
+
+    def _call_perceiver(
+        self,
+        all_tokens: torch.Tensor,
+        *,
+        attn_bias: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        if not bool(getattr(self, "_perceiver_stateful_autocast_enabled", False)):
+            return cast(torch.Tensor, self.perceiver(all_tokens, attn_bias=attn_bias))
+        master = self._perceiver_master_dtype()
+        return cast(
+            torch.Tensor,
+            self._perceiver_autocast.call(
+                self.perceiver,
+                all_tokens,
+                attn_bias=attn_bias,
+                device=all_tokens.device,
+                master_dtype=master,
+                validate=self._tensor_has_nonfinite,
+            ),
+        )
+
+    def _call_linear_fuse(
+        self,
+        fuse_fn: Callable[[Sequence[str], Sequence[torch.Tensor]], torch.Tensor],
+        child_names: Sequence[str],
+        child_tokens: Sequence[torch.Tensor],
+        *,
+        device: torch.device,
+    ) -> torch.Tensor:
+        if not bool(getattr(self, "_perceiver_stateful_autocast_enabled", False)):
+            return fuse_fn(child_names, child_tokens)
+        master = self._perceiver_master_dtype()
+        return cast(
+            torch.Tensor,
+            self._perceiver_autocast.call(
+                fuse_fn,
+                list(child_names),
+                list(child_tokens),
+                device=device,
+                master_dtype=master,
+                validate=self._tensor_has_nonfinite,
+            ),
+        )
+
     def _forward_topology(
         self: Self,
         x: torch.Tensor,
@@ -2747,9 +2829,9 @@ class Fuser(nn.Module):
                     w = getattr(mod, "weight", None)
                     e = getattr(mod, "eps", None)
                     if not isinstance(w, torch.Tensor):
-                        w = torch.as_tensor(1.0, dtype=torch.float32, device=tok0.device)
+                        w = torch.as_tensor(1.0, dtype=tok0.dtype, device=tok0.device)
                     if not isinstance(e, torch.Tensor):
-                        e = torch.as_tensor(1e-6, dtype=torch.float32, device=tok0.device)
+                        e = torch.as_tensor(1e-6, dtype=tok0.dtype, device=tok0.device)
                     coef = w.to(device=tok0.device, dtype=base.dtype).reshape(())
                     eps_t = e.to(device=tok0.device, dtype=base.dtype).reshape(())
                     coef = torch.where(coef == 0, eps_t, coef)
@@ -2782,7 +2864,7 @@ class Fuser(nn.Module):
                         device=all_tokens.device,
                         dtype=all_tokens.dtype,
                     )
-                    fused = self.perceiver(all_tokens, attn_bias=attn_bias)
+                    fused = self._call_perceiver(all_tokens, attn_bias=attn_bias)
                     if env_bool("ENN_FUSER_NONFINITE_FALLBACK", default=True) and _pair_has_nonfinite(fused):
                         fused = _fallback_fused_from_all(all_tokens)
                     token_cache[name] = fused
@@ -2795,7 +2877,7 @@ class Fuser(nn.Module):
                         )
                     else:
                         all_tokens = None
-                    fused = _linear_fuse(child_names, child_tokens)
+                    fused = self._call_linear_fuse(_linear_fuse, child_names, child_tokens, device=child_tokens[0].device)
                     if all_tokens is not None and _pair_has_nonfinite(fused):
                         fused = _fallback_fused_from_all(all_tokens)
                     token_cache[name] = fused
@@ -2879,14 +2961,14 @@ class Fuser(nn.Module):
                 device=all_tokens.device,
                 dtype=all_tokens.dtype,
             )
-            fused_tokens = self.perceiver(all_tokens, attn_bias=attn_bias)
+            fused_tokens = self._call_perceiver(all_tokens, attn_bias=attn_bias)
             if env_bool("ENN_FUSER_NONFINITE_FALLBACK", default=True) and _pair_has_nonfinite(fused_tokens):
                 fused_tokens = _fallback_fused_from_all(all_tokens)
             graph_break()
             context = self.decode(fused_tokens, apply_norm=True)
         elif root_reduction == "linear":
             all_tokens = token_sets[0] if len(token_sets) == 1 else torch.cat(token_sets, dim=1)
-            fused_tokens = _linear_fuse(roots, token_sets)
+            fused_tokens = self._call_linear_fuse(_linear_fuse, roots, token_sets, device=token_sets[0].device)
             if env_bool("ENN_FUSER_NONFINITE_FALLBACK", default=True) and _pair_has_nonfinite(fused_tokens):
                 fused_tokens = _fallback_fused_from_all(all_tokens)
             graph_break()
@@ -3062,12 +3144,12 @@ class Fuser(nn.Module):
                     getattr(get_runtime_cfg(), "compile_cudagraphs", False)
                 )
         cg_ok = bool(compile_cg_enabled and (not disable_pred_cg))
+        if bool(getattr(self, "_perceiver_stateful_autocast_enabled", False)):
+            cg_ok = False
         fallback_enabled = bool(
             infer_cuda and env_bool("ENN_FUSER_NONFINITE_FALLBACK", default=True)
         )
-        runtime_skip_perceiver = bool(
-            fallback_enabled and bool(getattr(self, "_disable_perceiver_runtime", False))
-        )
+        runtime_skip_perceiver = False
 
         def _fallback_fused_from_all() -> torch.Tensor:
             try:
@@ -3112,13 +3194,12 @@ class Fuser(nn.Module):
             else:
                 if cg_ok:
                     cudagraph_mark_step_begin()
-                    fused_tokens = self.perceiver(all_tokens, attn_bias=attn_bias)
+                    fused_tokens = self._call_perceiver(all_tokens, attn_bias=attn_bias)
                     cudagraph_mark_step_end()
                 else:
-                    fused_tokens = self.perceiver(all_tokens, attn_bias=attn_bias)
+                    fused_tokens = self._call_perceiver(all_tokens, attn_bias=attn_bias)
                 graph_break()
                 if fallback_enabled and _pair_has_nonfinite(fused_tokens):
-                    setattr(self, "_disable_perceiver_runtime", True)
                     if not bool(getattr(self, "_nonfinite_fallback_warned", False)):
                         _LOGGER.warning(
                             "[ENN] Fuser: perceiver produced non-finite fused_tokens; "
@@ -3147,7 +3228,6 @@ class Fuser(nn.Module):
                 context = self.decode(fused_tokens, apply_norm=True)
 
             if fallback_enabled and (_pair_has_nonfinite(fused_tokens) or _pair_has_nonfinite(context)):
-                setattr(self, "_disable_perceiver_runtime", True)
                 if not bool(getattr(self, "_nonfinite_fallback_warned", False)):
                     _LOGGER.warning(
                         "[ENN] Fuser: non-finite outputs detected (tokens/context); "
@@ -3290,9 +3370,9 @@ class Fuser(nn.Module):
                     w = getattr(mod, "weight", None)
                     e = getattr(mod, "eps", None)
                     if not isinstance(w, torch.Tensor):
-                        w = torch.as_tensor(1.0, dtype=torch.float32, device=tok0.device)
+                        w = torch.as_tensor(1.0, dtype=tok0.dtype, device=tok0.device)
                     if not isinstance(e, torch.Tensor):
-                        e = torch.as_tensor(1e-6, dtype=torch.float32, device=tok0.device)
+                        e = torch.as_tensor(1e-6, dtype=tok0.dtype, device=tok0.device)
                     coef = w.to(device=tok0.device, dtype=base.dtype).reshape(())
                     eps_t = e.to(device=tok0.device, dtype=base.dtype).reshape(())
                     coef = torch.where(coef == 0, eps_t, coef)
@@ -3322,9 +3402,9 @@ class Fuser(nn.Module):
                         device=all_tokens.device,
                         dtype=all_tokens.dtype,
                     )
-                    token_cache[name] = self.perceiver(all_tokens, attn_bias=attn_bias)
+                    token_cache[name] = self._call_perceiver(all_tokens, attn_bias=attn_bias)
                 elif red == "linear":
-                    token_cache[name] = _linear_fuse(child_names, child_tokens)
+                    token_cache[name] = self._call_linear_fuse(_linear_fuse, child_names, child_tokens, device=child_tokens[0].device)
                 else:
                     raise ValueError(f"Unknown taskset reduction '{red}'")
                 continue
@@ -3357,7 +3437,7 @@ class Fuser(nn.Module):
 
         root_reduction = str(getattr(self, "_root_reduction", "mean"))
         if root_reduction == "linear":
-            fused_tokens = _linear_fuse(roots, token_sets)
+            fused_tokens = self._call_linear_fuse(_linear_fuse, roots, token_sets, device=token_sets[0].device)
         elif root_reduction == "mean":
             all_tokens = token_sets[0] if len(token_sets) == 1 else torch.cat(token_sets, dim=1)
             attn_bias = self._build_attn_bias(
@@ -3366,7 +3446,7 @@ class Fuser(nn.Module):
                 device=all_tokens.device,
                 dtype=all_tokens.dtype,
             )
-            fused_tokens = self.perceiver(all_tokens, attn_bias=attn_bias)
+            fused_tokens = self._call_perceiver(all_tokens, attn_bias=attn_bias)
         else:
             raise ValueError(f"Unknown root reduction '{root_reduction}'")
 
@@ -4948,6 +5028,15 @@ class Model(nn.Module):
             if loss_weights is None and td_loss_weights is not None:
                 loss_weights = td_loss_weights
         device = _infer_module_device(self.fuser, self._device)
+        master_dtype: torch.dtype | None = None
+        _req_base = getattr(self, "base_dtype", None) or getattr(self, "_base_dtype", None)
+        if isinstance(_req_base, torch.dtype):
+            master_dtype = _req_base
+        else:
+            with contextlib.suppress(Exception):
+                master_dtype = next(self.parameters()).dtype
+        if master_dtype is None:
+            master_dtype = torch.get_default_dtype()
         infer_cuda = bool(
             infer_mode
             and (not self.training)
@@ -4988,11 +5077,11 @@ class Model(nn.Module):
         graph_break()
         meta = None
         try:
-            meta = Autocast.coerce_metadata(device)
+            meta = StatelessAutocast.coerce_metadata(device)
         except Exception:
             meta = None
             _LOGGER.debug(
-                "Autocast.coerce_metadata failed; falling back to fp32",
+                "StatelessAutocast.coerce_metadata failed; falling back to fp32",
                 exc_info=True,
             )
         amp_candidates: Tuple[torch.dtype, ...] = ()
@@ -5002,7 +5091,7 @@ class Model(nn.Module):
             except Exception:
                 amp_candidates = ()
         if not amp_candidates:
-            amp_candidates = (torch.float32,)
+            amp_candidates = (master_dtype,)
         safety_margin_pow2 = 3
         try:
             safety_margin_pow2 = int(
@@ -5062,9 +5151,9 @@ class Model(nn.Module):
             else:
                 amp_dtype = self._amp_dtype_cache.get(cache_key)
         if amp_dtype is None:
-            negotiated = Autocast.negotiate(
+            negotiated = StatelessAutocast.negotiate(
                 tuple(amp_candidates),
-                fallback=torch.float64,
+                fallback=master_dtype,
                 logger=_LOGGER,
                 context="instance.forward",
                 device=device,
@@ -5103,7 +5192,10 @@ class Model(nn.Module):
             else:
                 self._amp_dtype_cache_last_dtype = amp_dtype
                 self._amp_dtype_cache_last_key = cache_key
-        amp_enabled = amp_dtype is not torch.float64
+        amp_enabled = bool(
+            isinstance(amp_dtype, torch.dtype)
+            and amp_dtype is not torch.float64
+        )
         is_cls_loss = (
             isinstance(net_loss, (nn.CrossEntropyLoss, nn.NLLLoss))
             if net_loss is not None
@@ -5143,7 +5235,7 @@ class Model(nn.Module):
                 try:
                     base_dtype = next(self.parameters()).dtype
                 except Exception:
-                    base_dtype = torch.float32 if amp_enabled else amp_dtype
+                    base_dtype = master_dtype
             if (
                 isinstance(x_scaled, torch.Tensor)
                 and x_scaled.device != device
@@ -5190,9 +5282,9 @@ class Model(nn.Module):
                 inp: torch.Tensor,
             ) -> Tuple[torch.Tensor, Any]:
                 with (
-                    Autocast.float(device, metadata=meta)
+                    StatelessAutocast.float(device, metadata=meta)
                     if amp_enabled
-                    else Autocast.suspend(device)
+                    else StatelessAutocast.suspend(device)
                 ):
                     return self.fuser(inp)
 
@@ -5248,7 +5340,9 @@ class Model(nn.Module):
                     self._cast_graph_safe(features_t, device, assembled.dtype)
                 )
                 assembled = assembled + bl
-            mean_dtype = torch.float32 if amp_enabled else tokens.dtype
+            mean_dtype = (
+                master_dtype if (tokens.is_floating_point() and tokens.dtype != master_dtype) else tokens.dtype
+            )
             if mean_dtype != tokens.dtype:
                 mean = tokens.to(dtype=mean_dtype).mean(dim=1, keepdim=True)
             else:
@@ -5292,9 +5386,9 @@ class Model(nn.Module):
 
                 def _run_decode_chunk(chunk: torch.Tensor) -> torch.Tensor:
                     with (
-                        Autocast.float(device, metadata=meta)
+                        StatelessAutocast.float(device, metadata=meta)
                         if amp_enabled
-                        else Autocast.suspend(device)
+                        else StatelessAutocast.suspend(device)
                     ):
                         if dc is not None:
                             if cg_ok and (getattr(device, "type", None) == "cuda"):
@@ -5335,8 +5429,29 @@ class Model(nn.Module):
             z_true: Optional[torch.Tensor] = None
             if labels_flat is not None and not is_cls_loss:
                 y_true_raw = labels_flat.to(device=assembled.device)
+                try:
+                    y_master_float = PrecisionPolicy.from_metadata(
+                        device=device, metadata=meta, logger=_LOGGER
+                    ).master_float
+                except Exception:
+                    y_master_float = torch.float64
+
                 if not y_true_raw.is_floating_point():
-                    y_true_raw = y_true_raw.to(dtype=torch.float32)
+                    y_true_raw = y_true_raw.to(dtype=y_master_float)
+                else:
+                    try:
+                        if (
+                            torch.finfo(y_true_raw.dtype).bits
+                            < torch.finfo(y_master_float).bits
+                        ):
+                            y_true_raw = y_true_raw.to(dtype=y_master_float)
+                        elif (
+                            y_true_raw.dtype != y_master_float
+                            and y_master_float is torch.float64
+                        ):
+                            y_true_raw = y_true_raw.to(dtype=y_master_float)
+                    except Exception:
+                        y_true_raw = y_true_raw.to(dtype=y_master_float)
                 z_true = self.scaler.normalize_y(y_true_raw).to(
                     device=assembled.device, dtype=assembled.dtype
                 )

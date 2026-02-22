@@ -9,7 +9,7 @@ from typing import Any, Dict
 import torch
 from ..core.concurrency import Mutex
 from ..core.datatypes import env_bool, env_float, env_int
-from ..core.precision import Autocast
+from ..core.precision import StatelessAutocast
 from ..core.system import (
     accelerator_max_allocated_memory,
     allocated_accelerator_memory,
@@ -253,7 +253,7 @@ class BatchScaler:
                     if with_backward:
                         with contextlib.suppress(Exception):
                             model.train()
-                        with Autocast.float(device):
+                        with StatelessAutocast.float(device):
                             Y_flat = None
                             if labels is not None:
                                 Y = to_torch_tensor(labels)
@@ -282,7 +282,7 @@ class BatchScaler:
                             loss.backward()
                             forward_ran = True
                     else:
-                        with inference_mode(model), Autocast.float(device):
+                        with inference_mode(model), StatelessAutocast.float(device):
                             warmup_iters = int(
                                 env_int("ENN_SERVE_WARMUP_ITERS", 0) or 0
                             )

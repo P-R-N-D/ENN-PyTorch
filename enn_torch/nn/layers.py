@@ -1230,10 +1230,10 @@ class CrossAttention(nn.Module):
                     setattr(self, "_nonfinite_warned", True)
                 self._disable_flex_bias_runtime = True
 
-                from ..core.precision import Autocast
+                from ..core.precision import StatelessAutocast
                 from ..core.policies import PrecisionPolicy
 
-                meta = Autocast.metadata()
+                meta = StatelessAutocast.metadata()
                 master = PrecisionPolicy.from_metadata(
                     device=q.device, metadata=meta
                 ).master_float
@@ -1243,7 +1243,7 @@ class CrossAttention(nn.Module):
                     else master
                 )
 
-                with Autocast.suspend(q.device):
+                with StatelessAutocast.suspend(q.device):
                     qh = q.to(dtype=math_dtype)
                     kh = k.to(dtype=math_dtype)
                     vh = v.to(dtype=math_dtype)
@@ -1510,10 +1510,10 @@ class LatentAttention(nn.Module):
                     )
                     setattr(self, "_enn_nonfinite_warned", True)
 
-                from ..core.precision import Autocast
+                from ..core.precision import StatelessAutocast
                 from ..core.policies import PrecisionPolicy
 
-                meta = Autocast.metadata()
+                meta = StatelessAutocast.metadata()
                 master = PrecisionPolicy.from_metadata(
                     device=q.device, metadata=meta
                 ).master_float
@@ -1522,7 +1522,7 @@ class LatentAttention(nn.Module):
                     if q.is_floating_point()
                     else master
                 )
-                with Autocast.suspend(q.device):
+                with StatelessAutocast.suspend(q.device):
                     qh = q.to(dtype=math_dtype)
                     kh = k.to(dtype=math_dtype)
                     vh = v.to(dtype=math_dtype)
