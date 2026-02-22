@@ -5192,7 +5192,10 @@ class Model(nn.Module):
             else:
                 self._amp_dtype_cache_last_dtype = amp_dtype
                 self._amp_dtype_cache_last_key = cache_key
-        amp_enabled = bool(isinstance(amp_dtype, torch.dtype) and amp_dtype != master_dtype)
+        amp_enabled = bool(
+            isinstance(amp_dtype, torch.dtype)
+            and amp_dtype is not torch.float64
+        )
         is_cls_loss = (
             isinstance(net_loss, (nn.CrossEntropyLoss, nn.NLLLoss))
             if net_loss is not None
