@@ -31,7 +31,7 @@ from ..core.datatypes import (
 )
 from ..nn.graph import clear_model_cache
 from .concurrency import Mutex
-from .precision import Autocast, DeviceMeta, Quantization, is_scale_safe
+from .precision import StatelessAutocast, DeviceMeta, Quantization, is_scale_safe
 from .system import (
     CPU,
     _call,
@@ -789,13 +789,13 @@ class ModelPolicy:
     ) -> Dataset[Any]:
         from ..data.pipeline import Dataset
 
-        Autocast.configure(model, metadata=metadata)
-        meta = Autocast.metadata()
+        StatelessAutocast.configure(model, metadata=metadata)
+        meta = StatelessAutocast.metadata()
         if meta is None:
             ref = ModelPolicy._peek_layer(model)
             dev = ref.device if isinstance(ref, torch.Tensor) else get_device()
             meta = Dataset.for_device(dev)
-            Autocast.configure(model, metadata=meta)
+            StatelessAutocast.configure(model, metadata=meta)
         return meta
 
     @staticmethod
@@ -1321,11 +1321,11 @@ class ModelPolicy:
         meta = ModelPolicy._coerce_metadata(model, metadata)
         device = torch.device(meta.device)
         if env_bool("ENN_DISABLE_FP8", default=False):
-            Autocast.configure(model, fp8_backend="off", metadata=meta)
+            StatelessAutocast.configure(model, fp8_backend="off", metadata=meta)
             return (model, False, "disabled by ENN_DISABLE_FP8")
         ok, reason = Dataset.is_float8_supported(device)
         if not ok:
-            Autocast.configure(model, metadata=meta)
+            StatelessAutocast.configure(model, metadata=meta)
             return (model, False, reason)
         if isinstance(reason, str) and ("te-only" in reason.lower()):
             _log_info(
@@ -1333,7 +1333,7 @@ class ModelPolicy:
                 f"[FP8][quantize] TE-only fallback enabled (torchao missing): {reason}",
             )
         if getattr(meta, "has_scale", False):
-            float8_dtypes = Autocast.float8_formats()
+            float8_dtypes = StatelessAutocast.float8_formats()
             p2 = env_int(
                 "ENN_FP8_SCALE_HEADROOM_POW2",
                 env_int("ENN_FP8_HEADROOM_POW2", 1),
@@ -1352,7 +1352,7 @@ class ModelPolicy:
                     logger,
                     f"[FP8][quantize] training disabled: data scale exceeds float8 range (headroom=2^{p2})",
                 )
-                Autocast.configure(model, metadata=meta)
+                StatelessAutocast.configure(model, metadata=meta)
                 return (model, False, "data scale")
         params_dtype = ModelPolicy.negotiate(device, metadata=meta)
         allow_ao = bool(
@@ -1375,11 +1375,11 @@ class ModelPolicy:
                 _log_info(
                     logger, f"[FP8][quantize] training enabled via {why} ({reason})"
                 )
-                Autocast.configure(m2, metadata=meta)
+                StatelessAutocast.configure(m2, metadata=meta)
                 return (m2, True, why)
             else:
                 _log_debug(logger, f"[FP8] {backend} path skipped: {why}")
-        Autocast.configure(model, metadata=meta)
+        StatelessAutocast.configure(model, metadata=meta)
         return (
             model,
             False,
@@ -1397,11 +1397,11 @@ class ModelPolicy:
         meta = ModelPolicy._coerce_metadata(model, metadata)
         device = torch.device(meta.device)
         if env_bool("ENN_DISABLE_FP8", default=False):
-            Autocast.configure(model, fp8_backend="off", metadata=meta)
+            StatelessAutocast.configure(model, fp8_backend="off", metadata=meta)
             return (model, False, "disabled by ENN_DISABLE_FP8")
         ok, reason = Dataset.is_float8_supported(device)
         if not ok:
-            Autocast.configure(model, metadata=meta)
+            StatelessAutocast.configure(model, metadata=meta)
             return (model, False, reason)
         if isinstance(reason, str) and ("te-only" in reason.lower()):
             _log_info(
@@ -1409,7 +1409,7 @@ class ModelPolicy:
                 f"[FP8][quantize] TE-only fallback enabled (torchao missing): {reason}",
             )
         if getattr(meta, "has_scale", False):
-            float8_dtypes = Autocast.float8_formats()
+            float8_dtypes = StatelessAutocast.float8_formats()
             p2 = env_int(
                 "ENN_FP8_SCALE_HEADROOM_POW2",
                 env_int("ENN_FP8_HEADROOM_POW2", 1),
@@ -1428,7 +1428,7 @@ class ModelPolicy:
                     logger,
                     f"[FP8] inference disabled: data scale exceeds float8 range (headroom=2^{p2})",
                 )
-                Autocast.configure(model, metadata=meta)
+                StatelessAutocast.configure(model, metadata=meta)
                 return (model, False, "data scale")
         params_dtype = ModelPolicy.negotiate(device, metadata=meta)
         dynamic_activations = not (
@@ -1461,11 +1461,11 @@ class ModelPolicy:
                 _log_info(
                     logger, f"[FP8] inference enabled via {why} ({reason})"
                 )
-                Autocast.configure(m2, metadata=meta)
+                StatelessAutocast.configure(m2, metadata=meta)
                 return (m2, True, why)
             else:
                 _log_debug(logger, f"[FP8] {step} skipped: {why}")
-        Autocast.configure(model, metadata=meta)
+        StatelessAutocast.configure(model, metadata=meta)
         return (
             model,
             False,
@@ -1493,7 +1493,7 @@ class ModelPolicy:
             group_size=group_size,
             logger=logger,
         )
-        Autocast.configure(m2 if ok else model, metadata=meta)
+        StatelessAutocast.configure(m2 if ok else model, metadata=meta)
         return (m2, ok, why)
 
     @staticmethod
@@ -1513,7 +1513,7 @@ class ModelPolicy:
         m2, ok, why = Quantization._enable_ptq(
             model, dynamic_activations=dynamic_activations, logger=logger
         )
-        Autocast.configure(m2 if ok else model, metadata=meta)
+        StatelessAutocast.configure(m2 if ok else model, metadata=meta)
         return (m2, ok, why)
 
 
