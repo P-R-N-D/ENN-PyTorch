@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import contextlib
 import inspect
+import importlib.util
 import json
 import logging
 import math
@@ -24,6 +25,7 @@ from typing import (
 )
 
 import torch
+from ..core.datatypes import env_bool
 from ..core.concurrency import Mutex
 from ..core.policies import ModelPolicy, PrecisionPolicy
 from ..core.precision import StatelessAutocast, is_scale_safe
@@ -186,6 +188,29 @@ def _coerce_params(
             if isinstance(g, dict)
         ]
     return list(model_or_params)
+
+
+def _iter_param_tensors(
+    params: Union[List[nn.Parameter], List[Dict[str, Any]]],
+) -> Iterator[torch.Tensor]:
+    if (
+        isinstance(params, (list, tuple))
+        and params
+        and isinstance(params[0], dict)
+    ):
+        for g in params:
+            if not isinstance(g, dict):
+                continue
+            ps = g.get("params", None)
+            if ps is None:
+                continue
+            for p in ps:
+                if torch.is_tensor(p):
+                    yield p
+    else:
+        for p in params:
+            if torch.is_tensor(p):
+                yield p
 
 
 def _master_cpu_dtypes(
@@ -423,11 +448,68 @@ class AdamW:
             metadata,
         )
 
+        precision = PrecisionPolicy.from_metadata(
+            device=dev, metadata=meta, logger=_LOGGER
+        )
+        master_float = getattr(precision, "master_float", torch.float32)
+
+        float_param_dtypes = sorted(
+            {
+                p.dtype
+                for p in _iter_param_tensors(params)
+                if p.is_floating_point() and bool(getattr(p, "requires_grad", False))
+            },
+            key=lambda d: str(d),
+        )
+        if len(float_param_dtypes) > 1:
+            raise RuntimeError(
+                "AdamW parameter dtype mismatch detected (optimizer requires a single master dtype). "
+                f"Found dtypes: {', '.join(str(d) for d in float_param_dtypes)}"
+            )
+        param_dtype = float_param_dtypes[0] if float_param_dtypes else master_float
+        if param_dtype != master_float:
+            raise RuntimeError(
+                "AdamW requires parameters to use PrecisionPolicy.master_float before optimizer creation. "
+                f"param_dtype={param_dtype}, master_float={master_float}. "
+                "Cast model parameters (storage dtype) to master_float first."
+            )
+
+        allow_torchao = env_bool("ENN_OPTIMIZER_ALLOW_TORCHAO", default=False)
+
+
         def _attempt_load(
             mod_name: str,
             cls_name: str,
             extra: List[Dict[str, Any]],
+            *,
+            enabled: bool = True,
+            reason: Optional[str] = None,
         ) -> Optional[optim.Optimizer]:
+            fq = f"{mod_name}.{cls_name}"
+            present = False
+            with contextlib.suppress(Exception):
+                present = importlib.util.find_spec(mod_name) is not None
+            if not enabled:
+                extra.append(
+                    {
+                        "name": fq,
+                        "ok": None,
+                        "present": bool(present),
+                        "skipped": True,
+                        "reason": str(reason or "disabled"),
+                    }
+                )
+                return None
+            if not present:
+                extra.append(
+                    {
+                        "name": fq,
+                        "ok": False,
+                        "present": False,
+                        "error": "module not found",
+                    }
+                )
+                return None
             try:
                 mod = __import__(mod_name, fromlist=[cls_name])
                 cls = getattr(mod, cls_name)
@@ -435,8 +517,9 @@ class AdamW:
             except Exception as exc:
                 extra.append(
                     {
-                        "name": f"{mod_name}.{cls_name}",
+                        "name": fq,
                         "ok": False,
+                        "present": True,
                         "error": str(exc),
                     }
                 )
@@ -450,38 +533,79 @@ class AdamW:
             "weight_decay": weight_decay,
             **kwargs,
         }
-        if dev.type == "cuda":
-            selected_opt = _attempt_load(
-                "transformer_engine.pytorch.optimizers", "FusedAdam", attempts
-            )
-            if selected_opt:
-                selected_name = "te.FusedAdam"
+        te_enabled = (
+            dev.type == "cuda" and master_float == torch.float32 and param_dtype == torch.float32
+        )
+        selected_opt = _attempt_load(
+            "transformer_engine.pytorch.optimizers",
+            "FusedAdam",
+            attempts,
+            enabled=te_enabled,
+            reason=(
+                None
+                if te_enabled
+                else f"requires master_float=float32 (got {master_float})"
+            ),
+        )
+        if selected_opt:
+            selected_name = "te.FusedAdam"
+
+        ao_enabled = (
+            allow_torchao
+            and dev.type == "cuda"
+            and master_float == torch.float32
+            and param_dtype == torch.float32
+            and bool(getattr(meta, "has_scale", False))
+            and not bool(getattr(meta, "has_nonfinite", False))
+        )
+
         if not selected_opt and mode == "float" and dev.type == "cuda":
             float8_dtypes = StatelessAutocast.float8_formats()
-            safe_fp8 = not getattr(meta, "has_scale", False) or any(
-                is_scale_safe(dtype, meta, safety_margin=2.0)
-                for dtype in float8_dtypes
-            )
             hw_ok, _ = Dataset.is_float8_supported(dev)
-            if safe_fp8 and hw_ok:
+            safe_fp8 = ao_enabled and hw_ok and any(
+                is_scale_safe(dtype, meta, safety_margin=2.0) for dtype in float8_dtypes
+            )
+            if safe_fp8:
                 for pkg in ("torchao.optim", "torchao.prototype.float8.optim"):
                     selected_opt = _attempt_load(pkg, "AdamWFp8", attempts)
                     if selected_opt:
                         selected_name = "torchao.AdamWFp8"
                         break
+            else:
+                reason = "disabled by ENN_OPTIMIZER_ALLOW_TORCHAO=0"
+                if allow_torchao and not bool(getattr(meta, "has_scale", False)):
+                    reason = "requires has_scale=true (scale stats missing)"
+                elif allow_torchao and bool(getattr(meta, "has_nonfinite", False)):
+                    reason = "requires finite scale stats (has_nonfinite=true)"
+                elif allow_torchao and master_float != torch.float32:
+                    reason = f"requires master_float=float32 (got {master_float})"
+                elif allow_torchao and not hw_ok:
+                    reason = "hardware does not support float8"
+                elif allow_torchao and not safe_fp8:
+                    reason = "float8 not scale-safe for this dataset"
+                for pkg in ("torchao.optim", "torchao.prototype.float8.optim"):
+                    _attempt_load(
+                        pkg,
+                        "AdamWFp8",
+                        attempts,
+                        enabled=False,
+                        reason=reason,
+                    )
         if not selected_opt:
             quant_bits = getattr(meta, "int_quant_bits", None)
-            use_int = quant_bits in (4, 8) or (
-                mode == "integer"
-                and getattr(meta, "has_scale", False)
-                and getattr(meta, "scale_is_integral", None) is not False
+            use_int = ao_enabled and (
+                quant_bits in (4, 8)
+                or (
+                    mode == "integer"
+                    and bool(getattr(meta, "scale_is_integral", None) is not False)
+                )
             )
             if use_int:
 
                 def _scale_safe_int(meta: Any, bits: int) -> bool:
-                    if not getattr(meta, "has_scale", False):
-                        return True
-                    if getattr(meta, "has_nonfinite", False):
+                    if not bool(getattr(meta, "has_scale", False)):
+                        return False
+                    if bool(getattr(meta, "has_nonfinite", False)):
                         return False
                     if getattr(meta, "scale_is_integral", None) is False:
                         return False
@@ -531,6 +655,27 @@ class AdamW:
                         if selected_opt:
                             selected_name = f"torchao.{cls_name}"
                             break
+            else:
+                if quant_bits in (4, 8) or mode == "integer":
+                    reason = "disabled by ENN_OPTIMIZER_ALLOW_TORCHAO=0"
+                    if allow_torchao and not bool(getattr(meta, "has_scale", False)):
+                        reason = "requires has_scale=true (scale stats missing)"
+                    elif allow_torchao and bool(getattr(meta, "has_nonfinite", False)):
+                        reason = "requires finite scale stats (has_nonfinite=true)"
+                    elif allow_torchao and master_float != torch.float32:
+                        reason = f"requires master_float=float32 (got {master_float})"
+                    for cls_name in ("AdamW8bit", "AdamW4bit"):
+                        for pkg in (
+                            "torchao.optim",
+                            "torchao.prototype.low_bit_optim",
+                        ):
+                            _attempt_load(
+                                pkg,
+                                cls_name,
+                                attempts,
+                                enabled=False,
+                                reason=reason,
+                            )
         if not selected_opt:
             flags = optimal_optimizer_params(
                 dev, use_foreach=None, use_fused=False
@@ -559,6 +704,11 @@ class AdamW:
             "device": f"{dev.type}:{dev.index}",
             "selected": selected_name,
             "attempts": attempts,
+            "precision": {
+                "master_float": str(master_float),
+                "param_dtype": str(param_dtype),
+                "allow_torchao": bool(allow_torchao),
+            },
             "scale": scale_info,
         }
         _log_optimizer(
@@ -569,6 +719,8 @@ class AdamW:
                 dev.type,
                 dev.index,
                 tuple(scale_info.values()),
+                str(master_float),
+                bool(allow_torchao),
             ),
             payload,
         )
