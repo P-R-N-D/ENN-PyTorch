@@ -4916,16 +4916,14 @@ def process(*args: Any, **kwargs: Any) -> object:
     print(f"PyTorch Elastic has been launched. (PID: {current_pid})", flush=True)
     path = os.path.join(tempfile.gettempdir(), f"pytrace.{os.getpid()}.log")
     _log = open(path, "a", buffering=1, encoding="utf-8")
-    faulthandler.enable(all_threads=True)
-    try:
-        if hasattr(signal, "SIGUSR1"):
-            faulthandler.register(signal.SIGUSR1, all_threads=True, file=_log, chain=True)
-        elif hasattr(signal, "SIGUSR2"):
-            faulthandler.register(signal.SIGUSR2, all_threads=True, file=_log, chain=True)
-        elif hasattr(signal, "SIGBREAK"):
-            faulthandler.register(signal.SIGBREAK, all_threads=True, file=_log, chain=True)
-    except Exception:
-        pass
+    faulthandler.enable(all_threads=True, file=_log)
+    for name in ("SIGUSR1", "SIGUSR2", "SIGBREAK", "SIGQUIT"):
+        sig = getattr(signal, name, None)
+        try:
+            if sig is not None:
+                faulthandler.register(sig, all_threads=True, file=_log, chain=True)
+        except Exception:
+            pass
     if not args:
         raise TypeError("process requires at least a RuntimeConfig argument")
     _MA_SENTINEL = object()
