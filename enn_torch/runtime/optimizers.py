@@ -479,7 +479,7 @@ class AdamW:
             master_float = param_dtype
 
         allow_torchao = env_bool("ENN_OPTIMIZER_ALLOW_TORCHAO", default=False)
-
+        allow_fp8_state = env_bool("ENN_OPTIMIZER_ALLOW_FP8_STATE", default=False)
 
         def _attempt_load(
             mod_name: str,
@@ -488,6 +488,7 @@ class AdamW:
             *,
             enabled: bool = True,
             reason: Optional[str] = None,
+            override_kwargs: Optional[Dict[str, Any]] = None,
         ) -> Optional[optim.Optimizer]:
             fq = f"{mod_name}.{cls_name}"
             present = False
@@ -517,7 +518,11 @@ class AdamW:
             try:
                 mod = __import__(mod_name, fromlist=[cls_name])
                 cls = getattr(mod, cls_name)
-                return cls(params, **_coerce_kwargs(cls, common_kwargs))
+                use_kwargs: Dict[str, Any] = dict(common_kwargs)
+                if override_kwargs:
+                    with contextlib.suppress(Exception):
+                        use_kwargs.update(dict(override_kwargs))
+                return cls(params, **_coerce_kwargs(cls, use_kwargs))
             except Exception as exc:
                 extra.append(
                     {
@@ -537,8 +542,48 @@ class AdamW:
             "weight_decay": weight_decay,
             **kwargs,
         }
+        te_fp8_state_requested = bool(allow_fp8_state)
+        te_fp8_state_enabled = False
+        te_fp8_state_reason: Optional[str] = None
+        te_state_dtype: torch.dtype = torch.float32
+        if te_fp8_state_requested:
+            if dev.type != "cuda":
+                te_fp8_state_reason = "requires cuda device"
+            elif master_float != torch.float32 or param_dtype != torch.float32:
+                te_fp8_state_reason = (
+                    f"requires master_float=float32 params (got master_float={master_float}, param_dtype={param_dtype})"
+                )
+            elif not has_scale:
+                te_fp8_state_reason = "requires has_scale=true (scale stats missing)"
+            elif bool(getattr(meta, "has_nonfinite", False)):
+                te_fp8_state_reason = "requires finite scale stats (has_nonfinite=true)"
+            else:
+                hw_ok, hw_reason = Dataset.is_float8_supported(dev)
+                if not hw_ok:
+                    te_fp8_state_reason = str(hw_reason or "hardware does not support float8")
+                else:
+                    float8_dtypes = StatelessAutocast.float8_formats()
+                    if any(
+                        is_scale_safe(dtype, meta, safety_margin=2.0)
+                        for dtype in float8_dtypes
+                    ):
+                        te_fp8_state_enabled = True
+                        te_state_dtype = torch.uint8
+                    else:
+                        te_fp8_state_reason = "float8 not scale-safe for this dataset"
+
+        te_overrides: Dict[str, Any] = {
+            "adam_w_mode": True,
+            "master_weights": False,
+            "master_weight_dtype": torch.float32,
+            "exp_avg_dtype": te_state_dtype,
+            "exp_avg_sq_dtype": te_state_dtype,
+        }
+
         te_enabled = (
-            dev.type == "cuda" and master_float == torch.float32 and param_dtype == torch.float32
+            dev.type == "cuda"
+            and master_float == torch.float32
+            and param_dtype == torch.float32
         )
         selected_opt = _attempt_load(
             "transformer_engine.pytorch.optimizers",
@@ -550,6 +595,7 @@ class AdamW:
                 if te_enabled
                 else f"requires master_float=float32 (got {master_float})"
             ),
+            override_kwargs=te_overrides,
         )
         if selected_opt:
             selected_name = "te.FusedAdam"
@@ -714,6 +760,13 @@ class AdamW:
                 "param_dtype": str(param_dtype),
                 "has_scale": bool(has_scale),
                 "allow_torchao": bool(allow_torchao),
+                "allow_fp8_state": bool(allow_fp8_state),
+            },
+            "te": {
+                "fp8_state_requested": bool(te_fp8_state_requested),
+                "fp8_state_enabled": bool(te_fp8_state_enabled),
+                "state_dtype": str(te_state_dtype),
+                "reason": te_fp8_state_reason,
             },
             "scale": scale_info,
         }
@@ -727,6 +780,9 @@ class AdamW:
                 tuple(scale_info.values()),
                 str(master_float),
                 bool(allow_torchao),
+                bool(allow_fp8_state),
+                bool(te_fp8_state_enabled),
+                str(te_state_dtype),
             ),
             payload,
         )
