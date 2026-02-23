@@ -5084,8 +5084,8 @@ def process(*args: Any, **kwargs: Any) -> object:
         if MixedPrecisionPolicy is not None:
             mp_policy = MixedPrecisionPolicy(
                 param_dtype=param_dtype,
-                reduce_dtype=fsdp_mp_dtype,
-                output_dtype=fsdp_mp_dtype,
+                reduce_dtype=param_dtype,
+                output_dtype=param_dtype,
                 cast_forward_inputs=False,
             )
         elif verbose:
