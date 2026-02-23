@@ -4907,6 +4907,31 @@ def infer(
 
 @worker_main()
 def process(*args: Any, **kwargs: Any) -> object:
+    import signal
+    import sys
+    import traceback
+    import os
+
+    current_pid = os.getpid()
+    print(f"\n[INIT] 워커 프로세스가 시작되었습니다. PID: {current_pid}", file=sys.stderr)
+    sys.stderr.flush()
+
+    def _sigusr1_handler(signum, frame):
+        print(f"\n[PID {current_pid}] SIGUSR1 수신됨. 프로세스를 종료하기 전 모든 스레드의 스택 트레이스를 출력합니다.", file=sys.stderr)
+        
+        for thread_id, th_frame in sys._current_frames().items():
+            print(f"\n--- Thread ID: {thread_id} ---", file=sys.stderr)
+            traceback.print_stack(th_frame, file=sys.stderr)
+            
+        print("=======================================================\n", file=sys.stderr)
+        sys.stderr.flush()
+        os._exit(1)
+
+    try:
+        signal.signal(signal.SIGUSR1, _sigusr1_handler)
+    except Exception:
+        pass
+
     from ..data.pipeline import Session
 
     if not args:
