@@ -468,11 +468,12 @@ class AdamW:
             )
         param_dtype = float_param_dtypes[0] if float_param_dtypes else master_float
         if param_dtype != master_float:
-            raise RuntimeError(
-                "AdamW requires parameters to use PrecisionPolicy.master_float before optimizer creation. "
-                f"param_dtype={param_dtype}, master_float={master_float}. "
-                "Cast model parameters (storage dtype) to master_float first."
-            )
+            if bool(getattr(meta, "has_scale", False)):
+                raise RuntimeError(
+                    "AdamW requires parameters to use PrecisionPolicy.master_float before optimizer creation. "
+                    f"param_dtype={param_dtype}, master_float={master_float}. "
+                    "Cast model parameters (storage dtype) to master_float first."
+                )
 
         allow_torchao = env_bool("ENN_OPTIMIZER_ALLOW_TORCHAO", default=False)
 
