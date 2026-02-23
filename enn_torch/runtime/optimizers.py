@@ -452,6 +452,7 @@ class AdamW:
             device=dev, metadata=meta, logger=_LOGGER
         )
         master_float = getattr(precision, "master_float", torch.float32)
+        policy_master_float = master_float
 
         float_param_dtypes = sorted(
             {
@@ -467,13 +468,15 @@ class AdamW:
                 f"Found dtypes: {', '.join(str(d) for d in float_param_dtypes)}"
             )
         param_dtype = float_param_dtypes[0] if float_param_dtypes else master_float
+        has_scale = bool(getattr(meta, "has_scale", False))
         if param_dtype != master_float:
-            if bool(getattr(meta, "has_scale", False)):
+            if has_scale:
                 raise RuntimeError(
                     "AdamW requires parameters to use PrecisionPolicy.master_float before optimizer creation. "
                     f"param_dtype={param_dtype}, master_float={master_float}. "
                     "Cast model parameters (storage dtype) to master_float first."
                 )
+            master_float = param_dtype
 
         allow_torchao = env_bool("ENN_OPTIMIZER_ALLOW_TORCHAO", default=False)
 
@@ -706,8 +709,10 @@ class AdamW:
             "selected": selected_name,
             "attempts": attempts,
             "precision": {
+                "policy_master_float": str(policy_master_float),
                 "master_float": str(master_float),
                 "param_dtype": str(param_dtype),
+                "has_scale": bool(has_scale),
                 "allow_torchao": bool(allow_torchao),
             },
             "scale": scale_info,
