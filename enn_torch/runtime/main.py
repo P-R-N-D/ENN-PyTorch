@@ -599,6 +599,49 @@ def epochs(
     meta = (
         dataset if isinstance(dataset, Dataset) else Dataset.for_device(device)
     )
+
+    optim_diag = env_bool("ENN_OPTIMIZER_DIAG_NONFINITE", default=False)
+    optim_diag_every = max(1, int(env_int("ENN_OPTIMIZER_DIAG_EVERY", 1) or 1))
+    optim_diag_scope = str(env_str("ENN_OPTIMIZER_DIAG_SCOPE") or "").strip()
+
+    def _opt_scope_ok(name: str) -> bool:
+        return (not optim_diag_scope) or (optim_diag_scope in name)
+
+    def _first_nonfinite_grad(mod: nn.Module) -> str | None:
+        for n, p in mod.named_parameters(recurse=True):
+            if not _opt_scope_ok(n):
+                continue
+            g = getattr(p, "grad", None)
+            if torch.is_tensor(g) and g.numel() > 0:
+                with contextlib.suppress(Exception):
+                    if not bool(torch.isfinite(g).all().item()):
+                        return n
+        return None
+
+    def _first_nonfinite_param(mod: nn.Module) -> str | None:
+        for n, p in mod.named_parameters(recurse=True):
+            if not _opt_scope_ok(n):
+                continue
+            if not (torch.is_tensor(p) and p.is_floating_point() and p.numel() > 0):
+                continue
+            with contextlib.suppress(Exception):
+                if not bool(torch.isfinite(p).all().item()):
+                    return n
+        return None
+
+    def _first_nonfinite_optim_state(opt: object) -> str | None:
+        st = getattr(opt, "state", None)
+        if not isinstance(st, dict):
+            return None
+        for _, v in st.items():
+            if not isinstance(v, dict):
+                continue
+            for k2, t in v.items():
+                if torch.is_tensor(t) and t.numel() > 0:
+                    with contextlib.suppress(Exception):
+                        if not bool(torch.isfinite(t).all().item()):
+                            return str(k2)
+        return None
     autocast_dtype = None
     with contextlib.suppress(Exception):
         import inspect
@@ -1363,7 +1406,16 @@ def epochs(
                                                 policy=dist_policy.collective,
                                             )
                                         scaler.unscale_(optimizer)
+                                        if optim_diag and (int(delta_gate_auto_step_total) % int(optim_diag_every) == 0):
+                                            bad = _first_nonfinite_grad(model_for_grads)
+                                            if bad is not None:
+                                                _LOGGER.error("[OPTIM][nonfinite] pre-step grad non-finite: %s (step=%d, opt=%s)", bad, int(delta_gate_auto_step_total), type(optimizer).__name__)
                                         scaler.step(optimizer)
+                                        if optim_diag and (int(delta_gate_auto_step_total) % int(optim_diag_every) == 0):
+                                            bad_p = _first_nonfinite_param(model_for_grads)
+                                            if bad_p is not None:
+                                                bad_s = _first_nonfinite_optim_state(optimizer)
+                                                _LOGGER.error("[OPTIM][nonfinite] post-step param non-finite: %s (step=%d, opt=%s, state=%s)", bad_p, int(delta_gate_auto_step_total), type(optimizer).__name__, str(bad_s))
                                         scaler.update()
                                         optimizer.zero_grad(set_to_none=True)
                                         ema_target = (
@@ -2092,7 +2144,16 @@ def epochs(
                         policy=dist_policy.collective,
                     )
                 scaler.unscale_(optimizer)
+                if optim_diag and (int(delta_gate_auto_step_total) % int(optim_diag_every) == 0):
+                    bad = _first_nonfinite_grad(model_for_grads)
+                    if bad is not None:
+                        _LOGGER.error("[OPTIM][nonfinite] pre-step grad non-finite: %s (step=%d, opt=%s)", bad, int(delta_gate_auto_step_total), type(optimizer).__name__)
                 scaler.step(optimizer)
+                if optim_diag and (int(delta_gate_auto_step_total) % int(optim_diag_every) == 0):
+                    bad_p = _first_nonfinite_param(model_for_grads)
+                    if bad_p is not None:
+                        bad_s = _first_nonfinite_optim_state(optimizer)
+                        _LOGGER.error("[OPTIM][nonfinite] post-step param non-finite: %s (step=%d, opt=%s, state=%s)", bad_p, int(delta_gate_auto_step_total), type(optimizer).__name__, str(bad_s))
                 scaler.update()
                 optimizer.zero_grad(set_to_none=True)
                 if scheduler_step_per_batch:
@@ -5050,7 +5111,7 @@ def process(*args: Any, **kwargs: Any) -> object:
             autocast_dtype=precision.amp_float or param_dtype,
             enable_tf32=enable_tf32,
         )
-        fp8_quantize = env_bool("ENN_ENABLE_FP8_QUANTIZE", default=False)
+        fp8_quantize = env_bool(("ENN_MODEL_ENABLE_FP8_QUANTIZE", "ENN_ENABLE_FP8_QUANTIZE"), default=False)
         fp8_enabled = False
         fp8_backend = None
         disable_note = None
@@ -5073,7 +5134,7 @@ def process(*args: Any, **kwargs: Any) -> object:
         else:
             _float8_log(
                 "[FP8][quantize] skipped (default AMP-only). "
-                "Set ENN_ENABLE_FP8_QUANTIZE=1 to run model quantization."
+                "Set ENN_MODEL_ENABLE_FP8_QUANTIZE=1 to run model quantization."
             )
         model.train()
         fsdp_mp_dtype = precision.fsdp_reduce_dtype
@@ -5669,7 +5730,7 @@ def process(*args: Any, **kwargs: Any) -> object:
                 autocast_dtype=precision.amp_float or param_dtype,
                 enable_tf32=enable_tf32,
             )
-        fp8_quantize = env_bool("ENN_ENABLE_FP8_QUANTIZE", default=False)
+        fp8_quantize = env_bool(("ENN_MODEL_ENABLE_FP8_QUANTIZE", "ENN_ENABLE_FP8_QUANTIZE"), default=False)
         fp8_enabled = False
         fp8_backend = None
         disable_note = None
@@ -5688,7 +5749,7 @@ def process(*args: Any, **kwargs: Any) -> object:
         else:
             _float8_log(
                 "[FP8][quantize] skipped (default AMP-only). "
-                "Set ENN_ENABLE_FP8_QUANTIZE=1 to run model quantization."
+                "Set ENN_MODEL_ENABLE_FP8_QUANTIZE=1 to run model quantization."
             )
         model.eval()
         with contextlib.suppress(Exception):
