@@ -4913,11 +4913,11 @@ def process(*args: Any, **kwargs: Any) -> object:
     import os
 
     current_pid = os.getpid()
-    print(f"\n[INIT] 워커 프로세스가 시작되었습니다. PID: {current_pid}", file=sys.stderr)
+    print(f"PyTorch Elastic has been launched. (PID: {current_pid})", file=sys.stderr)
     sys.stderr.flush()
 
     def _sigusr1_handler(signum, frame):
-        print(f"\n[PID {current_pid}] SIGUSR1 수신됨. 프로세스를 종료하기 전 모든 스레드의 스택 트레이스를 출력합니다.", file=sys.stderr)
+        print(f"\n[PID {current_pid}] PyTorch Elastic has been terminated by SIGUSR1. Traceback is as below.", file=sys.stderr)
         
         for thread_id, th_frame in sys._current_frames().items():
             print(f"\n--- Thread ID: {thread_id} ---", file=sys.stderr)
