@@ -4914,11 +4914,12 @@ def process(*args: Any, **kwargs: Any) -> object:
 
     current_pid = os.getpid()
     print(f"PyTorch Elastic has been launched. (PID: {current_pid})", flush=True)
+    faulthandler.enable(all_threads=True)
     try:
-        if hasattr(signal, "SIGUSR1"):
-            faulthandler.register(signal.SIGUSR1, all_threads=True, chain=False)
+        if hasattr(signal, "SIGUSR2"):
+            faulthandler.register(signal.SIGUSR1, all_threads=True, chain=True)
         elif hasattr(signal, "SIGBREAK"):
-            faulthandler.register(signal.SIGBREAK, all_threads=True, chain=False)
+            faulthandler.register(signal.SIGBREAK, all_threads=True, chain=True)
     except Exception:
         pass
     if not args:
