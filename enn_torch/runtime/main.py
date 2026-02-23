@@ -4908,32 +4908,19 @@ def infer(
 @worker_main()
 def process(*args: Any, **kwargs: Any) -> object:
     import signal
-    import sys
-    import traceback
-    import os
-
-    current_pid = os.getpid()
-    print(f"PyTorch Elastic has been launched. (PID: {current_pid})", file=sys.stderr)
-    sys.stderr.flush()
-
-    def _sigusr1_handler(signum, frame):
-        print(f"\n[PID {current_pid}] PyTorch Elastic has been terminated by SIGUSR1. Traceback is as below.", file=sys.stderr)
-        
-        for thread_id, th_frame in sys._current_frames().items():
-            print(f"\n--- Thread ID: {thread_id} ---", file=sys.stderr)
-            traceback.print_stack(th_frame, file=sys.stderr)
-            
-        print("=======================================================\n", file=sys.stderr)
-        sys.stderr.flush()
-        os._exit(1)
-
-    try:
-        signal.signal(signal.SIGUSR1, _sigusr1_handler)
-    except Exception:
-        pass
+    import faulthandler
 
     from ..data.pipeline import Session
 
+    current_pid = os.getpid()
+    print(f"PyTorch Elastic has been launched. (PID: {current_pid})", flush=True)
+    try:
+        if hasattr(signal, "SIGUSR1"):
+            faulthandler.register(signal.SIGUSR1, all_threads=True, chain=False)
+        elif hasattr(signal, "SIGBREAK"):
+            faulthandler.register(signal.SIGBREAK, all_threads=True, chain=False)
+    except Exception:
+        pass
     if not args:
         raise TypeError("process requires at least a RuntimeConfig argument")
     _MA_SENTINEL = object()
