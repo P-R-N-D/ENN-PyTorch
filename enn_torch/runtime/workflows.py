@@ -796,6 +796,24 @@ def _save_model_checkpoint(
     def _first_nonfinite_state_tensor(
         m: torch.nn.Module,
     ) -> tuple[str | None, torch.Tensor | None]:
+        allow_scaler_inf = env_bool("ENN_SAVE_ALLOW_SCALER_INF", default=True)
+        scaler_inf_suffixes = (
+            "scaler.y_min",
+            "scaler.y_max",
+            "scaler.y_q_low",
+            "scaler.y_q_high",
+        )
+
+        def _allowed_nonfinite(name: str, t: torch.Tensor) -> bool:
+            if not allow_scaler_inf:
+                return False
+            if any(str(name).endswith(suf) for suf in scaler_inf_suffixes):
+                with torch.no_grad():
+                    if bool(torch.isnan(t).any().item()):
+                        return False
+                    return bool(torch.isinf(t).all().item())
+            return False
+
         def _scan_named_tensors(
             named_tensors: Iterable[tuple[str, torch.Tensor]],
         ) -> tuple[str | None, torch.Tensor | None]:
@@ -812,6 +830,8 @@ def _save_model_checkpoint(
                 except Exception:
                     ok = bool(torch.isfinite(v).all().item())
                 if not ok:
+                    if _allowed_nonfinite(str(k), v):
+                        continue
                     return str(k), v
             return None, None
 
