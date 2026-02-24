@@ -713,12 +713,11 @@ def _try_load_dir_checkpoint_fallback_pt(
                     sd_map[kk] = v
                     added += 1
 
-            if added > 0:
-                if (dump_dir or strict_nf) or env_bool("ENN_LOAD_ALIAS_PERCEIVER_LOG", default=False):
-                    logger.warning(
-                        "[ENN] load_weights: added %d aliased keys for perceiver wrapper compatibility",
-                        int(added),
-                    )
+            if added > 0 and env_bool("ENN_LOAD_ALIAS_PERCEIVER_LOG", default=False):
+                logger.warning(
+                    "[ENN] load_weights: added %d aliased keys for perceiver wrapper compatibility",
+                    int(added),
+                )
             sd_for_load = sd_map
         except Exception:
             sd_for_load = sd
