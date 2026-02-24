@@ -813,7 +813,9 @@ def _save_model_checkpoint(
                     return bool(torch.isinf(t).all().item())
             if allow_logger_inf:
                 n = str(name)
-                if ("logger.sampled_" in n) and (n.endswith("_min") or n.endswith("_max")):
+                if (("logger.sampled_" in n) or ("logger.reduced_" in n)) and (
+                    n.endswith("_min") or n.endswith("_max")
+                ):
                     with torch.no_grad():
                         if t.numel() <= 16:
                             if bool(torch.isnan(t).any().item()):
