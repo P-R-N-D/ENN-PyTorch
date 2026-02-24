@@ -820,6 +820,17 @@ class ExponentialMovingAverage(nn.Module):
         with torch.no_grad():
             self._init_shadow(model)
 
+    def _canon_key(self: Self, name: str) -> str:
+        k = str(name)
+        if k.startswith("module."):
+            k = k[len("module.") :]
+        k = k.replace("._enn_inner._orig_mod", "")
+        k = k.replace("._enn_inner", "")
+        if k.startswith("_orig_mod."):
+            k = k[len("_orig_mod.") :]
+        k = k.replace("fuser.perceiver._orig_mod.", "fuser.perceiver.")
+        return k
+
     def _iter_named_params(
         self: Self, model: nn.Module
     ) -> Iterator[tuple[str, torch.Tensor]]:
@@ -861,9 +872,14 @@ class ExponentialMovingAverage(nn.Module):
 
     def _init_shadow(self: Self, model: nn.Module) -> None:
         shadow: Dict[str, torch.Tensor] = {}
+        seen: set[str] = set()
         for name, p in self._iter_named_params(model):
+            key = self._canon_key(name)
+            if key in seen:
+                continue
+            seen.add(key)
             dt = self._target_dtype(p)
-            shadow[name] = _cpu_offload(
+            shadow[key] = _cpu_offload(
                 p.detach(),
                 dtype=dt,
                 pin_memory=bool(self.pin_memory),
@@ -886,15 +902,22 @@ class ExponentialMovingAverage(nn.Module):
         shadow = self.shadow
         pin_memory = bool(self.pin_memory)
         for name, p in self._iter_named_params(model):
+            key = self._canon_key(name)
             dt = self._target_dtype(p)
-            cur = shadow.get(name, None)
+            cur = shadow.get(key, None)
+            if cur is None and key != name:
+                cur = shadow.get(name, None)
+                if torch.is_tensor(cur):
+                    shadow[key] = cur
+                    with contextlib.suppress(Exception):
+                        shadow.pop(name, None)
             if (
                 cur is None
                 or (not isinstance(cur, torch.Tensor))
                 or cur.shape != p.shape
                 or cur.dtype != dt
             ):
-                shadow[name] = _cpu_offload(
+                shadow[key] = _cpu_offload(
                     p.detach(),
                     dtype=dt,
                     pin_memory=pin_memory,
@@ -923,8 +946,13 @@ class ExponentialMovingAverage(nn.Module):
         _ = optimizer
         self.collected = {}
         collected = self.collected
+        seen: set[str] = set()
         for name, p in self._iter_named_params(model):
-            collected[name] = _cpu_offload(
+            key = self._canon_key(name)
+            if key in seen:
+                continue
+            seen.add(key)
+            collected[key] = _cpu_offload(
                 p.detach(),
                 dtype=p.dtype,
                 pin_memory=bool(self.pin_memory),
@@ -939,7 +967,10 @@ class ExponentialMovingAverage(nn.Module):
         if not self.collected:
             return
         for name, p in self._iter_named_params(model):
-            prev = self.collected.get(name, None)
+            key = self._canon_key(name)
+            prev = self.collected.get(key, None)
+            if prev is None and key != name:
+                prev = self.collected.get(name, None)
             if not isinstance(prev, torch.Tensor):
                 continue
             try:
@@ -959,7 +990,10 @@ class ExponentialMovingAverage(nn.Module):
         if not shadow:
             return
         for name, p in self._iter_named_params(model):
-            ema_v = shadow.get(name, None)
+            key = self._canon_key(name)
+            ema_v = shadow.get(key, None)
+            if ema_v is None and key != name:
+                ema_v = shadow.get(name, None)
             if not isinstance(ema_v, torch.Tensor):
                 continue
             try:
@@ -1059,6 +1093,17 @@ class StochasticWeightAverage(nn.Module):
     def shadow(self: Self) -> Dict[str, torch.Tensor]:
         return self._shadow
 
+    def _canon_key(self: Self, name: str) -> str:
+        k = str(name)
+        if k.startswith("module."):
+            k = k[len("module.") :]
+        k = k.replace("._enn_inner._orig_mod", "")
+        k = k.replace("._enn_inner", "")
+        if k.startswith("_orig_mod."):
+            k = k[len("_orig_mod.") :]
+        k = k.replace("fuser.perceiver._orig_mod.", "fuser.perceiver.")
+        return k
+
     def _iter_named_params(
         self: Self, model: nn.Module
     ) -> Iterator[tuple[str, torch.Tensor]]:
@@ -1114,11 +1159,16 @@ class StochasticWeightAverage(nn.Module):
         else:
             self._mmap_dir = tempfile.mkdtemp(prefix=f"{self._mmap_prefix}_")
             self._mmap_created_temp = True
+        seen: set[str] = set()
         for name, p in self._iter_named_params(model):
+            key = self._canon_key(name)
+            if key in seen:
+                continue
+            seen.add(key)
             dt = self._target_dtype(p.detach())
             shape = tuple(int(x) for x in p.shape)
             numel = int(p.numel())
-            items.append((name, dt, shape, numel))
+            items.append((key, dt, shape, numel))
         if not items:
             self._use_mmap = False
             return
@@ -1326,9 +1376,16 @@ class StochasticWeightAverage(nn.Module):
 
             for name, p in self._iter_named_params(model):
                 v = p.detach()
+                key = self._canon_key(name)
                 dt = self._target_dtype(v)
-                cur = shadow.get(name, None)
+                cur = shadow.get(key, None)
                 created = False
+                if cur is None and key != name:
+                    cur = shadow.get(name, None)
+                    if torch.is_tensor(cur):
+                        shadow[key] = cur
+                        with contextlib.suppress(Exception):
+                            shadow.pop(name, None)
 
                 if (
                     cur is None
@@ -1342,27 +1399,27 @@ class StochasticWeightAverage(nn.Module):
                         device="cpu",
                         pin_memory=False,
                     )
-                    shadow[name] = cur
+                    shadow[key] = cur
                     created = True
 
                 if diag and self._has_nonfinite(v):
-                    self._maybe_dump_nonfinite("model_param", str(name), v)
-                    _LOGGER.error("[ENN][SWA] model param is non-finite before SWA update: %s", str(name))
+                    self._maybe_dump_nonfinite("model_param", str(key), v)
+                    _LOGGER.error("[ENN][SWA] model param is non-finite before SWA update: %s", str(key))
                     if strict:
-                        raise RuntimeError(f"[ENN][SWA] model param is non-finite before update: {name}")
+                        raise RuntimeError(f"[ENN][SWA] model param is non-finite before update: {key}")
 
                 if n == 0 or created:
                     if created and n > 0:
                         _LOGGER.warning(
                             "[ENN][SWA] shadow entry was reinitialized while n_averaged=%d; resetting average for key=%s",
                             int(n),
-                            str(name),
+                            str(key),
                         )
                     self._stream_copy_(cur, v, dtype=dt)
                     if diag and self._has_nonfinite(cur):
-                        self._maybe_dump_nonfinite("shadow_after_copy", str(name), cur)
+                        self._maybe_dump_nonfinite("shadow_after_copy", str(key), cur)
                         if strict:
-                            raise RuntimeError(f"[ENN][SWA] shadow became non-finite after copy: {name}")
+                            raise RuntimeError(f"[ENN][SWA] shadow became non-finite after copy: {key}")
                     continue
 
                 if cur.is_floating_point() or cur.is_complex():
@@ -1371,10 +1428,10 @@ class StochasticWeightAverage(nn.Module):
                     self._stream_copy_(cur, v, dtype=dt)
 
                 if diag and self._has_nonfinite(cur):
-                    self._maybe_dump_nonfinite("shadow_after_update", str(name), cur)
-                    _LOGGER.error("[ENN][SWA] shadow became non-finite after update: %s", str(name))
+                    self._maybe_dump_nonfinite("shadow_after_update", str(key), cur)
+                    _LOGGER.error("[ENN][SWA] shadow became non-finite after update: %s", str(key))
                     if strict:
-                        raise RuntimeError(f"[ENN][SWA] shadow became non-finite after update: {name}")
+                        raise RuntimeError(f"[ENN][SWA] shadow became non-finite after update: {key}")
 
             self._n_averaged = int(n + 1)
 
@@ -1387,9 +1444,13 @@ class StochasticWeightAverage(nn.Module):
         try:
             with torch.no_grad():
                 for k, p in target.named_parameters(recurse=True):
-                    if k in self._shadow:
+                    ck = self._canon_key(k)
+                    src = self._shadow.get(ck, None)
+                    if src is None:
+                        src = self._shadow.get(k, None)
+                    if torch.is_tensor(src):
                         backup[k] = p.detach().clone()
-                        p.detach().copy_(self._shadow[k], non_blocking=False)
+                        p.detach().copy_(src, non_blocking=False)
             yield target
         finally:
             with torch.no_grad():
@@ -1404,9 +1465,10 @@ class StochasticWeightAverage(nn.Module):
             return
         with torch.no_grad():
             for k, p in target.named_parameters(recurse=True):
-                if k not in self._shadow:
-                    continue
-                src = self._shadow[k]
+                ck = self._canon_key(k)
+                src = self._shadow.get(ck, None)
+                if src is None:
+                    src = self._shadow.get(k, None)
                 if not torch.is_tensor(src):
                     continue
                 if getattr(src, "is_meta", False) or src.device.type == "meta":
@@ -1424,7 +1486,10 @@ class StochasticWeightAverage(nn.Module):
         shadow = self._shadow
         with torch.no_grad():
             for name, p in model.named_parameters(recurse=True):
-                sv = shadow.get(name, None)
+                ck = self._canon_key(name)
+                sv = shadow.get(ck, None)
+                if sv is None:
+                    sv = shadow.get(name, None)
                 tv = sv if torch.is_tensor(sv) else p
                 if not torch.is_tensor(tv):
                     continue

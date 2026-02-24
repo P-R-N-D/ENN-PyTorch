@@ -4351,22 +4351,44 @@ def infer(
                 use_uncompiled: bool = False,
                 force_fp32: bool = False,
             ):
+                nonlocal force_uncompiled, force_eager
                 m = _select_pred_model(bool(use_uncompiled))
                 if bool(force_fp32) or bool(collapse_fp32_active):
                     with StatelessAutocast.suspend(device):
                         x_fp32 = x
                         if torch.is_tensor(x_fp32) and x_fp32.dtype != torch.float32:
                             x_fp32 = x_fp32.to(dtype=torch.float32)
-                        return m(
-                            x_fp32,
+                        x_use = x_fp32
+                else:
+                    x_use = x
+                try:
+                    return m(
+                        x_use,
+                        calibrate_output=bool(calibrate_output),
+                        return_loss=False,
+                    )
+                except AssertionError:
+                    if not env_bool("ENN_PRED_FALLBACK_ON_CUDAGRAPH_ASSERT", default=True):
+                        raise
+                    try:
+                        import traceback as _tb
+                        tb = _tb.format_exc()
+                        is_cg = ("torch/_inductor/cudagraph_trees.py" in tb) and ("assert isinstance" in tb)
+                    except Exception:
+                        is_cg = False
+                    if is_cg and (m is run_model) and (run_model_uncompiled is not run_model):
+                        _LOGGER.error(
+                            "[infer] inductor cudagraph assertion hit; falling back to uncompiled/eager. "
+                            "Set ENN_PRED_FALLBACK_ON_CUDAGRAPH_ASSERT=0 to disable."
+                        )
+                        force_uncompiled = True
+                        force_eager = True
+                        return run_model_uncompiled(
+                            x_use,
                             calibrate_output=bool(calibrate_output),
                             return_loss=False,
                         )
-                return m(
-                    x,
-                    calibrate_output=bool(calibrate_output),
-                    return_loss=False,
-                )
+                    raise
 
             def _maybe_enable_fp32_collapse_fallback() -> bool:
                 nonlocal collapse_fp32_active, force_uncompiled, force_eager
