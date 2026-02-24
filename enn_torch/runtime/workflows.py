@@ -797,6 +797,7 @@ def _save_model_checkpoint(
         m: torch.nn.Module,
     ) -> tuple[str | None, torch.Tensor | None]:
         allow_scaler_inf = env_bool("ENN_SAVE_ALLOW_SCALER_INF", default=True)
+        allow_logger_inf = env_bool("ENN_SAVE_ALLOW_LOGGER_INF", default=True)
         scaler_inf_suffixes = (
             "scaler.y_min",
             "scaler.y_max",
@@ -805,13 +806,19 @@ def _save_model_checkpoint(
         )
 
         def _allowed_nonfinite(name: str, t: torch.Tensor) -> bool:
-            if not allow_scaler_inf:
-                return False
-            if any(str(name).endswith(suf) for suf in scaler_inf_suffixes):
+            if allow_scaler_inf and any(str(name).endswith(suf) for suf in scaler_inf_suffixes):
                 with torch.no_grad():
                     if bool(torch.isnan(t).any().item()):
                         return False
                     return bool(torch.isinf(t).all().item())
+            if allow_logger_inf:
+                n = str(name)
+                if ("logger.sampled_" in n) and (n.endswith("_min") or n.endswith("_max")):
+                    with torch.no_grad():
+                        if t.numel() <= 16:
+                            if bool(torch.isnan(t).any().item()):
+                                return False
+                            return bool(torch.isinf(t).all().item())
             return False
 
         def _scan_named_tensors(
