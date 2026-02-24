@@ -765,21 +765,28 @@ class DilatedAttention(nn.Module):
         compiling = bool(is_compiling())
         exporting = bool(is_export_or_trace()) and (not compiling)
 
-        km = get_kernel_manager()
-        site = getattr(self, "_enn_kernel_site", None)
-        if not isinstance(site, str) or not site:
-            site = f"{self.__class__.__name__}@{id(self):x}"
-            setattr(self, "_enn_kernel_site", site)
-        dev_i = int(device.index) if device.index is not None else 0
-        kind = "self" if context is None else "ctx"
-        with contextlib.suppress(Exception):
-            child_site = getattr(self.dpa, "_enn_kernel_site", None)
-            if (not isinstance(child_site, str)) or (not child_site):
-                setattr(self.dpa, "_enn_kernel_site", f"{site}:dilated-{kind}.dpa")
-        kbase = f"attn:{site}:dilated-{kind}@{device.type}:{dev_i}"
-        k_flex = f"{kbase}:flex"
-        k_mha = f"{kbase}:mha"
-        k_dpa = f"{kbase}:dpa"
+        trace_like = bool(exporting or compiling or bool(is_symbolic()))
+
+        km = None
+        k_flex = ""
+        k_mha = ""
+        k_dpa = ""
+        if not trace_like:
+            km = get_kernel_manager()
+            site = getattr(self, "_enn_kernel_site", None)
+            if not isinstance(site, str) or not site:
+                site = f"{self.__class__.__name__}@{id(self):x}"
+                setattr(self, "_enn_kernel_site", site)
+            dev_i = int(device.index) if device.index is not None else 0
+            kind = "self" if context is None else "ctx"
+            with contextlib.suppress(Exception):
+                child_site = getattr(self.dpa, "_enn_kernel_site", None)
+                if (not isinstance(child_site, str)) or (not child_site):
+                    setattr(self.dpa, "_enn_kernel_site", f"{site}:dilated-{kind}.dpa")
+            kbase = f"attn:{site}:dilated-{kind}@{device.type}:{dev_i}"
+            k_flex = f"{kbase}:flex"
+            k_mha = f"{kbase}:mha"
+            k_dpa = f"{kbase}:dpa"
 
         def _is_finite_tensor(t: Any) -> bool:
             if not isinstance(t, torch.Tensor):
@@ -808,14 +815,13 @@ class DilatedAttention(nn.Module):
             and (create_block_mask is not None)
         )
 
-        allow_mha = (not (exporting or compiling)) and (not km.is_dead(k_mha))
+        allow_mha = (not (exporting or compiling)) and (km is not None) and (not km.is_dead(k_mha))
         allow_dpa = bool(
             (context is None)
             and (not need_weights)
             and (key_padding_mask is None)
             and (torch_mha is not None)
-            and (not km.is_dead(k_dpa))
-        )
+        ) and ((km is None) or (not km.is_dead(k_dpa)))
 
         allow_flex = False
         if (
@@ -833,7 +839,7 @@ class DilatedAttention(nn.Module):
             needs_mask = bool(self.causal) or (self.window_size is not None) or (int(self.dilation) != 1)
             use_score_mod = bool(x_norm.is_cuda and flex_supports_score_mod)
             block_mask_ok = bool(flex_supports_block_mask)
-            allow_flex = ((not needs_mask) or use_score_mod or block_mask_ok) and (not km.is_dead(k_flex))
+            allow_flex = ((not needs_mask) or use_score_mod or block_mask_ok) and (km is not None) and (not km.is_dead(k_flex))
 
         plan = ATTENTION_POLICY.plan(
             q=x_norm,
@@ -880,13 +886,16 @@ class DilatedAttention(nn.Module):
                         a = a.transpose(1, 2).contiguous().view(B, L, self.embed_dim)
                         return out_proj(a)
 
-                    attn_out = km.run(
-                        k_flex,
-                        _call_flex,
-                        validate=_validate_out,
-                        sticky=True,
-                        safe_on_exception=False,
-                    )
+                    if km is not None:
+                        attn_out = km.run(
+                            k_flex,
+                            _call_flex,
+                            validate=_validate_out,
+                            sticky=True,
+                            safe_on_exception=False,
+                        )
+                    else:
+                        attn_out = _call_flex()
                     attn_weights = None
                     break
 
@@ -918,13 +927,16 @@ class DilatedAttention(nn.Module):
                         a = a.transpose(1, 2).contiguous().view(B, L, self.embed_dim)
                         return out_proj(a)
 
-                    attn_out = km.run(
-                        k_dpa,
-                        _call_dpa,
-                        validate=_validate_out,
-                        sticky=True,
-                        safe_on_exception=False,
-                    )
+                    if km is not None:
+                        attn_out = km.run(
+                            k_dpa,
+                            _call_dpa,
+                            validate=_validate_out,
+                            sticky=True,
+                            safe_on_exception=False,
+                        )
+                    else:
+                        attn_out = _call_dpa()
                     attn_weights = None
                     if mask_keep is not None:
                         attn_mask_keep = mask_keep
@@ -950,13 +962,16 @@ class DilatedAttention(nn.Module):
                         is_causal=use_is_causal,
                     )
 
-                attn_out, attn_weights = km.run(
-                    k_mha,
-                    _call_mha,
-                    validate=_validate_out,
-                    sticky=True,
-                    safe_on_exception=False,
-                )
+                if km is not None:
+                    attn_out, attn_weights = km.run(
+                        k_mha,
+                        _call_mha,
+                        validate=_validate_out,
+                        sticky=True,
+                        safe_on_exception=False,
+                    )
+                else:
+                    attn_out, attn_weights = _call_mha()
                 break
 
             except Exception:
@@ -1090,21 +1105,23 @@ class CrossAttention(nn.Module):
         k = self.k_proj(kv_in).reshape(B, Lk, H, Dh).transpose(1, 2)
         v = self.v_proj(kv_in).reshape(B, Lk, H, Dh).transpose(1, 2)
 
-        km = get_kernel_manager()
-        site = getattr(self, "_enn_kernel_site", None)
-        if not isinstance(site, str) or not site:
-            site = f"{self.__class__.__name__}@{id(self):x}"
-            setattr(self, "_enn_kernel_site", site)
-        with contextlib.suppress(Exception):
-            child_site = getattr(self.attn, "_enn_kernel_site", None)
-            if (not isinstance(child_site, str)) or (not child_site):
-                setattr(self.attn, "_enn_kernel_site", f"{site}:cross.dpa")
-        dev_i = int(q.device.index) if q.device.index is not None else 0
-        kbase = f"attn:{site}:cross@{q.device.type}:{dev_i}"
-        k_mha = f"{kbase}:mha"
-
         compiling = bool(is_compiling())
         exporting = bool(is_export_or_trace()) and (not compiling)
+        km = None
+        k_mha = ""
+        if not (exporting or compiling or bool(is_symbolic())):
+            km = get_kernel_manager()
+            site = getattr(self, "_enn_kernel_site", None)
+            if not isinstance(site, str) or not site:
+                site = f"{self.__class__.__name__}@{id(self):x}"
+                setattr(self, "_enn_kernel_site", site)
+            with contextlib.suppress(Exception):
+                child_site = getattr(self.attn, "_enn_kernel_site", None)
+                if (not isinstance(child_site, str)) or (not child_site):
+                    setattr(self.attn, "_enn_kernel_site", f"{site}:cross.dpa")
+            dev_i = int(q.device.index) if q.device.index is not None else 0
+            kbase = f"attn:{site}:cross@{q.device.type}:{dev_i}"
+            k_mha = f"{kbase}:mha"
         has_bias = attn_bias is not None
 
         def _is_fp8_tensor(x: torch.Tensor) -> bool:
@@ -1158,7 +1175,7 @@ class CrossAttention(nn.Module):
             _ensure_flex_kwargs_initialized()
             allow_flex = (not self._disable_flex_bias_runtime) and ("score_mod" in _FLEX_KWARGS)
 
-        allow_mha = (not (exporting or compiling)) and (not km.is_dead(k_mha))
+        allow_mha = (not (exporting or compiling)) and (km is not None) and (not km.is_dead(k_mha))
         allow_dpa = True
 
         plan = ATTENTION_POLICY.plan(
@@ -1459,23 +1476,25 @@ class LatentAttention(nn.Module):
             .unbind(0)
         )
 
-        km = get_kernel_manager()
-        site = getattr(self, "_enn_kernel_site", None)
-        if not isinstance(site, str) or not site:
-            site = f"{self.__class__.__name__}@{id(self):x}"
-            setattr(self, "_enn_kernel_site", site)
-        with contextlib.suppress(Exception):
-            child_site = getattr(self.attn, "_enn_kernel_site", None)
-            if (not isinstance(child_site, str)) or (not child_site):
-                setattr(self.attn, "_enn_kernel_site", f"{site}:latent.dpa")
-        dev_i = int(q.device.index) if q.device.index is not None else 0
-        kbase = f"attn:{site}:latent@{q.device.type}:{dev_i}"
-        k_mha = f"{kbase}:mha"
-
         compiling = bool(is_compiling())
         exporting = bool(is_export_or_trace()) and (not compiling)
+        km = None
+        k_mha = ""
+        if not (exporting or compiling or bool(is_symbolic())):
+            km = get_kernel_manager()
+            site = getattr(self, "_enn_kernel_site", None)
+            if not isinstance(site, str) or not site:
+                site = f"{self.__class__.__name__}@{id(self):x}"
+                setattr(self, "_enn_kernel_site", site)
+            with contextlib.suppress(Exception):
+                child_site = getattr(self.attn, "_enn_kernel_site", None)
+                if (not isinstance(child_site, str)) or (not child_site):
+                    setattr(self.attn, "_enn_kernel_site", f"{site}:latent.dpa")
+            dev_i = int(q.device.index) if q.device.index is not None else 0
+            kbase = f"attn:{site}:latent@{q.device.type}:{dev_i}"
+            k_mha = f"{kbase}:mha"
         allow_flex = not self._disable_flex_runtime
-        allow_mha = (not (exporting or compiling)) and (not km.is_dead(k_mha))
+        allow_mha = (not (exporting or compiling)) and (km is not None) and (not km.is_dead(k_mha))
         allow_dpa = True
 
         plan = ATTENTION_POLICY.plan(

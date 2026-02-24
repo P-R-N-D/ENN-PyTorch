@@ -2133,14 +2133,24 @@ class DotProductAttention(nn.Module):
                     bias_float, device=q_bshd.device, B=B, H=H, L=L, S=S
                 )
 
-        km = get_kernel_manager()
-        site = getattr(self, "_enn_kernel_site", None)
-        if not isinstance(site, str) or not site:
-            site = f"{self.__class__.__name__}@{id(self):x}"
-            setattr(self, "_enn_kernel_site", site)
-        dev_i = int(q_bshd.device.index) if q_bshd.device.index is not None else 0
-        kkey_base = f"dpa:{site}@{q_bshd.device.type}:{dev_i}"
-        kkey_te = f"{kkey_base}:te"
+        try:
+            is_compiling = torch.compiler.is_compiling()
+        except:
+            is_compiling = False
+        exporting_boundary = _exporting_boundary()
+
+        km = None
+        kkey_base = ""
+        kkey_te = ""
+        if (not exporting_boundary) and (not is_compiling) and (not tracing):
+            km = get_kernel_manager()
+            site = getattr(self, "_enn_kernel_site", None)
+            if not isinstance(site, str) or not site:
+                site = f"{self.__class__.__name__}@{id(self):x}"
+                setattr(self, "_enn_kernel_site", site)
+            dev_i = int(q_bshd.device.index) if q_bshd.device.index is not None else 0
+            kkey_base = f"dpa:{site}@{q_bshd.device.type}:{dev_i}"
+            kkey_te = f"{kkey_base}:te"
 
         def _is_finite_out(out: Any) -> bool:
             if not isinstance(out, torch.Tensor):
@@ -2149,16 +2159,14 @@ class DotProductAttention(nn.Module):
                 return True
             with torch.no_grad():
                 return bool(torch.isfinite(out).all().item())
-        try:
-            is_compiling = torch.compiler.is_compiling()
-        except:
-            is_compiling = False
         d_type = str(getattr(q_bshd.device, "type", "cpu"))
         use_te = (
             self._te_ok
             and self.te_first
             and not self._force_pt
             and not self._disable_te
+            and (not exporting_boundary)
+            and (km is not None)
             and (not km.is_dead(kkey_te))
             and self._te_attn is not None
             and not is_compiling
@@ -2443,7 +2451,8 @@ class DotProductAttention(nn.Module):
                     cfg_backends = [be for be in cfg_backends if be != SDPBackend.FLASH_ATTENTION]
                 if cfg_backends and isinstance(am2, torch.Tensor) and (am2.dtype != torch.bool):
                     cfg_backends = [be for be in cfg_backends if be != SDPBackend.FLASH_ATTENTION]
-                cfg_backends = [be for be in cfg_backends if not km.is_dead(f"{kkey_base}:sdpa:{_be_name(be)}")]
+                if km is not None and kkey_base:
+                    cfg_backends = [be for be in cfg_backends if not km.is_dead(f"{kkey_base}:sdpa:{_be_name(be)}")]
 
                 try:
                     out0 = _sdpa_call(cfg_backends if cfg_backends else None)
@@ -2466,25 +2475,26 @@ class DotProductAttention(nn.Module):
                         candidates = [be for be in candidates if be != SDPBackend.FLASH_ATTENTION]
                     if candidates and isinstance(am2, torch.Tensor) and (am2.dtype != torch.bool):
                         candidates = [be for be in candidates if be != SDPBackend.FLASH_ATTENTION]
-                    candidates = [be for be in candidates if not km.is_dead(f"{kkey_base}:sdpa:{_be_name(be)}")]
+                    if km is not None and kkey_base:
+                        candidates = [be for be in candidates if not km.is_dead(f"{kkey_base}:sdpa:{_be_name(be)}")]
 
-                    for be in candidates:
-                        k_be = f"{kkey_base}:sdpa:{_be_name(be)}"
+                        for be in candidates:
+                            k_be = f"{kkey_base}:sdpa:{_be_name(be)}"
 
-                        def _call_one(be_: Any = be) -> torch.Tensor:
-                            return _sdpa_call([be_])
+                            def _call_one(be_: Any = be) -> torch.Tensor:
+                                return _sdpa_call([be_])
 
-                        try:
-                            sdpa_out = km.run(
-                                k_be,
-                                _call_one,
-                                validate=_is_finite_out,
-                                sticky=True,
-                                safe_on_exception=False,
-                            )
-                            break
-                        except Exception:
-                            sdpa_out = None
+                            try:
+                                sdpa_out = km.run(
+                                    k_be,
+                                    _call_one,
+                                    validate=_is_finite_out,
+                                    sticky=True,
+                                    safe_on_exception=False,
+                                )
+                                break
+                            except Exception:
+                                sdpa_out = None
 
                 if sdpa_out is None:
                     fm3 = sdpa_kwargs.get("attn_mask", None)
@@ -3187,6 +3197,17 @@ class MultiScaleRetention(nn.Module):
         if not _HAS_TRITON_MSR or _triton_retention is None:
             return self._scan_causal_torch(v, lam_h)
 
+        disable_triton = env_bool("ENN_MSR_FORCE_TORCH", default=False)
+        if (
+            disable_triton
+            or _exporting_boundary()
+            or (not self._triton_ok)
+            or (not v.is_cuda)
+            or (not torch.cuda.is_available())
+            or (not env_bool("ENN_ENABLE_MSR_TRITON", default=False))
+        ):
+            return self._scan_causal_torch(v, lam_h)
+
         km = get_kernel_manager()
         site = getattr(self, "_enn_kernel_site", None)
         if not isinstance(site, str) or not site:
@@ -3195,16 +3216,10 @@ class MultiScaleRetention(nn.Module):
         dev_i = int(v.device.index) if v.device.index is not None else 0
         k_triton = f"msr:{site}@{v.device.type}:{dev_i}:scan_triton"
 
-        disable_triton = env_bool("ENN_MSR_FORCE_TORCH", default=False)
-        use_triton = bool(
-            (not disable_triton)
-            and (not _exporting_boundary())
-            and self._triton_ok
-            and v.is_cuda
-            and torch.cuda.is_available()
-            and env_bool("ENN_ENABLE_MSR_TRITON", default=False)
-            and (not km.is_dead(k_triton))
-        )
+        if km.is_dead(k_triton):
+            return self._scan_causal_torch(v, lam_h)
+
+        use_triton = True
 
         def _is_finite_out(out: Any) -> bool:
             if not isinstance(out, torch.Tensor):
