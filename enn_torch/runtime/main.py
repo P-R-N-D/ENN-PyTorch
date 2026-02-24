@@ -603,6 +603,16 @@ def epochs(
     optim_diag = env_bool("ENN_OPTIMIZER_DIAG_NONFINITE", default=False)
     optim_diag_every = max(1, int(env_int("ENN_OPTIMIZER_DIAG_EVERY", 1) or 1))
     optim_diag_scope = str(env_str("ENN_OPTIMIZER_DIAG_SCOPE") or "").strip()
+    nonfinite_fail_fast = env_bool("ENN_FAIL_FAST_NONFINITE", default=False)
+    nonfinite_skip_step = env_bool("ENN_SKIP_STEP_ON_NONFINITE", default=False)
+    nonfinite_dump_dir = str(env_str("ENN_NONFINITE_DUMP_DIR") or "").strip()
+    nonfinite_dump_limit = max(
+        0, int(env_int("ENN_NONFINITE_DUMP_LIMIT", 4) or 4)
+    )
+    nonfinite_dump_all_ranks = env_bool(
+        "ENN_NONFINITE_DUMP_ALL_RANKS", default=False
+    )
+    nonfinite_dumped = 0
 
     def _opt_scope_ok(name: str) -> bool:
         return (not optim_diag_scope) or (optim_diag_scope in name)
@@ -642,6 +652,73 @@ def epochs(
                         if not bool(torch.isfinite(t).all().item()):
                             return str(k2)
         return None
+
+    def _maybe_dump_nonfinite(
+        *,
+        epoch: int,
+        step_idx: int,
+        step_total: int,
+        bad: str,
+        X: torch.Tensor | None = None,
+        Y: torch.Tensor | None = None,
+        Y_flat: torch.Tensor | None = None,
+        loss: torch.Tensor | None = None,
+    ) -> str | None:
+        nonlocal nonfinite_dumped
+        if not nonfinite_dump_dir:
+            return None
+        if nonfinite_dump_limit > 0 and int(nonfinite_dumped) >= int(
+            nonfinite_dump_limit
+        ):
+            return None
+        if is_distributed() and (not nonfinite_dump_all_ranks) and local_rank != 0:
+            return None
+        try:
+            os.makedirs(nonfinite_dump_dir, exist_ok=True)
+        except Exception:
+            return None
+
+        payload: dict[str, object] = {
+            "epoch": int(epoch),
+            "step_idx": int(step_idx),
+            "step_total": int(step_total),
+            "bad": str(bad),
+        }
+        try:
+            if torch.is_tensor(loss):
+                with contextlib.suppress(Exception):
+                    payload["loss"] = loss.detach().float().cpu()
+        except Exception:
+            pass
+        for k, t in (
+            ("X", X),
+            ("Y", Y),
+            ("Y_flat", Y_flat),
+        ):
+            if not torch.is_tensor(t):
+                continue
+            try:
+                tt = t.detach()
+                if tt.ndim >= 1:
+                    tt = tt[: min(16, int(tt.shape[0]))]
+                payload[k] = tt.to("cpu")
+                with contextlib.suppress(Exception):
+                    payload[f"{k}_shape"] = tuple(t.shape)
+                    payload[f"{k}_dtype"] = str(t.dtype)
+                    payload[f"{k}_device"] = str(t.device)
+            except Exception:
+                pass
+
+        path = os.path.join(
+            nonfinite_dump_dir,
+            f"nonfinite_e{int(epoch)}_s{int(step_idx)}_t{int(step_total)}.pt",
+        )
+        try:
+            torch.save(payload, path)
+            nonfinite_dumped += 1
+            return str(path)
+        except Exception:
+            return None
     autocast_dtype = None
     with contextlib.suppress(Exception):
         import inspect
@@ -1406,10 +1483,72 @@ def epochs(
                                                 policy=dist_policy.collective,
                                             )
                                         scaler.unscale_(optimizer)
-                                        if optim_diag and (int(delta_gate_auto_step_total) % int(optim_diag_every) == 0):
+                                        diag_now = (
+                                            int(delta_gate_auto_step_total)
+                                            % int(optim_diag_every)
+                                        ) == 0
+                                        if (
+                                            optim_diag
+                                            or nonfinite_fail_fast
+                                            or nonfinite_skip_step
+                                            or bool(nonfinite_dump_dir)
+                                        ) and (
+                                            diag_now
+                                            or nonfinite_fail_fast
+                                            or nonfinite_skip_step
+                                            or bool(nonfinite_dump_dir)
+                                        ):
                                             bad = _first_nonfinite_grad(model_for_grads)
                                             if bad is not None:
-                                                _LOGGER.error("[OPTIM][nonfinite] pre-step grad non-finite: %s (step=%d, opt=%s)", bad, int(delta_gate_auto_step_total), type(optimizer).__name__)
+                                                dump_path = _maybe_dump_nonfinite(
+                                                    epoch=int(epoch_idx),
+                                                    step_idx=int(step_idx),
+                                                    step_total=int(
+                                                        delta_gate_auto_step_total
+                                                    ),
+                                                    bad=str(bad),
+                                                    X=X,
+                                                    Y=Y,
+                                                    Y_flat=Y_flat,
+                                                    loss=loss_val,
+                                                )
+                                                _LOGGER.error(
+                                                    "[OPTIM][nonfinite] pre-step grad non-finite: %s (epoch=%d, step_idx=%d, step=%d, opt=%s)",
+                                                    bad,
+                                                    int(epoch_idx),
+                                                    int(step_idx),
+                                                    int(
+                                                        delta_gate_auto_step_total
+                                                    ),
+                                                    type(optimizer).__name__,
+                                                )
+                                                if dump_path:
+                                                    _LOGGER.error(
+                                                        "[OPTIM][nonfinite] dumped to: %s",
+                                                        str(dump_path),
+                                                    )
+                                                if nonfinite_fail_fast:
+                                                    raise RuntimeError(
+                                                        f"Non-finite gradients detected (param={bad}, epoch={int(epoch_idx)}, step_idx={int(step_idx)}, step={int(delta_gate_auto_step_total)})."
+                                                    )
+                                                if nonfinite_skip_step:
+                                                    _LOGGER.error(
+                                                        "[OPTIM][nonfinite] skipping optimizer step (epoch=%d, step_idx=%d, step=%d)",
+                                                        int(epoch_idx),
+                                                        int(step_idx),
+                                                        int(
+                                                            delta_gate_auto_step_total
+                                                        ),
+                                                    )
+                                                    optimizer.zero_grad(
+                                                        set_to_none=True
+                                                    )
+                                                    with contextlib.suppress(
+                                                        Exception
+                                                    ):
+                                                        scaler.update()
+                                                    train_accum_since_last = 0
+                                                    break
                                         scaler.step(optimizer)
                                         if optim_diag and (int(delta_gate_auto_step_total) % int(optim_diag_every) == 0):
                                             bad_p = _first_nonfinite_param(model_for_grads)
@@ -2144,49 +2283,98 @@ def epochs(
                         policy=dist_policy.collective,
                     )
                 scaler.unscale_(optimizer)
-                if optim_diag and (int(delta_gate_auto_step_total) % int(optim_diag_every) == 0):
+                diag_now = (
+                    int(delta_gate_auto_step_total) % int(optim_diag_every)
+                ) == 0
+                bad = None
+                if (
+                    optim_diag
+                    or nonfinite_fail_fast
+                    or nonfinite_skip_step
+                    or bool(nonfinite_dump_dir)
+                ) and (
+                    diag_now
+                    or nonfinite_fail_fast
+                    or nonfinite_skip_step
+                    or bool(nonfinite_dump_dir)
+                ):
                     bad = _first_nonfinite_grad(model_for_grads)
                     if bad is not None:
-                        _LOGGER.error("[OPTIM][nonfinite] pre-step grad non-finite: %s (step=%d, opt=%s)", bad, int(delta_gate_auto_step_total), type(optimizer).__name__)
-                scaler.step(optimizer)
+                        dump_path = _maybe_dump_nonfinite(
+                            epoch=int(epoch_idx),
+                            step_idx=int(step_idx),
+                            step_total=int(delta_gate_auto_step_total),
+                            bad=str(bad),
+                        )
+                        _LOGGER.error(
+                            "[OPTIM][nonfinite] pre-step grad non-finite: %s (epoch=%d, step_idx=%d, step=%d, opt=%s)",
+                            bad,
+                            int(epoch_idx),
+                            int(step_idx),
+                            int(delta_gate_auto_step_total),
+                            type(optimizer).__name__,
+                        )
+                        if dump_path:
+                            _LOGGER.error(
+                                "[OPTIM][nonfinite] dumped to: %s",
+                                str(dump_path),
+                            )
+                        if nonfinite_fail_fast:
+                            raise RuntimeError(
+                                f"Non-finite gradients detected (param={bad}, epoch={int(epoch_idx)}, step_idx={int(step_idx)}, step={int(delta_gate_auto_step_total)})."
+                            )
+                        if nonfinite_skip_step:
+                            _LOGGER.error(
+                                "[OPTIM][nonfinite] skipping optimizer step (epoch=%d, step_idx=%d, step=%d)",
+                                int(epoch_idx),
+                                int(step_idx),
+                                int(delta_gate_auto_step_total),
+                            )
+                            optimizer.zero_grad(set_to_none=True)
+                            with contextlib.suppress(Exception):
+                                scaler.update()
+                            train_accum_since_last = 0
+                if bad is None or (not nonfinite_skip_step):
+                    scaler.step(optimizer)
                 if optim_diag and (int(delta_gate_auto_step_total) % int(optim_diag_every) == 0):
                     bad_p = _first_nonfinite_param(model_for_grads)
                     if bad_p is not None:
                         bad_s = _first_nonfinite_optim_state(optimizer)
                         _LOGGER.error("[OPTIM][nonfinite] post-step param non-finite: %s (step=%d, opt=%s, state=%s)", bad_p, int(delta_gate_auto_step_total), type(optimizer).__name__, str(bad_s))
-                scaler.update()
-                optimizer.zero_grad(set_to_none=True)
-                if scheduler_step_per_batch:
-                    with contextlib.suppress(Exception):
-                        sched.step()
-                if local_rank == 0 and status_bar is not None:
-                    io_elapsed = prev_io_time + float(io_time)
-                    io_transferred = prev_io_bytes + float(io_bytes)
-                    comp_elapsed = prev_comp_time + float(comp_time)
-                    mbps_cur = (
-                        io_transferred / max(io_elapsed, 1e-06) / MB_DIV
-                    )
-                    flops_used = prev_flops_tflops + float(flops_tflops)
-                    kern_used = prev_kern_tflops + float(kern_tflops)
-                    denom = (
-                        kern_used
-                        if kern_used > 0.0
-                        else (prev_kern_time + float(kern_time))
-                    )
-                    if denom <= 0.0:
-                        denom = comp_elapsed
-                    tflops_cur = (
-                        flops_used
-                        / max(float(denom), 1e-06)
-                        / 1000000000000.0
-                    )
-                    ProcessBroker.update_progress_bar(
-                        status_bar,
-                        finish=train_accum_since_last,
-                        mbps=mbps_cur,
-                        tflops=tflops_cur,
-                    )
-                train_accum_since_last = 0
+                if bad is None or (not nonfinite_skip_step):
+                    scaler.update()
+                    optimizer.zero_grad(set_to_none=True)
+                    if scheduler_step_per_batch:
+                        with contextlib.suppress(Exception):
+                            sched.step()
+                    if local_rank == 0 and status_bar is not None:
+                        io_elapsed = prev_io_time + float(io_time)
+                        io_transferred = prev_io_bytes + float(io_bytes)
+                        comp_elapsed = prev_comp_time + float(comp_time)
+                        mbps_cur = (
+                            io_transferred / max(io_elapsed, 1e-06) / MB_DIV
+                        )
+                        flops_used = prev_flops_tflops + float(flops_tflops)
+                        kern_used = prev_kern_tflops + float(kern_tflops)
+                        denom = (
+                            kern_used
+                            if kern_used > 0.0
+                            else (prev_kern_time + float(kern_time))
+                        )
+                        if denom <= 0.0:
+                            denom = comp_elapsed
+                        tflops_cur = (
+                            flops_used
+                            / max(float(denom), 1e-06)
+                            / 1000000000000.0
+                        )
+                        ProcessBroker.update_progress_bar(
+                            status_bar,
+                            finish=train_accum_since_last,
+                            mbps=mbps_cur,
+                            tflops=tflops_cur,
+                        )
+                    train_accum_since_last = 0
             if val_loader is not None and flop_counter_val is not None:
                 with flop_counter_val:
                     model.eval()
