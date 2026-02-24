@@ -184,6 +184,8 @@ try:
 except Exception:
     pass
 
+os.environ.setdefault("TORCHDYNAMO_CAPTURE_SCALAR_OUTPUTS", "1")
+
 _COMPILE_SAFE_DONE = False
 _COMPILE_SAFE_LOCK = Mutex()
 _LOGGER = logging.getLogger(__name__)
