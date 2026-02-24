@@ -615,6 +615,7 @@ def epochs(
         "ENN_NONFINITE_DUMP_ALL_RANKS", default=False
     )
     nonfinite_dumped = 0
+    strict_sanitize = env_bool("ENN_SANITIZE_NAN_STRICT", default=False)
 
     def _opt_scope_ok(name: str) -> bool:
         return (not optim_diag_scope) or (optim_diag_scope in name)
@@ -665,6 +666,7 @@ def epochs(
         Y: torch.Tensor | None = None,
         Y_flat: torch.Tensor | None = None,
         loss: torch.Tensor | None = None,
+        extra: dict[str, object] | None = None,
     ) -> str | None:
         nonlocal nonfinite_dumped
         if not nonfinite_dump_dir:
@@ -686,6 +688,8 @@ def epochs(
             "step_total": int(step_total),
             "bad": str(bad),
         }
+        if isinstance(extra, dict) and extra:
+            payload["extra"] = extra
         try:
             if torch.is_tensor(loss):
                 with contextlib.suppress(Exception):
@@ -1593,6 +1597,56 @@ def epochs(
                                                     train_accum_since_last = 0
                                                     break
                                         scaler.step(optimizer)
+                                        if strict_sanitize or nonfinite_fail_fast or bool(nonfinite_dump_dir):
+                                            bad_p_post = _first_nonfinite_param(model_for_grads)
+                                            if bad_p_post is not None:
+                                                bad_s = _first_nonfinite_optim_state(optimizer)
+                                                p_t = None
+                                                with contextlib.suppress(Exception):
+                                                    for n, p in model_for_grads.named_parameters(recurse=True):
+                                                        if n == bad_p_post:
+                                                            p_t = p
+                                                            break
+                                                extra = {"where": "post_step_param", "param": str(bad_p_post)}
+                                                if bad_s is not None:
+                                                    extra["optim_state_first_bad"] = str(bad_s)
+                                                if torch.is_tensor(p_t):
+                                                    with torch.no_grad():
+                                                        tt = p_t.detach()
+                                                        extra["dtype"] = str(tt.dtype)
+                                                        with contextlib.suppress(Exception):
+                                                            extra["shape"] = [int(x) for x in tuple(tt.shape)]
+                                                        if tt.is_floating_point():
+                                                            with contextlib.suppress(Exception):
+                                                                extra["nan"] = int(torch.isnan(tt).sum().item())
+                                                            with contextlib.suppress(Exception):
+                                                                extra["inf"] = int(torch.isinf(tt).sum().item())
+                                                dump_path = _maybe_dump_nonfinite(
+                                                    epoch=int(epoch_idx),
+                                                    step_idx=int(step_idx),
+                                                    step_total=int(delta_gate_auto_step_total),
+                                                    bad=str("post_step_param:" + str(bad_p_post)),
+                                                    X=X,
+                                                    Y=Y,
+                                                    Y_flat=Y_flat,
+                                                    loss=loss_val,
+                                                    extra=extra,
+                                                )
+                                                _LOGGER.error(
+                                                    "[OPTIM][nonfinite] post-step param non-finite: %s (epoch=%d, step_idx=%d, step=%d, opt=%s, state=%s)",
+                                                    str(bad_p_post),
+                                                    int(epoch_idx),
+                                                    int(step_idx),
+                                                    int(delta_gate_auto_step_total),
+                                                    type(optimizer).__name__,
+                                                    str(bad_s),
+                                                )
+                                                if dump_path:
+                                                    _LOGGER.error("[OPTIM][nonfinite] dumped to: %s", str(dump_path))
+                                                if strict_sanitize or nonfinite_fail_fast:
+                                                    raise RuntimeError(
+                                                        f"Non-finite parameter after optimizer.step: {bad_p_post} (epoch={int(epoch_idx)}, step_idx={int(step_idx)}, step={int(delta_gate_auto_step_total)})"
+                                                    )
                                         if optim_diag and (int(delta_gate_auto_step_total) % int(optim_diag_every) == 0):
                                             bad_p = _first_nonfinite_param(model_for_grads)
                                             if bad_p is not None:
@@ -2409,6 +2463,35 @@ def epochs(
                             train_accum_since_last = 0
                 if bad is None or (not nonfinite_skip_step):
                     scaler.step(optimizer)
+                    if strict_sanitize or nonfinite_fail_fast or bool(nonfinite_dump_dir):
+                        bad_p_post = _first_nonfinite_param(model_for_grads)
+                        if bad_p_post is not None:
+                            bad_s = _first_nonfinite_optim_state(optimizer)
+                            extra = {"where": "post_step_param_tail", "param": str(bad_p_post)}
+                            if bad_s is not None:
+                                extra["optim_state_first_bad"] = str(bad_s)
+                            dump_path = _maybe_dump_nonfinite(
+                                epoch=int(epoch_idx),
+                                step_idx=int(step_idx),
+                                step_total=int(delta_gate_auto_step_total),
+                                bad=str("post_step_param:" + str(bad_p_post)),
+                                extra=extra,
+                            )
+                            _LOGGER.error(
+                                "[OPTIM][nonfinite] post-step param non-finite (tail): %s (epoch=%d, step_idx=%d, step=%d, opt=%s, state=%s)",
+                                str(bad_p_post),
+                                int(epoch_idx),
+                                int(step_idx),
+                                int(delta_gate_auto_step_total),
+                                type(optimizer).__name__,
+                                str(bad_s),
+                            )
+                            if dump_path:
+                                _LOGGER.error("[OPTIM][nonfinite] dumped to: %s", str(dump_path))
+                            if strict_sanitize or nonfinite_fail_fast:
+                                raise RuntimeError(
+                                    f"Non-finite parameter after optimizer.step (tail): {bad_p_post} (epoch={int(epoch_idx)}, step_idx={int(step_idx)}, step={int(delta_gate_auto_step_total)})"
+                                )
                 if optim_diag and (int(delta_gate_auto_step_total) % int(optim_diag_every) == 0):
                     bad_p = _first_nonfinite_param(model_for_grads)
                     if bad_p is not None:
