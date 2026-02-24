@@ -1,22 +1,23 @@
 diff --git a/enn_torch/runtime/workflows.py b/enn_torch/runtime/workflows.py
-index 7d0a0d0..9a9a9a9 100644
+index 7d0a0d0..merged000 100644
 --- a/enn_torch/runtime/workflows.py
 +++ b/enn_torch/runtime/workflows.py
-@@ -5123,6 +5123,91 @@ def load_weights(
-     if suffix and suffix not in (".pt", ".pth"):
-         raise ValueError(
-             f"Unsupported checkpoint extension {suffix!r}. Use .pt/.pth/.safetensors or a directory checkpoint instead."
-         )
-     obj = _torch_load_checkpoint(
-         p,
-         map_location=map_location or "cpu",
+@@ -89,6 +89,10 @@ logger = logging.getLogger(__name__)
+ 
+ 
+ def _rewrite_state_dict_key(k: str) -> str:
++    if k.startswith("module."):
++        return k[len("module.") :]
++    if k.startswith("model."):
++        return k[len("model.") :]
+     if k.startswith("m.") and ".module." in k:
+         parts = k.split(".")
+         if len(parts) >= 4 and parts[1].isdigit() and parts[2] == "module":
+@@ -1619,6 +1623,72 @@ def load_weights(
          weights_only=weights_only,
          mmap=mmap,
      )
 +
-+    # --- Non-finite diagnostics for PT/PTH checkpoints ---
-+    # These issues can otherwise surface much later (e.g., during predict-time save), especially
-+    # when strict=False allows missing keys and when meta/to_empty materialization is involved.
 +    dump_dir = str(os.environ.get("ENN_NONFINITE_DUMP_DIR", "") or "").strip()
 +    strict_nf = env_bool(
 +        "ENN_FAIL_ON_LOAD_NONFINITE",
@@ -24,7 +25,6 @@ index 7d0a0d0..9a9a9a9 100644
 +    )
 +
 +    def _allowed_nonfinite_key(name: str, t: torch.Tensor) -> bool:
-+        # Allow inf-only sentinels for scaler/logger buffers; never allow NaN.
 +        n = str(name)
 +        allow_scaler_inf = env_bool("ENN_SAVE_ALLOW_SCALER_INF", default=True)
 +        allow_logger_inf = env_bool("ENN_SAVE_ALLOW_LOGGER_INF", default=True)
@@ -74,16 +74,10 @@ index 7d0a0d0..9a9a9a9 100644
 +        return None
 +
 +    bad_sd: str | None = None
-+    # We'll compute bad_sd after we determine sd below.
-
-     meta: Mapping[str, Any] | None = obj if isinstance(obj, dict) else None
-     sd = None
-@@ -5175,10 +5260,55 @@ def load_weights(
+@@ -1648,10 +1718,49 @@ def load_weights(
      else:
          sd = obj
      sd = _coerce_state_dict(sd) if isinstance(sd, dict) else sd
-+
-+    # Detect whether the checkpoint itself contains non-finite tensors.
 +    if (dump_dir or strict_nf) and isinstance(sd, Mapping):
 +        bad_sd = _first_nonfinite_in_state(cast(Mapping[str, Any], sd))
 +        if bad_sd is not None:
@@ -98,16 +92,11 @@ index 7d0a0d0..9a9a9a9 100644
 +                    logger.error("[ENN] load_weights: dumped to: %s", str(path))
 +            if strict_nf:
 +                raise RuntimeError(f"[ENN] load_weights: non-finite tensor in checkpoint state: {bad_sd}")
-+
      with contextlib.suppress(Exception):
          resize_scaler_buffer(model, sd)
      if _model_has_meta_or_fake_tensors(model):
          _materialize_module_to_device(model, map_location or "cpu")
      _load_state_dict_compat(model, sd, strict=False)
-+
-+    # If strict mode is enabled, also ensure that the in-memory model parameters are finite
-+    # immediately after load. If the checkpoint was finite but the model is not, it usually
-+    # indicates missing-key loading into to_empty/materialized tensors (silent corruption).
 +    if dump_dir or strict_nf:
 +        bad_model = _first_nonfinite_param(model)
 +        if bad_model is not None:
@@ -119,7 +108,6 @@ index 7d0a0d0..9a9a9a9 100644
 +                    rank = str(os.environ.get("RANK", "0") or "0")
 +                    path = os.path.join(dump_dir, f"load_nonfinite.param.rank{rank}.{rid}.pt")
 +                    payload = {"where": "load_weights_param", "first_bad": str(bad_model), "path": str(p), "bad_sd": str(bad_sd) if bad_sd else None}
-+                    # Helpful for diagnosing silent missing-key loads.
 +                    if isinstance(sd, Mapping):
 +                        try:
 +                            sd_keys = set(str(k) for k in sd.keys())
@@ -132,9 +120,6 @@ index 7d0a0d0..9a9a9a9 100644
 +                    logger.error("[ENN] load_weights: dumped to: %s", str(path))
 +            if strict_nf:
 +                raise RuntimeError(f"[ENN] load_weights: non-finite parameter after load: {bad_model} (checkpoint_bad={bad_sd})")
-+
      with contextlib.suppress(Exception):
          _coerce_scaler_buffers_to_shape(
              model, getattr(model, "in_dim", None), getattr(model, "out_shape", ()) or ()
-         )
-     return meta
