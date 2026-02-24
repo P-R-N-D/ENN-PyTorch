@@ -681,7 +681,49 @@ def _try_load_dir_checkpoint_fallback_pt(
         resize_scaler_buffer(model, sd)
     if _model_has_meta_or_fake_tensors(model):
         _materialize_module_to_device(model, map_location or "cpu")
-    _load_state_dict_compat(model, sd, strict=False)
+    sd_for_load: object = sd
+    if isinstance(sd, Mapping) and env_bool("ENN_LOAD_ALIAS_PERCEIVER_KEYS", default=True):
+        try:
+            sd_map = dict(sd)
+            model_names = [str(n) for n, _ in model.named_parameters(recurse=True)]
+            model_keys = set(model_names)
+
+            has_perceiver_origmod = any(k.startswith("fuser.perceiver._orig_mod.") for k in model_keys)
+            has_perceiver_plain = any(
+                k.startswith("fuser.perceiver.") and (not k.startswith("fuser.perceiver._orig_mod."))
+                for k in model_keys
+            )
+
+            def _alias_key(k: str) -> str:
+                kk = str(k)
+                kk = kk.replace("._enn_inner._orig_mod", "")
+                kk = kk.replace("._enn_inner", "")
+                if has_perceiver_origmod and kk.startswith("fuser.perceiver.") and (not kk.startswith("fuser.perceiver._orig_mod.")):
+                    kk = "fuser.perceiver._orig_mod." + kk[len("fuser.perceiver.") :]
+                elif has_perceiver_plain and kk.startswith("fuser.perceiver._orig_mod."):
+                    kk = "fuser.perceiver." + kk[len("fuser.perceiver._orig_mod.") :]
+                return kk
+
+            added = 0
+            for k, v in list(sd_map.items()):
+                if not isinstance(k, str):
+                    continue
+                kk = _alias_key(k)
+                if kk != k and kk in model_keys and kk not in sd_map:
+                    sd_map[kk] = v
+                    added += 1
+
+            if added > 0:
+                if (dump_dir or strict_nf) or env_bool("ENN_LOAD_ALIAS_PERCEIVER_LOG", default=False):
+                    logger.warning(
+                        "[ENN] load_weights: added %d aliased keys for perceiver wrapper compatibility",
+                        int(added),
+                    )
+            sd_for_load = sd_map
+        except Exception:
+            sd_for_load = sd
+
+    _load_state_dict_compat(model, sd_for_load, strict=False)
     with contextlib.suppress(Exception):
         _coerce_scaler_buffers_to_shape(
             model,
@@ -1729,7 +1771,49 @@ def load_weights(
         resize_scaler_buffer(model, sd)
     if _model_has_meta_or_fake_tensors(model):
         _materialize_module_to_device(model, map_location or "cpu")
-    _load_state_dict_compat(model, sd, strict=False)
+    sd_for_load: object = sd
+    if isinstance(sd, Mapping) and env_bool("ENN_LOAD_ALIAS_PERCEIVER_KEYS", default=True):
+        try:
+            sd_map = dict(sd)
+            model_names = [str(n) for n, _ in model.named_parameters(recurse=True)]
+            model_keys = set(model_names)
+
+            has_perceiver_origmod = any(k.startswith("fuser.perceiver._orig_mod.") for k in model_keys)
+            has_perceiver_plain = any(
+                k.startswith("fuser.perceiver.") and (not k.startswith("fuser.perceiver._orig_mod."))
+                for k in model_keys
+            )
+
+            def _alias_key(k: str) -> str:
+                kk = str(k)
+                kk = kk.replace("._enn_inner._orig_mod", "")
+                kk = kk.replace("._enn_inner", "")
+                if has_perceiver_origmod and kk.startswith("fuser.perceiver.") and (not kk.startswith("fuser.perceiver._orig_mod.")):
+                    kk = "fuser.perceiver._orig_mod." + kk[len("fuser.perceiver.") :]
+                elif has_perceiver_plain and kk.startswith("fuser.perceiver._orig_mod."):
+                    kk = "fuser.perceiver." + kk[len("fuser.perceiver._orig_mod.") :]
+                return kk
+
+            added = 0
+            for k, v in list(sd_map.items()):
+                if not isinstance(k, str):
+                    continue
+                kk = _alias_key(k)
+                if kk != k and kk in model_keys and kk not in sd_map:
+                    sd_map[kk] = v
+                    added += 1
+
+            if added > 0:
+                if (dump_dir or strict_nf) or env_bool("ENN_LOAD_ALIAS_PERCEIVER_LOG", default=False):
+                    logger.warning(
+                        "[ENN] load_weights: added %d aliased keys for perceiver wrapper compatibility",
+                        int(added),
+                    )
+            sd_for_load = sd_map
+        except Exception:
+            sd_for_load = sd
+
+    _load_state_dict_compat(model, sd_for_load, strict=False)
 
     if dump_dir or strict_nf:
         bad_model = _first_nonfinite_param(model)
@@ -1742,9 +1826,10 @@ def load_weights(
                     rank = str(os.environ.get("RANK", "0") or "0")
                     path = os.path.join(dump_dir, f"load_nonfinite.param.rank{rank}.{rid}.pt")
                     payload = {"where": "load_weights_param", "first_bad": str(bad_model), "path": str(p), "bad_sd": str(bad_sd) if bad_sd else None}
-                    if isinstance(sd, Mapping):
+                    sd_used = sd_for_load if isinstance(sd_for_load, Mapping) else sd
+                    if isinstance(sd_used, Mapping):
                         try:
-                            sd_keys = set(str(k) for k in sd.keys())
+                            sd_keys = set(str(k) for k in sd_used.keys())
                             missing = [n for n, _ in model.named_parameters(recurse=True) if str(n) not in sd_keys]
                             payload["missing_param_keys"] = missing[:100]
                             payload["missing_param_count"] = int(len(missing))
