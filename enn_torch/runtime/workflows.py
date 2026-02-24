@@ -895,6 +895,47 @@ def _save_model_checkpoint(
                 k: (v.detach() if torch.is_tensor(v) else v)
                 for k, v in pt_state.items()
             }
+        dump_dir = str(os.environ.get("ENN_NONFINITE_DUMP_DIR", "") or "").strip()
+        strict_save = env_bool(
+            "ENN_FAIL_ON_SAVE_NONFINITE",
+            default=env_bool("ENN_SANITIZE_NAN_STRICT", default=False),
+        )
+        if dump_dir or strict_save:
+            bad_k = None
+            bad_t = None
+            for k, v in pt_state.items():
+                if not torch.is_tensor(v):
+                    continue
+                if (not v.is_floating_point()) and (not v.is_complex()):
+                    continue
+                if v.numel() <= 0:
+                    continue
+                try:
+                    a = v.detach().abs().amax()
+                    ok = bool(torch.isfinite(a).item())
+                except Exception:
+                    ok = bool(torch.isfinite(v).all().item())
+                if not ok:
+                    bad_k, bad_t = str(k), v
+                    break
+            if bad_k is not None:
+                logger.error("[ENN] save_checkpoint: non-finite detected before save_pt: %s", str(bad_k))
+                if dump_dir:
+                    with contextlib.suppress(Exception):
+                        os.makedirs(dump_dir, exist_ok=True)
+                        rid = os.urandom(4).hex()
+                        rank = str(os.environ.get("RANK", "0") or "0")
+                        path = os.path.join(dump_dir, f"save_nonfinite.pt.rank{rank}.{rid}.pt")
+                        payload = {"where": "save_pt", "first_bad": str(bad_k)}
+                        if torch.is_tensor(bad_t):
+                            with contextlib.suppress(Exception):
+                                payload["shape"] = [int(x) for x in tuple(bad_t.shape)]
+                                payload["dtype"] = str(bad_t.dtype)
+                                payload["device"] = str(bad_t.device)
+                        torch.save(payload, path)
+                        logger.error("[ENN] save_checkpoint: dumped to: %s", str(path))
+                if strict_save:
+                    raise RuntimeError(f"[ENN] save_checkpoint: non-finite detected before save_pt: {bad_k}")
         torch.save(pt_state, os.path.join(out_dir, "model.pt"))
     return m_sd
 
