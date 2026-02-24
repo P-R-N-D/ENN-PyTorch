@@ -12,6 +12,7 @@ import itertools
 import logging
 import math
 import os
+os.environ.setdefault("TORCHDYNAMO_CAPTURE_SCALAR_OUTPUTS", "1")
 import platform
 import re
 import socket
