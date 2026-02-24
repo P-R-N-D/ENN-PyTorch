@@ -794,6 +794,29 @@ def _save_model_checkpoint(
     if save_dcp:
         dcp_cpu_offload = env_bool("ENN_DCP_CPU_OFFLOAD", default=False)
         dcp_sync_files = env_bool("ENN_DCP_SYNC_FILES", default=True)
+        dump_dir = str(os.environ.get("ENN_NONFINITE_DUMP_DIR", "") or "").strip()
+        strict_save = env_bool(
+            "ENN_FAIL_ON_SAVE_NONFINITE",
+            default=env_bool("ENN_SANITIZE_NAN_STRICT", default=False),
+        )
+
+        def _first_nonfinite_state(sd: Mapping[str, object]) -> tuple[str | None, torch.Tensor | None]:
+            for k, v in sd.items():
+                if not isinstance(v, torch.Tensor):
+                    continue
+                if (not v.is_floating_point()) and (not v.is_complex()):
+                    continue
+                if v.numel() <= 0:
+                    continue
+                try:
+                    a = v.detach().abs().amax()
+                    ok = bool(torch.isfinite(a).item())
+                except Exception:
+                    ok = bool(torch.isfinite(v).all().item())
+                if not ok:
+                    return str(k), v
+            return None, None
+
         with _filtered_warnings():
             m_sd = get_model_state_dict(
                 model,
@@ -801,6 +824,26 @@ def _save_model_checkpoint(
                     full_state_dict=False, cpu_offload=bool(dcp_cpu_offload)
                 ),
             )
+            if (dump_dir or strict_save) and isinstance(m_sd, Mapping):
+                bad_k, bad_t = _first_nonfinite_state(cast(Mapping[str, object], m_sd))
+                if bad_k is not None:
+                    logger.error("[ENN] save_checkpoint: non-finite detected before save_dcp: %s", str(bad_k))
+                    if dump_dir:
+                        with contextlib.suppress(Exception):
+                            os.makedirs(dump_dir, exist_ok=True)
+                            rid = os.urandom(4).hex()
+                            rank = str(os.environ.get("RANK", "0") or "0")
+                            path = os.path.join(dump_dir, f"save_nonfinite.dcp.rank{rank}.{rid}.pt")
+                            payload = {"where": "save_dcp", "first_bad": str(bad_k)}
+                            if isinstance(bad_t, torch.Tensor):
+                                with contextlib.suppress(Exception):
+                                    payload["shape"] = [int(x) for x in tuple(bad_t.shape)]
+                                    payload["dtype"] = str(bad_t.dtype)
+                                    payload["device"] = str(bad_t.device)
+                            torch.save(payload, path)
+                            logger.error("[ENN] save_checkpoint: dumped to: %s", str(path))
+                    if strict_save:
+                        raise RuntimeError(f"[ENN] save_checkpoint: non-finite detected before save_dcp: {bad_k}")
             use_collectives = False
             with contextlib.suppress(Exception):
                 import torch.distributed as _dist
@@ -2371,6 +2414,15 @@ def predict(
         try:
             save_dcp = kwargs.pop("save_dcp", True)
             save_pt = kwargs.pop("save_pt", False)
+            strict = env_bool("ENN_SANITIZE_NAN_STRICT", default=False)
+            pt_only = env_bool("ENN_PRED_SAVE_PT_ONLY", default=False) or (
+                strict and env_bool("ENN_PRED_SAVE_PT_ONLY_IF_STRICT", default=True)
+            )
+            if pt_only:
+                save_pt = True
+                save_dcp = False
+            elif strict and env_bool("ENN_PRED_SAVE_PT_ALSO_IF_STRICT", default=False):
+                save_pt = True
             dcp_dir = os.path.join(ckpt_dir, "dcp")
             if not (save_dcp or save_pt):
                 save_dcp = True
