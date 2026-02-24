@@ -1498,6 +1498,47 @@ def epochs(
                                             or nonfinite_skip_step
                                             or bool(nonfinite_dump_dir)
                                         ):
+                                            bad_p0 = _first_nonfinite_param(model_for_grads)
+                                            if bad_p0 is not None:
+                                                dump_path = _maybe_dump_nonfinite(
+                                                    epoch=int(epoch_idx),
+                                                    step_idx=int(step_idx),
+                                                    step_total=int(delta_gate_auto_step_total),
+                                                    bad=str("param:" + str(bad_p0)),
+                                                    X=X,
+                                                    Y=Y,
+                                                    Y_flat=Y_flat,
+                                                    loss=loss_val,
+                                                )
+                                                _LOGGER.error(
+                                                    "[OPTIM][nonfinite] pre-step param non-finite: %s (epoch=%d, step_idx=%d, step=%d, opt=%s)",
+                                                    bad_p0,
+                                                    int(epoch_idx),
+                                                    int(step_idx),
+                                                    int(delta_gate_auto_step_total),
+                                                    type(optimizer).__name__,
+                                                )
+                                                if dump_path:
+                                                    _LOGGER.error(
+                                                        "[OPTIM][nonfinite] dumped to: %s",
+                                                        str(dump_path),
+                                                    )
+                                                if nonfinite_fail_fast:
+                                                    raise RuntimeError(
+                                                        f"Non-finite parameters detected (param={bad_p0}, epoch={int(epoch_idx)}, step_idx={int(step_idx)}, step={int(delta_gate_auto_step_total)})."
+                                                    )
+                                                if nonfinite_skip_step:
+                                                    _LOGGER.error(
+                                                        "[OPTIM][nonfinite] skipping optimizer step due to non-finite params (epoch=%d, step_idx=%d, step=%d)",
+                                                        int(epoch_idx),
+                                                        int(step_idx),
+                                                        int(delta_gate_auto_step_total),
+                                                    )
+                                                    optimizer.zero_grad(set_to_none=True)
+                                                    with contextlib.suppress(Exception):
+                                                        scaler.update()
+                                                    train_accum_since_last = 0
+                                                    break
                                             bad = _first_nonfinite_grad(model_for_grads)
                                             if bad is not None:
                                                 dump_path = _maybe_dump_nonfinite(
@@ -2298,6 +2339,34 @@ def epochs(
                     or nonfinite_skip_step
                     or bool(nonfinite_dump_dir)
                 ):
+                    bad_p0 = _first_nonfinite_param(model_for_grads)
+                    if bad_p0 is not None:
+                        dump_path = _maybe_dump_nonfinite(
+                            epoch=int(epoch_idx),
+                            step_idx=int(step_idx),
+                            step_total=int(delta_gate_auto_step_total),
+                            bad=str("param:" + str(bad_p0)),
+                        )
+                        _LOGGER.error(
+                            "[OPTIM][nonfinite] pre-step param non-finite: %s (epoch=%d, step_idx=%d, step=%d, opt=%s)",
+                            bad_p0,
+                            int(epoch_idx),
+                            int(step_idx),
+                            int(delta_gate_auto_step_total),
+                            type(optimizer).__name__,
+                        )
+                        if dump_path:
+                            _LOGGER.error("[OPTIM][nonfinite] dumped to: %s", str(dump_path))
+                        if nonfinite_fail_fast:
+                            raise RuntimeError(
+                                f"Non-finite parameters detected (param={bad_p0}, epoch={int(epoch_idx)}, step_idx={int(step_idx)}, step={int(delta_gate_auto_step_total)})."
+                            )
+                        if nonfinite_skip_step:
+                            optimizer.zero_grad(set_to_none=True)
+                            with contextlib.suppress(Exception):
+                                scaler.update()
+                            train_accum_since_last = 0
+                            bad = str("param:" + str(bad_p0))
                     bad = _first_nonfinite_grad(model_for_grads)
                     if bad is not None:
                         dump_path = _maybe_dump_nonfinite(
