@@ -722,7 +722,28 @@ def _try_load_dir_checkpoint_fallback_pt(
         except Exception:
             sd_for_load = sd
 
-    _load_state_dict_compat(model, sd_for_load, strict=False)
+    incompat = _load_state_dict_compat(model, sd_for_load, strict=False)
+    warn_missing = env_bool(
+        "ENN_LOAD_ALIAS_PERCEIVER_WARN_MISSING",
+        default=env_bool("ENN_SANITIZE_NAN_STRICT", default=False),
+    )
+    if warn_missing and incompat is not None:
+        miss = getattr(incompat, "missing_keys", None) or []
+        unexp = getattr(incompat, "unexpected_keys", None) or []
+        if miss:
+            miss_p = [k for k in miss if str(k).startswith("fuser.perceiver.")]
+            sample = miss_p[:10] if miss_p else miss[:10]
+            try:
+                sample_s = ", ".join(str(x) for x in sample)
+            except Exception:
+                sample_s = str(sample)
+            logger.warning(
+                "[ENN] load_weights: fallback load missing_keys=%d (perceiver=%d, unexpected=%d). Example: %s",
+                int(len(miss)),
+                int(len(miss_p)),
+                int(len(unexp)),
+                sample_s,
+            )
     with contextlib.suppress(Exception):
         _coerce_scaler_buffers_to_shape(
             model,
@@ -814,15 +835,14 @@ def _materialize_module_to_device(m: torch.nn.Module, device: object = "cpu") ->
     )
 
 
-def _load_state_dict_compat(m: torch.nn.Module, sd: Mapping[str, Any], *, strict: bool) -> None:
+def _load_state_dict_compat(m: torch.nn.Module, sd: Mapping[str, Any], *, strict: bool) -> object:
     strict_b = bool(strict)
     if _model_has_meta_or_fake_tensors(m):
         try:
-            m.load_state_dict(sd, strict=strict_b, assign=True)
-            return
+            return m.load_state_dict(sd, strict=strict_b, assign=True)
         except TypeError:
             pass
-    m.load_state_dict(sd, strict=strict_b)
+    return m.load_state_dict(sd, strict=strict_b)
 
 
 def _save_model_checkpoint(
