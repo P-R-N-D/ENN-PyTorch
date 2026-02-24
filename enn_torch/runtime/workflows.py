@@ -87,6 +87,10 @@ logger = logging.getLogger(__name__)
 
 
 def _rewrite_state_dict_key(k: str) -> str:
+    if k.startswith("module."):
+        return k[len("module.") :]
+    if k.startswith("model."):
+        return k[len("model.") :]
     if k.startswith("m.") and ".module." in k:
         parts = k.split(".")
         if len(parts) >= 4 and parts[1].isdigit() and parts[2] == "module":
@@ -1623,6 +1627,64 @@ def load_weights(
         weights_only=weights_only,
         mmap=mmap,
     )
+
+    dump_dir = str(os.environ.get("ENN_NONFINITE_DUMP_DIR", "") or "").strip()
+    strict_nf = env_bool(
+        "ENN_FAIL_ON_LOAD_NONFINITE",
+        default=env_bool("ENN_SANITIZE_NAN_STRICT", default=False),
+    )
+
+    def _allowed_nonfinite_key(name: str, t: torch.Tensor) -> bool:
+        n = str(name)
+        allow_scaler_inf = env_bool("ENN_SAVE_ALLOW_SCALER_INF", default=True)
+        allow_logger_inf = env_bool("ENN_SAVE_ALLOW_LOGGER_INF", default=True)
+        if bool(torch.isnan(t).any().item()):
+            return False
+        if allow_scaler_inf:
+            if n.endswith("scaler.y_min") or n.endswith("scaler.y_max") or n.endswith("scaler.y_q_low") or n.endswith("scaler.y_q_high"):
+                return bool(torch.isinf(t).all().item())
+        if allow_logger_inf:
+            if (("logger.sampled_" in n) or ("logger.reduced_" in n)) and (n.endswith("_min") or n.endswith("_max")):
+                if t.numel() <= 16:
+                    return bool(torch.isinf(t).all().item())
+        return False
+
+    def _first_nonfinite_in_state(sd: Mapping[str, Any]) -> str | None:
+        with torch.no_grad():
+            for k, v in sd.items():
+                if not torch.is_tensor(v):
+                    continue
+                if (not v.is_floating_point()) and (not v.is_complex()):
+                    continue
+                if v.numel() <= 0:
+                    continue
+                try:
+                    a = v.detach().abs().amax()
+                    ok = bool(torch.isfinite(a).item())
+                except Exception:
+                    ok = bool(torch.isfinite(v).all().item())
+                if not ok:
+                    if _allowed_nonfinite_key(str(k), v):
+                        continue
+                    return str(k)
+        return None
+
+    def _first_nonfinite_param(m: torch.nn.Module) -> str | None:
+        with torch.no_grad():
+            for n, p0 in m.named_parameters(recurse=True):
+                if not torch.is_tensor(p0) or (not p0.is_floating_point()) or p0.numel() <= 0:
+                    continue
+                try:
+                    a = p0.detach().abs().amax()
+                    ok = bool(torch.isfinite(a).item())
+                except Exception:
+                    ok = bool(torch.isfinite(p0).all().item())
+                if not ok:
+                    return str(n)
+        return None
+
+    bad_sd: str | None = None
+
     meta: Mapping[str, Any] | None = obj if isinstance(obj, dict) else None
     sd = None
     if isinstance(obj, dict):
@@ -1647,11 +1709,52 @@ def load_weights(
     else:
         sd = obj
     sd = _coerce_state_dict(sd) if isinstance(sd, dict) else sd
+
+    if (dump_dir or strict_nf) and isinstance(sd, Mapping):
+        bad_sd = _first_nonfinite_in_state(cast(Mapping[str, Any], sd))
+        if bad_sd is not None:
+            logger.error("[ENN] load_weights: non-finite tensor detected in checkpoint state: %s", str(bad_sd))
+            if dump_dir:
+                with contextlib.suppress(Exception):
+                    os.makedirs(dump_dir, exist_ok=True)
+                    rid = os.urandom(4).hex()
+                    rank = str(os.environ.get("RANK", "0") or "0")
+                    path = os.path.join(dump_dir, f"load_nonfinite.state.rank{rank}.{rid}.pt")
+                    torch.save({"where": "load_weights_state", "first_bad": str(bad_sd), "path": str(p)}, path)
+                    logger.error("[ENN] load_weights: dumped to: %s", str(path))
+            if strict_nf:
+                raise RuntimeError(f"[ENN] load_weights: non-finite tensor in checkpoint state: {bad_sd}")
+
     with contextlib.suppress(Exception):
         resize_scaler_buffer(model, sd)
     if _model_has_meta_or_fake_tensors(model):
         _materialize_module_to_device(model, map_location or "cpu")
     _load_state_dict_compat(model, sd, strict=False)
+
+    if dump_dir or strict_nf:
+        bad_model = _first_nonfinite_param(model)
+        if bad_model is not None:
+            logger.error("[ENN] load_weights: non-finite parameter detected after load: %s", str(bad_model))
+            if dump_dir:
+                with contextlib.suppress(Exception):
+                    os.makedirs(dump_dir, exist_ok=True)
+                    rid = os.urandom(4).hex()
+                    rank = str(os.environ.get("RANK", "0") or "0")
+                    path = os.path.join(dump_dir, f"load_nonfinite.param.rank{rank}.{rid}.pt")
+                    payload = {"where": "load_weights_param", "first_bad": str(bad_model), "path": str(p), "bad_sd": str(bad_sd) if bad_sd else None}
+                    if isinstance(sd, Mapping):
+                        try:
+                            sd_keys = set(str(k) for k in sd.keys())
+                            missing = [n for n, _ in model.named_parameters(recurse=True) if str(n) not in sd_keys]
+                            payload["missing_param_keys"] = missing[:100]
+                            payload["missing_param_count"] = int(len(missing))
+                        except Exception:
+                            pass
+                    torch.save(payload, path)
+                    logger.error("[ENN] load_weights: dumped to: %s", str(path))
+            if strict_nf:
+                raise RuntimeError(f"[ENN] load_weights: non-finite parameter after load: {bad_model} (checkpoint_bad={bad_sd})")
+
     with contextlib.suppress(Exception):
         _coerce_scaler_buffers_to_shape(
             model, getattr(model, "in_dim", None), getattr(model, "out_shape", ()) or ()
