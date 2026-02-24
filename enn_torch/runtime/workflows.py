@@ -874,7 +874,16 @@ def _save_model_checkpoint(
             pt_state = dict(m_sd)
             _coerce_dcp_keys(pt_state)
         else:
-            pt_state = model.state_dict()
+            with _filtered_warnings():
+                pt_state = dict(
+                    get_model_state_dict(
+                        model,
+                        options=StateDictOptions(
+                            full_state_dict=False, cpu_offload=False
+                        ),
+                    )
+                )
+            _coerce_dcp_keys(pt_state)
             if any(
                 torch.is_tensor(v) and is_meta_or_fake_tensor(v)
                 for v in pt_state.values()
@@ -888,6 +897,18 @@ def _save_model_checkpoint(
             }
         torch.save(pt_state, os.path.join(out_dir, "model.pt"))
     return m_sd
+
+
+def _is_wrapped_or_distributed_model(model: torch.nn.Module) -> bool:
+    wrapped = getattr(model, "module", None)
+    if isinstance(wrapped, torch.nn.Module):
+        return True
+    with contextlib.suppress(Exception):
+        import torch.distributed as _dist
+
+        if _dist.is_available() and _dist.is_initialized():
+            return int(_dist.get_world_size()) > 1
+    return False
 
 
 def _get_label_shape(
@@ -2418,9 +2439,15 @@ def predict(
             pt_only = env_bool("ENN_PRED_SAVE_PT_ONLY", default=False) or (
                 strict and env_bool("ENN_PRED_SAVE_PT_ONLY_IF_STRICT", default=True)
             )
+            wrapped_or_distributed = _is_wrapped_or_distributed_model(model)
             if pt_only:
                 save_pt = True
-                save_dcp = False
+                if wrapped_or_distributed:
+                    logger.info(
+                        "predict: keeping DCP checkpointing for wrapped/distributed model in strict PT-only mode"
+                    )
+                else:
+                    save_dcp = False
             elif strict and env_bool("ENN_PRED_SAVE_PT_ALSO_IF_STRICT", default=False):
                 save_pt = True
             dcp_dir = os.path.join(ckpt_dir, "dcp")
