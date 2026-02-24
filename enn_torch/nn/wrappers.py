@@ -3224,6 +3224,108 @@ class Fuser(nn.Module):
                 except Exception:
                     return not bool(torch.isfinite(t).all().item())
 
+        def _maybe_dump_fuser_nonfinite(
+            reason: str,
+            *,
+            all_tokens: torch.Tensor,
+            fused_tokens: object = None,
+            context: object = None,
+            attn_bias: object = None,
+        ) -> None:
+            dump_dir = str(env_str("ENN_NONFINITE_DUMP_DIR") or "").strip()
+            if not dump_dir:
+                return
+            dumped = int(getattr(self, "_enn_fuser_nonfinite_dumped", 0) or 0)
+            limit = int(env_int("ENN_FUSER_NONFINITE_DUMP_LIMIT", default=2) or 2)
+            if limit >= 0 and dumped >= limit:
+                return
+            with contextlib.suppress(Exception):
+                import os as _os
+
+                all_ranks = env_bool("ENN_NONFINITE_DUMP_ALL_RANKS", default=False)
+                if (not all_ranks) and int(_os.environ.get("LOCAL_RANK", "0") or 0) != 0:
+                    return
+
+                _os.makedirs(dump_dir, exist_ok=True)
+                rank = int(_os.environ.get("RANK", "0") or 0)
+                safe_reason = "".join(
+                    (c if (c.isalnum() or c in "._-") else "_") for c in str(reason)
+                )
+                fname = f"fuser_nonfinite.{safe_reason}.rank{rank}.{uuid.uuid4().hex[:8]}.pt"
+                out_path = _os.path.join(dump_dir, fname)
+
+                def _stats(t: object) -> object:
+                    if not torch.is_tensor(t):
+                        return None
+                    x = t.detach()
+                    out: dict[str, object] = {
+                        "shape": [int(v) for v in tuple(x.shape)],
+                        "dtype": str(x.dtype),
+                        "device": str(x.device),
+                        "numel": int(x.numel()),
+                    }
+                    if x.is_floating_point() and x.numel() > 0:
+                        with torch.no_grad():
+                            flat = x.reshape(-1)
+                            n = int(min(4096, int(flat.numel())))
+                            if n > 0:
+                                samp = flat[:n]
+                                out["absmax"] = float(samp.abs().max().item())
+                                out["nonfinite"] = int((~torch.isfinite(samp)).sum().item())
+                    return out
+
+                def _sample(t: object) -> object:
+                    if not torch.is_tensor(t):
+                        return None
+                    x = t.detach()
+                    if x.numel() > 0:
+                        with contextlib.suppress(Exception):
+                            if x.dim() >= 1:
+                                x = x[: min(2, int(x.shape[0]))]
+                            if x.dim() >= 2:
+                                x = x[:, : min(128, int(x.shape[1]))]
+                            if x.dim() >= 3:
+                                x = x[:, :, : min(128, int(x.shape[2]))]
+                        with contextlib.suppress(Exception):
+                            x = x.contiguous()
+                    return x.to("cpu")
+
+                bad_params: list[str] = []
+                with torch.no_grad():
+                    for pn, pv in self.perceiver.named_parameters(recurse=True):
+                        if pv is None or (not isinstance(pv, torch.Tensor)):
+                            continue
+                        if (not pv.is_floating_point()) or pv.numel() <= 0:
+                            continue
+                        with contextlib.suppress(Exception):
+                            if not bool(torch.isfinite(pv).all().item()):
+                                bad_params.append(str(pn))
+                                if len(bad_params) >= 256:
+                                    break
+
+                call_idx = int(getattr(self, "_enn_fuser_nonfinite_call_idx", 0) or 0) + 1
+                setattr(self, "_enn_fuser_nonfinite_call_idx", int(call_idx))
+
+                payload: dict[str, object] = {
+                    "reason": str(reason),
+                    "call_idx": int(call_idx),
+                    "infer_cuda": bool(infer_cuda),
+                    "cg_ok": bool(cg_ok),
+                    "fallback_enabled": bool(fallback_enabled),
+                    "all_tokens_stats": _stats(all_tokens),
+                    "fused_tokens_stats": _stats(fused_tokens),
+                    "context_stats": _stats(context),
+                    "attn_bias_stats": _stats(attn_bias),
+                    "all_tokens_sample": _sample(all_tokens),
+                    "fused_tokens_sample": _sample(fused_tokens),
+                    "context_sample": _sample(context),
+                    "attn_bias_sample": _sample(attn_bias),
+                    "perceiver_bad_params": bad_params,
+                }
+                torch.save(payload, out_path)
+                setattr(self, "_enn_fuser_nonfinite_dumped", dumped + 1)
+                _LOGGER.error("[ENN] Fuser: dumped non-finite snapshot to: %s", str(out_path))
+
         if runtime_skip_perceiver:
             fused_tokens = _fallback_fused_from_all()
             graph_break()
@@ -3250,6 +3352,14 @@ class Fuser(nn.Module):
                             "Set ENN_FUSER_NONFINITE_FALLBACK=0 to disable this."
                         )
                         setattr(self, "_nonfinite_fallback_warned", True)
+
+                    _maybe_dump_fuser_nonfinite(
+                        "fused_tokens",
+                        all_tokens=all_tokens,
+                        fused_tokens=fused_tokens,
+                        context=None,
+                        attn_bias=attn_bias,
+                    )
 
                     if env_bool("ENN_FUSER_DIAG_NONFINITE_PARAMS", default=True) and (not bool(getattr(self, "_nonfinite_params_warned", False))):
                         with contextlib.suppress(Exception):
@@ -3278,6 +3388,13 @@ class Fuser(nn.Module):
                         "falling back to raw template tokens (all_tokens)."
                     )
                     setattr(self, "_nonfinite_fallback_warned", True)
+                _maybe_dump_fuser_nonfinite(
+                    "tokens_or_context",
+                    all_tokens=all_tokens,
+                    fused_tokens=fused_tokens,
+                    context=context,
+                    attn_bias=attn_bias,
+                )
                 fused_tokens = _fallback_fused_from_all()
                 graph_break()
                 context = self.decode(fused_tokens, apply_norm=True)
@@ -3323,6 +3440,13 @@ class Fuser(nn.Module):
                             "falling back to pre-perceiver tokens (set ENN_FUSER_NONFINITE_FALLBACK=0 to disable)."
                         )
                         setattr(self, "_enn_nonfinite_fallback_logged", True)
+                    _maybe_dump_fuser_nonfinite(
+                        "infer_outputs",
+                        all_tokens=all_tokens,
+                        fused_tokens=fused_tokens,
+                        context=context,
+                        attn_bias=attn_bias,
+                    )
                     fb = all_tokens
                     try:
                         want_n = int(fused_tokens.shape[1])
@@ -4588,6 +4712,50 @@ class Model(nn.Module):
                     "absmax": absmax,
                 }
                 nonfinite_log.append(entry)
+                dump_dir = str(env_str("ENN_NONFINITE_DUMP_DIR") or "").strip()
+                if dump_dir:
+                    dumped = int(getattr(self, "_enn_pre_sanitize_dumped", 0) or 0)
+                    limit = int(env_int("ENN_PRE_SANITIZE_DUMP_LIMIT", default=4) or 4)
+                    if (limit < 0) or (dumped < limit):
+                        with contextlib.suppress(Exception):
+                            import os as _os
+
+                            all_ranks = env_bool("ENN_NONFINITE_DUMP_ALL_RANKS", default=False)
+                            do_dump = True
+                            if (not all_ranks) and int(_os.environ.get("LOCAL_RANK", "0") or 0) != 0:
+                                do_dump = False
+                            if do_dump:
+                                _os.makedirs(dump_dir, exist_ok=True)
+                                safe_tag = "".join(
+                                    (c if (c.isalnum() or c in "._-") else "_") for c in str(tag)
+                                )
+                                rank = int(_os.environ.get("RANK", "0") or 0)
+                                fname = f"pre_sanitize.{safe_tag}.rank{rank}.{uuid.uuid4().hex[:8]}.pt"
+                                out_path = _os.path.join(dump_dir, fname)
+
+                                samp = tt.detach()
+                                if samp.numel() > 0:
+                                    with contextlib.suppress(Exception):
+                                        if samp.dim() >= 1:
+                                            samp = samp[: min(2, int(samp.shape[0]))]
+                                        if samp.dim() >= 2:
+                                            samp = samp[:, : min(128, int(samp.shape[1]))]
+                                        if samp.dim() >= 3:
+                                            samp = samp[:, :, : min(128, int(samp.shape[2]))]
+                                    with contextlib.suppress(Exception):
+                                        samp = samp.contiguous()
+                                    samp = samp.to("cpu")
+                                payload = {
+                                    "tag": str(tag),
+                                    "entry": entry,
+                                    "sample": samp,
+                                }
+                                torch.save(payload, out_path)
+                                setattr(self, "_enn_pre_sanitize_dumped", dumped + 1)
+                                _LOGGER.error(
+                                    "[ENN] dumped pre-sanitize non-finite snapshot to: %s",
+                                    str(out_path),
+                                )
                 if strict_pre:
                     raise RuntimeError(
                         f"[ENN] nonfinite detected before sanitize in {tag}: nonfinite={nonfinite} absmax={absmax} dtype={dtype} shape={shape}"
