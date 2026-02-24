@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import (
     Any,
     Callable,
+    Iterable,
     Mapping,
     Optional,
     ParamSpec,
@@ -792,23 +793,34 @@ def _save_model_checkpoint(
         return None
     os.makedirs(out_dir, exist_ok=True)
 
-    def _first_nonfinite_param(
+    def _first_nonfinite_state_tensor(
         m: torch.nn.Module,
     ) -> tuple[str | None, torch.Tensor | None]:
-        for k, v in m.named_parameters(recurse=True):
-            if not isinstance(v, torch.Tensor):
-                continue
-            if (not v.is_floating_point()) and (not v.is_complex()):
-                continue
-            if v.numel() <= 0:
-                continue
-            try:
-                a = v.detach().abs().amax()
-                ok = bool(torch.isfinite(a).item())
-            except Exception:
-                ok = bool(torch.isfinite(v).all().item())
-            if not ok:
-                return str(k), v
+        def _scan_named_tensors(
+            named_tensors: Iterable[tuple[str, torch.Tensor]],
+        ) -> tuple[str | None, torch.Tensor | None]:
+            for k, v in named_tensors:
+                if not isinstance(v, torch.Tensor):
+                    continue
+                if (not v.is_floating_point()) and (not v.is_complex()):
+                    continue
+                if v.numel() <= 0:
+                    continue
+                try:
+                    a = v.detach().abs().amax()
+                    ok = bool(torch.isfinite(a).item())
+                except Exception:
+                    ok = bool(torch.isfinite(v).all().item())
+                if not ok:
+                    return str(k), v
+            return None, None
+
+        bad_k, bad_t = _scan_named_tensors(m.named_parameters(recurse=True))
+        if bad_k is not None:
+            return bad_k, bad_t
+        bad_k, bad_t = _scan_named_tensors(m.named_buffers(recurse=True))
+        if bad_k is not None:
+            return bad_k, bad_t
         return None, None
 
     if save_dcp:
@@ -821,10 +833,10 @@ def _save_model_checkpoint(
         )
 
         if dump_dir or strict_save:
-            bad_k, bad_t = _first_nonfinite_param(model)
+            bad_k, bad_t = _first_nonfinite_state_tensor(model)
             if bad_k is not None:
                 logger.error(
-                    "[ENN] save_checkpoint: non-finite parameter detected before save_dcp: %s",
+                    "[ENN] save_checkpoint: non-finite model state tensor detected before save_dcp: %s",
                     str(bad_k),
                 )
                 if dump_dir:
@@ -836,7 +848,7 @@ def _save_model_checkpoint(
                             dump_dir, f"save_nonfinite.dcp.rank{rank}.{rid}.pt"
                         )
                         payload = {
-                            "where": "save_dcp_param",
+                            "where": "save_dcp_state",
                             "first_bad": str(bad_k),
                         }
                         if isinstance(bad_t, torch.Tensor):
@@ -848,7 +860,7 @@ def _save_model_checkpoint(
                         logger.error("[ENN] save_checkpoint: dumped to: %s", str(path))
                 if strict_save:
                     raise RuntimeError(
-                        "[ENN] save_checkpoint: non-finite parameter detected before "
+                        "[ENN] save_checkpoint: non-finite model state tensor detected before "
                         f"save_dcp: {bad_k}"
                     )
 
@@ -916,10 +928,10 @@ def _save_model_checkpoint(
             default=env_bool("ENN_SANITIZE_NAN_STRICT", default=False),
         )
         if dump_dir or strict_save:
-            bad_k, bad_t = _first_nonfinite_param(model)
+            bad_k, bad_t = _first_nonfinite_state_tensor(model)
             if bad_k is not None:
                 logger.error(
-                    "[ENN] save_checkpoint: non-finite parameter detected before save_pt: %s",
+                    "[ENN] save_checkpoint: non-finite model state tensor detected before save_pt: %s",
                     str(bad_k),
                 )
                 if dump_dir:
@@ -930,7 +942,7 @@ def _save_model_checkpoint(
                         path = os.path.join(
                             dump_dir, f"save_nonfinite.pt.rank{rank}.{rid}.pt"
                         )
-                        payload = {"where": "save_pt_param", "first_bad": str(bad_k)}
+                        payload = {"where": "save_pt_state", "first_bad": str(bad_k)}
                         if isinstance(bad_t, torch.Tensor):
                             with contextlib.suppress(Exception):
                                 payload["shape"] = [int(x) for x in tuple(bad_t.shape)]
@@ -940,7 +952,7 @@ def _save_model_checkpoint(
                         logger.error("[ENN] save_checkpoint: dumped to: %s", str(path))
                 if strict_save:
                     raise RuntimeError(
-                        "[ENN] save_checkpoint: non-finite parameter detected before "
+                        "[ENN] save_checkpoint: non-finite model state tensor detected before "
                         f"save_pt: {bad_k}"
                     )
         torch.save(pt_state, os.path.join(out_dir, "model.pt"))
