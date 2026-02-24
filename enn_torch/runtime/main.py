@@ -4398,10 +4398,23 @@ def infer(
                     return False
                 if str(dev_type) != "cuda":
                     return False
+                cast_compiled = env_bool(
+                    "ENN_PRED_COLLAPSE_CAST_COMPILED_MODEL", default=False
+                )
                 mods: list[torch.nn.Module] = []
                 for cand in (run_model_uncompiled, run_model):
-                    if isinstance(cand, torch.nn.Module) and cand not in mods:
+                    if not isinstance(cand, torch.nn.Module):
+                        continue
+                    if (
+                        (cand is run_model)
+                        and (run_model_uncompiled is not run_model)
+                        and (not bool(cast_compiled))
+                    ):
+                        continue
+                    if cand not in mods:
                         mods.append(cand)
+                if not mods:
+                    return False
                 try:
                     for mm in mods:
                         mm.to(dtype=torch.float32)
