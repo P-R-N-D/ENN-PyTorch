@@ -4351,22 +4351,46 @@ def infer(
                 use_uncompiled: bool = False,
                 force_fp32: bool = False,
             ):
+                nonlocal force_uncompiled, force_eager
+
+                def _invoke_predict(mm: torch.nn.Module):
+                    if bool(force_fp32) or bool(collapse_fp32_active):
+                        with StatelessAutocast.suspend(device):
+                            x_fp32 = x
+                            if torch.is_tensor(x_fp32) and x_fp32.dtype != torch.float32:
+                                x_fp32 = x_fp32.to(dtype=torch.float32)
+                            return mm(
+                                x_fp32,
+                                calibrate_output=bool(calibrate_output),
+                                return_loss=False,
+                            )
+                    return mm(
+                        x,
+                        calibrate_output=bool(calibrate_output),
+                        return_loss=False,
+                    )
+
                 m = _select_pred_model(bool(use_uncompiled))
-                if bool(force_fp32) or bool(collapse_fp32_active):
-                    with StatelessAutocast.suspend(device):
-                        x_fp32 = x
-                        if torch.is_tensor(x_fp32) and x_fp32.dtype != torch.float32:
-                            x_fp32 = x_fp32.to(dtype=torch.float32)
-                        return m(
-                            x_fp32,
-                            calibrate_output=bool(calibrate_output),
-                            return_loss=False,
+                try:
+                    return _invoke_predict(m)
+                except AssertionError:
+                    if not env_bool("ENN_PRED_FALLBACK_ON_CUDAGRAPH_ASSERT", default=True):
+                        raise
+                    try:
+                        import traceback as _tb
+                        tb = _tb.format_exc()
+                        is_cg = ("torch/_inductor/cudagraph_trees.py" in tb) and ("assert isinstance" in tb)
+                    except Exception:
+                        is_cg = False
+                    if is_cg and (m is run_model) and (run_model_uncompiled is not run_model):
+                        _LOGGER.error(
+                            "[infer] inductor cudagraph assertion hit; falling back to uncompiled/eager. "
+                            "Set ENN_PRED_FALLBACK_ON_CUDAGRAPH_ASSERT=0 to disable."
                         )
-                return m(
-                    x,
-                    calibrate_output=bool(calibrate_output),
-                    return_loss=False,
-                )
+                        force_uncompiled = True
+                        force_eager = True
+                        return _invoke_predict(run_model_uncompiled)
+                    raise
 
             def _maybe_enable_fp32_collapse_fallback() -> bool:
                 nonlocal collapse_fp32_active, force_uncompiled, force_eager
@@ -4374,10 +4398,23 @@ def infer(
                     return False
                 if str(dev_type) != "cuda":
                     return False
+                cast_compiled = env_bool(
+                    "ENN_PRED_COLLAPSE_CAST_COMPILED_MODEL", default=False
+                )
                 mods: list[torch.nn.Module] = []
                 for cand in (run_model_uncompiled, run_model):
-                    if isinstance(cand, torch.nn.Module) and cand not in mods:
+                    if not isinstance(cand, torch.nn.Module):
+                        continue
+                    if (
+                        (cand is run_model)
+                        and (run_model_uncompiled is not run_model)
+                        and (not bool(cast_compiled))
+                    ):
+                        continue
+                    if cand not in mods:
                         mods.append(cand)
+                if not mods:
+                    return False
                 try:
                     for mm in mods:
                         mm.to(dtype=torch.float32)
