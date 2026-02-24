@@ -2367,17 +2367,19 @@ def epochs(
                                 scaler.update()
                             train_accum_since_last = 0
                             bad = str("param:" + str(bad_p0))
-                    bad = _first_nonfinite_grad(model_for_grads)
-                    if bad is not None:
+                    bad_g = _first_nonfinite_grad(model_for_grads)
+                    if bad_g is not None:
+                        if bad is None:
+                            bad = bad_g
                         dump_path = _maybe_dump_nonfinite(
                             epoch=int(epoch_idx),
                             step_idx=int(step_idx),
                             step_total=int(delta_gate_auto_step_total),
-                            bad=str(bad),
+                            bad=str(bad_g),
                         )
                         _LOGGER.error(
                             "[OPTIM][nonfinite] pre-step grad non-finite: %s (epoch=%d, step_idx=%d, step=%d, opt=%s)",
-                            bad,
+                            bad_g,
                             int(epoch_idx),
                             int(step_idx),
                             int(delta_gate_auto_step_total),
@@ -2390,7 +2392,7 @@ def epochs(
                             )
                         if nonfinite_fail_fast:
                             raise RuntimeError(
-                                f"Non-finite gradients detected (param={bad}, epoch={int(epoch_idx)}, step_idx={int(step_idx)}, step={int(delta_gate_auto_step_total)})."
+                                f"Non-finite gradients detected (param={bad_g}, epoch={int(epoch_idx)}, step_idx={int(step_idx)}, step={int(delta_gate_auto_step_total)})."
                             )
                         if nonfinite_skip_step:
                             _LOGGER.error(
