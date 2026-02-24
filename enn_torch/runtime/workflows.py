@@ -806,9 +806,7 @@ def _save_model_checkpoint(
         )
 
         def _allowed_nonfinite(name: str, t: torch.Tensor) -> bool:
-            if not allow_scaler_inf:
-                return False
-            if any(str(name).endswith(suf) for suf in scaler_inf_suffixes):
+            if allow_scaler_inf and any(str(name).endswith(suf) for suf in scaler_inf_suffixes):
                 with torch.no_grad():
                     if bool(torch.isnan(t).any().item()):
                         return False
