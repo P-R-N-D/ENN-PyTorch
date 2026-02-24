@@ -1090,6 +1090,15 @@ class CrossAttention(nn.Module):
         k = self.k_proj(kv_in).reshape(B, Lk, H, Dh).transpose(1, 2)
         v = self.v_proj(kv_in).reshape(B, Lk, H, Dh).transpose(1, 2)
 
+        km = get_kernel_manager()
+        site = getattr(self, "_enn_kernel_site", None)
+        if not isinstance(site, str) or not site:
+            site = f"{self.__class__.__name__}@{id(self):x}"
+            setattr(self, "_enn_kernel_site", site)
+        dev_i = int(q.device.index) if q.device.index is not None else 0
+        kbase = f"attn:{site}:cross@{q.device.type}:{dev_i}"
+        k_mha = f"{kbase}:mha"
+
         compiling = bool(is_compiling())
         exporting = bool(is_export_or_trace()) and (not compiling)
         has_bias = attn_bias is not None
@@ -1445,6 +1454,15 @@ class LatentAttention(nn.Module):
             .permute(2, 0, 3, 1, 4)
             .unbind(0)
         )
+
+        km = get_kernel_manager()
+        site = getattr(self, "_enn_kernel_site", None)
+        if not isinstance(site, str) or not site:
+            site = f"{self.__class__.__name__}@{id(self):x}"
+            setattr(self, "_enn_kernel_site", site)
+        dev_i = int(q.device.index) if q.device.index is not None else 0
+        kbase = f"attn:{site}:latent@{q.device.type}:{dev_i}"
+        k_mha = f"{kbase}:mha"
 
         compiling = bool(is_compiling())
         exporting = bool(is_export_or_trace()) and (not compiling)
