@@ -158,14 +158,80 @@ def _autofit_microbatch(
     return max(1, min(hard_max, int((eff * 0.35) // max(per_sample_bytes, 1))))
 
 
+_ENN_COERCE_NONFINITE_DUMPED: int = 0
+
+
 def _coerce_tensor(
     t: torch.Tensor, *args: object, enabled: bool, inplace: bool
 ) -> torch.Tensor:
-    return (
-        torch.nan_to_num(t, nan=0.0, posinf=0.0, neginf=0.0)
-        if enabled and (t.is_floating_point() or t.is_complex())
-        else t
-    )
+    if (not enabled) or (not (t.is_floating_point() or t.is_complex())):
+        return t
+
+    if t.numel() > 0 and env_bool("ENN_DIAG_NONFINITE_PRE_SANITIZE", default=False):
+        with torch.no_grad():
+            try:
+                absmax = t.detach().abs().amax()
+                has_nonfinite = not bool(torch.isfinite(absmax).item())
+            except Exception:
+                absmax = None
+                has_nonfinite = not bool(torch.isfinite(t).all().item())
+
+        if has_nonfinite:
+            dump_dir = str(os.environ.get("ENN_NONFINITE_DUMP_DIR", "") or "").strip()
+            strict = env_bool("ENN_SANITIZE_NAN_STRICT", default=False)
+            global _ENN_COERCE_NONFINITE_DUMPED
+            limit = int(env_int("ENN_PRE_SANITIZE_DUMP_LIMIT", 16) or 16)
+
+            if dump_dir and ((limit < 0) or (int(_ENN_COERCE_NONFINITE_DUMPED) < int(limit))):
+                with contextlib.suppress(Exception):
+                    os.makedirs(dump_dir, exist_ok=True)
+                    rank = str(os.environ.get("RANK", "0") or "0")
+                    rid = os.urandom(4).hex()
+                    tag = "coerce"
+                    if args and isinstance(args[0], str) and str(args[0]).strip():
+                        tag = str(args[0])
+                    safe_tag = "".join((c if (c.isalnum() or c in "._-") else "_") for c in tag)
+                    path = os.path.join(dump_dir, f"sanitize.{safe_tag}.rank{rank}.{rid}.pt")
+
+                    flat = t.detach().reshape(-1)
+                    n = int(min(4096, int(flat.numel())))
+                    samp = flat[:n]
+                    nan_n = int(torch.isnan(samp).sum().item()) if samp.is_floating_point() else 0
+                    inf_n = int(torch.isinf(samp).sum().item()) if samp.is_floating_point() else 0
+                    nonfinite_n = int((~torch.isfinite(samp)).sum().item()) if samp.is_floating_point() else 0
+
+                    view = t.detach()
+                    with contextlib.suppress(Exception):
+                        if view.dim() >= 1:
+                            view = view[: min(2, int(view.shape[0]))]
+                        if view.dim() >= 2:
+                            view = view[:, : min(128, int(view.shape[1]))]
+                        if view.dim() >= 3:
+                            view = view[:, :, : min(128, int(view.shape[2]))]
+                        view = view.contiguous()
+                    view = view.to("cpu")
+
+                    payload = {
+                        "tag": tag,
+                        "shape": [int(x) for x in tuple(t.shape)],
+                        "dtype": str(t.dtype),
+                        "device": str(t.device),
+                        "absmax": float(absmax.item()) if absmax is not None and torch.is_tensor(absmax) else None,
+                        "nan": nan_n,
+                        "inf": inf_n,
+                        "nonfinite": nonfinite_n,
+                        "sample": view,
+                    }
+                    torch.save(payload, path)
+                    _ENN_COERCE_NONFINITE_DUMPED = int(_ENN_COERCE_NONFINITE_DUMPED) + 1
+                    _LOGGER.error("[ENN] dumped pre-sanitize non-finite snapshot to: %s", str(path))
+
+            if strict:
+                raise RuntimeError(
+                    f"[ENN] non-finite reached sanitize (_coerce_tensor) tag={args[0] if args else 'coerce'} dtype={t.dtype} shape={tuple(t.shape)}"
+                )
+
+    return torch.nan_to_num(t, nan=0.0, posinf=0.0, neginf=0.0)
 
 
 def _prealloc_microbatch(

@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import contextlib
+import logging
 import os
+import uuid
 import warnings
 from typing import (
     Any,
@@ -50,6 +52,8 @@ try:
 except ImportError:
     create_block_mask = None
     _HAS_FLEX_ATTENTION_LIB = False
+
+_LOGGER = logging.getLogger(__name__)
 
 _DILATED_MASK_CACHE_MAX = 32
 _DILATED_MASK_CACHE_MAX_L = env_int("ENN_DILATED_MASK_CACHE_MAX_L", 4096)
@@ -1095,8 +1099,114 @@ class CrossAttention(nn.Module):
                 f"CrossAttention expects last dim D={self.d_model}, got latents D={D} tokens D={Dk}"
             )
 
+        diag_cross = env_bool("ENN_DIAG_NONFINITE_CROSSATTN", default=False) or env_bool(
+            "ENN_DIAG_NONFINITE_PRE_SANITIZE", default=False
+        )
+        dump_dir = str(os.environ.get("ENN_NONFINITE_DUMP_DIR", "") or "").strip()
+        strict = env_bool("ENN_SANITIZE_NAN_STRICT", default=False)
+        limit = int(env_int("ENN_CROSSATTN_DUMP_LIMIT", 8) or 8)
+        dumped = int(getattr(self, "_enn_cross_nonfinite_dumped", 0) or 0)
+
+        def _stats(x: object) -> object:
+            if not torch.is_tensor(x):
+                return None
+            tt = x.detach()
+            out: dict[str, object] = {
+                "shape": [int(v) for v in tuple(tt.shape)],
+                "dtype": str(tt.dtype),
+                "device": str(tt.device),
+                "numel": int(tt.numel()),
+            }
+            if tt.is_floating_point() and tt.numel() > 0:
+                with torch.no_grad():
+                    flat = tt.reshape(-1)
+                    n = int(min(4096, int(flat.numel())))
+                    samp = flat[:n]
+                    out["absmax"] = float(samp.abs().max().item())
+                    out["nan"] = int(torch.isnan(samp).sum().item())
+                    out["inf"] = int(torch.isinf(samp).sum().item())
+                    out["nonfinite"] = int((~torch.isfinite(samp)).sum().item())
+            return out
+
+        def _sample(x: object) -> object:
+            if not torch.is_tensor(x):
+                return None
+            tt = x.detach()
+            if tt.numel() <= 0:
+                return tt.to("cpu")
+            with contextlib.suppress(Exception):
+                if tt.dim() >= 1:
+                    tt = tt[: min(2, int(tt.shape[0]))]
+                if tt.dim() >= 2:
+                    tt = tt[:, : min(128, int(tt.shape[1]))]
+                if tt.dim() >= 3:
+                    tt = tt[:, :, : min(128, int(tt.shape[2]))]
+                tt = tt.contiguous()
+            return tt.to("cpu")
+
+        def _check(tag: str, x: torch.Tensor, *, extra: dict[str, object] | None = None) -> None:
+            nonlocal dumped
+            if (not diag_cross) or (not isinstance(x, torch.Tensor)):
+                return
+            if (not x.is_floating_point()) or x.numel() <= 0:
+                return
+            with torch.no_grad():
+                try:
+                    a = x.detach().abs().amax()
+                    bad = not bool(torch.isfinite(a).item())
+                except Exception:
+                    bad = not bool(torch.isfinite(x).all().item())
+            if not bad:
+                return
+
+            payload = {
+                "where": f"CrossAttention.{tag}",
+                "x_stats": _stats(x),
+                "x_sample": _sample(x),
+                "attn_bias_stats": _stats(attn_bias),
+                "extra": extra or {},
+            }
+
+            path = None
+            if dump_dir and ((limit < 0) or (dumped < limit)):
+                with contextlib.suppress(Exception):
+                    os.makedirs(dump_dir, exist_ok=True)
+                    rank = str(os.environ.get("RANK", "0") or "0")
+                    rid = uuid.uuid4().hex[:8]
+                    safe = "".join((c if (c.isalnum() or c in "._-") else "_") for c in tag)
+                    path = os.path.join(dump_dir, f"crossattn_nonfinite.{safe}.rank{rank}.{rid}.pt")
+                    torch.save(payload, path)
+                    dumped += 1
+                    setattr(self, "_enn_cross_nonfinite_dumped", int(dumped))
+                    _LOGGER.error("[ENN] CrossAttention non-finite at %s; dumped: %s", tag, str(path))
+
+            if strict:
+                raise RuntimeError(f"[ENN] CrossAttention produced non-finite at {tag}. dump={path}")
+
         q_in = self.norm_q(latents)
         kv_in = self.norm_kv(tokens)
+
+        if diag_cross:
+            _check(
+                "norm_q",
+                q_in,
+                extra={
+                    "norm_q": {
+                        "weight": _stats(getattr(self.norm_q, "weight", None)),
+                        "bias": _stats(getattr(self.norm_q, "bias", None)),
+                    }
+                },
+            )
+            _check(
+                "norm_kv",
+                kv_in,
+                extra={
+                    "norm_kv": {
+                        "weight": _stats(getattr(self.norm_kv, "weight", None)),
+                        "bias": _stats(getattr(self.norm_kv, "bias", None)),
+                    }
+                },
+            )
 
         H = int(self.nhead)
         Dh = int(self.head_dim)
@@ -1104,6 +1214,23 @@ class CrossAttention(nn.Module):
         q = self.q_proj(q_in).reshape(B, Lq, H, Dh).transpose(1, 2)
         k = self.k_proj(kv_in).reshape(B, Lk, H, Dh).transpose(1, 2)
         v = self.v_proj(kv_in).reshape(B, Lk, H, Dh).transpose(1, 2)
+
+        if diag_cross:
+            _check(
+                "q_proj",
+                q,
+                extra={"q_proj": {"weight": _stats(self.q_proj.weight), "bias": _stats(self.q_proj.bias)}},
+            )
+            _check(
+                "k_proj",
+                k,
+                extra={"k_proj": {"weight": _stats(self.k_proj.weight), "bias": _stats(self.k_proj.bias)}},
+            )
+            _check(
+                "v_proj",
+                v,
+                extra={"v_proj": {"weight": _stats(self.v_proj.weight), "bias": _stats(self.v_proj.bias)}},
+            )
 
         compiling = bool(is_compiling())
         exporting = bool(is_export_or_trace()) and (not compiling)
@@ -1342,6 +1469,15 @@ class CrossAttention(nn.Module):
             )
             attn_out = attn_out.transpose(1, 2).contiguous().view(B, Lq, D)
             attn_proj = self.out_proj(attn_out)
+
+        if diag_cross and isinstance(attn_proj, torch.Tensor):
+            _check(
+                "attn_proj",
+                attn_proj,
+                extra={
+                    "out_proj": {"weight": _stats(self.out_proj.weight), "bias": _stats(self.out_proj.bias)},
+                },
+            )
 
         if (
             (not exporting)

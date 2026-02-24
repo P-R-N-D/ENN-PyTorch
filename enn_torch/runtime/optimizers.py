@@ -1263,6 +1263,54 @@ class StochasticWeightAverage(nn.Module):
             dst_chunk = dst_flat[off : off + n]
             dst_chunk.mul_(one_m).add_(buf, alpha=inv_n1)
 
+    @staticmethod
+    def _has_nonfinite(x: torch.Tensor) -> bool:
+        if not torch.is_tensor(x) or x.numel() <= 0:
+            return False
+        if not (x.is_floating_point() or x.is_complex()):
+            return False
+        with torch.no_grad():
+            try:
+                a = x.detach().abs().amax()
+                return not bool(torch.isfinite(a).item())
+            except Exception:
+                return not bool(torch.isfinite(x).all().item())
+
+    def _maybe_dump_nonfinite(self: Self, tag: str, name: str, t: torch.Tensor) -> None:
+        dump_dir = str(os.environ.get("ENN_NONFINITE_DUMP_DIR", "") or "").strip()
+        if not dump_dir:
+            return
+        lim = int(os.environ.get("ENN_SWA_DUMP_LIMIT", "8") or 8)
+        dumped = int(getattr(self, "_enn_swa_nonfinite_dumped", 0) or 0)
+        if lim >= 0 and dumped >= lim:
+            return
+        with contextlib.suppress(Exception):
+            os.makedirs(dump_dir, exist_ok=True)
+            rid = os.urandom(4).hex()
+            rank = str(os.environ.get("RANK", "0") or "0")
+            safe = "".join((c if (c.isalnum() or c in "._-") else "_") for c in str(name))
+            path = os.path.join(dump_dir, f"swa_nonfinite.{tag}.rank{rank}.{safe[:80]}.{rid}.pt")
+            flat = t.detach().reshape(-1)
+            n = int(min(4096, int(flat.numel())))
+            samp = flat[:n]
+            payload = {
+                "tag": str(tag),
+                "name": str(name),
+                "step": int(self._step),
+                "n_averaged": int(self._n_averaged),
+                "shape": [int(x) for x in tuple(t.shape)],
+                "dtype": str(t.dtype),
+                "device": str(t.device),
+                "absmax": float(samp.abs().max().item()) if samp.numel() else None,
+                "nan": int(torch.isnan(samp).sum().item()) if samp.is_floating_point() else 0,
+                "inf": int(torch.isinf(samp).sum().item()) if samp.is_floating_point() else 0,
+                "nonfinite": int((~torch.isfinite(samp)).sum().item()) if samp.is_floating_point() else 0,
+                "sample": samp[: min(512, int(samp.numel()))].to("cpu"),
+            }
+            torch.save(payload, path)
+            setattr(self, "_enn_swa_nonfinite_dumped", dumped + 1)
+            _LOGGER.error("[ENN][SWA] dumped non-finite snapshot to: %s", str(path))
+
     def update(self: Self, model: nn.Module | None = None) -> None:
         if model is None:
             model = self._model
@@ -1272,10 +1320,15 @@ class StochasticWeightAverage(nn.Module):
                 return
             n = int(self._n_averaged)
             shadow = self._shadow
+
+            strict = env_bool("ENN_SANITIZE_NAN_STRICT", default=False)
+            diag = env_bool("ENN_SWA_DIAG_NONFINITE", default=False) or strict
+
             for name, p in self._iter_named_params(model):
                 v = p.detach()
                 dt = self._target_dtype(v)
                 cur = shadow.get(name, None)
+                created = False
 
                 if (
                     cur is None
@@ -1290,14 +1343,39 @@ class StochasticWeightAverage(nn.Module):
                         pin_memory=False,
                     )
                     shadow[name] = cur
-                if n == 0:
+                    created = True
+
+                if diag and self._has_nonfinite(v):
+                    self._maybe_dump_nonfinite("model_param", str(name), v)
+                    _LOGGER.error("[ENN][SWA] model param is non-finite before SWA update: %s", str(name))
+                    if strict:
+                        raise RuntimeError(f"[ENN][SWA] model param is non-finite before update: {name}")
+
+                if n == 0 or created:
+                    if created and n > 0:
+                        _LOGGER.warning(
+                            "[ENN][SWA] shadow entry was reinitialized while n_averaged=%d; resetting average for key=%s",
+                            int(n),
+                            str(name),
+                        )
                     self._stream_copy_(cur, v, dtype=dt)
+                    if diag and self._has_nonfinite(cur):
+                        self._maybe_dump_nonfinite("shadow_after_copy", str(name), cur)
+                        if strict:
+                            raise RuntimeError(f"[ENN][SWA] shadow became non-finite after copy: {name}")
                     continue
 
                 if cur.is_floating_point() or cur.is_complex():
                     self._stream_avg_(cur, v, n_averaged=n, dtype=dt)
                 else:
                     self._stream_copy_(cur, v, dtype=dt)
+
+                if diag and self._has_nonfinite(cur):
+                    self._maybe_dump_nonfinite("shadow_after_update", str(name), cur)
+                    _LOGGER.error("[ENN][SWA] shadow became non-finite after update: %s", str(name))
+                    if strict:
+                        raise RuntimeError(f"[ENN][SWA] shadow became non-finite after update: {name}")
+
             self._n_averaged = int(n + 1)
 
     @contextlib.contextmanager
