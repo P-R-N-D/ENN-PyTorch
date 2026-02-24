@@ -41,6 +41,7 @@ from .kernels import (
     _FLEX_KWARGS,
     _ensure_flex_kwargs_initialized,
     get_flex_kernel,
+    get_kernel_manager,
 )
 try:
     from torch.nn.attention.flex_attention import create_block_mask
@@ -764,6 +765,35 @@ class DilatedAttention(nn.Module):
         compiling = bool(is_compiling())
         exporting = bool(is_export_or_trace()) and (not compiling)
 
+        km = get_kernel_manager()
+        site = getattr(self, "_enn_kernel_site", None)
+        if not isinstance(site, str) or not site:
+            site = f"{self.__class__.__name__}@{id(self):x}"
+            setattr(self, "_enn_kernel_site", site)
+        dev_i = int(device.index) if device.index is not None else 0
+        kind = "self" if context is None else "ctx"
+        with contextlib.suppress(Exception):
+            child_site = getattr(self.dpa, "_enn_kernel_site", None)
+            if (not isinstance(child_site, str)) or (not child_site):
+                setattr(self.dpa, "_enn_kernel_site", f"{site}:dilated-{kind}.dpa")
+        kbase = f"attn:{site}:dilated-{kind}@{device.type}:{dev_i}"
+        k_flex = f"{kbase}:flex"
+        k_mha = f"{kbase}:mha"
+        k_dpa = f"{kbase}:dpa"
+
+        def _is_finite_tensor(t: Any) -> bool:
+            if not isinstance(t, torch.Tensor):
+                return True
+            if (not t.is_floating_point()) or t.numel() <= 0:
+                return True
+            with torch.no_grad():
+                return bool(torch.isfinite(t).all().item())
+
+        def _validate_out(out: Any) -> bool:
+            if isinstance(out, tuple) and out:
+                return _is_finite_tensor(out[0])
+            return _is_finite_tensor(out)
+
         x_norm = self.norm1(x)
         kv = x_norm if context is None else self.norm1(context)
 
@@ -778,12 +808,13 @@ class DilatedAttention(nn.Module):
             and (create_block_mask is not None)
         )
 
-        allow_mha = not (exporting or compiling)
+        allow_mha = (not (exporting or compiling)) and (not km.is_dead(k_mha))
         allow_dpa = bool(
             (context is None)
             and (not need_weights)
             and (key_padding_mask is None)
             and (torch_mha is not None)
+            and (not km.is_dead(k_dpa))
         )
 
         allow_flex = False
@@ -802,7 +833,7 @@ class DilatedAttention(nn.Module):
             needs_mask = bool(self.causal) or (self.window_size is not None) or (int(self.dilation) != 1)
             use_score_mod = bool(x_norm.is_cuda and flex_supports_score_mod)
             block_mask_ok = bool(flex_supports_block_mask)
-            allow_flex = (not needs_mask) or use_score_mod or block_mask_ok
+            allow_flex = ((not needs_mask) or use_score_mod or block_mask_ok) and (not km.is_dead(k_flex))
 
         plan = ATTENTION_POLICY.plan(
             q=x_norm,
@@ -835,18 +866,27 @@ class DilatedAttention(nn.Module):
                             block_mask = self._get_flex_block_mask(int(L), int(B), device)
                         if block_mask is None:
                             raise RuntimeError("Flex needs mask (causal/window/dilation) but no score_mod/block_mask available")
-                    a = get_flex_kernel()(
-                        q,
-                        k,
-                        v,
-                        score_mod=score_mod,
-                        block_mask=block_mask,
-                        scale=None,
-                        dropout_p=self.dropout_p if self.training else 0.0,
-                        training=bool(self.training),
+                    def _call_flex() -> torch.Tensor:
+                        a = get_flex_kernel()(
+                            q,
+                            k,
+                            v,
+                            score_mod=score_mod,
+                            block_mask=block_mask,
+                            scale=None,
+                            dropout_p=self.dropout_p if self.training else 0.0,
+                            training=bool(self.training),
+                        )
+                        a = a.transpose(1, 2).contiguous().view(B, L, self.embed_dim)
+                        return out_proj(a)
+
+                    attn_out = km.run(
+                        k_flex,
+                        _call_flex,
+                        validate=_validate_out,
+                        sticky=True,
+                        safe_on_exception=False,
                     )
-                    a = a.transpose(1, 2).contiguous().view(B, L, self.embed_dim)
-                    attn_out = out_proj(a)
                     attn_weights = None
                     break
 
@@ -865,17 +905,26 @@ class DilatedAttention(nn.Module):
                         and (exporting or compiling or bool(is_symbolic()))
                     ):
                         dpa_mask = dpa_mask.view(1, 1, L, L)
-                    a = self.dpa(
-                        q,
-                        k,
-                        v,
-                        attn_mask=dpa_mask,
-                        is_causal=use_is_causal,
-                        dropout_p=self.dropout_p if self.training else 0.0,
-                        training=bool(self.training),
+                    def _call_dpa() -> torch.Tensor:
+                        a = self.dpa(
+                            q,
+                            k,
+                            v,
+                            attn_mask=dpa_mask,
+                            is_causal=use_is_causal,
+                            dropout_p=self.dropout_p if self.training else 0.0,
+                            training=bool(self.training),
+                        )
+                        a = a.transpose(1, 2).contiguous().view(B, L, self.embed_dim)
+                        return out_proj(a)
+
+                    attn_out = km.run(
+                        k_dpa,
+                        _call_dpa,
+                        validate=_validate_out,
+                        sticky=True,
+                        safe_on_exception=False,
                     )
-                    a = a.transpose(1, 2).contiguous().view(B, L, self.embed_dim)
-                    attn_out = out_proj(a)
                     attn_weights = None
                     if mask_keep is not None:
                         attn_mask_keep = mask_keep
@@ -889,15 +938,24 @@ class DilatedAttention(nn.Module):
                     attn_mask_keep = self._get_mask(L, device)
                     attn_mask = ~attn_mask_keep
 
-                attn_out, attn_weights = self.mha(
-                    x_norm,
-                    kv,
-                    kv,
-                    key_padding_mask=key_padding_mask,
-                    attn_mask=attn_mask,
-                    need_weights=need_weights,
-                    average_attn_weights=average_attn_weights,
-                    is_causal=use_is_causal,
+                def _call_mha() -> tuple[torch.Tensor, Any]:
+                    return self.mha(
+                        x_norm,
+                        kv,
+                        kv,
+                        key_padding_mask=key_padding_mask,
+                        attn_mask=attn_mask,
+                        need_weights=need_weights,
+                        average_attn_weights=average_attn_weights,
+                        is_causal=use_is_causal,
+                    )
+
+                attn_out, attn_weights = km.run(
+                    k_mha,
+                    _call_mha,
+                    validate=_validate_out,
+                    sticky=True,
+                    safe_on_exception=False,
                 )
                 break
 
@@ -1087,7 +1145,7 @@ class CrossAttention(nn.Module):
             _ensure_flex_kwargs_initialized()
             allow_flex = (not self._disable_flex_bias_runtime) and ("score_mod" in _FLEX_KWARGS)
 
-        allow_mha = not (exporting or compiling)
+        allow_mha = (not (exporting or compiling)) and (not km.is_dead(k_mha))
         allow_dpa = True
 
         plan = ATTENTION_POLICY.plan(
@@ -1391,7 +1449,7 @@ class LatentAttention(nn.Module):
         compiling = bool(is_compiling())
         exporting = bool(is_export_or_trace()) and (not compiling)
         allow_flex = not self._disable_flex_runtime
-        allow_mha = not (exporting or compiling)
+        allow_mha = (not (exporting or compiling)) and (not km.is_dead(k_mha))
         allow_dpa = True
 
         plan = ATTENTION_POLICY.plan(
