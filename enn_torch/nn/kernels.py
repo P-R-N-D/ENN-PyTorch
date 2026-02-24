@@ -7,12 +7,14 @@ import math
 import os
 import traceback
 import threading
+import time
 import warnings
+from dataclasses import dataclass
 from typing import Any, Callable, Mapping, Optional, Self, Tuple
 
 import torch
 import torch._dynamo
-from ..core.datatypes import env_bool, env_str
+from ..core.datatypes import env_bool, env_int, env_str
 from ..core.system import (
     get_device,
     get_dpa_backends,
@@ -86,6 +88,218 @@ except Exception:
     _HAS_TORCH_FLEX = False
     _FLEX_KWARGS = set()
     pass
+
+class KernelFailure(RuntimeError):
+    pass
+
+
+@dataclass
+class _KernelState:
+    dead: bool = False
+    fail_count: int = 0
+    first_ts: float = 0.0
+    last_ts: float = 0.0
+    last_exc_type: str = ""
+    last_exc_msg: str = ""
+
+
+def _now() -> float:
+    try:
+        return time.time()
+    except Exception:
+        return 0.0
+
+
+def _sanitize(out: Any) -> Any:
+    if not isinstance(out, torch.Tensor):
+        return out
+    if (not out.is_floating_point()) or out.numel() <= 0:
+        return out
+    try:
+        return torch.nan_to_num(out, nan=0.0, posinf=0.0, neginf=0.0)
+    except Exception:
+        return out
+
+
+class KernelManager:
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._state: dict[str, _KernelState] = {}
+
+    def enabled(self) -> bool:
+        return bool(env_bool("ENN_KERNEL_MANAGER_ENABLE", default=True))
+
+    def _fail_threshold(self) -> int:
+        return max(1, int(env_int("ENN_KERNEL_MANAGER_FAIL_THRESHOLD", 3)))
+
+    def is_dead(self, key: str) -> bool:
+        if (not key) or (not self.enabled()):
+            return False
+        with self._lock:
+            st = self._state.get(key)
+            return bool(st.dead) if st is not None else False
+
+    def mark_dead(
+        self,
+        key: str,
+        *,
+        exc: BaseException | None = None,
+        reason: str | None = None,
+    ) -> None:
+        if (not key) or (not self.enabled()):
+            return
+        ts = _now()
+        with self._lock:
+            st = self._state.get(key)
+            if st is None:
+                st = _KernelState()
+                self._state[key] = st
+            st.dead = True
+            st.fail_count = max(1, int(st.fail_count) + 1)
+            st.last_ts = ts
+            if st.first_ts <= 0.0:
+                st.first_ts = ts
+            if exc is not None:
+                st.last_exc_type = type(exc).__name__
+                st.last_exc_msg = str(exc)
+            elif reason is not None:
+                st.last_exc_type = "KernelFailure"
+                st.last_exc_msg = str(reason)
+
+    def note_failure(
+        self,
+        key: str,
+        exc: BaseException,
+        *,
+        sticky: bool = True,
+    ) -> None:
+        if (not key) or (not self.enabled()):
+            return
+        ts = _now()
+        with self._lock:
+            st = self._state.get(key)
+            if st is None:
+                st = _KernelState()
+                self._state[key] = st
+            st.fail_count += 1
+            st.last_ts = ts
+            if st.first_ts <= 0.0:
+                st.first_ts = ts
+            st.last_exc_type = type(exc).__name__
+            st.last_exc_msg = str(exc)
+            if sticky or st.fail_count >= self._fail_threshold():
+                st.dead = True
+
+    def run(
+        self,
+        key: str,
+        fn_main: Callable[..., Any],
+        *args: Any,
+        device: torch.device | None = None,
+        master_dtype: torch.dtype | None = None,
+        fn_safe: Optional[Callable[..., Any]] = None,
+        validate: Optional[Callable[[Any], bool]] = None,
+        sticky: bool = True,
+        safe_on_exception: bool = True,
+        sanitize_dead: bool = False,
+        **kwargs: Any,
+    ) -> Any:
+        del device, master_dtype, kwargs
+
+        if (not key) or (not self.enabled()):
+            return fn_main(*args)
+
+        if self.is_dead(key):
+            if fn_safe is None:
+                raise KernelFailure(f"Kernel disabled: {key}")
+            out = fn_safe(*args)
+            return _sanitize(out) if sanitize_dead else out
+
+        try:
+            out = fn_main(*args)
+        except Exception as exc:
+            self.note_failure(key, exc, sticky=sticky)
+            if safe_on_exception and fn_safe is not None:
+                try:
+                    out2 = fn_safe(*args)
+                except Exception as exc2:
+                    self.note_failure(key, exc2, sticky=True)
+                    raise KernelFailure(
+                        f"Kernel '{key}' failed and safe fallback also failed: {type(exc2).__name__}: {exc2}"
+                    ) from exc2
+                return _sanitize(out2) if sanitize_dead else out2
+            raise
+
+        if validate is not None:
+            ok = False
+            try:
+                ok = bool(validate(out))
+            except Exception as exc:
+                self.note_failure(key, exc, sticky=sticky)
+                ok = False
+            if not ok:
+                self.note_failure(
+                    key,
+                    RuntimeError("output validation failed"),
+                    sticky=sticky,
+                )
+                if fn_safe is not None:
+                    try:
+                        out2 = fn_safe(*args)
+                    except Exception as exc2:
+                        self.note_failure(key, exc2, sticky=True)
+                        raise KernelFailure(
+                            f"Kernel '{key}' produced invalid output and safe fallback failed: {type(exc2).__name__}: {exc2}"
+                        ) from exc2
+                    return _sanitize(out2) if sanitize_dead else out2
+                if sanitize_dead:
+                    return _sanitize(out)
+                raise KernelFailure(f"Kernel '{key}' produced invalid output")
+
+        return out
+
+    def try_run(
+        self,
+        key: str,
+        fn_main: Callable[..., Any],
+        *args: Any,
+        validate: Optional[Callable[[Any], bool]] = None,
+        sticky: bool = True,
+    ) -> tuple[bool, Any]:
+        try:
+            out = self.run(
+                key,
+                fn_main,
+                *args,
+                validate=validate,
+                sticky=sticky,
+                safe_on_exception=False,
+                fn_safe=None,
+            )
+            return True, out
+        except Exception:
+            return False, None
+
+    def dead_keys(self) -> list[str]:
+        if not self.enabled():
+            return []
+        with self._lock:
+            return sorted([k for (k, st) in self._state.items() if st.dead])
+
+
+_KERNEL_MANAGER_LOCK = threading.Lock()
+_KERNEL_MANAGER_SINGLETON: KernelManager | None = None
+
+
+def get_kernel_manager() -> KernelManager:
+    global _KERNEL_MANAGER_SINGLETON
+    if _KERNEL_MANAGER_SINGLETON is not None:
+        return _KERNEL_MANAGER_SINGLETON
+    with _KERNEL_MANAGER_LOCK:
+        if _KERNEL_MANAGER_SINGLETON is None:
+            _KERNEL_MANAGER_SINGLETON = KernelManager()
+    return _KERNEL_MANAGER_SINGLETON
+
 
 _FLEX_KERNEL_SINGLETON_LOCK = threading.Lock()
 _FLEX_KERNEL_SINGLETON = None
@@ -1918,16 +2132,42 @@ class DotProductAttention(nn.Module):
                 bias_float, _, _, _ = _flatten_attn_mask(
                     bias_float, device=q_bshd.device, B=B, H=H, L=L, S=S
                 )
+
         try:
             is_compiling = torch.compiler.is_compiling()
         except:
             is_compiling = False
+        exporting_boundary = _exporting_boundary()
+
+        km = None
+        kkey_base = ""
+        kkey_te = ""
+        if (not exporting_boundary) and (not is_compiling) and (not tracing):
+            km = get_kernel_manager()
+            site = getattr(self, "_enn_kernel_site", None)
+            if not isinstance(site, str) or not site:
+                site = f"{self.__class__.__name__}@{id(self):x}"
+                setattr(self, "_enn_kernel_site", site)
+            dev_i = int(q_bshd.device.index) if q_bshd.device.index is not None else 0
+            kkey_base = f"dpa:{site}@{q_bshd.device.type}:{dev_i}"
+            kkey_te = f"{kkey_base}:te"
+
+        def _is_finite_out(out: Any) -> bool:
+            if not isinstance(out, torch.Tensor):
+                return True
+            if (not out.is_floating_point()) or out.numel() <= 0:
+                return True
+            with torch.no_grad():
+                return bool(torch.isfinite(out).all().item())
         d_type = str(getattr(q_bshd.device, "type", "cpu"))
         use_te = (
             self._te_ok
             and self.te_first
             and not self._force_pt
             and not self._disable_te
+            and (not exporting_boundary)
+            and (km is not None)
+            and (not km.is_dead(kkey_te))
             and self._te_attn is not None
             and not is_compiling
             and not tracing
@@ -2015,7 +2255,16 @@ class DotProductAttention(nn.Module):
             ):
                 te_kwargs[self._te_mask_param] = te_mask
             try:
-                out_te = self._te_attn(q_te, k_te, v_te, **te_kwargs)
+                def _call_te() -> torch.Tensor:
+                    return self._te_attn(q_te, k_te, v_te, **te_kwargs)
+
+                out_te = km.run(
+                    kkey_te,
+                    _call_te,
+                    validate=_is_finite_out,
+                    sticky=True,
+                    safe_on_exception=False,
+                )
             except Exception:
                 self._force_pt = True
                 use_te = False
@@ -2052,6 +2301,8 @@ class DotProductAttention(nn.Module):
                                             UserWarning,
                                             stacklevel=2,
                                         )
+                                    with contextlib.suppress(Exception):
+                                        km.mark_dead(kkey_te, reason="all-zero output")
                                     self._disable_te = True
                                     self._force_pt = True
                                     use_te = False
@@ -2151,9 +2402,34 @@ class DotProductAttention(nn.Module):
                 if not tracing and (bd not in (1, B) or hd not in (1, H)):
                     raise RuntimeError("Attn mask mismatch")
                 sdpa_kwargs["is_causal"] = bool(sdpa_is_causal)
-            sdpa_out = None
+            sdpa_out: torch.Tensor | None = None
             try:
                 from torch.nn.attention import SDPBackend, sdpa_kernel
+
+                def _be_name(be: Any) -> str:
+                    try:
+                        name = getattr(be, "name", None)
+                        if isinstance(name, str) and name:
+                            return name.lower()
+                    except Exception:
+                        pass
+                    s0 = str(be)
+                    return s0.replace("SDPBackend.", "").lower()
+
+                def _sdpa_call(backends: list[Any] | None) -> torch.Tensor:
+                    sdpa_ctx = sdpa_kernel(backends) if backends else contextlib.nullcontext()
+                    with sdpa_ctx:
+                        with warnings.catch_warnings():
+                            if env_bool("ENN_SDPA_FILTER_WARNINGS", default=True):
+                                warnings.filterwarnings("ignore", message=".*Memory efficient kernel not used because:.*", category=UserWarning)
+                                warnings.filterwarnings("ignore", message=".*Memory Efficient attention has been runtime disabled.*", category=UserWarning)
+                                warnings.filterwarnings("ignore", message=".*Flash attention kernel not used because:.*", category=UserWarning)
+                                warnings.filterwarnings("ignore", message=".*Flash Attention does not support non-null attn_mask.*", category=UserWarning)
+                                warnings.filterwarnings("ignore", message=".*cuDNN attention kernel not used because:.*", category=UserWarning)
+                                warnings.filterwarnings("ignore", message=".*cuDNN attention has been runtime disabled.*", category=UserWarning)
+                            return torch.nn.functional.scaled_dot_product_attention(
+                                q_bshd, k_bshd, v_bshd, **sdpa_kwargs
+                            )
 
                 am = sdpa_kwargs.get("attn_mask", None)
                 if (
@@ -2166,35 +2442,82 @@ class DotProductAttention(nn.Module):
                         if not bool(am.any().item()):
                             _warn_once(
                                 "dpa-all-false-mask",
-                                "[ENN] DotProductAttention: attn_mask is all-False (no allowed positions). "
-                                "Preserving mask so SDPA keeps fully masked queries zeroed.",
+                                "[ENN] DotProductAttention: attn_mask is all-False (no allowed positions). Preserving mask so SDPA keeps fully masked queries zeroed.",
                             )
 
-                backends = get_dpa_backends()
-                if backends and (sdpa_kwargs.get("attn_mask", None) is not None):
-                    backends = [be for be in backends if be != SDPBackend.FLASH_ATTENTION]
+                cfg_backends = list(get_dpa_backends())
                 am2 = sdpa_kwargs.get("attn_mask", None)
-                if backends and isinstance(am2, torch.Tensor) and (am2.dtype != torch.bool):
-                    backends = [be for be in backends if be != SDPBackend.FLASH_ATTENTION]
-                sdpa_ctx = sdpa_kernel(backends) if backends else contextlib.nullcontext()
+                if cfg_backends and (am2 is not None):
+                    cfg_backends = [be for be in cfg_backends if be != SDPBackend.FLASH_ATTENTION]
+                if cfg_backends and isinstance(am2, torch.Tensor) and (am2.dtype != torch.bool):
+                    cfg_backends = [be for be in cfg_backends if be != SDPBackend.FLASH_ATTENTION]
+                if km is not None and kkey_base:
+                    cfg_backends = [be for be in cfg_backends if not km.is_dead(f"{kkey_base}:sdpa:{_be_name(be)}")]
 
-                with sdpa_ctx:
-                    with warnings.catch_warnings():
-                        if env_bool("ENN_SDPA_FILTER_WARNINGS", default=True):
-                            warnings.filterwarnings("ignore", message=".*Memory efficient kernel not used because:.*", category=UserWarning)
-                            warnings.filterwarnings("ignore", message=".*Memory Efficient attention has been runtime disabled.*", category=UserWarning)
-                            warnings.filterwarnings("ignore", message=".*Flash attention kernel not used because:.*", category=UserWarning)
-                            warnings.filterwarnings("ignore", message=".*Flash Attention does not support non-null attn_mask.*", category=UserWarning)
-                            warnings.filterwarnings("ignore", message=".*cuDNN attention kernel not used because:.*", category=UserWarning)
-                            warnings.filterwarnings("ignore", message=".*cuDNN attention has been runtime disabled.*", category=UserWarning)
-                        sdpa_out = torch.nn.functional.scaled_dot_product_attention(
-                            q_bshd, k_bshd, v_bshd, **sdpa_kwargs
-                        )
+                try:
+                    out0 = _sdpa_call(cfg_backends if cfg_backends else None)
+                    if _is_finite_out(out0):
+                        sdpa_out = out0
+                except Exception:
+                    sdpa_out = None
+
+                if sdpa_out is None:
+                    candidates: list[Any]
+                    if cfg_backends:
+                        candidates = list(cfg_backends)
+                    else:
+                        candidates = []
+                        for nm in ("FLASH_ATTENTION", "EFFICIENT_ATTENTION", "CUDNN_ATTENTION", "MATH"):
+                            if hasattr(SDPBackend, nm):
+                                candidates.append(getattr(SDPBackend, nm))
+
+                    if candidates and (am2 is not None):
+                        candidates = [be for be in candidates if be != SDPBackend.FLASH_ATTENTION]
+                    if candidates and isinstance(am2, torch.Tensor) and (am2.dtype != torch.bool):
+                        candidates = [be for be in candidates if be != SDPBackend.FLASH_ATTENTION]
+                    if km is not None and kkey_base:
+                        candidates = [be for be in candidates if not km.is_dead(f"{kkey_base}:sdpa:{_be_name(be)}")]
+
+                        for be in candidates:
+                            k_be = f"{kkey_base}:sdpa:{_be_name(be)}"
+
+                            def _call_one(be_: Any = be) -> torch.Tensor:
+                                return _sdpa_call([be_])
+
+                            try:
+                                sdpa_out = km.run(
+                                    k_be,
+                                    _call_one,
+                                    validate=_is_finite_out,
+                                    sticky=True,
+                                    safe_on_exception=False,
+                                )
+                                break
+                            except Exception:
+                                sdpa_out = None
+
+                if sdpa_out is None:
+                    fm3 = sdpa_kwargs.get("attn_mask", None)
+                    sdpa_out = _attention_math_bshd(
+                        q_bshd,
+                        k_bshd,
+                        v_bshd,
+                        attn_mask=fm3,
+                        is_causal=bool(sdpa_kwargs.get("is_causal", False)),
+                        dropout_p=float(dropout_val),
+                        training=bool(training),
+                    )
+
             except Exception:
-                sdpa_out = None
-            if sdpa_out is None:
-                sdpa_out = torch.nn.functional.scaled_dot_product_attention(
-                    q_bshd, k_bshd, v_bshd, **sdpa_kwargs
+                fm3 = sdpa_kwargs.get("attn_mask", None)
+                sdpa_out = _attention_math_bshd(
+                    q_bshd,
+                    k_bshd,
+                    v_bshd,
+                    attn_mask=fm3,
+                    is_causal=bool(sdpa_kwargs.get("is_causal", False)),
+                    dropout_p=float(dropout_val),
+                    training=bool(training),
                 )
         try:
             flops = 4.0 * B * H * q_bshd.shape[2] * k_bshd.shape[2] * D
@@ -2870,54 +3193,74 @@ class MultiScaleRetention(nn.Module):
         )
         return out
 
-    def _scan_causal(
-        self: Self, v: torch.Tensor, lam_h: torch.Tensor
-    ) -> torch.Tensor:
+    def _scan_causal(self: Self, v: torch.Tensor, lam_h: torch.Tensor) -> torch.Tensor:
+        if not _HAS_TRITON_MSR or _triton_retention is None:
+            return self._scan_causal_torch(v, lam_h)
+
         disable_triton = env_bool("ENN_MSR_FORCE_TORCH", default=False)
-        use_triton = bool(
-            (not disable_triton)
-            and self._triton_ok
-            and v.is_cuda
-            and torch.cuda.is_available()
-            and (not _exporting_boundary())
-        )
+        if (
+            disable_triton
+            or _exporting_boundary()
+            or (not self._triton_ok)
+            or (not v.is_cuda)
+            or (not torch.cuda.is_available())
+            or (not env_bool("ENN_ENABLE_MSR_TRITON", default=False))
+        ):
+            return self._scan_causal_torch(v, lam_h)
+
+        km = get_kernel_manager()
+        site = getattr(self, "_enn_kernel_site", None)
+        if not isinstance(site, str) or not site:
+            site = f"{self.__class__.__name__}@{id(self):x}"
+            setattr(self, "_enn_kernel_site", site)
+        dev_i = int(v.device.index) if v.device.index is not None else 0
+        k_triton = f"msr:{site}@{v.device.type}:{dev_i}:scan_triton"
+
+        if km.is_dead(k_triton):
+            return self._scan_causal_torch(v, lam_h)
+
+        use_triton = True
+
+        def _is_finite_out(out: Any) -> bool:
+            if not isinstance(out, torch.Tensor):
+                return True
+            if (not out.is_floating_point()) or out.numel() <= 0:
+                return True
+            with torch.no_grad():
+                return bool(torch.isfinite(out).all().item())
+
         if use_triton:
             try:
-                out = self._scan_causal_triton(v.contiguous(), lam_h)
-                if env_bool("ENN_MSR_TRITON_FALLBACK_ON_ZERO", default=True):
-                    with contextlib.suppress(Exception):
-                        if out.numel() > 0:
-                            every = int(env_int("ENN_MSR_TRITON_ZERO_CHECK_EVERY", 0))
-                            cnt = int(getattr(self, "_triton_zero_check_count", 0) or 0)
-                            done = bool(getattr(self, "_triton_zero_check_done", False))
-                            do_check = False
-                            if not done:
-                                if cnt == 0:
-                                    do_check = True
-                                elif every > 0 and (cnt % every) == 0:
-                                    do_check = True
-                            setattr(self, "_triton_zero_check_count", cnt + 1)
+                def _call_triton() -> torch.Tensor:
+                    return self._scan_causal_triton(v.contiguous(), lam_h)
 
-                            if do_check:
-                                out_abs = float(out.detach().abs().amax().item())
-                                if out_abs == 0.0:
-                                    v_abs = float(v.detach().abs().amax().item())
-                                    if v_abs > 0.0:
-                                        if not bool(getattr(self, "_triton_zero_warned", False)):
-                                            warnings.warn(
-                                                "[ENN] MultiScaleRetention: Triton scan produced all-zero output on CUDA despite non-zero inputs; "
-                                                "falling back to torch scan and disabling triton for this module.",
-                                                UserWarning,
-                                                stacklevel=2,
-                                            )
-                                            setattr(self, "_triton_zero_warned", True)
-                                        self._triton_ok = False
-                                        return self._scan_causal_torch(v, lam_h)
-                                if every <= 0 and out_abs != 0.0:
-                                    setattr(self, "_triton_zero_check_done", True)
-                return out
+                out = km.run(
+                    k_triton,
+                    _call_triton,
+                    validate=_is_finite_out,
+                    sticky=True,
+                    safe_on_exception=False,
+                )
+
+                if env_bool("ENN_MSR_DEBUG_ZERO_OUTPUT", default=False):
+                    with contextlib.suppress(Exception):
+                        out_abs = float(out.detach().abs().sum().item())
+                        v_abs = float(v.detach().abs().sum().item())
+                        if out_abs == 0.0 and v_abs > 0.0:
+                            _warn_once(
+                                "msr-triton-zero-output",
+                                "[ENN] MultiScaleRetention(triton): got all-zeros output with non-zero inputs; disabling triton scan for this process.",
+                            )
+                            with contextlib.suppress(Exception):
+                                km.mark_dead(k_triton, reason="zero output")
+                            self._triton_ok = False
+                            use_triton = False
+
+                if use_triton:
+                    return out
             except Exception:
                 pass
+
         return self._scan_causal_torch(v, lam_h)
 
     def forward(
