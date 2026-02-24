@@ -12,7 +12,6 @@ import itertools
 import logging
 import math
 import os
-os.environ.setdefault("TORCHDYNAMO_CAPTURE_SCALAR_OUTPUTS", "1")
 import platform
 import re
 import socket
@@ -184,6 +183,8 @@ try:
     _exclude_td_from_pytree().set()
 except Exception:
     pass
+
+os.environ.setdefault("TORCHDYNAMO_CAPTURE_SCALAR_OUTPUTS", "1")
 
 _COMPILE_SAFE_DONE = False
 _COMPILE_SAFE_LOCK = Mutex()
