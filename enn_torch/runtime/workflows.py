@@ -1515,6 +1515,54 @@ def load_model(
     weights_only: bool = True,
     mmap: bool | None = True,
 ) -> Model:
+    def _diag_nonfinite_after_load(m: nn.Module, *, where: str) -> None:
+        dump_dir = str(os.environ.get("ENN_NONFINITE_DUMP_DIR", "") or "").strip()
+        strict = env_bool(
+            "ENN_FAIL_ON_LOAD_NONFINITE",
+            default=env_bool("ENN_SANITIZE_NAN_STRICT", default=False),
+        )
+        if (not dump_dir) and (not strict):
+            return
+
+        scope = str(os.environ.get("ENN_DIAG_LOAD_NONFINITE_SCOPE", "perceiver") or "perceiver").strip().lower()
+        tgt: nn.Module = m
+        with contextlib.suppress(Exception):
+            if scope in {"perceiver", "fuser.perceiver"}:
+                f0 = getattr(m, "fuser", None)
+                p0 = getattr(f0, "perceiver", None) if f0 is not None else None
+                if isinstance(p0, nn.Module):
+                    tgt = p0
+
+        first_bad = None
+        with torch.no_grad():
+            for n, p in tgt.named_parameters(recurse=True):
+                if not isinstance(p, torch.Tensor) or (not p.is_floating_point()) or p.numel() <= 0:
+                    continue
+                try:
+                    a = p.detach().abs().amax()
+                    ok = bool(torch.isfinite(a).item())
+                except Exception:
+                    ok = bool(torch.isfinite(p).all().item())
+                if not ok:
+                    first_bad = str(n)
+                    break
+
+        if first_bad is None:
+            return
+
+        logger.error("[ENN] load_model: non-finite parameters detected (%s): %s", str(where), str(first_bad))
+        if dump_dir:
+            with contextlib.suppress(Exception):
+                os.makedirs(dump_dir, exist_ok=True)
+                rid = os.urandom(4).hex()
+                rank = str(os.environ.get("RANK", "0") or "0")
+                path = os.path.join(dump_dir, f"load_nonfinite.{scope}.rank{rank}.{rid}.pt")
+                torch.save({"where": where, "scope": scope, "first_bad": first_bad}, path)
+                logger.error("[ENN] load_model: dumped to: %s", str(path))
+
+        if strict:
+            raise RuntimeError(f"[ENN] load_model: non-finite parameters detected ({where}): {first_bad}")
+
     p = Path(_normalize_windows_paste(checkpoint_path))
     load_dev = (
         torch.device(map_location)
@@ -1582,6 +1630,7 @@ def load_model(
                     map_location=map_location,
                     mmap=mmap,
                 ):
+                    _diag_nonfinite_after_load(model, where="dcp_dir_fallback_pt")
                     return model
                 raise
             resize_scaler_buffer(model, m_sd)
@@ -1592,6 +1641,7 @@ def load_model(
             )
         with contextlib.suppress(Exception):
             _coerce_scaler_buffers_to_shape(model, use_in_dim, use_out_shape)
+        _diag_nonfinite_after_load(model, where="dcp_dir")
         return model
     if not p.exists():
         raise FileNotFoundError(f"Checkpoint file not found: {str(p)!r}")
@@ -1657,6 +1707,7 @@ def load_model(
         _load_state_dict_compat(model, sd, strict=False)
         with contextlib.suppress(Exception):
             _coerce_scaler_buffers_to_shape(model, use_in_dim, use_out_shape)
+        _diag_nonfinite_after_load(model, where="safetensors")
         return model
 
     if suffix and suffix not in (".pt", ".pth"):
@@ -1735,6 +1786,7 @@ def load_model(
     _load_state_dict_compat(model, sd, strict=False)
     with contextlib.suppress(Exception):
         _coerce_scaler_buffers_to_shape(model, use_in_dim, use_out_shape)
+    _diag_nonfinite_after_load(model, where="file")
     return model
 
 

@@ -3331,6 +3331,54 @@ class Fuser(nn.Module):
             graph_break()
             context = self.decode(fused_tokens, apply_norm=True)
         else:
+            dump_dir = str(env_str("ENN_NONFINITE_DUMP_DIR") or "").strip()
+            strict_params = env_bool(
+                "ENN_FUSER_STRICT_NONFINITE_PARAMS",
+                default=env_bool("ENN_SANITIZE_NAN_STRICT", default=False),
+            )
+            check_every = int(env_int("ENN_FUSER_PARAM_CHECK_EVERY", 1) or 1)
+            if dump_dir and check_every > 0:
+                call_i = int(getattr(self, "_enn_fuser_call_idx", 0) or 0) + 1
+                setattr(self, "_enn_fuser_call_idx", int(call_i))
+                if (
+                    (call_i % int(check_every)) == 0
+                    and (not getattr(self, "_enn_fuser_param_bad", False))
+                ):
+                    bad_name = None
+                    with torch.no_grad():
+                        for pn, pv in self.perceiver.named_parameters(recurse=True):
+                            if (
+                                not isinstance(pv, torch.Tensor)
+                                or (not pv.is_floating_point())
+                                or pv.numel() <= 0
+                            ):
+                                continue
+                            try:
+                                a = pv.detach().abs().amax()
+                                ok = bool(torch.isfinite(a).item())
+                            except Exception:
+                                ok = bool(torch.isfinite(pv).all().item())
+                            if not ok:
+                                bad_name = str(pn)
+                                break
+                    if bad_name is not None:
+                        setattr(self, "_enn_fuser_param_bad", True)
+                        _maybe_dump_fuser_nonfinite(
+                            f"perceiver_params_pre.{call_i}",
+                            all_tokens=all_tokens,
+                            fused_tokens=None,
+                            context=None,
+                            attn_bias=attn_bias,
+                        )
+                        _LOGGER.error(
+                            "[ENN] Fuser: perceiver parameters already non-finite at call=%d: %s",
+                            int(call_i),
+                            str(bad_name),
+                        )
+                        if strict_params:
+                            raise RuntimeError(
+                                f"[ENN] Fuser: perceiver params non-finite at call={int(call_i)}: {bad_name}"
+                            )
             bg = getattr(self, "_backbone_graph", None)
             if isinstance(bg, nn.Module) and cg_ok:
                 fused_tokens, context = cast(

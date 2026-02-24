@@ -5175,14 +5175,28 @@ def process(*args: Any, **kwargs: Any) -> object:
     print(f"PyTorch Elastic has been launched. (PID: {current_pid})", flush=True)
     path = os.path.join(tempfile.gettempdir(), f"pytrace.{os.getpid()}.log")
     _log = open(path, "a", buffering=1, encoding="utf-8")
+    registered_signals: list[signal.Signals] = []
     faulthandler.enable(all_threads=True, file=_log)
     for name in ("SIGUSR1", "SIGUSR2", "SIGBREAK", "SIGQUIT"):
         sig = getattr(signal, name, None)
         try:
             if sig is not None:
                 faulthandler.register(sig, all_threads=True, file=_log, chain=True)
+                registered_signals.append(sig)
         except Exception:
             pass
+    def _cleanup_on_success() -> None:
+        for sig in registered_signals:
+            with contextlib.suppress(Exception):
+                faulthandler.unregister(sig)
+        with contextlib.suppress(Exception):
+            faulthandler.disable()
+        with contextlib.suppress(Exception):
+            _log.close()
+        with contextlib.suppress(Exception):
+            if os.path.exists(path):
+                os.remove(path)
+
     if not args:
         raise TypeError("process requires at least a RuntimeConfig argument")
     _MA_SENTINEL = object()
@@ -5872,6 +5886,7 @@ def process(*args: Any, **kwargs: Any) -> object:
             device_ids=[local_rank] if device.type in ("cuda", "xpu") else None
         )
         torch.distributed.destroy_process_group()
+        _cleanup_on_success()
         return None
     if ops.mode in ("predict", "infer"):
         device = get_device()
@@ -6080,6 +6095,7 @@ def process(*args: Any, **kwargs: Any) -> object:
                 session.close()
         distributed_barrier(device, group=get_accel_group(device), lane="auto")
         torch.distributed.destroy_process_group()
+        _cleanup_on_success()
         return None
     raise ValueError(f"unsupported ops mode: {ops.mode}")
 
