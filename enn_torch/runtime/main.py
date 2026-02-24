@@ -4352,21 +4352,27 @@ def infer(
                 force_fp32: bool = False,
             ):
                 nonlocal force_uncompiled, force_eager
-                m = _select_pred_model(bool(use_uncompiled))
-                if bool(force_fp32) or bool(collapse_fp32_active):
-                    with StatelessAutocast.suspend(device):
-                        x_fp32 = x
-                        if torch.is_tensor(x_fp32) and x_fp32.dtype != torch.float32:
-                            x_fp32 = x_fp32.to(dtype=torch.float32)
-                        x_use = x_fp32
-                else:
-                    x_use = x
-                try:
-                    return m(
-                        x_use,
+
+                def _invoke_predict(mm: torch.nn.Module):
+                    if bool(force_fp32) or bool(collapse_fp32_active):
+                        with StatelessAutocast.suspend(device):
+                            x_fp32 = x
+                            if torch.is_tensor(x_fp32) and x_fp32.dtype != torch.float32:
+                                x_fp32 = x_fp32.to(dtype=torch.float32)
+                            return mm(
+                                x_fp32,
+                                calibrate_output=bool(calibrate_output),
+                                return_loss=False,
+                            )
+                    return mm(
+                        x,
                         calibrate_output=bool(calibrate_output),
                         return_loss=False,
                     )
+
+                m = _select_pred_model(bool(use_uncompiled))
+                try:
+                    return _invoke_predict(m)
                 except AssertionError:
                     if not env_bool("ENN_PRED_FALLBACK_ON_CUDAGRAPH_ASSERT", default=True):
                         raise
@@ -4383,11 +4389,7 @@ def infer(
                         )
                         force_uncompiled = True
                         force_eager = True
-                        return run_model_uncompiled(
-                            x_use,
-                            calibrate_output=bool(calibrate_output),
-                            return_loss=False,
-                        )
+                        return _invoke_predict(run_model_uncompiled)
                     raise
 
             def _maybe_enable_fp32_collapse_fallback() -> bool:
