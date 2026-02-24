@@ -3337,7 +3337,7 @@ class Fuser(nn.Module):
                 default=env_bool("ENN_SANITIZE_NAN_STRICT", default=False),
             )
             check_every = int(env_int("ENN_FUSER_PARAM_CHECK_EVERY", 1) or 1)
-            if dump_dir and check_every > 0:
+            if (strict_params or dump_dir) and check_every > 0:
                 call_i = int(getattr(self, "_enn_fuser_call_idx", 0) or 0) + 1
                 setattr(self, "_enn_fuser_call_idx", int(call_i))
                 if (

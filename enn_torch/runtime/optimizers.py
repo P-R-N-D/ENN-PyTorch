@@ -1322,9 +1322,7 @@ class StochasticWeightAverage(nn.Module):
             shadow = self._shadow
 
             strict = env_bool("ENN_SANITIZE_NAN_STRICT", default=False)
-            diag = bool(str(os.environ.get("ENN_NONFINITE_DUMP_DIR", "") or "").strip()) and (
-                env_bool("ENN_SWA_DIAG_NONFINITE", default=False) or strict
-            )
+            diag = env_bool("ENN_SWA_DIAG_NONFINITE", default=False) or strict
 
             for name, p in self._iter_named_params(model):
                 v = p.detach()
