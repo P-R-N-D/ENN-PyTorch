@@ -1095,6 +1095,10 @@ class CrossAttention(nn.Module):
         if not isinstance(site, str) or not site:
             site = f"{self.__class__.__name__}@{id(self):x}"
             setattr(self, "_enn_kernel_site", site)
+        with contextlib.suppress(Exception):
+            child_site = getattr(self.attn, "_enn_kernel_site", None)
+            if (not isinstance(child_site, str)) or (not child_site):
+                setattr(self.attn, "_enn_kernel_site", f"{site}:cross.dpa")
         dev_i = int(q.device.index) if q.device.index is not None else 0
         kbase = f"attn:{site}:cross@{q.device.type}:{dev_i}"
         k_mha = f"{kbase}:mha"
@@ -1460,6 +1464,10 @@ class LatentAttention(nn.Module):
         if not isinstance(site, str) or not site:
             site = f"{self.__class__.__name__}@{id(self):x}"
             setattr(self, "_enn_kernel_site", site)
+        with contextlib.suppress(Exception):
+            child_site = getattr(self.attn, "_enn_kernel_site", None)
+            if (not isinstance(child_site, str)) or (not child_site):
+                setattr(self.attn, "_enn_kernel_site", f"{site}:latent.dpa")
         dev_i = int(q.device.index) if q.device.index is not None else 0
         kbase = f"attn:{site}:latent@{q.device.type}:{dev_i}"
         k_mha = f"{kbase}:mha"

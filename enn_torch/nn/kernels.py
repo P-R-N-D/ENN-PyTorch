@@ -3195,9 +3195,13 @@ class MultiScaleRetention(nn.Module):
         dev_i = int(v.device.index) if v.device.index is not None else 0
         k_triton = f"msr:{site}@{v.device.type}:{dev_i}:scan_triton"
 
+        disable_triton = env_bool("ENN_MSR_FORCE_TORCH", default=False)
         use_triton = bool(
-            self._triton_ok
+            (not disable_triton)
+            and (not _exporting_boundary())
+            and self._triton_ok
             and v.is_cuda
+            and torch.cuda.is_available()
             and env_bool("ENN_ENABLE_MSR_TRITON", default=False)
             and (not km.is_dead(k_triton))
         )
