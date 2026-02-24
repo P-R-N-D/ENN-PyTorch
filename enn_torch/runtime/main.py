@@ -1547,6 +1547,7 @@ def epochs(
                                                         Exception
                                                     ):
                                                         scaler.update()
+                                                    train_accum_since_last = 0
                                                     break
                                         scaler.step(optimizer)
                                         if optim_diag and (int(delta_gate_auto_step_total) % int(optim_diag_every) == 0):
