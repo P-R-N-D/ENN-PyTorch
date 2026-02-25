@@ -481,6 +481,95 @@ def _coerce_scaler_buffers_to_shape(
     return changed
 
 
+def _validate_scaler_buffers(model: torch.nn.Module, *, strict: bool) -> None:
+    if not env_bool("ENN_SCALER_VALIDATE", default=bool(strict)):
+        return
+    allow_default = env_bool("ENN_SCALER_ALLOW_DEFAULT", default=False)
+    log_only = env_bool("ENN_SCALER_VALIDATE_LOG_ONLY", default=False)
+    try:
+        tol = float(os.environ.get("ENN_SCALER_VALIDATE_TOL", "") or 0.0)
+    except Exception:
+        tol = 0.0
+    if tol <= 0.0:
+        tol = 1e-12
+
+    def _amax_abs(t: torch.Tensor) -> float:
+        if t.numel() <= 0:
+            return 0.0
+        try:
+            return float(t.detach().abs().amax().item())
+        except Exception:
+            return float(t.detach().abs().max().item())
+
+    def _amax_abs_diff1(t: torch.Tensor) -> float:
+        if t.numel() <= 0:
+            return 0.0
+        try:
+            return float((t.detach() - 1.0).abs().amax().item())
+        except Exception:
+            return float((t.detach() - 1.0).abs().max().item())
+
+    def _tmin(t: torch.Tensor) -> float:
+        if t.numel() <= 0:
+            return float("inf")
+        return float(t.detach().min().item())
+
+    def _tmax(t: torch.Tensor) -> float:
+        if t.numel() <= 0:
+            return float("-inf")
+        return float(t.detach().max().item())
+
+    for mod_name, mod in model.named_modules():
+        if not isinstance(mod, Scaler):
+            continue
+        x_mean = getattr(mod, "x_mean", None)
+        x_std = getattr(mod, "x_std", None)
+        y_mean = getattr(mod, "y_mean", None)
+        y_std = getattr(mod, "y_std", None)
+        if not all(isinstance(t, torch.Tensor) for t in (x_mean, x_std, y_mean, y_std)):
+            continue
+
+        issues: list[str] = []
+        with torch.no_grad():
+            for nm, t in (("x_mean", x_mean), ("x_std", x_std), ("y_mean", y_mean), ("y_std", y_std)):
+                if (t.is_floating_point() or t.is_complex()) and t.numel() > 0:
+                    try:
+                        ok = bool(torch.isfinite(t).all().item())
+                    except Exception:
+                        ok = True
+                    if not ok:
+                        issues.append(f"{nm}:nonfinite")
+            for nm, t in (("x_std", x_std), ("y_std", y_std)):
+                if t.is_floating_point() and t.numel() > 0:
+                    mn = _tmin(t)
+                    if not (mn > 0.0):
+                        issues.append(f"{nm}:min<=0({mn:.3g})")
+
+            default_x = (_amax_abs(x_mean) <= tol) and (_amax_abs_diff1(x_std) <= tol)
+            default_y = (_amax_abs(y_mean) <= tol) and (_amax_abs_diff1(y_std) <= tol)
+            if default_x and default_y and (not allow_default):
+                issues.append("stats_default(zeros/ones)")
+
+            xm = _amax_abs(x_mean)
+            xs_min = _tmin(x_std)
+            xs_max = _tmax(x_std)
+            ym = _amax_abs(y_mean)
+            ys_min = _tmin(y_std)
+            ys_max = _tmax(y_std)
+            cal = str(getattr(mod, "calib_mode", ""))
+
+        if issues:
+            loc = mod_name or "<root>"
+            msg = (
+                f"[ENN] scaler validate: module={loc} calib_mode={cal} issues={issues} "
+                f"x_mean_absmax={xm:.6g} x_std[min,max]=[{xs_min:.6g},{xs_max:.6g}] "
+                f"y_mean_absmax={ym:.6g} y_std[min,max]=[{ys_min:.6g},{ys_max:.6g}]"
+            )
+            logger.warning(msg)
+            if strict and (not log_only):
+                raise RuntimeError(msg)
+
+
 def _parse_meta(p: PathLike) -> Mapping[str, Any]:
     base = Path(p)
     for d in (base, base.parent, base.parent.parent, base.parent.parent.parent):
@@ -705,6 +794,11 @@ def _try_load_dir_checkpoint_fallback_pt(
                 return kk
 
             added = 0
+            examples: list[str] = []
+            try:
+                ex_lim = int(os.environ.get("ENN_LOAD_ALIAS_PERCEIVER_LOG_LIMIT", "10") or "10")
+            except Exception:
+                ex_lim = 10
             for k, v in list(sd_map.items()):
                 if not isinstance(k, str):
                     continue
@@ -712,44 +806,67 @@ def _try_load_dir_checkpoint_fallback_pt(
                 if kk != k and kk in model_keys and kk not in sd_map:
                     sd_map[kk] = v
                     added += 1
+                    if len(examples) < int(ex_lim):
+                        examples.append(f"{k} -> {kk}")
 
             if added > 0 and env_bool("ENN_LOAD_ALIAS_PERCEIVER_LOG", default=False):
+                msg = ""
+                if examples:
+                    msg = " Example: " + "; ".join(examples[:10])
                 logger.warning(
-                    "[ENN] load_weights: added %d aliased keys for perceiver wrapper compatibility",
+                    "[ENN] load_weights: added %d aliased keys for perceiver wrapper compatibility.%s",
                     int(added),
+                    msg,
                 )
             sd_for_load = sd_map
         except Exception:
             sd_for_load = sd
 
     incompat = _load_state_dict_compat(model, sd_for_load, strict=False)
-    warn_missing = env_bool(
+    warn_incompat = env_bool(
         "ENN_LOAD_ALIAS_PERCEIVER_WARN_MISSING",
         default=env_bool("ENN_SANITIZE_NAN_STRICT", default=False),
     )
-    if warn_missing and incompat is not None:
+    fail_incompat = env_bool(
+        "ENN_LOAD_FAIL_ON_INCOMPAT",
+        default=env_bool("ENN_SANITIZE_NAN_STRICT", default=False),
+    )
+    if (warn_incompat or fail_incompat) and incompat is not None:
         miss = getattr(incompat, "missing_keys", None) or []
         unexp = getattr(incompat, "unexpected_keys", None) or []
-        if miss:
+        if miss or unexp:
             miss_p = [k for k in miss if str(k).startswith("fuser.perceiver.")]
-            sample = miss_p[:10] if miss_p else miss[:10]
+            sm_miss = (miss_p[:10] if miss_p else miss[:10])
+            sm_unexp = unexp[:10]
             try:
-                sample_s = ", ".join(str(x) for x in sample)
+                sm_miss_s = ", ".join(str(x) for x in sm_miss)
             except Exception:
-                sample_s = str(sample)
+                sm_miss_s = str(sm_miss)
+            try:
+                sm_unexp_s = ", ".join(str(x) for x in sm_unexp)
+            except Exception:
+                sm_unexp_s = str(sm_unexp)
             logger.warning(
-                "[ENN] load_weights: fallback load missing_keys=%d (perceiver=%d, unexpected=%d). Example: %s",
+                "[ENN] load_weights: state_dict incompat: missing=%d (perceiver=%d), unexpected=%d. "
+                "missing_example=%s; unexpected_example=%s",
                 int(len(miss)),
                 int(len(miss_p)),
                 int(len(unexp)),
-                sample_s,
+                sm_miss_s,
+                sm_unexp_s,
             )
+            if fail_incompat:
+                raise RuntimeError(
+                    f"[ENN] load_weights: state_dict incompat (missing={len(miss)}, unexpected={len(unexp)}); "
+                    "set ENN_LOAD_FAIL_ON_INCOMPAT=0 to ignore."
+                )
     with contextlib.suppress(Exception):
         _coerce_scaler_buffers_to_shape(
             model,
             getattr(model, "in_dim", None),
             getattr(model, "out_shape", ()) or (),
         )
+    _validate_scaler_buffers(model, strict=env_bool("ENN_SANITIZE_NAN_STRICT", default=False))
     return True
 
 
@@ -1814,6 +1931,11 @@ def load_weights(
                 return kk
 
             added = 0
+            examples: list[str] = []
+            try:
+                ex_lim = int(os.environ.get("ENN_LOAD_ALIAS_PERCEIVER_LOG_LIMIT", "10") or "10")
+            except Exception:
+                ex_lim = 10
             for k, v in list(sd_map.items()):
                 if not isinstance(k, str):
                     continue
@@ -1821,18 +1943,61 @@ def load_weights(
                 if kk != k and kk in model_keys and kk not in sd_map:
                     sd_map[kk] = v
                     added += 1
+                    if len(examples) < int(ex_lim):
+                        examples.append(f"{k} -> {kk}")
 
             if added > 0:
                 if (dump_dir or strict_nf) or env_bool("ENN_LOAD_ALIAS_PERCEIVER_LOG", default=False):
+                    msg = ""
+                    if examples:
+                        msg = " Example: " + "; ".join(examples[:10])
                     logger.warning(
-                        "[ENN] load_weights: added %d aliased keys for perceiver wrapper compatibility",
+                        "[ENN] load_weights: added %d aliased keys for perceiver wrapper compatibility.%s",
                         int(added),
+                        msg,
                     )
             sd_for_load = sd_map
         except Exception:
             sd_for_load = sd
 
-    _load_state_dict_compat(model, sd_for_load, strict=False)
+    incompat = _load_state_dict_compat(model, sd_for_load, strict=False)
+
+    warn_incompat = bool(dump_dir or strict_nf) or env_bool(
+        "ENN_LOAD_ALIAS_PERCEIVER_WARN_MISSING",
+        default=env_bool("ENN_SANITIZE_NAN_STRICT", default=False),
+    )
+    fail_incompat = env_bool(
+        "ENN_LOAD_FAIL_ON_INCOMPAT",
+        default=env_bool("ENN_SANITIZE_NAN_STRICT", default=False),
+    )
+    if (warn_incompat or fail_incompat) and incompat is not None:
+        miss = getattr(incompat, "missing_keys", None) or []
+        unexp = getattr(incompat, "unexpected_keys", None) or []
+        if miss or unexp:
+            miss_p = [k for k in miss if str(k).startswith("fuser.perceiver.")]
+            sm_miss = (miss_p[:10] if miss_p else miss[:10])
+            sm_unexp = unexp[:10]
+            try:
+                sm_miss_s = ", ".join(str(x) for x in sm_miss)
+            except Exception:
+                sm_miss_s = str(sm_miss)
+            try:
+                sm_unexp_s = ", ".join(str(x) for x in sm_unexp)
+            except Exception:
+                sm_unexp_s = str(sm_unexp)
+            logger.warning(
+                "[ENN] load_weights: state_dict incompat: missing=%d (perceiver=%d), unexpected=%d. "
+                "missing_example=%s; unexpected_example=%s",
+                int(len(miss)),
+                int(len(miss_p)),
+                int(len(unexp)),
+                sm_miss_s,
+                sm_unexp_s,
+            )
+            if fail_incompat:
+                raise RuntimeError(
+                    f"[ENN] load_weights: state_dict incompat (missing={len(miss)}, unexpected={len(unexp)})"
+                )
 
     if dump_dir or strict_nf:
         bad_model = _first_nonfinite_param(model)
@@ -1863,6 +2028,7 @@ def load_weights(
         _coerce_scaler_buffers_to_shape(
             model, getattr(model, "in_dim", None), getattr(model, "out_shape", ()) or ()
         )
+    _validate_scaler_buffers(model, strict=bool(strict_nf))
     return meta
 
 

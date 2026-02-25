@@ -3601,6 +3601,17 @@ def infer(
                 env_bool("ENN_PRED_COLLAPSE_STAGE_DIAG_ONCE", default=True)
             )
             _collapse_stage_diag_done = False
+            diag_overwrite = bool(env_bool("ENN_PRED_DIAG_OVERWRITE", default=False))
+            diag_overwrite_abort = bool(
+                env_bool(
+                    "ENN_PRED_DIAG_OVERWRITE_ABORT",
+                    default=env_bool("ENN_SANITIZE_NAN_STRICT", default=False),
+                )
+            )
+            diag_overwrite_n = max(1, int(env_int("ENN_PRED_DIAG_OVERWRITE_SAMPLE", 256)))
+            prev_pred_ref: torch.Tensor | None = None
+            prev_pred_sample_cpu: torch.Tensor | None = None
+            prev_pred_ptr: int | None = None
 
             def _tensor_diag(t: object, *, sample_n: int = 64) -> dict[str, object]:
                 if not torch.is_tensor(t):
@@ -4306,7 +4317,12 @@ def infer(
             collapse_switched_uncompiled = False
             calibrate_pred_output = bool(env_bool("ENN_PRED_CALIBRATE_OUTPUT", True))
             collapse_fallback_raw = bool(env_bool("ENN_PRED_COLLAPSE_FALLBACK_RAW", True))
-            collapse_abort = bool(env_bool("ENN_PRED_COLLAPSE_ABORT", False))
+            collapse_abort = bool(
+                env_bool(
+                    "ENN_PRED_COLLAPSE_ABORT",
+                    default=env_bool("ENN_SANITIZE_NAN_STRICT", default=False),
+                )
+            )
 
             class _InferCollapseAbort(RuntimeError):
                 pass
@@ -4374,7 +4390,10 @@ def infer(
                 try:
                     return _invoke_predict(m)
                 except AssertionError:
-                    if not env_bool("ENN_PRED_FALLBACK_ON_CUDAGRAPH_ASSERT", default=True):
+                    if not env_bool(
+                        "ENN_PRED_FALLBACK_ON_CUDAGRAPH_ASSERT",
+                        default=not env_bool("ENN_SANITIZE_NAN_STRICT", default=False),
+                    ):
                         raise
                     try:
                         import traceback as _tb
@@ -4885,6 +4904,50 @@ def infer(
                         )
                     if pad_n > 0 and int(preds.shape[0]) == int(mb):
                         preds = preds[:n_i]
+                    if diag_overwrite and isinstance(preds, torch.Tensor) and getattr(getattr(preds, "device", None), "type", None) == "cuda":
+                        reuse_risk_diag = bool(cg_enabled) or bool(use_td_cg)
+                        if reuse_risk_diag:
+                            if prev_pred_ref is not None and prev_pred_sample_cpu is not None:
+                                with contextlib.suppress(Exception):
+                                    cur_prev = prev_pred_ref.detach().reshape(-1)[: int(diag_overwrite_n)]
+                                    if getattr(getattr(cur_prev, "device", None), "type", None) != "cpu":
+                                        cur_prev = cur_prev.to(device="cpu")
+                                    if isinstance(cur_prev, torch.Tensor) and cur_prev.dtype != torch.float32:
+                                        cur_prev = cur_prev.to(dtype=torch.float32)
+                                    prev0 = prev_pred_sample_cpu
+                                    if isinstance(prev0, torch.Tensor) and prev0.dtype != torch.float32:
+                                        prev0 = prev0.to(dtype=torch.float32)
+                                    if int(cur_prev.numel()) == int(prev0.numel()) and int(cur_prev.numel()) > 0:
+                                        d = (cur_prev - prev0).abs().max()
+                                        if float(d.item()) > 0.0:
+                                            _LOGGER.error(
+                                                "[infer] detected output overwrite across steps (likely cudagraph buffer reuse): max|prev-prev_snapshot|=%.6g",
+                                                float(d.item()),
+                                            )
+                                            if diag_overwrite_abort:
+                                                raise RuntimeError(
+                                                    "infer: output overwrite detected (likely cudagraph buffer reuse). "
+                                                    "Disable cudagraphs or force CPU copy to avoid aliasing."
+                                                )
+                            cur_ptr = None
+                            with contextlib.suppress(Exception):
+                                cur_ptr = int(preds.data_ptr())
+                            if prev_pred_ptr is not None and cur_ptr is not None and int(cur_ptr) == int(prev_pred_ptr):
+                                _LOGGER.warning(
+                                    "[infer] output data_ptr reused across steps (cudagraph reuse candidate): 0x%x",
+                                    int(cur_ptr),
+                                )
+                            prev_pred_ref = preds
+                            with contextlib.suppress(Exception):
+                                samp = preds.detach().reshape(-1)[: int(diag_overwrite_n)]
+                                if getattr(getattr(samp, "device", None), "type", None) != "cpu":
+                                    samp = samp.to(device="cpu")
+                                if isinstance(samp, torch.Tensor) and samp.dtype != torch.float32:
+                                    samp = samp.to(dtype=torch.float32)
+                                if isinstance(samp, torch.Tensor) and (not samp.is_contiguous()):
+                                    samp = samp.contiguous()
+                                prev_pred_sample_cpu = samp.clone() if isinstance(samp, torch.Tensor) else None
+                            prev_pred_ptr = int(cur_ptr) if cur_ptr is not None else None
                     if (
                         (not force_single)
                         and bool(detect_broadcast)
