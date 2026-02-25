@@ -20,7 +20,7 @@ from ..core.system import (
     CPU,
     get_runtime_cfg,
     is_accelerator_available,
-    set_runtime_cfg,
+    runtime_cfg_override,
 )
 from ..core.tensor import is_meta_or_fake_tensor
 from ..runtime.distributed import broadcast_scalar, is_dtensor_active
@@ -1321,7 +1321,6 @@ def checkpoint(fn: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
         setattr(tl, "depth", depth + 1)
         try:
             disable_cg = False
-            prev_cg: object | None = None
             try:
                 cfg = get_runtime_cfg()
                 prev_cg = getattr(cfg, "compile_cudagraphs", None)
@@ -1334,19 +1333,13 @@ def checkpoint(fn: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
                 disable_cg = False
             if disable_cg:
                 cudagraph_mark_step_begin()
-                with suppress(Exception):
-                    set_runtime_cfg("compile_cudagraphs", False)
                 fn_no_compile = torch_compiler_disable(
                     fn,
                     reason="checkpoint region: disable cudagraphs/compile for safety",
                     recursive=False,
                 )
-                try:
+                with runtime_cfg_override(compile_cudagraphs=False):
                     return fn_no_compile(*a, **k)
-                finally:
-                    with suppress(Exception):
-                        if prev_cg is not None:
-                            set_runtime_cfg("compile_cudagraphs", prev_cg)
             return fn(*a, **k)
         finally:
             setattr(tl, "depth", depth)
