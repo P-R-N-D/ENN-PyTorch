@@ -3732,7 +3732,6 @@ class Model(nn.Module):
         self.fuser = Fuser(self.in_dim, self.out_shape, config=config).to(
             self._device
         )
-        self.processor = self.fuser
         bucket = self._get_cfg(config, "length_bucket_multiple", 64, int)
         self.temporal_token_collector = Collector(
             int(config.d_model),
@@ -3743,7 +3742,6 @@ class Model(nn.Module):
             batch_first=True,
             length_bucket_multiple=bucket,
         ).to(self._device)
-        self.controller = self.temporal_token_collector
         self.delta_gate: Optional[SigmoidGate]
         k_def = self._get_cfg(config, "delta_gate_fallback_k", 6.0)
         self.delta_gate_fallback_k: float = float(k_def)
@@ -4307,6 +4305,14 @@ class Model(nn.Module):
         self._cg_static_in_specs: dict[str, tuple[tuple[int, ...], torch.dtype, str]] = {}
         self.__config = config
         self.__enn_instance_config__ = config
+
+    @property
+    def processor(self):
+        return self.fuser
+
+    @property
+    def controller(self):
+        return self.temporal_token_collector
 
     def maybe_upgrade_compile_mode(
         self: Self,

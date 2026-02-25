@@ -771,7 +771,7 @@ def _try_load_dir_checkpoint_fallback_pt(
     if _model_has_meta_or_fake_tensors(model):
         _materialize_module_to_device(model, map_location or "cpu")
     sd_for_load: object = sd
-    if isinstance(sd, Mapping) and env_bool("ENN_LOAD_ALIAS_PERCEIVER_KEYS", default=True):
+    if isinstance(sd, Mapping) and env_bool("ENN_LOAD_ALIAS_PERCEIVER_KEYS", default=False):
         try:
             sd_map = dict(sd)
             model_names = [str(n) for n, _ in model.named_parameters(recurse=True)]
@@ -822,7 +822,10 @@ def _try_load_dir_checkpoint_fallback_pt(
         except Exception:
             sd_for_load = sd
 
-    incompat = _load_state_dict_compat(model, sd_for_load, strict=False)
+    eager_ctx = getattr(model, "eager_for_export", None)
+    cm = eager_ctx() if callable(eager_ctx) else contextlib.nullcontext()
+    with cm:
+        incompat = _load_state_dict_compat(model, sd_for_load, strict=False)
     warn_incompat = env_bool(
         "ENN_LOAD_ALIAS_PERCEIVER_WARN_MISSING",
         default=env_bool("ENN_SANITIZE_NAN_STRICT", default=False),
@@ -1108,31 +1111,23 @@ def _save_model_checkpoint(
                         ),
                     )
     if save_pt:
-        if m_sd is not None:
-            pt_state = dict(m_sd)
-            _coerce_dcp_keys(pt_state)
-        else:
+        eager_ctx = getattr(model, "eager_for_export", None)
+        cm = eager_ctx() if callable(eager_ctx) else contextlib.nullcontext()
+        with cm:
             with _filtered_warnings():
-                pt_state = dict(
-                    get_model_state_dict(
-                        model,
-                        options=StateDictOptions(
-                            full_state_dict=False, cpu_offload=False
-                        ),
-                    )
-                )
-            _coerce_dcp_keys(pt_state)
-            if any(
-                torch.is_tensor(v) and is_meta_or_fake_tensor(v)
-                for v in pt_state.values()
-            ):
-                raise NotImplementedError(
-                    "Cannot save checkpoint with fake/meta tensors (no data)."
-                )
-            pt_state = {
-                k: (v.detach() if torch.is_tensor(v) else v)
-                for k, v in pt_state.items()
-            }
+                pt_state = dict(model.state_dict())
+        _coerce_dcp_keys(pt_state)
+        if any(
+            torch.is_tensor(v) and is_meta_or_fake_tensor(v)
+            for v in pt_state.values()
+        ):
+            raise NotImplementedError(
+                "Cannot save checkpoint with fake/meta tensors (no data)."
+            )
+        pt_state = {
+            k: (v.detach().to(device="cpu") if torch.is_tensor(v) else v)
+            for k, v in pt_state.items()
+        }
         dump_dir = str(os.environ.get("ENN_NONFINITE_DUMP_DIR", "") or "").strip()
         strict_save = env_bool(
             "ENN_FAIL_ON_SAVE_NONFINITE",
@@ -1908,7 +1903,7 @@ def load_weights(
     if _model_has_meta_or_fake_tensors(model):
         _materialize_module_to_device(model, map_location or "cpu")
     sd_for_load: object = sd
-    if isinstance(sd, Mapping) and env_bool("ENN_LOAD_ALIAS_PERCEIVER_KEYS", default=True):
+    if isinstance(sd, Mapping) and env_bool("ENN_LOAD_ALIAS_PERCEIVER_KEYS", default=False):
         try:
             sd_map = dict(sd)
             model_names = [str(n) for n, _ in model.named_parameters(recurse=True)]
@@ -1960,7 +1955,10 @@ def load_weights(
         except Exception:
             sd_for_load = sd
 
-    incompat = _load_state_dict_compat(model, sd_for_load, strict=False)
+    eager_ctx = getattr(model, "eager_for_export", None)
+    cm = eager_ctx() if callable(eager_ctx) else contextlib.nullcontext()
+    with cm:
+        incompat = _load_state_dict_compat(model, sd_for_load, strict=False)
 
     warn_incompat = bool(dump_dir or strict_nf) or env_bool(
         "ENN_LOAD_ALIAS_PERCEIVER_WARN_MISSING",
