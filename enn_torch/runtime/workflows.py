@@ -777,9 +777,23 @@ def _try_load_dir_checkpoint_fallback_pt(
             model_names = [str(n) for n, _ in model.named_parameters(recurse=True)]
             model_keys = set(model_names)
 
-            has_perceiver_origmod = any(k.startswith("fuser.perceiver._orig_mod.") for k in model_keys)
+            proc_root = "fuser"
+            if any(k.startswith("fuser.perceiver.") for k in model_keys):
+                proc_root = "fuser"
+            elif any(k.startswith("processor.perceiver.") for k in model_keys):
+                proc_root = "processor"
+
+            ctrl_root = "temporal_token_collector"
+            if any(k.startswith("temporal_token_collector.") for k in model_keys):
+                ctrl_root = "temporal_token_collector"
+            elif any(k.startswith("controller.") for k in model_keys):
+                ctrl_root = "controller"
+
+            perceiver_plain_prefix = f"{proc_root}.perceiver."
+            perceiver_orig_prefix = f"{proc_root}.perceiver._orig_mod."
+            has_perceiver_origmod = any(k.startswith(perceiver_orig_prefix) for k in model_keys)
             has_perceiver_plain = any(
-                k.startswith("fuser.perceiver.") and (not k.startswith("fuser.perceiver._orig_mod."))
+                k.startswith(perceiver_plain_prefix) and (not k.startswith(perceiver_orig_prefix))
                 for k in model_keys
             )
 
@@ -787,10 +801,21 @@ def _try_load_dir_checkpoint_fallback_pt(
                 kk = str(k)
                 kk = kk.replace("._enn_inner._orig_mod", "")
                 kk = kk.replace("._enn_inner", "")
-                if has_perceiver_origmod and kk.startswith("fuser.perceiver.") and (not kk.startswith("fuser.perceiver._orig_mod.")):
-                    kk = "fuser.perceiver._orig_mod." + kk[len("fuser.perceiver.") :]
-                elif has_perceiver_plain and kk.startswith("fuser.perceiver._orig_mod."):
-                    kk = "fuser.perceiver." + kk[len("fuser.perceiver._orig_mod.") :]
+
+                if proc_root == "fuser" and kk.startswith("processor."):
+                    kk = "fuser." + kk[len("processor.") :]
+                elif proc_root == "processor" and kk.startswith("fuser."):
+                    kk = "processor." + kk[len("fuser.") :]
+
+                if ctrl_root == "temporal_token_collector" and kk.startswith("controller."):
+                    kk = "temporal_token_collector." + kk[len("controller.") :]
+                elif ctrl_root == "controller" and kk.startswith("temporal_token_collector."):
+                    kk = "controller." + kk[len("temporal_token_collector.") :]
+
+                if has_perceiver_origmod and kk.startswith(perceiver_plain_prefix) and (not kk.startswith(perceiver_orig_prefix)):
+                    kk = perceiver_orig_prefix + kk[len(perceiver_plain_prefix) :]
+                elif has_perceiver_plain and kk.startswith(perceiver_orig_prefix):
+                    kk = perceiver_plain_prefix + kk[len(perceiver_orig_prefix) :]
                 return kk
 
             added = 0
@@ -838,7 +863,7 @@ def _try_load_dir_checkpoint_fallback_pt(
         miss = getattr(incompat, "missing_keys", None) or []
         unexp = getattr(incompat, "unexpected_keys", None) or []
         if miss or unexp:
-            miss_p = [k for k in miss if str(k).startswith("fuser.perceiver.")]
+            miss_p = [k for k in miss if str(k).startswith("fuser.perceiver.") or str(k).startswith("processor.perceiver.")]
             sm_miss = (miss_p[:10] if miss_p else miss[:10])
             sm_unexp = unexp[:10]
             try:
@@ -1909,9 +1934,23 @@ def load_weights(
             model_names = [str(n) for n, _ in model.named_parameters(recurse=True)]
             model_keys = set(model_names)
 
-            has_perceiver_origmod = any(k.startswith("fuser.perceiver._orig_mod.") for k in model_keys)
+            proc_root = "fuser"
+            if any(k.startswith("fuser.perceiver.") for k in model_keys):
+                proc_root = "fuser"
+            elif any(k.startswith("processor.perceiver.") for k in model_keys):
+                proc_root = "processor"
+
+            ctrl_root = "temporal_token_collector"
+            if any(k.startswith("temporal_token_collector.") for k in model_keys):
+                ctrl_root = "temporal_token_collector"
+            elif any(k.startswith("controller.") for k in model_keys):
+                ctrl_root = "controller"
+
+            perceiver_plain_prefix = f"{proc_root}.perceiver."
+            perceiver_orig_prefix = f"{proc_root}.perceiver._orig_mod."
+            has_perceiver_origmod = any(k.startswith(perceiver_orig_prefix) for k in model_keys)
             has_perceiver_plain = any(
-                k.startswith("fuser.perceiver.") and (not k.startswith("fuser.perceiver._orig_mod."))
+                k.startswith(perceiver_plain_prefix) and (not k.startswith(perceiver_orig_prefix))
                 for k in model_keys
             )
 
@@ -1919,10 +1958,21 @@ def load_weights(
                 kk = str(k)
                 kk = kk.replace("._enn_inner._orig_mod", "")
                 kk = kk.replace("._enn_inner", "")
-                if has_perceiver_origmod and kk.startswith("fuser.perceiver.") and (not kk.startswith("fuser.perceiver._orig_mod.")):
-                    kk = "fuser.perceiver._orig_mod." + kk[len("fuser.perceiver.") :]
-                elif has_perceiver_plain and kk.startswith("fuser.perceiver._orig_mod."):
-                    kk = "fuser.perceiver." + kk[len("fuser.perceiver._orig_mod.") :]
+
+                if proc_root == "fuser" and kk.startswith("processor."):
+                    kk = "fuser." + kk[len("processor.") :]
+                elif proc_root == "processor" and kk.startswith("fuser."):
+                    kk = "processor." + kk[len("fuser.") :]
+
+                if ctrl_root == "temporal_token_collector" and kk.startswith("controller."):
+                    kk = "temporal_token_collector." + kk[len("controller.") :]
+                elif ctrl_root == "controller" and kk.startswith("temporal_token_collector."):
+                    kk = "controller." + kk[len("temporal_token_collector.") :]
+
+                if has_perceiver_origmod and kk.startswith(perceiver_plain_prefix) and (not kk.startswith(perceiver_orig_prefix)):
+                    kk = perceiver_orig_prefix + kk[len(perceiver_plain_prefix) :]
+                elif has_perceiver_plain and kk.startswith(perceiver_orig_prefix):
+                    kk = perceiver_plain_prefix + kk[len(perceiver_orig_prefix) :]
                 return kk
 
             added = 0
@@ -1972,7 +2022,7 @@ def load_weights(
         miss = getattr(incompat, "missing_keys", None) or []
         unexp = getattr(incompat, "unexpected_keys", None) or []
         if miss or unexp:
-            miss_p = [k for k in miss if str(k).startswith("fuser.perceiver.")]
+            miss_p = [k for k in miss if str(k).startswith("fuser.perceiver.") or str(k).startswith("processor.perceiver.")]
             sm_miss = (miss_p[:10] if miss_p else miss[:10])
             sm_unexp = unexp[:10]
             try:
