@@ -5593,14 +5593,23 @@ class Model(nn.Module):
                 else:
                     enc_static_in: torch.Tensor | None = None
                     if mark_static_addr and self._pad_compiled_microbatch and (not pred_disable_cg):
-                        with contextlib.suppress(Exception):
+                        if mark_static_strict:
                             enc_static_in = self._get_cg_static_in_buf(
                                 'encoder',
                                 (int(mb), int(self.in_dim)),
                                 dtype=base_dtype,
                                 device=device,
-                                strict=mark_static_strict,
+                                strict=True,
                             )
+                        else:
+                            with contextlib.suppress(Exception):
+                                enc_static_in = self._get_cg_static_in_buf(
+                                    'encoder',
+                                    (int(mb), int(self.in_dim)),
+                                    dtype=base_dtype,
+                                    device=device,
+                                    strict=False,
+                                )
                     tokens, context = cast(
                         Tuple[torch.Tensor, torch.Tensor],
                         _prealloc_microbatch(
@@ -5710,15 +5719,25 @@ class Model(nn.Module):
                     and self._pad_compiled_microbatch
                     and (not pred_disable_cg)
                 ):
-                    with contextlib.suppress(Exception):
+                    if mark_static_strict:
                         tail = tuple(int(x) for x in tuple(refined_tokens.shape[1:]))
                         dec_static_in = self._get_cg_static_in_buf(
                             'decoder',
                             (int(ctrl_mb), *tail),
                             dtype=refined_tokens.dtype,
                             device=refined_tokens.device,
-                            strict=mark_static_strict,
+                            strict=True,
                         )
+                    else:
+                        with contextlib.suppress(Exception):
+                            tail = tuple(int(x) for x in tuple(refined_tokens.shape[1:]))
+                            dec_static_in = self._get_cg_static_in_buf(
+                                'decoder',
+                                (int(ctrl_mb), *tail),
+                                dtype=refined_tokens.dtype,
+                                device=refined_tokens.device,
+                                strict=False,
+                            )
 
                 residual_context = cast(
                     torch.Tensor,
