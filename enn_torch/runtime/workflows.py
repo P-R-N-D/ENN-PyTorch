@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import contextlib
+import collections
 import gc
 import inspect
 import json
@@ -101,7 +102,57 @@ def _rewrite_state_dict_key(k: str) -> str:
 def _coerce_state_dict(sd: Mapping[str, Any]) -> Mapping[str, Any]:
     if not any(_rewrite_state_dict_key(k) != k for k in sd):
         return sd
-    return {_rewrite_state_dict_key(k): v for k, v in sd.items()}
+
+    meta = getattr(sd, "_metadata", None)
+    try:
+        out: Any = type(sd)()
+    except Exception:
+        out = collections.OrderedDict()
+    for k, v in sd.items():
+        out[_rewrite_state_dict_key(k)] = v
+    if meta is not None:
+        with contextlib.suppress(Exception):
+            setattr(out, "_metadata", meta)
+    return out
+
+
+def _drop_runtime_only_state_keys(sd: Mapping[str, Any]) -> Mapping[str, Any]:
+    drop: list[str] = []
+    for k in sd.keys():
+        if not isinstance(k, str):
+            continue
+        if k == "output_baked_flag" or k.split(".")[-1] == "output_baked_flag":
+            drop.append(k)
+    if not drop:
+        return sd
+
+    meta = getattr(sd, "_metadata", None)
+    try:
+        out: Any = type(sd)()
+        if hasattr(out, "update"):
+            out.update(sd)
+        else:
+            out = collections.OrderedDict(sd)
+    except Exception:
+        out = collections.OrderedDict(sd)
+    for k in drop:
+        with contextlib.suppress(Exception):
+            out.pop(k, None)
+    if meta is not None:
+        with contextlib.suppress(Exception):
+            setattr(out, "_metadata", meta)
+
+    if env_bool(
+        "ENN_LOG_DROPPED_RUNTIME_KEYS",
+        default=env_bool("ENN_SANITIZE_NAN_STRICT", default=False),
+    ):
+        ex = drop[0] if drop else None
+        logger.warning(
+            "[ENN] load_weights: dropped %d runtime-only key(s) from checkpoint state (e.g. %s)",
+            int(len(drop)),
+            str(ex),
+        )
+    return out
 
 
 def _normalize_windows_paste(value: PathLike) -> PathLike:
@@ -766,6 +817,7 @@ def _try_load_dir_checkpoint_fallback_pt(
     if not isinstance(sd, dict):
         return False
     sd = _coerce_state_dict(sd)
+    sd = _drop_runtime_only_state_keys(sd)
     with contextlib.suppress(Exception):
         resize_scaler_buffer(model, sd)
     if _model_has_meta_or_fake_tensors(model):
@@ -1810,6 +1862,7 @@ def load_weights(
             dev = str(map_location)
         sd = load_tensors(str(p), device=dev)
         sd = _coerce_state_dict(sd)
+        sd = _drop_runtime_only_state_keys(sd)
         resize_scaler_buffer(model, sd)
         if _model_has_meta_or_fake_tensors(model):
             _materialize_module_to_device(model, dev)
@@ -1912,6 +1965,8 @@ def load_weights(
     else:
         sd = obj
     sd = _coerce_state_dict(sd) if isinstance(sd, dict) else sd
+    if isinstance(sd, Mapping):
+        sd = _drop_runtime_only_state_keys(cast(Mapping[str, Any], sd))
 
     if (dump_dir or strict_nf) and isinstance(sd, Mapping):
         bad_sd = _first_nonfinite_in_state(cast(Mapping[str, Any], sd))
