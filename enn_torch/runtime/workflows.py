@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import contextlib
+import collections
 import gc
 import inspect
 import json
@@ -101,7 +102,18 @@ def _rewrite_state_dict_key(k: str) -> str:
 def _coerce_state_dict(sd: Mapping[str, Any]) -> Mapping[str, Any]:
     if not any(_rewrite_state_dict_key(k) != k for k in sd):
         return sd
-    return {_rewrite_state_dict_key(k): v for k, v in sd.items()}
+
+    meta = getattr(sd, "_metadata", None)
+    try:
+        out: Any = type(sd)()
+    except Exception:
+        out = collections.OrderedDict()
+    for k, v in sd.items():
+        out[_rewrite_state_dict_key(k)] = v
+    if meta is not None:
+        with contextlib.suppress(Exception):
+            setattr(out, "_metadata", meta)
+    return out
 
 
 def _drop_runtime_only_state_keys(sd: Mapping[str, Any]) -> Mapping[str, Any]:
@@ -114,10 +126,21 @@ def _drop_runtime_only_state_keys(sd: Mapping[str, Any]) -> Mapping[str, Any]:
     if not drop:
         return sd
 
-    out = dict(sd)
+    meta = getattr(sd, "_metadata", None)
+    try:
+        out: Any = type(sd)()
+        if hasattr(out, "update"):
+            out.update(sd)
+        else:
+            out = collections.OrderedDict(sd)
+    except Exception:
+        out = collections.OrderedDict(sd)
     for k in drop:
         with contextlib.suppress(Exception):
             out.pop(k, None)
+    if meta is not None:
+        with contextlib.suppress(Exception):
+            setattr(out, "_metadata", meta)
 
     if env_bool(
         "ENN_LOG_DROPPED_RUNTIME_KEYS",
