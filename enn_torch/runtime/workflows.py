@@ -770,6 +770,11 @@ def _try_load_dir_checkpoint_fallback_pt(
         resize_scaler_buffer(model, sd)
     if _model_has_meta_or_fake_tensors(model):
         _materialize_module_to_device(model, map_location or "cpu")
+    with contextlib.suppress(Exception):
+        buf = getattr(model, "output_baked_flag", None)
+        if torch.is_tensor(buf):
+            buf.zero_()
+
     sd_for_load: object = sd
     if isinstance(sd, Mapping) and env_bool("ENN_LOAD_ALIAS_PERCEIVER_KEYS", default=True):
         try:
@@ -1927,6 +1932,11 @@ def load_weights(
         resize_scaler_buffer(model, sd)
     if _model_has_meta_or_fake_tensors(model):
         _materialize_module_to_device(model, map_location or "cpu")
+    with contextlib.suppress(Exception):
+        buf = getattr(model, "output_baked_flag", None)
+        if torch.is_tensor(buf):
+            buf.zero_()
+
     sd_for_load: object = sd
     if isinstance(sd, Mapping) and env_bool("ENN_LOAD_ALIAS_PERCEIVER_KEYS", default=True):
         try:
