@@ -4190,14 +4190,21 @@ class Model(nn.Module):
             return old_items
 
         def _compile_modulelist_inplace(
-            modlist: nn.ModuleList, *args: Any, label: str
+            modlist: nn.ModuleList,
+            *args: Any,
+            label: str,
+            options: dict[str, Any] | None = None,
         ) -> tuple[bool, list[nn.Module], list[nn.Module]]:
             eager_items = list(modlist)
             compiled_items: list[nn.Module] = []
             compiled_any = False
             for i, child in enumerate(eager_items):
                 compiled = (
-                    _compile_one(child, label=f"{label}[{i}]")
+                    _compile_one(
+                        child,
+                        label=f"{label}[{i}]",
+                        options=options,
+                    )
                     if isinstance(child, nn.Module)
                     else child
                 )
@@ -4211,10 +4218,33 @@ class Model(nn.Module):
 
         def _compile_perceiver_piecewise(perceiver: nn.Module) -> bool:
             compiled_any = False
+            perceiver_options: dict[str, Any] | None = None
+            try:
+                strict_nf = bool(env_bool("ENN_SANITIZE_NAN_STRICT", default=False))
+                disable_pc = bool(
+                    env_bool(
+                        "ENN_PERCEIVER_DISABLE_CUDAGRAPHS",
+                        default=(
+                            strict_nf
+                            and bool(getattr(self._device, "type", None) == "cuda")
+                            and bool(getattr(self, "_compile_cudagraphs", False))
+                        ),
+                    )
+                )
+                if disable_pc and bool(getattr(self._device, "type", None) == "cuda"):
+                    perceiver_options = {"triton.cudagraphs": False}
+                    _LOGGER.info(
+                        "[compile] Perceiver blocks: disabling cudagraphs (options=%s)",
+                        str(perceiver_options),
+                    )
+            except Exception:
+                perceiver_options = None
             cross = getattr(perceiver, "cross", None)
             if isinstance(cross, nn.ModuleList):
                 c_any, eager_items, _ = _compile_modulelist_inplace(
-                    cross, label="perceiver.cross"
+                    cross,
+                    label="perceiver.cross",
+                    options=perceiver_options,
                 )
                 if c_any:
                     compiled_any = True
@@ -4222,7 +4252,9 @@ class Model(nn.Module):
             self_blocks = getattr(perceiver, "self_blocks", None)
             if isinstance(self_blocks, nn.ModuleList):
                 s_any, eager_items, _ = _compile_modulelist_inplace(
-                    self_blocks, label="perceiver.self_blocks"
+                    self_blocks,
+                    label="perceiver.self_blocks",
+                    options=perceiver_options,
                 )
                 if s_any:
                     compiled_any = True

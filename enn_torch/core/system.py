@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import _thread
+import contextvars
 import functools
 import contextlib
 import ctypes
@@ -107,6 +108,10 @@ _LAZY_LOCK_NAMES = {
     "_CPU_PROC_LOCK",
     "_RUNTIME_CFG_LOCK",
 }
+_RUNTIME_CFG_OVERRIDE: contextvars.ContextVar[dict[str, object] | None] = contextvars.ContextVar(
+    "_enn_runtime_cfg_override",
+    default=None,
+)
 _RUNTIME_CFG = SimpleNamespace(
     deterministic=False,
     allow_tf32=None,
@@ -1333,11 +1338,34 @@ def system_info() -> Tuple[str, str, str, str]:
 
 
 def get_runtime_config() -> SimpleNamespace:
-    return _RUNTIME_CFG
+    base = _RUNTIME_CFG
+    ov = _RUNTIME_CFG_OVERRIDE.get()
+    if not ov:
+        return base
+    merged = SimpleNamespace(**getattr(base, "__dict__", {}))
+    for k, v in ov.items():
+        setattr(merged, str(k), v)
+    return merged
 
 
 def get_runtime_cfg() -> SimpleNamespace:
     return get_runtime_config()
+
+
+@contextlib.contextmanager
+def runtime_cfg_override(**kwargs: object):
+    if not kwargs:
+        yield get_runtime_cfg()
+        return
+    prev = _RUNTIME_CFG_OVERRIDE.get()
+    merged: dict[str, object] = dict(prev) if isinstance(prev, dict) else {}
+    for k, v in kwargs.items():
+        merged[str(k)] = v
+    token = _RUNTIME_CFG_OVERRIDE.set(merged)
+    try:
+        yield get_runtime_cfg()
+    finally:
+        _RUNTIME_CFG_OVERRIDE.reset(token)
 
 
 def set_runtime_cfg(

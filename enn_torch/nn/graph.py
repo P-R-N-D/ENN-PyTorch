@@ -16,7 +16,12 @@ from typing import Any, Callable, Dict, Iterator, List, Optional, Self, Sequence
 import torch
 from ..core.concurrency import Mutex
 from ..core.datatypes import env_bool, env_first, env_first_int
-from ..core.system import CPU, is_accelerator_available
+from ..core.system import (
+    CPU,
+    get_runtime_cfg,
+    is_accelerator_available,
+    runtime_cfg_override,
+)
 from ..core.tensor import is_meta_or_fake_tensor
 from ..runtime.distributed import broadcast_scalar, is_dtensor_active
 from torch import nn
@@ -1315,6 +1320,26 @@ def checkpoint(fn: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
         depth = int(getattr(tl, "depth", 0) or 0)
         setattr(tl, "depth", depth + 1)
         try:
+            disable_cg = False
+            try:
+                cfg = get_runtime_cfg()
+                prev_cg = getattr(cfg, "compile_cudagraphs", None)
+                disable_cg = bool(
+                    env_bool("ENN_CKPT_DISABLE_CUDAGRAPHS", default=True)
+                    and bool(prev_cg)
+                    and bool(is_accelerator_available("cuda"))
+                )
+            except Exception:
+                disable_cg = False
+            if disable_cg:
+                cudagraph_mark_step_begin()
+                fn_no_compile = torch_compiler_disable(
+                    fn,
+                    reason="checkpoint region: disable cudagraphs/compile for safety",
+                    recursive=False,
+                )
+                with runtime_cfg_override(compile_cudagraphs=False):
+                    return fn_no_compile(*a, **k)
             return fn(*a, **k)
         finally:
             setattr(tl, "depth", depth)
