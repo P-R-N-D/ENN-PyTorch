@@ -3612,6 +3612,158 @@ def infer(
             prev_pred_ref: torch.Tensor | None = None
             prev_pred_sample_cpu: torch.Tensor | None = None
             prev_pred_ptr: int | None = None
+            prev_pred_step: int | None = None
+            prev_pred_slice: tuple[int, int] | None = None
+            prev_pred_rows_cpu: torch.Tensor | None = None
+            prev_pred_X_cpu: torch.Tensor | None = None
+            prev_pred_X_run_cpu: torch.Tensor | None = None
+            prev_pred_X_run_ptr: int | None = None
+            prev_pred_X_run_source: str | None = None
+            prev_pred_pad_n: int | None = None
+            prev_pred_mb: int | None = None
+            prev_pred_n_i: int | None = None
+
+            def _ids_diag(ids: object, *, head: int = 8) -> object:
+                if ids is None:
+                    return None
+                try:
+                    if torch.is_tensor(ids):
+                        x = ids.detach()
+                        try:
+                            x = x.reshape(-1)
+                        except Exception:
+                            x = x.flatten()
+                        if getattr(getattr(x, 'device', None), 'type', None) != 'cpu':
+                            x = x.to(device='cpu')
+                        n = int(min(int(head), int(x.numel())))
+                        vals = x[:n].tolist()
+                        out_vals: list[object] = []
+                        for v in vals:
+                            try:
+                                out_vals.append(int(v))
+                            except Exception:
+                                out_vals.append(v)
+                        return {'type': 'tensor', 'n': int(x.numel()), 'head': out_vals}
+                    if isinstance(ids, (list, tuple)):
+                        vals = list(ids)[: int(head)]
+                        out_vals: list[object] = []
+                        for v in vals:
+                            try:
+                                out_vals.append(int(v))
+                            except Exception:
+                                out_vals.append(v)
+                        return {'type': type(ids).__name__, 'n': int(len(ids)), 'head': out_vals}
+                    if isinstance(ids, dict):
+                        keys = list(ids.keys())
+                        return {'type': 'dict', 'keys_head': keys[: int(head)]}
+                except Exception:
+                    pass
+                r = repr(ids)
+                if len(r) > 200:
+                    r = r[:200] + '...'
+                return {'type': type(ids).__name__, 'repr': r}
+
+            def _x_diag(X: object, *, head_rows: int = 4, head_cols: int = 8) -> object:
+                if not torch.is_tensor(X):
+                    return {'type': type(X).__name__}
+                x = X.detach()
+                info: dict[str, object] = {
+                    'shape': [int(v) for v in tuple(x.shape)],
+                    'dtype': str(x.dtype),
+                    'device': str(x.device),
+                }
+                try:
+                    if x.ndim >= 2:
+                        rr = int(min(int(head_rows), int(x.shape[0])))
+                        if rr <= 0:
+                            return info
+                        xr = x[:rr]
+                        if getattr(getattr(xr, 'device', None), 'type', None) != 'cpu':
+                            xr = xr.to('cpu')
+                        if isinstance(xr, torch.Tensor) and xr.dtype != torch.float32:
+                            xr = xr.to(dtype=torch.float32)
+                        cc = int(min(int(head_cols), int(xr.shape[1]))) if xr.ndim >= 2 else 0
+                        rows: list[dict[str, object]] = []
+                        for i in range(rr):
+                            row_full = xr[i].reshape(-1)
+                            s = float(row_full.sum().item()) if int(row_full.numel()) > 0 else 0.0
+                            mean = float(row_full.mean().item()) if int(row_full.numel()) > 0 else 0.0
+                            std = float(row_full.std(unbiased=False).item()) if int(row_full.numel()) > 1 else 0.0
+                            vals = [float(v) for v in row_full[:cc].tolist()] if cc > 0 else []
+                            rows.append({'row': int(i), 'vals': vals, 'stats': {'sum': s, 'mean': mean, 'std': std, 'numel': int(row_full.numel())}})
+                        info['head'] = rows
+                    else:
+                        flat = x.reshape(-1)
+                        if getattr(getattr(flat, 'device', None), 'type', None) != 'cpu':
+                            flat = flat.to('cpu')
+                        if isinstance(flat, torch.Tensor) and flat.dtype != torch.float32:
+                            flat = flat.to(dtype=torch.float32)
+                        n = int(min(32, int(flat.numel())))
+                        info['head'] = [float(v) for v in flat[:n].tolist()]
+                        s = float(flat.sum().item()) if int(flat.numel()) > 0 else 0.0
+                        mean = float(flat.mean().item()) if int(flat.numel()) > 0 else 0.0
+                        std = float(flat.std(unbiased=False).item()) if int(flat.numel()) > 1 else 0.0
+                        info['stats'] = {'sum': s, 'mean': mean, 'std': std, 'numel': int(flat.numel())}
+                except Exception:
+                    pass
+                return info
+
+            def _row_stats(xrow: object) -> object:
+                if not torch.is_tensor(xrow):
+                    return None
+                try:
+                    v = xrow.detach().reshape(-1)
+                    if getattr(getattr(v, 'device', None), 'type', None) != 'cpu':
+                        v = v.to('cpu')
+                    if isinstance(v, torch.Tensor) and v.dtype != torch.float32:
+                        v = v.to(dtype=torch.float32)
+                    n = int(v.numel())
+                    if n <= 0:
+                        return {'sum': 0.0, 'mean': 0.0, 'std': 0.0, 'numel': 0}
+                    s = float(v.sum().item())
+                    mean = float(v.mean().item())
+                    std = float(v.std(unbiased=False).item()) if n > 1 else 0.0
+                    return {'sum': s, 'mean': mean, 'std': std, 'numel': n}
+                except Exception:
+                    return None
+
+            def _unravel_index(flat_idx: int, shape: list[int]) -> list[int]:
+                idx = int(flat_idx)
+                out: list[int] = []
+                for dim in reversed(shape):
+                    d = int(dim)
+                    if d <= 0:
+                        out.append(0)
+                        continue
+                    out.append(int(idx % d))
+                    idx //= d
+                return list(reversed(out))
+
+            def _overwrite_dump_dir() -> str:
+                d = env_str('ENN_PRED_OVERWRITE_DUMP_DIR')
+                if d:
+                    return str(d)
+                d = env_str('ENN_NONFINITE_DUMP_DIR')
+                if d:
+                    return os.path.join(str(d), 'pred_overwrite')
+                return os.path.join(str(chunk_dir), 'pred_overwrite')
+
+            def _dump_overwrite_diag(payload: dict[str, object]) -> str | None:
+                try:
+                    ddir = _overwrite_dump_dir()
+                    os.makedirs(ddir, exist_ok=True)
+                    fn = payload.get('filename')
+                    if not isinstance(fn, str) or not fn:
+                        ts = int(time.time() * 1000)
+                        fn = f'overwrite_rank{int(rank)}_{ts}.json'
+                    path = os.path.join(ddir, fn)
+                    with open(path, 'w', encoding='utf-8') as f:
+                        json.dump(payload, f, ensure_ascii=False, indent=2, default=str)
+                    return path
+                except Exception:
+                    with contextlib.suppress(Exception):
+                        _LOGGER.exception('[infer][overwrite-diag] failed to write overwrite dump')
+                    return None
 
             def _tensor_diag(t: object, *, sample_n: int = 64) -> dict[str, object]:
                 if not torch.is_tensor(t):
@@ -4907,37 +5059,246 @@ def infer(
                     if diag_overwrite and isinstance(preds, torch.Tensor) and getattr(getattr(preds, "device", None), "type", None) == "cuda":
                         reuse_risk_diag = bool(cg_enabled) or bool(use_td_cg)
                         if reuse_risk_diag:
-                            if prev_pred_ref is not None and prev_pred_sample_cpu is not None:
-                                with contextlib.suppress(Exception):
+                            cur_batch = int(seen_batches)
+                            cur_slice = (int(start), int(end))
+                            cur_ptr = None
+                            with contextlib.suppress(Exception):
+                                cur_ptr = int(preds.data_ptr())
+
+                            if prev_pred_ptr is not None and cur_ptr is not None and int(cur_ptr) == int(prev_pred_ptr):
+                                _LOGGER.warning(
+                                    "[infer][overwrite-diag] output data_ptr reused: prev_batch=%s prev_slice=%s curr_batch=%s curr_slice=%s ptr=0x%x cg=%s td_cg=%s",
+                                    prev_pred_step,
+                                    prev_pred_slice,
+                                    cur_batch,
+                                    cur_slice,
+                                    int(cur_ptr),
+                                    bool(cg_enabled),
+                                    bool(use_td_cg),
+                                )
+
+                            overwrite_max = None
+                            overwrite_idx = None
+                            cur_prev = None
+                            prev0 = prev_pred_sample_cpu
+                            if prev_pred_ref is not None and prev0 is not None:
+                                try:
                                     cur_prev = prev_pred_ref.detach().reshape(-1)[: int(diag_overwrite_n)]
                                     if getattr(getattr(cur_prev, "device", None), "type", None) != "cpu":
                                         cur_prev = cur_prev.to(device="cpu")
                                     if isinstance(cur_prev, torch.Tensor) and cur_prev.dtype != torch.float32:
                                         cur_prev = cur_prev.to(dtype=torch.float32)
-                                    prev0 = prev_pred_sample_cpu
                                     if isinstance(prev0, torch.Tensor) and prev0.dtype != torch.float32:
                                         prev0 = prev0.to(dtype=torch.float32)
                                     if int(cur_prev.numel()) == int(prev0.numel()) and int(cur_prev.numel()) > 0:
-                                        d = (cur_prev - prev0).abs().max()
-                                        if float(d.item()) > 0.0:
-                                            _LOGGER.error(
-                                                "[infer] detected output overwrite across steps (likely cudagraph buffer reuse): max|prev-prev_snapshot|=%.6g",
-                                                float(d.item()),
-                                            )
-                                            if diag_overwrite_abort:
-                                                raise RuntimeError(
-                                                    "infer: output overwrite detected (likely cudagraph buffer reuse). "
-                                                    "Disable cudagraphs or force CPU copy to avoid aliasing."
-                                                )
-                            cur_ptr = None
-                            with contextlib.suppress(Exception):
-                                cur_ptr = int(preds.data_ptr())
-                            if prev_pred_ptr is not None and cur_ptr is not None and int(cur_ptr) == int(prev_pred_ptr):
-                                _LOGGER.warning(
-                                    "[infer] output data_ptr reused across steps (cudagraph reuse candidate): 0x%x",
-                                    int(cur_ptr),
-                                )
+                                        diff = (cur_prev - prev0).abs()
+                                        dmax, imax = diff.max(dim=0)
+                                        overwrite_max = float(dmax.item())
+                                        overwrite_idx = int(imax.item())
+                                        if overwrite_max <= 0.0:
+                                            overwrite_max = None
+                                            overwrite_idx = None
+                                except Exception as e:
+                                    prev_d = None
+                                    cur_d = None
+                                    with contextlib.suppress(Exception):
+                                        prev_d = _tensor_diag(prev_pred_ref, sample_n=16)
+                                    with contextlib.suppress(Exception):
+                                        cur_d = _tensor_diag(preds, sample_n=16)
+                                    _LOGGER.exception(
+                                        "[infer][overwrite-diag] diagnostic FAILED: prev_batch=%s prev_slice=%s curr_batch=%s curr_slice=%s prev_ptr=%s curr_ptr=%s cg=%s td_cg=%s prev_row_ids=%s curr_row_ids=%s prev=%s curr=%s",
+                                        prev_pred_step,
+                                        prev_pred_slice,
+                                        cur_batch,
+                                        cur_slice,
+                                        (f"0x{int(prev_pred_ptr):x}" if prev_pred_ptr is not None else None),
+                                        (f"0x{int(cur_ptr):x}" if cur_ptr is not None else None),
+                                        bool(cg_enabled),
+                                        bool(use_td_cg),
+                                        _ids_diag(prev_pred_rows_cpu),
+                                        _ids_diag(rows_i),
+                                        prev_d,
+                                        cur_d,
+                                    )
+                                    if diag_overwrite_abort:
+                                        raise RuntimeError(
+                                            "infer: overwrite diagnostic failed while ENN_PRED_DIAG_OVERWRITE_ABORT=1. Cannot guarantee cudagraph safety; aborting."
+                                        ) from e
+                                if overwrite_max is not None:
+                                    prev_shape = [int(v) for v in tuple(getattr(prev_pred_ref, "shape", ()))] if prev_pred_ref is not None else []
+                                    multi = _unravel_index(int(overwrite_idx or 0), prev_shape) if prev_shape else []
+                                    row_in_prev = int(multi[0]) if multi else 0
+                                    axis1_idx = int(multi[1]) if len(multi) >= 2 else None
+                                    axis2_idx = int(multi[2]) if len(multi) >= 3 else None
+                                    row_id = None
+                                    x_row_head = None
+                                    x_row_stats = None
+                                    x_run_row_head = None
+                                    x_run_row_stats = None
+
+                                    curr_x_run_ptr = None
+                                    with contextlib.suppress(Exception):
+                                        if torch.is_tensor(Xi_run):
+                                            curr_x_run_ptr = int(Xi_run.data_ptr())
+                                    curr_x_run_source = None
+                                    with contextlib.suppress(Exception):
+                                        if Xi_run is Xi:
+                                            curr_x_run_source = 'Xi'
+                                        elif use_td_cg and (td_cg_pad_buf is not None) and (Xi_run is td_cg_pad_buf):
+                                            curr_x_run_source = 'td_cg_pad_buf'
+                                        elif Xi_pad is not None and (Xi_run is Xi_pad):
+                                            curr_x_run_source = 'pad_buf'
+                                        else:
+                                            curr_x_run_source = 'other'
+
+                                    with contextlib.suppress(Exception):
+                                        if prev_pred_rows_cpu is not None and int(prev_pred_rows_cpu.numel()) > row_in_prev:
+                                            row_id = int(prev_pred_rows_cpu[row_in_prev].item())
+                                    with contextlib.suppress(Exception):
+                                        if prev_pred_X_cpu is not None and int(prev_pred_X_cpu.shape[0]) > row_in_prev:
+                                            xrow = prev_pred_X_cpu[row_in_prev]
+                                            xflat = xrow.detach().reshape(-1)
+                                            n = int(min(16, int(xflat.numel())))
+                                            x_row_head = [float(v) for v in xflat[:n].tolist()]
+                                            x_row_stats = _row_stats(xrow)
+                                    with contextlib.suppress(Exception):
+                                        if prev_pred_X_run_cpu is not None and int(prev_pred_X_run_cpu.shape[0]) > row_in_prev:
+                                            xrow = prev_pred_X_run_cpu[row_in_prev]
+                                            xflat = xrow.detach().reshape(-1)
+                                            n = int(min(16, int(xflat.numel())))
+                                            x_run_row_head = [float(v) for v in xflat[:n].tolist()]
+                                            x_run_row_stats = _row_stats(xrow)
+
+                                    prev_val = None
+                                    cur_val = None
+                                    with contextlib.suppress(Exception):
+                                        if prev0 is not None and overwrite_idx is not None and int(prev0.numel()) > int(overwrite_idx):
+                                            prev_val = float(prev0[int(overwrite_idx)].item())
+                                    with contextlib.suppress(Exception):
+                                        if cur_prev is not None and overwrite_idx is not None and int(cur_prev.numel()) > int(overwrite_idx):
+                                            cur_val = float(cur_prev[int(overwrite_idx)].item())
+
+                                    prev_d = _tensor_diag(prev_pred_ref, sample_n=min(32, int(diag_overwrite_n)))
+                                    cur_d = _tensor_diag(preds, sample_n=min(32, int(diag_overwrite_n)))
+                                    payload: dict[str, object] = {
+                                        "kind": "pred_overwrite",
+                                        "rank": int(rank),
+                                        "timestamp_ms": int(time.time() * 1000),
+                                        "cg_enabled": bool(cg_enabled),
+                                        "td_cg": bool(use_td_cg),
+                                        "prev_batch": prev_pred_step,
+                                        "prev_slice": prev_pred_slice,
+                                        "curr_batch": cur_batch,
+                                        "curr_slice": cur_slice,
+                                        "prev_ptr": (f"0x{int(prev_pred_ptr):x}" if prev_pred_ptr is not None else None),
+                                        "curr_ptr": (f"0x{int(cur_ptr):x}" if cur_ptr is not None else None),
+                                        "row_id": row_id,
+                                        "row_in_prev": row_in_prev,
+                                        "multi_index": multi,
+                                        "axis1_index": axis1_idx,
+                                        "axis2_index": axis2_idx,
+                                        "x_row_head": x_row_head,
+                                        "x_row_stats": x_row_stats,
+                                        "x_run_row_head": x_run_row_head,
+                                        "x_run_row_stats": x_run_row_stats,
+                                        "prev_pad_n": int(prev_pred_pad_n) if prev_pred_pad_n is not None else None,
+                                        "curr_pad_n": int(pad_n),
+                                        "prev_mb": int(prev_pred_mb) if prev_pred_mb is not None else None,
+                                        "curr_mb": int(mb),
+                                        "prev_n_i": int(prev_pred_n_i) if prev_pred_n_i is not None else None,
+                                        "curr_n_i": int(n_i),
+                                        "prev_X_run_ptr": (f"0x{int(prev_pred_X_run_ptr):x}" if prev_pred_X_run_ptr is not None else None),
+                                        "curr_X_run_ptr": (f"0x{int(curr_x_run_ptr):x}" if curr_x_run_ptr is not None else None),
+                                        "prev_X_run_source": prev_pred_X_run_source,
+                                        "curr_X_run_source": curr_x_run_source,
+                                        "prev_X_run_diag": _x_diag(prev_pred_X_run_cpu) if prev_pred_X_run_cpu is not None else None,
+                                        "curr_X_run_diag": _x_diag(Xi_run),
+                                        "overwrite_max": float(overwrite_max),
+                                        "overwrite_sample_index": int(overwrite_idx or 0),
+                                        "prev_value_at_max": prev_val,
+                                        "curr_value_at_max": cur_val,
+                                        "prev_row_ids_diag": _ids_diag(prev_pred_rows_cpu),
+                                        "curr_row_ids_diag": _ids_diag(rows_i),
+                                        "prev_X_diag": _x_diag(prev_pred_X_cpu) if prev_pred_X_cpu is not None else None,
+                                        "curr_X_diag": _x_diag(Xi),
+                                        "prev_pred_diag": prev_d,
+                                        "curr_pred_diag": cur_d,
+                                    }
+
+                                    _row_part = f"row{row_id}" if row_id is not None else "rowNA"
+                                    _a1_part = f"a1{int(axis1_idx)}" if axis1_idx is not None else "a1NA"
+                                    _a2_part = f"a2{int(axis2_idx)}" if axis2_idx is not None else "a2NA"
+                                    payload["filename"] = (
+                                        f"overwrite_rank{int(rank)}_prevb{prev_pred_step}_prevsl{prev_pred_slice}_curb{cur_batch}_cursl{cur_slice}_"
+                                        f"prevptr{int(prev_pred_ptr) if prev_pred_ptr is not None else 0:x}_curptr{int(cur_ptr) if cur_ptr is not None else 0:x}_"
+                                        f"{_row_part}_{_a1_part}_{_a2_part}.json"
+                                    )
+                                    dump_path = _dump_overwrite_diag(payload)
+
+                                    _LOGGER.error(
+                                        "[infer][overwrite-diag] OUTPUT OVERWRITE DETECTED: max|prev-prev_snapshot|=%.6g prev_batch=%s prev_slice=%s curr_batch=%s curr_slice=%s prev_ptr=%s curr_ptr=%s row_id=%s multi=%s a1=%s a2=%s x_head=%s x_stats=%s x_run_head=%s x_run_stats=%s x_run_src_prev=%s x_run_src_curr=%s dump=%s",
+                                        float(overwrite_max),
+                                        prev_pred_step,
+                                        prev_pred_slice,
+                                        cur_batch,
+                                        cur_slice,
+                                        (f"0x{int(prev_pred_ptr):x}" if prev_pred_ptr is not None else None),
+                                        (f"0x{int(cur_ptr):x}" if cur_ptr is not None else None),
+                                        row_id,
+                                        multi,
+                                        axis1_idx,
+                                        axis2_idx,
+                                        x_row_head,
+                                        x_row_stats,
+                                        x_run_row_head,
+                                        x_run_row_stats,
+                                        prev_pred_X_run_source,
+                                        curr_x_run_source,
+                                        dump_path,
+                                    )
+                                    if diag_overwrite_abort:
+                                        raise RuntimeError(
+                                            "infer: output overwrite detected (likely cudagraph buffer reuse). "
+                                            f"prev={prev_pred_step}/{prev_pred_slice}, curr={cur_batch}/{cur_slice}, prev_ptr={prev_pred_ptr}, curr_ptr={cur_ptr}, "
+                                            f"row_id={row_id}, multi={multi}, max_abs={overwrite_max}. dump={dump_path}"
+                                        )
                             prev_pred_ref = preds
+                            prev_pred_step = cur_batch
+                            prev_pred_slice = cur_slice
+                            prev_pred_ptr = int(cur_ptr) if cur_ptr is not None else None
+                            with contextlib.suppress(Exception):
+                                prev_pred_rows_cpu = rows_i.detach().to(device='cpu', dtype=torch.int64).reshape(-1).clone()
+                            with contextlib.suppress(Exception):
+                                xcpu = Xi.detach()
+                                if getattr(getattr(xcpu, 'device', None), 'type', None) != 'cpu':
+                                    xcpu = xcpu.to('cpu')
+                                if isinstance(xcpu, torch.Tensor) and xcpu.dtype != torch.float32:
+                                    xcpu = xcpu.to(dtype=torch.float32)
+                                prev_pred_X_cpu = xcpu.clone() if isinstance(xcpu, torch.Tensor) else None
+                                prev_pred_pad_n = int(pad_n)
+                                prev_pred_mb = int(mb)
+                                prev_pred_n_i = int(n_i)
+                                with contextlib.suppress(Exception):
+                                    if torch.is_tensor(Xi_run):
+                                        prev_pred_X_run_ptr = int(Xi_run.data_ptr())
+                                with contextlib.suppress(Exception):
+                                    if Xi_run is Xi:
+                                        prev_pred_X_run_source = 'Xi'
+                                    elif use_td_cg and (td_cg_pad_buf is not None) and (Xi_run is td_cg_pad_buf):
+                                        prev_pred_X_run_source = 'td_cg_pad_buf'
+                                    elif Xi_pad is not None and (Xi_run is Xi_pad):
+                                        prev_pred_X_run_source = 'pad_buf'
+                                    else:
+                                        prev_pred_X_run_source = 'other'
+                                with contextlib.suppress(Exception):
+                                    xrun_cpu = Xi_run.detach()
+                                    if getattr(getattr(xrun_cpu, 'device', None), 'type', None) != 'cpu':
+                                        xrun_cpu = xrun_cpu.to('cpu')
+                                    if isinstance(xrun_cpu, torch.Tensor) and xrun_cpu.dtype != torch.float32:
+                                        xrun_cpu = xrun_cpu.to(dtype=torch.float32)
+                                    if isinstance(xrun_cpu, torch.Tensor) and int(xrun_cpu.shape[0]) >= int(n_i):
+                                        xrun_cpu = xrun_cpu[: int(n_i)]
+                                    prev_pred_X_run_cpu = xrun_cpu.clone() if isinstance(xrun_cpu, torch.Tensor) else None
                             with contextlib.suppress(Exception):
                                 samp = preds.detach().reshape(-1)[: int(diag_overwrite_n)]
                                 if getattr(getattr(samp, "device", None), "type", None) != "cpu":
@@ -4947,7 +5308,6 @@ def infer(
                                 if isinstance(samp, torch.Tensor) and (not samp.is_contiguous()):
                                     samp = samp.contiguous()
                                 prev_pred_sample_cpu = samp.clone() if isinstance(samp, torch.Tensor) else None
-                            prev_pred_ptr = int(cur_ptr) if cur_ptr is not None else None
                     if (
                         (not force_single)
                         and bool(detect_broadcast)
