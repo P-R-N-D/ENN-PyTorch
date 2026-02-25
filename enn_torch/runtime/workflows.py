@@ -771,7 +771,7 @@ def _try_load_dir_checkpoint_fallback_pt(
     if _model_has_meta_or_fake_tensors(model):
         _materialize_module_to_device(model, map_location or "cpu")
     sd_for_load: object = sd
-    if isinstance(sd, Mapping) and env_bool("ENN_LOAD_ALIAS_PERCEIVER_KEYS", default=False):
+    if isinstance(sd, Mapping) and env_bool("ENN_LOAD_ALIAS_PERCEIVER_KEYS", default=True):
         try:
             sd_map = dict(sd)
             model_names = [str(n) for n, _ in model.named_parameters(recurse=True)]
@@ -1903,7 +1903,7 @@ def load_weights(
     if _model_has_meta_or_fake_tensors(model):
         _materialize_module_to_device(model, map_location or "cpu")
     sd_for_load: object = sd
-    if isinstance(sd, Mapping) and env_bool("ENN_LOAD_ALIAS_PERCEIVER_KEYS", default=False):
+    if isinstance(sd, Mapping) and env_bool("ENN_LOAD_ALIAS_PERCEIVER_KEYS", default=True):
         try:
             sd_map = dict(sd)
             model_names = [str(n) for n, _ in model.named_parameters(recurse=True)]
