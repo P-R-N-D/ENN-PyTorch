@@ -392,16 +392,12 @@ def _export_return_model_pt(
         return
     os.makedirs(out_dir, exist_ok=True)
 
-    model_averaging = _normalize_model_averaging(
-        model_averaging, default="auto"
-    )
+    model_averaging = _normalize_model_averaging(model_averaging, default="auto")
     if model_averaging == "auto":
         env_ma = os.environ.get("ENN_MODEL_AVERAGING", None)
         if env_ma is not None:
             with contextlib.suppress(Exception):
-                model_averaging = _normalize_model_averaging(
-                    env_ma, default="auto"
-                )
+                model_averaging = _normalize_model_averaging(env_ma, default="auto")
         if model_averaging == "auto":
             model_averaging = "ema" if _has_bn_modules(model) else "swa"
 
@@ -423,40 +419,85 @@ def _export_return_model_pt(
         if isinstance(shadow, dict) and shadow:
             avg_params = shadow
 
-    with _EXPORT_RETURN_LOCK:
-        sd_out: dict[str, object] = {}
-        with torch.no_grad():
-            for name, p in model.named_parameters(recurse=True):
-                if not torch.is_tensor(p) or p.numel() <= 0:
-                    continue
-                key = str(name)
-                if avg_params is not None:
-                    av = avg_params.get(key, None)
-                    if torch.is_tensor(av):
-                        sd_out[key] = av.detach()
-                        continue
-                t = p.detach()
-                if getattr(t, "is_meta", False) or t.device.type == "meta":
-                    continue
-                if t.device.type != "cpu":
-                    t = t.to("cpu")
-                sd_out[key] = t
+    def _canon_key(k: str) -> str:
+        kk = str(k)
+        kk = kk.replace("._enn_inner._orig_mod", "")
+        kk = kk.replace("._enn_inner", "")
+        if kk.startswith("processor."):
+            kk = "fuser." + kk[len("processor.") :]
+        if kk.startswith("controller."):
+            kk = "temporal_token_collector." + kk[len("controller.") :]
+        if kk.startswith("fuser.perceiver._orig_mod."):
+            kk = "fuser.perceiver." + kk[len("fuser.perceiver._orig_mod.") :]
+        return kk
 
-            for name, b in model.named_buffers(recurse=True):
-                if not torch.is_tensor(b) or b.numel() <= 0:
+    with _EXPORT_RETURN_LOCK:
+        eager_ctx = getattr(model, "eager_for_export", None)
+        cm = eager_ctx() if callable(eager_ctx) else contextlib.nullcontext()
+        with cm:
+            with torch.no_grad():
+                sd = dict(model.state_dict())
+
+        if isinstance(avg_params, dict) and avg_params:
+            for name, v in avg_params.items():
+                if not isinstance(name, str) or not torch.is_tensor(v):
                     continue
-                key = str(name)
-                t = b.detach()
+                cur = sd.get(name, None)
+                if not torch.is_tensor(cur):
+                    continue
+                try:
+                    vv = v.detach()
+                    if tuple(vv.shape) != tuple(cur.shape):
+                        continue
+                    if vv.dtype != cur.dtype:
+                        vv = vv.to(dtype=cur.dtype)
+                    sd[name] = vv
+                except Exception:
+                    continue
+
+        sd_out: dict[str, object] = {}
+        collisions = 0
+        for k, v in sd.items():
+            if not isinstance(k, str):
+                k = str(k)
+            kk = _canon_key(k)
+            if torch.is_tensor(v):
+                t = v.detach()
                 if getattr(t, "is_meta", False) or t.device.type == "meta":
                     continue
                 if t.device.type != "cpu":
                     t = t.to("cpu")
-                sd_out[key] = t
+                if kk in sd_out and torch.is_tensor(sd_out.get(kk)):
+                    try:
+                        cur = sd_out[kk]
+                        if torch.is_tensor(cur) and tuple(cur.shape) != tuple(t.shape):
+                            collisions += 1
+                            continue
+                    except Exception:
+                        collisions += 1
+                        continue
+                sd_out[kk] = t
+            else:
+                sd_out[kk] = v
+
+        with contextlib.suppress(Exception):
+            from .distributed import _coerce_dcp_keys
+
+            _coerce_dcp_keys(sd_out)
+
+        if collisions > 0:
+            with contextlib.suppress(Exception):
+                _LOGGER.warning(
+                    "[export_return_model_pt] key canonicalization collisions=%d (kept first matching tensor)",
+                    int(collisions),
+                )
 
         out_path = os.path.join(out_dir, "model.pt")
         _atomic_torch_save(sd_out, out_path)
 
+        sd.clear()
         sd_out.clear()
+        del sd
         del sd_out
         gc.collect()
 
