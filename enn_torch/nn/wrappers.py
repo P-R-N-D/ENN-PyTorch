@@ -4085,32 +4085,10 @@ class Model(nn.Module):
         requested_compile_mode = str(compile_mode_canonical)
 
         warmup_steps = 0
-        if (
-            compile_mode_canonical in {"max-autotune", "max-autotune-no-cudagraphs"}
-            and getattr(self._device, "type", None) == "cuda"
-        ):
-            try:
-                warmup_steps = int(
-                    env_first_int(
-                        (
-                            "ENN_COMPILE_MAX_AUTOTUNE_WARMUP_STEPS",
-                            "ENN_MAX_AUTOTUNE_WARMUP_STEPS",
-                        ),
-                        default=10,
-                    )
-                    or 10
-                )
-            except Exception:
-                warmup_steps = 10
-            warmup_steps = max(0, int(warmup_steps))
-            if warmup_steps > 0:
-                compile_mode_canonical = "reduce-overhead"
 
-        self._enn_compile_requested_mode: str = (
-            requested_compile_mode if warmup_steps > 0 else ""
-        )
-        self._enn_compile_upgrade_after_steps: int = int(warmup_steps)
-        self._enn_compile_upgrade_done: bool = bool(warmup_steps <= 0)
+        self._enn_compile_requested_mode: str = ""
+        self._enn_compile_upgrade_after_steps: int = 0
+        self._enn_compile_upgrade_done: bool = True
         self._enn_compile_upgrade_inflight: bool = False
         self._enn_compile_active_mode: str = str(compile_mode_canonical)
         set_runtime_cfg("compile_mode", compile_mode_canonical)
@@ -4325,6 +4303,8 @@ class Model(nn.Module):
         self._amp_dtype_cache_max = 64
         self._amp_dtype_cache_lock = Mutex()
         self._amp_dtype_cache_use_lock = not bool(is_gil_enabled())
+        self._cg_static_in_buffers: dict[str, torch.Tensor] = {}
+        self._cg_static_in_specs: dict[str, tuple[tuple[int, ...], torch.dtype, str]] = {}
         self.__config = config
         self.__enn_instance_config__ = config
 
@@ -4559,6 +4539,8 @@ class Model(nn.Module):
         state.pop("_amp_dtype_cache", None)
         state.pop("_amp_dtype_cache_last_key", None)
         state.pop("_amp_dtype_cache_last_dtype", None)
+        state.pop("_cg_static_in_buffers", None)
+        state.pop("_cg_static_in_specs", None)
         return state
 
     def __setstate__(self: Self, state: dict[str, object]) -> None:
@@ -4569,6 +4551,8 @@ class Model(nn.Module):
         self._amp_dtype_cache = {}
         self._amp_dtype_cache_last_key = None
         self._amp_dtype_cache_last_dtype = None
+        self._cg_static_in_buffers = {}
+        self._cg_static_in_specs = {}
         if not hasattr(self, "_amp_dtype_cache_max"):
             self._amp_dtype_cache_max = 64
 
@@ -5208,6 +5192,40 @@ class Model(nn.Module):
         )
         return int(mb_size)
 
+    def _get_cg_static_in_buf(
+        self: Self,
+        key: str,
+        shape: tuple[int, ...],
+        *,
+        dtype: torch.dtype,
+        device: torch.device,
+        strict: bool,
+    ) -> torch.Tensor:
+        want_shape = tuple(int(x) for x in tuple(shape))
+        dev_s = str(device)
+        buf = self._cg_static_in_buffers.get(str(key))
+        spec = self._cg_static_in_specs.get(str(key))
+        if buf is not None and spec is not None:
+            old_shape, old_dtype, old_dev = spec
+            if old_shape != want_shape or old_dtype != dtype or old_dev != dev_s:
+                if strict:
+                    raise RuntimeError(
+                        f"cudagraph static input '{key}' changed: was shape={old_shape},dtype={old_dtype},dev={old_dev} "
+                        f"now shape={want_shape},dtype={dtype},dev={dev_s}. Fix microbatch or disable ENN_CUDAGRAPH_MARK_STATIC_ADDRESS."
+                    )
+                buf = None
+        if buf is None:
+            buf = torch.empty(want_shape, device=device, dtype=dtype)
+            with contextlib.suppress(Exception):
+                import torch._dynamo as _dynamo
+
+                fn = getattr(_dynamo, 'mark_static_address', None)
+                if callable(fn):
+                    fn(buf)
+            self._cg_static_in_buffers[str(key)] = buf
+            self._cg_static_in_specs[str(key)] = (want_shape, dtype, dev_s)
+        return buf
+
     def forward(
         self: Self,
         features: torch.Tensor | TensorDictBase,
@@ -5313,6 +5331,20 @@ class Model(nn.Module):
                     getattr(get_runtime_cfg(), "compile_cudagraphs", False)
                 )
         cg_ok = bool(compile_cg_enabled and (not pred_disable_cg))
+        mark_static_addr = bool(
+            cg_ok
+            and infer_cuda
+            and env_bool(
+                'ENN_CUDAGRAPH_MARK_STATIC_ADDRESS',
+                default=env_bool('ENN_SANITIZE_NAN_STRICT', default=False),
+            )
+        )
+        mark_static_strict = bool(
+            env_bool(
+                'ENN_CUDAGRAPH_MARK_STATIC_ADDRESS_STRICT',
+                default=env_bool('ENN_SANITIZE_NAN_STRICT', default=False),
+            )
+        )
         x_raw = features
         if (
             isinstance(x_raw, torch.Tensor)
@@ -5559,6 +5591,16 @@ class Model(nn.Module):
                         Tuple[torch.Tensor, torch.Tensor], _encode(features_t)
                     )
                 else:
+                    enc_static_in: torch.Tensor | None = None
+                    if mark_static_addr and self._pad_compiled_microbatch and (not pred_disable_cg):
+                        with contextlib.suppress(Exception):
+                            enc_static_in = self._get_cg_static_in_buf(
+                                'encoder',
+                                (int(mb), int(self.in_dim)),
+                                dtype=base_dtype,
+                                device=device,
+                                strict=mark_static_strict,
+                            )
                     tokens, context = cast(
                         Tuple[torch.Tensor, torch.Tensor],
                         _prealloc_microbatch(
@@ -5577,6 +5619,8 @@ class Model(nn.Module):
                             cast_slice=lambda t: self._cast_graph_safe(
                                 t, device, base_dtype
                             ),
+                            static_in_buf=enc_static_in,
+                            static_in_zero=True,
                             stage="encoder",
                         ),
                     )
@@ -5659,6 +5703,23 @@ class Model(nn.Module):
                             return cast(torch.Tensor, dc(chunk))
                         return self.fuser.decode(chunk, apply_norm=True)
 
+                dec_static_in: torch.Tensor | None = None
+                if (
+                    mark_static_addr
+                    and (dc is not None)
+                    and self._pad_compiled_microbatch
+                    and (not pred_disable_cg)
+                ):
+                    with contextlib.suppress(Exception):
+                        tail = tuple(int(x) for x in tuple(refined_tokens.shape[1:]))
+                        dec_static_in = self._get_cg_static_in_buf(
+                            'decoder',
+                            (int(ctrl_mb), *tail),
+                            dtype=refined_tokens.dtype,
+                            device=refined_tokens.device,
+                            strict=mark_static_strict,
+                        )
+
                 residual_context = cast(
                     torch.Tensor,
                     _prealloc_microbatch(
@@ -5674,6 +5735,8 @@ class Model(nn.Module):
                             )
                             else None
                         ),
+                        static_in_buf=dec_static_in,
+                        static_in_zero=True,
                         stage="decoder",
                     ),
                 )

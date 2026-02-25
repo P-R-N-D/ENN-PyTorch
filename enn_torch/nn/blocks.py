@@ -15,7 +15,7 @@ from ..core.compat import StochasticDepth
 from ..core.datatypes import env_bool, env_int
 from ..runtime.distributed import _from_hsdp_module
 from .activations import GeGLU
-from .graph import coerce_checkpoint, is_checkpoint, is_export_or_trace, is_symbolic, canonicalize_compile_mode
+from .graph import coerce_checkpoint, is_checkpoint, is_export_or_trace, is_symbolic, canonicalize_compile_mode, torch_compiler_disable
 from .layers import CrossAttention, DilatedAttention, LatentAttention, Retention, norm_layer
 _LOGGER = logging.getLogger(__name__)
 _PRESET_ALIASES: dict[str, str] = {
@@ -242,6 +242,8 @@ def _prealloc_microbatch(
     pad_to: Optional[int] = None,
     out_dtype: Optional[torch.dtype] = None,
     cast_slice: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
+    static_in_buf: Optional[torch.Tensor] = None,
+    static_in_zero: bool = True,
     stage: str = "microbatch",
 ) -> torch.Tensor | tuple[torch.Tensor, ...]:
     if inp.ndim < 1:
@@ -251,6 +253,27 @@ def _prealloc_microbatch(
     pad_i = int(pad_to) if pad_to is not None else None
     if pad_i is not None and (pad_i := max(1, pad_i)) < mb_i:
         raise ValueError(f"{stage}: pad_to {pad_i} < microbatch {mb_i}")
+    static_buf = static_in_buf
+    if static_buf is not None:
+        if torch.is_grad_enabled():
+            static_buf = None
+        else:
+            try:
+                static_pad = int(static_buf.shape[0])
+            except Exception:
+                static_pad = 0
+            if static_pad <= 0:
+                static_buf = None
+            else:
+                if pad_i is not None and int(pad_i) != int(static_pad):
+                    raise ValueError(
+                        f"{stage}: static_in_buf batch {static_pad} != pad_to {pad_i}"
+                    )
+                pad_i = int(pad_i) if pad_i is not None else int(static_pad)
+                if int(pad_i) < int(mb_i):
+                    raise ValueError(
+                        f"{stage}: static_in_buf batch {pad_i} < microbatch {mb_i}"
+                    )
     out_bufs: Optional[List[torch.Tensor]] = None
     pad_buf = None
     for s in range(0, total_b, mb_i):
@@ -260,7 +283,30 @@ def _prealloc_microbatch(
         slice_n = int(x_slice.shape[0])
         x_in = x_slice
         did_pad = False
-        if pad_i is not None and slice_n < pad_i:
+        if static_buf is not None:
+            if static_buf.dtype != x_slice.dtype or static_buf.device != x_slice.device:
+                raise ValueError(
+                    f"{stage}: static_in_buf dtype/device mismatch: buf({static_buf.dtype},{static_buf.device}) vs slice({x_slice.dtype},{x_slice.device})"
+                )
+            if tuple(static_buf.shape[1:]) != tuple(x_slice.shape[1:]):
+                raise ValueError(
+                    f"{stage}: static_in_buf shape mismatch: buf{tuple(static_buf.shape)} vs slice{tuple(x_slice.shape)}"
+                )
+            if slice_n > int(static_buf.shape[0]):
+                raise ValueError(
+                    f"{stage}: static_in_buf batch {int(static_buf.shape[0])} < slice {slice_n}"
+                )
+            if slice_n < int(static_buf.shape[0]):
+                if static_in_zero:
+                    static_buf.zero_()
+                else:
+                    static_buf[slice_n:].zero_()
+                static_buf[:slice_n].copy_(x_slice)
+                did_pad = True
+            else:
+                static_buf.copy_(x_slice)
+            x_in = static_buf
+        elif pad_i is not None and slice_n < pad_i:
             want_shape = (pad_i, *x_slice.shape[1:])
             if not torch.is_grad_enabled():
                 if (
@@ -872,9 +918,18 @@ class LongNet(nn.Module):
             _from_hsdp_module(self)
             _from_hsdp_module(layer)
         if bool(torch.is_grad_enabled() or is_checkpoint()) and bool(getattr(t.device, "type", None) == "cuda"):
-            from .graph import cudagraph_mark_step_begin
+            if env_bool("ENN_CKPT_DISABLE_CUDAGRAPHS", default=True):
+                with contextlib.suppress(Exception):
+                    torch_compiler_disable(
+                        layer,
+                        attr="forward",
+                        reason="Disable torch.compile under checkpoint to avoid CUDAGraph overwrite",
+                        recursive=False,
+                    )
+            else:
+                from .graph import cudagraph_mark_step_begin
 
-            cudagraph_mark_step_begin()
+                cudagraph_mark_step_begin()
         out = layer(
             t,
             key_padding_mask=key_padding_mask,
