@@ -770,6 +770,11 @@ def _try_load_dir_checkpoint_fallback_pt(
         resize_scaler_buffer(model, sd)
     if _model_has_meta_or_fake_tensors(model):
         _materialize_module_to_device(model, map_location or "cpu")
+    with contextlib.suppress(Exception):
+        buf = getattr(model, "output_baked_flag", None)
+        if torch.is_tensor(buf):
+            buf.zero_()
+
     sd_for_load: object = sd
     if isinstance(sd, Mapping) and env_bool("ENN_LOAD_ALIAS_PERCEIVER_KEYS", default=True):
         try:
@@ -1927,6 +1932,11 @@ def load_weights(
         resize_scaler_buffer(model, sd)
     if _model_has_meta_or_fake_tensors(model):
         _materialize_module_to_device(model, map_location or "cpu")
+    with contextlib.suppress(Exception):
+        buf = getattr(model, "output_baked_flag", None)
+        if torch.is_tensor(buf):
+            buf.zero_()
+
     sd_for_load: object = sd
     if isinstance(sd, Mapping) and env_bool("ENN_LOAD_ALIAS_PERCEIVER_KEYS", default=True):
         try:
@@ -2019,8 +2029,35 @@ def load_weights(
         default=env_bool("ENN_SANITIZE_NAN_STRICT", default=False),
     )
     if (warn_incompat or fail_incompat) and incompat is not None:
-        miss = getattr(incompat, "missing_keys", None) or []
-        unexp = getattr(incompat, "unexpected_keys", None) or []
+        miss0 = getattr(incompat, "missing_keys", None) or []
+        unexp0 = getattr(incompat, "unexpected_keys", None) or []
+
+        def _is_ignorable_incompat_key(k: object) -> bool:
+            try:
+                s = str(k)
+            except Exception:
+                return False
+            return s == "output_baked_flag" or s.endswith(".output_baked_flag")
+
+        ign_miss = [k for k in miss0 if _is_ignorable_incompat_key(k)]
+        ign_unexp = [k for k in unexp0 if _is_ignorable_incompat_key(k)]
+        miss = [k for k in miss0 if not _is_ignorable_incompat_key(k)]
+        unexp = [k for k in unexp0 if not _is_ignorable_incompat_key(k)]
+
+        if ign_miss:
+            with contextlib.suppress(Exception):
+                buf = getattr(model, "output_baked_flag", None)
+                if torch.is_tensor(buf):
+                    buf.zero_()
+
+        if (ign_miss or ign_unexp) and (dump_dir or strict_nf or env_bool("ENN_LOAD_ALIAS_PERCEIVER_LOG", default=False)):
+            with contextlib.suppress(Exception):
+                logger.info(
+                    "[ENN] load_weights: ignoring state_dict incompat keys: missing=%s; unexpected=%s",
+                    ", ".join(str(x) for x in ign_miss[:10]) if ign_miss else "",
+                    ", ".join(str(x) for x in ign_unexp[:10]) if ign_unexp else "",
+                )
+
         if miss or unexp:
             miss_p = [k for k in miss if str(k).startswith("fuser.perceiver.") or str(k).startswith("processor.perceiver.")]
             sm_miss = (miss_p[:10] if miss_p else miss[:10])

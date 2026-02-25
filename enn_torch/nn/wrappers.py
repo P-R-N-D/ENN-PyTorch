@@ -4074,7 +4074,7 @@ class Model(nn.Module):
             self.register_buffer(
                 "output_baked_flag",
                 torch.tensor(0, dtype=torch.uint8),
-                persistent=True,
+                persistent=False,
             )
         except Exception:
             pass
