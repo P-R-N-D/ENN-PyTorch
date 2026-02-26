@@ -4231,12 +4231,25 @@ class Model(nn.Module):
                         ),
                     )
                 )
-                if disable_pc and bool(getattr(self._device, "type", None) == "cuda"):
-                    perceiver_options = {"triton.cudagraphs": False}
-                    _LOGGER.info(
-                        "[compile] Perceiver blocks: disabling cudagraphs (options=%s)",
-                        str(perceiver_options),
+                disable_trees = bool(
+                    env_bool(
+                        "ENN_PERCEIVER_DISABLE_CUDAGRAPH_TREES",
+                        default=False,
                     )
+                )
+                if bool(getattr(self._device, "type", None) == "cuda"):
+                    if disable_pc:
+                        perceiver_options = {"triton.cudagraphs": False}
+                        _LOGGER.info(
+                            "[compile] Perceiver blocks: disabling cudagraph capture (options=%s)",
+                            str(perceiver_options),
+                        )
+                    elif disable_trees:
+                        perceiver_options = {"triton.cudagraph_trees": False}
+                        _LOGGER.info(
+                            "[compile] Perceiver blocks: disabling cudagraph_trees (keep cudagraphs) (options=%s)",
+                            str(perceiver_options),
+                        )
             except Exception:
                 perceiver_options = None
             cross = getattr(perceiver, "cross", None)

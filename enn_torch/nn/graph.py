@@ -731,25 +731,51 @@ def compile(
                 obj = getattr(obj, part)
             return True
 
-        if isinstance(compile_kwargs.get("options", None), dict) and callable(
-            patch
-        ):
-            options_dict = dict(compile_kwargs.get("options") or {})
-            if options_dict:
-                patchable = {
-                    k: v
-                    for k, v in options_dict.items()
-                    if isinstance(k, str) and _has_cfg_key(inductor_cfg, k)
-                }
+        options_dict = (
+            dict(compile_kwargs.get("options") or {})
+            if isinstance(compile_kwargs.get("options", None), dict)
+            else {}
+        )
+        compile_time_keys = {"triton.cudagraphs", "triton.cudagraph_trees"}
+        compile_time_opts = {
+            k: v
+            for k, v in options_dict.items()
+            if isinstance(k, str) and k in compile_time_keys
+        }
+        if callable(patch) and options_dict:
+            patchable = {
+                k: v
+                for k, v in options_dict.items()
+                if isinstance(k, str)
+                and (k not in compile_time_keys)
+                and _has_cfg_key(inductor_cfg, k)
+            }
         strip_options = bool(mode_value is not None)
 
-        if patchable and (strip_options or patchable):
+        compile_time_patch: Dict[str, Any] = {}
+        if strip_options and compile_time_opts:
+            if callable(patch):
+                compile_time_patch = dict(compile_time_opts)
+            else:
+                compile_kwargs.pop("mode", None)
+                strip_options = False
+
+        if strip_options:
             compile_kwargs.pop("options", None)
-        elif strip_options:
-            compile_kwargs.pop("options", None)
+        elif patchable:
+            if compile_time_opts:
+                compile_kwargs["options"] = dict(compile_time_opts)
+            else:
+                compile_kwargs.pop("options", None)
 
         with _TORCH_COMPILE_LOCK:
-            compiled = compile_fn(module, **compile_kwargs)
+            cm_compile = (
+                patch(dict(compile_time_patch))
+                if callable(patch) and compile_time_patch
+                else nullcontext()
+            )
+            with cm_compile:
+                compiled = compile_fn(module, **compile_kwargs)
 
         need_scope = bool(_scoped_inductor_overrides) or bool(patchable)
         if not need_scope:

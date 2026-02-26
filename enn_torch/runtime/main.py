@@ -3547,9 +3547,28 @@ def infer(
         dev_type == "cuda"
         and getattr(module_eval, "_compile_cudagraphs", False)
     )
+    _pred_compile_mode = ""
+    with contextlib.suppress(Exception):
+        _pred_compile_mode = str(
+            getattr(module_eval, "_enn_compile_active_mode", "")
+            or getattr(module_eval, "_enn_compile_requested_mode", "")
+            or ""
+        )
+    if not _pred_compile_mode:
+        with contextlib.suppress(Exception):
+            _pred_compile_mode = str(
+                getattr(model, "_enn_compile_active_mode", "")
+                or getattr(model, "_enn_compile_requested_mode", "")
+                or ""
+            )
+    _pred_compile_mode = str(_pred_compile_mode).strip().lower()
+    _td_cg_default = True
+    if "no-cudagraph" in _pred_compile_mode:
+        _td_cg_default = False
     td_cg_candidate = bool(
         (not cg_enabled)
         and dev_type == "cuda"
+        and bool(env_bool("ENN_PRED_TD_CUDAGRAPH", default=_td_cg_default))
         and (TD_CudaGraphModule is not None)
         and bool(getattr(torch.cuda, "is_available", lambda: False)())
         and hasattr(torch.cuda, "CUDAGraph")
@@ -4585,21 +4604,27 @@ def infer(
                 nonlocal force_uncompiled, force_eager
 
                 def _invoke_predict(mm: torch.nn.Module):
-                    if bool(force_fp32) or bool(collapse_fp32_active):
-                        with StatelessAutocast.suspend(device):
-                            x_fp32 = x
-                            if torch.is_tensor(x_fp32) and x_fp32.dtype != torch.float32:
-                                x_fp32 = x_fp32.to(dtype=torch.float32)
-                            return mm(
-                                x_fp32,
-                                calibrate_output=bool(calibrate_output),
-                                return_loss=False,
-                            )
-                    return mm(
-                        x,
-                        calibrate_output=bool(calibrate_output),
-                        return_loss=False,
+                    ctx = (
+                        eager_ctx_factory()
+                        if (force_eager and callable(eager_ctx_factory))
+                        else contextlib.nullcontext()
                     )
+                    with ctx:
+                        if bool(force_fp32) or bool(collapse_fp32_active):
+                            with StatelessAutocast.suspend(device):
+                                x_fp32 = x
+                                if torch.is_tensor(x_fp32) and x_fp32.dtype != torch.float32:
+                                    x_fp32 = x_fp32.to(dtype=torch.float32)
+                                return mm(
+                                    x_fp32,
+                                    calibrate_output=bool(calibrate_output),
+                                    return_loss=False,
+                                )
+                        return mm(
+                            x,
+                            calibrate_output=bool(calibrate_output),
+                            return_loss=False,
+                        )
 
                 m = _select_pred_model(bool(use_uncompiled))
                 try:
@@ -4648,14 +4673,51 @@ def infer(
                         or (not env_bool("ENN_SANITIZE_NAN_STRICT", default=False)),
                     ):
                         raise
-                    if is_cg_trees and (m is run_model) and (run_model_uncompiled is not run_model):
+                    if is_cg_trees:
+                        if bool(force_uncompiled) and bool(force_eager):
+                            raise
                         _LOGGER.error(
-                            "[infer] inductor cudagraph assertion hit; falling back to uncompiled/eager. "
+                            "[infer] inductor cudagraph assertion hit; falling back to eager (disable compiled submodules). "
                             "Set ENN_PRED_FALLBACK_ON_CUDAGRAPH_ASSERT=0 to disable."
                         )
                         force_uncompiled = True
                         force_eager = True
-                        return _invoke_predict(run_model_uncompiled)
+                        mm_fb = (
+                            run_model_uncompiled
+                            if (run_model_uncompiled is not None and run_model_uncompiled is not run_model)
+                            else m
+                        )
+                        return _invoke_predict(mm_fb)
+                    raise
+
+                except Exception as e:
+                    err_name = type(e).__name__
+                    err_msg = ""
+                    with contextlib.suppress(Exception):
+                        err_msg = str(e)
+                    is_backend_failed = bool(
+                        ("BackendCompilerFailed" in err_name)
+                        or ("backend='inductor'" in err_msg)
+                        or ("Offset increment outside graph capture" in err_msg)
+                    )
+                    if is_backend_failed and env_bool(
+                        "ENN_PRED_FALLBACK_ON_COMPILER_ERROR", default=True
+                    ):
+                        if bool(force_uncompiled) and bool(force_eager):
+                            raise
+                        _LOGGER.error(
+                            "[infer] compiler/capture failure (%s); falling back to eager (disable compiled submodules). "
+                            "Set ENN_PRED_FALLBACK_ON_COMPILER_ERROR=0 to disable.",
+                            err_name,
+                        )
+                        force_uncompiled = True
+                        force_eager = True
+                        mm_fb = (
+                            run_model_uncompiled
+                            if (run_model_uncompiled is not None and run_model_uncompiled is not run_model)
+                            else m
+                        )
+                        return _invoke_predict(mm_fb)
                     raise
 
             def _maybe_enable_fp32_collapse_fallback() -> bool:
@@ -4802,9 +4864,6 @@ def infer(
                 td_cg_pad_buf = X_now.new_empty(
                     (int(td_cg_mb),) + tuple(td_cg_x_inner_shape)
                 )
-                td_cg_mod = TD_CudaGraphModule(
-                    _td_predict, warmup=2, device=device
-                )
                 n0 = int(min(int(bs_now), int(td_cg_mb)))
                 td_cg_pad_buf[:n0].copy_(X_now[:n0])
                 if n0 < int(td_cg_mb):
@@ -4814,8 +4873,23 @@ def infer(
                         )
                     )
                 try:
-                    for _ in range(3):
-                        _ = td_cg_mod(td_cg_pad_buf)
+                    prewarm = int(env_int("ENN_PRED_TD_CUDAGRAPH_PREWARM", 2) or 0)
+                    prewarm = max(0, min(8, int(prewarm)))
+                    if prewarm > 0:
+                        for _ in range(int(prewarm)):
+                            _ = _td_predict(td_cg_pad_buf)
+
+                    td_cg_mod = TD_CudaGraphModule(
+                        _td_predict, warmup=0, device=device
+                    )
+
+                    _compile_disable = getattr(getattr(torch, "compiler", None), "disable", None)
+                    _compile_disable_ctx = (
+                        _compile_disable() if callable(_compile_disable) else contextlib.nullcontext()
+                    )
+                    with _compile_disable_ctx:
+                        for _ in range(3):
+                            _ = td_cg_mod(td_cg_pad_buf)
                     td_cg_active = True
                     with contextlib.suppress(Exception):
                         setattr(model, "microbatch", int(td_cg_mb))
