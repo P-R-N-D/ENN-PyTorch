@@ -1322,11 +1322,8 @@ def checkpoint(fn: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
         try:
             disable_cg = False
             try:
-                cfg = get_runtime_cfg()
-                prev_cg = getattr(cfg, "compile_cudagraphs", None)
                 disable_cg = bool(
                     env_bool("ENN_CKPT_DISABLE_CUDAGRAPHS", default=True)
-                    and bool(prev_cg)
                     and bool(is_accelerator_available("cuda"))
                 )
             except Exception:

@@ -791,6 +791,8 @@ def _call_with_flex_warn_guard(fn: Callable[[], Any]) -> tuple[Any, bool]:
 def _flex_ckpt_always_clone_enabled(out: Any) -> bool:
     if not bool(is_checkpoint()):
         return False
+    if env_bool("ENN_CKPT_DISABLE_CUDAGRAPHS", default=True):
+        return False
     if bool(torch.is_grad_enabled()) and (not env_bool("ENN_CKPT_CUDAGRAPH_CLONE_RECOMPUTE", default=False)):
         return False
     if _flex_attention_compile_mode() not in {"max-autotune", "reduce-overhead"}:
@@ -846,6 +848,7 @@ def _call_torch_flex_attention_eager(
             if (
                 bool(is_checkpoint())
                 and bool(getattr(q.device, "type", None) == "cuda")
+                and (not env_bool("ENN_CKPT_DISABLE_CUDAGRAPHS", default=True))
                 and _flex_attention_compile_mode() in {"max-autotune", "reduce-overhead"}
             ):
                 cudagraph_mark_step_begin()

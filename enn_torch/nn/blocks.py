@@ -84,6 +84,8 @@ def _enn_longnet_ckpt_clone_if_needed(t: torch.Tensor) -> torch.Tensor:
         return t
     if not bool(is_checkpoint()):
         return t
+    if env_bool("ENN_CKPT_DISABLE_CUDAGRAPHS", default=True):
+        return t
     if bool(torch.is_grad_enabled()) and (not env_bool("ENN_CKPT_CUDAGRAPH_CLONE_RECOMPUTE", default=False)):
         return t
     try:
