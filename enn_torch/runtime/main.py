@@ -4605,11 +4605,6 @@ def infer(
                 try:
                     return _invoke_predict(m)
                 except AssertionError:
-                    if not env_bool(
-                        "ENN_PRED_FALLBACK_ON_CUDAGRAPH_ASSERT",
-                        default=not env_bool("ENN_SANITIZE_NAN_STRICT", default=False),
-                    ):
-                        raise
                     tb = ""
                     is_cg_trees = False
                     try:
@@ -4624,7 +4619,6 @@ def infer(
                     ):
                         try:
                             import torch._inductor.config as _icfg
-
                             _LOGGER.error(
                                 "[infer] inductor cudagraph_trees assertion hit; retrying with triton.cudagraph_trees=0 (keep cudagraphs). "
                                 "Set ENN_PRED_RETRY_ON_CUDAGRAPH_TREES_ASSERT=0 to disable."
@@ -4633,6 +4627,27 @@ def infer(
                                 return _invoke_predict(m)
                         except Exception:
                             pass
+                    if is_cg_trees and env_bool(
+                        "ENN_PRED_RETRY_ON_CUDAGRAPH_DISABLE_ASSERT", default=True
+                    ):
+                        try:
+                            import torch._inductor.config as _icfg
+                            _LOGGER.error(
+                                "[infer] inductor cudagraph_trees assertion persists; retrying with triton.cudagraphs=0 (no cudagraph capture, keep compile). "
+                                "Set ENN_PRED_RETRY_ON_CUDAGRAPH_DISABLE_ASSERT=0 to disable."
+                            )
+                            with _icfg.patch(
+                                {"triton.cudagraph_trees": False, "triton.cudagraphs": False}
+                            ):
+                                return _invoke_predict(m)
+                        except Exception:
+                            pass
+                    if not env_bool(
+                        "ENN_PRED_FALLBACK_ON_CUDAGRAPH_ASSERT",
+                        default=is_cg_trees
+                        or (not env_bool("ENN_SANITIZE_NAN_STRICT", default=False)),
+                    ):
+                        raise
                     if is_cg_trees and (m is run_model) and (run_model_uncompiled is not run_model):
                         _LOGGER.error(
                             "[infer] inductor cudagraph assertion hit; falling back to uncompiled/eager. "
