@@ -5875,6 +5875,31 @@ def process(*args: Any, **kwargs: Any) -> object:
     with contextlib.suppress(Exception):
         torch.backends.cudnn.deterministic = det
         torch.backends.cudnn.benchmark = not det
+    try:
+        if ops.mode != "train" and env_bool(
+            ("ENN_PRED_UNIQUE_INDUCTOR_CACHE", "ENN_UNIQUE_INDUCTOR_CACHE"),
+            default=True,
+        ):
+            root = os.environ.get("TORCHINDUCTOR_CACHE_DIR")
+            if not root:
+                root = env_str("ENN_PRED_INDUCTOR_CACHE_ROOT")
+            if isinstance(root, str):
+                root = root.replace("\\r\\n", "\n").replace("\\n", "\n").strip()
+            if not root:
+                root = os.path.join(tempfile.gettempdir(), "torchinductor_enn")
+            os.makedirs(root, exist_ok=True)
+            rid = os.environ.get("ENN_RUN_ID") or os.urandom(4).hex()
+            rank = os.environ.get("RANK") or str(local_rank)
+            cache_dir = os.path.join(
+                root,
+                f"pred_{rid}_pid{os.getpid()}_rank{rank}",
+            )
+            os.makedirs(cache_dir, exist_ok=True)
+            os.environ["TORCHINDUCTOR_CACHE_DIR"] = cache_dir
+            if verbose or env_bool("ENN_LOG_INDUCTOR_CACHE_DIR", default=True):
+                print(f"[ENN] TORCHINDUCTOR_CACHE_DIR={cache_dir}", flush=True)
+    except Exception:
+        pass
     if ops.mode == "train":
         resolved_ma: str | None = None
         has_bn = False
