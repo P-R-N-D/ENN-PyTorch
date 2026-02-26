@@ -213,6 +213,21 @@ def _env_bool(key: str, default: bool = False) -> bool:
     return bool(default)
 
 
+def _sync_torchinductor_cache_globals(cache_dir: str) -> None:
+    with contextlib.suppress(Exception):
+        import torch._inductor.config as _icfg
+
+        if hasattr(_icfg, "global_cache_dir"):
+            _icfg.global_cache_dir = cache_dir
+        if hasattr(_icfg, "cache_dir"):
+            _icfg.cache_dir = cache_dir
+    with contextlib.suppress(Exception):
+        import torch._inductor.codecache as _cc
+
+        if hasattr(_cc, "_cache_dir"):
+            _cc._cache_dir = cache_dir
+
+
 def _normalize_model_averaging(
     x: object, *, default: str = "auto"
 ) -> str | None:
@@ -5896,6 +5911,7 @@ def process(*args: Any, **kwargs: Any) -> object:
             )
             os.makedirs(cache_dir, exist_ok=True)
             os.environ["TORCHINDUCTOR_CACHE_DIR"] = cache_dir
+            _sync_torchinductor_cache_globals(cache_dir)
             if verbose or env_bool("ENN_LOG_INDUCTOR_CACHE_DIR", default=True):
                 print(f"[ENN] TORCHINDUCTOR_CACHE_DIR={cache_dir}", flush=True)
     except Exception:
