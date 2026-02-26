@@ -3078,8 +3078,6 @@ class Scaler(nn.Module):
         if z_target.numel() == 0:
             return z_target
         mode = str(getattr(self, "calib_mode", "none") or "none").strip().lower()
-        if mode in ("none", ""):
-            return z_target
         if is_symbolic() or is_meta_or_fake_tensor(z_target):
             return z_target
 
@@ -3088,6 +3086,32 @@ class Scaler(nn.Module):
         if master_dtype is torch.int64:
             master_dtype = torch.float64
         z = z_target.to(dtype=master_dtype)
+
+        def _inv_output_ab(t: torch.Tensor) -> torch.Tensor:
+            if t.numel() == 0 or not bool(getattr(self, "output_ab_enabled", False)):
+                return t
+            scale = self.y_out_scale.to(device=t.device, dtype=t.dtype).reshape(-1)
+            bias = self.y_out_bias.to(device=t.device, dtype=t.dtype).reshape(-1)
+            if t.dim() == 0:
+                return t
+            orig = t.shape
+            t2 = t.unsqueeze(0) if t.dim() == 1 else t.reshape(-1, orig[-1])
+            c = int(t2.shape[-1])
+            if scale.numel() == 1 and c != 1:
+                s2 = scale.expand((c,))
+            else:
+                s2 = scale[:c] if scale.numel() >= c else scale.expand((c,))
+            if bias.numel() == 1 and c != 1:
+                b2 = bias.expand((c,))
+            else:
+                b2 = bias[:c] if bias.numel() >= c else bias.expand((c,))
+            eps_v = max(float(self.eps), 1e-6)
+            mask = s2.abs() < eps_v
+            s_safe = torch.where(mask, torch.ones_like(s2), s2)
+            out2 = (t2 - b2.view(1, -1)) / s_safe.view(1, -1)
+            if mask.any():
+                out2[:, mask] = t2[:, mask]
+            return out2.squeeze(0) if t.dim() == 1 else out2.reshape(orig)
 
         def _inv_affine(t: torch.Tensor) -> torch.Tensor:
             a = self.affine_a.to(device=t.device, dtype=t.dtype).reshape(-1)
@@ -3156,14 +3180,17 @@ class Scaler(nn.Module):
                 out[:, j] = x0 + tlin * (x1 - x0)
             return out.reshape(orig)
 
-        if mode == "affine":
+        z = _inv_output_ab(z)
+        if mode in ("none", ""):
+            out = z
+        elif mode == "affine":
             out = _inv_affine(z)
         elif mode == "piecewise":
             out = _inv_piecewise(z)
         elif mode == "ab":
             out = _inv_affine(_inv_piecewise(z))
         else:
-            out = z_target
+            out = z
 
         if z_target.is_floating_point() and out.dtype != input_dtype and self._should_restore_input_dtype(input_dtype):
             out = out.to(dtype=input_dtype)

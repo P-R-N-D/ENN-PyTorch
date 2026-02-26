@@ -3319,7 +3319,7 @@ def epochs(
 
                     y_pred = model(
                         x_raw,
-                        calibrate_output=True,
+                        calibrate_output=False,
                         sanitize_nan=True,
                         return_loss=False,
                         return_aux=False,
