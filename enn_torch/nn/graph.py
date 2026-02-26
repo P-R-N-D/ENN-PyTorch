@@ -752,7 +752,9 @@ def compile(
             }
         strip_options = bool(mode_value is not None)
 
-        if strip_options or patchable:
+        if strip_options:
+            compile_kwargs.pop("options", None)
+        elif patchable:
             if compile_time_opts:
                 compile_kwargs["options"] = dict(compile_time_opts)
             else:
