@@ -752,6 +752,14 @@ def compile(
             }
         strip_options = bool(mode_value is not None)
 
+        compile_time_patch: Dict[str, Any] = {}
+        if strip_options and compile_time_opts:
+            if callable(patch):
+                compile_time_patch = dict(compile_time_opts)
+            else:
+                compile_kwargs.pop("mode", None)
+                strip_options = False
+
         if strip_options:
             compile_kwargs.pop("options", None)
         elif patchable:
@@ -761,7 +769,13 @@ def compile(
                 compile_kwargs.pop("options", None)
 
         with _TORCH_COMPILE_LOCK:
-            compiled = compile_fn(module, **compile_kwargs)
+            cm_compile = (
+                patch(dict(compile_time_patch))
+                if callable(patch) and compile_time_patch
+                else nullcontext()
+            )
+            with cm_compile:
+                compiled = compile_fn(module, **compile_kwargs)
 
         need_scope = bool(_scoped_inductor_overrides) or bool(patchable)
         if not need_scope:
