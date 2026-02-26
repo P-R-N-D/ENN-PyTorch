@@ -213,6 +213,28 @@ def _env_bool(key: str, default: bool = False) -> bool:
     return bool(default)
 
 
+def _sync_torchinductor_cache_globals(cache_dir: str) -> None:
+    with contextlib.suppress(Exception):
+        import torch._inductor.config as _icfg
+
+        if hasattr(_icfg, "global_cache_dir"):
+            _icfg.global_cache_dir = cache_dir
+        if hasattr(_icfg, "cache_dir"):
+            _icfg.cache_dir = cache_dir
+    with contextlib.suppress(Exception):
+        import torch._inductor.codecache as _cc
+
+        if hasattr(_cc, "_cache_dir"):
+            _cc._cache_dir = cache_dir
+        for _name in ("global_cache_dir", "cache_dir", "inductor_cache_dir"):
+            if hasattr(_cc, _name):
+                v = getattr(_cc, _name)
+                if isinstance(v, str):
+                    setattr(_cc, _name, cache_dir)
+        if callable(getattr(_cc, "cache_dir", None)):
+            _cc.cache_dir()
+
+
 def _normalize_model_averaging(
     x: object, *, default: str = "auto"
 ) -> str | None:
@@ -5875,6 +5897,44 @@ def process(*args: Any, **kwargs: Any) -> object:
     with contextlib.suppress(Exception):
         torch.backends.cudnn.deterministic = det
         torch.backends.cudnn.benchmark = not det
+    strict_cache = env_bool(
+        ("ENN_PRED_UNIQUE_INDUCTOR_CACHE_STRICT", "ENN_UNIQUE_INDUCTOR_CACHE_STRICT"),
+        default=env_bool("ENN_SANITIZE_NAN_STRICT", default=False),
+    )
+    try:
+        if ops.mode != "train" and env_bool(
+            ("ENN_PRED_UNIQUE_INDUCTOR_CACHE", "ENN_UNIQUE_INDUCTOR_CACHE"),
+            default=True,
+        ):
+            root = os.environ.get("TORCHINDUCTOR_CACHE_DIR")
+            if not root:
+                root = env_str("ENN_PRED_INDUCTOR_CACHE_ROOT")
+            if isinstance(root, str):
+                root = root.strip()
+                if "\n" in root or "\r" in root:
+                    root = root.splitlines()[0].strip()
+            if not root:
+                root = os.path.join(tempfile.gettempdir(), "torchinductor_enn")
+            os.makedirs(root, exist_ok=True)
+            rid = os.environ.get("ENN_RUN_ID") or os.urandom(4).hex()
+            rank = os.environ.get("RANK") or str(local_rank)
+            cache_dir = os.path.join(
+                root,
+                f"pred_{rid}_pid{os.getpid()}_rank{rank}",
+            )
+            os.makedirs(cache_dir, exist_ok=True)
+            os.environ["TORCHINDUCTOR_CACHE_DIR"] = cache_dir
+            _sync_torchinductor_cache_globals(cache_dir)
+            if verbose or env_bool("ENN_LOG_INDUCTOR_CACHE_DIR", default=True):
+                print(f"[ENN] TORCHINDUCTOR_CACHE_DIR={cache_dir}", flush=True)
+    except Exception as e:
+        if strict_cache:
+            raise
+        if verbose or env_bool("ENN_LOG_INDUCTOR_CACHE_DIR_ERRORS", default=True):
+            print(
+                f"[ENN] WARNING: failed to set unique TORCHINDUCTOR_CACHE_DIR: {e!r}",
+                flush=True,
+            )
     if ops.mode == "train":
         resolved_ma: str | None = None
         has_bn = False
