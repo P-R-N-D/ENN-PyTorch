@@ -3274,6 +3274,133 @@ def epochs(
 
     with torch.inference_mode():
         _finalize_affine(total_n, sum_x, sum_y, sum_x2, sum_xy)
+
+    try:
+        enable_out_ab = bool(
+            env_bool(
+                ("ENN_OUTPUT_AB_ENABLE", "ENN_SCALER_OUTPUT_AB_ENABLE"),
+                default=True,
+            )
+        )
+    except Exception:
+        enable_out_ab = True
+    if enable_out_ab and getattr(model_for_scaler, "scaler", None) is not None:
+        scaler = model_for_scaler.scaler
+        if not env_bool("ENN_DISABLE_OUTPUT_AB", default=False):
+            mix_alpha = float(os.environ.get("ENN_OUTPUT_AB_MIX_ALPHA", "") or 0.9)
+            if not (0.0 <= mix_alpha <= 1.0):
+                mix_alpha = max(0.0, min(1.0, mix_alpha))
+            scale_clamp = float(os.environ.get("ENN_OUTPUT_AB_SCALE_CLAMP", "") or 4.0)
+            if scale_clamp <= 0.0:
+                scale_clamp = 0.0
+
+            with torch.no_grad():
+                with contextlib.suppress(Exception):
+                    scaler.disable_output_ab()
+
+            sum_py = sum_py2 = None
+            n_py = 0
+            seen_batches2 = 0
+            seen_samples2 = 0
+
+            model.eval()
+            with inference_mode(model), StatelessAutocast.float(device):
+                for batch in _iter_raw(calib_src):
+                    if int(max_batches) > 0 and int(seen_batches2) >= int(max_batches):
+                        break
+                    if int(max_samples) > 0 and int(seen_samples2) >= int(max_samples):
+                        break
+                    x_b, _y_b = collate.get_row(batch, labels_required=True)
+                    x_raw = torch.atleast_2d(x_b.to(device))
+                    b2 = int(x_raw.shape[0])
+                    if b2 <= 0:
+                        seen_batches2 += 1
+                        continue
+
+                    y_pred = model(
+                        x_raw,
+                        calibrate_output=True,
+                        sanitize_nan=True,
+                        return_loss=False,
+                        return_aux=False,
+                    )
+                    if isinstance(y_pred, tuple):
+                        y_pred = y_pred[0]
+                    if not isinstance(y_pred, torch.Tensor):
+                        y_pred = torch.as_tensor(y_pred, device=device)
+
+                    ypf = y_pred.reshape(b2, -1)
+                    yp64 = ypf.to(device=accum_device, dtype=torch.float64)
+
+                    if sum_py is None:
+                        feat_y = int(yp64.shape[1])
+                        sum_py = torch.zeros((feat_y,), device=accum_device, dtype=torch.float64)
+                        sum_py2 = torch.zeros((feat_y,), device=accum_device, dtype=torch.float64)
+
+                    sum_py += yp64.sum(dim=0, dtype=torch.float64)
+                    sum_py2 += (yp64 * yp64).sum(dim=0, dtype=torch.float64)
+                    n_py += int(b2)
+                    seen_batches2 += 1
+                    seen_samples2 += int(b2)
+
+            if is_distributed():
+                n_t2 = torch.tensor(int(n_py), device="cpu", dtype=torch.int64)
+                _dist_all_reduce_sum_(n_t2)
+                n_py = int(n_t2.item())
+                if sum_py is not None:
+                    _dist_all_reduce_sum_(sum_py)
+                if sum_py2 is not None:
+                    _dist_all_reduce_sum_(sum_py2)
+
+            if int(n_py) > 0 and sum_py is not None and sum_py2 is not None:
+                n2 = float(int(n_py))
+                pred_mean = sum_py / n2
+                pred_var = (sum_py2 / n2 - pred_mean * pred_mean).clamp_min(
+                    float(getattr(scaler, "eps", 1e-6))
+                )
+                pred_std = pred_var.sqrt()
+
+                ref_mean = getattr(scaler, "y_mean", None)
+                ref_std = getattr(scaler, "y_std", None)
+                if isinstance(ref_mean, torch.Tensor):
+                    ref_mean = ref_mean.detach().to(device=pred_mean.device, dtype=pred_mean.dtype).reshape(-1)
+                else:
+                    ref_mean = pred_mean.new_tensor(0.0).reshape(1)
+                if isinstance(ref_std, torch.Tensor):
+                    ref_std = ref_std.detach().to(device=pred_std.device, dtype=pred_std.dtype).reshape(-1)
+                else:
+                    ref_std = pred_std.new_tensor(1.0).reshape(1)
+
+                if ref_mean.numel() == 1 and pred_mean.numel() != 1:
+                    ref_mean = ref_mean.expand_as(pred_mean)
+                if ref_std.numel() == 1 and pred_std.numel() != 1:
+                    ref_std = ref_std.expand_as(pred_std)
+
+                clip_low = getattr(scaler, "y_min", None)
+                clip_high = getattr(scaler, "y_max", None)
+                try:
+                    use_quant = bool(getattr(model_for_scaler, "delta_gate_bounds_use_quantile", False))
+                except Exception:
+                    use_quant = False
+                if use_quant:
+                    ql = getattr(scaler, "y_q_low", None)
+                    qh = getattr(scaler, "y_q_high", None)
+                    if isinstance(ql, torch.Tensor) and isinstance(qh, torch.Tensor):
+                        with contextlib.suppress(Exception):
+                            if bool(torch.isfinite(ql).all().item()) and bool(torch.isfinite(qh).all().item()):
+                                clip_low, clip_high = ql, qh
+
+                scaler.fit_output_ab(
+                    pred_mean,
+                    pred_std,
+                    ref_mean,
+                    ref_std,
+                    clip_low=clip_low,
+                    clip_high=clip_high,
+                    mix_alpha=mix_alpha,
+                    scale_clamp=scale_clamp,
+                    enable=True,
+                )
     end_kst_ns = posix_time()
     try:
         dev_t = getattr(device, "type", "")

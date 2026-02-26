@@ -5924,6 +5924,12 @@ class Model(nn.Module):
                     if ylo_t is not None and yhi_t is not None:
                         z_min = (ylo_t - mean) / denom
                         z_max = (yhi_t - mean) / denom
+                        if infer_mode and calibrate_output and (not is_cls_loss):
+                            with contextlib.suppress(Exception):
+                                if z_min is not None:
+                                    z_min = self.scaler.inverse_calibrate(z_min)
+                                if z_max is not None:
+                                    z_max = self.scaler.inverse_calibrate(z_max)
                     else:
                         if bool(
                             getattr(self, "delta_gate_fallback_enabled", False)
