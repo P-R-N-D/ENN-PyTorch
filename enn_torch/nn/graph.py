@@ -1322,8 +1322,39 @@ def checkpoint(fn: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
         try:
             disable_cg = False
             try:
+                cfg = get_runtime_cfg()
+                prev_cg = getattr(cfg, "compile_cudagraphs", None)
+                if prev_cg is None:
+                    try:
+                        mode = canonicalize_compile_mode(
+                            getattr(cfg, "compile_mode", "disabled")
+                        )
+                    except Exception:
+                        mode = "disabled"
+                    cg_mode = mode not in {
+                        "disabled",
+                        "aot-eager",
+                        "max-autotune-no-cudagraphs",
+                    }
+
+                    def _has_cuda_tensor(obj: Any, _depth: int = 0) -> bool:
+                        if _depth > 4:
+                            return False
+                        if torch.is_tensor(obj):
+                            return bool(getattr(obj.device, "type", None) == "cuda")
+                        if isinstance(obj, (list, tuple)):
+                            return any(_has_cuda_tensor(x, _depth + 1) for x in obj)
+                        if isinstance(obj, dict):
+                            return any(
+                                _has_cuda_tensor(x, _depth + 1)
+                                for x in obj.values()
+                            )
+                        return False
+
+                    prev_cg = bool(cg_mode and (_has_cuda_tensor(a) or _has_cuda_tensor(k)))
                 disable_cg = bool(
                     env_bool("ENN_CKPT_DISABLE_CUDAGRAPHS", default=True)
+                    and bool(prev_cg)
                     and bool(is_accelerator_available("cuda"))
                 )
             except Exception:
