@@ -2567,6 +2567,15 @@ class Scaler(nn.Module):
         self.register_buffer("affine_b", torch.zeros(1, dtype=torch.float64))
         self.register_buffer("pw_x", torch.zeros((1, 1), dtype=torch.float64))
         self.register_buffer("pw_y", torch.zeros((1, 1), dtype=torch.float64))
+        self.register_buffer("y_out_scale", torch.ones(1, dtype=torch.float64))
+        self.register_buffer("y_out_bias", torch.zeros(1, dtype=torch.float64))
+        self.register_buffer(
+            "y_out_clip_low", torch.full((1,), float("-inf"), dtype=torch.float64)
+        )
+        self.register_buffer(
+            "y_out_clip_high", torch.full((1,), float("inf"), dtype=torch.float64)
+        )
+        self.output_ab_enabled: bool = False
         self._stats_cache_lock = Mutex()
         self._stats_cache_max = 8
         self._x_stats_cache: Dict[
@@ -2960,14 +2969,232 @@ class Scaler(nn.Module):
         match self.calib_mode:
             case "piecewise":
                 if self.pw_x.numel() >= 2 and self.pw_y.numel() >= 2:
-                    return self._piecewise(z_raw)
-                return z_raw
+                    z = self._piecewise(z_raw)
+                else:
+                    z = z_raw
+                return self._apply_output_ab(z)
             case "affine":
-                return self.affine(z_raw)
+                return self._apply_output_ab(self.affine(z_raw))
+            case "ab":
+                return self._apply_output_ab(self._piecewise(z_raw))
             case "none":
-                return z_raw
+                return self._apply_output_ab(z_raw)
             case _:
-                return z_raw
+                return self._apply_output_ab(z_raw)
+
+    def _apply_output_ab(self: Self, z: torch.Tensor) -> torch.Tensor:
+        if z.numel() == 0 or not bool(getattr(self, "output_ab_enabled", False)):
+            return z
+        input_dtype = z.dtype
+        master_dtype = self._resolve_master_dtype_for_io(z)
+        if master_dtype is torch.int64:
+            master_dtype = torch.float64
+        zz = z.to(dtype=master_dtype)
+        scale = self.y_out_scale.to(device=zz.device, dtype=zz.dtype)
+        bias = self.y_out_bias.to(device=zz.device, dtype=zz.dtype)
+        out = self._apply_affine_no_broadcast(zz, weight=scale, bias=bias)
+        lo = self.y_out_clip_low.to(device=out.device, dtype=out.dtype)
+        hi = self.y_out_clip_high.to(device=out.device, dtype=out.dtype)
+        out = torch.minimum(torch.maximum(out, lo), hi)
+        if z.is_floating_point() and out.dtype != input_dtype and self._should_restore_input_dtype(input_dtype):
+            out = out.to(dtype=input_dtype)
+        return out
+
+    @torch.no_grad()
+    def disable_output_ab(self: Self) -> None:
+        self.output_ab_enabled = False
+
+    @torch.no_grad()
+    def fit_output_ab(
+        self: Self,
+        pred_mean: torch.Tensor,
+        pred_std: torch.Tensor,
+        ref_mean: torch.Tensor,
+        ref_std: torch.Tensor,
+        clip_low=None,
+        clip_high=None,
+        eps=None,
+        mix_alpha: float | None = None,
+        scale_clamp: float | None = None,
+        enable: bool = True,
+    ) -> None:
+        pm = pred_mean.detach().reshape(-1).to(dtype=torch.float64)
+        ps = pred_std.detach().reshape(-1).to(dtype=torch.float64)
+        rm = ref_mean.detach().reshape(-1).to(dtype=torch.float64)
+        rs = ref_std.detach().reshape(-1).to(dtype=torch.float64)
+        if pm.numel() == 0 or ps.numel() == 0 or rm.numel() == 0 or rs.numel() == 0:
+            self.output_ab_enabled = False
+            return
+        eps_f = float(self.eps if eps is None else eps)
+        eps_f = max(eps_f, 1e-9)
+        ps = torch.clamp(ps, min=eps_f)
+        rs = torch.clamp(rs, min=eps_f)
+        scale = rs / ps
+        bias = rm - scale * pm
+        if mix_alpha is not None:
+            try:
+                alpha = float(mix_alpha)
+            except Exception:
+                alpha = 1.0
+            alpha = max(0.0, min(1.0, alpha))
+            if alpha < 1.0:
+                pm_g = pm.mean()
+                ps_g = torch.clamp(ps.mean(), min=eps_f)
+                rm_g = rm.mean()
+                rs_g = torch.clamp(rs.mean(), min=eps_f)
+                s_g = rs_g / ps_g
+                b_g = rm_g - s_g * pm_g
+                scale = alpha * scale + (1.0 - alpha) * s_g
+                bias = alpha * bias + (1.0 - alpha) * b_g
+        if scale_clamp is not None:
+            try:
+                sc = float(scale_clamp)
+            except Exception:
+                sc = 0.0
+            if sc > 0.0:
+                scale = torch.clamp(scale, min=1.0 / sc, max=sc)
+        self.y_out_scale.resize_(scale.shape).copy_(scale)
+        self.y_out_bias.resize_(bias.shape).copy_(bias)
+
+        if clip_low is None:
+            lo = torch.full_like(scale, float("-inf"))
+        else:
+            lo = torch.as_tensor(clip_low, dtype=torch.float64).reshape(-1)
+        if clip_high is None:
+            hi = torch.full_like(scale, float("inf"))
+        else:
+            hi = torch.as_tensor(clip_high, dtype=torch.float64).reshape(-1)
+        if lo.numel() == 1 and scale.numel() != 1:
+            lo = lo.expand_as(scale)
+        if hi.numel() == 1 and scale.numel() != 1:
+            hi = hi.expand_as(scale)
+        self.y_out_clip_low.resize_(lo.shape).copy_(lo)
+        self.y_out_clip_high.resize_(hi.shape).copy_(hi)
+        self.output_ab_enabled = bool(enable)
+        if self.output_ab_enabled and self.calib_mode == "none":
+            self.calib_mode = "ab"
+
+    def inverse_calibrate(self: Self, z_target: torch.Tensor) -> torch.Tensor:
+        if z_target.numel() == 0:
+            return z_target
+        mode = str(getattr(self, "calib_mode", "none") or "none").strip().lower()
+        if is_symbolic() or is_meta_or_fake_tensor(z_target):
+            return z_target
+
+        input_dtype = z_target.dtype
+        master_dtype = self._resolve_master_dtype_for_io(z_target)
+        if master_dtype is torch.int64:
+            master_dtype = torch.float64
+        z = z_target.to(dtype=master_dtype)
+
+        def _inv_output_ab(t: torch.Tensor) -> torch.Tensor:
+            if t.numel() == 0 or not bool(getattr(self, "output_ab_enabled", False)):
+                return t
+            scale = self.y_out_scale.to(device=t.device, dtype=t.dtype).reshape(-1)
+            bias = self.y_out_bias.to(device=t.device, dtype=t.dtype).reshape(-1)
+            if t.dim() == 0:
+                return t
+            orig = t.shape
+            t2 = t.unsqueeze(0) if t.dim() == 1 else t.reshape(-1, orig[-1])
+            c = int(t2.shape[-1])
+            if scale.numel() == 1 and c != 1:
+                s2 = scale.expand((c,))
+            else:
+                s2 = scale[:c] if scale.numel() >= c else scale.expand((c,))
+            if bias.numel() == 1 and c != 1:
+                b2 = bias.expand((c,))
+            else:
+                b2 = bias[:c] if bias.numel() >= c else bias.expand((c,))
+            eps_v = max(float(self.eps), 1e-6)
+            mask = s2.abs() < eps_v
+            s_safe = torch.where(mask, torch.ones_like(s2), s2)
+            out2 = (t2 - b2.view(1, -1)) / s_safe.view(1, -1)
+            if mask.any():
+                out2[:, mask] = t2[:, mask]
+            return out2.squeeze(0) if t.dim() == 1 else out2.reshape(orig)
+
+        def _inv_affine(t: torch.Tensor) -> torch.Tensor:
+            a = self.affine_a.to(device=t.device, dtype=t.dtype).reshape(-1)
+            b = self.affine_b.to(device=t.device, dtype=t.dtype).reshape(-1)
+            if t.dim() == 0:
+                return t
+            orig = t.shape
+            t2 = t.unsqueeze(0) if t.dim() == 1 else t.reshape(-1, orig[-1])
+            c = int(t2.shape[-1])
+            if a.numel() == 1 and c != 1:
+                a2 = a.expand((c,))
+            else:
+                a2 = a[:c] if a.numel() >= c else a.expand((c,))
+            if b.numel() == 1 and c != 1:
+                b2 = b.expand((c,))
+            else:
+                b2 = b[:c] if b.numel() >= c else b.expand((c,))
+            eps_v = max(float(self.eps), 1e-6)
+            mask = a2.abs() < eps_v
+            a_safe = torch.where(mask, torch.ones_like(a2), a2)
+            out2 = (t2 - b2.view(1, -1)) / a_safe.view(1, -1)
+            if mask.any():
+                out2[:, mask] = t2[:, mask]
+            return out2.squeeze(0) if t.dim() == 1 else out2.reshape(orig)
+
+        def _inv_piecewise(t: torch.Tensor) -> torch.Tensor:
+            if self.pw_x.numel() < 2 or self.pw_y.numel() < 2:
+                return t
+            if self.pw_x.dim() != 2 or self.pw_y.dim() != 2:
+                return t
+            pw_x = self.pw_x
+            pw_y = self.pw_y
+            c_saved, kx = pw_x.shape
+            _, ky = pw_y.shape
+            k = int(min(kx, ky))
+            if k < 2:
+                return t
+            pw_x = pw_x[:, :k]
+            pw_y = pw_y[:, :k]
+
+            orig = t.shape
+            tt = t.unsqueeze(-1) if t.ndim == 1 else t
+            tt = tt.reshape(-1, int(tt.shape[-1]))
+            _, c_target = tt.shape
+            out = torch.empty_like(tt)
+            last = max(0, int(c_saved) - 1)
+
+            for j in range(int(c_target)):
+                src = j if j < int(c_saved) else last
+                v = tt[:, j]
+                kyv = pw_y[src].to(device=v.device, dtype=v.dtype)
+                kxv = pw_x[src].to(device=v.device, dtype=v.dtype)
+                if not (is_symbolic() or is_meta_or_fake_tensor(kyv)):
+                    with contextlib.suppress(Exception):
+                        if not bool((kyv[1:] >= kyv[:-1]).all().item()):
+                            ky_sorted, order = torch.sort(kyv)
+                            kxv = kxv[order]
+                            kyv = ky_sorted
+                idx = torch.bucketize(v, kyv)
+                idx = idx.clamp(1, kyv.numel() - 1)
+                y0 = kyv[idx - 1]
+                y1 = kyv[idx]
+                x0 = kxv[idx - 1]
+                x1 = kxv[idx]
+                tlin = (v - y0) / (y1 - y0 + self.eps)
+                out[:, j] = x0 + tlin * (x1 - x0)
+            return out.reshape(orig)
+
+        z = _inv_output_ab(z)
+        if mode in ("none", ""):
+            out = z
+        elif mode == "affine":
+            out = _inv_affine(z)
+        elif mode == "piecewise":
+            out = _inv_piecewise(z)
+        elif mode == "ab":
+            out = _inv_affine(_inv_piecewise(z))
+        else:
+            out = z
+
+        if z_target.is_floating_point() and out.dtype != input_dtype and self._should_restore_input_dtype(input_dtype):
+            out = out.to(dtype=input_dtype)
+        return out
 
     def affine(self: Self, z_raw: torch.Tensor) -> torch.Tensor:
         if z_raw.numel() == 0:

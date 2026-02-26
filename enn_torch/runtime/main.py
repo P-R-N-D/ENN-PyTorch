@@ -3274,6 +3274,142 @@ def epochs(
 
     with torch.inference_mode():
         _finalize_affine(total_n, sum_x, sum_y, sum_x2, sum_xy)
+
+    try:
+        enable_out_ab = bool(
+            env_bool(
+                ("ENN_OUTPUT_AB_ENABLE", "ENN_SCALER_OUTPUT_AB_ENABLE"),
+                default=True,
+            )
+        )
+    except Exception:
+        enable_out_ab = True
+    if enable_out_ab and getattr(model_for_scaler, "scaler", None) is not None:
+        scaler = model_for_scaler.scaler
+        if not env_bool("ENN_DISABLE_OUTPUT_AB", default=False):
+            mix_alpha = float(os.environ.get("ENN_OUTPUT_AB_MIX_ALPHA", "") or 0.9)
+            if not (0.0 <= mix_alpha <= 1.0):
+                mix_alpha = max(0.0, min(1.0, mix_alpha))
+            scale_clamp = float(os.environ.get("ENN_OUTPUT_AB_SCALE_CLAMP", "") or 4.0)
+            if scale_clamp <= 0.0:
+                scale_clamp = 0.0
+
+            with torch.no_grad():
+                with contextlib.suppress(Exception):
+                    scaler.disable_output_ab()
+
+            sum_pz = sum_pz2 = None
+            sum_tz = sum_tz2 = None
+            n_z = 0
+            seen_batches2 = 0
+            seen_samples2 = 0
+
+            model.eval()
+            with inference_mode(model), StatelessAutocast.float(device):
+                for batch in _iter_raw(calib_src):
+                    if int(max_batches) > 0 and int(seen_batches2) >= int(max_batches):
+                        break
+                    if int(max_samples) > 0 and int(seen_samples2) >= int(max_samples):
+                        break
+                    x_b, _y_b = collate.get_row(batch, labels_required=True)
+                    x_raw = torch.atleast_2d(x_b.to(device))
+                    b2 = int(x_raw.shape[0])
+                    if b2 <= 0:
+                        seen_batches2 += 1
+                        continue
+
+                    y_pred = model(
+                        x_raw,
+                        calibrate_output=False,
+                        sanitize_nan=True,
+                        return_loss=False,
+                        return_aux=False,
+                    )
+                    if isinstance(y_pred, tuple):
+                        y_pred = y_pred[0]
+                    if not isinstance(y_pred, torch.Tensor):
+                        y_pred = torch.as_tensor(y_pred, device=device)
+
+                    ypf = y_pred.reshape(b2, -1)
+                    pred_is_z = bool(env_bool("ENN_OUTPUT_AB_PRED_IS_Z", default=False))
+                    z_hat = ypf if pred_is_z else scaler.normalize_y(ypf)
+                    z_pred = scaler.calibrate(z_hat)
+                    zp64 = z_pred.to(device=accum_device, dtype=torch.float64)
+
+                    y_true = torch.atleast_2d(_y_b.to(device)).reshape(b2, -1)
+                    z_true = scaler.normalize_y(y_true)
+                    zt64 = z_true.to(device=accum_device, dtype=torch.float64)
+
+                    if sum_pz is None:
+                        feat_y = int(zp64.shape[1])
+                        sum_pz = torch.zeros((feat_y,), device=accum_device, dtype=torch.float64)
+                        sum_pz2 = torch.zeros((feat_y,), device=accum_device, dtype=torch.float64)
+                        sum_tz = torch.zeros((feat_y,), device=accum_device, dtype=torch.float64)
+                        sum_tz2 = torch.zeros((feat_y,), device=accum_device, dtype=torch.float64)
+
+                    sum_pz += zp64.sum(dim=0, dtype=torch.float64)
+                    sum_pz2 += (zp64 * zp64).sum(dim=0, dtype=torch.float64)
+                    sum_tz += zt64.sum(dim=0, dtype=torch.float64)
+                    sum_tz2 += (zt64 * zt64).sum(dim=0, dtype=torch.float64)
+                    n_z += int(b2)
+                    seen_batches2 += 1
+                    seen_samples2 += int(b2)
+
+            if is_distributed():
+                n_t2 = torch.tensor(int(n_z), device="cpu", dtype=torch.int64)
+                _dist_all_reduce_sum_(n_t2)
+                n_z = int(n_t2.item())
+                if sum_pz is not None:
+                    _dist_all_reduce_sum_(sum_pz)
+                if sum_pz2 is not None:
+                    _dist_all_reduce_sum_(sum_pz2)
+                if sum_tz is not None:
+                    _dist_all_reduce_sum_(sum_tz)
+                if sum_tz2 is not None:
+                    _dist_all_reduce_sum_(sum_tz2)
+
+            if int(n_z) > 0 and sum_pz is not None and sum_pz2 is not None and sum_tz is not None and sum_tz2 is not None:
+                n2 = float(int(n_z))
+                pred_mean = sum_pz / n2
+                pred_var = (sum_pz2 / n2 - pred_mean * pred_mean).clamp_min(
+                    float(getattr(scaler, "eps", 1e-6))
+                )
+                pred_std = pred_var.sqrt()
+
+                ref_mean = sum_tz / n2
+                ref_var = (sum_tz2 / n2 - ref_mean * ref_mean).clamp_min(
+                    float(getattr(scaler, "eps", 1e-6))
+                )
+                ref_std = ref_var.sqrt()
+
+                clip_low_y = getattr(scaler, "y_min", None)
+                clip_high_y = getattr(scaler, "y_max", None)
+                try:
+                    use_quant = bool(getattr(model_for_scaler, "delta_gate_bounds_use_quantile", False))
+                except Exception:
+                    use_quant = False
+                if use_quant:
+                    ql = getattr(scaler, "y_q_low", None)
+                    qh = getattr(scaler, "y_q_high", None)
+                    if isinstance(ql, torch.Tensor) and isinstance(qh, torch.Tensor):
+                        with contextlib.suppress(Exception):
+                            if bool(torch.isfinite(ql).all().item()) and bool(torch.isfinite(qh).all().item()):
+                                clip_low_y, clip_high_y = ql, qh
+
+                clip_low = scaler.normalize_y(clip_low_y) if isinstance(clip_low_y, torch.Tensor) else clip_low_y
+                clip_high = scaler.normalize_y(clip_high_y) if isinstance(clip_high_y, torch.Tensor) else clip_high_y
+
+                scaler.fit_output_ab(
+                    pred_mean,
+                    pred_std,
+                    ref_mean,
+                    ref_std,
+                    clip_low=clip_low,
+                    clip_high=clip_high,
+                    mix_alpha=mix_alpha,
+                    scale_clamp=scale_clamp,
+                    enable=True,
+                )
     end_kst_ns = posix_time()
     try:
         dev_t = getattr(device, "type", "")
