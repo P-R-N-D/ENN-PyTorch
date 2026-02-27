@@ -2155,7 +2155,22 @@ class Fuser(nn.Module):
         self: Self, specs: Sequence[Dict[str, Any]]
     ) -> None:
         _dev = self._infer_any_device()
+        _sentinel = object()
+        _prev_dev = getattr(self, "_rebuild_tasks_device", _sentinel)
         setattr(self, "_rebuild_tasks_device", _dev)
+
+        _old_tasks = getattr(self, "tasks", None)
+        _old_task_meta = getattr(self, "_task_meta", None)
+        _old_user_submodels = getattr(self, "_user_submodels", None)
+        _old_legacy = getattr(self, "_legacy_task_id_to_name", None)
+        _old_root_children = getattr(self, "_root_children", None)
+        _old_parent = getattr(self, "_parent", None)
+        _old_root_reduction = getattr(self, "_root_reduction", None)
+        _old_exec_plan = getattr(self, "_exec_plan", None)
+        _old_topology_version = getattr(self, "_topology_version", None)
+        _old_stream_task_name = getattr(self, "stream_task_name", None)
+        _old_stream_task_id = getattr(self, "stream_task_id", None)
+
         try:
             self.tasks = nn.ModuleDict()
             self._task_meta = {}
@@ -2303,9 +2318,47 @@ class Fuser(nn.Module):
 
             self._resolve_stream_task_id()
             self._invalidate_exec_plan()
+        except Exception:
+            with contextlib.suppress(Exception):
+                if isinstance(_old_tasks, nn.ModuleDict):
+                    self.tasks = _old_tasks
+                elif isinstance(_old_tasks, nn.Module):
+                    self.tasks = _old_tasks
+                else:
+                    self.tasks = nn.ModuleDict()
+            self._task_meta = _old_task_meta if isinstance(_old_task_meta, dict) else {}
+            self._user_submodels = (
+                _old_user_submodels if isinstance(_old_user_submodels, dict) else {}
+            )
+            self._legacy_task_id_to_name = (
+                _old_legacy if isinstance(_old_legacy, dict) else {}
+            )
+            self._root_children = (
+                _old_root_children if isinstance(_old_root_children, list) else []
+            )
+            self._parent = _old_parent if isinstance(_old_parent, dict) else {}
+            self._root_reduction = (
+                str(_old_root_reduction)
+                if _old_root_reduction is not None and str(_old_root_reduction).strip()
+                else "mean"
+            )
+            self._exec_plan = _old_exec_plan
+            if _old_topology_version is not None:
+                with contextlib.suppress(Exception):
+                    self._topology_version = int(_old_topology_version)
+            if _old_stream_task_name is not None:
+                with contextlib.suppress(Exception):
+                    self.stream_task_name = str(_old_stream_task_name)
+            if _old_stream_task_id is not None:
+                with contextlib.suppress(Exception):
+                    self.stream_task_id = str(_old_stream_task_id)
+            raise
         finally:
             with contextlib.suppress(Exception):
-                delattr(self, "_rebuild_tasks_device")
+                if _prev_dev is _sentinel:
+                    delattr(self, "_rebuild_tasks_device")
+                else:
+                    setattr(self, "_rebuild_tasks_device", _prev_dev)
 
     def remap_legacy_task_ids_in_state_dict(
         self: Self,
