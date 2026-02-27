@@ -723,7 +723,7 @@ class Template(nn.Module):
         self._ckpt_min_bytes = int(ckpt_min_bytes)
 
         if submodel is not None:
-            self.attach_submodel(submodel, name=self.submodel_name or None)
+            self.attach_submodel(submodel, name=_META_UNSET)
 
     @staticmethod
     def _coerce_mode(mode: str) -> str:
@@ -759,11 +759,14 @@ class Template(nn.Module):
         return s
 
     def attach_submodel(
-        self: Self, submodel: nn.Module, *, name: Optional[str] = None
+        self: Self, submodel: nn.Module, *, name: object = _META_UNSET
     ) -> str:
         if not isinstance(submodel, nn.Module):
             raise TypeError("submodel must be an nn.Module")
-        nm = self._coerce_submodel_name(self.submodel_name if name is None else name)
+        if name is _META_UNSET:
+            nm = self._coerce_submodel_name(self.submodel_name)
+        else:
+            nm = self._coerce_submodel_name(name)
         if not nm:
             nm = "byom"
         attr = f"submodel_{nm}"
