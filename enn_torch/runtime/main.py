@@ -3080,6 +3080,107 @@ def epochs(
 
     seen_batches = 0
     seen_samples = 0
+
+    def _dist_all_reduce_min_(t: torch.Tensor) -> None:
+        if not is_distributed():
+            return
+        exc0: Exception | None = None
+        try:
+            torch.distributed.all_reduce(t, op=torch.distributed.ReduceOp.MIN)
+            return
+        except Exception as exc:
+            exc0 = exc
+
+        td = t
+        moved = False
+        try:
+            backend = str(torch.distributed.get_backend() or "").lower()
+        except Exception:
+            backend = ""
+        if t.device.type == "cpu" and backend == "nccl":
+            try:
+                dev = device
+                if getattr(dev, "type", "cpu") != "cuda" and torch.cuda.is_available():
+                    dev = torch.device("cuda", torch.cuda.current_device())
+                td = t.to(device=dev)
+                moved = True
+                torch.distributed.all_reduce(td, op=torch.distributed.ReduceOp.MIN)
+                t.copy_(td.to(device="cpu"))
+                return
+            except Exception as exc:
+                exc0 = exc
+
+        try:
+            if t.device.type == "cpu" and backend == "nccl" and not moved:
+                dev = device
+                if getattr(dev, "type", "cpu") != "cuda" and torch.cuda.is_available():
+                    dev = torch.device("cuda", torch.cuda.current_device())
+                td = t.to(device=dev)
+                moved = True
+            world = int(torch.distributed.get_world_size())
+            bufs = [torch.empty_like(td) for _ in range(world)]
+            torch.distributed.all_gather(bufs, td)
+            out = torch.stack(bufs, dim=0).min(dim=0).values
+            if moved:
+                t.copy_(out.to(device="cpu"))
+            else:
+                t.copy_(out)
+            return
+        except Exception as exc:
+            raise RuntimeError(
+                "[ENN] distributed calibration: failed to synchronize observed label MIN across ranks"
+            ) from (exc0 if exc0 is not None else exc)
+
+    def _dist_all_reduce_max_(t: torch.Tensor) -> None:
+        if not is_distributed():
+            return
+        exc0: Exception | None = None
+        try:
+            torch.distributed.all_reduce(t, op=torch.distributed.ReduceOp.MAX)
+            return
+        except Exception as exc:
+            exc0 = exc
+
+        td = t
+        moved = False
+        try:
+            backend = str(torch.distributed.get_backend() or "").lower()
+        except Exception:
+            backend = ""
+        if t.device.type == "cpu" and backend == "nccl":
+            try:
+                dev = device
+                if getattr(dev, "type", "cpu") != "cuda" and torch.cuda.is_available():
+                    dev = torch.device("cuda", torch.cuda.current_device())
+                td = t.to(device=dev)
+                moved = True
+                torch.distributed.all_reduce(td, op=torch.distributed.ReduceOp.MAX)
+                t.copy_(td.to(device="cpu"))
+                return
+            except Exception as exc:
+                exc0 = exc
+
+        try:
+            if t.device.type == "cpu" and backend == "nccl" and not moved:
+                dev = device
+                if getattr(dev, "type", "cpu") != "cuda" and torch.cuda.is_available():
+                    dev = torch.device("cuda", torch.cuda.current_device())
+                td = t.to(device=dev)
+                moved = True
+            world = int(torch.distributed.get_world_size())
+            bufs = [torch.empty_like(td) for _ in range(world)]
+            torch.distributed.all_gather(bufs, td)
+            out = torch.stack(bufs, dim=0).max(dim=0).values
+            if moved:
+                t.copy_(out.to(device="cpu"))
+            else:
+                t.copy_(out)
+            return
+        except Exception as exc:
+            raise RuntimeError(
+                "[ENN] distributed calibration: failed to synchronize observed label MAX across ranks"
+            ) from (exc0 if exc0 is not None else exc)
+
     def _run_calibration(
         sum_x, sum_y, sum_x2, sum_xy, total_n: int, seen_batches: int, seen_samples: int
     ):
@@ -3300,6 +3401,7 @@ def epochs(
 
             sum_pz = sum_pz2 = None
             sum_tz = sum_tz2 = None
+            y_min_obs = y_max_obs = None
             n_z = 0
             seen_batches2 = 0
             seen_samples2 = 0
@@ -3337,6 +3439,15 @@ def epochs(
                     zp64 = z_pred.to(device=accum_device, dtype=torch.float64)
 
                     y_true = torch.atleast_2d(_y_b.to(device)).reshape(b2, -1)
+                    yt64 = y_true.to(device=accum_device, dtype=torch.float64)
+                    yb_min = yt64.min(dim=0).values
+                    yb_max = yt64.max(dim=0).values
+                    if y_min_obs is None:
+                        y_min_obs = yb_min
+                        y_max_obs = yb_max
+                    else:
+                        y_min_obs = torch.minimum(y_min_obs, yb_min)
+                        y_max_obs = torch.maximum(y_max_obs, yb_max)
                     z_true = scaler.normalize_y(y_true)
                     zt64 = z_true.to(device=accum_device, dtype=torch.float64)
 
@@ -3367,6 +3478,10 @@ def epochs(
                     _dist_all_reduce_sum_(sum_tz)
                 if sum_tz2 is not None:
                     _dist_all_reduce_sum_(sum_tz2)
+                if y_min_obs is not None:
+                    _dist_all_reduce_min_(y_min_obs)
+                if y_max_obs is not None:
+                    _dist_all_reduce_max_(y_max_obs)
 
             if int(n_z) > 0 and sum_pz is not None and sum_pz2 is not None and sum_tz is not None and sum_tz2 is not None:
                 n2 = float(int(n_z))
@@ -3384,6 +3499,28 @@ def epochs(
 
                 clip_low_y = getattr(scaler, "y_min", None)
                 clip_high_y = getattr(scaler, "y_max", None)
+
+                try:
+                    ext_abs = float(os.environ.get("ENN_SCALER_BOUNDS_EXTREME_ABS", "") or 1e307)
+                    low_ok = isinstance(clip_low_y, torch.Tensor) and bool(torch.isfinite(clip_low_y).all().item()) and bool((clip_low_y.abs() < ext_abs).all().item())
+                    high_ok = isinstance(clip_high_y, torch.Tensor) and bool(torch.isfinite(clip_high_y).all().item()) and bool((clip_high_y.abs() < ext_abs).all().item())
+                except Exception:
+                    low_ok = False
+                    high_ok = False
+                if (not low_ok or not high_ok) and isinstance(y_min_obs, torch.Tensor) and isinstance(y_max_obs, torch.Tensor):
+                    if not low_ok:
+                        clip_low_y = y_min_obs.to(device=device, dtype=torch.float64)
+                        with contextlib.suppress(Exception):
+                            t0 = getattr(scaler, "y_min")
+                            v0 = clip_low_y.to(device=t0.device, dtype=t0.dtype)
+                            t0.resize_(v0.shape).copy_(v0)
+                    if not high_ok:
+                        clip_high_y = y_max_obs.to(device=device, dtype=torch.float64)
+                        with contextlib.suppress(Exception):
+                            t1 = getattr(scaler, "y_max")
+                            v1 = clip_high_y.to(device=t1.device, dtype=t1.dtype)
+                            t1.resize_(v1.shape).copy_(v1)
+
                 try:
                     use_quant = bool(getattr(model_for_scaler, "delta_gate_bounds_use_quantile", False))
                 except Exception:
@@ -4780,10 +4917,11 @@ def infer(
                     ):
                         try:
                             import torch._inductor.config as _icfg
-                            _LOGGER.error(
-                                "[infer] inductor cudagraph_trees assertion hit; retrying with triton.cudagraph_trees=0 (keep cudagraphs). "
-                                "Set ENN_PRED_RETRY_ON_CUDAGRAPH_TREES_ASSERT=0 to disable."
-                            )
+                            if env_bool("ENN_PRED_LOG_CUDAGRAPH_RECOVERY", default=False):
+                                _LOGGER.error(
+                                    "[infer] inductor cudagraph_trees assertion hit; retrying with triton.cudagraph_trees=0 (keep cudagraphs). "
+                                    "Set ENN_PRED_RETRY_ON_CUDAGRAPH_TREES_ASSERT=0 to disable."
+                                )
                             with _icfg.patch({"triton.cudagraph_trees": False}):
                                 return _invoke_predict(m)
                         except Exception:
@@ -4793,10 +4931,11 @@ def infer(
                     ):
                         try:
                             import torch._inductor.config as _icfg
-                            _LOGGER.error(
-                                "[infer] inductor cudagraph_trees assertion persists; retrying with triton.cudagraphs=0 (no cudagraph capture, keep compile). "
-                                "Set ENN_PRED_RETRY_ON_CUDAGRAPH_DISABLE_ASSERT=0 to disable."
-                            )
+                            if env_bool("ENN_PRED_LOG_CUDAGRAPH_RECOVERY", default=False):
+                                _LOGGER.error(
+                                    "[infer] inductor cudagraph_trees assertion persists; retrying with triton.cudagraphs=0 (no cudagraph capture, keep compile). "
+                                    "Set ENN_PRED_RETRY_ON_CUDAGRAPH_DISABLE_ASSERT=0 to disable."
+                                )
                             with _icfg.patch(
                                 {"triton.cudagraph_trees": False, "triton.cudagraphs": False}
                             ):
@@ -4812,10 +4951,11 @@ def infer(
                     if is_cg_trees:
                         if bool(force_uncompiled) and bool(force_eager):
                             raise
-                        _LOGGER.error(
-                            "[infer] inductor cudagraph assertion hit; falling back to eager (disable compiled submodules). "
-                            "Set ENN_PRED_FALLBACK_ON_CUDAGRAPH_ASSERT=0 to disable."
-                        )
+                        if env_bool("ENN_PRED_LOG_CUDAGRAPH_RECOVERY", default=False):
+                            _LOGGER.error(
+                                "[infer] inductor cudagraph assertion hit; falling back to eager (disable compiled submodules). "
+                                "Set ENN_PRED_FALLBACK_ON_CUDAGRAPH_ASSERT=0 to disable."
+                            )
                         force_uncompiled = True
                         force_eager = True
                         mm_fb = (
