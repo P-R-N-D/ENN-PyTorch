@@ -799,6 +799,7 @@ def _try_load_dir_checkpoint_fallback_pt(
     pt_path: Path,
     map_location: TorchDeviceLike | None,
     mmap: bool | None,
+    rebuild_tasks: bool = False,
 ) -> bool:
     if not pt_path.is_file():
         return False
@@ -809,20 +810,21 @@ def _try_load_dir_checkpoint_fallback_pt(
         mmap=mmap,
     )
 
-    side_meta: Mapping[str, Any] | None = None
-    with contextlib.suppress(Exception):
-        side_meta = _read_pt_sidecar_meta(pt_path)
-    if isinstance(side_meta, Mapping):
+    if rebuild_tasks:
+        side_meta: Mapping[str, Any] | None = None
         with contextlib.suppress(Exception):
-            tasks = side_meta.get("tasks")
-            if tasks:
-                tgt = model
-                wrapped = getattr(model, "module", None)
-                if isinstance(wrapped, torch.nn.Module):
-                    tgt = wrapped
-                rebuild = getattr(tgt, "rebuild_tasks_from_specs", None)
-                if callable(rebuild):
-                    rebuild(tasks)
+            side_meta = _read_pt_sidecar_meta(pt_path)
+        if isinstance(side_meta, Mapping):
+            with contextlib.suppress(Exception):
+                tasks = side_meta.get("tasks")
+                if tasks:
+                    tgt = model
+                    wrapped = getattr(model, "module", None)
+                    if isinstance(wrapped, torch.nn.Module):
+                        tgt = wrapped
+                    rebuild = getattr(tgt, "rebuild_tasks_from_specs", None)
+                    if callable(rebuild):
+                        rebuild(tasks)
 
     sd = None
     if isinstance(obj, dict):
@@ -1883,6 +1885,7 @@ def load_weights(
                     pt_path=(p / "model.pt"),
                     map_location=map_location,
                     mmap=mmap,
+                    rebuild_tasks=bool(rebuild_tasks),
                 ):
                     return meta if isinstance(meta, dict) else None
                 raise
@@ -2378,6 +2381,7 @@ def load_model(
                     pt_path=(p / "model.pt"),
                     map_location=map_location,
                     mmap=mmap,
+                    rebuild_tasks=True,
                 ):
                     _diag_nonfinite_after_load(model, where="dcp_dir_fallback_pt")
                     return model
