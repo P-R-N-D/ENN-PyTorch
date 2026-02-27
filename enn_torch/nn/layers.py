@@ -2552,16 +2552,16 @@ class Scaler(nn.Module):
         self.register_buffer("y_mean", torch.zeros(1, dtype=torch.float64))
         self.register_buffer("y_std", torch.ones(1, dtype=torch.float64))
         self.register_buffer(
-            "y_min", torch.full((1,), float("-inf"), dtype=torch.float64)
+            "y_min", torch.full((1,), torch.finfo(torch.float64).min, dtype=torch.float64)
         )
         self.register_buffer(
-            "y_max", torch.full((1,), float("inf"), dtype=torch.float64)
+            "y_max", torch.full((1,), torch.finfo(torch.float64).max, dtype=torch.float64)
         )
         self.register_buffer(
-            "y_q_low", torch.full((1,), float("-inf"), dtype=torch.float64)
+            "y_q_low", torch.full((1,), torch.finfo(torch.float64).min, dtype=torch.float64)
         )
         self.register_buffer(
-            "y_q_high", torch.full((1,), float("inf"), dtype=torch.float64)
+            "y_q_high", torch.full((1,), torch.finfo(torch.float64).max, dtype=torch.float64)
         )
         self.register_buffer("affine_a", torch.ones(1, dtype=torch.float64))
         self.register_buffer("affine_b", torch.zeros(1, dtype=torch.float64))
@@ -2570,10 +2570,10 @@ class Scaler(nn.Module):
         self.register_buffer("y_out_scale", torch.ones(1, dtype=torch.float64))
         self.register_buffer("y_out_bias", torch.zeros(1, dtype=torch.float64))
         self.register_buffer(
-            "y_out_clip_low", torch.full((1,), float("-inf"), dtype=torch.float64)
+            "y_out_clip_low", torch.full((1,), torch.finfo(torch.float64).min, dtype=torch.float64)
         )
         self.register_buffer(
-            "y_out_clip_high", torch.full((1,), float("inf"), dtype=torch.float64)
+            "y_out_clip_high", torch.full((1,), torch.finfo(torch.float64).max, dtype=torch.float64)
         )
         self.output_ab_enabled: bool = False
         self._stats_cache_lock = Mutex()
@@ -2750,6 +2750,66 @@ class Scaler(nn.Module):
             error_msgs,
         )
         self._invalidate_stats_cache()
+        with contextlib.suppress(Exception):
+            self._sanitize_nonfinite_bounds_inplace()
+
+    @torch.no_grad()
+    def _sanitize_nonfinite_bounds_inplace(self: Self) -> None:
+        BIG_MIN = torch.finfo(torch.float64).min
+        BIG_MAX = torch.finfo(torch.float64).max
+
+        def _fix(name: str, fill: float) -> None:
+            t = getattr(self, name, None)
+            if isinstance(t, torch.Tensor) and t.is_floating_point():
+                if t.numel() == 0:
+                    return
+                if not torch.isfinite(t).all():
+                    tt = t.detach().clone()
+                    bad = ~torch.isfinite(tt)
+                    if bad.any():
+                        tt[bad] = fill
+                        t.resize_(tt.shape).copy_(tt)
+
+        _fix("y_min", BIG_MIN)
+        _fix("y_max", BIG_MAX)
+        _fix("y_q_low", BIG_MIN)
+        _fix("y_q_high", BIG_MAX)
+        _fix("y_out_clip_low", BIG_MIN)
+        _fix("y_out_clip_high", BIG_MAX)
+        _fix("y_out_scale", 1.0)
+        _fix("y_out_bias", 0.0)
+
+        with contextlib.suppress(Exception):
+            if isinstance(self.y_min, torch.Tensor) and isinstance(self.y_max, torch.Tensor):
+                lo = self.y_min
+                hi = self.y_max
+                if lo.numel() == hi.numel() and lo.is_floating_point():
+                    swap = lo > hi
+                    if swap.any():
+                        lo2 = torch.minimum(lo, hi)
+                        hi2 = torch.maximum(lo, hi)
+                        self.y_min.resize_(lo2.shape).copy_(lo2)
+                        self.y_max.resize_(hi2.shape).copy_(hi2)
+            if isinstance(self.y_q_low, torch.Tensor) and isinstance(self.y_q_high, torch.Tensor):
+                lo = self.y_q_low
+                hi = self.y_q_high
+                if lo.numel() == hi.numel() and lo.is_floating_point():
+                    swap = lo > hi
+                    if swap.any():
+                        lo2 = torch.minimum(lo, hi)
+                        hi2 = torch.maximum(lo, hi)
+                        self.y_q_low.resize_(lo2.shape).copy_(lo2)
+                        self.y_q_high.resize_(hi2.shape).copy_(hi2)
+            if isinstance(self.y_out_clip_low, torch.Tensor) and isinstance(self.y_out_clip_high, torch.Tensor):
+                lo = self.y_out_clip_low
+                hi = self.y_out_clip_high
+                if lo.numel() == hi.numel() and lo.is_floating_point():
+                    swap = lo > hi
+                    if swap.any():
+                        lo2 = torch.minimum(lo, hi)
+                        hi2 = torch.maximum(lo, hi)
+                        self.y_out_clip_low.resize_(lo2.shape).copy_(lo2)
+                        self.y_out_clip_high.resize_(hi2.shape).copy_(hi2)
 
     def _update_stats_impl(
         self: Self,
@@ -3053,21 +3113,34 @@ class Scaler(nn.Module):
                 sc = 0.0
             if sc > 0.0:
                 scale = torch.clamp(scale, min=1.0 / sc, max=sc)
+        if not torch.isfinite(scale).all():
+            scale = torch.where(torch.isfinite(scale), scale, torch.ones_like(scale))
+        if not torch.isfinite(bias).all():
+            bias = torch.where(torch.isfinite(bias), bias, torch.zeros_like(bias))
+
         self.y_out_scale.resize_(scale.shape).copy_(scale)
         self.y_out_bias.resize_(bias.shape).copy_(bias)
 
         if clip_low is None:
-            lo = torch.full_like(scale, float("-inf"))
+            lo = torch.full_like(scale, torch.finfo(torch.float64).min)
         else:
             lo = torch.as_tensor(clip_low, dtype=torch.float64).reshape(-1)
         if clip_high is None:
-            hi = torch.full_like(scale, float("inf"))
+            hi = torch.full_like(scale, torch.finfo(torch.float64).max)
         else:
             hi = torch.as_tensor(clip_high, dtype=torch.float64).reshape(-1)
         if lo.numel() == 1 and scale.numel() != 1:
             lo = lo.expand_as(scale)
         if hi.numel() == 1 and scale.numel() != 1:
             hi = hi.expand_as(scale)
+        if not torch.isfinite(lo).all():
+            lo = torch.where(torch.isfinite(lo), lo, torch.full_like(lo, torch.finfo(torch.float64).min))
+        if not torch.isfinite(hi).all():
+            hi = torch.where(torch.isfinite(hi), hi, torch.full_like(hi, torch.finfo(torch.float64).max))
+        lo2 = torch.minimum(lo, hi)
+        hi2 = torch.maximum(lo, hi)
+        lo, hi = lo2, hi2
+
         self.y_out_clip_low.resize_(lo.shape).copy_(lo)
         self.y_out_clip_high.resize_(hi.shape).copy_(hi)
         self.output_ab_enabled = bool(enable)
@@ -3438,12 +3511,12 @@ class Recorder(nn.Module):
         )
         self.register_buffer(
             "sampled_x_min",
-            torch.full((1,), float("inf"), dtype=torch.float64),
+            torch.full((1,), torch.finfo(torch.float64).max, dtype=torch.float64),
             persistent=True,
         )
         self.register_buffer(
             "sampled_x_max",
-            torch.full((1,), float("-inf"), dtype=torch.float64),
+            torch.full((1,), torch.finfo(torch.float64).min, dtype=torch.float64),
             persistent=True,
         )
         self.register_buffer(
@@ -3458,12 +3531,12 @@ class Recorder(nn.Module):
         )
         self.register_buffer(
             "sampled_y_min",
-            torch.full((1,), float("inf"), dtype=torch.float64),
+            torch.full((1,), torch.finfo(torch.float64).max, dtype=torch.float64),
             persistent=True,
         )
         self.register_buffer(
             "sampled_y_max",
-            torch.full((1,), float("-inf"), dtype=torch.float64),
+            torch.full((1,), torch.finfo(torch.float64).min, dtype=torch.float64),
             persistent=True,
         )
         self.register_buffer(
@@ -3481,12 +3554,12 @@ class Recorder(nn.Module):
         )
         self.register_buffer(
             "reduced_x_min",
-            torch.full((1,), float("inf"), dtype=torch.float64),
+            torch.full((1,), torch.finfo(torch.float64).max, dtype=torch.float64),
             persistent=True,
         )
         self.register_buffer(
             "reduced_x_max",
-            torch.full((1,), float("-inf"), dtype=torch.float64),
+            torch.full((1,), torch.finfo(torch.float64).min, dtype=torch.float64),
             persistent=True,
         )
         self.register_buffer(
@@ -3501,12 +3574,12 @@ class Recorder(nn.Module):
         )
         self.register_buffer(
             "reduced_y_min",
-            torch.full((1,), float("inf"), dtype=torch.float64),
+            torch.full((1,), torch.finfo(torch.float64).max, dtype=torch.float64),
             persistent=True,
         )
         self.register_buffer(
             "reduced_y_max",
-            torch.full((1,), float("-inf"), dtype=torch.float64),
+            torch.full((1,), torch.finfo(torch.float64).min, dtype=torch.float64),
             persistent=True,
         )
         self._global_step: int = 0
