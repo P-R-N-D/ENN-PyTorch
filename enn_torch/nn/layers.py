@@ -2552,16 +2552,16 @@ class Scaler(nn.Module):
         self.register_buffer("y_mean", torch.zeros(1, dtype=torch.float64))
         self.register_buffer("y_std", torch.ones(1, dtype=torch.float64))
         self.register_buffer(
-            "y_min", torch.full((1,), torch.finfo(torch.float64).min, dtype=torch.float64)
+            "y_min", torch.full((1,), float("-inf"), dtype=torch.float64)
         )
         self.register_buffer(
-            "y_max", torch.full((1,), torch.finfo(torch.float64).max, dtype=torch.float64)
+            "y_max", torch.full((1,), float("inf"), dtype=torch.float64)
         )
         self.register_buffer(
-            "y_q_low", torch.full((1,), torch.finfo(torch.float64).min, dtype=torch.float64)
+            "y_q_low", torch.full((1,), float("-inf"), dtype=torch.float64)
         )
         self.register_buffer(
-            "y_q_high", torch.full((1,), torch.finfo(torch.float64).max, dtype=torch.float64)
+            "y_q_high", torch.full((1,), float("inf"), dtype=torch.float64)
         )
         self.register_buffer("affine_a", torch.ones(1, dtype=torch.float64))
         self.register_buffer("affine_b", torch.zeros(1, dtype=torch.float64))
@@ -2770,10 +2770,10 @@ class Scaler(nn.Module):
                         tt[bad] = fill
                         t.resize_(tt.shape).copy_(tt)
 
-        _fix("y_min", BIG_MIN)
-        _fix("y_max", BIG_MAX)
-        _fix("y_q_low", BIG_MIN)
-        _fix("y_q_high", BIG_MAX)
+        _fix("y_min", float("-inf"))
+        _fix("y_max", float("inf"))
+        _fix("y_q_low", float("-inf"))
+        _fix("y_q_high", float("inf"))
         _fix("y_out_clip_low", BIG_MIN)
         _fix("y_out_clip_high", BIG_MAX)
         _fix("y_out_scale", 1.0)
