@@ -2570,10 +2570,12 @@ class Scaler(nn.Module):
         self.register_buffer("y_out_scale", torch.ones(1, dtype=torch.float64))
         self.register_buffer("y_out_bias", torch.zeros(1, dtype=torch.float64))
         self.register_buffer(
-            "y_out_clip_low", torch.full((1,), torch.finfo(torch.float64).min, dtype=torch.float64)
+            "y_out_clip_low",
+            torch.full((1,), float(torch.finfo(torch.float32).min), dtype=torch.float64),
         )
         self.register_buffer(
-            "y_out_clip_high", torch.full((1,), torch.finfo(torch.float64).max, dtype=torch.float64)
+            "y_out_clip_high",
+            torch.full((1,), float(torch.finfo(torch.float32).max), dtype=torch.float64),
         )
         self.output_ab_enabled: bool = False
         self._stats_cache_lock = Mutex()
@@ -2755,29 +2757,43 @@ class Scaler(nn.Module):
 
     @torch.no_grad()
     def _sanitize_nonfinite_bounds_inplace(self: Self) -> None:
-        BIG_MIN = torch.finfo(torch.float64).min
-        BIG_MAX = torch.finfo(torch.float64).max
+        BIG32_MIN = float(torch.finfo(torch.float32).min)
+        BIG32_MAX = float(torch.finfo(torch.float32).max)
+        EXTREME_ABS = float(os.environ.get("ENN_SCALER_BOUNDS_EXTREME_ABS", "") or 1e307)
 
-        def _fix(name: str, fill: float) -> None:
+        def _fix_bound(name: str, fill: float) -> None:
             t = getattr(self, name, None)
             if isinstance(t, torch.Tensor) and t.is_floating_point():
                 if t.numel() == 0:
                     return
-                if not torch.isfinite(t).all():
-                    tt = t.detach().clone()
-                    bad = ~torch.isfinite(tt)
-                    if bad.any():
-                        tt[bad] = fill
-                        t.resize_(tt.shape).copy_(tt)
+                tt = t.detach().clone()
+                bad = (~torch.isfinite(tt)) | (tt.abs() >= EXTREME_ABS)
+                if bad.any():
+                    tt[bad] = fill
+                    t.resize_(tt.shape).copy_(tt)
 
-        _fix("y_min", float("-inf"))
-        _fix("y_max", float("inf"))
-        _fix("y_q_low", float("-inf"))
-        _fix("y_q_high", float("inf"))
-        _fix("y_out_clip_low", BIG_MIN)
-        _fix("y_out_clip_high", BIG_MAX)
-        _fix("y_out_scale", 1.0)
-        _fix("y_out_bias", 0.0)
+        def _fix_finite(name: str, fill: float, clamp32: bool = False) -> None:
+            t = getattr(self, name, None)
+            if isinstance(t, torch.Tensor) and t.is_floating_point():
+                if t.numel() == 0:
+                    return
+                tt = t.detach().clone()
+                bad = ~torch.isfinite(tt)
+                if bad.any():
+                    tt[bad] = fill
+                if clamp32:
+                    tt = tt.clamp(min=BIG32_MIN, max=BIG32_MAX)
+                t.resize_(tt.shape).copy_(tt)
+
+        _fix_bound("y_min", float("-inf"))
+        _fix_bound("y_max", float("inf"))
+        _fix_bound("y_q_low", float("-inf"))
+        _fix_bound("y_q_high", float("inf"))
+
+        _fix_finite("y_out_scale", 1.0, clamp32=True)
+        _fix_finite("y_out_bias", 0.0, clamp32=True)
+        _fix_finite("y_out_clip_low", BIG32_MIN, clamp32=True)
+        _fix_finite("y_out_clip_high", BIG32_MAX, clamp32=True)
 
         with contextlib.suppress(Exception):
             if isinstance(self.y_min, torch.Tensor) and isinstance(self.y_max, torch.Tensor):
@@ -3055,6 +3071,11 @@ class Scaler(nn.Module):
         out = self._apply_affine_no_broadcast(zz, weight=scale, bias=bias)
         lo = self.y_out_clip_low.to(device=out.device, dtype=out.dtype)
         hi = self.y_out_clip_high.to(device=out.device, dtype=out.dtype)
+        if out.is_floating_point():
+            with contextlib.suppress(Exception):
+                finfo = torch.finfo(out.dtype)
+                lo = torch.where(torch.isfinite(lo), lo, out.new_tensor(float(finfo.min)))
+                hi = torch.where(torch.isfinite(hi), hi, out.new_tensor(float(finfo.max)))
         out = torch.minimum(torch.maximum(out, lo), hi)
         if z.is_floating_point() and out.dtype != input_dtype and self._should_restore_input_dtype(input_dtype):
             out = out.to(dtype=input_dtype)
@@ -3121,12 +3142,14 @@ class Scaler(nn.Module):
         self.y_out_scale.resize_(scale.shape).copy_(scale)
         self.y_out_bias.resize_(bias.shape).copy_(bias)
 
+        BIG32_MIN = float(torch.finfo(torch.float32).min)
+        BIG32_MAX = float(torch.finfo(torch.float32).max)
         if clip_low is None:
-            lo = torch.full_like(scale, torch.finfo(torch.float64).min)
+            lo = torch.full_like(scale, BIG32_MIN)
         else:
             lo = torch.as_tensor(clip_low, dtype=torch.float64).reshape(-1)
         if clip_high is None:
-            hi = torch.full_like(scale, torch.finfo(torch.float64).max)
+            hi = torch.full_like(scale, BIG32_MAX)
         else:
             hi = torch.as_tensor(clip_high, dtype=torch.float64).reshape(-1)
         if lo.numel() == 1 and scale.numel() != 1:
@@ -3134,9 +3157,11 @@ class Scaler(nn.Module):
         if hi.numel() == 1 and scale.numel() != 1:
             hi = hi.expand_as(scale)
         if not torch.isfinite(lo).all():
-            lo = torch.where(torch.isfinite(lo), lo, torch.full_like(lo, torch.finfo(torch.float64).min))
+            lo = torch.where(torch.isfinite(lo), lo, torch.full_like(lo, BIG32_MIN))
         if not torch.isfinite(hi).all():
-            hi = torch.where(torch.isfinite(hi), hi, torch.full_like(hi, torch.finfo(torch.float64).max))
+            hi = torch.where(torch.isfinite(hi), hi, torch.full_like(hi, BIG32_MAX))
+        lo = lo.clamp(min=BIG32_MIN, max=BIG32_MAX)
+        hi = hi.clamp(min=BIG32_MIN, max=BIG32_MAX)
         lo2 = torch.minimum(lo, hi)
         hi2 = torch.maximum(lo, hi)
         lo, hi = lo2, hi2

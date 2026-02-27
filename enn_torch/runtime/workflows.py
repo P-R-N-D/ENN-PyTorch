@@ -1897,7 +1897,14 @@ def load_weights(
         if bool(torch.isnan(t).any().item()):
             return False
         if allow_scaler_inf:
-            if n.endswith("scaler.y_min") or n.endswith("scaler.y_max") or n.endswith("scaler.y_q_low") or n.endswith("scaler.y_q_high"):
+            if (
+                n.endswith("scaler.y_min")
+                or n.endswith("scaler.y_max")
+                or n.endswith("scaler.y_q_low")
+                or n.endswith("scaler.y_q_high")
+                or n.endswith("scaler.y_out_clip_low")
+                or n.endswith("scaler.y_out_clip_high")
+            ):
                 return bool(torch.isinf(t).all().item())
         if allow_logger_inf:
             if (("logger.sampled_" in n) or ("logger.reduced_" in n)) and (n.endswith("_min") or n.endswith("_max")):
