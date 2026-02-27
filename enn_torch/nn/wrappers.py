@@ -659,6 +659,9 @@ class Template(nn.Module):
         nhead: int,
         depth: int,
         *args: Any,
+        name: Optional[str] = None,
+        submodel_name: Optional[str] = None,
+        submodel: Optional[nn.Module] = None,
         mode: str = "spatial",
         mlp_ratio: float = 4.0,
         dropout: float = 0.0,
@@ -672,6 +675,9 @@ class Template(nn.Module):
     ) -> None:
         super().__init__()
         del args, kwargs
+        self.template_name: str = self._coerce_template_name(name)
+        self.submodel_name: str = self._coerce_submodel_name(submodel_name)
+        self._submodel_attr: str = ""
         self.in_dim = int(in_dim)
         self.tokens = max(1, int(tokens))
         self.d_model = int(d_model)
@@ -716,6 +722,9 @@ class Template(nn.Module):
         self._ckpt_enabled = bool(ckpt_enabled)
         self._ckpt_min_bytes = int(ckpt_min_bytes)
 
+        if submodel is not None:
+            self.attach_submodel(submodel, name=self.submodel_name or None)
+
     @staticmethod
     def _coerce_mode(mode: str) -> str:
         m = str(mode or "spatial").strip().lower()
@@ -726,6 +735,65 @@ class Template(nn.Module):
         raise ValueError(
             f"Unknown mode '{mode}' (expected 'spatial' or 'temporal')"
         )
+
+    @staticmethod
+    def _coerce_key_name(name: object) -> str:
+        s = "" if name is None else str(name)
+        s = s.replace("\r", "").replace("\n", "").strip()
+        if "." in s:
+            s = s.replace(".", "_")
+        return s
+
+    @classmethod
+    def _coerce_template_name(cls, name: object) -> str:
+        s = cls._coerce_key_name(name)
+        if s.lower().startswith("template_"):
+            s = s[len("template_") :]
+        return s
+
+    @classmethod
+    def _coerce_submodel_name(cls, name: object) -> str:
+        s = cls._coerce_key_name(name)
+        if s.lower().startswith("submodel_"):
+            s = s[len("submodel_") :]
+        return s
+
+    def attach_submodel(
+        self: Self, submodel: nn.Module, *, name: Optional[str] = None
+    ) -> str:
+        if not isinstance(submodel, nn.Module):
+            raise TypeError("submodel must be an nn.Module")
+        nm = self._coerce_submodel_name(self.submodel_name if name is None else name)
+        if not nm:
+            nm = "byom"
+        attr = f"submodel_{nm}"
+        if self._submodel_attr and self._submodel_attr != attr:
+            self.detach_submodel()
+        setattr(self, attr, submodel)
+        self._submodel_attr = attr
+        self.submodel_name = nm
+        return attr
+
+    def detach_submodel(self: Self) -> None:
+        attr = str(getattr(self, "_submodel_attr", "") or "")
+        if not attr:
+            return
+        with contextlib.suppress(Exception):
+            if hasattr(self, "_modules") and attr in getattr(self, "_modules", {}):
+                del self._modules[attr]
+        with contextlib.suppress(Exception):
+            delattr(self, attr)
+        self._submodel_attr = ""
+
+    def get_submodel(self: Self) -> Optional[nn.Module]:
+        attr = str(getattr(self, "_submodel_attr", "") or "")
+        if not attr:
+            return None
+        sm = getattr(self, attr, None)
+        return sm if isinstance(sm, nn.Module) else None
+
+    def has_submodel(self: Self) -> bool:
+        return self.get_submodel() is not None
 
     def set_mode(self: Self, mode: str) -> None:
         self.mode = self._coerce_mode(mode)
@@ -1142,6 +1210,17 @@ class SubFuser(nn.Module):
             "SubFuser is a topology node and must be executed via Fuser.forward()"
         )
 class Fuser(nn.Module):
+    _TEMPLATE_PREFIX = "template_"
+    _SUBFUSER_PREFIX = "subfuser_"
+
+    @classmethod
+    def _strip_task_prefix(cls, name: object) -> str:
+        s = "" if name is None else str(name)
+        for p in (cls._TEMPLATE_PREFIX, cls._SUBFUSER_PREFIX):
+            if s.startswith(p):
+                return s[len(p) :]
+        return s
+
     def __init__(
         self: Self,
         in_dim: int,
@@ -1537,11 +1616,17 @@ class Fuser(nn.Module):
         return s
 
     def _generate_unique_uuid_name(
-        self: Self, *args: Any, exclude: Optional[str] = None
+        self: Self,
+        *args: Any,
+        exclude: Optional[str] = None,
+        prefix: Optional[str] = None,
     ) -> str:
         exclude = str(exclude) if exclude is not None else None
+        pref = "" if prefix is None else str(prefix)
         while True:
             candidate = uuid.uuid4().hex
+            if pref:
+                candidate = pref + candidate
             if exclude is not None and candidate == exclude:
                 continue
             if candidate not in self.tasks:
@@ -1552,14 +1637,18 @@ class Fuser(nn.Module):
         preferred: object,
         *args: Any,
         exclude: Optional[str] = None,
+        prefix: Optional[str] = None,
     ) -> str:
         candidate = self._normalize_task_name(preferred)
+        pref = "" if prefix is None else str(prefix)
+        if pref and candidate and (not candidate.startswith(pref)):
+            candidate = pref + candidate
         if not candidate:
-            return self._generate_unique_uuid_name(exclude=exclude)
+            return self._generate_unique_uuid_name(exclude=exclude, prefix=pref or None)
         if exclude is not None and candidate == exclude:
             return candidate
         if candidate in self.tasks:
-            return self._generate_unique_uuid_name(exclude=exclude)
+            return self._generate_unique_uuid_name(exclude=exclude, prefix=pref or None)
         return candidate
 
     def _topology_guard(self: Self) -> contextlib.AbstractContextManager[object]:
@@ -1688,8 +1777,11 @@ class Fuser(nn.Module):
 
     def get_submodel(self: Self, task_spec: str) -> Optional[nn.Module]:
         key = self.resolve_task_name(task_spec)
-        sm = self._user_submodels.get(key)
-        return sm if isinstance(sm, nn.Module) else None
+        mod = self.tasks.get(key)
+        if isinstance(mod, Template):
+            sm = mod.get_submodel()
+            return sm if isinstance(sm, nn.Module) else None
+        return None
 
     def get(
         self: Self, task_spec: str, default: Optional[nn.Module] = None
@@ -1968,13 +2060,23 @@ class Fuser(nn.Module):
                     }
                 )
             else:
+                has_sm = False
+                sm_name = ""
+                tpl_name = ""
+                if isinstance(t, Template):
+                    tpl_name = str(getattr(t, "template_name", "") or "")
+                    has_sm = bool(t.has_submodel())
+                    if has_sm:
+                        sm_name = str(getattr(t, "submodel_name", "") or "")
                 base.update(
                     {
                         "type": "task",
                         "mode": str(getattr(t, "mode", "spatial")),
                         "tokens": int(getattr(t, "tokens", 1)),
                         "depth": int(getattr(t, "depth", 1)),
-                        "has_submodel": bool(name in self._user_submodels),
+                        "template_name": tpl_name,
+                        "has_submodel": bool(has_sm),
+                        "submodel_name": sm_name,
                     }
                 )
             specs.append(base)
@@ -2063,7 +2165,9 @@ class Fuser(nn.Module):
             orig_norm = self._normalize_task_name(preferred_name)
 
             if stype in {"taskset", "subfuser"}:
-                nm = self._ensure_unique_task_name(preferred_name)
+                nm = self._ensure_unique_task_name(
+                    preferred_name, prefix=self._SUBFUSER_PREFIX
+                )
                 node = SubFuser(
                     tokens=int(self.fused_tokens),
                     children=None,
@@ -2088,7 +2192,20 @@ class Fuser(nn.Module):
                 }
                 self._root_children.append(nm)
                 self._parent[nm] = None
-                name_map[orig_norm or nm] = nm
+                with contextlib.suppress(Exception):
+                    if orig_norm:
+                        self._legacy_task_id_to_name.setdefault(orig_norm, nm)
+                        s = self._normalize_task_name(
+                            self._strip_task_prefix(orig_norm)
+                        )
+                        if s and s != orig_norm:
+                            self._legacy_task_id_to_name.setdefault(s, nm)
+                if orig_norm:
+                    name_map[orig_norm] = nm
+                    s = self._normalize_task_name(self._strip_task_prefix(orig_norm))
+                    if s and s not in name_map:
+                        name_map[s] = nm
+                name_map.setdefault(nm, nm)
                 pending_children[nm] = [
                     self._normalize_task_name(x)
                     for x in (spec.get("children") or [])
@@ -2112,7 +2229,12 @@ class Fuser(nn.Module):
                 depth=spec.get("depth"),
                 parent=None,
             )
-            name_map[orig_norm or final_name] = final_name
+            if orig_norm:
+                name_map[orig_norm] = final_name
+                s = self._normalize_task_name(self._strip_task_prefix(orig_norm))
+                if s and s not in name_map:
+                    name_map[s] = final_name
+            name_map.setdefault(final_name, final_name)
             for lid in legacy_ids:
                 lid_norm = self._normalize_task_name(lid)
                 if lid_norm and lid_norm != final_name:
@@ -2180,6 +2302,7 @@ class Fuser(nn.Module):
         weight: float = 1.0,
         eps: float = 1e-6,
         submodel: Optional[nn.Module] = None,
+        submodel_name: Optional[str] = None,
         tokens: Optional[int] = None,
         depth: Optional[int] = None,
         parent: Optional[str] = None,
@@ -2189,7 +2312,9 @@ class Fuser(nn.Module):
         preferred = name
         if preferred is None or not str(preferred).strip():
             preferred = task_id
-        nm = self._ensure_unique_task_name(preferred)
+        nm = self._ensure_unique_task_name(
+            preferred, prefix=self._TEMPLATE_PREFIX
+        )
         if tokens is None:
             tokens = int(
                 self.spatial_tokens
@@ -2209,6 +2334,9 @@ class Fuser(nn.Module):
             self.d_model,
             self.nhead,
             int(depth),
+            name=self._strip_task_prefix(nm),
+            submodel_name=submodel_name,
+            submodel=submodel,
             mode=mode,
             mlp_ratio=self.mlp_ratio,
             dropout=self.dropout,
@@ -2233,8 +2361,20 @@ class Fuser(nn.Module):
             "description": str(description) if description is not None else "",
             "tags": tags_list,
         }
-        if submodel is not None:
-            self._user_submodels[nm] = submodel
+        with contextlib.suppress(Exception):
+            base = self._normalize_task_name(preferred)
+            if base:
+                self._legacy_task_id_to_name.setdefault(base, nm)
+                stripped = self._normalize_task_name(self._strip_task_prefix(base))
+                if stripped and stripped != base:
+                    self._legacy_task_id_to_name.setdefault(stripped, nm)
+            if task_id is not None and str(task_id).strip():
+                tid = self._normalize_task_name(task_id)
+                if tid:
+                    self._legacy_task_id_to_name.setdefault(tid, nm)
+                    stripped = self._normalize_task_name(self._strip_task_prefix(tid))
+                    if stripped and stripped != tid:
+                        self._legacy_task_id_to_name.setdefault(stripped, nm)
         parent_key: Optional[str] = None
         if parent is not None and str(parent).strip():
             parent_key = self.resolve_task_name(str(parent))
@@ -2253,6 +2393,7 @@ class Fuser(nn.Module):
         description: object = _META_UNSET,
         tags: object = _META_UNSET,
         submodel: object = _SUBMODEL_UNSET,
+        submodel_name: object = _META_UNSET,
         weight: object = _META_UNSET,
         eps: object = _META_UNSET,
     ) -> str:
@@ -2285,22 +2426,42 @@ class Fuser(nn.Module):
                     if s and s not in tags_list:
                         tags_list.append(s)
             meta["tags"] = tags_list
-        if submodel is not _SUBMODEL_UNSET:
-            if submodel is None:
-                self._user_submodels.pop(key, None)
-            else:
-                self._user_submodels[key] = submodel
+        if isinstance(tmpl, Template):
+            if submodel_name is not _META_UNSET:
+                nm = None if submodel_name is None else str(submodel_name)
+                if tmpl.has_submodel():
+                    sm0 = tmpl.get_submodel()
+                    if sm0 is not None:
+                        tmpl.attach_submodel(sm0, name=nm)
+                    else:
+                        tmpl.submodel_name = Template._coerce_submodel_name(nm)
+                else:
+                    tmpl.submodel_name = Template._coerce_submodel_name(nm)
+            if submodel is not _SUBMODEL_UNSET:
+                if submodel is None:
+                    tmpl.detach_submodel()
+                else:
+                    nm = None
+                    if submodel_name is not _META_UNSET:
+                        nm = None if submodel_name is None else str(submodel_name)
+                    else:
+                        cur = str(getattr(tmpl, "submodel_name", "") or "").strip()
+                        nm = cur or None
+                    tmpl.attach_submodel(cast(nn.Module, submodel), name=nm)
         if name is not _META_UNSET:
-            new_key = self._ensure_unique_task_name(name, exclude=key)
+            new_key = self._ensure_unique_task_name(
+                name, exclude=key, prefix=self._TEMPLATE_PREFIX
+            )
             if new_key != key:
                 mod = self.tasks[key]
                 del self.tasks[key]
                 self.tasks[new_key] = mod
                 self._task_meta[new_key] = self._task_meta.pop(key, {})
-                if key in self._user_submodels:
-                    self._user_submodels[new_key] = self._user_submodels.pop(
-                        key
-                    )
+                if isinstance(mod, Template):
+                    with contextlib.suppress(Exception):
+                        mod.template_name = Template._coerce_template_name(
+                            self._strip_task_prefix(new_key)
+                        )
                 with self._topology_guard():
                     p = self._parent.pop(key, None)
                     self._parent[new_key] = p
@@ -2316,6 +2477,12 @@ class Fuser(nn.Module):
                 for lid, mapped in list(self._legacy_task_id_to_name.items()):
                     if mapped == key:
                         self._legacy_task_id_to_name[lid] = new_key
+                with contextlib.suppress(Exception):
+                    stripped = self._normalize_task_name(
+                        self._strip_task_prefix(new_key)
+                    )
+                    if stripped:
+                        self._legacy_task_id_to_name.setdefault(stripped, new_key)
                 if getattr(self, "stream_task_name", "") == key:
                     self.stream_task_name = new_key
                 if getattr(self, "stream_task_id", "") == key:
@@ -2346,9 +2513,12 @@ class Fuser(nn.Module):
                 self._detach_unlocked(key)
             self._parent.pop(key, None)
         if key in self.tasks:
+            with contextlib.suppress(Exception):
+                mod = self.tasks[key]
+                if isinstance(mod, Template):
+                    mod.detach_submodel()
             del self.tasks[key]
         self._task_meta.pop(key, None)
-        self._user_submodels.pop(key, None)
         for lid, mapped in list(self._legacy_task_id_to_name.items()):
             if mapped == key:
                 del self._legacy_task_id_to_name[lid]
@@ -2378,7 +2548,9 @@ class Fuser(nn.Module):
         preferred = name
         if preferred is None or not str(preferred).strip():
             preferred = task_id
-        nm = self._ensure_unique_task_name(preferred)
+        nm = self._ensure_unique_task_name(
+            preferred, prefix=self._SUBFUSER_PREFIX
+        )
         tok = int(self.fused_tokens if tokens is None else int(tokens))
         if int(tok) != int(self.fused_tokens):
             raise ValueError(
@@ -2405,6 +2577,20 @@ class Fuser(nn.Module):
             "description": str(description) if description is not None else "",
             "tags": tags_list,
         }
+        with contextlib.suppress(Exception):
+            base = self._normalize_task_name(preferred)
+            if base:
+                self._legacy_task_id_to_name.setdefault(base, nm)
+                stripped = self._normalize_task_name(self._strip_task_prefix(base))
+                if stripped and stripped != base:
+                    self._legacy_task_id_to_name.setdefault(stripped, nm)
+            if task_id is not None and str(task_id).strip():
+                tid = self._normalize_task_name(task_id)
+                if tid:
+                    self._legacy_task_id_to_name.setdefault(tid, nm)
+                    stripped = self._normalize_task_name(self._strip_task_prefix(tid))
+                    if stripped and stripped != tid:
+                        self._legacy_task_id_to_name.setdefault(stripped, nm)
         parent_key: Optional[str] = None
         if parent is not None and str(parent).strip():
             parent_key = self.resolve_task_name(str(parent))
@@ -2441,7 +2627,9 @@ class Fuser(nn.Module):
             self._task_meta[key] = meta
 
         if name is not _META_UNSET:
-            new_key = self._ensure_unique_task_name(name, exclude=key)
+            new_key = self._ensure_unique_task_name(
+                name, exclude=key, prefix=self._SUBFUSER_PREFIX
+            )
             if new_key != key:
                 mod = self.tasks[key]
                 del self.tasks[key]
@@ -2465,6 +2653,12 @@ class Fuser(nn.Module):
                 for lid, mapped in list(self._legacy_task_id_to_name.items()):
                     if mapped == key:
                         self._legacy_task_id_to_name[lid] = new_key
+                with contextlib.suppress(Exception):
+                    stripped = self._normalize_task_name(
+                        self._strip_task_prefix(new_key)
+                    )
+                    if stripped:
+                        self._legacy_task_id_to_name.setdefault(stripped, new_key)
                 if getattr(self, "stream_task_name", "") == key:
                     self.stream_task_name = new_key
                 if getattr(self, "stream_task_id", "") == key:
@@ -2608,7 +2802,6 @@ class Fuser(nn.Module):
                         self._detach_unlocked(n)
                     self._parent.pop(n, None)
                     if n in self.tasks:
-                        self._user_submodels.pop(n, None)
                         del self.tasks[n]
                     self._task_meta.pop(n, None)
                     for lid, mapped in list(self._legacy_task_id_to_name.items()):
@@ -2935,9 +3128,10 @@ class Fuser(nn.Module):
             ):
                 st_in: Optional[torch.Tensor] = None
                 if state_is_map:
-                    st_raw = cast(Mapping[str, object], temporal_state).get(
-                        str(name), None
-                    )
+                    st_map = cast(Mapping[str, object], temporal_state)
+                    st_raw = st_map.get(str(name), None)
+                    if st_raw is None:
+                        st_raw = st_map.get(self._strip_task_prefix(str(name)), None)
                     if st_raw is not None and not isinstance(st_raw, torch.Tensor):
                         raise TypeError(
                             f"temporal_state[{name!r}] must be a torch.Tensor or None; got {type(st_raw)}"
@@ -2956,6 +3150,9 @@ class Fuser(nn.Module):
                     if isinstance(st_out, torch.Tensor):
                         if state_is_map:
                             next_state_map[str(name)] = st_out
+                            alt = self._strip_task_prefix(str(name))
+                            if alt != str(name) and alt not in next_state_map:
+                                next_state_map[alt] = st_out
                         elif str(name) == str(getattr(self, "stream_task_id", "")):
                             next_state = st_out
                 else:
@@ -2975,7 +3172,7 @@ class Fuser(nn.Module):
                 raise TypeError(
                     f"Task '{name}' must return a torch.Tensor tokens (B,N,D); got {type(out_tokens)}"
                 )
-            sm = self._user_submodels.get(str(name))
+            sm = mod.get_submodel() if isinstance(mod, Template) else None
             if sm is not None:
                 out_tokens = sm(out_tokens)
                 if not isinstance(out_tokens, torch.Tensor):
@@ -3071,9 +3268,10 @@ class Fuser(nn.Module):
             ):
                 st_in: Optional[torch.Tensor] = None
                 if state_is_map:
-                    st_raw = cast(Mapping[str, object], temporal_state).get(
-                        str(name), None
-                    )
+                    st_map = cast(Mapping[str, object], temporal_state)
+                    st_raw = st_map.get(str(name), None)
+                    if st_raw is None:
+                        st_raw = st_map.get(self._strip_task_prefix(str(name)), None)
                     if st_raw is not None and not isinstance(
                         st_raw, torch.Tensor
                     ):
@@ -3094,6 +3292,9 @@ class Fuser(nn.Module):
                     if isinstance(st_out, torch.Tensor):
                         if state_is_map:
                             next_state_map[str(name)] = st_out
+                            alt = self._strip_task_prefix(str(name))
+                            if alt != str(name) and alt not in next_state_map:
+                                next_state_map[alt] = st_out
                         elif str(name) == str(
                             getattr(self, "stream_task_id", "")
                         ):
@@ -3114,7 +3315,7 @@ class Fuser(nn.Module):
                 raise TypeError(
                     f"Task '{name}' must return a torch.Tensor tokens (B,N,D); got {type(out_tokens)}"
                 )
-            sm = self._user_submodels.get(str(name))
+            sm = tmpl.get_submodel() if isinstance(tmpl, Template) else None
             if sm is not None:
                 out_tokens = sm(out_tokens)
                 if not isinstance(out_tokens, torch.Tensor):
@@ -3638,7 +3839,7 @@ class Fuser(nn.Module):
 
             if not isinstance(out_tokens, torch.Tensor):
                 raise TypeError(f"Task '{name}' must return a torch.Tensor")
-            sm = self._user_submodels.get(str(name))
+            sm = mod.get_submodel() if isinstance(mod, Template) else None
             if sm is not None:
                 out_tokens = sm(out_tokens)
                 if not isinstance(out_tokens, torch.Tensor):
@@ -6441,6 +6642,7 @@ class Model(nn.Module):
         weight: float = 1.0,
         eps: float = 1e-6,
         submodel: Optional[nn.Module] = None,
+        submodel_name: Optional[str] = None,
         tokens: Optional[int] = None,
         depth: Optional[int] = None,
         task_id: Optional[str] = None,
@@ -6455,6 +6657,7 @@ class Model(nn.Module):
             weight=weight,
             eps=eps,
             submodel=submodel,
+            submodel_name=submodel_name,
             task_id=task_id,
         )
 
@@ -6467,6 +6670,7 @@ class Model(nn.Module):
         description: object = _META_UNSET,
         tags: object = _META_UNSET,
         submodel: Union[torch.nn.Module, None, object] = _SUBMODEL_UNSET,
+        submodel_name: object = _META_UNSET,
         weight: object = _META_UNSET,
         eps: object = _META_UNSET,
     ) -> str:
@@ -6477,6 +6681,7 @@ class Model(nn.Module):
             description=description,
             tags=tags,
             submodel=submodel,
+            submodel_name=submodel_name,
             weight=weight,
             eps=eps,
         )
