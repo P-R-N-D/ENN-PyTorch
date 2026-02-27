@@ -3084,36 +3084,102 @@ def epochs(
     def _dist_all_reduce_min_(t: torch.Tensor) -> None:
         if not is_distributed():
             return
+        exc0: Exception | None = None
         try:
             torch.distributed.all_reduce(t, op=torch.distributed.ReduceOp.MIN)
             return
-        except Exception:
-            pass
+        except Exception as exc:
+            exc0 = exc
+
+        td = t
+        moved = False
         try:
-            if t.device.type == "cpu":
-                td = t.to(device=device)
+            backend = str(torch.distributed.get_backend() or "").lower()
+        except Exception:
+            backend = ""
+        if t.device.type == "cpu" and backend == "nccl":
+            try:
+                dev = device
+                if getattr(dev, "type", "cpu") != "cuda" and torch.cuda.is_available():
+                    dev = torch.device("cuda", torch.cuda.current_device())
+                td = t.to(device=dev)
+                moved = True
                 torch.distributed.all_reduce(td, op=torch.distributed.ReduceOp.MIN)
                 t.copy_(td.to(device="cpu"))
                 return
-        except Exception:
-            pass
+            except Exception as exc:
+                exc0 = exc
+
+        try:
+            if t.device.type == "cpu" and backend == "nccl" and not moved:
+                dev = device
+                if getattr(dev, "type", "cpu") != "cuda" and torch.cuda.is_available():
+                    dev = torch.device("cuda", torch.cuda.current_device())
+                td = t.to(device=dev)
+                moved = True
+            world = int(torch.distributed.get_world_size())
+            bufs = [torch.empty_like(td) for _ in range(world)]
+            torch.distributed.all_gather(bufs, td)
+            out = torch.stack(bufs, dim=0).min(dim=0).values
+            if moved:
+                t.copy_(out.to(device="cpu"))
+            else:
+                t.copy_(out)
+            return
+        except Exception as exc:
+            raise RuntimeError(
+                "[ENN] distributed calibration: failed to synchronize observed label MIN across ranks"
+            ) from (exc0 if exc0 is not None else exc)
 
     def _dist_all_reduce_max_(t: torch.Tensor) -> None:
         if not is_distributed():
             return
+        exc0: Exception | None = None
         try:
             torch.distributed.all_reduce(t, op=torch.distributed.ReduceOp.MAX)
             return
-        except Exception:
-            pass
+        except Exception as exc:
+            exc0 = exc
+
+        td = t
+        moved = False
         try:
-            if t.device.type == "cpu":
-                td = t.to(device=device)
+            backend = str(torch.distributed.get_backend() or "").lower()
+        except Exception:
+            backend = ""
+        if t.device.type == "cpu" and backend == "nccl":
+            try:
+                dev = device
+                if getattr(dev, "type", "cpu") != "cuda" and torch.cuda.is_available():
+                    dev = torch.device("cuda", torch.cuda.current_device())
+                td = t.to(device=dev)
+                moved = True
                 torch.distributed.all_reduce(td, op=torch.distributed.ReduceOp.MAX)
                 t.copy_(td.to(device="cpu"))
                 return
-        except Exception:
-            pass
+            except Exception as exc:
+                exc0 = exc
+
+        try:
+            if t.device.type == "cpu" and backend == "nccl" and not moved:
+                dev = device
+                if getattr(dev, "type", "cpu") != "cuda" and torch.cuda.is_available():
+                    dev = torch.device("cuda", torch.cuda.current_device())
+                td = t.to(device=dev)
+                moved = True
+            world = int(torch.distributed.get_world_size())
+            bufs = [torch.empty_like(td) for _ in range(world)]
+            torch.distributed.all_gather(bufs, td)
+            out = torch.stack(bufs, dim=0).max(dim=0).values
+            if moved:
+                t.copy_(out.to(device="cpu"))
+            else:
+                t.copy_(out)
+            return
+        except Exception as exc:
+            raise RuntimeError(
+                "[ENN] distributed calibration: failed to synchronize observed label MAX across ranks"
+            ) from (exc0 if exc0 is not None else exc)
 
     def _run_calibration(
         sum_x, sum_y, sum_x2, sum_xy, total_n: int, seen_batches: int, seen_samples: int
