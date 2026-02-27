@@ -642,6 +642,27 @@ def _parse_meta(p: PathLike) -> Mapping[str, Any]:
     return {}
 
 
+def _read_pt_sidecar_meta(p: Path) -> Mapping[str, Any] | None:
+    try:
+        cand1 = p.with_suffix(".meta.json")
+    except Exception:
+        cand1 = None
+    cand2 = None
+    with contextlib.suppress(Exception):
+        cand2 = p.with_name(p.name + ".meta.json")
+    for cand in (cand1, cand2):
+        if cand is None:
+            continue
+        try:
+            if cand.exists():
+                meta = read_json(cand)
+                if isinstance(meta, Mapping):
+                    return meta
+        except Exception:
+            continue
+    return None
+
+
 def _dcp_strict_load_enabled() -> bool:
     return env_bool(
         ("ENN_DCP_STRICT_LOAD", "ENN_CHECKPOINT_STRICT", "ENN_STRICT_LOAD"),
@@ -787,6 +808,21 @@ def _try_load_dir_checkpoint_fallback_pt(
         weights_only=True,
         mmap=mmap,
     )
+
+    side_meta: Mapping[str, Any] | None = None
+    with contextlib.suppress(Exception):
+        side_meta = _read_pt_sidecar_meta(pt_path)
+    if isinstance(side_meta, Mapping):
+        with contextlib.suppress(Exception):
+            tasks = side_meta.get("tasks")
+            if tasks:
+                tgt = model
+                wrapped = getattr(model, "module", None)
+                if isinstance(wrapped, torch.nn.Module):
+                    tgt = wrapped
+                rebuild = getattr(tgt, "rebuild_tasks_from_specs", None)
+                if callable(rebuild):
+                    rebuild(tasks)
 
     sd = None
     if isinstance(obj, dict):
@@ -1244,6 +1280,35 @@ def _save_model_checkpoint(
                         f"save_pt: {bad_k}"
                     )
         torch.save(pt_state, os.path.join(out_dir, "model.pt"))
+        with contextlib.suppress(Exception):
+            base = model
+            wrapped = getattr(model, "module", None)
+            if isinstance(wrapped, torch.nn.Module):
+                base = wrapped
+            meta_payload: dict[str, Any] = {
+                "format": "enn-model-meta-v1",
+                "created_time": float(time.time()),
+            }
+            in_dim0 = getattr(base, "in_dim", None)
+            out_shape0 = getattr(base, "out_shape", None)
+            if in_dim0 is not None:
+                with contextlib.suppress(Exception):
+                    meta_payload["in_dim"] = int(in_dim0)
+            if out_shape0 is not None:
+                with contextlib.suppress(Exception):
+                    meta_payload["out_shape"] = [int(x) for x in tuple(out_shape0)]
+            cfg0 = _extract_model_config_dict(base)
+            if isinstance(cfg0, dict) and cfg0:
+                meta_payload["config"] = cfg0
+            ts_fn = getattr(base, "task_specs", None)
+            if callable(ts_fn):
+                with contextlib.suppress(Exception):
+                    meta_payload["tasks"] = ts_fn()
+            collate.write_json(
+                os.path.join(out_dir, "model.meta.json"),
+                meta_payload,
+                indent=2,
+            )
     return m_sd
 
 
@@ -1769,6 +1834,11 @@ def load_weights(
 ) -> Mapping[str, Any] | None:
     p = Path(_normalize_windows_paste(checkpoint_path))
 
+    side_meta: Mapping[str, Any] | None = None
+    with contextlib.suppress(Exception):
+        if p.is_file() and p.suffix.lower() in (".pt", ".pth"):
+            side_meta = _read_pt_sidecar_meta(p)
+
     if p.is_dir():
         if _model_has_meta_or_fake_tensors(model):
             _materialize_module_to_device(model, map_location or "cpu")
@@ -1954,6 +2024,8 @@ def load_weights(
         if rebuild_tasks:
             with contextlib.suppress(Exception):
                 tasks = obj.get("tasks")
+                if (not tasks) and isinstance(side_meta, Mapping):
+                    tasks = side_meta.get("tasks")
                 if tasks:
                     model.rebuild_tasks_from_specs(tasks)
         for k in ("state_dict", "model_state_dict", "model", "model_sd", "weights", "model_weights"):
@@ -2237,6 +2309,10 @@ def load_model(
             raise RuntimeError(f"[ENN] load_model: non-finite parameters detected ({where}): {first_bad}")
 
     p = Path(_normalize_windows_paste(checkpoint_path))
+    side_meta: Mapping[str, Any] | None = None
+    with contextlib.suppress(Exception):
+        if p.is_file() and p.suffix.lower() in (".pt", ".pth"):
+            side_meta = _read_pt_sidecar_meta(p)
     load_dev = (
         torch.device(map_location)
         if map_location is not None
@@ -2449,6 +2525,8 @@ def load_model(
     model = new_model(use_in_dim, use_out_shape, use_config)
     with contextlib.suppress(Exception):
         tasks = obj.get("tasks") if isinstance(obj, dict) else None
+        if (not tasks) and isinstance(side_meta, Mapping):
+            tasks = side_meta.get("tasks")
         if tasks:
             model.rebuild_tasks_from_specs(tasks)
     sd = _coerce_state_dict(sd) if isinstance(sd, dict) else sd
@@ -2720,7 +2798,7 @@ def train(
                     _materialize_to_cpu(model)
             try:
                 load_weights(
-                    model, fallback, map_location="cpu", rebuild_tasks=False
+                    model, fallback, map_location="cpu", rebuild_tasks=True
                 )
             finally:
                 with contextlib.suppress(Exception):
@@ -2862,7 +2940,7 @@ def train(
                         restore_path,
                         map_location="cpu",
                         weights_only=True,
-                        rebuild_tasks=False,
+                        rebuild_tasks=True,
                     )
             except Exception:
                 pass
