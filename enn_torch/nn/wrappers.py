@@ -2156,156 +2156,156 @@ class Fuser(nn.Module):
     ) -> None:
         _dev = self._infer_any_device()
         setattr(self, "_rebuild_tasks_device", _dev)
-        self.tasks = nn.ModuleDict()
-        self._task_meta = {}
-        self._user_submodels = {}
-        self._legacy_task_id_to_name = {}
-        self._root_children = []
-        self._parent = {}
-        self._root_reduction = "mean"
-        self._exec_plan = None
-        if not specs:
-            self._init_default_tasks()
-            self._resolve_stream_task_id()
-            with contextlib.suppress(Exception):
-                delattr(self, "_rebuild_tasks_device")
-            return
-        roots_override: Optional[list[str]] = None
-        name_map: dict[str, str] = {}
-        pending_children: dict[str, list[str]] = {}
-        for spec in specs:
-            if not isinstance(spec, dict):
-                continue
-            stype = str(spec.get("type") or "task").strip().lower()
-            if stype in {"__fuser__", "fuser", "root"}:
-                roots_raw = spec.get("roots")
-                if isinstance(roots_raw, (list, tuple)):
-                    roots_override = [self._normalize_task_name(x) for x in roots_raw]
-                red = str(spec.get("reduction") or "mean")
-                with contextlib.suppress(Exception):
-                    self._root_reduction = SubFuser._coerce_reduction(red)
-                continue
+        try:
+            self.tasks = nn.ModuleDict()
+            self._task_meta = {}
+            self._user_submodels = {}
+            self._legacy_task_id_to_name = {}
+            self._root_children = []
+            self._parent = {}
+            self._root_reduction = "mean"
+            self._exec_plan = None
+            if not specs:
+                self._init_default_tasks()
+                self._resolve_stream_task_id()
+                return
+            roots_override: Optional[list[str]] = None
+            name_map: dict[str, str] = {}
+            pending_children: dict[str, list[str]] = {}
+            for spec in specs:
+                if not isinstance(spec, dict):
+                    continue
+                stype = str(spec.get("type") or "task").strip().lower()
+                if stype in {"__fuser__", "fuser", "root"}:
+                    roots_raw = spec.get("roots")
+                    if isinstance(roots_raw, (list, tuple)):
+                        roots_override = [self._normalize_task_name(x) for x in roots_raw]
+                    red = str(spec.get("reduction") or "mean")
+                    with contextlib.suppress(Exception):
+                        self._root_reduction = SubFuser._coerce_reduction(red)
+                    continue
 
-            legacy_ids: list[str] = []
-            for k in ("task_id", "legacy_task_id", "id"):
-                v = spec.get(k)
-                if v is not None and str(v).strip():
-                    legacy_ids.append(str(v).strip())
-            preferred_name = spec.get("name")
-            if preferred_name is None or not str(preferred_name).strip():
-                preferred_name = legacy_ids[0] if legacy_ids else None
+                legacy_ids: list[str] = []
+                for k in ("task_id", "legacy_task_id", "id"):
+                    v = spec.get(k)
+                    if v is not None and str(v).strip():
+                        legacy_ids.append(str(v).strip())
+                preferred_name = spec.get("name")
+                if preferred_name is None or not str(preferred_name).strip():
+                    preferred_name = legacy_ids[0] if legacy_ids else None
 
-            orig_norm = self._normalize_task_name(preferred_name)
+                orig_norm = self._normalize_task_name(preferred_name)
 
-            if stype in {"taskset", "subfuser"}:
-                nm = self._ensure_unique_task_name(
-                    preferred_name, prefix=self._SUBFUSER_PREFIX
-                )
-                node = SubFuser(
-                    tokens=int(self.fused_tokens),
-                    children=None,
-                    reduction=str(spec.get("reduction") or "mean"),
-                    weight=float(spec.get("weight", 1.0)),
-                    eps=float(spec.get("eps", 1e-6)),
-                )
-                with contextlib.suppress(Exception):
-                    node.to(device=self._device_for_new_modules())
-                self.tasks[nm] = node
-                with contextlib.suppress(Exception):
-                    node._bind(self, nm)
-                tags_list: list[str] = []
-                raw_tags = spec.get("tags")
-                if raw_tags is not None:
-                    tags_iter = (raw_tags,) if isinstance(raw_tags, str) else raw_tags
-                    for t in tags_iter:
-                        s = str(t).strip()
-                        if s and s not in tags_list:
-                            tags_list.append(s)
-                self._task_meta[nm] = {
-                    "description": str(spec.get("description") or ""),
-                    "tags": tags_list,
-                }
-                self._root_children.append(nm)
-                self._parent[nm] = None
-                with contextlib.suppress(Exception):
+                if stype in {"taskset", "subfuser"}:
+                    nm = self._ensure_unique_task_name(
+                        preferred_name, prefix=self._SUBFUSER_PREFIX
+                    )
+                    node = SubFuser(
+                        tokens=int(self.fused_tokens),
+                        children=None,
+                        reduction=str(spec.get("reduction") or "mean"),
+                        weight=float(spec.get("weight", 1.0)),
+                        eps=float(spec.get("eps", 1e-6)),
+                    )
+                    with contextlib.suppress(Exception):
+                        node.to(device=self._device_for_new_modules())
+                    self.tasks[nm] = node
+                    with contextlib.suppress(Exception):
+                        node._bind(self, nm)
+                    tags_list: list[str] = []
+                    raw_tags = spec.get("tags")
+                    if raw_tags is not None:
+                        tags_iter = (raw_tags,) if isinstance(raw_tags, str) else raw_tags
+                        for t in tags_iter:
+                            s = str(t).strip()
+                            if s and s not in tags_list:
+                                tags_list.append(s)
+                    self._task_meta[nm] = {
+                        "description": str(spec.get("description") or ""),
+                        "tags": tags_list,
+                    }
+                    self._root_children.append(nm)
+                    self._parent[nm] = None
+                    with contextlib.suppress(Exception):
+                        if orig_norm:
+                            self._legacy_task_id_to_name.setdefault(orig_norm, nm)
+                            s = self._normalize_task_name(
+                                self._strip_task_prefix(orig_norm)
+                            )
+                            if s and s != orig_norm:
+                                self._legacy_task_id_to_name.setdefault(s, nm)
                     if orig_norm:
-                        self._legacy_task_id_to_name.setdefault(orig_norm, nm)
-                        s = self._normalize_task_name(
-                            self._strip_task_prefix(orig_norm)
-                        )
-                        if s and s != orig_norm:
-                            self._legacy_task_id_to_name.setdefault(s, nm)
+                        name_map[orig_norm] = nm
+                        s = self._normalize_task_name(self._strip_task_prefix(orig_norm))
+                        if s and s not in name_map:
+                            name_map[s] = nm
+                    name_map.setdefault(nm, nm)
+                    pending_children[nm] = [
+                        self._normalize_task_name(x)
+                        for x in (spec.get("children") or [])
+                        if x is not None and str(x).strip()
+                    ]
+                    for lid in legacy_ids:
+                        lid_norm = self._normalize_task_name(lid)
+                        if lid_norm and lid_norm != nm:
+                            self._legacy_task_id_to_name[lid_norm] = nm
+                    continue
+
+                final_name = self.add_task(
+                    preferred_name,
+                    mode=spec.get("mode", "spatial"),
+                    description=spec.get("description"),
+                    tags=spec.get("tags"),
+                    weight=spec.get("weight", 1.0),
+                    eps=spec.get("eps", 1e-6),
+                    submodel=None,
+                    tokens=spec.get("tokens"),
+                    depth=spec.get("depth"),
+                    parent=None,
+                )
                 if orig_norm:
-                    name_map[orig_norm] = nm
+                    name_map[orig_norm] = final_name
                     s = self._normalize_task_name(self._strip_task_prefix(orig_norm))
                     if s and s not in name_map:
-                        name_map[s] = nm
-                name_map.setdefault(nm, nm)
-                pending_children[nm] = [
-                    self._normalize_task_name(x)
-                    for x in (spec.get("children") or [])
-                    if x is not None and str(x).strip()
-                ]
+                        name_map[s] = final_name
+                name_map.setdefault(final_name, final_name)
                 for lid in legacy_ids:
                     lid_norm = self._normalize_task_name(lid)
-                    if lid_norm and lid_norm != nm:
-                        self._legacy_task_id_to_name[lid_norm] = nm
-                continue
+                    if lid_norm and lid_norm != final_name:
+                        self._legacy_task_id_to_name[lid_norm] = final_name
 
-            final_name = self.add_task(
-                preferred_name,
-                mode=spec.get("mode", "spatial"),
-                description=spec.get("description"),
-                tags=spec.get("tags"),
-                weight=spec.get("weight", 1.0),
-                eps=spec.get("eps", 1e-6),
-                submodel=None,
-                tokens=spec.get("tokens"),
-                depth=spec.get("depth"),
-                parent=None,
-            )
-            if orig_norm:
-                name_map[orig_norm] = final_name
-                s = self._normalize_task_name(self._strip_task_prefix(orig_norm))
-                if s and s not in name_map:
-                    name_map[s] = final_name
-            name_map.setdefault(final_name, final_name)
-            for lid in legacy_ids:
-                lid_norm = self._normalize_task_name(lid)
-                if lid_norm and lid_norm != final_name:
-                    self._legacy_task_id_to_name[lid_norm] = final_name
-
-        with self._topology_guard():
-            for ts_name, kids in pending_children.items():
-                if ts_name not in self.tasks:
-                    continue
-                ts = self.tasks[ts_name]
-                if not isinstance(ts, SubFuser):
-                    continue
-                ts._children = []
-                for child_raw in kids:
-                    c_norm = self._normalize_task_name(child_raw)
-                    c_key = name_map.get(c_norm, c_norm)
-                    if not c_key or c_key not in self.tasks:
+            with self._topology_guard():
+                for ts_name, kids in pending_children.items():
+                    if ts_name not in self.tasks:
                         continue
-                    if c_key == ts_name:
+                    ts = self.tasks[ts_name]
+                    if not isinstance(ts, SubFuser):
                         continue
-                    self._attach_unlocked(c_key, ts_name)
-            if roots_override:
-                desired: list[str] = []
-                for r in roots_override:
-                    rk = name_map.get(self._normalize_task_name(r), self._normalize_task_name(r))
-                    if rk in self.tasks and (self._parent.get(rk) is None) and (rk not in desired):
-                        desired.append(rk)
-                for r in list(self._root_children):
-                    if r in self.tasks and (self._parent.get(r) is None) and (r not in desired):
-                        desired.append(r)
-                self._root_children = desired
+                    ts._children = []
+                    for child_raw in kids:
+                        c_norm = self._normalize_task_name(child_raw)
+                        c_key = name_map.get(c_norm, c_norm)
+                        if not c_key or c_key not in self.tasks:
+                            continue
+                        if c_key == ts_name:
+                            continue
+                        self._attach_unlocked(c_key, ts_name)
+                if roots_override:
+                    desired: list[str] = []
+                    for r in roots_override:
+                        rk = name_map.get(self._normalize_task_name(r), self._normalize_task_name(r))
+                        if rk in self.tasks and (self._parent.get(rk) is None) and (rk not in desired):
+                            desired.append(rk)
+                    for r in list(self._root_children):
+                        if r in self.tasks and (self._parent.get(r) is None) and (r not in desired):
+                            desired.append(r)
+                    self._root_children = desired
 
-        self._resolve_stream_task_id()
-        self._invalidate_exec_plan()
-        with contextlib.suppress(Exception):
-            delattr(self, "_rebuild_tasks_device")
+            self._resolve_stream_task_id()
+            self._invalidate_exec_plan()
+        finally:
+            with contextlib.suppress(Exception):
+                delattr(self, "_rebuild_tasks_device")
 
     def remap_legacy_task_ids_in_state_dict(
         self: Self,
