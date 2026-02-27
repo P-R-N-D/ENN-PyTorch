@@ -773,6 +773,17 @@ class Template(nn.Module):
         if self._submodel_attr and self._submodel_attr != attr:
             self.detach_submodel()
         setattr(self, attr, submodel)
+        with contextlib.suppress(Exception):
+            dev: Optional[torch.device] = None
+            for p in self.parameters(recurse=False):
+                dev = p.device
+                break
+            if dev is None:
+                for b in self.buffers(recurse=False):
+                    dev = b.device
+                    break
+            if dev is not None:
+                cast(nn.Module, submodel).to(device=dev)
         self._submodel_attr = attr
         self.submodel_name = nm
         return attr
@@ -1215,6 +1226,21 @@ class SubFuser(nn.Module):
 class Fuser(nn.Module):
     _TEMPLATE_PREFIX = "template_"
     _SUBFUSER_PREFIX = "subfuser_"
+
+    def _infer_any_device(self: Self) -> torch.device:
+        with contextlib.suppress(Exception):
+            for p in self.parameters():
+                return p.device
+        with contextlib.suppress(Exception):
+            for b in self.buffers():
+                return b.device
+        return torch.device("cpu")
+
+    def _device_for_new_modules(self: Self) -> torch.device:
+        d = getattr(self, "_rebuild_tasks_device", None)
+        if isinstance(d, torch.device):
+            return d
+        return self._infer_any_device()
 
     @classmethod
     def _strip_task_prefix(cls, name: object) -> str:
@@ -2128,6 +2154,8 @@ class Fuser(nn.Module):
     def rebuild_tasks_from_specs(
         self: Self, specs: Sequence[Dict[str, Any]]
     ) -> None:
+        _dev = self._infer_any_device()
+        setattr(self, "_rebuild_tasks_device", _dev)
         self.tasks = nn.ModuleDict()
         self._task_meta = {}
         self._user_submodels = {}
@@ -2139,6 +2167,8 @@ class Fuser(nn.Module):
         if not specs:
             self._init_default_tasks()
             self._resolve_stream_task_id()
+            with contextlib.suppress(Exception):
+                delattr(self, "_rebuild_tasks_device")
             return
         roots_override: Optional[list[str]] = None
         name_map: dict[str, str] = {}
@@ -2178,6 +2208,8 @@ class Fuser(nn.Module):
                     weight=float(spec.get("weight", 1.0)),
                     eps=float(spec.get("eps", 1e-6)),
                 )
+                with contextlib.suppress(Exception):
+                    node.to(device=self._device_for_new_modules())
                 self.tasks[nm] = node
                 with contextlib.suppress(Exception):
                     node._bind(self, nm)
@@ -2272,6 +2304,8 @@ class Fuser(nn.Module):
 
         self._resolve_stream_task_id()
         self._invalidate_exec_plan()
+        with contextlib.suppress(Exception):
+            delattr(self, "_rebuild_tasks_device")
 
     def remap_legacy_task_ids_in_state_dict(
         self: Self,
@@ -2352,6 +2386,8 @@ class Fuser(nn.Module):
                 self.cfg, "ckpt_min_bytes", 64 * 1024 * 1024
             ),
         )
+        with contextlib.suppress(Exception):
+            tmpl.to(device=self._device_for_new_modules())
         tags_list: list[str] = []
         if tags is not None:
             tags_iter = (tags,) if isinstance(tags, str) else tags
@@ -2566,6 +2602,8 @@ class Fuser(nn.Module):
             weight=float(weight),
             eps=float(eps),
         )
+        with contextlib.suppress(Exception):
+            node.to(device=self._device_for_new_modules())
         tags_list: list[str] = []
         if tags is not None:
             tags_iter = (tags,) if isinstance(tags, str) else tags
