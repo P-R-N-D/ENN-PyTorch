@@ -5114,11 +5114,42 @@ def infer(
                         if n <= 0:
                             return v, False, 0, 0
                         if n > max_elems:
-                            idx = torch.arange(max_elems, device=v.device, dtype=torch.long)
-                            idx = (idx * (n - 1)) // max(1, (max_elems - 1))
+                            if int(max_elems) == 1:
+                                idx = torch.tensor([n - 1], device=v.device, dtype=torch.long)
+                            else:
+                                idx = torch.arange(max_elems, device=v.device, dtype=torch.long)
+                                idx = (idx * (n - 1)) // max(1, (max_elems - 1))
                             vv = v.index_select(0, idx)
                             return vv, True, int(vv.numel()), n
                         return v, False, n, n
+
+                    def _sample_pair(
+                        a: torch.Tensor, b: torch.Tensor
+                    ) -> tuple[torch.Tensor, torch.Tensor, bool, int, int, int, bool]:
+                        na = int(a.numel())
+                        nb = int(b.numel())
+                        if na <= 0 or nb <= 0:
+                            return a[:0], b[:0], False, 0, na, nb, False
+                        if na == 1 and nb > 1:
+                            bb, sampled, sample_n, _ = _sample_vec(b)
+                            return a[:1], bb, bool(sampled), int(sample_n), na, nb, False
+                        if nb == 1 and na > 1:
+                            aa, sampled, sample_n, _ = _sample_vec(a)
+                            return aa, b[:1], bool(sampled), int(sample_n), na, nb, False
+
+                        n_base = int(min(na, nb))
+                        mismatch = bool((na != nb) and (na != 1) and (nb != 1))
+                        sample_n = int(min(int(max_elems), n_base))
+                        if n_base > sample_n:
+                            if sample_n <= 1:
+                                idx = torch.tensor([n_base - 1], device=a.device, dtype=torch.long)
+                            else:
+                                idx = torch.arange(sample_n, device=a.device, dtype=torch.long)
+                                idx = (idx * (n_base - 1)) // max(1, (sample_n - 1))
+                            aa = a[:n_base].index_select(0, idx)
+                            bb = b[:n_base].index_select(0, idx)
+                            return aa, bb, True, int(aa.numel()), na, nb, mismatch
+                        return a[:n_base], b[:n_base], False, n_base, na, nb, mismatch
 
                     def _vec_stats(name: str, v: torch.Tensor) -> dict[str, object]:
                         d: dict[str, object] = {}
@@ -5173,10 +5204,16 @@ def infer(
 
                     if (lo is not None) and (hi is not None):
                         try:
-                            lo_s, _, _, _ = _sample_vec(lo)
-                            hi_s, _, _, _ = _sample_vec(hi)
-                            lo32 = lo_s.to(device="cpu", dtype=torch.float32)
-                            hi32 = hi_s.to(device="cpu", dtype=torch.float32)
+                            lo_s, hi_s, clip_sampled, clip_sample_n, n_lo, n_hi, clip_mismatch = _sample_pair(lo, hi)
+                            out["clip_sampled"] = bool(clip_sampled)
+                            out["clip_sample_n"] = int(clip_sample_n)
+                            out["clip_numel_low"] = int(n_lo)
+                            out["clip_numel_high"] = int(n_hi)
+                            if bool(clip_mismatch):
+                                out["clip_numel_mismatch"] = True
+
+                            lo32 = lo_s.to(dtype=torch.float32)
+                            hi32 = hi_s.to(dtype=torch.float32)
                             if lo32.numel() == 1 and hi32.numel() != 1:
                                 lo32 = lo32.expand_as(hi32)
                             if hi32.numel() == 1 and lo32.numel() != 1:
