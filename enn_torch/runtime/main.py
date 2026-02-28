@@ -4992,6 +4992,7 @@ def infer(
             collapse_diag_save = bool(env_bool("ENN_PRED_COLLAPSE_DIAG_SAVE", True))
             collapse_diag_max_elems = int(env_int("ENN_PRED_COLLAPSE_DIAG_MAX_ELEMS", 64) or 64)
             collapse_diag_once = bool(env_bool("ENN_PRED_COLLAPSE_DIAG_ONCE", True))
+            collapse_diag_scaler = bool(env_bool("ENN_PRED_COLLAPSE_DIAG_SCALER", True))
             _collapse_diag_done = False
 
             _collapse_diag_out_dir = (
@@ -5088,6 +5089,108 @@ def infer(
                 except Exception:
                     return None
 
+            def _scaler_output_ab_stats() -> dict[str, object] | None:
+                if not collapse_diag_scaler:
+                    return None
+                try:
+                    sc = getattr(module_eval, "scaler", None)
+                    if sc is None:
+                        return None
+                    out: dict[str, object] = {}
+                    out["calib_mode"] = str(getattr(sc, "calib_mode", ""))
+                    out["output_ab_enabled"] = bool(getattr(sc, "output_ab_enabled", False))
+                    out["force_fp64_on_cuda"] = bool(getattr(sc, "_output_ab_force_fp64_on_cuda", False))
+                    out["fp64_reason"] = str(getattr(sc, "_output_ab_fp64_reason", ""))
+
+                    max_elems = int(env_int("ENN_PRED_COLLAPSE_DIAG_SCALER_MAX_ELEMS", 4096) or 4096)
+
+                    def _as_vec(t: object) -> torch.Tensor | None:
+                        if not isinstance(t, torch.Tensor):
+                            return None
+                        return t.detach().reshape(-1)
+
+                    def _vec_stats(name: str, v: torch.Tensor) -> dict[str, object]:
+                        d: dict[str, object] = {}
+                        d["name"] = str(name)
+                        d["shape"] = [int(x) for x in v.shape]
+                        d["dtype"] = str(v.dtype)
+                        d["device"] = str(v.device)
+                        n = int(v.numel())
+                        d["numel"] = n
+                        if n <= 0:
+                            return d
+
+                        vv = v
+                        if max_elems > 0 and n > max_elems:
+                            idx = torch.arange(max_elems, device=vv.device, dtype=torch.long)
+                            idx = (idx * (n - 1)) // max(1, (max_elems - 1))
+                            vv = vv.index_select(0, idx)
+                            d["sampled"] = True
+                            d["sample_n"] = int(vv.numel())
+                        else:
+                            d["sampled"] = False
+                            d["sample_n"] = n
+
+                        vv = vv.to(device="cpu")
+                        if vv.is_floating_point():
+                            vv64 = vv.to(dtype=torch.float64)
+                            finite = torch.isfinite(vv64)
+                            d["finite_frac"] = float(finite.to(dtype=torch.float32).mean().item())
+                            with contextlib.suppress(Exception):
+                                d["zero_frac_fp64"] = float((vv64 == 0).to(dtype=torch.float32).mean().item())
+                            if bool(finite.any().item()):
+                                vvf = vv64[finite]
+                                d["min"] = float(vvf.min().item())
+                                d["max"] = float(vvf.max().item())
+                                d["mean"] = float(vvf.mean().item())
+                                d["abs_max"] = float(vvf.abs().max().item())
+                            vv32 = vv.to(dtype=torch.float32)
+                            d["zero_frac_fp32"] = float((vv32 == 0).to(dtype=torch.float32).mean().item())
+                        else:
+                            with contextlib.suppress(Exception):
+                                d["min"] = int(vv.min().item())
+                                d["max"] = int(vv.max().item())
+                        return d
+
+                    s = _as_vec(getattr(sc, "y_out_scale", None))
+                    b = _as_vec(getattr(sc, "y_out_bias", None))
+                    lo = _as_vec(getattr(sc, "y_out_clip_low", None))
+                    hi = _as_vec(getattr(sc, "y_out_clip_high", None))
+
+                    if s is not None:
+                        out["y_out_scale"] = _vec_stats("y_out_scale", s)
+                        with contextlib.suppress(Exception):
+                            s32 = s.to(device="cpu", dtype=torch.float32)
+                            out["scale_zero_frac_fp32"] = float((s32 == 0).to(dtype=torch.float32).mean().item())
+                    if b is not None:
+                        out["y_out_bias"] = _vec_stats("y_out_bias", b)
+                    if lo is not None:
+                        out["y_out_clip_low"] = _vec_stats("y_out_clip_low", lo)
+                    if hi is not None:
+                        out["y_out_clip_high"] = _vec_stats("y_out_clip_high", hi)
+
+                    if (lo is not None) and (hi is not None):
+                        try:
+                            lo32 = lo.to(device="cpu", dtype=torch.float32)
+                            hi32 = hi.to(device="cpu", dtype=torch.float32)
+                            if lo32.numel() == 1 and hi32.numel() != 1:
+                                lo32 = lo32.expand_as(hi32)
+                            if hi32.numel() == 1 and lo32.numel() != 1:
+                                hi32 = hi32.expand_as(lo32)
+                            n2 = int(min(int(lo32.numel()), int(hi32.numel())))
+                            if n2 > 0:
+                                lo32 = lo32[:n2]
+                                hi32 = hi32[:n2]
+                                span32 = hi32 - lo32
+                                out["clip0_frac_fp32"] = float((span32 == 0).to(dtype=torch.float32).mean().item())
+                                out["clip_neg_frac_fp32"] = float((span32 < 0).to(dtype=torch.float32).mean().item())
+                        except Exception as e:
+                            out["clip_fp32_error"] = f"{type(e).__name__}: {e}"
+
+                    return out
+                except Exception as e:
+                    return {"error": f"{type(e).__name__}: {e}"}
+
             def _diag_collapse_once(*, Xi2: torch.Tensor, preds2: torch.Tensor, x_diff: float, y_diff: float, where: str) -> None:
                 nonlocal _collapse_diag_done
                 if not collapse_diag:
@@ -5104,6 +5207,10 @@ def infer(
                     diag["y_diff_calibrated"] = float(y_diff)
                     diag["X"] = _brief_stats(Xi2)
                     diag["Y_cal"] = _brief_stats(preds2)
+                    if collapse_diag_scaler:
+                        sc_stats = _scaler_output_ab_stats()
+                        if sc_stats is not None:
+                            diag["scaler_output_ab"] = sc_stats
                     z2 = _try_normalize_x(Xi2)
                     if z2 is not None and isinstance(z2, torch.Tensor):
                         diag["Z_norm"] = _brief_stats(z2)
