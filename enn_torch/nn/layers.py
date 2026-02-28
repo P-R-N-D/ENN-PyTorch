@@ -3081,8 +3081,15 @@ class Scaler(nn.Module):
                                     if not ("in_scale" in locals()) or not (in_scale > 0.0):
                                         in_scale = 1.0
                                     max_std = float(max(1.0, in_scale * 1000.0 + 1.0))
-                                    std3 = std2.clamp(min=eps_use2, max=max_std)
-                                    mean3 = mean2
+                                    feature_row = t32[0]
+                                    finite_mean = torch.isfinite(mean2)
+                                    finite_std = torch.isfinite(std2) & (std2 > eps_use2)
+                                    mean3 = torch.where(finite_mean, mean2, feature_row)
+                                    std3 = torch.where(
+                                        finite_std,
+                                        std2,
+                                        feature_row.abs().clamp_min(1.0),
+                                    ).clamp(min=eps_use2, max=max_std)
                                     with contextlib.suppress(Exception):
                                         mean_lim = float(max(1.0, in_scale * 1000.0 + 1.0))
                                         if mean3.numel() and float(mean3.abs().amax().item()) > mean_lim:
@@ -3090,7 +3097,7 @@ class Scaler(nn.Module):
                                     out2 = (t32 - mean3) / std3
                                     if env_bool("ENN_SCALER_GUARD_LOG", bool(guard_enabled)):
                                         warnings.warn(
-                                            "Scaler.normalize_x: collapse persisted; clamped stored stats for single-row input (avoid per-feature mixing).",
+                                            "Scaler.normalize_x: collapse persisted; sanitized stored stats for single-row input (invalid entries fell back to input-derived values).",
                                             RuntimeWarning,
                                             stacklevel=2,
                                         )
