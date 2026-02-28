@@ -1478,61 +1478,67 @@ def load_scaler_stats(sources: Any) -> Optional[Dict[str, Any]]:
             if isinstance(ys2, torch.Tensor)
             else torch.as_tensor(ys2, dtype=torch.float64)
         )
-        local_xmin = payload.get("x_min")
-        local_xmax = payload.get("x_max")
-        local_ymin = payload.get("y_min")
-        local_ymax = payload.get("y_max")
-        local_yq_low = payload.get("y_q_low")
-        local_yq_high = payload.get("y_q_high")
+        ref_x_shape = tuple(xs.shape)
+        ref_y_shape = tuple(ys.shape)
+
+        def _coerce_bounds(v: Any, ref_shape: tuple[int, ...]) -> Optional[torch.Tensor]:
+            if v is None:
+                return None
+            t = (
+                v.detach().to(dtype=torch.float64, device="cpu")
+                if isinstance(v, torch.Tensor)
+                else torch.as_tensor(v, dtype=torch.float64)
+            )
+            if tuple(t.shape) != tuple(ref_shape):
+                if int(t.numel()) == 1 and len(ref_shape) >= 1:
+                    t = t.reshape((1,)).expand(ref_shape).clone()
+                else:
+                    return None
+            if not bool(torch.isfinite(t).all().item()):
+                return None
+            return t
+
+        local_xmin = _coerce_bounds(payload.get("x_min"), ref_x_shape)
+        local_xmax = _coerce_bounds(payload.get("x_max"), ref_x_shape)
+        local_ymin = _coerce_bounds(payload.get("y_min"), ref_y_shape)
+        local_ymax = _coerce_bounds(payload.get("y_max"), ref_y_shape)
+        local_yq_low = _coerce_bounds(payload.get("y_q_low"), ref_y_shape)
+        local_yq_high = _coerce_bounds(payload.get("y_q_high"), ref_y_shape)
+
         local_have_bounds = (
             local_xmin is not None
             and local_xmax is not None
             and local_ymin is not None
             and local_ymax is not None
         )
+        if local_have_bounds:
+            try:
+                if bool((local_xmin > local_xmax).any().item()) or bool((local_ymin > local_ymax).any().item()):
+                    local_have_bounds = False
+                    local_xmin = local_xmax = local_ymin = local_ymax = None
+            except Exception:
+                local_have_bounds = False
+                local_xmin = local_xmax = local_ymin = local_ymax = None
         if have_bounds is None:
             have_bounds = bool(local_have_bounds)
         elif have_bounds and not local_have_bounds:
             have_bounds = False
             x_min = x_max = y_min = y_max = None
+
         local_have_q = local_yq_low is not None and local_yq_high is not None
+        if local_have_q:
+            try:
+                if bool((local_yq_low > local_yq_high).any().item()):
+                    local_have_q = False
+                    local_yq_low = local_yq_high = None
+            except Exception:
+                local_have_q = False
+                local_yq_low = local_yq_high = None
         if have_qbounds is None:
             have_qbounds = bool(local_have_q)
         elif have_qbounds and not local_have_q:
             have_qbounds = False
             y_q_low = y_q_high = None
-        if have_bounds:
-            local_xmin = (
-                local_xmin.detach().to(dtype=torch.float64, device="cpu")
-                if isinstance(local_xmin, torch.Tensor)
-                else torch.as_tensor(local_xmin, dtype=torch.float64)
-            )
-            local_xmax = (
-                local_xmax.detach().to(dtype=torch.float64, device="cpu")
-                if isinstance(local_xmax, torch.Tensor)
-                else torch.as_tensor(local_xmax, dtype=torch.float64)
-            )
-            local_ymin = (
-                local_ymin.detach().to(dtype=torch.float64, device="cpu")
-                if isinstance(local_ymin, torch.Tensor)
-                else torch.as_tensor(local_ymin, dtype=torch.float64)
-            )
-            local_ymax = (
-                local_ymax.detach().to(dtype=torch.float64, device="cpu")
-                if isinstance(local_ymax, torch.Tensor)
-                else torch.as_tensor(local_ymax, dtype=torch.float64)
-            )
-        if have_qbounds:
-            local_yq_low = (
-                local_yq_low.detach().to(dtype=torch.float64, device="cpu")
-                if isinstance(local_yq_low, torch.Tensor)
-                else torch.as_tensor(local_yq_low, dtype=torch.float64)
-            )
-            local_yq_high = (
-                local_yq_high.detach().to(dtype=torch.float64, device="cpu")
-                if isinstance(local_yq_high, torch.Tensor)
-                else torch.as_tensor(local_yq_high, dtype=torch.float64)
-            )
         if x_sum is None:
             x_sum = xs.clone()
             x_sum_sq = xs2.clone()

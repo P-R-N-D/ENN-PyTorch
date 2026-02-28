@@ -3082,12 +3082,29 @@ class Scaler(nn.Module):
                                         in_scale = 1.0
                                     max_std = float(max(1.0, in_scale * 1000.0 + 1.0))
                                     feature_row = t32[0]
-                                    finite_mean = torch.isfinite(mean2)
-                                    finite_std = torch.isfinite(std2) & (std2 > eps_use2)
-                                    mean3 = torch.where(finite_mean, mean2, feature_row)
+                                    feature_row = torch.where(
+                                        torch.isfinite(feature_row),
+                                        feature_row,
+                                        torch.zeros_like(feature_row),
+                                    )
+                                    mean2v = mean2
+                                    std2v = std2
+                                    with contextlib.suppress(Exception):
+                                        if int(mean2v.numel()) == int(feature_row.numel()):
+                                            mean2v = mean2v.reshape(feature_row.shape)
+                                    with contextlib.suppress(Exception):
+                                        if int(std2v.numel()) == int(feature_row.numel()):
+                                            std2v = std2v.reshape(feature_row.shape)
+                                    if mean2v.shape != feature_row.shape:
+                                        mean2v = feature_row
+                                    if std2v.shape != feature_row.shape:
+                                        std2v = feature_row.abs().clamp_min(1.0)
+                                    finite_mean = torch.isfinite(mean2v)
+                                    finite_std = torch.isfinite(std2v) & (std2v > eps_use2)
+                                    mean3 = torch.where(finite_mean, mean2v, feature_row)
                                     std3 = torch.where(
                                         finite_std,
-                                        std2,
+                                        std2v,
                                         feature_row.abs().clamp_min(1.0),
                                     ).clamp(min=eps_use2, max=max_std)
                                     with contextlib.suppress(Exception):
