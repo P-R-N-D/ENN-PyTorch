@@ -5102,12 +5102,23 @@ def infer(
                     out["force_fp64_on_cuda"] = bool(getattr(sc, "_output_ab_force_fp64_on_cuda", False))
                     out["fp64_reason"] = str(getattr(sc, "_output_ab_fp64_reason", ""))
 
-                    max_elems = int(env_int("ENN_PRED_COLLAPSE_DIAG_SCALER_MAX_ELEMS", 4096) or 4096)
+                    max_elems = max(1, int(env_int("ENN_PRED_COLLAPSE_DIAG_SCALER_MAX_ELEMS", 4096) or 4096))
 
                     def _as_vec(t: object) -> torch.Tensor | None:
                         if not isinstance(t, torch.Tensor):
                             return None
                         return t.detach().reshape(-1)
+
+                    def _sample_vec(v: torch.Tensor) -> tuple[torch.Tensor, bool, int, int]:
+                        n = int(v.numel())
+                        if n <= 0:
+                            return v, False, 0, 0
+                        if n > max_elems:
+                            idx = torch.arange(max_elems, device=v.device, dtype=torch.long)
+                            idx = (idx * (n - 1)) // max(1, (max_elems - 1))
+                            vv = v.index_select(0, idx)
+                            return vv, True, int(vv.numel()), n
+                        return v, False, n, n
 
                     def _vec_stats(name: str, v: torch.Tensor) -> dict[str, object]:
                         d: dict[str, object] = {}
@@ -5115,21 +5126,13 @@ def infer(
                         d["shape"] = [int(x) for x in v.shape]
                         d["dtype"] = str(v.dtype)
                         d["device"] = str(v.device)
-                        n = int(v.numel())
+                        vv, sampled, sample_n, n = _sample_vec(v)
                         d["numel"] = n
                         if n <= 0:
                             return d
 
-                        vv = v
-                        if max_elems > 0 and n > max_elems:
-                            idx = torch.arange(max_elems, device=vv.device, dtype=torch.long)
-                            idx = (idx * (n - 1)) // max(1, (max_elems - 1))
-                            vv = vv.index_select(0, idx)
-                            d["sampled"] = True
-                            d["sample_n"] = int(vv.numel())
-                        else:
-                            d["sampled"] = False
-                            d["sample_n"] = n
+                        d["sampled"] = bool(sampled)
+                        d["sample_n"] = int(sample_n)
 
                         vv = vv.to(device="cpu")
                         if vv.is_floating_point():
@@ -5160,8 +5163,7 @@ def infer(
                     if s is not None:
                         out["y_out_scale"] = _vec_stats("y_out_scale", s)
                         with contextlib.suppress(Exception):
-                            s32 = s.to(device="cpu", dtype=torch.float32)
-                            out["scale_zero_frac_fp32"] = float((s32 == 0).to(dtype=torch.float32).mean().item())
+                            out["scale_zero_frac_fp32"] = float(out["y_out_scale"].get("zero_frac_fp32", 0.0))
                     if b is not None:
                         out["y_out_bias"] = _vec_stats("y_out_bias", b)
                     if lo is not None:
@@ -5171,8 +5173,10 @@ def infer(
 
                     if (lo is not None) and (hi is not None):
                         try:
-                            lo32 = lo.to(device="cpu", dtype=torch.float32)
-                            hi32 = hi.to(device="cpu", dtype=torch.float32)
+                            lo_s, _, _, _ = _sample_vec(lo)
+                            hi_s, _, _, _ = _sample_vec(hi)
+                            lo32 = lo_s.to(device="cpu", dtype=torch.float32)
+                            hi32 = hi_s.to(device="cpu", dtype=torch.float32)
                             if lo32.numel() == 1 and hi32.numel() != 1:
                                 lo32 = lo32.expand_as(hi32)
                             if hi32.numel() == 1 and lo32.numel() != 1:
