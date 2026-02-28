@@ -2797,6 +2797,34 @@ class Scaler(nn.Module):
         _fix_finite("y_out_clip_low", BIG32_MIN, clamp32=True)
         _fix_finite("y_out_clip_high", BIG32_MAX, clamp32=True)
 
+        def _fix_mean(name: str, fill: float = 0.0) -> None:
+            t = getattr(self, name, None)
+            if isinstance(t, torch.Tensor) and t.is_floating_point():
+                if t.numel() == 0:
+                    return
+                tt = t.detach().clone()
+                bad = (~torch.isfinite(tt)) | (tt.abs() >= EXTREME_ABS)
+                if bad.any():
+                    tt[bad] = float(fill)
+                    t.resize_(tt.shape).copy_(tt)
+
+        def _fix_std(name: str, fill: float = 1.0) -> None:
+            t = getattr(self, name, None)
+            if isinstance(t, torch.Tensor) and t.is_floating_point():
+                if t.numel() == 0:
+                    return
+                tt = t.detach().clone()
+                bad = (~torch.isfinite(tt)) | (tt.abs() >= EXTREME_ABS) | (tt <= 0.0)
+                if bad.any():
+                    tt[bad] = float(fill)
+                tt = tt.clamp(min=1e-12, max=BIG32_MAX)
+                t.resize_(tt.shape).copy_(tt)
+
+        _fix_mean("x_mean", 0.0)
+        _fix_std("x_std", 1.0)
+        _fix_mean("y_mean", 0.0)
+        _fix_std("y_std", 1.0)
+
         with contextlib.suppress(Exception):
             if isinstance(self.y_min, torch.Tensor) and isinstance(self.y_max, torch.Tensor):
                 lo = self.y_min
@@ -3023,6 +3051,19 @@ class Scaler(nn.Module):
                         RuntimeWarning,
                         stacklevel=2,
                     )
+                if self._guard_is_collapse(out2, std_min=float(std_min)):
+                    with contextlib.suppress(Exception):
+                        in_std = t32.std(unbiased=False) if t32.dim() == 1 else t32.std(dim=-1, unbiased=False).mean()
+                        if float(in_std.item()) > float(std_min) * 10.0:
+                            mean3 = t32.mean(dim=0)
+                            std3 = t32.std(dim=0, unbiased=False).clamp_min(eps_use2)
+                            out2 = (t32 - mean3) / std3
+                            if env_bool("ENN_SCALER_GUARD_LOG", True):
+                                warnings.warn(
+                                    "Scaler.normalize_x: collapse persisted; fell back to per-batch stats (stored stats look corrupted).",
+                                    RuntimeWarning,
+                                    stacklevel=2,
+                                )
         out = out2.reshape(orig_shape) if t.dim() != 1 else out2.reshape(-1)
         if t.is_floating_point() and out.dtype != input_dtype and self._should_restore_input_dtype(input_dtype):
             out = out.to(dtype=input_dtype)
