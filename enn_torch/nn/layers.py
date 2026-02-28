@@ -2959,11 +2959,15 @@ class Scaler(nn.Module):
                             n = int(max(int(b0.numel()), int(lo0.numel()), int(hi0.numel())))
 
                             def _to_n(v: torch.Tensor, n: int) -> torch.Tensor:
+                                if v.numel() == n:
+                                    return v
                                 if v.numel() == 1 and n != 1:
                                     return v.expand((n,))
                                 if v.numel() >= n:
                                     return v[:n]
-                                return v.expand((n,))
+                                # tolerate mismatched non-singleton lengths from malformed checkpoints
+                                reps = (n + int(v.numel()) - 1) // int(v.numel())
+                                return v.repeat(reps)[:n]
 
                             bN = _to_n(b0, n)
                             loN = _to_n(lo0, n)
