@@ -4235,8 +4235,21 @@ def infer(
 
                     if int(broadcast_sample_max) > 0 and numel > int(broadcast_sample_max):
                         flat = diff.reshape(-1)
-                        step = max(1, numel // int(broadcast_sample_max))
-                        sample = flat[::step][: int(broadcast_sample_max)]
+                        sample_n = int(broadcast_sample_max)
+                        if sample_n <= 1:
+                            sample = flat[-1:].clone()
+                        else:
+                            # Use evenly spaced indices over the full flattened tensor.
+                            # This avoids prefix-only sampling when numel is only slightly
+                            # above sample_n (where step-based slicing can collapse to step=1).
+                            idx = torch.linspace(
+                                0,
+                                max(0, numel - 1),
+                                steps=sample_n,
+                                device=flat.device,
+                                dtype=torch.float32,
+                            ).to(dtype=torch.long)
+                            sample = flat.index_select(0, idx)
                         st["sampled"] = 1.0
                         st["sample_n"] = float(int(sample.numel()))
                         mean_abs = float(sample.mean().item())
