@@ -4214,6 +4214,59 @@ def infer(
             broadcast_checked = False
             detect_broadcast = bool(env_bool("ENN_PRED_DETECT_BATCH_BROADCAST", True))
             broadcast_atol = float(env_float("ENN_PRED_BROADCAST_ATOL", 1e-6))
+            broadcast_match_frac = float(env_float("ENN_PRED_BROADCAST_MATCH_FRAC", 0.995))
+            broadcast_rel_mean = float(env_float("ENN_PRED_BROADCAST_REL_MEAN", 1e-5))
+            broadcast_sample_max = max(0, int(env_int("ENN_PRED_BROADCAST_SAMPLE_MAX", 16384) or 16384))
+
+            def _broadcast_like(
+                y0: torch.Tensor,
+                y1: torch.Tensor,
+                *,
+                atol: float,
+            ) -> tuple[bool, dict[str, float]]:
+                st: dict[str, float] = {}
+                try:
+                    diff = (y0 - y1).abs()
+                    numel = int(diff.numel())
+                    st["y_numel"] = float(numel)
+                    if numel <= 0:
+                        st.update({"y_max": 0.0, "y_mean": 0.0, "y_match_frac": 1.0, "y_scale": 1.0, "y_rel_mean": 0.0, "sample_n": 0.0, "sampled": 0.0})
+                        return True, st
+
+                    if int(broadcast_sample_max) > 0 and numel > int(broadcast_sample_max):
+                        flat = diff.reshape(-1)
+                        step = max(1, numel // int(broadcast_sample_max))
+                        sample = flat[::step][: int(broadcast_sample_max)]
+                        st["sampled"] = 1.0
+                        st["sample_n"] = float(int(sample.numel()))
+                        mean_abs = float(sample.mean().item())
+                        match_frac = float((sample <= float(atol)).to(dtype=torch.float32).mean().item())
+                    else:
+                        st["sampled"] = 0.0
+                        st["sample_n"] = float(numel)
+                        mean_abs = float(diff.mean().item())
+                        match_frac = float((diff <= float(atol)).to(dtype=torch.float32).mean().item())
+
+                    max_abs = float(diff.max().item())
+                    st["y_max"] = float(max_abs)
+                    st["y_mean"] = float(mean_abs)
+                    st["y_match_frac"] = float(match_frac)
+
+                    y_scale = float(torch.maximum(y0.abs().mean(), y1.abs().mean()).item())
+                    if (not math.isfinite(y_scale)) or y_scale <= 0.0:
+                        y_scale = 1.0
+                    st["y_scale"] = float(y_scale)
+                    rel_mean = float(mean_abs) / float(max(float(y_scale), 1e-12))
+                    st["y_rel_mean"] = float(rel_mean)
+
+                    if float(max_abs) <= float(atol):
+                        return True, st
+                    if float(match_frac) >= float(broadcast_match_frac) and float(rel_mean) <= float(broadcast_rel_mean):
+                        return True, st
+                    return False, st
+                except Exception:
+                    st["error"] = 1.0
+                    return False, st
             collapse_stage_diag_enabled = bool(
                 env_bool("ENN_PRED_COLLAPSE_STAGE_DIAG", default=True)
             )
@@ -6034,26 +6087,34 @@ def infer(
                             if float(x_diff.item()) > 0.0:
                                 y0 = preds[0].detach()
                                 y1 = preds[1].detach()
-                                y_diff = (y0 - y1).abs().max()
-                                if float(y_diff.item()) <= float(broadcast_atol):
+                                is_broadcast_like, bstats = _broadcast_like(
+                                    y0, y1, atol=float(broadcast_atol)
+                                )
+                                y_diff = float(bstats.get("y_max", float("nan")))
+                                if bool(is_broadcast_like):
                                     _dump_collapse_stage_diag_from_model(
                                         Xi,
                                         where="broadcast_trigger",
                                         x_diff=float(x_diff.item()),
-                                        y_diff_cal=float(y_diff.item()),
+                                        y_diff_cal=float(y_diff),
                                     )
                                     with contextlib.suppress(Exception):
                                         _diag_collapse_once(
                                             Xi2=Xi[:2].detach(),
                                             preds2=preds[:2].detach(),
                                             x_diff=float(x_diff.item()),
-                                            y_diff=float(y_diff.item()),
+                                            y_diff=float(y_diff),
                                             where="broadcast_trigger",
                                         )
                                     _LOGGER.warning(
-                                        "[infer] detected batch-broadcasted predictions (inputs differ but outputs match within atol=%.3e). "
+                                        "[infer] detected batch-broadcasted predictions (inputs differ but outputs are ~equal). "
+                                        "max|Y0-Y1|=%.6g match_frac=%.5f rel_mean=%.3e (atol=%.3e, sample_n=%.0f). "
                                         "Falling back to per-sample inference (microbatch=1) for correctness.",
+                                        float(y_diff),
+                                        float(bstats.get("y_match_frac", float("nan"))),
+                                        float(bstats.get("y_rel_mean", float("nan"))),
                                         float(broadcast_atol),
+                                        float(bstats.get("sample_n", float("nan"))),
                                     )
                                     if eager_on_broadcast:
                                         force_eager = True
@@ -6116,14 +6177,17 @@ def infer(
                                         if int(preds.shape[0]) >= 2:
                                             y0b = preds[0].detach()
                                             y1b = preds[1].detach()
-                                            ydiff2 = (y0b - y1b).abs().max()
-                                            if float(ydiff2.item()) <= float(broadcast_atol):
+                                            is_broadcast_like2, bstats2 = _broadcast_like(
+                                                y0b, y1b, atol=float(broadcast_atol)
+                                            )
+                                            ydiff2 = float(bstats2.get("y_max", float("nan")))
+                                            if bool(is_broadcast_like2):
                                                 with contextlib.suppress(Exception):
                                                     _diag_collapse_once(
                                                         Xi2=Xi[:2].detach(),
                                                         preds2=preds[:2].detach(),
                                                         x_diff=float(x_diff.item()) if "x_diff" in locals() else float("nan"),
-                                                        y_diff=float(ydiff2.item()),
+                                                        y_diff=float(ydiff2),
                                                         where="after_per_sample_fix",
                                                     )
                                                 _LOGGER.warning(
@@ -6134,7 +6198,7 @@ def infer(
                                                     Xi2=Xi[:2].detach(),
                                                     seen_batches=int(seen_batches),
                                                     x_diff=float(x_diff.item()),
-                                                    y_diff_cal=float(ydiff2.item()),
+                                                    y_diff_cal=float(ydiff2),
                                                 )
                                                 if _maybe_enable_fp32_collapse_fallback():
                                                     preds_fix_fp32: torch.Tensor | None = None
@@ -6162,12 +6226,19 @@ def infer(
                                                             )
                                                         preds_fix_fp32[j : j + 1].copy_(pj_fp32_cpu[:1])
                                                     if preds_fix_fp32 is not None and int(preds_fix_fp32.shape[0]) >= 2:
-                                                        dy_fp32 = (preds_fix_fp32[0] - preds_fix_fp32[1]).abs().max()
-                                                        _LOGGER.warning(
-                                                            "[infer] fp32 fallback sanity (this batch): max|Y0-Y1|=%.6g",
-                                                            float(dy_fp32.item()),
+                                                        is_like_fp32, st_fp32 = _broadcast_like(
+                                                            preds_fix_fp32[0],
+                                                            preds_fix_fp32[1],
+                                                            atol=float(broadcast_atol),
                                                         )
-                                                        if float(dy_fp32.item()) > float(broadcast_atol):
+                                                        dy_fp32 = float(st_fp32.get("y_max", float("nan")))
+                                                        _LOGGER.warning(
+                                                            "[infer] fp32 fallback sanity (this batch): max|Y0-Y1|=%.6g match_frac=%.5f rel_mean=%.3e",
+                                                            float(dy_fp32),
+                                                            float(st_fp32.get("y_match_frac", float("nan"))),
+                                                            float(st_fp32.get("y_rel_mean", float("nan"))),
+                                                        )
+                                                        if not bool(is_like_fp32):
                                                             preds = preds_fix_fp32
                                                             if not bool(collapse_force_fp32_persist):
                                                                 collapse_fp32_active = False
@@ -6217,8 +6288,11 @@ def infer(
                                                         preds = preds_fix_uc
                                                         with contextlib.suppress(Exception):
                                                             if int(preds.shape[0]) >= 2:
-                                                                dy_uc = (preds[0] - preds[1]).abs().max()
-                                                                if float(dy_uc.item()) > float(broadcast_atol):
+                                                                is_like_uc, st_uc = _broadcast_like(
+                                                                    preds[0], preds[1], atol=float(broadcast_atol)
+                                                                )
+                                                                dy_uc = float(st_uc.get("y_max", float("nan")))
+                                                                if not bool(is_like_uc):
                                                                     _LOGGER.warning(
                                                                         "[infer] uncompiled per-sample resolved collapse for this batch; keeping force_eager=1 and force_uncompiled=1."
                                                                     )
@@ -6254,12 +6328,19 @@ def infer(
                                                             )
                                                         preds_fix2[j : j + 1].copy_(pj2_cpu[:1])
                                                     if preds_fix2 is not None and int(preds_fix2.shape[0]) >= 2:
-                                                        dy2 = (preds_fix2[0] - preds_fix2[1]).abs().max()
-                                                        _LOGGER.warning(
-                                                            "[infer] calibrate_output=False sanity (this batch only): max|Y0-Y1|=%.6g",
-                                                            float(dy2.item()),
+                                                        is_like_raw, st_raw = _broadcast_like(
+                                                            preds_fix2[0],
+                                                            preds_fix2[1],
+                                                            atol=float(broadcast_atol),
                                                         )
-                                                        if float(dy2.item()) <= float(broadcast_atol) and bool(collapse_abort):
+                                                        dy2 = float(st_raw.get("y_max", float("nan")))
+                                                        _LOGGER.warning(
+                                                            "[infer] calibrate_output=False sanity (this batch only): max|Y0-Y1|=%.6g match_frac=%.5f rel_mean=%.3e",
+                                                            float(dy2),
+                                                            float(st_raw.get("y_match_frac", float("nan"))),
+                                                            float(st_raw.get("y_rel_mean", float("nan"))),
+                                                        )
+                                                        if bool(is_like_raw) and bool(collapse_abort):
                                                             raise _InferCollapseAbort(
                                                                 "infer: collapse persisted even in calibrate_output=False path; "
                                                                 "this indicates a true model/preprocess collapse. "
