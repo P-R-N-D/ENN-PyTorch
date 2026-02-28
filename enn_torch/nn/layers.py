@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import contextlib
+import math
 import logging
 import os
 import uuid
@@ -24,7 +25,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from ..core.compat import StochasticDepth
 from ..core.concurrency import Mutex
-from ..core.datatypes import env_bool, env_int
+from ..core.datatypes import env_bool, env_float, env_int
 from ..core.policies import ATTENTION_POLICY, AttentionBackend
 from .activations import GeGLU
 from .graph import (
@@ -2936,6 +2937,55 @@ class Scaler(nn.Module):
                     or (hi0 - default_hi).abs().max().item() > 1e-6
                 ):
                     enable_ab = True
+
+            if enable_ab and env_bool("ENN_OUTPUT_AB_SANITY_DISABLE", default=True):
+                try:
+                    b_abs_th = float(env_float("ENN_OUTPUT_AB_SANITY_BIAS_ABS_MAX", 1000.0))
+                    ratio_th = float(env_float("ENN_OUTPUT_AB_SANITY_BIAS_SPAN_RATIO_MAX", 1e3))
+                    span_eps = float(env_float("ENN_OUTPUT_AB_SANITY_SPAN_EPS", 1e-12))
+
+                    if isinstance(bb, torch.Tensor) and bb.numel():
+                        b0 = bb.detach().to(dtype=torch.float64).reshape(-1)
+                        b_abs_max = float(b0.abs().max().item())
+
+                        ratio_max = float("nan")
+                        span_min = float("nan")
+                        span_max = float("nan")
+                        bad_ratio_frac = 0.0
+
+                        if isinstance(lo, torch.Tensor) and isinstance(hi, torch.Tensor) and lo.numel() and hi.numel():
+                            lo0 = lo.detach().to(dtype=torch.float64).reshape(-1)
+                            hi0 = hi.detach().to(dtype=torch.float64).reshape(-1)
+                            n = int(max(int(b0.numel()), int(lo0.numel()), int(hi0.numel())))
+
+                            def _to_n(v: torch.Tensor, n: int) -> torch.Tensor:
+                                if v.numel() == 1 and n != 1:
+                                    return v.expand((n,))
+                                if v.numel() >= n:
+                                    return v[:n]
+                                return v.expand((n,))
+
+                            bN = _to_n(b0, n)
+                            loN = _to_n(lo0, n)
+                            hiN = _to_n(hi0, n)
+                            span = (hiN - loN).abs()
+                            span_min = float(span.min().item())
+                            span_max = float(span.max().item())
+                            ratio = bN.abs() / torch.clamp(span, min=span_eps)
+                            ratio_max = float(ratio.max().item())
+                            bad_ratio_frac = float((ratio > ratio_th).to(dtype=torch.float32).mean().item())
+
+                        if (math.isfinite(b_abs_max) and b_abs_max > b_abs_th) or (math.isfinite(ratio_max) and ratio_max > ratio_th):
+                            enable_ab = False
+                            if env_bool("ENN_OUTPUT_AB_SANITY_LOG", default=True):
+                                _LOGGER.warning(
+                                    "[ENN][scaler] disabling output_ab after load (suspicious params): "
+                                    "bias_abs_max=%.6g(th=%.6g) ratio_max=%.6g(th=%.6g) bad_ratio_frac=%.4f span[min/max]=%.6g/%.6g. "
+                                    "Set ENN_OUTPUT_AB_SANITY_DISABLE=0 to override.",
+                                    float(b_abs_max), float(b_abs_th), float(ratio_max), float(ratio_th), float(bad_ratio_frac), float(span_min), float(span_max),
+                                )
+                except Exception:
+                    pass
 
         self.output_ab_enabled = bool(enable_ab)
 
