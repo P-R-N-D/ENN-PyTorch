@@ -3443,25 +3443,21 @@ def epochs(
                     z_true = scaler.normalize_y(y_true)
                     zt64 = z_true.to(device=accum_device, dtype=torch.float64)
 
-                    with contextlib.suppress(Exception):
-                        zb_min = zt64.min(dim=0).values
-                        zb_max = zt64.max(dim=0).values
-                        if z_min_obs is None:
-                            z_min_obs = zb_min
-                            z_max_obs = zb_max
-                        else:
-                            z_min_obs = torch.minimum(z_min_obs, zb_min)
-                            z_max_obs = torch.maximum(z_max_obs, zb_max)
-                    with contextlib.suppress(Exception):
-                        yt64 = y_true.to(device=accum_device, dtype=torch.float64)
-                        yb_min = yt64.min(dim=0).values
-                        yb_max = yt64.max(dim=0).values
-                        if y_min_obs is None:
-                            y_min_obs = yb_min
-                            y_max_obs = yb_max
-                        else:
-                            y_min_obs = torch.minimum(y_min_obs, yb_min)
-                            y_max_obs = torch.maximum(y_max_obs, yb_max)
+                    zb_min = zt64.amin(dim=0)
+                    zb_max = zt64.amax(dim=0)
+                    yt64 = y_true.to(device=accum_device, dtype=torch.float64)
+                    yb_min = yt64.amin(dim=0)
+                    yb_max = yt64.amax(dim=0)
+                    if z_min_obs is None:
+                        z_min_obs = zb_min
+                        z_max_obs = zb_max
+                        y_min_obs = yb_min
+                        y_max_obs = yb_max
+                    else:
+                        z_min_obs = torch.minimum(z_min_obs, zb_min)
+                        z_max_obs = torch.maximum(z_max_obs, zb_max)
+                        y_min_obs = torch.minimum(y_min_obs, yb_min)
+                        y_max_obs = torch.maximum(y_max_obs, yb_max)
 
                     if sum_pz is None:
                         feat_y = int(zp64.shape[1])
