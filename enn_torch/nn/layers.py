@@ -3054,7 +3054,8 @@ class Scaler(nn.Module):
                 if self._guard_is_collapse(out2, std_min=float(std_min)):
                     with contextlib.suppress(Exception):
                         in_std = t32.std(unbiased=False) if t32.dim() == 1 else t32.std(dim=-1, unbiased=False).mean()
-                        if float(in_std.item()) > float(std_min) * 10.0:
+                        batch_rows = int(t32.shape[0]) if t32.dim() >= 2 else 1
+                        if batch_rows > 1 and float(in_std.item()) > float(std_min) * 10.0:
                             mean3 = t32.mean(dim=0)
                             std3 = t32.std(dim=0, unbiased=False).clamp_min(eps_use2)
                             out2 = (t32 - mean3) / std3
