@@ -3055,16 +3055,27 @@ class Scaler(nn.Module):
                     with contextlib.suppress(Exception):
                         in_std = t32.std(unbiased=False) if t32.dim() == 1 else t32.std(dim=-1, unbiased=False).mean()
                         batch_rows = int(t32.shape[0]) if t32.dim() >= 2 else 1
-                        if batch_rows > 1 and float(in_std.item()) > float(std_min) * 10.0:
-                            mean3 = t32.mean(dim=0)
-                            std3 = t32.std(dim=0, unbiased=False).clamp_min(eps_use2)
-                            out2 = (t32 - mean3) / std3
-                            if env_bool("ENN_SCALER_GUARD_LOG", True):
-                                warnings.warn(
-                                    "Scaler.normalize_x: collapse persisted; fell back to per-batch stats (stored stats look corrupted).",
-                                    RuntimeWarning,
-                                    stacklevel=2,
-                                )
+                        if float(in_std.item()) > float(std_min) * 10.0:
+                            if batch_rows > 1:
+                                mean3 = t32.mean(dim=0)
+                                std3 = t32.std(dim=0, unbiased=False).clamp_min(eps_use2)
+                                out2 = (t32 - mean3) / std3
+                                if env_bool("ENN_SCALER_GUARD_LOG", True):
+                                    warnings.warn(
+                                        "Scaler.normalize_x: collapse persisted; fell back to per-batch stats (stored stats look corrupted).",
+                                        RuntimeWarning,
+                                        stacklevel=2,
+                                    )
+                            elif t32.dim() >= 2 and int(t32.shape[1]) > 1:
+                                mean3 = t32.mean(dim=1, keepdim=True)
+                                std3 = t32.std(dim=1, keepdim=True, unbiased=False).clamp_min(eps_use2)
+                                out2 = (t32 - mean3) / std3
+                                if env_bool("ENN_SCALER_GUARD_LOG", True):
+                                    warnings.warn(
+                                        "Scaler.normalize_x: collapse persisted; fell back to per-sample feature stats (single-row input; stored stats look corrupted).",
+                                        RuntimeWarning,
+                                        stacklevel=2,
+                                    )
         out = out2.reshape(orig_shape) if t.dim() != 1 else out2.reshape(-1)
         if t.is_floating_point() and out.dtype != input_dtype and self._should_restore_input_dtype(input_dtype):
             out = out.to(dtype=input_dtype)
