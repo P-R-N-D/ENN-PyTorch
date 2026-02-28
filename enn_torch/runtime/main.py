@@ -6484,6 +6484,14 @@ def infer(
                                                                 (int(n_i),) + tuple(pj2_cpu.shape[1:])
                                                             )
                                                         preds_fix2[j : j + 1].copy_(pj2_cpu[:1])
+                                                    if preds_fix2 is not None:
+                                                        preds = preds_fix2
+                                                        with contextlib.suppress(Exception):
+                                                            if isinstance(preds, torch.Tensor) and (not preds.is_contiguous()):
+                                                                preds = preds.contiguous()
+                                                        _LOGGER.warning(
+                                                            "[infer] using calibrate_output=False per-sample predictions for output of this batch."
+                                                        )
                                                     if preds_fix2 is not None and int(preds_fix2.shape[0]) >= 2:
                                                         is_like_raw, st_raw = _broadcast_like(
                                                             preds_fix2[0],
