@@ -3475,25 +3475,58 @@ def epochs(
                     seen_samples2 += int(b2)
 
             if is_distributed():
+                feat_local = int(sum_pz.shape[0]) if isinstance(sum_pz, torch.Tensor) else 0
+                big_feat = float(1.0e30)
+                feat_t_max = torch.tensor(float(feat_local), device="cpu", dtype=torch.float64)
+                feat_t_min = torch.tensor(
+                    float(feat_local) if int(feat_local) > 0 else big_feat,
+                    device="cpu",
+                    dtype=torch.float64,
+                )
+                _dist_all_reduce_max_(feat_t_max)
+                _dist_all_reduce_min_(feat_t_min)
+                feat_max = int(round(float(feat_t_max.item())))
+                feat_min_f = float(feat_t_min.item())
+                feat_min = 0 if feat_min_f >= big_feat * 0.9 else int(round(feat_min_f))
+                if feat_min > 0 and feat_max != feat_min:
+                    raise RuntimeError(
+                        f"[ENN] distributed calibration: inconsistent output feature dim across ranks (min={feat_min}, max={feat_max})"
+                    )
+
+                feat_y = int(feat_max)
+                if feat_y <= 0:
+                    with contextlib.suppress(Exception):
+                        feat_y = int(
+                            getattr(scaler, "y_mean", torch.zeros(1))
+                            .reshape(-1)
+                            .numel()
+                        )
+                if feat_y <= 0:
+                    feat_y = 1
+
+                if sum_pz is None or sum_pz2 is None or sum_tz is None or sum_tz2 is None:
+                    sum_pz = torch.zeros((feat_y,), device=accum_device, dtype=torch.float64)
+                    sum_pz2 = torch.zeros((feat_y,), device=accum_device, dtype=torch.float64)
+                    sum_tz = torch.zeros((feat_y,), device=accum_device, dtype=torch.float64)
+                    sum_tz2 = torch.zeros((feat_y,), device=accum_device, dtype=torch.float64)
+
+                if z_min_obs is None or z_max_obs is None or y_min_obs is None or y_max_obs is None:
+                    z_min_obs = torch.full((feat_y,), float("inf"), device=accum_device, dtype=torch.float64)
+                    z_max_obs = torch.full((feat_y,), float("-inf"), device=accum_device, dtype=torch.float64)
+                    y_min_obs = torch.full((feat_y,), float("inf"), device=accum_device, dtype=torch.float64)
+                    y_max_obs = torch.full((feat_y,), float("-inf"), device=accum_device, dtype=torch.float64)
+
                 n_t2 = torch.tensor(int(n_z), device="cpu", dtype=torch.int64)
                 _dist_all_reduce_sum_(n_t2)
                 n_z = int(n_t2.item())
-                if sum_pz is not None:
-                    _dist_all_reduce_sum_(sum_pz)
-                if sum_pz2 is not None:
-                    _dist_all_reduce_sum_(sum_pz2)
-                if sum_tz is not None:
-                    _dist_all_reduce_sum_(sum_tz)
-                if sum_tz2 is not None:
-                    _dist_all_reduce_sum_(sum_tz2)
-                if z_min_obs is not None:
-                    _dist_all_reduce_min_(z_min_obs)
-                if z_max_obs is not None:
-                    _dist_all_reduce_max_(z_max_obs)
-                if y_min_obs is not None:
-                    _dist_all_reduce_min_(y_min_obs)
-                if y_max_obs is not None:
-                    _dist_all_reduce_max_(y_max_obs)
+                _dist_all_reduce_sum_(sum_pz)
+                _dist_all_reduce_sum_(sum_pz2)
+                _dist_all_reduce_sum_(sum_tz)
+                _dist_all_reduce_sum_(sum_tz2)
+                _dist_all_reduce_min_(z_min_obs)
+                _dist_all_reduce_max_(z_max_obs)
+                _dist_all_reduce_min_(y_min_obs)
+                _dist_all_reduce_max_(y_max_obs)
 
             if int(n_z) > 0 and sum_pz is not None and sum_pz2 is not None and sum_tz is not None and sum_tz2 is not None:
                 n2 = float(int(n_z))
