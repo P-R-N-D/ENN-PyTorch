@@ -3434,7 +3434,17 @@ def epochs(
                         y_pred = torch.as_tensor(y_pred, device=device)
 
                     ypf = y_pred.reshape(b2, -1)
-                    pred_is_z = bool(env_bool("ENN_OUTPUT_AB_PRED_IS_Z", default=True))
+                    _pred_is_z_env = os.environ.get("ENN_OUTPUT_AB_PRED_IS_Z", None)
+                    if _pred_is_z_env is not None:
+                        pred_is_z = bool(env_bool("ENN_OUTPUT_AB_PRED_IS_Z", default=False))
+                    else:
+                        pred_is_z = False
+                        with contextlib.suppress(Exception):
+                            yp0 = ypf.detach().to(dtype=torch.float32)
+                            if yp0.numel() > 0:
+                                max_abs = float(yp0.abs().amax().item())
+                                std0 = float(yp0.std(unbiased=False).item())
+                                pred_is_z = (max_abs <= 30.0) and (std0 <= 15.0)
                     z_hat = ypf if pred_is_z else scaler.normalize_y(ypf)
                     z_pred = scaler.calibrate(z_hat)
                     zp64 = z_pred.to(device=accum_device, dtype=torch.float64)
@@ -3443,11 +3453,22 @@ def epochs(
                     z_true = scaler.normalize_y(y_true)
                     zt64 = z_true.to(device=accum_device, dtype=torch.float64)
 
-                    zb_min = zt64.amin(dim=0)
-                    zb_max = zt64.amax(dim=0)
                     yt64 = y_true.to(device=accum_device, dtype=torch.float64)
-                    yb_min = yt64.amin(dim=0)
-                    yb_max = yt64.amax(dim=0)
+                    allow_neg_targets = bool(env_bool("ENN_OUTPUT_AB_ALLOW_NEGATIVE_TARGETS", default=False))
+                    valid = torch.isfinite(yt64)
+                    if not allow_neg_targets:
+                        valid = valid & (yt64 >= 0.0)
+                    valid = valid & torch.isfinite(zt64)
+
+                    pos_inf = torch.full_like(yt64, float("inf"))
+                    neg_inf = torch.full_like(yt64, float("-inf"))
+                    yb_min = torch.where(valid, yt64, pos_inf).amin(dim=0)
+                    yb_max = torch.where(valid, yt64, neg_inf).amax(dim=0)
+
+                    z_pos_inf = torch.full_like(zt64, float("inf"))
+                    z_neg_inf = torch.full_like(zt64, float("-inf"))
+                    zb_min = torch.where(valid, zt64, z_pos_inf).amin(dim=0)
+                    zb_max = torch.where(valid, zt64, z_neg_inf).amax(dim=0)
                     if z_min_obs is None:
                         z_min_obs = zb_min
                         z_max_obs = zb_max
@@ -3572,6 +3593,12 @@ def epochs(
 
                     low_ok = _ok_bound(clip_low_y)
                     high_ok = _ok_bound(clip_high_y)
+                    if not bool(env_bool("ENN_OUTPUT_AB_ALLOW_NEGATIVE_TARGETS", default=False)):
+                        with contextlib.suppress(Exception):
+                            if isinstance(clip_low_y, torch.Tensor) and bool((clip_low_y < 0).any().item()):
+                                low_ok = False
+                            if isinstance(clip_high_y, torch.Tensor) and bool((clip_high_y < 0).any().item()):
+                                high_ok = False
                 except Exception:
                     low_ok = False
                     high_ok = False
