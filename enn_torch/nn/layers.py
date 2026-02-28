@@ -2754,6 +2754,8 @@ class Scaler(nn.Module):
         self._invalidate_stats_cache()
         with contextlib.suppress(Exception):
             self._sanitize_nonfinite_bounds_inplace()
+        with contextlib.suppress(Exception):
+            self._restore_calib_state_after_load()
 
     @torch.no_grad()
     def _sanitize_nonfinite_bounds_inplace(self: Self) -> None:
@@ -2826,6 +2828,85 @@ class Scaler(nn.Module):
                         hi2 = torch.maximum(lo, hi)
                         self.y_out_clip_low.resize_(lo2.shape).copy_(lo2)
                         self.y_out_clip_high.resize_(hi2.shape).copy_(hi2)
+
+    @torch.no_grad()
+    def _restore_calib_state_after_load(self: Self) -> None:
+        if env_bool("ENN_DISABLE_OUTPUT_AB", default=False):
+            self.output_ab_enabled = False
+
+        mode = str(getattr(self, "calib_mode", "none") or "none").strip().lower()
+        if mode not in {"none", "affine", "piecewise", "ab"}:
+            mode = "none"
+
+        inferred = "none"
+        with contextlib.suppress(Exception):
+            pwx = getattr(self, "pw_x", None)
+            pwy = getattr(self, "pw_y", None)
+            if (
+                isinstance(pwx, torch.Tensor)
+                and isinstance(pwy, torch.Tensor)
+                and pwx.dim() == 2
+                and pwy.dim() == 2
+                and pwx.numel() >= 2
+                and pwy.numel() >= 2
+            ):
+                inferred = "piecewise"
+
+        if inferred == "none":
+            with contextlib.suppress(Exception):
+                a = getattr(self, "affine_a", None)
+                b = getattr(self, "affine_b", None)
+                if (
+                    isinstance(a, torch.Tensor)
+                    and isinstance(b, torch.Tensor)
+                    and a.is_floating_point()
+                    and b.is_floating_point()
+                    and a.numel() > 0
+                    and b.numel() > 0
+                ):
+                    a0 = a.detach().to(dtype=torch.float64).reshape(-1)
+                    b0 = b.detach().to(dtype=torch.float64).reshape(-1)
+                    if (a0 - 1.0).abs().max().item() > 1e-12 or b0.abs().max().item() > 1e-12:
+                        inferred = "affine"
+
+        if mode in {"none", "ab"}:
+            self.calib_mode = inferred
+
+        if env_bool("ENN_DISABLE_OUTPUT_AB", default=False):
+            self.output_ab_enabled = False
+            return
+
+        enable_ab = False
+        default_lo = float(torch.finfo(torch.float32).min)
+        default_hi = float(torch.finfo(torch.float32).max)
+        with contextlib.suppress(Exception):
+            s = getattr(self, "y_out_scale", None)
+            bb = getattr(self, "y_out_bias", None)
+            lo = getattr(self, "y_out_clip_low", None)
+            hi = getattr(self, "y_out_clip_high", None)
+
+            if isinstance(s, torch.Tensor) and isinstance(bb, torch.Tensor) and s.numel() and bb.numel():
+                s0 = s.detach().to(dtype=torch.float64).reshape(-1)
+                b0 = bb.detach().to(dtype=torch.float64).reshape(-1)
+                if (s0 - 1.0).abs().max().item() > 1e-12 or b0.abs().max().item() > 1e-12:
+                    enable_ab = True
+
+            if (
+                (not enable_ab)
+                and isinstance(lo, torch.Tensor)
+                and isinstance(hi, torch.Tensor)
+                and lo.numel()
+                and hi.numel()
+            ):
+                lo0 = lo.detach().to(dtype=torch.float64).reshape(-1)
+                hi0 = hi.detach().to(dtype=torch.float64).reshape(-1)
+                if (
+                    (lo0 - default_lo).abs().max().item() > 1e-6
+                    or (hi0 - default_hi).abs().max().item() > 1e-6
+                ):
+                    enable_ab = True
+
+        self.output_ab_enabled = bool(enable_ab)
 
     def _update_stats_impl(
         self: Self,
