@@ -3406,6 +3406,14 @@ def epochs(
             n_z = 0
             seen_batches2 = 0
             seen_samples2 = 0
+            _pred_is_z_env = os.environ.get("ENN_OUTPUT_AB_PRED_IS_Z", None)
+            pred_is_z_fixed = (
+                bool(env_bool("ENN_OUTPUT_AB_PRED_IS_Z", default=False))
+                if _pred_is_z_env is not None
+                else None
+            )
+            need_pred_is_z_sync = bool(is_distributed() and (_pred_is_z_env is None))
+            pred_is_z_synced = False
 
             model.eval()
             with inference_mode(model), StatelessAutocast.float(device):
@@ -3434,20 +3442,91 @@ def epochs(
                         y_pred = torch.as_tensor(y_pred, device=device)
 
                     ypf = y_pred.reshape(b2, -1)
-                    pred_is_z = bool(env_bool("ENN_OUTPUT_AB_PRED_IS_Z", default=True))
-                    z_hat = ypf if pred_is_z else scaler.normalize_y(ypf)
-                    z_pred = scaler.calibrate(z_hat)
-                    zp64 = z_pred.to(device=accum_device, dtype=torch.float64)
-
                     y_true = torch.atleast_2d(_y_b.to(device)).reshape(b2, -1)
                     z_true = scaler.normalize_y(y_true)
                     zt64 = z_true.to(device=accum_device, dtype=torch.float64)
 
-                    zb_min = zt64.amin(dim=0)
-                    zb_max = zt64.amax(dim=0)
+                    local_vote = bool(pred_is_z_fixed) if pred_is_z_fixed is not None else False
+                    vote_valid = 0.0
+                    local_err_z_sum = 0.0
+                    local_err_y_sum = 0.0
+                    local_err_n = 0.0
+
+                    if pred_is_z_fixed is None:
+                        vote_valid = 1.0
+                        with contextlib.suppress(Exception):
+                            yp0 = ypf.detach().to(dtype=torch.float32)
+                            if yp0.numel() > 0:
+                                max_abs = float(yp0.abs().amax().item())
+                                std0 = float(yp0.std(unbiased=False).item())
+                                local_vote = (max_abs <= 30.0) and (std0 <= 15.0)
+
+                        with contextlib.suppress(Exception):
+                            zt0 = z_true.detach().to(dtype=torch.float32)
+                            z_as_z = ypf.detach().to(dtype=torch.float32)
+                            z_as_y = scaler.normalize_y(ypf).detach().to(dtype=torch.float32)
+                            valid = torch.isfinite(zt0) & torch.isfinite(z_as_z) & torch.isfinite(z_as_y)
+                            if valid.any():
+                                dz0 = z_as_z - zt0
+                                dz1 = z_as_y - zt0
+                                e0 = (dz0[valid] * dz0[valid]).sum()
+                                e1 = (dz1[valid] * dz1[valid]).sum()
+                                n0 = int(valid.sum().item())
+                                if n0 > 0 and torch.isfinite(e0).all() and torch.isfinite(e1).all():
+                                    local_err_z_sum = float(e0.item())
+                                    local_err_y_sum = float(e1.item())
+                                    local_err_n = float(n0)
+                                    local_vote = local_err_z_sum <= local_err_y_sum
+
+                        pred_is_z_fixed = bool(local_vote)
+
+                    if need_pred_is_z_sync and (not pred_is_z_synced):
+                        pack = torch.tensor(
+                            [
+                                float(local_err_z_sum),
+                                float(local_err_y_sum),
+                                float(local_err_n),
+                                float(int(bool(local_vote))),
+                                float(vote_valid),
+                            ],
+                            device="cpu",
+                            dtype=torch.float64,
+                        )
+                        _dist_all_reduce_sum_(pack)
+                        g_err_z = float(pack[0].item())
+                        g_err_y = float(pack[1].item())
+                        g_n = float(pack[2].item())
+                        g_vote_sum = float(pack[3].item())
+                        g_vote_n = float(pack[4].item())
+                        if g_n > 0.0 and math.isfinite(g_err_z) and math.isfinite(g_err_y):
+                            pred_is_z_fixed = bool(g_err_z <= g_err_y)
+                        elif g_vote_n > 0.0:
+                            pred_is_z_fixed = bool((g_vote_sum * 2.0) >= g_vote_n)
+                        else:
+                            pred_is_z_fixed = False
+                        pred_is_z_synced = True
+
+                    pred_is_z = bool(pred_is_z_fixed)
+                    z_hat = ypf if pred_is_z else scaler.normalize_y(ypf)
+                    z_pred = scaler.calibrate(z_hat)
+                    zp64 = z_pred.to(device=accum_device, dtype=torch.float64)
+
                     yt64 = y_true.to(device=accum_device, dtype=torch.float64)
-                    yb_min = yt64.amin(dim=0)
-                    yb_max = yt64.amax(dim=0)
+                    allow_neg_targets = bool(env_bool("ENN_OUTPUT_AB_ALLOW_NEGATIVE_TARGETS", default=False))
+                    valid = torch.isfinite(yt64)
+                    if not allow_neg_targets:
+                        valid = valid & (yt64 >= 0.0)
+                    valid = valid & torch.isfinite(zt64)
+
+                    pos_inf = torch.full_like(yt64, float("inf"))
+                    neg_inf = torch.full_like(yt64, float("-inf"))
+                    yb_min = torch.where(valid, yt64, pos_inf).amin(dim=0)
+                    yb_max = torch.where(valid, yt64, neg_inf).amax(dim=0)
+
+                    z_pos_inf = torch.full_like(zt64, float("inf"))
+                    z_neg_inf = torch.full_like(zt64, float("-inf"))
+                    zb_min = torch.where(valid, zt64, z_pos_inf).amin(dim=0)
+                    zb_max = torch.where(valid, zt64, z_neg_inf).amax(dim=0)
                     if z_min_obs is None:
                         z_min_obs = zb_min
                         z_max_obs = zb_max
@@ -3473,6 +3552,22 @@ def epochs(
                     n_z += int(b2)
                     seen_batches2 += 1
                     seen_samples2 += int(b2)
+
+            if need_pred_is_z_sync and (not pred_is_z_synced):
+                pack = torch.zeros((5,), device="cpu", dtype=torch.float64)
+                _dist_all_reduce_sum_(pack)
+                g_err_z = float(pack[0].item())
+                g_err_y = float(pack[1].item())
+                g_n = float(pack[2].item())
+                g_vote_sum = float(pack[3].item())
+                g_vote_n = float(pack[4].item())
+                if g_n > 0.0 and math.isfinite(g_err_z) and math.isfinite(g_err_y):
+                    pred_is_z_fixed = bool(g_err_z <= g_err_y)
+                elif g_vote_n > 0.0:
+                    pred_is_z_fixed = bool((g_vote_sum * 2.0) >= g_vote_n)
+                else:
+                    pred_is_z_fixed = False
+                pred_is_z_synced = True
 
             if is_distributed():
                 feat_local = int(sum_pz.shape[0]) if isinstance(sum_pz, torch.Tensor) else 0
@@ -3572,6 +3667,12 @@ def epochs(
 
                     low_ok = _ok_bound(clip_low_y)
                     high_ok = _ok_bound(clip_high_y)
+                    if not bool(env_bool("ENN_OUTPUT_AB_ALLOW_NEGATIVE_TARGETS", default=False)):
+                        with contextlib.suppress(Exception):
+                            if isinstance(clip_low_y, torch.Tensor) and bool((clip_low_y < 0).any().item()):
+                                low_ok = False
+                            if isinstance(clip_high_y, torch.Tensor) and bool((clip_high_y < 0).any().item()):
+                                high_ok = False
                 except Exception:
                     low_ok = False
                     high_ok = False
