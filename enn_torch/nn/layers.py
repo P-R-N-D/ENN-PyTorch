@@ -2586,6 +2586,7 @@ class Scaler(nn.Module):
         self._y_stats_cache: Dict[
             Tuple[str, int, torch.dtype], Tuple[torch.Tensor, torch.Tensor]
         ] = {}
+        self._output_ab_log_once: bool = False
 
     def __getstate__(self: Self) -> dict[str, object]:
         state = super().__getstate__()
@@ -2601,6 +2602,8 @@ class Scaler(nn.Module):
             self._stats_cache_max = 8
         self._x_stats_cache = {}
         self._y_stats_cache = {}
+        if not hasattr(self, "_output_ab_log_once"):
+            self._output_ab_log_once = False
 
     def _resolve_master_dtype_for_io(self: Self, t: torch.Tensor) -> torch.dtype:
         pref = str(os.environ.get("ENN_SCALER_MASTER_DTYPE", "") or "").strip().lower()
@@ -2935,6 +2938,75 @@ class Scaler(nn.Module):
                     enable_ab = True
 
         self.output_ab_enabled = bool(enable_ab)
+
+        if (
+            bool(self.output_ab_enabled)
+            and env_bool("ENN_SCALER_OUTPUT_AB_LOG", default=False)
+            and (not bool(getattr(self, "_output_ab_log_once", False)))
+        ):
+            self._output_ab_log_once = True
+            try:
+                max_elems = max(1, int(env_int("ENN_SCALER_OUTPUT_AB_LOG_MAX_ELEMS", 4096) or 4096))
+
+                def _sample(v: torch.Tensor) -> tuple[torch.Tensor, bool, int]:
+                    vv = v.detach().reshape(-1)
+                    n = int(vv.numel())
+                    if n <= 0:
+                        return vv, False, 0
+                    if n <= max_elems:
+                        return vv, False, n
+                    if max_elems == 1:
+                        idx = torch.tensor([n - 1], device=vv.device, dtype=torch.long)
+                    else:
+                        idx = torch.arange(max_elems, device=vv.device, dtype=torch.long)
+                        idx = (idx * (n - 1)) // max(1, (max_elems - 1))
+                    return vv.index_select(0, idx), True, n
+
+                s0 = getattr(self, "y_out_scale", None)
+                b0 = getattr(self, "y_out_bias", None)
+                lo0 = getattr(self, "y_out_clip_low", None)
+                hi0 = getattr(self, "y_out_clip_high", None)
+                if isinstance(s0, torch.Tensor) and isinstance(b0, torch.Tensor) and isinstance(lo0, torch.Tensor) and isinstance(hi0, torch.Tensor):
+                    s_s, s_sampled, s_n = _sample(s0)
+                    b_s, b_sampled, b_n = _sample(b0)
+                    lo_s, lo_sampled, lo_n = _sample(lo0)
+                    hi_s, hi_sampled, hi_n = _sample(hi0)
+
+                    s_cpu = s_s.to(device="cpu", dtype=torch.float64)
+                    b_cpu = b_s.to(device="cpu", dtype=torch.float64)
+                    lo_cpu = lo_s.to(device="cpu", dtype=torch.float64)
+                    hi_cpu = hi_s.to(device="cpu", dtype=torch.float64)
+                    span_cpu = hi_cpu - lo_cpu
+
+                    denom = torch.clamp(span_cpu.abs(), min=1e-12)
+                    ratio = b_cpu.abs() / denom
+                    frac_ratio_1e2 = float((ratio > 1e2).to(dtype=torch.float32).mean().item())
+                    frac_ratio_1e3 = float((ratio > 1e3).to(dtype=torch.float32).mean().item())
+
+                    _LOGGER.warning(
+                        "[ENN][scaler] output_ab enabled after load (mode=%s). "
+                        "scale[min/mean/max]=%.6g/%.6g/%.6g bias[abs_max]=%.6g "
+                        "clip_low[min/max]=%.6g/%.6g clip_high[min/max]=%.6g/%.6g span[min/max]=%.6g/%.6g "
+                        "|bias|/|span|>1e2 frac=%.3f >1e3 frac=%.3f (numel=%d, max_elems=%d, sampled=%s).",
+                        str(getattr(self, "calib_mode", "")),
+                        float(s_cpu.min().item()) if s_cpu.numel() else float("nan"),
+                        float(s_cpu.mean().item()) if s_cpu.numel() else float("nan"),
+                        float(s_cpu.max().item()) if s_cpu.numel() else float("nan"),
+                        float(b_cpu.abs().max().item()) if b_cpu.numel() else float("nan"),
+                        float(lo_cpu.min().item()) if lo_cpu.numel() else float("nan"),
+                        float(lo_cpu.max().item()) if lo_cpu.numel() else float("nan"),
+                        float(hi_cpu.min().item()) if hi_cpu.numel() else float("nan"),
+                        float(hi_cpu.max().item()) if hi_cpu.numel() else float("nan"),
+                        float(span_cpu.min().item()) if span_cpu.numel() else float("nan"),
+                        float(span_cpu.max().item()) if span_cpu.numel() else float("nan"),
+                        float(frac_ratio_1e2),
+                        float(frac_ratio_1e3),
+                        int(max(int(s_n), int(b_n), int(lo_n), int(hi_n))),
+                        int(max_elems),
+                        str(bool(s_sampled or b_sampled or lo_sampled or hi_sampled)),
+                    )
+            except Exception:
+                pass
 
     def _update_stats_impl(
         self: Self,
