@@ -2943,51 +2943,104 @@ class Scaler(nn.Module):
                     b_abs_th = float(env_float("ENN_OUTPUT_AB_SANITY_BIAS_ABS_MAX", 1000.0))
                     ratio_th = float(env_float("ENN_OUTPUT_AB_SANITY_BIAS_SPAN_RATIO_MAX", 1e3))
                     span_eps = float(env_float("ENN_OUTPUT_AB_SANITY_SPAN_EPS", 1e-12))
+                    sample_max = max(1, int(env_int("ENN_OUTPUT_AB_SANITY_SAMPLE_MAX", 4096) or 4096))
+                    disable_on_mismatch = bool(env_bool("ENN_OUTPUT_AB_SANITY_DISABLE_ON_SHAPE_MISMATCH", default=True))
+                    disable_on_degen_span = bool(env_bool("ENN_OUTPUT_AB_SANITY_DISABLE_ON_DEGENERATE_SPAN", default=True))
+                    degen_span_frac_max = float(env_float("ENN_OUTPUT_AB_SANITY_DEGENERATE_SPAN_FRAC_MAX", 0.01))
 
                     if isinstance(bb, torch.Tensor) and bb.numel():
-                        b0 = bb.detach().to(dtype=torch.float64).reshape(-1)
+                        b0 = bb.detach().reshape(-1)
                         b_abs_max = float(b0.abs().max().item())
 
                         ratio_max = float("nan")
                         span_min = float("nan")
                         span_max = float("nan")
                         bad_ratio_frac = 0.0
+                        ratio_error = ""
+                        neg_span_frac = 0.0
+                        degen_span_frac = 0.0
+
+                        len_s = int(s.numel()) if isinstance(s, torch.Tensor) else 0
+                        len_b = int(b0.numel())
+                        len_lo = int(lo.numel()) if isinstance(lo, torch.Tensor) else 0
+                        len_hi = int(hi.numel()) if isinstance(hi, torch.Tensor) else 0
+                        shape_mismatch = (
+                            (len_s > 1 and len_b > 1 and len_s != len_b)
+                            or (len_b > 1 and len_lo > 1 and len_b != len_lo)
+                            or (len_b > 1 and len_hi > 1 and len_b != len_hi)
+                            or (len_lo > 1 and len_hi > 1 and len_lo != len_hi)
+                        )
 
                         if isinstance(lo, torch.Tensor) and isinstance(hi, torch.Tensor) and lo.numel() and hi.numel():
-                            lo0 = lo.detach().to(dtype=torch.float64).reshape(-1)
-                            hi0 = hi.detach().to(dtype=torch.float64).reshape(-1)
-                            n = int(max(int(b0.numel()), int(lo0.numel()), int(hi0.numel())))
+                            try:
+                                lo0 = lo.detach().reshape(-1)
+                                hi0 = hi.detach().reshape(-1)
 
-                            def _to_n(v: torch.Tensor, n: int) -> torch.Tensor:
-                                if v.numel() == n:
-                                    return v
-                                if v.numel() == 1 and n != 1:
-                                    return v.expand((n,))
-                                if v.numel() >= n:
-                                    return v[:n]
-                                # tolerate mismatched non-singleton lengths from malformed checkpoints
-                                reps = (n + int(v.numel()) - 1) // int(v.numel())
-                                return v.repeat(reps)[:n]
+                                lb = int(b0.numel())
+                                llo = int(lo0.numel())
+                                lhi = int(hi0.numel())
+                                base_n = int(max(lb, llo, lhi))
+                                if base_n > 0:
+                                    sn = int(min(sample_max, base_n))
+                                    if sn <= 1:
+                                        idx_base = torch.tensor([base_n - 1], device=b0.device, dtype=torch.long)
+                                    else:
+                                        idx_base = torch.arange(sn, device=b0.device, dtype=torch.long)
+                                        idx_base = (idx_base * (base_n - 1)) // max(1, (sn - 1))
 
-                            bN = _to_n(b0, n)
-                            loN = _to_n(lo0, n)
-                            hiN = _to_n(hi0, n)
-                            span = (hiN - loN).abs()
-                            span_min = float(span.min().item())
-                            span_max = float(span.max().item())
-                            ratio = bN.abs() / torch.clamp(span, min=span_eps)
-                            ratio_max = float(ratio.max().item())
-                            bad_ratio_frac = float((ratio > ratio_th).to(dtype=torch.float32).mean().item())
+                                    def _gather(v: torch.Tensor, lv: int) -> torch.Tensor:
+                                        if lv <= 0:
+                                            return v[:0]
+                                        if lv == 1:
+                                            return v[:1].expand((int(idx_base.numel()),))
+                                        if lv == base_n:
+                                            return v.index_select(0, idx_base)
+                                        return v.index_select(0, (idx_base % lv))
 
-                        if (math.isfinite(b_abs_max) and b_abs_max > b_abs_th) or (math.isfinite(ratio_max) and ratio_max > ratio_th):
+                                    b_s = _gather(b0, lb).to(dtype=torch.float64)
+                                    lo_s = _gather(lo0, llo).to(dtype=torch.float64)
+                                    hi_s = _gather(hi0, lhi).to(dtype=torch.float64)
+                                    span = (hi_s - lo_s).abs()
+                                    span_min = float(span.min().item()) if span.numel() else float("nan")
+                                    span_max = float(span.max().item()) if span.numel() else float("nan")
+                                    ratio = b_s.abs() / torch.clamp(span, min=max(float(span_eps), 1e-12))
+                                    ratio_max = float(ratio.max().item()) if ratio.numel() else float("nan")
+                                    bad_ratio_frac = float((ratio > ratio_th).to(dtype=torch.float32).mean().item()) if ratio.numel() else 0.0
+                                    neg_span_frac = float((hi_s < lo_s).to(dtype=torch.float32).mean().item()) if hi_s.numel() and lo_s.numel() else 0.0
+                                    degen_span_frac = float((span <= max(float(span_eps), 1e-12)).to(dtype=torch.float32).mean().item()) if span.numel() else 0.0
+                            except Exception as e:
+                                ratio_error = f"{type(e).__name__}: {e}"
+
+                        disable_reason = ""
+                        if (math.isfinite(b_abs_max) and b_abs_max > b_abs_th):
+                            disable_reason = "bias_abs_max"
+                        elif (math.isfinite(ratio_max) and ratio_max > ratio_th):
+                            disable_reason = "ratio_max"
+                        elif disable_on_degen_span and (neg_span_frac > 0.0):
+                            disable_reason = "negative_span"
+                        elif disable_on_degen_span and (degen_span_frac > degen_span_frac_max):
+                            disable_reason = "degenerate_span"
+                        elif disable_on_mismatch and bool(shape_mismatch):
+                            disable_reason = "shape_mismatch"
+
+                        if disable_reason:
                             enable_ab = False
                             if env_bool("ENN_OUTPUT_AB_SANITY_LOG", default=True):
+                                extra = f" ratio_error={ratio_error}" if ratio_error else ""
                                 _LOGGER.warning(
                                     "[ENN][scaler] disabling output_ab after load (suspicious params): "
                                     "bias_abs_max=%.6g(th=%.6g) ratio_max=%.6g(th=%.6g) bad_ratio_frac=%.4f span[min/max]=%.6g/%.6g. "
-                                    "Set ENN_OUTPUT_AB_SANITY_DISABLE=0 to override.",
+                                    "neg_span_frac=%.4f degen_span_frac=%.4f shape_mismatch=%s lens(s=%d,b=%d,lo=%d,hi=%d) "
+                                    "reason=%s%s Set ENN_OUTPUT_AB_SANITY_DISABLE=0 to override.",
                                     float(b_abs_max), float(b_abs_th), float(ratio_max), float(ratio_th), float(bad_ratio_frac), float(span_min), float(span_max),
+                                    float(neg_span_frac), float(degen_span_frac), str(bool(shape_mismatch)),
+                                    int(len_s), int(len_b), int(len_lo), int(len_hi),
+                                    str(disable_reason), str(extra),
                                 )
+                            with contextlib.suppress(Exception):
+                                setattr(self, "_output_ab_sanity_reason", str(disable_reason))
+                                setattr(self, "_output_ab_sanity_bias_abs_max", float(b_abs_max))
+                                setattr(self, "_output_ab_sanity_ratio_max", float(ratio_max))
                 except Exception:
                     pass
 
@@ -3373,6 +3426,42 @@ class Scaler(nn.Module):
     def _apply_output_ab(self: Self, z: torch.Tensor) -> torch.Tensor:
         if z.numel() == 0 or not bool(getattr(self, "output_ab_enabled", False)):
             return z
+
+        if env_bool("ENN_OUTPUT_AB_SANITY_RUNTIME_DISABLE", default=True) and (not bool(getattr(self, "_output_ab_runtime_sanity_checked", False))):
+            setattr(self, "_output_ab_runtime_sanity_checked", True)
+            try:
+                b_abs_th = float(env_float("ENN_OUTPUT_AB_SANITY_BIAS_ABS_MAX", 1000.0))
+                disable_on_mismatch = bool(env_bool("ENN_OUTPUT_AB_SANITY_DISABLE_ON_SHAPE_MISMATCH", default=True))
+                bb = getattr(self, "y_out_bias", None)
+                s = getattr(self, "y_out_scale", None)
+                lo = getattr(self, "y_out_clip_low", None)
+                hi = getattr(self, "y_out_clip_high", None)
+                len_s = int(s.numel()) if isinstance(s, torch.Tensor) else 0
+                len_b = int(bb.numel()) if isinstance(bb, torch.Tensor) else 0
+                len_lo = int(lo.numel()) if isinstance(lo, torch.Tensor) else 0
+                len_hi = int(hi.numel()) if isinstance(hi, torch.Tensor) else 0
+                shape_mismatch = (
+                    (len_s > 1 and len_b > 1 and len_s != len_b)
+                    or (len_b > 1 and len_lo > 1 and len_b != len_lo)
+                    or (len_b > 1 and len_hi > 1 and len_b != len_hi)
+                    or (len_lo > 1 and len_hi > 1 and len_lo != len_hi)
+                )
+                b_abs_max = float("nan")
+                if isinstance(bb, torch.Tensor) and bb.numel():
+                    b_abs_max = float(bb.detach().reshape(-1).abs().max().item())
+                if (math.isfinite(b_abs_max) and b_abs_max > b_abs_th) or (disable_on_mismatch and bool(shape_mismatch)):
+                    self.output_ab_enabled = False
+                    if env_bool("ENN_OUTPUT_AB_SANITY_LOG", default=True) and (not bool(getattr(self, "_output_ab_runtime_sanity_warned", False))):
+                        setattr(self, "_output_ab_runtime_sanity_warned", True)
+                        _LOGGER.warning(
+                            "[ENN][scaler] disabling output_ab at runtime (sanity): bias_abs_max=%.6g(th=%.6g) shape_mismatch=%s lens(s=%d,b=%d,lo=%d,hi=%d).",
+                            float(b_abs_max), float(b_abs_th), str(bool(shape_mismatch)),
+                            int(len_s), int(len_b), int(len_lo), int(len_hi),
+                        )
+                    return z
+            except Exception:
+                pass
+
         input_dtype = z.dtype
         master_dtype = self._resolve_master_dtype_for_io(z)
         if master_dtype is torch.int64:
