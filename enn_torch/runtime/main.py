@@ -3401,6 +3401,7 @@ def epochs(
 
             sum_pz = sum_pz2 = None
             sum_tz = sum_tz2 = None
+            z_min_obs = z_max_obs = None
             y_min_obs = y_max_obs = None
             n_z = 0
             seen_batches2 = 0
@@ -3433,23 +3434,30 @@ def epochs(
                         y_pred = torch.as_tensor(y_pred, device=device)
 
                     ypf = y_pred.reshape(b2, -1)
-                    pred_is_z = bool(env_bool("ENN_OUTPUT_AB_PRED_IS_Z", default=False))
+                    pred_is_z = bool(env_bool("ENN_OUTPUT_AB_PRED_IS_Z", default=True))
                     z_hat = ypf if pred_is_z else scaler.normalize_y(ypf)
                     z_pred = scaler.calibrate(z_hat)
                     zp64 = z_pred.to(device=accum_device, dtype=torch.float64)
 
                     y_true = torch.atleast_2d(_y_b.to(device)).reshape(b2, -1)
+                    z_true = scaler.normalize_y(y_true)
+                    zt64 = z_true.to(device=accum_device, dtype=torch.float64)
+
+                    zb_min = zt64.amin(dim=0)
+                    zb_max = zt64.amax(dim=0)
                     yt64 = y_true.to(device=accum_device, dtype=torch.float64)
-                    yb_min = yt64.min(dim=0).values
-                    yb_max = yt64.max(dim=0).values
-                    if y_min_obs is None:
+                    yb_min = yt64.amin(dim=0)
+                    yb_max = yt64.amax(dim=0)
+                    if z_min_obs is None:
+                        z_min_obs = zb_min
+                        z_max_obs = zb_max
                         y_min_obs = yb_min
                         y_max_obs = yb_max
                     else:
+                        z_min_obs = torch.minimum(z_min_obs, zb_min)
+                        z_max_obs = torch.maximum(z_max_obs, zb_max)
                         y_min_obs = torch.minimum(y_min_obs, yb_min)
                         y_max_obs = torch.maximum(y_max_obs, yb_max)
-                    z_true = scaler.normalize_y(y_true)
-                    zt64 = z_true.to(device=accum_device, dtype=torch.float64)
 
                     if sum_pz is None:
                         feat_y = int(zp64.shape[1])
@@ -3467,21 +3475,58 @@ def epochs(
                     seen_samples2 += int(b2)
 
             if is_distributed():
+                feat_local = int(sum_pz.shape[0]) if isinstance(sum_pz, torch.Tensor) else 0
+                big_feat = float(1.0e30)
+                feat_t_max = torch.tensor(float(feat_local), device="cpu", dtype=torch.float64)
+                feat_t_min = torch.tensor(
+                    float(feat_local) if int(feat_local) > 0 else big_feat,
+                    device="cpu",
+                    dtype=torch.float64,
+                )
+                _dist_all_reduce_max_(feat_t_max)
+                _dist_all_reduce_min_(feat_t_min)
+                feat_max = int(round(float(feat_t_max.item())))
+                feat_min_f = float(feat_t_min.item())
+                feat_min = 0 if feat_min_f >= big_feat * 0.9 else int(round(feat_min_f))
+                if feat_min > 0 and feat_max != feat_min:
+                    raise RuntimeError(
+                        f"[ENN] distributed calibration: inconsistent output feature dim across ranks (min={feat_min}, max={feat_max})"
+                    )
+
+                feat_y = int(feat_max)
+                if feat_y <= 0:
+                    with contextlib.suppress(Exception):
+                        feat_y = int(
+                            getattr(scaler, "y_mean", torch.zeros(1))
+                            .reshape(-1)
+                            .numel()
+                        )
+                if feat_y <= 0:
+                    feat_y = 1
+
+                if sum_pz is None or sum_pz2 is None or sum_tz is None or sum_tz2 is None:
+                    sum_pz = torch.zeros((feat_y,), device=accum_device, dtype=torch.float64)
+                    sum_pz2 = torch.zeros((feat_y,), device=accum_device, dtype=torch.float64)
+                    sum_tz = torch.zeros((feat_y,), device=accum_device, dtype=torch.float64)
+                    sum_tz2 = torch.zeros((feat_y,), device=accum_device, dtype=torch.float64)
+
+                if z_min_obs is None or z_max_obs is None or y_min_obs is None or y_max_obs is None:
+                    z_min_obs = torch.full((feat_y,), float("inf"), device=accum_device, dtype=torch.float64)
+                    z_max_obs = torch.full((feat_y,), float("-inf"), device=accum_device, dtype=torch.float64)
+                    y_min_obs = torch.full((feat_y,), float("inf"), device=accum_device, dtype=torch.float64)
+                    y_max_obs = torch.full((feat_y,), float("-inf"), device=accum_device, dtype=torch.float64)
+
                 n_t2 = torch.tensor(int(n_z), device="cpu", dtype=torch.int64)
                 _dist_all_reduce_sum_(n_t2)
                 n_z = int(n_t2.item())
-                if sum_pz is not None:
-                    _dist_all_reduce_sum_(sum_pz)
-                if sum_pz2 is not None:
-                    _dist_all_reduce_sum_(sum_pz2)
-                if sum_tz is not None:
-                    _dist_all_reduce_sum_(sum_tz)
-                if sum_tz2 is not None:
-                    _dist_all_reduce_sum_(sum_tz2)
-                if y_min_obs is not None:
-                    _dist_all_reduce_min_(y_min_obs)
-                if y_max_obs is not None:
-                    _dist_all_reduce_max_(y_max_obs)
+                _dist_all_reduce_sum_(sum_pz)
+                _dist_all_reduce_sum_(sum_pz2)
+                _dist_all_reduce_sum_(sum_tz)
+                _dist_all_reduce_sum_(sum_tz2)
+                _dist_all_reduce_min_(z_min_obs)
+                _dist_all_reduce_max_(z_max_obs)
+                _dist_all_reduce_min_(y_min_obs)
+                _dist_all_reduce_max_(y_max_obs)
 
             if int(n_z) > 0 and sum_pz is not None and sum_pz2 is not None and sum_tz is not None and sum_tz2 is not None:
                 n2 = float(int(n_z))
@@ -3499,27 +3544,8 @@ def epochs(
 
                 clip_low_y = getattr(scaler, "y_min", None)
                 clip_high_y = getattr(scaler, "y_max", None)
-
-                try:
-                    ext_abs = float(os.environ.get("ENN_SCALER_BOUNDS_EXTREME_ABS", "") or 1e307)
-                    low_ok = isinstance(clip_low_y, torch.Tensor) and bool(torch.isfinite(clip_low_y).all().item()) and bool((clip_low_y.abs() < ext_abs).all().item())
-                    high_ok = isinstance(clip_high_y, torch.Tensor) and bool(torch.isfinite(clip_high_y).all().item()) and bool((clip_high_y.abs() < ext_abs).all().item())
-                except Exception:
-                    low_ok = False
-                    high_ok = False
-                if (not low_ok or not high_ok) and isinstance(y_min_obs, torch.Tensor) and isinstance(y_max_obs, torch.Tensor):
-                    if not low_ok:
-                        clip_low_y = y_min_obs.to(device=device, dtype=torch.float64)
-                        with contextlib.suppress(Exception):
-                            t0 = getattr(scaler, "y_min")
-                            v0 = clip_low_y.to(device=t0.device, dtype=t0.dtype)
-                            t0.resize_(v0.shape).copy_(v0)
-                    if not high_ok:
-                        clip_high_y = y_max_obs.to(device=device, dtype=torch.float64)
-                        with contextlib.suppress(Exception):
-                            t1 = getattr(scaler, "y_max")
-                            v1 = clip_high_y.to(device=t1.device, dtype=t1.dtype)
-                            t1.resize_(v1.shape).copy_(v1)
+                clip_low = clip_high = None
+                clip_src = "unset"
 
                 try:
                     use_quant = bool(getattr(model_for_scaler, "delta_gate_bounds_use_quantile", False))
@@ -3532,9 +3558,74 @@ def epochs(
                         with contextlib.suppress(Exception):
                             if bool(torch.isfinite(ql).all().item()) and bool(torch.isfinite(qh).all().item()):
                                 clip_low_y, clip_high_y = ql, qh
+                                clip_src = "quantile"
 
-                clip_low = scaler.normalize_y(clip_low_y) if isinstance(clip_low_y, torch.Tensor) else clip_low_y
-                clip_high = scaler.normalize_y(clip_high_y) if isinstance(clip_high_y, torch.Tensor) else clip_high_y
+                try:
+                    ext_abs = float(os.environ.get("ENN_SCALER_BOUNDS_EXTREME_ABS", "") or 1e307)
+
+                    def _ok_bound(t: object) -> bool:
+                        if not isinstance(t, torch.Tensor):
+                            return False
+                        if is_symbolic() or is_meta_or_fake_tensor(t):
+                            return True
+                        return bool(torch.isfinite(t).all().item()) and bool((t.abs() < ext_abs).all().item())
+
+                    low_ok = _ok_bound(clip_low_y)
+                    high_ok = _ok_bound(clip_high_y)
+                except Exception:
+                    low_ok = False
+                    high_ok = False
+                if (low_ok and high_ok) and isinstance(clip_low_y, torch.Tensor) and isinstance(clip_high_y, torch.Tensor):
+                    with contextlib.suppress(Exception):
+                        clip_low = scaler.normalize_y(clip_low_y)
+                        clip_high = scaler.normalize_y(clip_high_y)
+                        if clip_src == "quantile":
+                            clip_src = "quantile_y"
+                        else:
+                            clip_src = "y_minmax"
+
+                if (clip_low is None or clip_high is None) and isinstance(z_min_obs, torch.Tensor) and isinstance(z_max_obs, torch.Tensor):
+                    clip_low = z_min_obs
+                    clip_high = z_max_obs
+                    clip_src = "z_obs"
+
+                if clip_low is None or clip_high is None:
+                    k = float(os.environ.get("ENN_OUTPUT_AB_FALLBACK_K", "") or 8.0)
+                    with contextlib.suppress(Exception):
+                        k = max(2.0, min(12.0, k))
+                    clip_low = ref_mean - k * ref_std
+                    clip_high = ref_mean + k * ref_std
+                    clip_src = "ref_k"
+
+                with contextlib.suppress(Exception):
+                    if isinstance(clip_low, torch.Tensor) and isinstance(clip_high, torch.Tensor):
+                        clip_low = clip_low.to(device=accum_device, dtype=torch.float64).reshape(-1)
+                        clip_high = clip_high.to(device=accum_device, dtype=torch.float64).reshape(-1)
+                        lo2 = torch.minimum(clip_low, clip_high)
+                        hi2 = torch.maximum(clip_low, clip_high)
+                        clip_low, clip_high = lo2, hi2
+
+                        bad = (~torch.isfinite(clip_low)) | (~torch.isfinite(clip_high))
+                        if bad.any():
+                            k = float(os.environ.get("ENN_OUTPUT_AB_FALLBACK_K", "") or 8.0)
+                            k = max(2.0, min(12.0, k))
+                            rm = ref_mean.to(device=accum_device, dtype=torch.float64).reshape(-1)
+                            rs = ref_std.to(device=accum_device, dtype=torch.float64).reshape(-1)
+                            fb_lo = rm - k * rs
+                            fb_hi = rm + k * rs
+                            clip_low = torch.where(bad, fb_lo, clip_low)
+                            clip_high = torch.where(bad, fb_hi, clip_high)
+
+                        rm = ref_mean.to(device=accum_device, dtype=torch.float64).reshape(-1)
+                        ok = (rm >= clip_low) & (rm <= clip_high)
+                        frac_ok = float(ok.float().mean().item()) if ok.numel() else 1.0
+                        if frac_ok < 0.90:
+                            k = float(os.environ.get("ENN_OUTPUT_AB_FALLBACK_K", "") or 8.0)
+                            k = max(2.0, min(12.0, k))
+                            rs = ref_std.to(device=accum_device, dtype=torch.float64).reshape(-1)
+                            clip_low = rm - k * rs
+                            clip_high = rm + k * rs
+                            clip_src = "sanity_ref_k"
 
                 scaler.fit_output_ab(
                     pred_mean,
@@ -3547,6 +3638,79 @@ def epochs(
                     scale_clamp=scale_clamp,
                     enable=True,
                 )
+
+                if env_bool(("ENN_PRED_DIAG_OVERWRITE", "ENN_OUTPUT_AB_DIAG"), default=False):
+                    with contextlib.suppress(Exception):
+                        def _q3(x: torch.Tensor) -> dict[str, float]:
+                            xf = x.detach().to(device="cpu", dtype=torch.float32).reshape(-1)
+                            if xf.numel() == 0:
+                                return {"p0": float("nan"), "p50": float("nan"), "p100": float("nan")}
+                            q = torch.quantile(xf, torch.tensor([0.0, 0.5, 1.0]))
+                            return {"p0": float(q[0].item()), "p50": float(q[1].item()), "p100": float(q[2].item())}
+
+                        batch0 = None
+                        for _b in _iter_raw(calib_src):
+                            batch0 = _b
+                            break
+                        if batch0 is not None:
+                            xb0, yb0 = collate.get_row(batch0, labels_required=True)
+                            x0 = torch.atleast_2d(xb0.to(device))
+                            y0 = torch.atleast_2d(yb0.to(device)).reshape(int(x0.shape[0]), -1)
+
+                            with inference_mode(model), StatelessAutocast.float(device):
+                                z0 = model(
+                                    x0,
+                                    calibrate_output=False,
+                                    sanitize_nan=True,
+                                    return_loss=False,
+                                    return_aux=False,
+                                )
+                                if isinstance(z0, tuple):
+                                    z0 = z0[0]
+                                z0 = torch.as_tensor(z0, device=device).reshape(int(x0.shape[0]), -1)
+                                z0_cal = scaler.calibrate(z0)
+                                y0_hat = scaler.denormalize_y(z0_cal)
+
+                            clip_y_lo = clip_y_hi = None
+                            with contextlib.suppress(Exception):
+                                if isinstance(clip_low, torch.Tensor):
+                                    clip_y_lo = scaler.denormalize_y(clip_low.to(device=device, dtype=torch.float64))
+                                if isinstance(clip_high, torch.Tensor):
+                                    clip_y_hi = scaler.denormalize_y(clip_high.to(device=device, dtype=torch.float64))
+
+                            payload = {
+                                "tag": "output_ab_diag",
+                                "n_z": int(n_z),
+                                "pred_is_z": bool(pred_is_z),
+                                "clip_src": str(clip_src),
+                                "y_true": _q3(y0),
+                                "y_pred": _q3(y0_hat),
+                                "z_pred": _q3(z0),
+                                "z_pred_cal": _q3(z0_cal),
+                                "pred_mean": _q3(pred_mean),
+                                "pred_std": _q3(pred_std),
+                                "ref_mean": _q3(ref_mean),
+                                "ref_std": _q3(ref_std),
+                                "clip_low_z": _q3(clip_low) if isinstance(clip_low, torch.Tensor) else None,
+                                "clip_high_z": _q3(clip_high) if isinstance(clip_high, torch.Tensor) else None,
+                                "clip_low_y": _q3(clip_y_lo) if isinstance(clip_y_lo, torch.Tensor) else None,
+                                "clip_high_y": _q3(clip_y_hi) if isinstance(clip_y_hi, torch.Tensor) else None,
+                                "y_min_obs": _q3(y_min_obs) if isinstance(y_min_obs, torch.Tensor) else None,
+                                "y_max_obs": _q3(y_max_obs) if isinstance(y_max_obs, torch.Tensor) else None,
+                                "z_min_obs": _q3(z_min_obs) if isinstance(z_min_obs, torch.Tensor) else None,
+                                "z_max_obs": _q3(z_max_obs) if isinstance(z_max_obs, torch.Tensor) else None,
+                                "y_out_scale": _q3(getattr(scaler, "y_out_scale")),
+                                "y_out_bias": _q3(getattr(scaler, "y_out_bias")),
+                            }
+                            dump_dir = os.environ.get("ENN_PRED_OVERWRITE_DUMP_DIR", "") or os.environ.get("ENN_NONFINITE_DUMP_DIR", "")
+                            if dump_dir:
+                                os.makedirs(dump_dir, exist_ok=True)
+                                rid = str(os.environ.get("ENN_RUN_ID", "") or "run").strip() or "run"
+                                path = os.path.join(
+                                    dump_dir,
+                                    f"output_ab_diag.rank{int(get_rank() or 0)}.{rid}.json",
+                                )
+                                collate.write_json(path, payload, indent=2)
     end_kst_ns = posix_time()
     try:
         dev_t = getattr(device, "type", "")
