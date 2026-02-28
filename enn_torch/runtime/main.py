@@ -4237,18 +4237,14 @@ def infer(
                         flat = diff.reshape(-1)
                         sample_n = int(broadcast_sample_max)
                         if sample_n <= 1:
-                            sample = flat[-1:].clone()
+                            if numel <= 1:
+                                sample = flat[:1].clone()
+                            else:
+                                idx = torch.tensor([0, numel - 1], device=flat.device, dtype=torch.long)
+                                sample = flat.index_select(0, idx)
                         else:
-                            # Use evenly spaced indices over the full flattened tensor.
-                            # This avoids prefix-only sampling when numel is only slightly
-                            # above sample_n (where step-based slicing can collapse to step=1).
-                            idx = torch.linspace(
-                                0,
-                                max(0, numel - 1),
-                                steps=sample_n,
-                                device=flat.device,
-                                dtype=torch.float32,
-                            ).to(dtype=torch.long)
+                            idx = torch.arange(sample_n, device=flat.device, dtype=torch.long)
+                            idx = (idx * (numel - 1)) // (sample_n - 1)
                             sample = flat.index_select(0, idx)
                         st["sampled"] = 1.0
                         st["sample_n"] = float(int(sample.numel()))
