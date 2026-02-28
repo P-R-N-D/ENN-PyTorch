@@ -3406,6 +3406,12 @@ def epochs(
             n_z = 0
             seen_batches2 = 0
             seen_samples2 = 0
+            _pred_is_z_env = os.environ.get("ENN_OUTPUT_AB_PRED_IS_Z", None)
+            pred_is_z_fixed = (
+                bool(env_bool("ENN_OUTPUT_AB_PRED_IS_Z", default=False))
+                if _pred_is_z_env is not None
+                else None
+            )
 
             model.eval()
             with inference_mode(model), StatelessAutocast.float(device):
@@ -3434,17 +3440,15 @@ def epochs(
                         y_pred = torch.as_tensor(y_pred, device=device)
 
                     ypf = y_pred.reshape(b2, -1)
-                    _pred_is_z_env = os.environ.get("ENN_OUTPUT_AB_PRED_IS_Z", None)
-                    if _pred_is_z_env is not None:
-                        pred_is_z = bool(env_bool("ENN_OUTPUT_AB_PRED_IS_Z", default=False))
-                    else:
-                        pred_is_z = False
+                    if pred_is_z_fixed is None:
+                        pred_is_z_fixed = False
                         with contextlib.suppress(Exception):
                             yp0 = ypf.detach().to(dtype=torch.float32)
                             if yp0.numel() > 0:
                                 max_abs = float(yp0.abs().amax().item())
                                 std0 = float(yp0.std(unbiased=False).item())
-                                pred_is_z = (max_abs <= 30.0) and (std0 <= 15.0)
+                                pred_is_z_fixed = (max_abs <= 30.0) and (std0 <= 15.0)
+                    pred_is_z = bool(pred_is_z_fixed)
                     z_hat = ypf if pred_is_z else scaler.normalize_y(ypf)
                     z_pred = scaler.calibrate(z_hat)
                     zp64 = z_pred.to(device=accum_device, dtype=torch.float64)
