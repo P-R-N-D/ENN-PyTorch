@@ -1478,61 +1478,67 @@ def load_scaler_stats(sources: Any) -> Optional[Dict[str, Any]]:
             if isinstance(ys2, torch.Tensor)
             else torch.as_tensor(ys2, dtype=torch.float64)
         )
-        local_xmin = payload.get("x_min")
-        local_xmax = payload.get("x_max")
-        local_ymin = payload.get("y_min")
-        local_ymax = payload.get("y_max")
-        local_yq_low = payload.get("y_q_low")
-        local_yq_high = payload.get("y_q_high")
+        ref_x_shape = tuple(xs.shape)
+        ref_y_shape = tuple(ys.shape)
+
+        def _coerce_bounds(v: Any, ref_shape: tuple[int, ...]) -> Optional[torch.Tensor]:
+            if v is None:
+                return None
+            t = (
+                v.detach().to(dtype=torch.float64, device="cpu")
+                if isinstance(v, torch.Tensor)
+                else torch.as_tensor(v, dtype=torch.float64)
+            )
+            if tuple(t.shape) != tuple(ref_shape):
+                if int(t.numel()) == 1 and len(ref_shape) >= 1:
+                    t = t.reshape((1,)).expand(ref_shape).clone()
+                else:
+                    return None
+            if not bool(torch.isfinite(t).all().item()):
+                return None
+            return t
+
+        local_xmin = _coerce_bounds(payload.get("x_min"), ref_x_shape)
+        local_xmax = _coerce_bounds(payload.get("x_max"), ref_x_shape)
+        local_ymin = _coerce_bounds(payload.get("y_min"), ref_y_shape)
+        local_ymax = _coerce_bounds(payload.get("y_max"), ref_y_shape)
+        local_yq_low = _coerce_bounds(payload.get("y_q_low"), ref_y_shape)
+        local_yq_high = _coerce_bounds(payload.get("y_q_high"), ref_y_shape)
+
         local_have_bounds = (
             local_xmin is not None
             and local_xmax is not None
             and local_ymin is not None
             and local_ymax is not None
         )
+        if local_have_bounds:
+            try:
+                if bool((local_xmin > local_xmax).any().item()) or bool((local_ymin > local_ymax).any().item()):
+                    local_have_bounds = False
+                    local_xmin = local_xmax = local_ymin = local_ymax = None
+            except Exception:
+                local_have_bounds = False
+                local_xmin = local_xmax = local_ymin = local_ymax = None
         if have_bounds is None:
             have_bounds = bool(local_have_bounds)
         elif have_bounds and not local_have_bounds:
             have_bounds = False
             x_min = x_max = y_min = y_max = None
+
         local_have_q = local_yq_low is not None and local_yq_high is not None
+        if local_have_q:
+            try:
+                if bool((local_yq_low > local_yq_high).any().item()):
+                    local_have_q = False
+                    local_yq_low = local_yq_high = None
+            except Exception:
+                local_have_q = False
+                local_yq_low = local_yq_high = None
         if have_qbounds is None:
             have_qbounds = bool(local_have_q)
         elif have_qbounds and not local_have_q:
             have_qbounds = False
             y_q_low = y_q_high = None
-        if have_bounds:
-            local_xmin = (
-                local_xmin.detach().to(dtype=torch.float64, device="cpu")
-                if isinstance(local_xmin, torch.Tensor)
-                else torch.as_tensor(local_xmin, dtype=torch.float64)
-            )
-            local_xmax = (
-                local_xmax.detach().to(dtype=torch.float64, device="cpu")
-                if isinstance(local_xmax, torch.Tensor)
-                else torch.as_tensor(local_xmax, dtype=torch.float64)
-            )
-            local_ymin = (
-                local_ymin.detach().to(dtype=torch.float64, device="cpu")
-                if isinstance(local_ymin, torch.Tensor)
-                else torch.as_tensor(local_ymin, dtype=torch.float64)
-            )
-            local_ymax = (
-                local_ymax.detach().to(dtype=torch.float64, device="cpu")
-                if isinstance(local_ymax, torch.Tensor)
-                else torch.as_tensor(local_ymax, dtype=torch.float64)
-            )
-        if have_qbounds:
-            local_yq_low = (
-                local_yq_low.detach().to(dtype=torch.float64, device="cpu")
-                if isinstance(local_yq_low, torch.Tensor)
-                else torch.as_tensor(local_yq_low, dtype=torch.float64)
-            )
-            local_yq_high = (
-                local_yq_high.detach().to(dtype=torch.float64, device="cpu")
-                if isinstance(local_yq_high, torch.Tensor)
-                else torch.as_tensor(local_yq_high, dtype=torch.float64)
-            )
         if x_sum is None:
             x_sum = xs.clone()
             x_sum_sq = xs2.clone()
@@ -1649,6 +1655,29 @@ def warmup_scaler_stats(
     except Exception:
         stats = None
 
+    if stats is not None:
+        try:
+            xs = stats.get("x_sum")
+            xs2 = stats.get("x_sum_sq")
+            ys = stats.get("y_sum")
+            ys2 = stats.get("y_sum_sq")
+            c = int(stats.get("train_count") or 0)
+            ok = (
+                c > 0
+                and isinstance(xs, torch.Tensor)
+                and isinstance(xs2, torch.Tensor)
+                and isinstance(ys, torch.Tensor)
+                and isinstance(ys2, torch.Tensor)
+                and torch.isfinite(xs).all().item()
+                and torch.isfinite(xs2).all().item()
+                and torch.isfinite(ys).all().item()
+                and torch.isfinite(ys2).all().item()
+            )
+            if not ok:
+                stats = None
+        except Exception:
+            stats = None
+
     if stats:
         x_cnt = int(stats.get("train_count") or 0)
         y_cnt = int(stats.get("train_count") or 0)
@@ -1656,8 +1685,14 @@ def warmup_scaler_stats(
         x_ss = stats["x_sum_sq"].to(dev_x)
         y_sum = stats["y_sum"].to(dev_y)
         y_ss = stats["y_sum_sq"].to(dev_y)
+        x_min = stats.get("x_min")
+        x_max = stats.get("x_max")
         y_min = stats.get("y_min")
         y_max = stats.get("y_max")
+        if x_min is not None:
+            x_min = x_min.to(dev_x)
+        if x_max is not None:
+            x_max = x_max.to(dev_x)
         if y_min is not None:
             y_min = y_min.to(dev_y)
         if y_max is not None:
@@ -1669,6 +1704,8 @@ def warmup_scaler_stats(
         x_ss = None
         y_sum = None
         y_ss = None
+        x_min = None
+        x_max = None
         y_min = None
         y_max = None
 
@@ -1684,6 +1721,10 @@ def warmup_scaler_stats(
                     s2 = (xf**2).sum(0)
                     x_sum = s if x_sum is None else x_sum + s
                     x_ss = s2 if x_ss is None else x_ss + s2
+                    mnx = xf.amin(0)
+                    mxx = xf.amax(0)
+                    x_min = mnx if x_min is None else torch.minimum(x_min, mnx)
+                    x_max = mxx if x_max is None else torch.maximum(x_max, mxx)
 
                 if yf.shape[0] > 0:
                     y_cnt += int(yf.shape[0])
@@ -1707,6 +1748,8 @@ def warmup_scaler_stats(
                 if tensor is not None:
                     dist.all_reduce(tensor, dist.ReduceOp.SUM)
             for tensor, op in (
+                (x_min, dist.ReduceOp.MIN),
+                (x_max, dist.ReduceOp.MAX),
                 (y_min, dist.ReduceOp.MIN),
                 (y_max, dist.ReduceOp.MAX),
             ):
@@ -1750,6 +1793,29 @@ def warmup_scaler_stats(
             if std_buf.shape != mean.shape:
                 std_buf.resize_(mean.shape)
             std_buf.copy_(std)
+
+    try:
+        x_std = getattr(scaler, "x_std", None)
+        if isinstance(x_std, torch.Tensor) and x_std.numel():
+            eps = float(getattr(scaler, "eps", 1e-6))
+            abs_floor = float(os.environ.get("ENN_SCALER_X_STD_FLOOR_ABS", "") or 1e-3)
+            abs_cap = float(os.environ.get("ENN_SCALER_X_STD_CAP_ABS", "") or 1e6)
+            std2 = torch.where(torch.isfinite(x_std), x_std, torch.ones_like(x_std))
+            std2 = std2.clamp(min=max(eps, abs_floor), max=abs_cap)
+            if x_min is not None and x_max is not None:
+                rng = (x_max.to(device=std2.device, dtype=std2.dtype) - x_min.to(device=std2.device, dtype=std2.dtype)).abs()
+                tiny = rng < 1e-6
+                if tiny.any():
+                    std2 = torch.where(tiny, torch.ones_like(std2), std2)
+                floor = torch.maximum(rng * 0.05, std2.new_full(rng.shape, max(eps, abs_floor)))
+                cap = torch.maximum(rng * 50.0, std2.new_full(rng.shape, 1.0))
+                std2 = torch.maximum(std2, floor)
+                std2 = torch.minimum(std2, cap)
+            if std2.shape != x_std.shape:
+                x_std.resize_(std2.shape)
+            x_std.copy_(std2)
+    except Exception:
+        pass
 
     if y_min is not None and isinstance(
         getattr(scaler, "y_min", None), torch.Tensor

@@ -3036,7 +3036,15 @@ class Scaler(nn.Module):
         eps_use = float(max(float(self.eps), float(eps_min)))
         denom = (std_b + eps_use).clamp_min(eps_use)
         out2 = (t2 - mean_b) / denom
-        if self._scaler_guard_enabled() and getattr(t.device, "type", None) == "cuda":
+        guard_enabled = self._scaler_guard_enabled()
+        auto_guard = (
+            (not guard_enabled)
+            and (str(cache_key_prefix) == "x")
+            and (not torch.is_grad_enabled())
+            and (getattr(t.device, "type", None) == "cuda")
+            and bool(env_bool("ENN_SCALER_GUARD_AUTO_INFER", True))
+        )
+        if (guard_enabled or auto_guard) and getattr(t.device, "type", None) == "cuda":
             if self._guard_is_collapse(out2, std_min=float(std_min)):
                 md2 = torch.float32 if force_fp32_on_cuda else master_dtype
                 mean2 = mean_buf.to(device=t.device, dtype=md2)
@@ -3045,7 +3053,7 @@ class Scaler(nn.Module):
                 eps_use2 = float(max(eps_use, 1e-4 if t.dtype == torch.bfloat16 else 1e-5))
                 denom2 = (std2 + eps_use2).clamp_min(eps_use2)
                 out2 = (t32 - mean2) / denom2
-                if env_bool("ENN_SCALER_GUARD_LOG", True):
+                if env_bool("ENN_SCALER_GUARD_LOG", bool(guard_enabled)):
                     warnings.warn(
                         "Scaler.normalize_x: detected collapse/nonfinite; retried this batch with safer fp32 math.",
                         RuntimeWarning,
@@ -3060,22 +3068,66 @@ class Scaler(nn.Module):
                                 mean3 = t32.mean(dim=0)
                                 std3 = t32.std(dim=0, unbiased=False).clamp_min(eps_use2)
                                 out2 = (t32 - mean3) / std3
-                                if env_bool("ENN_SCALER_GUARD_LOG", True):
+                                if env_bool("ENN_SCALER_GUARD_LOG", bool(guard_enabled)):
                                     warnings.warn(
                                         "Scaler.normalize_x: collapse persisted; fell back to per-batch stats (stored stats look corrupted).",
                                         RuntimeWarning,
                                         stacklevel=2,
                                     )
                             elif t32.dim() >= 2 and int(t32.shape[1]) > 1:
-                                mean3 = t32.mean(dim=1, keepdim=True)
-                                std3 = t32.std(dim=1, keepdim=True, unbiased=False).clamp_min(eps_use2)
-                                out2 = (t32 - mean3) / std3
-                                if env_bool("ENN_SCALER_GUARD_LOG", True):
-                                    warnings.warn(
-                                        "Scaler.normalize_x: collapse persisted; fell back to per-sample feature stats (single-row input; stored stats look corrupted).",
-                                        RuntimeWarning,
-                                        stacklevel=2,
+                                if str(cache_key_prefix) == "x":
+                                    with contextlib.suppress(Exception):
+                                        in_scale = float(t32.abs().amax().item()) if t32.numel() else 0.0
+                                    if not ("in_scale" in locals()) or not (in_scale > 0.0):
+                                        in_scale = 1.0
+                                    max_std = float(max(1.0, in_scale * 1000.0 + 1.0))
+                                    feature_row = t32[0]
+                                    feature_row = torch.where(
+                                        torch.isfinite(feature_row),
+                                        feature_row,
+                                        torch.zeros_like(feature_row),
                                     )
+                                    mean2v = mean2
+                                    std2v = std2
+                                    with contextlib.suppress(Exception):
+                                        if int(mean2v.numel()) == int(feature_row.numel()):
+                                            mean2v = mean2v.reshape(feature_row.shape)
+                                    with contextlib.suppress(Exception):
+                                        if int(std2v.numel()) == int(feature_row.numel()):
+                                            std2v = std2v.reshape(feature_row.shape)
+                                    if mean2v.shape != feature_row.shape:
+                                        mean2v = feature_row
+                                    if std2v.shape != feature_row.shape:
+                                        std2v = feature_row.abs().clamp_min(1.0)
+                                    finite_mean = torch.isfinite(mean2v)
+                                    finite_std = torch.isfinite(std2v) & (std2v > eps_use2)
+                                    mean3 = torch.where(finite_mean, mean2v, feature_row)
+                                    std3 = torch.where(
+                                        finite_std,
+                                        std2v,
+                                        feature_row.abs().clamp_min(1.0),
+                                    ).clamp(min=eps_use2, max=max_std)
+                                    with contextlib.suppress(Exception):
+                                        mean_lim = float(max(1.0, in_scale * 1000.0 + 1.0))
+                                        if mean3.numel() and float(mean3.abs().amax().item()) > mean_lim:
+                                            mean3 = torch.zeros_like(mean3)
+                                    out2 = (t32 - mean3) / std3
+                                    if env_bool("ENN_SCALER_GUARD_LOG", bool(guard_enabled)):
+                                        warnings.warn(
+                                            "Scaler.normalize_x: collapse persisted; sanitized stored stats for single-row input (invalid entries fell back to input-derived values).",
+                                            RuntimeWarning,
+                                            stacklevel=2,
+                                        )
+                                else:
+                                    mean3 = t32.mean(dim=1, keepdim=True)
+                                    std3 = t32.std(dim=1, keepdim=True, unbiased=False).clamp_min(eps_use2)
+                                    out2 = (t32 - mean3) / std3
+                                    if env_bool("ENN_SCALER_GUARD_LOG", bool(guard_enabled)):
+                                        warnings.warn(
+                                            "Scaler.normalize_x: collapse persisted; fell back to per-sample feature stats (single-row input; stored stats look corrupted).",
+                                            RuntimeWarning,
+                                            stacklevel=2,
+                                        )
         out = out2.reshape(orig_shape) if t.dim() != 1 else out2.reshape(-1)
         if t.is_floating_point() and out.dtype != input_dtype and self._should_restore_input_dtype(input_dtype):
             out = out.to(dtype=input_dtype)

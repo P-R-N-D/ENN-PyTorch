@@ -4920,10 +4920,10 @@ def infer(
                 except Exception:
                     return
             collapse_force_fp32 = bool(
-                env_bool("ENN_PRED_COLLAPSE_FORCE_FP32", default=True)
+                env_bool("ENN_PRED_COLLAPSE_FORCE_FP32", default=False)
             )
             collapse_force_fp32_persist = bool(
-                env_bool("ENN_PRED_COLLAPSE_FORCE_FP32_PERSIST", default=True)
+                env_bool("ENN_PRED_COLLAPSE_FORCE_FP32_PERSIST", default=False)
             )
             collapse_fp32_active = False
             collapse_diag = bool(env_bool("ENN_PRED_COLLAPSE_DIAG", True))
