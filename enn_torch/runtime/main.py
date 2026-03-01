@@ -6654,82 +6654,83 @@ def infer(
                                                                     "this indicates a true model/preprocess collapse. "
                                                                     "Set ENN_PRED_COLLAPSE_ABORT=0 to ignore and write outputs anyway."
                                                                 )
-                                            elif bool(partial_like2):
-                                                _LOGGER.warning(
-                                                    "[infer] partial broadcast persists after per-sample fallback (match_frac=%.5f); retrying this batch per-sample with fp32+no-autocast.",
-                                                    float(mf2),
-                                                )
-                                                preds_fix_fp32_once: Optional[torch.Tensor] = None
-                                                try:
-                                                    for j in range(int(n_i)):
-                                                        x1_buf.copy_(Xi[j : j + 1])
-                                                        cudagraph_mark_step_begin()
-                                                        pj_fp32_once = _td_predict(
-                                                            x1_buf,
-                                                            calibrate_output=True,
-                                                            use_uncompiled=True,
-                                                            force_fp32=True,
-                                                        )
-                                                        cudagraph_mark_step_end()
-                                                        pj_cpu = pj_fp32_once.detach()
-                                                        if getattr(pj_cpu.device, "type", None) != "cpu":
-                                                            pj_cpu = pj_cpu.to(device="cpu")
-                                                        with contextlib.suppress(Exception):
-                                                            pj_cpu = pj_cpu.contiguous()
-                                                        pj_cpu = pj_cpu.clone()
-                                                        if preds_fix_fp32_once is None:
-                                                            preds_fix_fp32_once = pj_cpu.new_empty(
-                                                                (int(n_i),) + tuple(pj_cpu.shape[1:])
-                                                            )
-                                                        preds_fix_fp32_once[j : j + 1].copy_(pj_cpu[:1])
-
-                                                    if (
-                                                        preds_fix_fp32_once is not None
-                                                        and int(preds_fix_fp32_once.shape[0]) >= 2
-                                                    ):
-                                                        _, st_fp32_once = _broadcast_like(
-                                                            preds_fix_fp32_once[0],
-                                                            preds_fix_fp32_once[1],
-                                                            atol=float(broadcast_atol),
-                                                        )
-                                                        mf_fp32 = float(st_fp32_once.get("y_match_frac", float("nan")))
-                                                        yd_fp32 = float(st_fp32_once.get("y_max", float("nan")))
+                                                if bool(partial_like2) or bool(is_broadcast_like2):
+                                                    if bool(partial_like2):
                                                         _LOGGER.warning(
-                                                            "[infer] fp32 retry sanity (this batch): match_frac=%.5f (was %.5f) max|Y0-Y1|=%.6g (was %.6g)",
-                                                            float(mf_fp32),
+                                                            "[infer] partial broadcast persists after per-sample fallback (match_frac=%.5f); retrying this batch per-sample with fp32+no-autocast.",
                                                             float(mf2),
-                                                            float(yd_fp32),
-                                                            float(ydiff2),
                                                         )
-                                                        improved_match = bool(
-                                                            math.isfinite(mf_fp32)
-                                                            and math.isfinite(mf2)
-                                                            and (mf_fp32 <= float(mf2) - float(partial_broadcast_fp32_min_gain))
-                                                        )
-                                                        improved_ymax = bool(
-                                                            math.isfinite(yd_fp32)
-                                                            and math.isfinite(ydiff2)
-                                                            and (yd_fp32 >= float(ydiff2) + float(partial_broadcast_fp32_min_ymax_gain))
-                                                        )
-                                                        if bool(improved_match or improved_ymax):
-                                                            preds = preds_fix_fp32_once
-                                                            if bool(partial_broadcast_fp32_persist):
-                                                                collapse_fp32_active = True
-                                                            with contextlib.suppress(Exception):
-                                                                _diag_collapse_once(
-                                                                    Xi2=Xi[:2].detach(),
-                                                                    preds2=preds[:2].detach(),
-                                                                    x_diff=float(x_diff.item()) if "x_diff" in locals() else float("nan"),
-                                                                    y_diff=float(yd_fp32),
-                                                                    where="after_per_sample_fp32_retry",
+                                                        preds_fix_fp32_once: Optional[torch.Tensor] = None
+                                                        try:
+                                                            for j in range(int(n_i)):
+                                                                x1_buf.copy_(Xi[j : j + 1])
+                                                                cudagraph_mark_step_begin()
+                                                                pj_fp32_once = _td_predict(
+                                                                    x1_buf,
+                                                                    calibrate_output=True,
+                                                                    use_uncompiled=True,
+                                                                    force_fp32=True,
                                                                 )
-                                                except RuntimeError as e:
-                                                    if is_oom_error(e):
-                                                        _LOGGER.warning(
-                                                            "[infer] fp32 per-sample retry skipped due to OOM; keeping current precision path."
-                                                        )
-                                                    else:
-                                                        raise
+                                                                cudagraph_mark_step_end()
+                                                                pj_cpu = pj_fp32_once.detach()
+                                                                if getattr(pj_cpu.device, "type", None) != "cpu":
+                                                                    pj_cpu = pj_cpu.to(device="cpu")
+                                                                with contextlib.suppress(Exception):
+                                                                    pj_cpu = pj_cpu.contiguous()
+                                                                pj_cpu = pj_cpu.clone()
+                                                                if preds_fix_fp32_once is None:
+                                                                    preds_fix_fp32_once = pj_cpu.new_empty(
+                                                                        (int(n_i),) + tuple(pj_cpu.shape[1:])
+                                                                    )
+                                                                preds_fix_fp32_once[j : j + 1].copy_(pj_cpu[:1])
+
+                                                            if (
+                                                                preds_fix_fp32_once is not None
+                                                                and int(preds_fix_fp32_once.shape[0]) >= 2
+                                                            ):
+                                                                _, st_fp32_once = _broadcast_like(
+                                                                    preds_fix_fp32_once[0],
+                                                                    preds_fix_fp32_once[1],
+                                                                    atol=float(broadcast_atol),
+                                                                )
+                                                                mf_fp32 = float(st_fp32_once.get("y_match_frac", float("nan")))
+                                                                yd_fp32 = float(st_fp32_once.get("y_max", float("nan")))
+                                                                _LOGGER.warning(
+                                                                    "[infer] fp32 retry sanity (this batch): match_frac=%.5f (was %.5f) max|Y0-Y1|=%.6g (was %.6g)",
+                                                                    float(mf_fp32),
+                                                                    float(mf2),
+                                                                    float(yd_fp32),
+                                                                    float(ydiff2),
+                                                                )
+                                                                improved_match = bool(
+                                                                    math.isfinite(mf_fp32)
+                                                                    and math.isfinite(mf2)
+                                                                    and (mf_fp32 <= float(mf2) - float(partial_broadcast_fp32_min_gain))
+                                                                )
+                                                                improved_ymax = bool(
+                                                                    math.isfinite(yd_fp32)
+                                                                    and math.isfinite(ydiff2)
+                                                                    and (yd_fp32 >= float(ydiff2) + float(partial_broadcast_fp32_min_ymax_gain))
+                                                                )
+                                                                if bool(improved_match or improved_ymax):
+                                                                    preds = preds_fix_fp32_once
+                                                                    if bool(partial_broadcast_fp32_persist):
+                                                                        collapse_fp32_active = True
+                                                                    with contextlib.suppress(Exception):
+                                                                        _diag_collapse_once(
+                                                                            Xi2=Xi[:2].detach(),
+                                                                            preds2=preds[:2].detach(),
+                                                                            x_diff=float(x_diff.item()) if "x_diff" in locals() else float("nan"),
+                                                                            y_diff=float(yd_fp32),
+                                                                            where="after_per_sample_fp32_retry",
+                                                                        )
+                                                        except RuntimeError as e:
+                                                            if is_oom_error(e):
+                                                                _LOGGER.warning(
+                                                                    "[infer] fp32 per-sample retry skipped due to OOM; keeping current precision path."
+                                                                )
+                                                            else:
+                                                                raise
                                                 if (
                                                     (not collapse_switched_uncompiled)
                                                     and bool(collapse_force_uncompiled)
