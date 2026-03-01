@@ -6226,20 +6226,11 @@ class Model(nn.Module):
                                 skip_ab = bool(
                                     env_bool("ENN_DELTA_GATE_BOUNDS_INVERSE_SKIP_OUTPUT_AB", default=True)
                                     and callable(inv)
-                                    and bool(getattr(sc, "output_ab_enabled", False))
                                 )
-                                prev_ab = None
-                                if skip_ab:
-                                    prev_ab = bool(getattr(sc, "output_ab_enabled", False))
-                                    setattr(sc, "output_ab_enabled", False)
-                                try:
-                                    if z_min is not None and callable(inv):
-                                        z_min = inv(z_min)
-                                    if z_max is not None and callable(inv):
-                                        z_max = inv(z_max)
-                                finally:
-                                    if skip_ab and (prev_ab is not None):
-                                        setattr(sc, "output_ab_enabled", bool(prev_ab))
+                                if z_min is not None and callable(inv):
+                                    z_min = inv(z_min, apply_output_ab=(not skip_ab))
+                                if z_max is not None and callable(inv):
+                                    z_max = inv(z_max, apply_output_ab=(not skip_ab))
                     else:
                         if bool(
                             getattr(self, "delta_gate_fallback_enabled", False)

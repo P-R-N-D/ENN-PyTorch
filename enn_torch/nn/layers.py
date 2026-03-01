@@ -3577,7 +3577,12 @@ class Scaler(nn.Module):
         if self.output_ab_enabled and self.calib_mode == "none":
             self.calib_mode = "ab"
 
-    def inverse_calibrate(self: Self, z_target: torch.Tensor) -> torch.Tensor:
+    def inverse_calibrate(
+        self: Self,
+        z_target: torch.Tensor,
+        *,
+        apply_output_ab: bool = True,
+    ) -> torch.Tensor:
         if z_target.numel() == 0:
             return z_target
         mode = str(getattr(self, "calib_mode", "none") or "none").strip().lower()
@@ -3591,7 +3596,11 @@ class Scaler(nn.Module):
         z = z_target.to(dtype=master_dtype)
 
         def _inv_output_ab(t: torch.Tensor) -> torch.Tensor:
-            if t.numel() == 0 or not bool(getattr(self, "output_ab_enabled", False)):
+            if (
+                t.numel() == 0
+                or (not apply_output_ab)
+                or not bool(getattr(self, "output_ab_enabled", False))
+            ):
                 return t
             scale = self.y_out_scale.to(device=t.device, dtype=t.dtype).reshape(-1)
             bias = self.y_out_bias.to(device=t.device, dtype=t.dtype).reshape(-1)
