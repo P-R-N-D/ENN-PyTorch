@@ -296,12 +296,19 @@ def _resize_scaler_buffers_for_shape(
     y_numel = int(numpy.prod(label_shape)) if label_shape else None
 
     def _resize_buffer(
-        module: Scaler, name: str, shape: tuple[int, ...]
+        module: Scaler,
+        name: str,
+        shape: tuple[int, ...],
+        *,
+        fill: float | None = None,
     ) -> None:
         buf = getattr(module, name, None)
         if not isinstance(buf, torch.Tensor):
             return
         if tuple(buf.shape) == tuple(shape):
+            return
+        if fill is not None:
+            module._buffers[name] = buf.detach().new_full(shape, fill_value=float(fill))
             return
         try:
             buf.resize_(shape)
@@ -326,12 +333,14 @@ def _resize_scaler_buffers_for_shape(
                 "affine_a",
                 "affine_b",
                 "pw_y",
-                "y_out_scale",
-                "y_out_bias",
-                "y_out_clip_low",
-                "y_out_clip_high",
             ):
                 _resize_buffer(module, name, (y_numel,))
+            big32_min = float(torch.finfo(torch.float32).min)
+            big32_max = float(torch.finfo(torch.float32).max)
+            _resize_buffer(module, "y_out_scale", (y_numel,), fill=1.0)
+            _resize_buffer(module, "y_out_bias", (y_numel,), fill=0.0)
+            _resize_buffer(module, "y_out_clip_low", (y_numel,), fill=big32_min)
+            _resize_buffer(module, "y_out_clip_high", (y_numel,), fill=big32_max)
         continue
 
 
