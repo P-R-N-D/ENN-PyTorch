@@ -296,12 +296,22 @@ def _resize_scaler_buffers_for_shape(
     y_numel = int(numpy.prod(label_shape)) if label_shape else None
 
     def _resize_buffer(
-        module: Scaler, name: str, shape: tuple[int, ...]
+        module: Scaler,
+        name: str,
+        shape: tuple[int, ...],
+        *,
+        fill: float | None = None,
     ) -> None:
         buf = getattr(module, name, None)
         if not isinstance(buf, torch.Tensor):
             return
         if tuple(buf.shape) == tuple(shape):
+            return
+        if fill is not None:
+            try:
+                module._buffers[name] = buf.detach().new_full(shape, fill_value=float(fill))
+            except Exception:
+                setattr(module, name, buf.detach().new_full(shape, fill_value=float(fill)))
             return
         try:
             buf.resize_(shape)
@@ -328,6 +338,14 @@ def _resize_scaler_buffers_for_shape(
                 "pw_y",
             ):
                 _resize_buffer(module, name, (y_numel,))
+            big32_min = float(torch.finfo(torch.float32).min)
+            big32_max = float(torch.finfo(torch.float32).max)
+            _resize_buffer(module, "y_out_scale", (y_numel,), fill=1.0)
+            _resize_buffer(module, "y_out_bias", (y_numel,), fill=0.0)
+            _resize_buffer(module, "y_out_clip_low", (y_numel,), fill=big32_min)
+            _resize_buffer(module, "y_out_clip_high", (y_numel,), fill=big32_max)
+            with contextlib.suppress(Exception):
+                module.output_ab_enabled = False
         continue
 
 
@@ -353,10 +371,18 @@ def _resize_scaler_buffers_from_metadata(
         "scaler.affine_b": "affine_b",
         "scaler.pw_x": "pw_x",
         "scaler.pw_y": "pw_y",
+        "scaler.y_out_scale": "y_out_scale",
+        "scaler.y_out_bias": "y_out_bias",
+        "scaler.y_out_clip_low": "y_out_clip_low",
+        "scaler.y_out_clip_high": "y_out_clip_high",
     }
 
     def _resize_buffer(
-        module: Scaler, name: str, shape: tuple[int, ...]
+        module: Scaler,
+        name: str,
+        shape: tuple[int, ...],
+        *,
+        fill: float | None = None,
     ) -> None:
         buf = getattr(module, name, None)
         if not isinstance(buf, torch.Tensor):
@@ -364,11 +390,27 @@ def _resize_scaler_buffers_from_metadata(
         if tuple(buf.shape) == tuple(shape):
             return
         old_shape = tuple(buf.shape)
+        if fill is not None:
+            try:
+                module._buffers[name] = buf.detach().new_full(shape, fill_value=float(fill))
+            except Exception:
+                setattr(module, name, buf.detach().new_full(shape, fill_value=float(fill)))
+            logger.debug("scaler pre-load resize(init): %s %s -> %s", name, old_shape, tuple(shape))
+            return
         try:
             buf.resize_(shape)
         except Exception:
             module._buffers[name] = buf.detach().new_zeros(shape)
         logger.debug("scaler pre-load resize: %s %s -> %s", name, old_shape, tuple(shape))
+
+    big32_min = float(torch.finfo(torch.float32).min)
+    big32_max = float(torch.finfo(torch.float32).max)
+    fill_defaults: dict[str, float] = {
+        "y_out_scale": 1.0,
+        "y_out_bias": 0.0,
+        "y_out_clip_low": big32_min,
+        "y_out_clip_high": big32_max,
+    }
 
     resized_any = False
     for module in model.modules():
@@ -387,8 +429,11 @@ def _resize_scaler_buffers_from_metadata(
                     shape = tuple(int(dim) for dim in size)
                 except Exception:
                     continue
-                _resize_buffer(module, buf_name, shape)
+                _resize_buffer(module, buf_name, shape, fill=fill_defaults.get(buf_name))
                 resized_local = True
+        if resized_local:
+            with contextlib.suppress(Exception):
+                module.output_ab_enabled = False
         resized_any = resized_any or resized_local
     return resized_any
 
