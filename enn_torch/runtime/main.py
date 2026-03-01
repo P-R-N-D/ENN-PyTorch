@@ -4235,6 +4235,33 @@ def infer(
                     default=bool(_dbg_raw_fallback),
                 )
             )
+            partial_broadcast_after_fix_match_frac = float(
+                env_float("ENN_PRED_PARTIAL_BROADCAST_AFTER_FIX_MATCH_FRAC", 0.97)
+            )
+            partial_broadcast_force_uncompiled = bool(
+                env_bool(
+                    "ENN_PRED_PARTIAL_BROADCAST_FORCE_UNCOMPILED",
+                    default=bool(_dbg_raw_fallback),
+                )
+            )
+            partial_broadcast_force_eager = bool(
+                env_bool(
+                    "ENN_PRED_PARTIAL_BROADCAST_FORCE_EAGER",
+                    default=bool(_dbg_raw_fallback),
+                )
+            )
+            partial_broadcast_fp32_retry = bool(
+                env_bool(
+                    "ENN_PRED_PARTIAL_BROADCAST_FP32_RETRY",
+                    default=bool(_dbg_raw_fallback),
+                )
+            )
+            partial_broadcast_fp32_min_gain = float(
+                env_float("ENN_PRED_PARTIAL_BROADCAST_FP32_MIN_GAIN", 0.01)
+            )
+            partial_broadcast_fp32_persist = bool(
+                env_bool("ENN_PRED_PARTIAL_BROADCAST_FP32_PERSIST", default=False)
+            )
 
             def _broadcast_like(
                 y0: torch.Tensor,
@@ -6493,6 +6520,18 @@ def infer(
                                     if eager_on_broadcast:
                                         force_eager = True
 
+                                    if str(sel_kind) == "partial_like":
+                                        if bool(partial_broadcast_force_uncompiled) and (not bool(force_uncompiled)):
+                                            force_uncompiled = True
+                                            _LOGGER.warning(
+                                                "[infer] partial-broadcast: forcing uncompiled model for correctness (ENN_PRED_PARTIAL_BROADCAST_FORCE_UNCOMPILED=1)."
+                                            )
+                                        if bool(partial_broadcast_force_eager) and (not bool(force_eager)):
+                                            force_eager = True
+                                            _LOGGER.warning(
+                                                "[infer] partial-broadcast: forcing eager mode for correctness (ENN_PRED_PARTIAL_BROADCAST_FORCE_EAGER=1)."
+                                            )
+
                                     force_single = True
                                     td_cg_active = False
                                     td_cg_disabled = True
@@ -6555,6 +6594,92 @@ def infer(
                                                 y0b, y1b, atol=float(broadcast_atol)
                                             )
                                             ydiff2 = float(bstats2.get("y_max", float("nan")))
+                                            mf2 = float(bstats2.get("y_match_frac", float("nan")))
+                                            partial_like2 = bool(
+                                                detect_partial_broadcast
+                                                and math.isfinite(mf2)
+                                                and (mf2 >= float(partial_broadcast_after_fix_match_frac))
+                                                and ("x_diff" in locals())
+                                                and (float(x_diff.item()) > 0.0)
+                                                and (str(dev_type) == "cuda")
+                                            )
+                                            if (
+                                                bool(partial_like2)
+                                                and bool(partial_broadcast_fp32_retry)
+                                                and (not bool(is_broadcast_like2))
+                                            ):
+                                                _LOGGER.warning(
+                                                    "[infer] partial-broadcast persists after per-sample fallback (match_frac=%.5f); retrying this batch per-sample with fp32+no-autocast.",
+                                                    float(mf2),
+                                                )
+                                                preds_fix_fp32_once: torch.Tensor | None = None
+                                                try:
+                                                    for j in range(int(n_i)):
+                                                        x1_buf.copy_(Xi[j : j + 1])
+                                                        if dev_type == "cuda":
+                                                            cudagraph_mark_step_begin()
+                                                        pj_fp32_once = _td_predict(
+                                                            x1_buf,
+                                                            calibrate_output=(bool(calibrate_pred_output) if "calibrate_pred_output" in locals() else True),
+                                                            use_uncompiled=True,
+                                                            force_fp32=True,
+                                                        )
+                                                        if dev_type == "cuda":
+                                                            cudagraph_mark_step_end()
+                                                        pj_cpu = pj_fp32_once.detach()
+                                                        if getattr(pj_cpu.device, "type", None) != "cpu":
+                                                            pj_cpu = pj_cpu.to(device="cpu")
+                                                        with contextlib.suppress(Exception):
+                                                            pj_cpu = pj_cpu.contiguous()
+                                                        pj_cpu = pj_cpu.clone()
+                                                        if preds_fix_fp32_once is None:
+                                                            preds_fix_fp32_once = pj_cpu.new_empty(
+                                                                (int(n_i),) + tuple(pj_cpu.shape[1:])
+                                                            )
+                                                        preds_fix_fp32_once[j : j + 1].copy_(pj_cpu[:1])
+
+                                                    if (
+                                                        preds_fix_fp32_once is not None
+                                                        and int(preds_fix_fp32_once.shape[0]) >= 2
+                                                    ):
+                                                        _, st_fp32_once = _broadcast_like(
+                                                            preds_fix_fp32_once[0],
+                                                            preds_fix_fp32_once[1],
+                                                            atol=float(broadcast_atol),
+                                                        )
+                                                        mf_fp32 = float(st_fp32_once.get("y_match_frac", float("nan")))
+                                                        yd_fp32 = float(st_fp32_once.get("y_max", float("nan")))
+                                                        _LOGGER.warning(
+                                                            "[infer] fp32 retry sanity (this batch): match_frac=%.5f (was %.5f) max|Y0-Y1|=%.6g (was %.6g)",
+                                                            float(mf_fp32),
+                                                            float(mf2),
+                                                            float(yd_fp32),
+                                                            float(ydiff2),
+                                                        )
+                                                        improved = bool(
+                                                            math.isfinite(mf_fp32)
+                                                            and math.isfinite(mf2)
+                                                            and (mf_fp32 <= float(mf2) - float(partial_broadcast_fp32_min_gain))
+                                                        )
+                                                        if bool(improved):
+                                                            preds = preds_fix_fp32_once
+                                                            if bool(partial_broadcast_fp32_persist):
+                                                                collapse_fp32_active = True
+                                                            with contextlib.suppress(Exception):
+                                                                _diag_collapse_once(
+                                                                    Xi2=Xi[:2].detach(),
+                                                                    preds2=preds[:2].detach(),
+                                                                    x_diff=float(x_diff.item()) if "x_diff" in locals() else float("nan"),
+                                                                    y_diff=float(yd_fp32),
+                                                                    where="after_per_sample_fp32_retry",
+                                                                )
+                                                except RuntimeError as e:
+                                                    if is_oom_error(e):
+                                                        _LOGGER.warning(
+                                                            "[infer] fp32 per-sample retry skipped due to OOM; keeping current precision path."
+                                                        )
+                                                    else:
+                                                        raise
                                             if bool(is_broadcast_like2):
                                                 with contextlib.suppress(Exception):
                                                     _diag_collapse_once(
