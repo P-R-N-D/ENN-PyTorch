@@ -5277,10 +5277,40 @@ def infer(
                                 (d0 <= float(broadcast_atol)).sum().item()
                             )
                             diag["y_numel"] = int(d0.numel())
-                            d_cpu = d0.reshape(-1)
+                            d_flat = d0.reshape(-1)
+                            if (
+                                int(broadcast_sample_max) > 0
+                                and int(d_flat.numel()) > int(broadcast_sample_max)
+                            ):
+                                sample_n = int(broadcast_sample_max)
+                                if sample_n <= 1:
+                                    if int(d_flat.numel()) <= 1:
+                                        d_flat = d_flat[:1]
+                                    else:
+                                        idx = torch.tensor(
+                                            [0, int(d_flat.numel()) - 1],
+                                            device=d_flat.device,
+                                            dtype=torch.long,
+                                        )
+                                        d_flat = d_flat.index_select(0, idx)
+                                else:
+                                    idx = torch.arange(
+                                        sample_n,
+                                        device=d_flat.device,
+                                        dtype=torch.long,
+                                    )
+                                    idx = (idx * (int(d_flat.numel()) - 1)) // (
+                                        sample_n - 1
+                                    )
+                                    d_flat = d_flat.index_select(0, idx)
+                                diag["y_diff_quantile_sampled"] = 1
+                                diag["y_diff_quantile_n"] = int(d_flat.numel())
+                            else:
+                                diag["y_diff_quantile_sampled"] = 0
+                                diag["y_diff_quantile_n"] = int(d_flat.numel())
+                            d_cpu = d_flat.to(dtype=torch.float32)
                             if getattr(getattr(d_cpu, "device", None), "type", None) != "cpu":
                                 d_cpu = d_cpu.to(device="cpu")
-                            d_cpu = d_cpu.to(dtype=torch.float32)
                             if int(d_cpu.numel()) > 0:
                                 qs = torch.tensor([0.5, 0.9, 0.99], dtype=torch.float32)
                                 qv = torch.quantile(d_cpu, qs).tolist()
