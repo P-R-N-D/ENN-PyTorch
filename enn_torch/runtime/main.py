@@ -5013,6 +5013,7 @@ def infer(
             collapse_diag_scaler = bool(env_bool("ENN_PRED_COLLAPSE_DIAG_SCALER", True))
             collapse_diag_always_once = bool(env_bool("ENN_PRED_COLLAPSE_DIAG_ALWAYS_ONCE", True))
             _collapse_diag_done = False
+            _collapse_diag_probe_done = False
 
             _collapse_diag_out_dir = (
                 str(os.environ.get("ENN_PRED_COLLAPSE_DIAG_DIR") or "").strip()
@@ -5251,16 +5252,37 @@ def infer(
                 except Exception as e:
                     return {"error": f"{type(e).__name__}: {e}"}
 
-            def _diag_collapse_once(*, Xi2: torch.Tensor, preds2: torch.Tensor, x_diff: float, y_diff: float, where: str, extra: dict[str, object] | None = None) -> None:
-                nonlocal _collapse_diag_done
+            def _diag_collapse_once(
+                *,
+                Xi2: torch.Tensor,
+                preds2: torch.Tensor,
+                x_diff: float,
+                y_diff: float,
+                where: str,
+                extra: dict[str, object] | None = None,
+                consume_once: bool = True,
+            ) -> None:
+                nonlocal _collapse_diag_done, _collapse_diag_probe_done
                 if not collapse_diag:
                     return
-                if collapse_diag_once and _collapse_diag_done:
-                    return
-                _collapse_diag_done = True
+                is_probe = str(where).startswith("probe")
+                if consume_once and is_probe and env_bool(
+                    "ENN_PRED_COLLAPSE_DIAG_PROBE_DOES_NOT_CONSUME_ONCE", default=True
+                ):
+                    consume_once = False
+                if consume_once:
+                    if collapse_diag_once and _collapse_diag_done:
+                        return
+                    _collapse_diag_done = True
+                else:
+                    if _collapse_diag_probe_done:
+                        return
+                    _collapse_diag_probe_done = True
                 diag: dict[str, object] = {}
                 try:
                     diag["where"] = str(where)
+                    diag["diag_is_probe"] = int(not bool(consume_once))
+                    diag["diag_consume_once"] = int(bool(consume_once))
                     diag["rank"] = int(rank)
                     diag["seen_batches"] = int(seen_batches)
                     diag["x_diff"] = float(x_diff)
@@ -5361,7 +5383,16 @@ def infer(
                     if collapse_diag_save:
                         with contextlib.suppress(Exception):
                             os.makedirs(str(chunk_dir), exist_ok=True)
-                            fname = f"collapse_diag.rank{int(rank)}.batch{int(seen_batches):06d}.json"
+                            base = f"collapse_diag.rank{int(rank)}.batch{int(seen_batches):06d}"
+                            safe_where = re.sub(r"[^0-9A-Za-z_.-]+", "-", str(where))[:80] or "where"
+                            fname = f"{base}.json"
+                            fp0 = os.path.join(str(chunk_dir), fname)
+                            if not bool(consume_once):
+                                fname = f"{base}.{safe_where}.json"
+                            elif os.path.exists(fp0) and env_bool(
+                                "ENN_PRED_COLLAPSE_DIAG_APPEND_WHERE_ON_COLLISION", default=True
+                            ):
+                                fname = f"{base}.{safe_where}.json"
                             fp = os.path.join(str(chunk_dir), fname)
                             with open(fp, "w", encoding="utf-8") as f:
                                 json.dump(diag, f, ensure_ascii=False, indent=2)
