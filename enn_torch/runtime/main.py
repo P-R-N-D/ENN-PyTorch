@@ -4217,6 +4217,24 @@ def infer(
             broadcast_match_frac = float(env_float("ENN_PRED_BROADCAST_MATCH_FRAC", 0.995))
             broadcast_rel_mean = float(env_float("ENN_PRED_BROADCAST_REL_MEAN", 1e-5))
             broadcast_sample_max = max(0, int(env_int("ENN_PRED_BROADCAST_SAMPLE_MAX", 16384) or 16384))
+            broadcast_probe_k = max(2, int(env_int("ENN_PRED_BROADCAST_PROBE_K", 4) or 4))
+            _dbg_diag_enabled = bool(env_bool("ENN_PRED_COLLAPSE_DIAG", default=False))
+            _dbg_raw_fallback = bool(env_bool("ENN_PRED_COLLAPSE_FALLBACK_RAW", default=False))
+            detect_partial_broadcast = bool(
+                env_bool(
+                    "ENN_PRED_DETECT_PARTIAL_BROADCAST",
+                    default=bool(_dbg_diag_enabled or _dbg_raw_fallback),
+                )
+            )
+            partial_broadcast_match_frac = float(
+                env_float("ENN_PRED_PARTIAL_BROADCAST_MATCH_FRAC", 0.90)
+            )
+            partial_broadcast_force_single = bool(
+                env_bool(
+                    "ENN_PRED_PARTIAL_BROADCAST_FORCE_SINGLE",
+                    default=bool(_dbg_raw_fallback),
+                )
+            )
 
             def _broadcast_like(
                 y0: torch.Tensor,
@@ -4993,7 +5011,9 @@ def infer(
             collapse_diag_max_elems = int(env_int("ENN_PRED_COLLAPSE_DIAG_MAX_ELEMS", 64) or 64)
             collapse_diag_once = bool(env_bool("ENN_PRED_COLLAPSE_DIAG_ONCE", True))
             collapse_diag_scaler = bool(env_bool("ENN_PRED_COLLAPSE_DIAG_SCALER", True))
+            collapse_diag_always_once = bool(env_bool("ENN_PRED_COLLAPSE_DIAG_ALWAYS_ONCE", True))
             _collapse_diag_done = False
+            _collapse_diag_probe_done = False
 
             _collapse_diag_out_dir = (
                 str(os.environ.get("ENN_PRED_COLLAPSE_DIAG_DIR") or "").strip()
@@ -5232,22 +5252,95 @@ def infer(
                 except Exception as e:
                     return {"error": f"{type(e).__name__}: {e}"}
 
-            def _diag_collapse_once(*, Xi2: torch.Tensor, preds2: torch.Tensor, x_diff: float, y_diff: float, where: str) -> None:
-                nonlocal _collapse_diag_done
+            def _diag_collapse_once(
+                *,
+                Xi2: torch.Tensor,
+                preds2: torch.Tensor,
+                x_diff: float,
+                y_diff: float,
+                where: str,
+                extra: dict[str, object] | None = None,
+                consume_once: bool = True,
+            ) -> None:
+                nonlocal _collapse_diag_done, _collapse_diag_probe_done
                 if not collapse_diag:
                     return
-                if collapse_diag_once and _collapse_diag_done:
-                    return
-                _collapse_diag_done = True
+                is_probe = str(where).startswith("probe")
+                if consume_once and is_probe and env_bool(
+                    "ENN_PRED_COLLAPSE_DIAG_PROBE_DOES_NOT_CONSUME_ONCE", default=True
+                ):
+                    consume_once = False
+                if consume_once:
+                    if collapse_diag_once and _collapse_diag_done:
+                        return
+                    _collapse_diag_done = True
+                else:
+                    if _collapse_diag_probe_done:
+                        return
+                    _collapse_diag_probe_done = True
                 diag: dict[str, object] = {}
                 try:
                     diag["where"] = str(where)
+                    diag["diag_is_probe"] = int(not bool(consume_once))
+                    diag["diag_consume_once"] = int(bool(consume_once))
                     diag["rank"] = int(rank)
                     diag["seen_batches"] = int(seen_batches)
                     diag["x_diff"] = float(x_diff)
                     diag["y_diff_calibrated"] = float(y_diff)
                     diag["X"] = _brief_stats(Xi2)
                     diag["Y_cal"] = _brief_stats(preds2)
+                    with contextlib.suppress(Exception):
+                        if int(getattr(preds2, "shape", (0,))[0]) >= 2:
+                            d0 = (preds2[0] - preds2[1]).detach().abs()
+                            diag["y_eq_frac_atol"] = float(
+                                (d0 <= float(broadcast_atol)).to(dtype=torch.float32).mean().item()
+                            )
+                            diag["y_eq_count_atol"] = int(
+                                (d0 <= float(broadcast_atol)).sum().item()
+                            )
+                            diag["y_numel"] = int(d0.numel())
+                            d_flat = d0.reshape(-1)
+                            if (
+                                int(broadcast_sample_max) > 0
+                                and int(d_flat.numel()) > int(broadcast_sample_max)
+                            ):
+                                sample_n = int(broadcast_sample_max)
+                                if sample_n <= 1:
+                                    if int(d_flat.numel()) <= 1:
+                                        d_flat = d_flat[:1]
+                                    else:
+                                        idx = torch.tensor(
+                                            [0, int(d_flat.numel()) - 1],
+                                            device=d_flat.device,
+                                            dtype=torch.long,
+                                        )
+                                        d_flat = d_flat.index_select(0, idx)
+                                else:
+                                    idx = torch.arange(
+                                        sample_n,
+                                        device=d_flat.device,
+                                        dtype=torch.long,
+                                    )
+                                    idx = (idx * (int(d_flat.numel()) - 1)) // (
+                                        sample_n - 1
+                                    )
+                                    d_flat = d_flat.index_select(0, idx)
+                                diag["y_diff_quantile_sampled"] = 1
+                                diag["y_diff_quantile_n"] = int(d_flat.numel())
+                            else:
+                                diag["y_diff_quantile_sampled"] = 0
+                                diag["y_diff_quantile_n"] = int(d_flat.numel())
+                            d_cpu = d_flat.to(dtype=torch.float32)
+                            if getattr(getattr(d_cpu, "device", None), "type", None) != "cpu":
+                                d_cpu = d_cpu.to(device="cpu")
+                            if int(d_cpu.numel()) > 0:
+                                qs = torch.tensor([0.5, 0.9, 0.99], dtype=torch.float32)
+                                qv = torch.quantile(d_cpu, qs).tolist()
+                                diag["y_diff_p50"] = float(qv[0])
+                                diag["y_diff_p90"] = float(qv[1])
+                                diag["y_diff_p99"] = float(qv[2])
+                    if extra is not None:
+                        diag["extra"] = extra
                     if collapse_diag_scaler:
                         sc_stats = _scaler_output_ab_stats()
                         if sc_stats is not None:
@@ -5290,7 +5383,16 @@ def infer(
                     if collapse_diag_save:
                         with contextlib.suppress(Exception):
                             os.makedirs(str(chunk_dir), exist_ok=True)
-                            fname = f"collapse_diag.rank{int(rank)}.batch{int(seen_batches):06d}.json"
+                            base = f"collapse_diag.rank{int(rank)}.batch{int(seen_batches):06d}"
+                            safe_where = re.sub(r"[^0-9A-Za-z_.-]+", "-", str(where))[:80] or "where"
+                            fname = f"{base}.json"
+                            fp0 = os.path.join(str(chunk_dir), fname)
+                            if not bool(consume_once):
+                                fname = f"{base}.{safe_where}.json"
+                            elif os.path.exists(fp0) and env_bool(
+                                "ENN_PRED_COLLAPSE_DIAG_APPEND_WHERE_ON_COLLISION", default=True
+                            ):
+                                fname = f"{base}.{safe_where}.json"
                             fp = os.path.join(str(chunk_dir), fname)
                             with open(fp, "w", encoding="utf-8") as f:
                                 json.dump(diag, f, ensure_ascii=False, indent=2)
@@ -5853,6 +5955,37 @@ def infer(
                     Xi = X[sl]
                     rows_i = row_ids[sl]
                     n_i = int(end - start)
+                    if (
+                        bool(collapse_diag)
+                        and bool(collapse_diag_save)
+                        and bool(collapse_diag_always_once)
+                        and (not bool(_collapse_diag_done))
+                        and int(seen_batches) == 1
+                        and int(bs) >= 2
+                        and int(start) == 0
+                    ):
+                        with contextlib.suppress(Exception):
+                            Xi2_probe = X[:2].detach()
+                            out_probe = _td_predict(
+                                Xi2_probe,
+                                calibrate_output=(bool(calibrate_pred_output) if "calibrate_pred_output" in locals() else None),
+                            )
+                            if isinstance(out_probe, torch.Tensor) and int(out_probe.shape[0]) >= 2:
+                                xdp = (Xi2_probe[0] - Xi2_probe[1]).abs().max()
+                                ydp = (out_probe[0] - out_probe[1]).abs().max()
+                                _diag_collapse_once(
+                                    Xi2=Xi2_probe[:2].detach(),
+                                    preds2=out_probe[:2].detach(),
+                                    x_diff=float(xdp.item()),
+                                    y_diff=float(ydp.item()),
+                                    where="probe_first_batch",
+                                    extra={
+                                        "probe_kind": "always",
+                                        "use_td_cg": bool(use_td_cg),
+                                        "mb": int(mb),
+                                        "bs": int(bs),
+                                    },
+                                )
                     Xi_pad = None
                     pad_n = 0
                     Xi_run = Xi
@@ -6239,16 +6372,100 @@ def infer(
                         broadcast_checked = True
                         try:
                             x0 = Xi[0].detach()
-                            x1 = Xi[1].detach()
+                            y0 = preds[0].detach()
+                            n_pred = int(getattr(preds, "shape", (0,))[0])
+                            probe_k = int(min(int(broadcast_probe_k), int(n_i), int(n_pred)))
+                            pair_stats: list[dict[str, float]] = []
+                            best_i = 1
+                            best_match = -1.0
+                            best_x_diff_val = 0.0
+                            best_bstats: dict[str, float] | None = None
+                            sel_i = 1
+                            sel_kind = ""
+                            sel_bstats: dict[str, float] | None = None
+
+                            for pi in range(1, int(probe_k)):
+                                xi = Xi[pi].detach()
+                                x_di = (x0 - xi).abs().max()
+                                xdv = float(x_di.item()) if torch.is_tensor(x_di) else float("nan")
+                                if (not math.isfinite(xdv)) or (xdv <= 0.0):
+                                    continue
+                                yi = preds[pi].detach()
+                                is_like, st = _broadcast_like(y0, yi, atol=float(broadcast_atol))
+                                pair_stats.append(
+                                    {
+                                        "i": float(pi),
+                                        "x_diff": float(xdv),
+                                        "y_max": float(st.get("y_max", float("nan"))),
+                                        "y_match_frac": float(st.get("y_match_frac", float("nan"))),
+                                        "y_rel_mean": float(st.get("y_rel_mean", float("nan"))),
+                                        "sample_n": float(st.get("sample_n", float("nan"))),
+                                    }
+                                )
+                                mf = float(st.get("y_match_frac", -1.0))
+                                if mf > best_match:
+                                    best_match = float(mf)
+                                    best_i = int(pi)
+                                    best_x_diff_val = float(xdv)
+                                    best_bstats = st
+                                if bool(is_like):
+                                    sel_i = int(pi)
+                                    sel_kind = "broadcast_like"
+                                    sel_bstats = st
+                                    break
+
+                            if (not sel_kind) and bool(detect_partial_broadcast) and (best_bstats is not None):
+                                if (best_match >= float(partial_broadcast_match_frac)) and (best_x_diff_val > 0.0):
+                                    sel_i = int(best_i)
+                                    sel_kind = "partial_like"
+                                    sel_bstats = best_bstats
+
+                            if (
+                                bool(collapse_diag)
+                                and bool(collapse_diag_save)
+                                and bool(collapse_diag_always_once)
+                                and (not bool(_collapse_diag_done))
+                                and int(probe_k) >= 2
+                                and int(sel_i) >= 1
+                                and int(sel_i) < int(n_i)
+                                and int(sel_i) < int(n_pred)
+                            ):
+                                with contextlib.suppress(Exception):
+                                    idx2 = torch.tensor([0, int(sel_i)], device=Xi.device, dtype=torch.long)
+                                    Xi2_sel = Xi.index_select(0, idx2)
+                                    preds2_sel = preds.index_select(0, idx2)
+                                    xds = (Xi2_sel[0] - Xi2_sel[1]).abs().max()
+                                    _, st_s = _broadcast_like(preds2_sel[0], preds2_sel[1], atol=float(broadcast_atol))
+                                    _diag_collapse_once(
+                                        Xi2=Xi2_sel.detach(),
+                                        preds2=preds2_sel.detach(),
+                                        x_diff=float(xds.item()),
+                                        y_diff=float(st_s.get("y_max", float("nan"))),
+                                        where="broadcast_probe",
+                                        extra={
+                                            "probe_kind": str(sel_kind or "probe"),
+                                            "probe_pairs": pair_stats,
+                                            "probe_selected_i": int(sel_i),
+                                            "probe_selected_match_frac": float(st_s.get("y_match_frac", float("nan"))),
+                                            "probe_selected_rel_mean": float(st_s.get("y_rel_mean", float("nan"))),
+                                        },
+                                    )
+
+                            if sel_bstats is None:
+                                sel_i = 1
+                                sel_kind = ""
+                            x1 = Xi[int(sel_i)].detach()
                             x_diff = (x0 - x1).abs().max()
                             if float(x_diff.item()) > 0.0:
-                                y0 = preds[0].detach()
-                                y1 = preds[1].detach()
+                                y1 = preds[int(sel_i)].detach()
                                 is_broadcast_like, bstats = _broadcast_like(
                                     y0, y1, atol=float(broadcast_atol)
                                 )
                                 y_diff = float(bstats.get("y_max", float("nan")))
-                                if bool(is_broadcast_like):
+                                trigger_fallback = bool(is_broadcast_like) or (
+                                    (str(sel_kind) == "partial_like") and bool(partial_broadcast_force_single)
+                                )
+                                if bool(trigger_fallback):
                                     _dump_collapse_stage_diag_from_model(
                                         Xi,
                                         where="broadcast_trigger",
