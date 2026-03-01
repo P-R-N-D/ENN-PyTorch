@@ -6223,14 +6223,24 @@ class Model(nn.Module):
                             with contextlib.suppress(Exception):
                                 sc = getattr(self, "scaler", None)
                                 inv = getattr(sc, "inverse_calibrate", None)
-                                skip_ab = bool(
-                                    env_bool("ENN_DELTA_GATE_BOUNDS_INVERSE_SKIP_OUTPUT_AB", default=True)
-                                    and callable(inv)
-                                )
-                                if z_min is not None and callable(inv):
-                                    z_min = inv(z_min, apply_output_ab=(not skip_ab))
-                                if z_max is not None and callable(inv):
-                                    z_max = inv(z_max, apply_output_ab=(not skip_ab))
+                                if callable(inv):
+                                    skip_ab = bool(
+                                        env_bool("ENN_DELTA_GATE_BOUNDS_INVERSE_SKIP_OUTPUT_AB", default=True)
+                                        and bool(getattr(sc, "output_ab_enabled", False))
+                                    )
+
+                                    def _inv_bound(t: torch.Tensor) -> torch.Tensor:
+                                        if not bool(skip_ab):
+                                            return inv(t)
+                                        try:
+                                            return inv(t, apply_output_ab=False)
+                                        except TypeError:
+                                            return inv(t)
+
+                                    if z_min is not None:
+                                        z_min = _inv_bound(z_min)
+                                    if z_max is not None:
+                                        z_max = _inv_bound(z_max)
                     else:
                         if bool(
                             getattr(self, "delta_gate_fallback_enabled", False)
