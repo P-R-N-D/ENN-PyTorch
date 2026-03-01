@@ -6221,10 +6221,26 @@ class Model(nn.Module):
                         z_max = (yhi_t - mean) / denom
                         if infer_mode and calibrate_output and (not is_cls_loss):
                             with contextlib.suppress(Exception):
-                                if z_min is not None:
-                                    z_min = self.scaler.inverse_calibrate(z_min)
-                                if z_max is not None:
-                                    z_max = self.scaler.inverse_calibrate(z_max)
+                                sc = getattr(self, "scaler", None)
+                                inv = getattr(sc, "inverse_calibrate", None)
+                                if callable(inv):
+                                    skip_ab = bool(
+                                        env_bool("ENN_DELTA_GATE_BOUNDS_INVERSE_SKIP_OUTPUT_AB", default=True)
+                                        and bool(getattr(sc, "output_ab_enabled", False))
+                                    )
+
+                                    def _inv_bound(t: torch.Tensor) -> torch.Tensor:
+                                        if not bool(skip_ab):
+                                            return inv(t)
+                                        try:
+                                            return inv(t, apply_output_ab=False)
+                                        except TypeError:
+                                            return inv(t)
+
+                                    if z_min is not None:
+                                        z_min = _inv_bound(z_min)
+                                    if z_max is not None:
+                                        z_max = _inv_bound(z_max)
                     else:
                         if bool(
                             getattr(self, "delta_gate_fallback_enabled", False)
