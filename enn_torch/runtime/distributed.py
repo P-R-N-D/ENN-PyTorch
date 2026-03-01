@@ -45,7 +45,7 @@ from torch.optim import Optimizer
 
 
 def _maybe_patch_object_collectives_pickler() -> None:
-    if sys.version_info < (3, 14):
+    if not env_bool("ENN_DISTRIBUTED_OBJECT_PICKLER_CLOUDPICKLE", default=True):
         return
     try:
         import cloudpickle

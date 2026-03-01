@@ -98,6 +98,8 @@ Key building blocks:
    pip install -e .
    ```
 
+3. `cloudpickle>=3.1.2` is a mandatory dependency and is installed automatically from package metadata.
+
 Optional extras:
 ```bash
 # Broader export stack (platform/python constraints; some wheels may be unavailable on py3.13/py3.14t)
