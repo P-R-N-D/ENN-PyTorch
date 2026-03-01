@@ -6221,10 +6221,25 @@ class Model(nn.Module):
                         z_max = (yhi_t - mean) / denom
                         if infer_mode and calibrate_output and (not is_cls_loss):
                             with contextlib.suppress(Exception):
-                                if z_min is not None:
-                                    z_min = self.scaler.inverse_calibrate(z_min)
-                                if z_max is not None:
-                                    z_max = self.scaler.inverse_calibrate(z_max)
+                                sc = getattr(self, "scaler", None)
+                                inv = getattr(sc, "inverse_calibrate", None)
+                                skip_ab = bool(
+                                    env_bool("ENN_DELTA_GATE_BOUNDS_INVERSE_SKIP_OUTPUT_AB", default=True)
+                                    and callable(inv)
+                                    and bool(getattr(sc, "output_ab_enabled", False))
+                                )
+                                prev_ab = None
+                                if skip_ab:
+                                    prev_ab = bool(getattr(sc, "output_ab_enabled", False))
+                                    setattr(sc, "output_ab_enabled", False)
+                                try:
+                                    if z_min is not None and callable(inv):
+                                        z_min = inv(z_min)
+                                    if z_max is not None and callable(inv):
+                                        z_max = inv(z_max)
+                                finally:
+                                    if skip_ab and (prev_ab is not None):
+                                        setattr(sc, "output_ab_enabled", bool(prev_ab))
                     else:
                         if bool(
                             getattr(self, "delta_gate_fallback_enabled", False)
