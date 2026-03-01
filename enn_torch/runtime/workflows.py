@@ -326,6 +326,10 @@ def _resize_scaler_buffers_for_shape(
                 "affine_a",
                 "affine_b",
                 "pw_y",
+                "y_out_scale",
+                "y_out_bias",
+                "y_out_clip_low",
+                "y_out_clip_high",
             ):
                 _resize_buffer(module, name, (y_numel,))
         continue
@@ -353,6 +357,10 @@ def _resize_scaler_buffers_from_metadata(
         "scaler.affine_b": "affine_b",
         "scaler.pw_x": "pw_x",
         "scaler.pw_y": "pw_y",
+        "scaler.y_out_scale": "y_out_scale",
+        "scaler.y_out_bias": "y_out_bias",
+        "scaler.y_out_clip_low": "y_out_clip_low",
+        "scaler.y_out_clip_high": "y_out_clip_high",
     }
 
     def _resize_buffer(

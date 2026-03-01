@@ -158,6 +158,10 @@ def resize_scaler_buffer(model: nn.Module, state: Mapping[str, Any]) -> None:
         "affine_b",
         "pw_x",
         "pw_y",
+        "y_out_scale",
+        "y_out_bias",
+        "y_out_clip_low",
+        "y_out_clip_high",
     )
     prefixes = ("scaler.", "module.scaler.")
     for prefix in prefixes:
