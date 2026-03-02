@@ -5212,12 +5212,11 @@ class Model(nn.Module):
                 )
             )
             if (not torch.is_grad_enabled()) and (not export) and (not is_export_or_trace()):
-                p_floor = float(env_float("ENN_DELTA_GATE_P_FLOOR_INFER", 0.01))
-                if not math.isfinite(p_floor):
-                    p_floor = 0.01
-                p_floor = float(min(max(p_floor, 0.0), 0.49))
-                if p_floor > float(clip):
-                    clip = float(p_floor)
+                p_floor = float(env_float("ENN_DELTA_GATE_P_FLOOR_INFER", 0.0))
+                if math.isfinite(p_floor) and p_floor > 0.0:
+                    p_floor = float(min(max(p_floor, 0.0), 0.49))
+                    if p_floor > float(clip):
+                        clip = float(p_floor)
             p = p.clamp(clip, 1.0 - clip)
             if (
                 p.dim() == 2
@@ -6354,7 +6353,7 @@ class Model(nn.Module):
                         p_eps, float(getattr(self.delta_gate, "eps", 0.0))
                     )
                 if infer_mode:
-                    p_floor = float(env_float("ENN_DELTA_GATE_P_FLOOR_INFER", 0.01))
+                    p_floor = float(env_float("ENN_DELTA_GATE_P_FLOOR_INFER", 0.0))
                     if math.isfinite(p_floor) and p_floor > 0.0:
                         p_floor = float(min(max(p_floor, 0.0), 0.49))
                         p_eps = float(max(float(p_eps), float(p_floor)))
