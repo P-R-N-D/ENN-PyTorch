@@ -25,7 +25,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from ..core.concurrency import Mutex, is_gil_enabled
 from ..core.config import ModelConfig
-from ..core.datatypes import env_bool, env_first_int, env_int, env_str
+from ..core.datatypes import env_bool, env_first_int, env_int, env_str, env_float
 from ..core.policies import LossWeightPolicy, PrecisionPolicy
 from ..core.precision import AutocastState, StatefulAutocast, StatelessAutocast
 from ..core.system import (
@@ -5211,6 +5211,13 @@ class Model(nn.Module):
                     0.49,
                 )
             )
+            if (not torch.is_grad_enabled()) and (not export) and (not is_export_or_trace()):
+                p_floor = float(env_float("ENN_DELTA_GATE_P_FLOOR_INFER", 0.01))
+                if not math.isfinite(p_floor):
+                    p_floor = 0.01
+                p_floor = float(min(max(p_floor, 0.0), 0.49))
+                if p_floor > float(clip):
+                    clip = float(p_floor)
             p = p.clamp(clip, 1.0 - clip)
             if (
                 p.dim() == 2
@@ -6346,6 +6353,11 @@ class Model(nn.Module):
                     p_eps = max(
                         p_eps, float(getattr(self.delta_gate, "eps", 0.0))
                     )
+                if infer_mode:
+                    p_floor = float(env_float("ENN_DELTA_GATE_P_FLOOR_INFER", 0.01))
+                    if math.isfinite(p_floor) and p_floor > 0.0:
+                        p_floor = float(min(max(p_floor, 0.0), 0.49))
+                        p_eps = float(max(float(p_eps), float(p_floor)))
                 hi = 1.0 - p_eps
                 if hi > p_eps:
                     p = p.clamp(min=p_eps, max=hi)
