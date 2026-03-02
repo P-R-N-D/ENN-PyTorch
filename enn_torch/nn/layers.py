@@ -2874,10 +2874,17 @@ class Scaler(nn.Module):
                         self.y_out_clip_low.resize_(lo2.shape).copy_(lo2)
                         self.y_out_clip_high.resize_(hi2.shape).copy_(hi2)
 
+    def _reset_output_ab_clip_only_state(self: Self) -> None:
+        with contextlib.suppress(Exception):
+            self._output_ab_clip_only = False
+            self._output_ab_clip_only_reason = ""
+            self._output_ab_clip_only_warned = False
+
     @torch.no_grad()
     def _restore_calib_state_after_load(self: Self) -> None:
+        self._reset_output_ab_clip_only_state()
         if env_bool("ENN_DISABLE_OUTPUT_AB", default=False):
-            self.output_ab_enabled = False
+            self.disable_output_ab()
 
         mode = str(getattr(self, "calib_mode", "none") or "none").strip().lower()
         if mode not in {"none", "affine", "piecewise", "ab"}:
@@ -2918,7 +2925,7 @@ class Scaler(nn.Module):
             self.calib_mode = inferred
 
         if env_bool("ENN_DISABLE_OUTPUT_AB", default=False):
-            self.output_ab_enabled = False
+            self.disable_output_ab()
             return
 
         enable_ab = False
@@ -3529,9 +3536,7 @@ class Scaler(nn.Module):
     @torch.no_grad()
     def disable_output_ab(self: Self) -> None:
         self.output_ab_enabled = False
-        self._output_ab_clip_only = False
-        self._output_ab_clip_only_reason = ""
-        self._output_ab_clip_only_warned = False
+        self._reset_output_ab_clip_only_state()
 
     @torch.no_grad()
     def fit_output_ab(
@@ -3547,12 +3552,13 @@ class Scaler(nn.Module):
         scale_clamp: float | None = None,
         enable: bool = True,
     ) -> None:
+        self._reset_output_ab_clip_only_state()
         pm = pred_mean.detach().reshape(-1).to(dtype=torch.float64)
         ps = pred_std.detach().reshape(-1).to(dtype=torch.float64)
         rm = ref_mean.detach().reshape(-1).to(dtype=torch.float64)
         rs = ref_std.detach().reshape(-1).to(dtype=torch.float64)
         if pm.numel() == 0 or ps.numel() == 0 or rm.numel() == 0 or rs.numel() == 0:
-            self.output_ab_enabled = False
+            self.disable_output_ab()
             return
         eps_f = float(self.eps if eps is None else eps)
         eps_f = max(eps_f, 1e-9)
@@ -3617,9 +3623,7 @@ class Scaler(nn.Module):
         self.y_out_clip_low.resize_(lo.shape).copy_(lo)
         self.y_out_clip_high.resize_(hi.shape).copy_(hi)
         self.output_ab_enabled = bool(enable)
-        self._output_ab_clip_only = False
-        self._output_ab_clip_only_reason = ""
-        self._output_ab_clip_only_warned = False
+        self._reset_output_ab_clip_only_state()
         if self.output_ab_enabled and self.calib_mode == "none":
             self.calib_mode = "ab"
 
