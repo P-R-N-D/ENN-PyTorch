@@ -109,18 +109,79 @@ def get_batch_length(loader: object) -> int:
     if alt > 0:
         return alt
     if hasattr(loader, "state_dict") and hasattr(loader, "load_state_dict"):
-        state_dict = object()
         try:
             state_dict = loader.state_dict()  # type: ignore[attr-defined]
         except Exception:
             return 0
+        if state_dict is None:
+            return 0
+
+        if (
+            int(
+                env_first_int(
+                    (
+                        "ENN_LEN_PROBE_DEEPCOPY",
+                        "ENN_BATCHLEN_PROBE_DEEPCOPY",
+                    ),
+                    default=1,
+                )
+                or 0
+            )
+            > 0
+        ):
+            with contextlib.suppress(Exception):
+                import copy as _copy
+
+                state_dict = _copy.deepcopy(state_dict)
+
+        pre_restored = False
+        with contextlib.suppress(Exception):
+            loader.load_state_dict(state_dict)  # type: ignore[attr-defined]
+            pre_restored = True
+        if not pre_restored:
+            return 0
+
+        max_batches = int(
+            env_first_int(
+                (
+                    "ENN_LEN_PROBE_MAX_BATCHES",
+                    "ENN_BATCHLEN_PROBE_MAX_BATCHES",
+                ),
+                default=0,
+            )
+            or 0
+        )
+        max_seconds = float(
+            env_first_float(
+                (
+                    "ENN_LEN_PROBE_MAX_SECONDS",
+                    "ENN_BATCHLEN_PROBE_MAX_SECONDS",
+                ),
+                default=0.0,
+            )
+            or 0.0
+        )
+        deadline_ns = 0
+        if max_seconds > 0.0:
+            deadline_ns = int(
+                time.perf_counter_ns() + (max_seconds * 1_000_000_000.0)
+            )
+
         count = 0
         iter_failed = False
         try:
             for _ in loader:  # type: ignore[assignment]
                 count += 1
+                if max_batches > 0 and count >= max_batches:
+                    iter_failed = True
+                    break
+                if deadline_ns and (count & 0xFF) == 0:
+                    if time.perf_counter_ns() >= deadline_ns:
+                        iter_failed = True
+                        break
         except Exception:
             iter_failed = True
+
         restored = False
         with contextlib.suppress(Exception):
             loader.load_state_dict(state_dict)  # type: ignore[attr-defined]
