@@ -3529,6 +3529,9 @@ class Scaler(nn.Module):
     @torch.no_grad()
     def disable_output_ab(self: Self) -> None:
         self.output_ab_enabled = False
+        self._output_ab_clip_only = False
+        self._output_ab_clip_only_reason = ""
+        self._output_ab_clip_only_warned = False
 
     @torch.no_grad()
     def fit_output_ab(
@@ -3614,6 +3617,9 @@ class Scaler(nn.Module):
         self.y_out_clip_low.resize_(lo.shape).copy_(lo)
         self.y_out_clip_high.resize_(hi.shape).copy_(hi)
         self.output_ab_enabled = bool(enable)
+        self._output_ab_clip_only = False
+        self._output_ab_clip_only_reason = ""
+        self._output_ab_clip_only_warned = False
         if self.output_ab_enabled and self.calib_mode == "none":
             self.calib_mode = "ab"
 
