@@ -73,27 +73,51 @@ logger = logging.getLogger(__name__)
 
 
 def get_batch_length(loader: object) -> int:
-    if loader is None:
-        return 0
-    try:
-        n = len(loader)
-        if isinstance(n, int) and n >= 0:
-            return int(n)
-    except Exception:
-        pass
-    if hasattr(loader, "state_dict") and hasattr(loader, "load_state_dict"):
-        state = None
-        with contextlib.suppress(Exception):
-            state = loader.state_dict()
-        if state is not None:
-            count = 0
+    def _sum_epochable_lengths(obj: object) -> int:
+        epochables = getattr(obj, "_enn_epochables", None)
+        if not epochables:
+            return 0
+        try:
+            items = (
+                list(epochables)
+                if isinstance(epochables, (list, tuple))
+                else [epochables]
+            )
+        except Exception:
+            items = [epochables]
+        total = 0
+        for it in items:
             try:
-                for _ in loader:
-                    count += 1
-            finally:
-                with contextlib.suppress(Exception):
-                    loader.load_state_dict(state)
+                vi = int(len(it))
+            except Exception:
+                continue
+            if vi > 0:
+                total += vi
+        return int(total)
+
+    try:
+        out = len(loader)  # type: ignore[arg-type]
+    except Exception:
+        out = None
+    if isinstance(out, int) and out > 0:
+        if out <= 1:
+            alt = _sum_epochable_lengths(loader)
+            if alt > out:
+                return alt
+        return int(out)
+    alt = _sum_epochable_lengths(loader)
+    if alt > 0:
+        return alt
+    if hasattr(loader, "state_dict") and hasattr(loader, "load_state_dict"):
+        try:
+            state_dict = loader.state_dict()  # type: ignore[attr-defined]
+            count = 0
+            for _ in loader:  # type: ignore[assignment]
+                count += 1
+            loader.load_state_dict(state_dict)  # type: ignore[attr-defined]
             return int(count)
+        except Exception:
+            return 0
     return 0
 
 
@@ -1156,8 +1180,15 @@ def fetch(
         collect_epochables=True,
         epochables=train_epochables,
     )
+    val_epochables = []
     val_loader = (
-        _create_loader_stage("val", False, val_weights)
+        _create_loader_stage(
+            "val",
+            False,
+            val_weights,
+            collect_epochables=True,
+            epochables=val_epochables,
+        )
         if float(val_frac) > 0.0
         else None
     )
@@ -1167,6 +1198,7 @@ def fetch(
             setattr(train_loader, "_enn_epochables", list(train_epochables))
         if val_loader is not None:
             setattr(val_loader, "_enn_sampler_scale", scale_ctl)
+            setattr(val_loader, "_enn_epochables", list(val_epochables))
     return {
         "training_loader": train_loader,
         "validation_loader": val_loader,

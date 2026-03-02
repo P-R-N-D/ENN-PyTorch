@@ -1145,7 +1145,69 @@ def epochs(
     )
     train_steps = _get_batch_length(train_loader)
     val_steps = _get_batch_length(val_loader)
-    total_updates = int(total_epochs) * (int(train_steps) + int(val_steps))
+    progress_mode = str(env_str("ENN_PROGRESS_MODE", "auto") or "auto").strip().lower()
+
+    def _loader_samples_per_epoch(loader: object | None, fallback_steps: int) -> int:
+        if loader is None:
+            return 0
+        epochables = getattr(loader, "_enn_epochables", None)
+        if epochables:
+            total = 0
+            for e in epochables:
+                if isinstance(e, Sampler):
+                    try:
+                        start = int(getattr(e, "start"))
+                        end = int(getattr(e, "end"))
+                        total += max(0, end - start)
+                    except Exception:
+                        continue
+            if total > 0:
+                if world_sz > 1:
+                    total = (total + world_sz - 1) // world_sz
+                return int(total)
+        try:
+            bs = int(getattr(loader, "batch_size"))
+        except Exception:
+            bs = 0
+        if bs > 0 and int(fallback_steps) > 0:
+            return int(bs * int(fallback_steps))
+        return 0
+
+    def _infer_batch_samples(batch: object) -> int:
+        bs = getattr(batch, "batch_size", None)
+        if bs is not None:
+            try:
+                n = 1
+                for d in list(bs):
+                    n *= int(d)
+                return int(n)
+            except Exception:
+                pass
+        try:
+            return int(len(batch))
+        except Exception:
+            return 1
+
+    train_samples_per_epoch = _loader_samples_per_epoch(train_loader, train_steps)
+    val_samples_per_epoch = _loader_samples_per_epoch(val_loader, val_steps)
+
+    use_sample_progress = False
+    if progress_mode in {"samples", "sample"}:
+        use_sample_progress = True
+    elif progress_mode in {"steps", "step"}:
+        use_sample_progress = False
+    else:
+        use_sample_progress = bool(
+            train_samples_per_epoch > 0
+            and (val_loader is None or val_samples_per_epoch > 0)
+        )
+
+    total_updates = (
+        int(total_epochs) * (int(train_samples_per_epoch) + int(val_samples_per_epoch))
+        if use_sample_progress
+        else int(total_epochs) * (int(train_steps) + int(val_steps))
+    )
+    total_for_bar = int(total_updates) if int(total_updates) > 0 else None
     if train_steps > 0:
         util_adjust_interval = max(10, int(train_steps * 0.05))
         util_warmup_steps = max(
@@ -1155,7 +1217,7 @@ def epochs(
     status_bar = (
         ProcessBroker.get_progress_bar(
             title="Training",
-            total=total_updates,
+            total=total_for_bar,
             device=device,
         )
         if local_rank == 0
@@ -1241,6 +1303,9 @@ def epochs(
             if val_loader is not None
             else None
         )
+        ckpt_busy_policy = str(env_str("ENN_DCP_BUSY_POLICY", "skip") or "skip").strip().lower()
+        ckpt_block_last_epoch = env_bool("ENN_DCP_BLOCK_IF_BUSY_LAST_EPOCH", True)
+        ckpt_log_busy = env_bool("ENN_DCP_LOG_BUSY", False)
         for epoch_idx in range(int(total_epochs)):
             with contextlib.suppress(Exception):
                 epochables = getattr(train_loader, "_enn_epochables", None)
@@ -1375,7 +1440,11 @@ def epochs(
                 for step_idx, _raw in enumerate(
                     itertools.chain([_first_raw], train_iter)
                 ):
-                    train_accum_since_last += 1
+                    train_accum_since_last += (
+                        max(1, _infer_batch_samples(_raw))
+                        if use_sample_progress
+                        else 1
+                    )
                     while True:
                         mark_cudagraph = False
                         try:
@@ -2757,7 +2826,11 @@ def epochs(
                                         )
                                         ProcessBroker.update_progress_bar(
                                             status_bar,
-                                            finish=1,
+                                            finish=(
+                                                max(1, int(X.shape[0]))
+                                                if use_sample_progress
+                                                else 1
+                                            ),
                                             mbps=mbps_cur,
                                             tflops=tflops_cur,
                                         )
@@ -2858,6 +2931,15 @@ def epochs(
                         ckpt_pg = train_pg
 
                 if ckpt_participate:
+                    was_idle = bool(checkpointer.is_idle())
+                    block_if_busy = ckpt_busy_policy in {"wait", "block"}
+                    if (
+                        not block_if_busy
+                        and ckpt_block_last_epoch
+                        and int(epoch_idx + 1) >= int(total_epochs)
+                    ):
+                        block_if_busy = True
+
                     did_start_ckpt = bool(
                         checkpointer.try_request_save_epoch_collective(
                             epoch=int(epoch_idx + 1),
@@ -2865,13 +2947,25 @@ def epochs(
                             optimizer=optimizer,
                             save_optimizer=getattr(ops, "ckpt_save_optimizer", None),
                             extra_state={"epoch": int(epoch_idx + 1)},
-                            block_if_busy=False,
+                            block_if_busy=block_if_busy,
                             device=device,
                             group=ckpt_pg,
                             process_group=ckpt_pg,
                             use_collectives=use_collectives,
                         )
                     )
+                    if (
+                        (not did_start_ckpt)
+                        and ckpt_log_busy
+                        and (not was_idle)
+                        and (not block_if_busy)
+                        and (local_rank == 0)
+                    ):
+                        logging.info(
+                            "Async checkpoint busy; skipped save request for epoch=%d (policy=%s)",
+                            int(epoch_idx + 1),
+                            ckpt_busy_policy,
+                        )
                     if did_start_ckpt:
                         checkpointer.await_staging()
             prev_comp_time += float(comp_time)
