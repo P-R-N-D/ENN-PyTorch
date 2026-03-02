@@ -281,11 +281,12 @@ class _LineProgress:
         pct = ""
         rem = ""
         if self.total is not None and self.total > 0:
-            frac = max(0.0, min(1.0, float(self.n) / float(self.total)))
+            frac = max(0.0, float(self.n) / float(self.total))
             pct = f"{100.0 * frac:6.2f} % "
             if self.n > 0 and elapsed > 0:
                 rate = float(self.n) / float(elapsed)
-                rem_s = float(self.total - self.n) / rate if rate > 0 else 0.0
+                remaining_units = max(0.0, float(self.total) - float(self.n))
+                rem_s = remaining_units / rate if rate > 0 else 0.0
                 rem = f", Remaining: {self._fmt_hms(rem_s)}"
             else:
                 rem = ", Remaining: ?"

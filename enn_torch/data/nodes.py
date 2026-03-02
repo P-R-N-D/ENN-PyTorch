@@ -1308,12 +1308,36 @@ class Loader:
         return iter(iterable)
 
     def __len__(self: Self) -> int:
-        if self._length is not None:
-            return int(self._length)
+        epochables = getattr(self, "_enn_epochables", None)
+        if epochables:
+            try:
+                items = (
+                    list(epochables)
+                    if isinstance(epochables, (list, tuple))
+                    else [epochables]
+                )
+            except Exception:
+                items = [epochables]
+            total = 0
+            for obj in items:
+                try:
+                    li = int(len(obj))
+                except Exception:
+                    continue
+                if li > 0:
+                    total += li
+            if total > 0:
+                return int(total)
+        with suppress(Exception):
+            if self._length is not None:
+                l_hint = int(self._length)
+                if l_hint >= 0:
+                    return l_hint
         try:
-            return int(len(self._base_iterable))
+            l2 = int(len(self._base_iterable))
+            return l2 if l2 >= 0 else 0
         except Exception:
-            return 1
+            return 0
 
     def _device_for_current_thread(self: Self) -> torch.device:
         if isinstance(self._device, list):

@@ -73,27 +73,122 @@ logger = logging.getLogger(__name__)
 
 
 def get_batch_length(loader: object) -> int:
-    if loader is None:
-        return 0
-    try:
-        n = len(loader)
-        if isinstance(n, int) and n >= 0:
-            return int(n)
-    except Exception:
-        pass
-    if hasattr(loader, "state_dict") and hasattr(loader, "load_state_dict"):
-        state = None
-        with contextlib.suppress(Exception):
-            state = loader.state_dict()
-        if state is not None:
-            count = 0
+    def _sum_epochable_lengths(obj: object) -> int:
+        epochables = getattr(obj, "_enn_epochables", None)
+        if not epochables:
+            return 0
+        try:
+            items = (
+                list(epochables)
+                if isinstance(epochables, (list, tuple))
+                else [epochables]
+            )
+        except Exception:
+            items = [epochables]
+        total = 0
+        for it in items:
             try:
-                for _ in loader:
-                    count += 1
-            finally:
-                with contextlib.suppress(Exception):
-                    loader.load_state_dict(state)
-            return int(count)
+                vi = int(len(it))
+            except Exception:
+                continue
+            if vi > 0:
+                total += vi
+        return int(total)
+
+    try:
+        out = len(loader)  # type: ignore[arg-type]
+    except Exception:
+        out = None
+    if isinstance(out, int) and out > 0:
+        if out <= 1:
+            alt = _sum_epochable_lengths(loader)
+            if alt > out:
+                return alt
+        return int(out)
+    alt = _sum_epochable_lengths(loader)
+    if alt > 0:
+        return alt
+    if hasattr(loader, "state_dict") and hasattr(loader, "load_state_dict"):
+        try:
+            state_dict = loader.state_dict()
+        except Exception:
+            return 0
+        if state_dict is None:
+            return 0
+
+        if (
+            int(
+                env_first_int(
+                    (
+                        "ENN_LEN_PROBE_DEEPCOPY",
+                        "ENN_BATCHLEN_PROBE_DEEPCOPY",
+                    ),
+                    default=1,
+                )
+                or 0
+            )
+            > 0
+        ):
+            with contextlib.suppress(Exception):
+                import copy as _copy
+
+                state_dict = _copy.deepcopy(state_dict)
+
+        pre_restored = False
+        with contextlib.suppress(Exception):
+            loader.load_state_dict(state_dict)
+            pre_restored = True
+        if not pre_restored:
+            return 0
+
+        max_batches = int(
+            env_first_int(
+                (
+                    "ENN_LEN_PROBE_MAX_BATCHES",
+                    "ENN_BATCHLEN_PROBE_MAX_BATCHES",
+                ),
+                default=0,
+            )
+            or 0
+        )
+        max_seconds = float(
+            env_first_float(
+                (
+                    "ENN_LEN_PROBE_MAX_SECONDS",
+                    "ENN_BATCHLEN_PROBE_MAX_SECONDS",
+                ),
+                default=0.0,
+            )
+            or 0.0
+        )
+        deadline_ns = 0
+        if max_seconds > 0.0:
+            deadline_ns = int(
+                time.perf_counter_ns() + (max_seconds * 1_000_000_000.0)
+            )
+
+        count = 0
+        iter_failed = False
+        try:
+            for _ in loader:  # type: ignore[assignment]
+                count += 1
+                if max_batches > 0 and count >= max_batches:
+                    iter_failed = True
+                    break
+                if deadline_ns and (count & 0xFF) == 0:
+                    if time.perf_counter_ns() >= deadline_ns:
+                        iter_failed = True
+                        break
+        except Exception:
+            iter_failed = True
+
+        restored = False
+        with contextlib.suppress(Exception):
+            loader.load_state_dict(state_dict)
+            restored = True
+        if not restored or iter_failed:
+            return 0
+        return int(count)
     return 0
 
 
@@ -1156,8 +1251,15 @@ def fetch(
         collect_epochables=True,
         epochables=train_epochables,
     )
+    val_epochables = []
     val_loader = (
-        _create_loader_stage("val", False, val_weights)
+        _create_loader_stage(
+            "val",
+            False,
+            val_weights,
+            collect_epochables=True,
+            epochables=val_epochables,
+        )
         if float(val_frac) > 0.0
         else None
     )
@@ -1167,6 +1269,7 @@ def fetch(
             setattr(train_loader, "_enn_epochables", list(train_epochables))
         if val_loader is not None:
             setattr(val_loader, "_enn_sampler_scale", scale_ctl)
+            setattr(val_loader, "_enn_epochables", list(val_epochables))
     return {
         "training_loader": train_loader,
         "validation_loader": val_loader,
