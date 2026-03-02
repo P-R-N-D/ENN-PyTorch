@@ -2592,6 +2592,9 @@ class Scaler(nn.Module):
             Tuple[str, int, torch.dtype], Tuple[torch.Tensor, torch.Tensor]
         ] = {}
         self._output_ab_log_once: bool = False
+        self._output_ab_clip_only: bool = False
+        self._output_ab_clip_only_reason: str = ""
+        self._output_ab_clip_only_warned: bool = False
 
     def __getstate__(self: Self) -> dict[str, object]:
         state = super().__getstate__()
@@ -2609,6 +2612,12 @@ class Scaler(nn.Module):
         self._y_stats_cache = {}
         if not hasattr(self, "_output_ab_log_once"):
             self._output_ab_log_once = False
+        if not hasattr(self, "_output_ab_clip_only"):
+            self._output_ab_clip_only = False
+        if not hasattr(self, "_output_ab_clip_only_reason"):
+            self._output_ab_clip_only_reason = ""
+        if not hasattr(self, "_output_ab_clip_only_warned"):
+            self._output_ab_clip_only_warned = False
 
     def _resolve_master_dtype_for_io(self: Self, t: torch.Tensor) -> torch.dtype:
         pref = str(os.environ.get("ENN_SCALER_MASTER_DTYPE", "") or "").strip().lower()
@@ -2865,10 +2874,17 @@ class Scaler(nn.Module):
                         self.y_out_clip_low.resize_(lo2.shape).copy_(lo2)
                         self.y_out_clip_high.resize_(hi2.shape).copy_(hi2)
 
+    def _reset_output_ab_clip_only_state(self: Self) -> None:
+        with contextlib.suppress(Exception):
+            self._output_ab_clip_only = False
+            self._output_ab_clip_only_reason = ""
+            self._output_ab_clip_only_warned = False
+
     @torch.no_grad()
     def _restore_calib_state_after_load(self: Self) -> None:
+        self._reset_output_ab_clip_only_state()
         if env_bool("ENN_DISABLE_OUTPUT_AB", default=False):
-            self.output_ab_enabled = False
+            self.disable_output_ab()
 
         mode = str(getattr(self, "calib_mode", "none") or "none").strip().lower()
         if mode not in {"none", "affine", "piecewise", "ab"}:
@@ -2909,7 +2925,7 @@ class Scaler(nn.Module):
             self.calib_mode = inferred
 
         if env_bool("ENN_DISABLE_OUTPUT_AB", default=False):
-            self.output_ab_enabled = False
+            self.disable_output_ab()
             return
 
         enable_ab = False
@@ -3029,18 +3045,33 @@ class Scaler(nn.Module):
 
                         if disable_reason:
                             enable_ab = False
-                            if env_bool("ENN_OUTPUT_AB_SANITY_LOG", default=True):
-                                extra = f" ratio_error={ratio_error}" if ratio_error else ""
-                                _LOGGER.warning(
-                                    "[ENN][scaler] disabling output_ab after load (suspicious params): "
-                                    "bias_abs_max=%.6g(th=%.6g) ratio_max=%.6g(th=%.6g) bad_ratio_frac=%.4f span[min/max]=%.6g/%.6g. "
-                                    "neg_span_frac=%.4f degen_span_frac=%.4f shape_mismatch=%s lens(s=%d,b=%d,lo=%d,hi=%d) "
-                                    "reason=%s%s Set ENN_OUTPUT_AB_SANITY_DISABLE=0 to override.",
-                                    float(b_abs_max), float(b_abs_th), float(ratio_max), float(ratio_th), float(bad_ratio_frac), float(span_min), float(span_max),
-                                    float(neg_span_frac), float(degen_span_frac), str(bool(shape_mismatch)),
-                                    int(len_s), int(len_b), int(len_lo), int(len_hi),
-                                    str(disable_reason), str(extra),
-                                )
+                            if (
+                                str(disable_reason) != "shape_mismatch"
+                                and env_bool("ENN_OUTPUT_AB_SANITY_CLIP_ONLY", default=True)
+                            ):
+                                self._output_ab_clip_only = True
+                                self._output_ab_clip_only_reason = str(disable_reason)
+                                if env_bool("ENN_OUTPUT_AB_SANITY_LOG", default=True):
+                                    extra = f" ratio_error={ratio_error}" if ratio_error else ""
+                                    _LOGGER.warning(
+                                        "[ENN][scaler] output_ab params suspicious; enabling CLIP-ONLY fallback (scale/bias ignored): "
+                                        "bias_abs_max=%.6g(th=%.6g) ratio_max=%.6g(th=%.6g) bad_ratio_frac=%.4f span[min/max]=%.6g/%.6g "
+                                        "reason=%s%s",
+                                        float(b_abs_max), float(b_abs_th), float(ratio_max), float(ratio_th),
+                                        float(bad_ratio_frac), float(span_min), float(span_max),
+                                        str(disable_reason), str(extra),
+                                    )
+                            else:
+                                if env_bool("ENN_OUTPUT_AB_SANITY_LOG", default=True):
+                                    extra = f" ratio_error={ratio_error}" if ratio_error else ""
+                                    _LOGGER.warning(
+                                        "[ENN][scaler] disabling output_ab after load (suspicious params): "
+                                        "bias_abs_max=%.6g(th=%.6g) ratio_max=%.6g(th=%.6g) bad_ratio_frac=%.4f span[min/max]=%.6g/%.6g. "
+                                        "reason=%s%s",
+                                        float(b_abs_max), float(b_abs_th), float(ratio_max), float(ratio_th),
+                                        float(bad_ratio_frac), float(span_min), float(span_max),
+                                        str(disable_reason), str(extra),
+                                    )
                             with contextlib.suppress(Exception):
                                 setattr(self, "_output_ab_sanity_reason", str(disable_reason))
                                 setattr(self, "_output_ab_sanity_bias_abs_max", float(b_abs_max))
@@ -3428,10 +3459,17 @@ class Scaler(nn.Module):
                 return self._apply_output_ab(z_raw)
 
     def _apply_output_ab(self: Self, z: torch.Tensor) -> torch.Tensor:
-        if z.numel() == 0 or not bool(getattr(self, "output_ab_enabled", False)):
+        if z.numel() == 0:
             return z
 
-        if env_bool("ENN_OUTPUT_AB_SANITY_RUNTIME_DISABLE", default=True) and (not bool(getattr(self, "_output_ab_runtime_sanity_checked", False))):
+        clip_only = bool(getattr(self, "_output_ab_clip_only", False)) or bool(
+            env_bool("ENN_OUTPUT_AB_CLIP_ONLY", default=False)
+        )
+        enabled = bool(getattr(self, "output_ab_enabled", False))
+        if (not enabled) and (not clip_only):
+            return z
+
+        if enabled and (not clip_only) and env_bool("ENN_OUTPUT_AB_SANITY_RUNTIME_DISABLE", default=True) and (not bool(getattr(self, "_output_ab_runtime_sanity_checked", False))):
             setattr(self, "_output_ab_runtime_sanity_checked", True)
             try:
                 b_abs_th = float(env_float("ENN_OUTPUT_AB_SANITY_BIAS_ABS_MAX", 1000.0))
@@ -3471,9 +3509,12 @@ class Scaler(nn.Module):
         if master_dtype is torch.int64:
             master_dtype = torch.float64
         zz = z.to(dtype=master_dtype)
-        scale = self.y_out_scale.to(device=zz.device, dtype=zz.dtype)
-        bias = self.y_out_bias.to(device=zz.device, dtype=zz.dtype)
-        out = self._apply_affine_no_broadcast(zz, weight=scale, bias=bias)
+
+        out = zz
+        if enabled and (not clip_only):
+            scale = self.y_out_scale.to(device=zz.device, dtype=zz.dtype)
+            bias = self.y_out_bias.to(device=zz.device, dtype=zz.dtype)
+            out = self._apply_affine_no_broadcast(zz, weight=scale, bias=bias)
         lo = self.y_out_clip_low.to(device=out.device, dtype=out.dtype)
         hi = self.y_out_clip_high.to(device=out.device, dtype=out.dtype)
         if out.is_floating_point():
@@ -3481,6 +3522,12 @@ class Scaler(nn.Module):
                 finfo = torch.finfo(out.dtype)
                 lo = torch.where(torch.isfinite(lo), lo, out.new_tensor(float(finfo.min)))
                 hi = torch.where(torch.isfinite(hi), hi, out.new_tensor(float(finfo.max)))
+                clip_eps = float(os.environ.get("ENN_SCALER_OUTPUT_AB_CLIP_EPS", "") or 0.0)
+                if clip_eps < 0.0:
+                    clip_eps = 0.0
+                mask = (hi == lo) if clip_eps == 0.0 else (hi - lo).abs() <= float(clip_eps)
+                lo = torch.where(mask, out.new_tensor(float(finfo.min)), lo)
+                hi = torch.where(mask, out.new_tensor(float(finfo.max)), hi)
         out = torch.minimum(torch.maximum(out, lo), hi)
         if z.is_floating_point() and out.dtype != input_dtype and self._should_restore_input_dtype(input_dtype):
             out = out.to(dtype=input_dtype)
@@ -3489,6 +3536,7 @@ class Scaler(nn.Module):
     @torch.no_grad()
     def disable_output_ab(self: Self) -> None:
         self.output_ab_enabled = False
+        self._reset_output_ab_clip_only_state()
 
     @torch.no_grad()
     def fit_output_ab(
@@ -3504,12 +3552,13 @@ class Scaler(nn.Module):
         scale_clamp: float | None = None,
         enable: bool = True,
     ) -> None:
+        self._reset_output_ab_clip_only_state()
         pm = pred_mean.detach().reshape(-1).to(dtype=torch.float64)
         ps = pred_std.detach().reshape(-1).to(dtype=torch.float64)
         rm = ref_mean.detach().reshape(-1).to(dtype=torch.float64)
         rs = ref_std.detach().reshape(-1).to(dtype=torch.float64)
         if pm.numel() == 0 or ps.numel() == 0 or rm.numel() == 0 or rs.numel() == 0:
-            self.output_ab_enabled = False
+            self.disable_output_ab()
             return
         eps_f = float(self.eps if eps is None else eps)
         eps_f = max(eps_f, 1e-9)
@@ -3574,6 +3623,7 @@ class Scaler(nn.Module):
         self.y_out_clip_low.resize_(lo.shape).copy_(lo)
         self.y_out_clip_high.resize_(hi.shape).copy_(hi)
         self.output_ab_enabled = bool(enable)
+        self._reset_output_ab_clip_only_state()
         if self.output_ab_enabled and self.calib_mode == "none":
             self.calib_mode = "ab"
 
