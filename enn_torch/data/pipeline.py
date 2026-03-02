@@ -109,15 +109,25 @@ def get_batch_length(loader: object) -> int:
     if alt > 0:
         return alt
     if hasattr(loader, "state_dict") and hasattr(loader, "load_state_dict"):
+        state_dict = object()
         try:
             state_dict = loader.state_dict()  # type: ignore[attr-defined]
-            count = 0
-            for _ in loader:  # type: ignore[assignment]
-                count += 1
-            loader.load_state_dict(state_dict)  # type: ignore[attr-defined]
-            return int(count)
         except Exception:
             return 0
+        count = 0
+        iter_failed = False
+        try:
+            for _ in loader:  # type: ignore[assignment]
+                count += 1
+        except Exception:
+            iter_failed = True
+        restored = False
+        with contextlib.suppress(Exception):
+            loader.load_state_dict(state_dict)  # type: ignore[attr-defined]
+            restored = True
+        if not restored or iter_failed:
+            return 0
+        return int(count)
     return 0
 
 
