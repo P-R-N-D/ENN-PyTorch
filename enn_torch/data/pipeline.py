@@ -473,7 +473,7 @@ def _set_batch_interval(
         _lws = max(1, int(getattr(_wp, "local_world_size", 1) or 1))
     else:
         try:
-            _wp = WorkerPolicy.optimize()
+            _wp = WorkerPolicy.optimize(device=_dev)
             _max_conc = max(1, int(getattr(_wp, "max_concurrency", 1) or 1))
             _streams = max(1, int(getattr(_wp, "h2d_streams", 1) or 1))
             _lws = max(1, int(getattr(_wp, "local_world_size", 1) or 1))
@@ -1195,7 +1195,7 @@ def fetch(
     wp = (
         worker_policy
         if isinstance(worker_policy, WorkerPolicy)
-        else WorkerPolicy.optimize()
+        else WorkerPolicy.optimize(device=device_obj)
     )
     wp.set_thread_setting()
     io_workers = int(getattr(wp, "num_workers", 0) or 0)
@@ -1486,7 +1486,7 @@ class Session:
             if not isinstance(self.device, torch.device)
             else self.device
         )
-        wp = self.worker_policy or WorkerPolicy.optimize()
+        wp = self.worker_policy or WorkerPolicy.optimize(device=dev)
         wp = self.loader_policy.apply_soft_limits(wp, dev)
         self.worker_policy = wp
         dl = fetch(
