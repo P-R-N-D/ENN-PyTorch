@@ -8,22 +8,38 @@ import sys
 import time
 from typing import Any, Dict
 
-from .datatypes import env_bool, env_first
+from .datatypes import env_first, parse_bool
 
 _DIAG_SEEN: set[str] = set()
 
 
+_DIAG_KEYS = (
+    "ENN_DIAG_BATCH_SIZES",
+    "ENN_DIAG_BATCHING",
+    "ENN_DIAG_BATCH",
+)
+
+
+def diag_level() -> int:
+    raw = env_first(_DIAG_KEYS, default=None)
+    if raw is None:
+        return 0
+
+    v = parse_bool(raw)
+    if v is not None:
+        return 1 if bool(v) else 0
+
+    s = str(raw).strip()
+    if not s:
+        return 0
+    try:
+        return int(s, 10)
+    except Exception:
+        return 1
+
+
 def diag_enabled() -> bool:
-    return bool(
-        env_bool(
-            (
-                "ENN_DIAG_BATCH_SIZES",
-                "ENN_DIAG_BATCHING",
-                "ENN_DIAG_BATCH",
-            ),
-            default=False,
-        )
-    )
+    return bool(diag_level() > 0)
 
 
 def diag_dir() -> str:
