@@ -26,10 +26,12 @@ import torch.nn.functional as F
 from ..core.concurrency import Mutex, is_gil_enabled
 from ..core.config import ModelConfig
 from ..core.datatypes import env_bool, env_first_int, env_int, env_str, env_float
+from ..runtime.autobatch import diag_emit
 from ..core.policies import LossWeightPolicy, PrecisionPolicy
 from ..core.precision import AutocastState, StatefulAutocast, StatelessAutocast
 from ..core.system import (
     CPU,
+    Memory,
     empty_device_cache,
     get_device,
     get_runtime_cfg,
@@ -4568,10 +4570,15 @@ class Model(nn.Module):
                     self._eager_perceiver_self_blocks = eager_items
             return compiled_any
 
-        staged_heavy = bool(
-            nogil_opt
-            or compile_mode_canonical
+        staged_heavy_default = bool(
+            compile_mode_canonical
             in {"max-autotune", "max-autotune-no-cudagraphs"}
+        )
+        staged_heavy = bool(
+            env_bool(
+                ("ENN_COMPILE_STAGE_HEAVY", "ENN_PERCEIVER_STAGE_HEAVY"),
+                default=staged_heavy_default,
+            )
         )
         compiled_decode = False
         compiled_perceiver = False
@@ -4785,9 +4792,14 @@ class Model(nn.Module):
 
             perceiver = getattr(self.fuser, "perceiver", None)
             if isinstance(perceiver, nn.Module):
+                staged_heavy_default = bool(
+                    target_mode in {"max-autotune", "max-autotune-no-cudagraphs"}
+                )
                 staged_heavy = bool(
-                    CPU.is_optimized_for_no_gil()
-                    or target_mode in {"max-autotune", "max-autotune-no-cudagraphs"}
+                    env_bool(
+                        ("ENN_COMPILE_STAGE_HEAVY", "ENN_PERCEIVER_STAGE_HEAVY"),
+                        default=staged_heavy_default,
+                    )
                 )
                 compiled_any = False
                 if staged_heavy:
@@ -5522,9 +5534,11 @@ class Model(nn.Module):
         b = int(X.shape[0] if X.ndim > 0 else 1)
         hard_max = int(env_int("ENN_MICROBATCH_MAX", 64))
         hard_max = max(1, min(hard_max, b))
-        per_sample = int(
+        per_sample_env = int(
             env_first_int(
                 (
+                    "ENN_MICROBATCH_PER_SAMPLE_MEM_BYTES",
+                    "ENN_MICROBATCH_BYTES_PER_SAMPLE",
                     "ENN_PER_SAMPLE_MEM_BYTES",
                     "ENN_DEVICE_BYTES_PER_SAMPLE",
                 ),
@@ -5532,15 +5546,42 @@ class Model(nn.Module):
             )
             or 0
         )
-        if per_sample <= 0:
-            one = X[:1]
-            bytes_per_sample = int(one.nelement()) * int(one.element_size())
-            per_sample = int(bytes_per_sample * 8)
-        per_sample_raw = int(per_sample)
+        one = X[:1]
+        bytes_per_sample_in = int(one.nelement()) * int(one.element_size())
+        if per_sample_env > 0:
+            per_sample_raw = int(per_sample_env)
+            per_sample_src = "env"
+        else:
+            per_sample_raw = int(bytes_per_sample_in * 8)
+            per_sample_src = "input_bytes*8"
+
         stage_div = max(1, int(env_int("ENN_MICROBATCH_STAGE_DIV", 4)))
-        per_sample = max(1, int(per_sample // stage_div))
+        per_sample_used = max(1, int(per_sample_raw // stage_div))
+
+        clamp_applied = False
+        clamp_reason = ""
+        dev_free = None
+        target_min_mb = 1
+        if CPU.is_optimized_for_no_gil() and device.type in {"cuda", "xpu", "mps"}:
+            with contextlib.suppress(Exception):
+                dev_free = int(Memory.mem_get_info(device)[0])
+            target_min_mb = int(env_int("ENN_MICROBATCH_TARGET_MIN", 0) or 0)
+            if target_min_mb <= 0:
+                target_min_mb = 4
+            target_min_mb = max(1, min(int(target_min_mb), int(hard_max)))
+            if (
+                dev_free is not None
+                and int(dev_free) > 0
+                and int(target_min_mb) > 1
+            ):
+                cap = int((int(dev_free) * 0.35) // max(1, int(target_min_mb)))
+                if cap > 0 and int(per_sample_used) > int(cap):
+                    per_sample_used = int(cap)
+                    clamp_applied = True
+                    clamp_reason = f"cap_for_min_mb={int(target_min_mb)}"
+
         mb_size = _autofit_microbatch(
-            device=device, hard_max=hard_max, per_sample_bytes=per_sample
+            device=device, hard_max=hard_max, per_sample_bytes=per_sample_used
         )
 
         global _ENN_DIAG_AUTOMICROBATCH_LOGGED
@@ -5549,17 +5590,24 @@ class Model(nn.Module):
             default=False,
         ):
             _ENN_DIAG_AUTOMICROBATCH_LOGGED = True
-            with contextlib.suppress(Exception):
-                _LOGGER.info(
-                    "[ENN][diag] automicrobatch: device=%s input_b=%d hard_max=%d stage_div=%d per_sample_raw=%d per_sample_used=%d -> mb=%d",
-                    str(device),
-                    int(b),
-                    int(hard_max),
-                    int(stage_div),
-                    int(per_sample_raw),
-                    int(per_sample),
-                    int(mb_size),
-                )
+            diag_emit(
+                "automicrobatch",
+                {
+                    "device": str(device),
+                    "input_b": int(b),
+                    "hard_max": int(hard_max),
+                    "bytes_per_sample_in": int(bytes_per_sample_in),
+                    "per_sample_raw": int(per_sample_raw),
+                    "per_sample_src": str(per_sample_src),
+                    "stage_div": int(stage_div),
+                    "per_sample_used": int(per_sample_used),
+                    "dev_free": dev_free,
+                    "target_min_mb": int(target_min_mb),
+                    "clamp_applied": bool(clamp_applied),
+                    "clamp_reason": str(clamp_reason),
+                    "mb": int(mb_size),
+                },
+            )
 
         return int(mb_size)
 

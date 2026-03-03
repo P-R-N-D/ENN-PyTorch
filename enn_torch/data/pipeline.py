@@ -43,6 +43,7 @@ from ..core.datatypes import (
     env_first_int,
     normalize_underflow_action,
 )
+from ..runtime.autobatch import diag_emit
 from ..core.policies import BatchPolicy, LoaderPolicy, WorkerPolicy
 from ..core.system import (
     Memory,
@@ -721,32 +722,31 @@ def _set_batch_interval(
     )
     if (diag > 0) and (not _ENN_DIAG_DATALOADER_LOGGED):
         _ENN_DIAG_DATALOADER_LOGGED = True
-        try:
-            logger.info(
-                "[ENN][diag] dataloader: device=%s no_gil=%s B=%d B_cap=%d med=%.3fms per_sample=%d(%s) host_sample_bytes=%d dev_free=%s dev_total=%s host_free=%s host_total=%s pf=%d nw=%d prebatch=%d streams=%d max_conc=%d lws=%d dev_cap=%s host_cap=%s",
-                str(_dev),
-                bool(no_gil),
-                int(B),
-                int(B_cap),
-                float(med),
-                int(per_sample),
-                str(per_sample_src),
-                int(sbytes),
-                str(dev_free),
-                str(dev_total),
-                str(host_free),
-                str(host_total),
-                int(prefetch_factor),
-                int(num_workers),
-                int(prebatch),
-                int(_streams),
-                int(_max_conc),
-                int(_lws),
-                str(tpl.device_budget_max_bytes),
-                str(tpl.host_budget_max_bytes),
-            )
-        except Exception:
-            pass
+        diag_emit(
+            "dataloader.batch",
+            {
+                "device": str(_dev),
+                "no_gil": bool(no_gil),
+                "B": int(B),
+                "B_cap": int(B_cap),
+                "med_ms": float(med),
+                "per_sample_bytes": int(per_sample),
+                "per_sample_src": str(per_sample_src),
+                "host_sample_bytes": int(sbytes),
+                "dev_free": dev_free,
+                "dev_total": dev_total,
+                "host_free": host_free,
+                "host_total": host_total,
+                "prefetch_factor": int(prefetch_factor),
+                "num_workers": int(num_workers),
+                "prebatch": int(prebatch),
+                "streams": int(_streams),
+                "max_concurrency": int(_max_conc),
+                "local_world_size": int(_lws),
+                "device_cap_bytes": tpl.device_budget_max_bytes,
+                "host_cap_bytes": tpl.host_budget_max_bytes,
+            },
+        )
     if min_batch_env > 0:
         B = min(int(B_cap), max(int(B), int(min_batch_env)))
     return (max(1, int(B)), float(med))
