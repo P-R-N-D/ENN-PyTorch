@@ -13,6 +13,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from ..core.compat import StochasticDepth
 from ..core.datatypes import env_bool, env_int
+from ..core.diag import diag_emit
 from ..runtime.distributed import _from_hsdp_module
 from .activations import GeGLU
 from .graph import coerce_checkpoint, is_checkpoint, is_export_or_trace, is_symbolic, canonicalize_compile_mode, torch_compiler_disable
@@ -176,18 +177,19 @@ def _autofit_microbatch(
         default=False,
     ):
         _ENN_DIAG_MICROBATCH_LOGGED = True
-        with contextlib.suppress(Exception):
-            _LOGGER.info(
-                "[ENN][diag] microbatch: device=%s hard_max=%d per_sample_bytes=%d host_free=%s dev_free=%s eff=%s use_host_limit=%s -> mb=%d",
-                str(device),
-                int(hard_max),
-                int(per_sample_bytes),
-                str(host_free),
-                str(dev_free),
-                str(eff),
-                bool(use_host_limit),
-                int(mb),
-            )
+        diag_emit(
+            "microbatch.autofit",
+            {
+                "device": str(device),
+                "hard_max": int(hard_max),
+                "per_sample_bytes": int(per_sample_bytes),
+                "host_free": host_free,
+                "dev_free": dev_free,
+                "eff": eff,
+                "use_host_limit": bool(use_host_limit),
+                "mb": int(mb),
+            },
+        )
 
     return int(mb)
 

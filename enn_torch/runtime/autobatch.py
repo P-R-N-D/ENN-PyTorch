@@ -9,6 +9,7 @@ from typing import Any, Dict
 import torch
 from ..core.concurrency import Mutex
 from ..core.datatypes import env_bool, env_float, env_int
+from ..core.diag import diag_emit
 from ..core.precision import StatelessAutocast
 from ..core.system import (
     CPU,
@@ -220,149 +221,122 @@ class BatchScaler:
             N = 0
         if N <= 0:
             return
-        B0 = max(1, min(int(max_probe_batch), N))
+        B_max = max(1, min(int(max_probe_batch), N))
+        B_small = max(1, min(max(2, int(B_max // 2)), N))
+        if int(B_small) >= int(B_max):
+            B_small = max(1, min(max(1, int(B_max) - 1), N))
 
-        try:
-            base_alloc = allocated_accelerator_memory(device)
-            if base_alloc is None:
-                return
+        def _measure(B: int, *, warmup: bool) -> dict[str, int | bool | None]:
+            B = max(1, min(int(B), N))
+            base0 = allocated_accelerator_memory(device)
+            if base0 is None:
+                return {"B": int(B), "ok": False}
+
             flush_accelerator_memory_stats(device)
-            batch = ds.get(0, B0)
+            batch = ds.get(0, B)
 
             forward_ran = False
-            base_alloc_meas = int(base_alloc)
-            base_includes_inputs = False
+            base_meas = int(base0)
             input_bytes = 0
             training_mode = bool(getattr(model, "training", False))
-            meta = (
-                dataset
-                if isinstance(dataset, Dataset)
-                else Dataset.for_device(device)
-            )
 
             try:
                 from ..nn.graph import inference_mode
 
-                feats, labels, *_rest = meta.preprocess(
-                    batch, return_keys=False
-                )
+                feats, labels, *_rest = meta.preprocess(batch, return_keys=False)
                 X = to_torch_tensor(feats)
                 X = torch.atleast_2d(X)
-                if X.dim() == 2 and int(X.shape[1]) == int(
-                    getattr(ops, "in_dim", X.shape[1])
-                ):
-                    X = X.to(
+                if not (X.dim() == 2 and int(X.shape[1]) == int(getattr(ops, "in_dim", X.shape[1]))):
+                    return {"B": int(B), "ok": False}
+
+                X = X.to(device=device, non_blocking=is_pin_supported(device.type))
+
+                if with_backward:
+                    with contextlib.suppress(Exception):
+                        model.train()
+
+                Y_flat = None
+                if with_backward and labels is not None:
+                    Y = to_torch_tensor(labels)
+                    Y = torch.atleast_2d(Y).to(
                         device=device,
                         non_blocking=is_pin_supported(device.type),
                     )
+                    Y_flat = Y.reshape(Y.shape[0], -1)
+
+                with contextlib.suppress(Exception):
+                    input_bytes = int(X.nelement()) * int(X.element_size())
+                    if isinstance(Y_flat, torch.Tensor):
+                        input_bytes += int(Y_flat.nelement()) * int(Y_flat.element_size())
+
+                def _run_once() -> bool:
+                    if with_backward:
+                        with StatelessAutocast.float(device):
+                            y_hat, loss_val = model(
+                                X,
+                                labels_flat=Y_flat,
+                                global_loss=global_loss,
+                                local_loss=local_loss,
+                                loss_weights=loss_weights,
+                                calibrate_output=False,
+                            )
+                        target = None
+                        if isinstance(loss_val, torch.Tensor):
+                            target = loss_val
+                        elif isinstance(y_hat, torch.Tensor):
+                            target = y_hat
+                        if target is None:
+                            return False
+                        loss = target if target.ndim == 0 else target.mean()
+                        loss.backward()
+                        return True
+
+                    with inference_mode(model), StatelessAutocast.float(device):
+                        _ = model(
+                            X,
+                            global_loss=None,
+                            local_loss=None,
+                            loss_weights=None,
+                            calibrate_output=True,
+                            return_loss=False,
+                        )
+                    return True
+
+                if warmup:
                     if with_backward:
                         with contextlib.suppress(Exception):
                             model.train()
-
-                        Y_flat = None
-                        if labels is not None:
-                            Y = to_torch_tensor(labels)
-                            Y = torch.atleast_2d(Y).to(
-                                device=device,
-                                non_blocking=is_pin_supported(device.type),
-                            )
-                            Y_flat = Y.reshape(Y.shape[0], -1)
-
-                        with contextlib.suppress(Exception):
-                            input_bytes = int(X.nelement()) * int(X.element_size())
-                            if isinstance(Y_flat, torch.Tensor):
-                                input_bytes += int(Y_flat.nelement()) * int(
-                                    Y_flat.element_size()
-                                )
-
-                        def _run_fb() -> bool:
-                            with StatelessAutocast.float(device):
-                                y_hat, loss_val = model(
-                                    X,
-                                    labels_flat=Y_flat,
-                                    global_loss=global_loss,
-                                    local_loss=local_loss,
-                                    loss_weights=loss_weights,
-                                    calibrate_output=False,
-                                )
-                            target = None
-                            if isinstance(loss_val, torch.Tensor):
-                                target = loss_val
-                            elif isinstance(y_hat, torch.Tensor):
-                                target = y_hat
-                            if target is None:
-                                return False
-                            loss = target if target.ndim == 0 else target.mean()
-                            loss.backward()
-                            return True
-
-                        warmup_iters = int(
-                            env_int("ENN_MEMPROBE_WARMUP_ITERS_TRAIN", 0) or 0
-                        )
+                        warmup_iters = int(env_int("ENN_MEMPROBE_WARMUP_ITERS_TRAIN", 0) or 0)
                         if warmup_iters <= 0:
-                            warmup_iters = (
-                                2 if CPU.is_optimized_for_no_gil() else 1
-                            )
+                            warmup_iters = 2 if CPU.is_optimized_for_no_gil() else 1
                         warmup_iters = max(1, min(8, int(warmup_iters)))
-                        for _i in range(max(0, int(warmup_iters) - 1)):
-                            if not _run_fb():
-                                break
-                            forward_ran = True
-                            with contextlib.suppress(Exception):
-                                sync_accelerator(device)
+                    else:
+                        warmup_iters = int(env_int("ENN_SERVE_WARMUP_ITERS", 0) or 0)
+                        if warmup_iters <= 0:
+                            warmup_iters = 1
+                        warmup_iters = max(1, min(16, int(warmup_iters)))
+
+                    for _i in range(max(0, int(warmup_iters) - 1)):
+                        if not _run_once():
+                            break
+                        forward_ran = True
+                        with contextlib.suppress(Exception):
+                            sync_accelerator(device)
+                        if with_backward:
                             with contextlib.suppress(Exception):
                                 model.zero_grad(set_to_none=True)
 
-                        with contextlib.suppress(Exception):
-                            sync_accelerator(device)
-                        flush_accelerator_memory_stats(device)
-                        base2 = allocated_accelerator_memory(device)
-                        if base2 is not None:
-                            base_alloc_meas = int(base2)
-                            base_includes_inputs = True
+                with contextlib.suppress(Exception):
+                    sync_accelerator(device)
 
-                        if _run_fb():
-                            forward_ran = True
-                    else:
-                        with inference_mode(model), StatelessAutocast.float(device):
-                            warmup_iters = int(
-                                env_int("ENN_SERVE_WARMUP_ITERS", 0) or 0
-                            )
-                            if (
-                                warmup_iters <= 0
-                                and str(getattr(ops, "mode", "") or "")
-                                in ("predict", "infer")
-                                and env_bool("ENN_MAX_PERF", True)
-                            ):
-                                m_eval = (
-                                    model.module
-                                    if hasattr(model, "module")
-                                    else model
-                                )
-                                compiled = getattr(
-                                    m_eval, "_compiled_submodules", None
-                                )
-                                warmup_iters = (
-                                    3
-                                    if (
-                                        isinstance(compiled, dict)
-                                        and any(
-                                            bool(v) for v in compiled.values()
-                                        )
-                                    )
-                                    else 1
-                                )
-                            warmup_iters = max(1, min(16, int(warmup_iters)))
-                            for _i in range(warmup_iters):
-                                _ = model(
-                                    X,
-                                    global_loss=None,
-                                    local_loss=None,
-                                    loss_weights=None,
-                                    calibrate_output=True,
-                                    return_loss=False,
-                                )
-                        forward_ran = True
+                flush_accelerator_memory_stats(device)
+                base2 = allocated_accelerator_memory(device)
+                if base2 is not None:
+                    base_meas = int(base2)
+
+                if _run_once():
+                    forward_ran = True
+
             except Exception:
                 forward_ran = False
             finally:
@@ -374,72 +348,104 @@ class BatchScaler:
                         model.eval()
 
             if not forward_ran:
-                batch_dev = to_device_recursive(batch, device)
-                touch_tensors(batch_dev)
+                with contextlib.suppress(Exception):
+                    batch_dev = to_device_recursive(batch, device)
+                    touch_tensors(batch_dev)
 
             with contextlib.suppress(Exception):
                 sync_accelerator(device)
 
-            peak_alloc = accelerator_max_allocated_memory(device)
-            if peak_alloc is None:
-                peak_alloc = allocated_accelerator_memory(device)
-            if peak_alloc is None:
-                return
+            peak = accelerator_max_allocated_memory(device)
+            if peak is None:
+                peak = allocated_accelerator_memory(device)
+            if peak is None:
+                return {"B": int(B), "ok": False}
 
-            delta = max(0, int(peak_alloc) - int(base_alloc_meas))
-            if base_includes_inputs and input_bytes > 0:
+            delta = max(0, int(peak) - int(base_meas))
+            if int(input_bytes) > 0:
                 delta += int(input_bytes)
-            if delta <= 0:
-                return
 
-            per_sample = int(delta // max(B0, 1))
-            if floor_bytes > 0:
-                per_sample = max(per_sample, floor_bytes)
-            margin = 1.5 if with_backward else 1.2
-            per_sample = int(per_sample * float(margin))
-            if per_sample <= 0:
-                return
+            return {
+                "B": int(B),
+                "ok": True,
+                "base0": int(base0),
+                "base": int(base_meas),
+                "peak": int(peak),
+                "input_bytes": int(input_bytes),
+                "delta": int(delta),
+            }
 
-            with contextlib.suppress(Exception):
-                if (
-                    torch.distributed.is_available()
-                    and torch.distributed.is_initialized()
-                ):
-                    t = torch.tensor(
-                        [int(per_sample)], device=device, dtype=torch.long
-                    )
-                    torch.distributed.all_reduce(
-                        t, op=torch.distributed.ReduceOp.MAX
-                    )
-                    per_sample = int(t.item())
+        try:
+            meta = (
+                dataset if isinstance(dataset, Dataset) else Dataset.for_device(device)
+            )
+        except Exception:
+            meta = Dataset.for_device(device)
 
-            global _ENN_DIAG_MEMPROBE_LOGGED
-            if (not _ENN_DIAG_MEMPROBE_LOGGED) and env_bool(
-                ("ENN_DIAG_BATCH_SIZES", "ENN_DIAG_BATCHING", "ENN_DIAG_BATCH"),
-                default=False,
-            ):
-                _ENN_DIAG_MEMPROBE_LOGGED = True
-                with contextlib.suppress(Exception):
-                    self._logger.info(
-                        "[ENN][diag] memprobe: with_backward=%s B0=%d peak=%d base0=%d base=%d delta=%d per_sample=%d (floor=%d margin=%.2f)",
-                        bool(with_backward),
-                        int(B0),
-                        int(peak_alloc),
-                        int(base_alloc),
-                        int(base_alloc_meas),
-                        int(delta),
-                        int(per_sample),
-                        int(floor_bytes),
-                        float(margin),
-                    )
-
-            with contextlib.suppress(Exception):
-                Sampler._per_sample_mem_bytes = int(per_sample)
-            with contextlib.suppress(Exception):
-                os.environ["ENN_PER_SAMPLE_MEM_BYTES"] = str(int(per_sample))
-
+        try:
+            m_large = _measure(int(B_max), warmup=True)
+            m_small = _measure(int(B_small), warmup=False) if int(B_small) < int(B_max) else None
         except Exception:
             return
+
+        if not bool(m_large.get("ok")):
+            return
+
+        delta_large = int(m_large.get("delta") or 0)
+        per_sample = 0
+        method = "single"
+        if m_small is not None and bool(m_small.get("ok")):
+            bL = int(m_large.get("B") or B_max)
+            bS = int(m_small.get("B") or B_small)
+            dS = int(m_small.get("delta") or 0)
+            if bL > bS and delta_large >= dS and (delta_large - dS) > 0:
+                per_sample = int((delta_large - dS) // max(1, (bL - bS)))
+                method = "slope"
+
+        if per_sample <= 0:
+            per_sample = int(delta_large // max(1, int(m_large.get("B") or B_max)))
+
+        if floor_bytes > 0:
+            per_sample = max(int(per_sample), int(floor_bytes))
+        margin = 1.5 if with_backward else 1.2
+        per_sample = int(int(per_sample) * float(margin))
+        if per_sample <= 0:
+            return
+
+        with contextlib.suppress(Exception):
+            if torch.distributed.is_available() and torch.distributed.is_initialized():
+                t = torch.tensor([int(per_sample)], device=device, dtype=torch.long)
+                torch.distributed.all_reduce(t, op=torch.distributed.ReduceOp.MAX)
+                per_sample = int(t.item())
+
+        global _ENN_DIAG_MEMPROBE_LOGGED
+        if (not _ENN_DIAG_MEMPROBE_LOGGED) and env_bool(
+            ("ENN_DIAG_BATCH_SIZES", "ENN_DIAG_BATCHING", "ENN_DIAG_BATCH"),
+            default=False,
+        ):
+            _ENN_DIAG_MEMPROBE_LOGGED = True
+            diag_emit(
+                "memprobe",
+                {
+                    "with_backward": bool(with_backward),
+                    "method": str(method),
+                    "B_max": int(B_max),
+                    "B_small": int(B_small),
+                    "m_large": m_large,
+                    "m_small": m_small,
+                    "floor_bytes": int(floor_bytes),
+                    "margin": float(margin),
+                    "per_sample": int(per_sample),
+                },
+            )
+
+        with contextlib.suppress(Exception):
+            Sampler._per_sample_mem_bytes = int(per_sample)
+        with contextlib.suppress(Exception):
+            os.environ["ENN_PER_SAMPLE_MEM_BYTES"] = str(int(per_sample))
+
+        return
+
 
 
 class OOMHandler:
