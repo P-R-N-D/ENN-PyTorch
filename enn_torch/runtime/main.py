@@ -7231,7 +7231,9 @@ def process(*args: Any, **kwargs: Any) -> object:
         default=env_bool("ENN_SANITIZE_NAN_STRICT", default=False),
     )
     try:
-        if ops.mode != "train" and env_bool(
+        cm_hint = os.environ.get("ENN_SERVE_COMPILE_MODE") or ops.cfg_dict.get("compile_mode") or "disabled"
+        cm_hint = str(cm_hint).strip().lower()
+        if ops.mode != "train" and cm_hint not in ("disabled", "eager", "aot-eager") and env_bool(
             ("ENN_PRED_UNIQUE_INDUCTOR_CACHE", "ENN_UNIQUE_INDUCTOR_CACHE"),
             default=True,
         ):
@@ -7876,7 +7878,10 @@ def process(*args: Any, **kwargs: Any) -> object:
             ops.cfg_dict if isinstance(ops.cfg_dict, dict) else ops.cfg_dict
         )
         cfg = replace(cfg, device=device)
-        if env_bool("ENN_MAX_PERF", True):
+        serve_cm = env_str("ENN_SERVE_COMPILE_MODE")
+        if serve_cm:
+            cfg = replace(cfg, compile_mode=str(serve_cm))
+        if env_bool("ENN_MAX_PERF", False):
             cm = canonicalize_compile_mode(getattr(cfg, "compile_mode", None))
             if (
                 cm == "reduce-overhead"
@@ -7884,34 +7889,21 @@ def process(*args: Any, **kwargs: Any) -> object:
             ):
                 with contextlib.suppress(Exception):
                     setattr(cfg, "compile_dynamic", False)
-            if "ENN_COMPILE_DYNAMIC" in os.environ:
-                with contextlib.suppress(Exception):
-                    setattr(
-                        cfg,
-                        "compile_dynamic",
-                        bool(env_bool("ENN_COMPILE_DYNAMIC", False)),
-                    )
-            if cm == "disabled":
-                default_cm = env_str("ENN_SERVE_COMPILE_MODE")
-                if not default_cm:
-                    default_cm = (
-                        "max-autotune"
-                        if getattr(device, "type", None) == "cuda"
-                        else "max-autotune-no-cudagraphs"
-                    )
-                cfg = replace(cfg, compile_mode=str(default_cm))
-                with contextlib.suppress(Exception):
-                    setattr(
-                        cfg,
-                        "compile_dynamic",
-                        bool(env_bool("ENN_COMPILE_DYNAMIC", False)),
-                    )
-                with contextlib.suppress(Exception):
-                    setattr(
-                        cfg,
-                        "compile_cudagraphs",
-                        bool(env_bool("ENN_COMPILE_CUDAGRAPHS", True)),
-                    )
+            if cm not in ("disabled", "eager", "aot-eager"):
+                if "ENN_COMPILE_DYNAMIC" in os.environ:
+                    with contextlib.suppress(Exception):
+                        setattr(
+                            cfg,
+                            "compile_dynamic",
+                            bool(env_bool("ENN_COMPILE_DYNAMIC", False)),
+                        )
+                if "ENN_COMPILE_CUDAGRAPHS" in os.environ:
+                    with contextlib.suppress(Exception):
+                        setattr(
+                            cfg,
+                            "compile_cudagraphs",
+                            bool(env_bool("ENN_COMPILE_CUDAGRAPHS", True)),
+                        )
         if not ops.model_ckpt_dir:
             raise RuntimeError(
                 "predict/infer requires model_ckpt_dir (checkpoint directory). Set RuntimeConfig.model_ckpt_dir to a directory produced by train()."

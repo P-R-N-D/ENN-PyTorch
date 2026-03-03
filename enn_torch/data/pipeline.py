@@ -34,7 +34,7 @@ from typing import (
 
 import torch
 from . import collate
-from ..core.concurrency import Disposable, Mutex, new_affinity
+from ..core.concurrency import Disposable, Mutex, new_affinity, is_free_threading_build, is_gil_enabled
 from ..core.datatypes import (
     PathLike,
     default_underflow_action,
@@ -431,6 +431,17 @@ def _set_batch_interval(
             setattr(_ds, "_S_sample_bytes", int(sbytes))
     if sbytes <= 0:
         return (max(1, min(256, len(_ds))), 0.0)
+    is_cuda = bool(getattr(_dev, "type", None) == "cuda")
+    no_gil = bool(is_free_threading_build() and (not is_gil_enabled()))
+    if is_cuda and no_gil:
+        _tmin_ms = env_first_float(
+            ("ENN_H2D_TMIN_MS_NO_GIL", "ENN_H2D_TMIN_NO_GIL"),
+            default=max(1.0, float(_tmin_ms)),
+        )
+        _tmax_ms = env_first_float(
+            ("ENN_H2D_TMAX_MS_NO_GIL", "ENN_H2D_TMAX_NO_GIL"),
+            default=max(4.5, float(_tmax_ms)),
+        )
     B_cap = 1 << 16
     max_batch_env = int(
         env_first_int(("ENN_MAX_BATCH_SIZE", "ENN_MAX_BATCH"), default=0) or 0
@@ -684,6 +695,19 @@ def _set_batch_interval(
         if med_next <= 0.0:
             break
         B, med = B_next, med_next
+    min_batch_env = int(
+        env_first_int(("ENN_MIN_BATCH_SIZE", "ENN_MIN_BATCH"), default=0) or 0
+    )
+    if min_batch_env <= 0 and is_cuda and no_gil:
+        min_batch_env = int(
+            env_first_int(
+                ("ENN_MIN_BATCH_SIZE_NO_GIL", "ENN_MIN_BATCH_NO_GIL"),
+                default=8,
+            )
+            or 0
+        )
+    if min_batch_env > 0:
+        B = min(int(B_cap), max(int(B), int(min_batch_env)))
     return (max(1, int(B)), float(med))
 
 
