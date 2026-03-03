@@ -4398,8 +4398,8 @@ class Model(nn.Module):
             nogil_opt = bool(CPU.is_optimized_for_no_gil())
         if nogil_opt and compile_enabled:
             _LOGGER.info(
-                "No-GIL optimized mode detected; using conservative torch.compile defaults "
-                "(disable cudagraphs and prefer staged compilation for heavy submodules)"
+                "No-GIL optimized mode detected; using torch.compile defaults tuned for throughput "
+                "(cudagraphs enabled unless you request otherwise)"
             )
         if compile_requested and not compile_available:
             _LOGGER.warning(
@@ -4413,9 +4413,7 @@ class Model(nn.Module):
                 compile_mode_canonical == "reduce-overhead",
             )
         )
-        compile_cudagraphs_default = (
-            not bool(nogil_opt)
-        ) and compile_mode_canonical not in {
+        compile_cudagraphs_default = compile_mode_canonical not in {
             "aot-eager",
             "max-autotune-no-cudagraphs",
         }
