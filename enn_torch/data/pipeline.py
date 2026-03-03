@@ -45,6 +45,7 @@ from ..core.datatypes import (
 )
 from ..core.policies import BatchPolicy, LoaderPolicy, WorkerPolicy
 from ..core.system import (
+    CPU,
     Memory,
     accelerator,
     cuda_compute_capability,
@@ -70,6 +71,18 @@ SourceType = Literal["memmap"]
 TExtra = TypeVar("TExtra")
 TMerge = TypeVar("TMerge")
 logger = logging.getLogger(__name__)
+
+
+def is_free_threaded_build() -> bool:
+    with contextlib.suppress(Exception):
+        return bool(CPU.is_free_threaded_build())
+    return False
+
+
+def is_no_gil_build() -> bool:
+    with contextlib.suppress(Exception):
+        return bool(CPU.is_no_gil_enforced())
+    return False
 
 
 def get_batch_length(loader: object) -> int:
