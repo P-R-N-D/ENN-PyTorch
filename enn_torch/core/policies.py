@@ -366,13 +366,13 @@ class WorkerPolicy:
         if env_pre:
             with contextlib.suppress(Exception):
                 prebatch = max(1, int(env_pre))
-        elif _nogil:
+        elif _nogil and (not is_accel):
             prebatch = 2
         env_pf = env_str("ENN_PREFETCH_FACTOR")
         if env_pf:
             with contextlib.suppress(Exception):
                 prefetch_factor = max(1, int(env_pf))
-        elif _nogil:
+        elif _nogil and (not is_accel):
             prefetch_factor = 2
         prebatch = max(1, int(prebatch))
         prefetch_factor = max(1, int(prefetch_factor))
