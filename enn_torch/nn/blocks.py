@@ -18,6 +18,7 @@ from .activations import GeGLU
 from .graph import coerce_checkpoint, is_checkpoint, is_export_or_trace, is_symbolic, canonicalize_compile_mode, torch_compiler_disable
 from .layers import CrossAttention, DilatedAttention, LatentAttention, Retention, norm_layer
 _LOGGER = logging.getLogger(__name__)
+_ENN_DIAG_MICROBATCH_LOGGED = False
 _PRESET_ALIASES: dict[str, str] = {
     "ss": "spatial",
     "spatial": "spatial",
@@ -144,20 +145,51 @@ def _autofit_microbatch(
 
     try:
         host_free = int(_Mem.available())
-    except:
+    except Exception:
         host_free = None
     dev_free = None
     if device.type in {"cuda", "xpu", "mps"}:
         with contextlib.suppress(Exception):
             dev_free = int(_Mem.mem_get_info(device)[0])
-    eff = (
-        min(host_free, dev_free)
-        if (host_free and dev_free)
-        else (dev_free or host_free)
+    use_host_limit = env_bool(
+        ("ENN_MICROBATCH_USE_HOST_LIMIT", "ENN_MICROBATCH_LIMIT_BY_HOST"),
+        default=False,
     )
+    if device.type in {"cuda", "xpu", "mps"} and (not use_host_limit):
+        eff = dev_free or host_free
+    else:
+        eff = (
+            min(host_free, dev_free)
+            if (host_free and dev_free)
+            else (dev_free or host_free)
+        )
     if not eff or eff <= 0:
-        return hard_max
-    return max(1, min(hard_max, int((eff * 0.35) // max(per_sample_bytes, 1))))
+        mb = int(hard_max)
+    else:
+        mb = max(
+            1, min(hard_max, int((int(eff) * 0.35) // max(per_sample_bytes, 1)))
+        )
+
+    global _ENN_DIAG_MICROBATCH_LOGGED
+    if (not _ENN_DIAG_MICROBATCH_LOGGED) and env_bool(
+        ("ENN_DIAG_BATCH_SIZES", "ENN_DIAG_BATCHING", "ENN_DIAG_BATCH"),
+        default=False,
+    ):
+        _ENN_DIAG_MICROBATCH_LOGGED = True
+        with contextlib.suppress(Exception):
+            _LOGGER.info(
+                "[ENN][diag] microbatch: device=%s hard_max=%d per_sample_bytes=%d host_free=%s dev_free=%s eff=%s use_host_limit=%s -> mb=%d",
+                str(device),
+                int(hard_max),
+                int(per_sample_bytes),
+                str(host_free),
+                str(dev_free),
+                str(eff),
+                bool(use_host_limit),
+                int(mb),
+            )
+
+    return int(mb)
 
 
 _ENN_COERCE_NONFINITE_DUMPED: int = 0

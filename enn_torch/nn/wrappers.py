@@ -68,6 +68,7 @@ from .graph import (
 from .layers import Recorder, Scaler, SigmoidGate
 from tensordict import TensorDictBase
 _LOGGER = logging.getLogger(__name__)
+_ENN_DIAG_AUTOMICROBATCH_LOGGED = False
 
 
 def _is_process_group(obj: object) -> bool:
@@ -5535,11 +5536,31 @@ class Model(nn.Module):
             one = X[:1]
             bytes_per_sample = int(one.nelement()) * int(one.element_size())
             per_sample = int(bytes_per_sample * 8)
+        per_sample_raw = int(per_sample)
         stage_div = max(1, int(env_int("ENN_MICROBATCH_STAGE_DIV", 4)))
         per_sample = max(1, int(per_sample // stage_div))
         mb_size = _autofit_microbatch(
             device=device, hard_max=hard_max, per_sample_bytes=per_sample
         )
+
+        global _ENN_DIAG_AUTOMICROBATCH_LOGGED
+        if (not _ENN_DIAG_AUTOMICROBATCH_LOGGED) and env_bool(
+            ("ENN_DIAG_BATCH_SIZES", "ENN_DIAG_BATCHING", "ENN_DIAG_BATCH"),
+            default=False,
+        ):
+            _ENN_DIAG_AUTOMICROBATCH_LOGGED = True
+            with contextlib.suppress(Exception):
+                _LOGGER.info(
+                    "[ENN][diag] automicrobatch: device=%s input_b=%d hard_max=%d stage_div=%d per_sample_raw=%d per_sample_used=%d -> mb=%d",
+                    str(device),
+                    int(b),
+                    int(hard_max),
+                    int(stage_div),
+                    int(per_sample_raw),
+                    int(per_sample),
+                    int(mb_size),
+                )
+
         return int(mb_size)
 
     def _get_cg_static_in_buf(

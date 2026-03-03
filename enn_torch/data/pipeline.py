@@ -70,6 +70,7 @@ SourceType = Literal["memmap"]
 TExtra = TypeVar("TExtra")
 TMerge = TypeVar("TMerge")
 logger = logging.getLogger(__name__)
+_ENN_DIAG_DATALOADER_LOGGED = False
 
 
 def get_batch_length(loader: object) -> int:
@@ -447,6 +448,7 @@ def _set_batch_interval(
         env_first_int(("ENN_MAX_BATCH_SIZE", "ENN_MAX_BATCH"), default=0) or 0
     )
     per_sample = int(getattr(_ds, "_per_sample_mem_bytes", 0) or 0)
+    per_sample_src = "ds._per_sample_mem_bytes" if per_sample > 0 else ""
     if per_sample <= 0:
         per_sample = int(
             env_first_int(
@@ -458,8 +460,11 @@ def _set_batch_interval(
             )
             or 0
         )
+        if per_sample > 0:
+            per_sample_src = "env.ENN_PER_SAMPLE_MEM_BYTES"
     if per_sample <= 0:
         per_sample = sbytes
+        per_sample_src = "sample_bytes"
     if worker_policy is not None:
         _wp = worker_policy
         _max_conc = max(1, int(getattr(_wp, "max_concurrency", 1) or 1))
@@ -706,6 +711,42 @@ def _set_batch_interval(
             )
             or 0
         )
+    global _ENN_DIAG_DATALOADER_LOGGED
+    diag = int(
+        env_first_int(
+            ("ENN_DIAG_BATCH_SIZES", "ENN_DIAG_BATCHING", "ENN_DIAG_BATCH"),
+            default=0,
+        )
+        or 0
+    )
+    if (diag > 0) and (not _ENN_DIAG_DATALOADER_LOGGED):
+        _ENN_DIAG_DATALOADER_LOGGED = True
+        try:
+            logger.info(
+                "[ENN][diag] dataloader: device=%s no_gil=%s B=%d B_cap=%d med=%.3fms per_sample=%d(%s) host_sample_bytes=%d dev_free=%s dev_total=%s host_free=%s host_total=%s pf=%d nw=%d prebatch=%d streams=%d max_conc=%d lws=%d dev_cap=%s host_cap=%s",
+                str(_dev),
+                bool(no_gil),
+                int(B),
+                int(B_cap),
+                float(med),
+                int(per_sample),
+                str(per_sample_src),
+                int(sbytes),
+                str(dev_free),
+                str(dev_total),
+                str(host_free),
+                str(host_total),
+                int(prefetch_factor),
+                int(num_workers),
+                int(prebatch),
+                int(_streams),
+                int(_max_conc),
+                int(_lws),
+                str(tpl.device_budget_max_bytes),
+                str(tpl.host_budget_max_bytes),
+            )
+        except Exception:
+            pass
     if min_batch_env > 0:
         B = min(int(B_cap), max(int(B), int(min_batch_env)))
     return (max(1, int(B)), float(med))
