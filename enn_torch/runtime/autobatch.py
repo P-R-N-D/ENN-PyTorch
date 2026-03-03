@@ -11,6 +11,7 @@ from ..core.concurrency import Mutex
 from ..core.datatypes import env_bool, env_float, env_int
 from ..core.precision import StatelessAutocast
 from ..core.system import (
+    CPU,
     accelerator_max_allocated_memory,
     allocated_accelerator_memory,
     flush_accelerator_memory_stats,
@@ -20,6 +21,7 @@ from ..core.system import (
 from ..core.tensor import to_device_recursive, to_torch_tensor, touch_tensors
 from ..data.pipeline import Dataset
 _LOGGER = logging.getLogger(__name__)
+_ENN_DIAG_MEMPROBE_LOGGED = False
 
 
 def _get_source_path(obj: object) -> str:
@@ -228,6 +230,9 @@ class BatchScaler:
             batch = ds.get(0, B0)
 
             forward_ran = False
+            base_alloc_meas = int(base_alloc)
+            base_includes_inputs = False
+            input_bytes = 0
             training_mode = bool(getattr(model, "training", False))
             meta = (
                 dataset
@@ -253,33 +258,70 @@ class BatchScaler:
                     if with_backward:
                         with contextlib.suppress(Exception):
                             model.train()
-                        with StatelessAutocast.float(device):
-                            Y_flat = None
-                            if labels is not None:
-                                Y = to_torch_tensor(labels)
-                                Y = torch.atleast_2d(Y).to(
-                                    device=device,
-                                    non_blocking=is_pin_supported(device.type),
+
+                        Y_flat = None
+                        if labels is not None:
+                            Y = to_torch_tensor(labels)
+                            Y = torch.atleast_2d(Y).to(
+                                device=device,
+                                non_blocking=is_pin_supported(device.type),
+                            )
+                            Y_flat = Y.reshape(Y.shape[0], -1)
+
+                        with contextlib.suppress(Exception):
+                            input_bytes = int(X.nelement()) * int(X.element_size())
+                            if isinstance(Y_flat, torch.Tensor):
+                                input_bytes += int(Y_flat.nelement()) * int(
+                                    Y_flat.element_size()
                                 )
-                                Y_flat = Y.reshape(Y.shape[0], -1)
-                            y_hat, loss_val = model(
-                                X,
-                                labels_flat=Y_flat,
-                                global_loss=global_loss,
-                                local_loss=local_loss,
-                                loss_weights=loss_weights,
-                                calibrate_output=False,
-                            )
-                        target = None
-                        if isinstance(loss_val, torch.Tensor):
-                            target = loss_val
-                        elif isinstance(y_hat, torch.Tensor):
-                            target = y_hat
-                        if target is not None:
-                            loss = (
-                                target if target.ndim == 0 else target.mean()
-                            )
+
+                        def _run_fb() -> bool:
+                            with StatelessAutocast.float(device):
+                                y_hat, loss_val = model(
+                                    X,
+                                    labels_flat=Y_flat,
+                                    global_loss=global_loss,
+                                    local_loss=local_loss,
+                                    loss_weights=loss_weights,
+                                    calibrate_output=False,
+                                )
+                            target = None
+                            if isinstance(loss_val, torch.Tensor):
+                                target = loss_val
+                            elif isinstance(y_hat, torch.Tensor):
+                                target = y_hat
+                            if target is None:
+                                return False
+                            loss = target if target.ndim == 0 else target.mean()
                             loss.backward()
+                            return True
+
+                        warmup_iters = int(
+                            env_int("ENN_MEMPROBE_WARMUP_ITERS_TRAIN", 0) or 0
+                        )
+                        if warmup_iters <= 0:
+                            warmup_iters = (
+                                2 if CPU.is_optimized_for_no_gil() else 1
+                            )
+                        warmup_iters = max(1, min(8, int(warmup_iters)))
+                        for _i in range(max(0, int(warmup_iters) - 1)):
+                            if not _run_fb():
+                                break
+                            forward_ran = True
+                            with contextlib.suppress(Exception):
+                                sync_accelerator(device)
+                            with contextlib.suppress(Exception):
+                                model.zero_grad(set_to_none=True)
+
+                        with contextlib.suppress(Exception):
+                            sync_accelerator(device)
+                        flush_accelerator_memory_stats(device)
+                        base2 = allocated_accelerator_memory(device)
+                        if base2 is not None:
+                            base_alloc_meas = int(base2)
+                            base_includes_inputs = True
+
+                        if _run_fb():
                             forward_ran = True
                     else:
                         with inference_mode(model), StatelessAutocast.float(device):
@@ -344,7 +386,9 @@ class BatchScaler:
             if peak_alloc is None:
                 return
 
-            delta = max(0, int(peak_alloc) - int(base_alloc))
+            delta = max(0, int(peak_alloc) - int(base_alloc_meas))
+            if base_includes_inputs and input_bytes > 0:
+                delta += int(input_bytes)
             if delta <= 0:
                 return
 
@@ -368,6 +412,26 @@ class BatchScaler:
                         t, op=torch.distributed.ReduceOp.MAX
                     )
                     per_sample = int(t.item())
+
+            global _ENN_DIAG_MEMPROBE_LOGGED
+            if (not _ENN_DIAG_MEMPROBE_LOGGED) and env_bool(
+                ("ENN_DIAG_BATCH_SIZES", "ENN_DIAG_BATCHING", "ENN_DIAG_BATCH"),
+                default=False,
+            ):
+                _ENN_DIAG_MEMPROBE_LOGGED = True
+                with contextlib.suppress(Exception):
+                    self._logger.info(
+                        "[ENN][diag] memprobe: with_backward=%s B0=%d peak=%d base0=%d base=%d delta=%d per_sample=%d (floor=%d margin=%.2f)",
+                        bool(with_backward),
+                        int(B0),
+                        int(peak_alloc),
+                        int(base_alloc),
+                        int(base_alloc_meas),
+                        int(delta),
+                        int(per_sample),
+                        int(floor_bytes),
+                        float(margin),
+                    )
 
             with contextlib.suppress(Exception):
                 Sampler._per_sample_mem_bytes = int(per_sample)
