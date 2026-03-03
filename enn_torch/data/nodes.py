@@ -1130,7 +1130,7 @@ class Mapper:
         **kwargs: Any,
     ) -> None:
         self.map_fn = map_fn
-        wp = WorkerPolicy.optimize()
+        wp = WorkerPolicy.optimize(device=device)
         wp.set_thread_setting()
         self.io_workers = (
             int(io_workers)

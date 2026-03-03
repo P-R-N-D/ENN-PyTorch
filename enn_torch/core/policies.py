@@ -155,11 +155,69 @@ class WorkerPolicy:
             dev_type, n = "cpu", 0
         return dev_type, max(0, n)
 
+    @staticmethod
+    def _device_count_for_type(dev_type: str) -> int:
+        dt = str(dev_type or "cpu").strip().lower()
+        try:
+            if dt == "cuda":
+                if torch.cuda.is_available():
+                    return int(torch.cuda.device_count())
+                return 0
+            if dt == "xpu":
+                xpu = getattr(torch, "xpu", None)
+                if (
+                    xpu is not None
+                    and callable(getattr(xpu, "is_available", None))
+                    and xpu.is_available()
+                ):
+                    return int(getattr(xpu, "device_count", lambda: 1)())
+                return 0
+            if dt == "mps":
+                mps_backend = getattr(torch.backends, "mps", None)
+                if (
+                    mps_backend is not None
+                    and callable(getattr(mps_backend, "is_available", None))
+                    and mps_backend.is_available()
+                ):
+                    return 1
+                return 0
+        except Exception:
+            return 0
+        return 0
+
     @classmethod
-    def optimize(cls: type[Self]) -> "WorkerPolicy":
+    def optimize(
+        cls: type[Self],
+        device: Optional[Union[torch.device, str]] = None,
+    ) -> "WorkerPolicy":
         ncpu_raw = max(1, int(cls._cpu_count() or 1))
         dev_type, nacc = cls._available_accelerator()
-        is_accel = bool(nacc and int(nacc) > 0)
+
+        if device is not None:
+            hinted: Optional[str] = None
+            try:
+                dev_obj = (
+                    device
+                    if isinstance(device, torch.device)
+                    else torch.device(str(device))
+                )
+                hinted = str(getattr(dev_obj, "type", None) or "").strip().lower()
+            except Exception:
+                hinted = None
+            if not hinted:
+                with contextlib.suppress(Exception):
+                    hinted = str(device).strip().lower()
+            if hinted:
+                hinted = hinted.split(":")[0].strip()
+                if hinted == "cpu":
+                    dev_type, nacc = "cpu", 0
+                else:
+                    dev_type = hinted
+                    nacc = int(cls._device_count_for_type(dev_type) or 0)
+                    if int(nacc) <= 0:
+                        dev_type, nacc = "cpu", 0
+
+        is_accel = bool(dev_type != "cpu" and nacc and int(nacc) > 0)
         local_world_guess = max(1, int(nacc or 1)) if is_accel else 1
         local_world_guess = max(
             1,
@@ -366,13 +424,13 @@ class WorkerPolicy:
         if env_pre:
             with contextlib.suppress(Exception):
                 prebatch = max(1, int(env_pre))
-        elif _nogil and (not is_accel):
+        elif _nogil and (dev_type == "cpu"):
             prebatch = 2
         env_pf = env_str("ENN_PREFETCH_FACTOR")
         if env_pf:
             with contextlib.suppress(Exception):
                 prefetch_factor = max(1, int(env_pf))
-        elif _nogil and (not is_accel):
+        elif _nogil and (dev_type == "cpu"):
             prefetch_factor = 2
         prebatch = max(1, int(prebatch))
         prefetch_factor = max(1, int(prefetch_factor))
