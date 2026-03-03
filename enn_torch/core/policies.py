@@ -243,7 +243,7 @@ class WorkerPolicy:
             if requested > 0:
                 compile_threads = int(requested)
             else:
-                compile_threads = 1 if CPU.is_free_threaded_build() else 2
+                compile_threads = 2
                 if int(thread_cap_total) <= 6:
                     compile_threads = 1
 
