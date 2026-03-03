@@ -498,8 +498,13 @@ class Sampler(torch.utils.data.Sampler):
         epoch = int(getattr(self, "_S_epoch", 0) or 0)
         snap_epoch = int(getattr(self, "_len_epoch", -1) or -1)
         snap = getattr(self, "_len_B_snapshot", None)
-        if snap is None or snap_epoch != epoch:
-            snap = max(1, int(self._effective_batch_size()))
+        curr_B = None
+        try:
+            curr_B = max(1, int(self._effective_batch_size()))
+        except Exception:
+            curr_B = None
+        if snap is None or snap_epoch != epoch or (curr_B is not None and int(snap) != int(curr_B)):
+            snap = curr_B if curr_B is not None else max(1, int(self._effective_batch_size()))
             self._len_B_snapshot = int(snap)
             self._len_epoch = int(epoch)
         return max(1, int(snap))
