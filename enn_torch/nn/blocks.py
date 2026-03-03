@@ -13,7 +13,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from ..core.compat import StochasticDepth
 from ..core.datatypes import env_bool, env_int
-from ..core.diag import diag_emit
+from ..runtime.autobatch import diag_emit
 from ..runtime.distributed import _from_hsdp_module
 from .activations import GeGLU
 from .graph import coerce_checkpoint, is_checkpoint, is_export_or_trace, is_symbolic, canonicalize_compile_mode, torch_compiler_disable

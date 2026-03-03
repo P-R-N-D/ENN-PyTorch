@@ -26,7 +26,7 @@ import torch.nn.functional as F
 from ..core.concurrency import Mutex, is_gil_enabled
 from ..core.config import ModelConfig
 from ..core.datatypes import env_bool, env_first_int, env_int, env_str, env_float
-from ..core.diag import diag_emit
+from ..runtime.autobatch import diag_emit
 from ..core.policies import LossWeightPolicy, PrecisionPolicy
 from ..core.precision import AutocastState, StatefulAutocast, StatelessAutocast
 from ..core.system import (

@@ -43,7 +43,7 @@ from ..core.datatypes import (
     env_first_int,
     normalize_underflow_action,
 )
-from ..core.diag import diag_emit
+from ..runtime.autobatch import diag_emit
 from ..core.policies import BatchPolicy, LoaderPolicy, WorkerPolicy
 from ..core.system import (
     Memory,
