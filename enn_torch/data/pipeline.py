@@ -34,7 +34,7 @@ from typing import (
 
 import torch
 from . import collate
-from ..core.concurrency import Disposable, Mutex, new_affinity
+from ..core.concurrency import Disposable, Mutex, new_affinity, is_free_threading_build, is_gil_enabled
 from ..core.datatypes import (
     PathLike,
     default_underflow_action,
@@ -45,7 +45,6 @@ from ..core.datatypes import (
 )
 from ..core.policies import BatchPolicy, LoaderPolicy, WorkerPolicy
 from ..core.system import (
-    CPU,
     Memory,
     accelerator,
     cuda_compute_capability,
@@ -71,18 +70,6 @@ SourceType = Literal["memmap"]
 TExtra = TypeVar("TExtra")
 TMerge = TypeVar("TMerge")
 logger = logging.getLogger(__name__)
-
-
-def is_free_threaded_build() -> bool:
-    with contextlib.suppress(Exception):
-        return bool(CPU.is_free_threaded_build())
-    return False
-
-
-def is_no_gil_build() -> bool:
-    with contextlib.suppress(Exception):
-        return bool(CPU.is_no_gil_enforced())
-    return False
 
 
 def get_batch_length(loader: object) -> int:
@@ -445,7 +432,8 @@ def _set_batch_interval(
     if sbytes <= 0:
         return (max(1, min(256, len(_ds))), 0.0)
     is_cuda = bool(getattr(_dev, "type", None) == "cuda")
-    if is_cuda and (is_free_threaded_build() or is_no_gil_build()):
+    no_gil = bool(is_free_threading_build() and (not is_gil_enabled()))
+    if is_cuda and no_gil:
         _tmin_ms = env_first_float(
             ("ENN_H2D_TMIN_MS_NO_GIL", "ENN_H2D_TMIN_NO_GIL"),
             default=max(1.0, float(_tmin_ms)),
@@ -710,7 +698,7 @@ def _set_batch_interval(
     min_batch_env = int(
         env_first_int(("ENN_MIN_BATCH_SIZE", "ENN_MIN_BATCH"), default=0) or 0
     )
-    if min_batch_env <= 0 and is_cuda and (is_free_threaded_build() or is_no_gil_build()):
+    if min_batch_env <= 0 and is_cuda and no_gil:
         min_batch_env = int(
             env_first_int(
                 ("ENN_MIN_BATCH_SIZE_NO_GIL", "ENN_MIN_BATCH_NO_GIL"),
