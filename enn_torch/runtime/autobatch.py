@@ -530,10 +530,22 @@ class BatchScaler:
         if m_small is not None and bool(m_small.get("ok")):
             bL = int(m_large.get("B") or B_max)
             bS = int(m_small.get("B") or B_small)
-            dS = int(m_small.get("delta") or 0)
-            if bL > bS and delta_large >= dS and (delta_large - dS) > 0:
-                per_sample = int((delta_large - dS) // max(1, (bL - bS)))
-                method = "slope"
+            if bL > bS:
+                pL = int(m_large.get("peak") or 0)
+                pS = int(m_small.get("peak") or 0)
+                inL = int(m_large.get("input_bytes") or 0)
+                inS = int(m_small.get("input_bytes") or 0)
+                if pL > 0 and pS > 0 and (pL + inL) >= (pS + inS):
+                    num = (pL + inL) - (pS + inS)
+                    if num > 0:
+                        per_sample = int(num // max(1, (bL - bS)))
+                        method = "slope_peak"
+
+                if per_sample <= 0:
+                    dS = int(m_small.get("delta") or 0)
+                    if delta_large >= dS and (delta_large - dS) > 0:
+                        per_sample = int((delta_large - dS) // max(1, (bL - bS)))
+                        method = "slope"
 
         if per_sample <= 0:
             per_sample = int(delta_large // max(1, int(m_large.get("B") or B_max)))

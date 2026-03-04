@@ -6648,6 +6648,12 @@ def infer(
                                     if eager_on_broadcast:
                                         force_eager = True
 
+                                    if bool(env_bool("ENN_PRED_BROADCAST_FORCE_UNCOMPILED", default=True)) and (not bool(force_uncompiled)):
+                                        force_uncompiled = True
+                                        _LOGGER.warning(
+                                            "[infer] broadcast-like: forcing uncompiled model for correctness (ENN_PRED_BROADCAST_FORCE_UNCOMPILED=1)."
+                                        )
+
                                     if str(sel_kind) == "partial_like":
                                         if bool(partial_broadcast_force_uncompiled) and (not bool(force_uncompiled)):
                                             force_uncompiled = True
