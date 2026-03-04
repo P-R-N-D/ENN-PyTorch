@@ -4,7 +4,6 @@ from __future__ import annotations
 import contextlib
 import logging
 import math
-import threading
 import uuid
 import weakref
 from typing import (
@@ -4647,7 +4646,7 @@ class Model(nn.Module):
         self._amp_dtype_cache_last_dtype: torch.dtype | None = None
         self._amp_dtype_cache_max = 64
         self._amp_dtype_cache_lock = Mutex()
-        default_lock = (not bool(is_gil_enabled())) and (threading.active_count() > 1)
+        default_lock = not bool(is_gil_enabled())
         self._amp_dtype_cache_use_lock = bool(
             env_bool("ENN_AMP_DTYPE_CACHE_LOCK", default=bool(default_lock))
         )
@@ -4908,7 +4907,7 @@ class Model(nn.Module):
         super().__setstate__(state)
         self._runtime_lock = Mutex()
         self._amp_dtype_cache_lock = Mutex()
-        default_lock = (not bool(is_gil_enabled())) and (threading.active_count() > 1)
+        default_lock = not bool(is_gil_enabled())
         self._amp_dtype_cache_use_lock = bool(
             env_bool("ENN_AMP_DTYPE_CACHE_LOCK", default=bool(default_lock))
         )
