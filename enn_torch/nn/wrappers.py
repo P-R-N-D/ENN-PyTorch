@@ -4,6 +4,7 @@ from __future__ import annotations
 import contextlib
 import logging
 import math
+import threading
 import uuid
 import weakref
 from typing import (
@@ -4646,7 +4647,10 @@ class Model(nn.Module):
         self._amp_dtype_cache_last_dtype: torch.dtype | None = None
         self._amp_dtype_cache_max = 64
         self._amp_dtype_cache_lock = Mutex()
-        self._amp_dtype_cache_use_lock = not bool(is_gil_enabled())
+        default_lock = (not bool(is_gil_enabled())) and (threading.active_count() > 1)
+        self._amp_dtype_cache_use_lock = bool(
+            env_bool("ENN_AMP_DTYPE_CACHE_LOCK", default=bool(default_lock))
+        )
         self._cg_static_in_buffers: dict[str, torch.Tensor] = {}
         self._cg_static_in_specs: dict[str, tuple[tuple[int, ...], torch.dtype, str]] = {}
         self.__config = config
@@ -4904,7 +4908,10 @@ class Model(nn.Module):
         super().__setstate__(state)
         self._runtime_lock = Mutex()
         self._amp_dtype_cache_lock = Mutex()
-        self._amp_dtype_cache_use_lock = not bool(is_gil_enabled())
+        default_lock = (not bool(is_gil_enabled())) and (threading.active_count() > 1)
+        self._amp_dtype_cache_use_lock = bool(
+            env_bool("ENN_AMP_DTYPE_CACHE_LOCK", default=bool(default_lock))
+        )
         self._amp_dtype_cache = {}
         self._amp_dtype_cache_last_key = None
         self._amp_dtype_cache_last_dtype = None
