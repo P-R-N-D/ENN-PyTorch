@@ -138,12 +138,16 @@ def _ensure_disk_cache_env() -> None:
     def _is_unsafe_cache_path(key: str, cur: str | None) -> bool:
         if not cur:
             return True
+        with contextlib.suppress(Exception):
+            if os.path.exists(cur) and (not os.path.isdir(cur)):
+                return True
         if _is_tmpfs_path(cur):
             return True
         if key in {
             "TORCHINDUCTOR_CACHE_DIR",
             "TRITON_CACHE_DIR",
             "CUDA_CACHE_PATH",
+            "PYTORCH_KERNEL_CACHE_PATH",
             "XDG_CACHE_HOME",
         }:
             if cur.startswith("/tmp/") or cur == "/tmp":
@@ -169,6 +173,9 @@ def _ensure_disk_cache_env() -> None:
     _set_if_unset_or_unsafe("TORCHINDUCTOR_CACHE_DIR", inductor_dir)
     _set_if_unset_or_unsafe("TRITON_CACHE_DIR", os.path.join(root, "triton"))
     _set_if_unset_or_unsafe("CUDA_CACHE_PATH", os.path.join(root, "cuda_cache"))
+    _set_if_unset_or_unsafe(
+        "PYTORCH_KERNEL_CACHE_PATH", os.path.join(root, "torch_kernel_cache")
+    )
     _set_if_unset_or_unsafe("XDG_CACHE_HOME", os.path.join(root, "xdg"))
     with contextlib.suppress(Exception):
         import tempfile
@@ -185,6 +192,18 @@ def _ensure_disk_cache_env() -> None:
             parents=True,
             exist_ok=True,
         )
+    with contextlib.suppress(Exception):
+        kcache = os.environ.get(
+            "PYTORCH_KERNEL_CACHE_PATH", os.path.join(root, "torch_kernel_cache")
+        )
+        if kcache and os.path.exists(kcache) and (not os.path.isdir(kcache)):
+            try:
+                os.unlink(kcache)
+            except Exception:
+                kcache = os.path.join(root, "torch_kernel_cache")
+                os.environ["PYTORCH_KERNEL_CACHE_PATH"] = kcache
+        if kcache:
+            Path(kcache).mkdir(parents=True, exist_ok=True)
     with contextlib.suppress(Exception):
         xdg = os.environ.get("XDG_CACHE_HOME", os.path.join(root, "xdg"))
         Path(xdg).mkdir(parents=True, exist_ok=True)

@@ -125,6 +125,7 @@ from ..nn.profiler import (
 from ..nn.wrappers import Model, update_delta_gate_auto_k as _set_gate_factor
 from .autobatch import (
     clear_oom_retries as _clear_oom_retries,
+    diag_emit as _diag_emit,
     get_sampler_scaler as _get_sampler_scaler,
     log_scale_rate_throttled as _is_scale_rate_logged,
     probe_per_sample_mem_bytes as _get_sample_size,
@@ -2992,6 +2993,39 @@ def epochs(
             f"{mbps:.2f} MB/s, {tflops:.2f} TFLOPS", refresh=True
         )
         status_bar.close()
+
+    if local_rank == 0:
+        try:
+            comp_s = float(prev_comp_time)
+            kern_s = float(prev_kern_time)
+            io_s = float(prev_io_time)
+            other_s = max(0.0, comp_s - kern_s)
+            target_module = model.module if hasattr(model, "module") else model
+            amp_cache_lock = bool(
+                getattr(target_module, "_amp_dtype_cache_use_lock", False)
+            )
+            _diag_emit(
+                "train.perf",
+                {
+                    "device": str(device),
+                    "torch": str(getattr(torch, "__version__", "")),
+                    "py_tag": str(
+                        getattr(getattr(sys, "implementation", None), "cache_tag", "") or ""
+                    ),
+                    "no_gil": bool(CPU.is_no_gil_enforced()),
+                    "gil_enabled": bool(CPU.is_gil_enabled()),
+                    "comp_s": comp_s,
+                    "kern_s": kern_s,
+                    "io_s": io_s,
+                    "other_s": other_s,
+                    "kern_over_comp": (kern_s / comp_s) if comp_s > 0 else None,
+                    "io_over_comp": (io_s / comp_s) if comp_s > 0 else None,
+                    "amp_cache_lock": amp_cache_lock,
+                },
+                also_print=False,
+            )
+        except Exception:
+            pass
 
     model_for_scaler = model.module if hasattr(model, "module") else model
     scaler_y_device = model_for_scaler.scaler.y_mean.device

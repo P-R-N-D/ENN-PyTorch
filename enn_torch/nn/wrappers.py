@@ -4,6 +4,7 @@ from __future__ import annotations
 import contextlib
 import logging
 import math
+import threading
 import uuid
 import weakref
 from typing import (
@@ -4646,7 +4647,15 @@ class Model(nn.Module):
         self._amp_dtype_cache_last_dtype: torch.dtype | None = None
         self._amp_dtype_cache_max = 64
         self._amp_dtype_cache_lock = Mutex()
-        self._amp_dtype_cache_use_lock = not bool(is_gil_enabled())
+        default_lock = not bool(is_gil_enabled())
+        self._amp_dtype_cache_use_lock = bool(
+            env_bool("ENN_AMP_DTYPE_CACHE_LOCK", default=bool(default_lock))
+        )
+        self._amp_dtype_cache_tls: threading.local | None = (
+            threading.local()
+            if ((not self._amp_dtype_cache_use_lock) and (not bool(is_gil_enabled())))
+            else None
+        )
         self._cg_static_in_buffers: dict[str, torch.Tensor] = {}
         self._cg_static_in_specs: dict[str, tuple[tuple[int, ...], torch.dtype, str]] = {}
         self.__config = config
@@ -4896,6 +4905,7 @@ class Model(nn.Module):
         state.pop("_amp_dtype_cache", None)
         state.pop("_amp_dtype_cache_last_key", None)
         state.pop("_amp_dtype_cache_last_dtype", None)
+        state.pop("_amp_dtype_cache_tls", None)
         state.pop("_cg_static_in_buffers", None)
         state.pop("_cg_static_in_specs", None)
         return state
@@ -4904,7 +4914,15 @@ class Model(nn.Module):
         super().__setstate__(state)
         self._runtime_lock = Mutex()
         self._amp_dtype_cache_lock = Mutex()
-        self._amp_dtype_cache_use_lock = not bool(is_gil_enabled())
+        default_lock = not bool(is_gil_enabled())
+        self._amp_dtype_cache_use_lock = bool(
+            env_bool("ENN_AMP_DTYPE_CACHE_LOCK", default=bool(default_lock))
+        )
+        self._amp_dtype_cache_tls = (
+            threading.local()
+            if ((not self._amp_dtype_cache_use_lock) and (not bool(is_gil_enabled())))
+            else None
+        )
         self._amp_dtype_cache = {}
         self._amp_dtype_cache_last_key = None
         self._amp_dtype_cache_last_dtype = None
@@ -5856,11 +5874,27 @@ class Model(nn.Module):
                 else:
                     amp_dtype = self._amp_dtype_cache.get(cache_key)
         else:
-            last_key = self._amp_dtype_cache_last_key
-            if last_key == cache_key:
-                amp_dtype = self._amp_dtype_cache_last_dtype
+            use_tls = not bool(is_gil_enabled())
+            if use_tls:
+                tls = getattr(self, "_amp_dtype_cache_tls", None)
+                if tls is None:
+                    tls = threading.local()
+                    self._amp_dtype_cache_tls = tls
+                cache = getattr(tls, "cache", None)
+                if cache is None:
+                    cache = {}
+                    setattr(tls, "cache", cache)
+                last_key = getattr(tls, "last_key", None)
+                if last_key == cache_key:
+                    amp_dtype = getattr(tls, "last_dtype", None)
+                else:
+                    amp_dtype = cache.get(cache_key)
             else:
-                amp_dtype = self._amp_dtype_cache.get(cache_key)
+                last_key = self._amp_dtype_cache_last_key
+                if last_key == cache_key:
+                    amp_dtype = self._amp_dtype_cache_last_dtype
+                else:
+                    amp_dtype = self._amp_dtype_cache.get(cache_key)
         if amp_dtype is None:
             negotiated = StatelessAutocast.negotiate(
                 tuple(amp_candidates),
@@ -5885,24 +5919,52 @@ class Model(nn.Module):
                     self._amp_dtype_cache_last_dtype = amp_dtype
                     self._amp_dtype_cache_last_key = cache_key
             else:
-                amp_dtype = self._amp_dtype_cache.get(cache_key)
-                if amp_dtype is None:
-                    amp_dtype = negotiated
-                    if len(self._amp_dtype_cache) >= int(
-                        self._amp_dtype_cache_max
-                    ):
-                        self._amp_dtype_cache.clear()
-                    self._amp_dtype_cache[cache_key] = amp_dtype
-                self._amp_dtype_cache_last_dtype = amp_dtype
-                self._amp_dtype_cache_last_key = cache_key
+                use_tls = not bool(is_gil_enabled())
+                if use_tls:
+                    tls = getattr(self, "_amp_dtype_cache_tls", None)
+                    if tls is None:
+                        tls = threading.local()
+                        self._amp_dtype_cache_tls = tls
+                    cache = getattr(tls, "cache", None)
+                    if cache is None:
+                        cache = {}
+                        setattr(tls, "cache", cache)
+                    amp_dtype = cache.get(cache_key)
+                    if amp_dtype is None:
+                        amp_dtype = negotiated
+                        if len(cache) >= int(self._amp_dtype_cache_max):
+                            cache.clear()
+                        cache[cache_key] = amp_dtype
+                    setattr(tls, "last_dtype", amp_dtype)
+                    setattr(tls, "last_key", cache_key)
+                else:
+                    amp_dtype = self._amp_dtype_cache.get(cache_key)
+                    if amp_dtype is None:
+                        amp_dtype = negotiated
+                        if len(self._amp_dtype_cache) >= int(
+                            self._amp_dtype_cache_max
+                        ):
+                            self._amp_dtype_cache.clear()
+                        self._amp_dtype_cache[cache_key] = amp_dtype
+                    self._amp_dtype_cache_last_dtype = amp_dtype
+                    self._amp_dtype_cache_last_key = cache_key
         else:
             if self._amp_dtype_cache_use_lock:
                 with self._amp_dtype_cache_lock:
                     self._amp_dtype_cache_last_dtype = amp_dtype
                     self._amp_dtype_cache_last_key = cache_key
             else:
-                self._amp_dtype_cache_last_dtype = amp_dtype
-                self._amp_dtype_cache_last_key = cache_key
+                use_tls = not bool(is_gil_enabled())
+                if use_tls:
+                    tls = getattr(self, "_amp_dtype_cache_tls", None)
+                    if tls is None:
+                        tls = threading.local()
+                        self._amp_dtype_cache_tls = tls
+                    setattr(tls, "last_dtype", amp_dtype)
+                    setattr(tls, "last_key", cache_key)
+                else:
+                    self._amp_dtype_cache_last_dtype = amp_dtype
+                    self._amp_dtype_cache_last_key = cache_key
         amp_enabled = bool(
             isinstance(amp_dtype, torch.dtype)
             and amp_dtype is not torch.float64
