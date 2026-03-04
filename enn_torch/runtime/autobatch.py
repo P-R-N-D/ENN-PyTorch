@@ -16,6 +16,7 @@ from ..core.system import (
     CPU,
     accelerator_max_allocated_memory,
     allocated_accelerator_memory,
+    empty_device_cache,
     flush_accelerator_memory_stats,
     is_pin_supported,
     sync_accelerator,
@@ -423,7 +424,7 @@ class BatchScaler:
                             model.train()
                         warmup_iters = int(env_int("ENN_MEMPROBE_WARMUP_ITERS_TRAIN", 0) or 0)
                         if warmup_iters <= 0:
-                            warmup_iters = 2 if CPU.is_optimized_for_no_gil() else 1
+                            warmup_iters = 3 if CPU.is_optimized_for_no_gil() else 1
                         warmup_iters = max(1, min(8, int(warmup_iters)))
                     else:
                         warmup_iters = int(env_int("ENN_SERVE_WARMUP_ITERS", 0) or 0)
@@ -448,6 +449,25 @@ class BatchScaler:
                 base2 = allocated_accelerator_memory(device)
                 if base2 is not None:
                     base_meas = int(base2)
+
+                stable = bool(
+                    env_bool(
+                        "ENN_MEMPROBE_STABLE",
+                        default=bool(with_backward and CPU.is_optimized_for_no_gil()),
+                    )
+                )
+                if stable:
+                    if _run_once():
+                        forward_ran = True
+                    with contextlib.suppress(Exception):
+                        sync_accelerator(device)
+                    if with_backward:
+                        with contextlib.suppress(Exception):
+                            model.zero_grad(set_to_none=True)
+                    flush_accelerator_memory_stats(device)
+                    base3 = allocated_accelerator_memory(device)
+                    if base3 is not None:
+                        base_meas = int(base3)
 
                 if _run_once():
                     forward_ran = True
@@ -498,8 +518,13 @@ class BatchScaler:
             meta = Dataset.for_device(device)
 
         try:
+            m_small = _measure(int(B_small), warmup=True) if int(B_small) < int(B_max) else None
+            if m_small is not None and bool(m_small.get("ok")):
+                with contextlib.suppress(Exception):
+                    sync_accelerator(device)
+                with contextlib.suppress(Exception):
+                    empty_device_cache(device=device, do_gc=False, min_interval_s=0.0)
             m_large = _measure(int(B_max), warmup=True)
-            m_small = _measure(int(B_small), warmup=False) if int(B_small) < int(B_max) else None
         except Exception:
             return
 
@@ -534,10 +559,7 @@ class BatchScaler:
                 per_sample = int(t.item())
 
         global _ENN_DIAG_MEMPROBE_LOGGED
-        if (not _ENN_DIAG_MEMPROBE_LOGGED) and env_bool(
-            ("ENN_DIAG_BATCH_SIZES", "ENN_DIAG_BATCHING", "ENN_DIAG_BATCH"),
-            default=False,
-        ):
+        if (not _ENN_DIAG_MEMPROBE_LOGGED) and diag_enabled():
             _ENN_DIAG_MEMPROBE_LOGGED = True
             diag_emit(
                 "memprobe",
