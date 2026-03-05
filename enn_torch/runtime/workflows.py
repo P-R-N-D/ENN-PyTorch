@@ -112,8 +112,6 @@ def _embedding_from_meta(
         return None
     raw = meta.get("embedding")
     if not isinstance(raw, Mapping):
-        raw = meta.get("embedder")
-    if not isinstance(raw, Mapping):
         return None
     spec = dict(raw)
     spec_in_dim = spec.get("in_dim")
