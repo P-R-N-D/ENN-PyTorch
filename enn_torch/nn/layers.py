@@ -2546,7 +2546,7 @@ class SigmoidGate(nn.Module):
         )
 
 
-class Embedder(nn.Module):
+class Embedding(nn.Module):
     def __init__(
         self,
         *,
@@ -2654,11 +2654,11 @@ class Embedder(nn.Module):
             x_raw = x_raw.view(1, -1)
         if x_raw.dim() != 2:
             raise ValueError(
-                f"Embedder expects a 2D tensor [B, in_dim], got {tuple(x_raw.shape)}"
+                f"Embedding expects a 2D tensor [B, in_dim], got {tuple(x_raw.shape)}"
             )
         if int(x_raw.shape[1]) != int(self.in_dim):
             raise ValueError(
-                f"Embedder expects in_dim={self.in_dim}, got x_raw.shape[1]={int(x_raw.shape[1])}"
+                f"Embedding expects in_dim={self.in_dim}, got x_raw.shape[1]={int(x_raw.shape[1])}"
             )
 
         x_cont_src = x_norm if x_norm is not None else x_raw
@@ -2703,7 +2703,7 @@ class Embedder(nn.Module):
         return out
 
     @classmethod
-    def from_spec(cls, spec: Mapping[str, Any], *, in_dim: int) -> "Embedder":
+    def from_spec(cls, spec: Mapping[str, Any], *, in_dim: int) -> "Embedding":
         cats = spec.get("categorical") or spec.get("cats") or ()
         cont = None
         if "continuous_idx" in spec:
