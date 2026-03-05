@@ -706,13 +706,14 @@ def _validate_scaler_buffers(model: torch.nn.Module, *, strict: bool) -> None:
 def _parse_meta(p: PathLike) -> Mapping[str, Any]:
     base = Path(p)
     for d in (base, base.parent, base.parent.parent, base.parent.parent.parent):
-        meta_path = d / "meta.json"
-        try:
-            if meta_path.exists():
-                out = read_json(meta_path)
-                return out if isinstance(out, Mapping) else {}
-        except Exception as exc:
-            raise RuntimeError(f"Metadata parse failed: {meta_path}") from exc
+        for name in ("meta.json", "model.meta.json"):
+            meta_path = d / name
+            try:
+                if meta_path.exists():
+                    out = read_json(meta_path)
+                    return out if isinstance(out, Mapping) else {}
+            except Exception as exc:
+                raise RuntimeError(f"Metadata parse failed: {meta_path}") from exc
     done_path = base / "done.json"
     with contextlib.suppress(Exception):
         if done_path.exists():
@@ -3237,6 +3238,8 @@ def predict(
                 else:
                     save_dcp = False
             elif strict and env_bool("ENN_PRED_SAVE_PT_ALSO_IF_STRICT", default=False):
+                save_pt = True
+            if getattr(model, "embedder", None) is not None:
                 save_pt = True
             dcp_dir = os.path.join(ckpt_dir, "dcp")
             if not (save_dcp or save_pt):
