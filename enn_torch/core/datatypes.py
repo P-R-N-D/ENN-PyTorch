@@ -119,13 +119,15 @@ def sanitize_single_line(
     *,
     replacement: str = "",
     trim: bool = True,
+    decode_escaped_newlines: bool = True,
 ) -> str:
     if value is None:
         return ""
     if isinstance(value, (bytes, bytearray)):
         value = value.decode(errors="ignore")
     s = str(value)
-    s = s.replace("\\r\\n", "\n").replace("\\n", "\n").replace("\\r", "\n")
+    if decode_escaped_newlines:
+        s = s.replace("\\r\\n", "\n").replace("\\n", "\n").replace("\\r", "\n")
     s = s.replace("\r\n", "\n").replace("\r", "\n")
     s = s.replace("\n", replacement)
     return s.strip() if trim else s

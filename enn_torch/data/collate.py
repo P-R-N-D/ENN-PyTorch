@@ -200,7 +200,12 @@ def _td_batch_size_from_X(x: Any) -> list[int]:
 def _coerce_path(path: PathLike) -> Optional[str]:
     if path is None:
         return None
-    p = sanitize_single_line(path)
+    p = sanitize_single_line(
+        path,
+        replacement="",
+        trim=True,
+        decode_escaped_newlines=False,
+    )
     if not p or p.lower() in ("none", "null", "nil"):
         return None
     return os.path.abspath(os.path.expanduser(p))
