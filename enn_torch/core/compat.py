@@ -1,23 +1,75 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
+# 1. Standard Library Imports
 from contextlib import contextmanager, suppress
 from functools import partial
 from types import ModuleType
 from typing import Any, Iterator, Self
 
+# 2. Third-Party Imports
 import torch
-from ..nn.graph import compile_distributed_safe
-from .concurrency import Mutex
 from torch import nn
+
+# 3. Local Imports
+from .concurrency import Mutex
+from ..nn.graph import compile_distributed_safe
+
+
+# =============================================================================
+# Globals & Constants
+# =============================================================================
 _PATCH_LOCK = Mutex(reentrant=True)
 _TORCH_COMPAT: TorchCompat | None = None
-RMSNorm = getattr(nn, "RMSNorm", None)
 
 
-def _fmin_impl(
-    tm: ModuleType, a: torch.Tensor, b: torch.Tensor
-) -> torch.Tensor:
+# =============================================================================
+# Fallback Classes
+# =============================================================================
+class _RMSNormFallback(nn.Module):
+    def __init__(self: Self, d_model: int, eps: float = 1e-06) -> None:
+        super().__init__()
+        self.eps = float(eps)
+        self.weight = nn.Parameter(torch.ones(int(d_model)))
+
+    def forward(self: Self, x: torch.Tensor) -> torch.Tensor:
+        inv_rms = x.pow(2).mean(dim=-1, keepdim=True).add(self.eps).rsqrt()
+        return x * inv_rms * self.weight
+
+
+class _StochasticDepthFallback(nn.Module):
+    def __init__(self: Self, p: float = 0.0, mode: str = "row") -> None:
+        super().__init__()
+        self.p = float(p)
+        self.mode = str(mode)
+
+    def forward(self: Self, x: torch.Tensor) -> torch.Tensor:
+        if not self.training or self.p <= 0.0:
+            return x
+        
+        keep = 1.0 - self.p
+        if keep <= 0.0:
+            return torch.zeros_like(x)
+            
+        shape = (
+            (x.shape[0],) + (1,) * (x.dim() - 1)
+            if self.mode == "row" and x.dim() >= 2
+            else x.shape
+        )
+        return x * x.new_empty(shape).bernoulli_(keep).div_(keep)
+
+
+class _SDPBackendFallback:
+    MATH = object()
+    FLASH_ATTENTION = object()
+    EFFICIENT_ATTENTION = object()
+    CUDNN_ATTENTION = object()
+
+
+# =============================================================================
+# Helper Functions (Missing Tensor Operations)
+# =============================================================================
+def _fmin_impl(tm: ModuleType, a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     a, b = tm.broadcast_tensors(a, b)
     an, bn = tm.isnan(a), tm.isnan(b)
     return tm.where(an & ~bn, b, tm.where(bn & ~an, a, tm.minimum(a, b)))
@@ -32,18 +84,21 @@ def _nan_mm_impl(
     fill: float | str,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     if isinstance(x, torch.Tensor) and not tm.is_floating_point(x):
-        return getattr(x, op)(
-            **({"dim": dim, "keepdim": keepdim} if dim is not None else {})
-        )
+        kwargs = {"dim": dim, "keepdim": keepdim} if dim is not None else {}
+        return getattr(x, op)(**kwargs)
+        
     mask = tm.isfinite(x)
     xp = tm.where(mask, x, tm.full_like(x, float(fill)))
+    
     if dim is None:
         res = getattr(xp, op)()
         return tm.where(mask.any(), res, tm.full_like(res, float("nan")))
+        
     val, idx = getattr(xp, op)(dim=dim, keepdim=keepdim)
     valid = mask.any(dim=dim, keepdim=keepdim)
-    return tm.where(valid, val, tm.full_like(val, float("nan"))), tm.where(
-        valid, idx, tm.zeros_like(idx)
+    return (
+        tm.where(valid, val, tm.full_like(val, float("nan"))),
+        tm.where(valid, idx, tm.zeros_like(idx)),
     )
 
 
@@ -77,9 +132,12 @@ def _nansum_impl(
     if dtype and not isinstance(dtype, torch.dtype):
         with suppress(Exception):
             dtype = getattr(torch, str(dtype).split(".")[-1], None)
+            
     x_cast = x.to(dtype) if dtype is not None else x
+    
     if isinstance(x_cast, torch.Tensor) and not tm.is_floating_point(x_cast):
         return tm.sum(x_cast, dim=dim, keepdim=keepdim, **kwargs)
+        
     if callable(n2n := getattr(tm, "nan_to_num", None)):
         with suppress(Exception):
             return tm.sum(
@@ -88,6 +146,7 @@ def _nansum_impl(
                 keepdim=keepdim,
                 **kwargs,
             )
+            
     return tm.sum(
         tm.where(
             tm.isfinite(x_cast),
@@ -100,56 +159,9 @@ def _nansum_impl(
     )
 
 
-def torch_compat(
-    module: Any | None = None, nn_module: Any | None = None
-) -> TorchCompat:
-    global _TORCH_COMPAT
-    with _PATCH_LOCK:
-        compat = (
-            TorchCompat(module=module, nn_module=nn_module)
-            if _TORCH_COMPAT is None or module or nn_module
-            else _TORCH_COMPAT
-        )
-        compat.apply()
-        _TORCH_COMPAT = compat
-        return compat
-
-
-class _RMSNormFallback(nn.Module):
-    def __init__(self: Self, d_model: int, eps: float = 1e-06) -> None:
-        super().__init__()
-        self.eps, self.weight = (
-            float(eps),
-            nn.Parameter(torch.ones(int(d_model))),
-        )
-
-    def forward(self: Self, x: Any) -> Any:
-        inv_rms = x.pow(2).mean(dim=-1, keepdim=True).add(self.eps).rsqrt()
-        return x * inv_rms * self.weight
-
-
-class _StochasticDepthFallback(nn.Module):
-    def __init__(self: Self, p: float = 0.0, mode: str = "row") -> None:
-        super().__init__()
-        self.p, self.mode = float(p), str(mode)
-
-    def forward(self: Self, x: torch.Tensor) -> torch.Tensor:
-        if not self.training or self.p <= 0.0:
-            return x
-        if (keep := 1.0 - self.p) <= 0.0:
-            return torch.zeros_like(x)
-        shape = (
-            (x.shape[0],) + (1,) * (x.dim() - 1)
-            if self.mode == "row" and x.dim() >= 2
-            else x.shape
-        )
-        return x * x.new_empty(shape).bernoulli_(keep).div_(keep)
-
-
-class _SDPBackendFallback:
-    MATH = FLASH_ATTENTION = EFFICIENT_ATTENTION = CUDNN_ATTENTION = object()
-
-
+# =============================================================================
+# Core Compatibility Logic
+# =============================================================================
 class TorchCompat:
     def __init__(
         self: Self, module: Any | None = None, nn_module: Any | None = None
@@ -177,18 +189,35 @@ class TorchCompat:
             for name, impl in patches:
                 if not hasattr(self.module, name):
                     setattr(self.module, name, partial(impl, self.module))
+                    
             compile_distributed_safe()
 
 
-StochasticDepth = (
-    getattr(nn, "StochasticDepth", None) or _StochasticDepthFallback
-)
+def torch_compat(
+    module: Any | None = None, nn_module: Any | None = None
+) -> TorchCompat:
+    global _TORCH_COMPAT
+    with _PATCH_LOCK:
+        compat = (
+            TorchCompat(module=module, nn_module=nn_module)
+            if _TORCH_COMPAT is None or module or nn_module
+            else _TORCH_COMPAT
+        )
+        compat.apply()
+        _TORCH_COMPAT = compat
+        return compat
+
+
+# =============================================================================
+# Deferred & Lazy Declarations
+# =============================================================================
+RMSNorm = getattr(nn, "RMSNorm", None)
+StochasticDepth = getattr(nn, "StochasticDepth", None) or _StochasticDepthFallback
 
 try:
-    from torch.nn.attention import SDPBackend
-    from torch.nn.attention import sdpa_kernel
-except Exception:
-    SDPBackend = _SDPBackendFallback
+    from torch.nn.attention import SDPBackend, sdpa_kernel
+except ImportError:
+    SDPBackend = _SDPBackendFallback  # type: ignore
 
     @contextmanager
     def sdpa_kernel(*backends: Any) -> Iterator[None]:
