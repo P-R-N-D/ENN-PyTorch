@@ -1,17 +1,23 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
+# =============================================================================
 # 1. Standard Library Imports
+# =============================================================================
 from contextlib import contextmanager, suppress
 from functools import partial
 from types import ModuleType
 from typing import Any, Iterator, Self
 
+# =============================================================================
 # 2. Third-Party Imports
+# =============================================================================
 import torch
 from torch import nn
 
+# =============================================================================
 # 3. Local Imports
+# =============================================================================
 from .concurrency import Mutex
 from ..nn.graph import compile_distributed_safe
 
