@@ -18,6 +18,7 @@ from tensordict import TensorDict
 
 from enn_torch.core.config import ModelConfig, PatchConfig
 from enn_torch.core.system import get_device
+from enn_torch.nn.layers import Embedder
 from enn_torch.runtime.workflows import new_model, predict, train
 
 COL_DIR = "방향"
@@ -387,8 +388,20 @@ def main() -> None:
         preset="spatiotemporal",
         compile_mode="disabled",
     )
+    EMBED_SPEC = {
+        "continuous_idx": [],
+        "categorical": [
+            {"name": "month", "idx": 0, "num_embeddings": 12, "embedding_dim": 4, "offset": -1, "clamp": True},
+            {"name": "weekday", "idx": 1, "num_embeddings": 7, "embedding_dim": 3, "clamp": True},
+            {"name": "direction", "idx": 2, "num_embeddings": 2, "embedding_dim": 2, "clamp": True},
+        ],
+    }
+    embedder = Embedder.from_spec(EMBED_SPEC, in_dim=int(td_train["X"].shape[1]))
     model = new_model(
-        in_dim=td_train["X"].shape[1], out_shape=(S, T), config=config
+        in_dim=td_train["X"].shape[1],
+        out_shape=(S, T),
+        config=config,
+        embedder=embedder,
     ).to(device)
     with contextlib.suppress(Exception):
         model.add_task("extra_spatial", mode="spatial", weight=0.25)

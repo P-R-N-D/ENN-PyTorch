@@ -4367,7 +4367,7 @@ class Model(nn.Module):
                 nn.LayerNorm(int(config.d_model)),
                 nn.Linear(int(config.d_model), hid),
                 nn.SiLU(),
-                nn.Linear(hid, int(in_dim)),
+                nn.Linear(hid, int(self.model_in_dim)),
             ).to(self._device)
         else:
             self.x_recon_head = None
