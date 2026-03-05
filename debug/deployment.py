@@ -61,15 +61,11 @@ _EMBED_SPEC: dict[str, list[object]] = {
 }
 
 
-def _normalize_pasted_text(value: object) -> str:
-    return (
-        str(value)
-        .replace("\r\n", "\n")
-        .replace("\r", "\n")
-        .replace("\\r\\n", "\n")
-        .replace("\\n", "\n")
-        .strip()
-    )
+def _normalize_pasted_text(value: object, *, decode_escaped_newlines: bool = True) -> str:
+    text = str(value).replace("\r\n", "\n").replace("\r", "\n")
+    if decode_escaped_newlines:
+        text = text.replace("\\r\\n", "\n").replace("\\n", "\n")
+    return text.strip()
 
 
 def _env_truthy(name: str, default: bool = False) -> bool:
@@ -190,8 +186,12 @@ def _run_isolated_export(
     fmt_name: str, out_path: str, state_path: str
 ) -> dict[str, Any]:
     fmt_name = _normalize_pasted_text(fmt_name).strip()
-    out_path = _normalize_pasted_text(out_path).strip()
-    state_path = _normalize_pasted_text(state_path).strip()
+    out_path = _normalize_pasted_text(
+        out_path, decode_escaped_newlines=False
+    ).strip()
+    state_path = _normalize_pasted_text(
+        state_path, decode_escaped_newlines=False
+    ).strip()
     cmd = [
         sys.executable,
         "-m",
@@ -809,8 +809,14 @@ def main() -> None:
     args, _unused_args = ap.parse_known_args()
     if args.export_only:
         export_only = _normalize_pasted_text(args.export_only)
-        export_out = _normalize_pasted_text(args.out or "") or None
-        export_state = _normalize_pasted_text(args.state or "") or None
+        export_out = (
+            _normalize_pasted_text(args.out or "", decode_escaped_newlines=False)
+            or None
+        )
+        export_state = (
+            _normalize_pasted_text(args.state or "", decode_escaped_newlines=False)
+            or None
+        )
         raise SystemExit(_export_only_main(export_only, export_out, export_state))
     os.environ.setdefault("ENN_PREBATCH", "1")
     os.environ.setdefault("ENN_PREFETCH_FACTOR", "1")
