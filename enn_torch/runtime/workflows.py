@@ -65,7 +65,7 @@ from ..data.pipeline import (
     preload_memmap,
 )
 from ..nn.graph import inference_mode
-from ..nn.layers import Recorder, Scaler, resize_scaler_buffer
+from ..nn.layers import Embedder, Recorder, Scaler, resize_scaler_buffer
 from ..nn.wrappers import Model
 from .distributed import (
     ProcessBroker,
@@ -1864,9 +1864,16 @@ def new_model(
     in_dim: int,
     out_shape: Sequence[int],
     config: ModelConfig | Mapping[str, object] | None,
+    *,
+    embedder: Embedder | None = None,
 ) -> Model:
     cfg = coerce_model_config(config)
-    core = Model(in_dim, tuple((int(x) for x in out_shape)), config=cfg)
+    core = Model(
+        in_dim,
+        tuple((int(x) for x in out_shape)),
+        config=cfg,
+        embedder=embedder,
+    )
     return core
 
 

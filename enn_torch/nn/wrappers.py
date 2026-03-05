@@ -68,7 +68,7 @@ from .graph import (
     torch_compiler_disable,
     torch_compiler_supported,
 )
-from .layers import Recorder, Scaler, SigmoidGate
+from .layers import Embedder, Recorder, Scaler, SigmoidGate
 from tensordict import TensorDictBase
 _LOGGER = logging.getLogger(__name__)
 _ENN_DIAG_AUTOMICROBATCH_LOGGED = False
@@ -3994,10 +3994,17 @@ class Model(nn.Module):
         return type_(getattr(cfg, name, default))
 
     def __init__(
-        self: Self, in_dim: int, out_shape: Sequence[int], config: ModelConfig
+        self: Self,
+        in_dim: int,
+        out_shape: Sequence[int],
+        config: ModelConfig,
+        *,
+        embedder: Embedder | None = None,
     ) -> None:
         super().__init__()
         self.in_dim = int(in_dim)
+        self.embedder: Embedder | None = embedder
+        self.model_in_dim = int(getattr(embedder, "out_dim", self.in_dim))
         self.out_shape = tuple((int(x) for x in out_shape))
         self.out_dim = int(math.prod(self.out_shape))
         if config.device is not None:
@@ -4014,6 +4021,8 @@ class Model(nn.Module):
                     )
         else:
             self._device = get_device()
+        if self.embedder is not None:
+            self.embedder = self.embedder.to(self._device)
         self.scaler = Scaler().to(self._device)
         with torch.no_grad():
             if self.scaler.x_mean.numel() != self.in_dim:
@@ -4024,11 +4033,11 @@ class Model(nn.Module):
         self.logger = Recorder()
         self.is_norm_linear = bool(getattr(config, "use_linear_branch", False))
         self.linear_branch = (
-            nn.Linear(self.in_dim, self.out_dim).to(self._device)
+            nn.Linear(self.model_in_dim, self.out_dim).to(self._device)
             if self.is_norm_linear
             else None
         )
-        self.fuser = Fuser(self.in_dim, self.out_shape, config=config).to(
+        self.fuser = Fuser(self.model_in_dim, self.out_shape, config=config).to(
             self._device
         )
         bucket = self._get_cfg(config, "length_bucket_multiple", 64, int)
@@ -5168,10 +5177,26 @@ class Model(nn.Module):
                         f"[ENN] nonfinite detected before sanitize in {tag}: nonfinite={nonfinite} absmax={absmax} dtype={dtype} shape={shape}"
                     )
 
-        x = self._cast_graph_safe(
+        x_raw = self._cast_graph_safe(
             features, device or self._device, base_dtype or features.dtype
         )
-        x = self.scaler.normalize_x(x)
+        x_norm: torch.Tensor | None = None
+        if self.embedder is None:
+            x = self.scaler.normalize_x(x_raw)
+        else:
+            if bool(getattr(self.embedder, "uses_x_norm", False)):
+                x_norm = self.scaler.normalize_x(x_raw)
+            x = self.embedder(x_raw, x_norm=x_norm)
+
+        if x.dim() == 1:
+            x = x.view(1, -1)
+        if x.dim() != 2 or int(x.shape[1]) != int(self.model_in_dim):
+            raise ValueError(
+                f"model input dim mismatch: expected [B,{int(self.model_in_dim)}] after embedder, got {tuple(x.shape)}"
+            )
+
+        if base_dtype is not None and x.dtype != base_dtype:
+            x = self._cast_graph_safe(x, device or self._device, base_dtype)
         b = x.size(0)
         if export:
             tokens, context = self.fuser.forward_export(x)
@@ -5802,7 +5827,13 @@ class Model(nn.Module):
                 )
         if isinstance(x_raw, torch.Tensor) and x_raw.device != device:
             x_raw = x_raw.to(device=device, non_blocking=True)
-        x_scaled = self.scaler.normalize_x(x_raw)
+        x_norm: torch.Tensor | None = None
+        if self.embedder is None:
+            x_scaled = self.scaler.normalize_x(x_raw)
+        else:
+            if bool(getattr(self.embedder, "uses_x_norm", False)):
+                x_norm = self.scaler.normalize_x(x_raw)
+            x_scaled = self.embedder(x_raw, x_norm=x_norm)
         graph_break()
         meta = None
         try:
@@ -6019,9 +6050,9 @@ class Model(nn.Module):
                 if x_scaled.dtype != base_dtype
                 else x_scaled
             )
-            if features_t.ndim != 2 or features_t.shape[1] != self.in_dim:
+            if features_t.ndim != 2 or features_t.shape[1] != self.model_in_dim:
                 raise ValueError(
-                    f"Expected features shaped (B, {self.in_dim}), got {tuple(features_t.shape)}"
+                    f"Expected features shaped (B, {self.model_in_dim}), got {tuple(features_t.shape)}"
                 )
             exporting = bool(is_export_or_trace())
 
@@ -6077,7 +6108,7 @@ class Model(nn.Module):
                         if mark_static_strict:
                             enc_static_in = self._get_cg_static_in_buf(
                                 'encoder',
-                                (int(mb), int(self.in_dim)),
+                                (int(mb), int(self.model_in_dim)),
                                 dtype=base_dtype,
                                 device=device,
                                 strict=True,
@@ -6086,7 +6117,7 @@ class Model(nn.Module):
                             with contextlib.suppress(Exception):
                                 enc_static_in = self._get_cg_static_in_buf(
                                     'encoder',
-                                    (int(mb), int(self.in_dim)),
+                                    (int(mb), int(self.model_in_dim)),
                                     dtype=base_dtype,
                                     device=device,
                                     strict=False,
