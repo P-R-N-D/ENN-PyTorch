@@ -846,7 +846,7 @@ def coerce_runtime_config(config: RuntimeConfig | Dict[str, Any]) -> RuntimeConf
         case _:
             raise ValueError(f"invalid runtime mode: {mode_value}")
             
-    return RuntimeConfig.from_partial(mode=mode, **data)  # type: ignore
+    return RuntimeConfig.from_partial(mode=mode, **data)
 
 
 def runtime_config(mode: OpsMode, base: Dict[str, Any] | None, /, *args: Any, **kwargs: Any) -> RuntimeConfig:
