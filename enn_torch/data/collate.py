@@ -67,24 +67,29 @@ def _td_del(td: TensorDictBase, key: str) -> None:
 
 
 def _resolve_key(
-    data: Any, aliases: frozenset, name: str, required: bool
+    data: Any,
+    aliases: frozenset[str],
+    name: str,
+    required: bool,
 ) -> Optional[str]:
     if not isinstance(data, (Mapping, TensorDictBase)):
         raise TypeError(f"get_{name}_key expects Mapping/TensorDict")
-    matches = [
-        str(k)
-        for k in data.keys()
-        if isinstance(k, str) and k.casefold() in aliases
-    ]
-    if len(matches) == 1:
-        return matches[0]
-    if len(matches) > 1:
+
+    found: str | None = None
+    for key in data.keys():
+        if not isinstance(key, str) or key.casefold() not in aliases:
+            continue
+        if found is not None:
+            raise KeyError(
+                f"Expected exactly one {name} key among {sorted(aliases)}; found multiple matches"
+            )
+        found = str(key)
+
+    if found is not None:
+        return found
+    elif required:
         raise KeyError(
-            f"Expected exactly one {name} key among {sorted(aliases)}; found {matches}"
-        )
-    if required:
-        raise KeyError(
-            f"Expected exactly one {name} key among {sorted(aliases)}; found {matches or 'none'}"
+            f"Expected exactly one {name} key among {sorted(aliases)}; found none"
         )
     return None
 
@@ -94,9 +99,11 @@ def get_feature_key(data: Any) -> str:
 
 
 def get_label_key(
-    data: Any, *args: Any, required: bool = True
+    data: Any,
+    *args: Any,
+    required: bool = True,
 ) -> Optional[str]:
-    del args
+    _ = args
     return _resolve_key(data, _LABEL_KEY_ALIASES, "label", required)
 
 
@@ -107,7 +114,7 @@ def canonicalize_keys_(
     y_key: str = "Y",
     allow_missing_labels: bool = False,
 ) -> TensorDictBase:
-    del args
+    _ = args
     if not isinstance(td, TensorDictBase):
         raise TypeError("canonicalize_keys_ expects a TensorDict")
     fkey = get_feature_key(td)
@@ -126,7 +133,7 @@ def get_row(
     *args: Any,
     labels_required: bool = False,
 ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
-    del args
+    _ = args
     return data[get_feature_key(data)], (
         data[l]
         if (l := get_label_key(data, required=labels_required))
@@ -216,11 +223,16 @@ def _coerce_str_choice(
     aliases: dict[str, set[str]],
     default: str,
 ) -> str:
-    if isinstance(value, str):
-        normalized = value.strip().lower()
-        for canonical, candidates in aliases.items():
-            if normalized in candidates:
+    if not isinstance(value, str):
+        return default
+
+    normalized = value.strip().lower()
+    for canonical, candidates in aliases.items():
+        match normalized:
+            case candidate if candidate in candidates:
                 return canonical
+            case _:
+                continue
     return default
 
 
@@ -247,9 +259,11 @@ def _coerce_prediction_overwrite(overwrite: object) -> str:
 
 
 def _coerce_prediction_path(
-    path: PathLike, *args: Any, run_id: str
+    path: PathLike,
+    *args: Any,
+    run_id: str,
 ) -> Optional[str]:
-    del args
+    _ = args
     p = Path(str(path))
     if p.suffix.lower() in {".h5", ".hdf5"}:
         return os.fspath(p)
@@ -280,7 +294,7 @@ def _get_prediction_dtype(
     *args: Any,
     default: torch.dtype = torch.float32,
 ) -> torch.dtype:
-    del args
+    _ = args
     manifest_path = os.path.join(os.fspath(chunks_dir), "manifest.json")
     if not os.path.isfile(manifest_path):
         return default
@@ -354,8 +368,13 @@ def _expand_multinode_sources(spec: Any) -> tuple[Any, bool]:
 
 
 def _preload_slice_any(
-    obj: object | None, s: int, e: int, *args: object, name: str
+    obj: object | None,
+    s: int,
+    e: int,
+    *args: Any,
+    name: str,
 ) -> object | None:
+    _ = args, name
     if obj is None:
         return None
     try:
@@ -368,9 +387,10 @@ def _preload_gather_any_preconverted(
     obj: object | None,
     idx_cpu: torch.Tensor,
     idx_np: object | None,
-    *args: object,
+    *args: Any,
     name: str,
 ) -> object | None:
+    _ = args, name
     if obj is None:
         return None
     if torch.is_tensor(obj):
@@ -1928,7 +1948,7 @@ def concat_memory_mapped_tensor(
             "Variable-shaped predictions cannot be assembled into a single dense MemoryMappedTensor. "
             "Please rerun with a fixed output shape."
         )
-    parts = list(manifest.get("parts", []) or [])
+    parts = manifest.get("parts", []) or []
     for part in parts:
         rows_file = os.path.join(chunks_dir, str(part["rows"]))
         pred_file = os.path.join(chunks_dir, str(part["pred"]))
@@ -1965,7 +1985,7 @@ def concat_tensor(
         raise NotImplementedError(
             "Variable-shaped predictions cannot be returned as a single dense Tensor. Please rerun with a fixed output shape."
         )
-    parts = list(manifest.get("parts", []) or [])
+    parts = manifest.get("parts", []) or []
     for part in parts:
         rows_file = os.path.join(chunks_dir, str(part["rows"]))
         pred_file = os.path.join(chunks_dir, str(part["pred"]))
@@ -2035,7 +2055,7 @@ def concat_segment_h5(
             raise NotImplementedError(
                 "Variable-shaped predictions cannot be stored as a dense HDF5 dataset. Please rerun with a fixed output shape."
             )
-        parts = list(manifest.get("parts", []) or [])
+        parts = manifest.get("parts", []) or []
         for part in parts:
             rows_file = os.path.join(chunks_dir, str(part["rows"]))
             pred_file = os.path.join(chunks_dir, str(part["pred"]))
@@ -2186,7 +2206,7 @@ def postprocess(
     path: PathLike | None = None,
     overwrite: str = "error",
 ) -> Any:
-    del args
+    _ = args
     with torch.inference_mode():
         if not bool(source):
             raise ValueError("postprocess: 'source' must be a non-empty path")

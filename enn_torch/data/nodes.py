@@ -161,16 +161,15 @@ def _normalize_device_spec(
 ) -> torch.device | list[torch.device]:
     if isinstance(device, torch.device):
         return device
-    if isinstance(device, str):
+    elif isinstance(device, str):
         return torch.device(device)
-    if isinstance(device, Sequence) and not isinstance(
+    elif isinstance(device, Sequence) and not isinstance(
         device, (str, bytes, bytearray)
     ):
-        devs: list[torch.device] = []
-        for d in device:
-            devs.append(
-                d if isinstance(d, torch.device) else torch.device(str(d))
-            )
+        devs: list[torch.device] = [
+            d if isinstance(d, torch.device) else torch.device(str(d))
+            for d in device
+        ]
         return devs if devs else torch.device("cpu")
     return torch.device(device)
 
@@ -1005,7 +1004,7 @@ class Multiplexer:
             if len(sources) < 1:
                 raise ValueError("sources must be non-empty")
             sources_map: Dict[str, BaseNode] = {}
-            for k, v in dict(sources).items():
+            for k, v in sources.items():
                 kk = str(k)
                 if kk in sources_map:
                     raise ValueError(
@@ -1046,7 +1045,7 @@ class Multiplexer:
                     "weights must be a Mapping[str, float] when sources is a Mapping"
                 )
             w_in: Dict[str, float] = {}
-            for k, v in dict(raw).items():
+            for k, v in raw.items():
                 kk = str(k)
                 if kk in w_in:
                     raise ValueError(
@@ -1080,15 +1079,14 @@ class Multiplexer:
                 raise TypeError(
                     "weights must be a Sequence[float] when sources is a Sequence"
                 )
-            seq = list(raw)
             expected = len(sources_map)
-            if len(seq) != expected:
+            if len(raw) != expected:
                 raise ValueError(
-                    f"weights sequence length mismatch: expected {expected}, got {len(seq)}"
+                    f"weights sequence length mismatch: expected {expected}, got {len(raw)}"
                 )
             w_seq = [
                 _coerce_weight(v, where=f"weights[{i}]")
-                for i, v in enumerate(seq)
+                for i, v in enumerate(raw)
             ]
             if not any((float(v) > 0.0) for v in w_seq):
                 raise ValueError(

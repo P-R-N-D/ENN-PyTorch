@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 from __future__ import annotations
 
 import contextlib
@@ -6,7 +7,7 @@ import logging
 import os
 import sys
 import time
-from typing import Any, Dict, TYPE_CHECKING
+from typing import Any, Dict
 
 import torch
 from ..core.concurrency import Mutex
@@ -21,9 +22,6 @@ from ..core.system import (
     sync_accelerator,
 )
 from ..core.tensor import to_device_recursive, to_torch_tensor, touch_tensors
-
-if TYPE_CHECKING:
-    from ..data.pipeline import Dataset
 
 _LOGGER = logging.getLogger(__name__)
 _ENN_DIAG_MEMPROBE_LOGGED = False
@@ -181,24 +179,25 @@ class BatchThrottler:
 
     def oom_max_retries(self, phase: object) -> int:
         ph = str(phase).strip().lower()
-        if ph == "train":
-            v = env_int(
-                "ENN_OOM_MAX_RETRIES_TRAIN",
-                env_int("ENN_OOM_MAX_RETRIES_PER_BATCH", 4),
-            )
-        elif ph in {"val", "valid", "validation"}:
-            v = env_int(
-                "ENN_OOM_MAX_RETRIES_VAL",
-                env_int("ENN_OOM_MAX_RETRIES_PER_BATCH", 2),
-            )
-        else:
-            v = env_int("ENN_OOM_MAX_RETRIES_PER_BATCH", 3)
+        match ph:
+            case "train":
+                v = env_int(
+                    "ENN_OOM_MAX_RETRIES_TRAIN",
+                    env_int("ENN_OOM_MAX_RETRIES_PER_BATCH", 4),
+                )
+            case "val" | "valid" | "validation":
+                v = env_int(
+                    "ENN_OOM_MAX_RETRIES_VAL",
+                    env_int("ENN_OOM_MAX_RETRIES_PER_BATCH", 2),
+                )
+            case _:
+                v = env_int("ENN_OOM_MAX_RETRIES_PER_BATCH", 3)
         return max(0, int(v))
 
     def get_oom_blocking_time(
         self, oom_try: int, phase: str | None = None
     ) -> float:
-        del phase
+        _ = phase
         try:
             base_ms = float(env_float("ENN_OOM_BACKOFF_BASE_MS", 0.0))
         except Exception:
@@ -223,7 +222,7 @@ class BatchThrottler:
         level: str = "info",
         min_interval_s: float | None = None,
     ) -> None:
-        del args
+        _ = args
         if min_interval_s is None:
             min_interval_s = env_float(
                 "ENN_SAMPLER_SCALE_LOG_MIN_INTERVAL_S", 5.0
@@ -242,10 +241,11 @@ class BatchThrottler:
                 return
             self._scale_log_last_s[key] = float(now)
         try:
-            if str(level).lower() == "debug":
-                logger.debug(str(msg))
-            else:
-                logger.info(str(msg))
+            match str(level).lower():
+                case "debug":
+                    logger.debug(str(msg))
+                case _:
+                    logger.info(str(msg))
         except Exception:
             pass
 
@@ -259,7 +259,7 @@ class BatchScaler:
     def get_sampler_scaler(
         loader: object, *args: Any, max_depth: int = 4
     ) -> object:
-        del args
+        _ = args
         obj = loader
         try:
             depth = max(1, int(max_depth))
@@ -267,11 +267,21 @@ class BatchScaler:
             depth = 4
         for _ in range(depth):
             if obj is None:
-                break
+                return None
             ctl = getattr(obj, "_enn_sampler_scale", None)
             if ctl is not None:
                 return ctl
-            obj = getattr(obj, "_src", None) or getattr(obj, "src", None)
+            obj = next(
+                (
+                    cand
+                    for cand in (
+                        getattr(obj, "_src", None),
+                        getattr(obj, "src", None),
+                    )
+                    if cand is not None
+                ),
+                None,
+            )
         return None
 
     @staticmethod
@@ -606,15 +616,17 @@ class OOMHandler:
     @staticmethod
     def is_batch_skippable(phase: object) -> bool:
         ph = str(phase).strip().lower()
-        if ph == "train":
-            return env_bool(
-                "ENN_OOM_SKIP_TRAIN", env_bool("ENN_OOM_SKIP_BATCH", True)
-            )
-        if ph in {"val", "valid", "validation"}:
-            return env_bool(
-                "ENN_OOM_SKIP_VAL", env_bool("ENN_OOM_SKIP_BATCH", True)
-            )
-        return env_bool("ENN_OOM_SKIP_BATCH", True)
+        match ph:
+            case "train":
+                return env_bool(
+                    "ENN_OOM_SKIP_TRAIN", env_bool("ENN_OOM_SKIP_BATCH", True)
+                )
+            case "val" | "valid" | "validation":
+                return env_bool(
+                    "ENN_OOM_SKIP_VAL", env_bool("ENN_OOM_SKIP_BATCH", True)
+                )
+            case _:
+                return env_bool("ENN_OOM_SKIP_BATCH", True)
 
     def recover_oom(
         self,
@@ -629,7 +641,7 @@ class OOMHandler:
         grad_accum_steps: int | None = None,
         min_grad_accum: int = 1,
     ) -> tuple[str, int | None]:
-        del args
+        _ = args
         try:
             from .distributed import broadcast_scalar
         except Exception:

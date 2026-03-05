@@ -67,17 +67,25 @@ _LAST_TORCH_INTEROP_THREADS: Optional[int] = None
 
 
 def _flatten_args(items: Sequence[Any]) -> Iterator[Any]:
-    for item in items:
-        if isinstance(item, dict):
-            yield from _flatten_args(list(item.values()))
-        elif isinstance(item, (list, tuple, set)):
-            yield from _flatten_args(list(item))
-        else:
-            yield item
+    stack: list[Iterator[Any]] = [iter(items)]
+    while stack:
+        try:
+            item = next(stack[-1])
+        except StopIteration:
+            stack.pop()
+            continue
+
+        match item:
+            case dict():
+                stack.append(iter(item.values()))
+            case list() | tuple() | set():
+                stack.append(iter(item))
+            case _:
+                yield item
 
 
 def _get_throttle_state() -> str:
-    s = (
+    state = (
         str(
             env_first(
                 (
@@ -92,11 +100,13 @@ def _get_throttle_state() -> str:
         .strip()
         .lower()
     )
-    return (
-        "sync"
-        if s in {"sync", "synchronous"}
-        else ("raise" if s in {"raise", "error"} else "block")
-    )
+    match state:
+        case "sync" | "synchronous":
+            return "sync"
+        case "raise" | "error":
+            return "raise"
+        case _:
+            return "block"
 
 
 def _get_throttle_timeout() -> float:
@@ -490,7 +500,6 @@ def _set_current_thread_affinity(cores: Sequence[int]) -> None:
             tid = int(threading.get_native_id())
             if tid > 0:
                 os.sched_setaffinity(tid, {int(c) for c in cores})
-    return
 
 
 def _set_current_process_affinity(cores: Sequence[int]) -> None:
@@ -499,7 +508,6 @@ def _set_current_process_affinity(cores: Sequence[int]) -> None:
     if sys.platform.startswith("linux"):
         with contextlib.suppress(Exception):
             os.sched_setaffinity(0, {int(c) for c in cores})
-    return
 
 
 def _executor_thread_initializer(
@@ -863,11 +871,11 @@ def close(obj: Any, *args: Any, join_timeout: float | None = 1.0) -> None:
     ):
         if callable(fn := getattr(obj, name, None)):
             with contextlib.suppress(Exception):
-                (
-                    fn(timeout=float(join_timeout))
-                    if name == "join" and join_timeout is not None
-                    else fn()
-                )
+                match name:
+                    case "join" if join_timeout is not None:
+                        fn(timeout=float(join_timeout))
+                    case _:
+                        fn()
             return
     with contextlib.suppress(Exception):
         obj() if callable(obj) else None
@@ -1190,7 +1198,7 @@ class TensorPagePool:
         with contextlib.suppress(Exception):
             if isinstance(evt, _QueryEvent):
                 return bool(evt.query())
-            if callable(is_set := getattr(evt, "is_set", None)):
+            elif callable(is_set := getattr(evt, "is_set", None)):
                 return bool(is_set())
         return False
 

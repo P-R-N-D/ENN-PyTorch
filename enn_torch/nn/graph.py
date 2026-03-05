@@ -11,7 +11,7 @@ import warnings
 import weakref
 from contextlib import AbstractContextManager, nullcontext, suppress
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, Iterator, List, Optional, Self, Sequence
+from typing import Any, Callable, Dict, Iterator, Optional, Self, Sequence
 
 import torch
 from ..core.concurrency import Mutex
@@ -106,7 +106,7 @@ def _is_compiled_for_inference(model: torch.nn.Module) -> bool:
             pass
         return True
     jit = getattr(torch, "jit", None)
-    script_like_types: List[type] = []
+    script_like_types: list[type] = []
     if jit is not None:
         for name in (
             "ScriptModule",
@@ -517,7 +517,7 @@ def compile(
     disable: bool = False,
     **kwargs: Any,
 ) -> nn.Module:
-    del args
+    _ = args
     if disable:
         return module
     canonical_mode = canonicalize_compile_mode(mode)
@@ -1453,7 +1453,7 @@ class GraphSequential(nn.Module):
         root: nn.Module | None = None,
     ) -> None:
         super().__init__()
-        del args
+        _ = args
         self._name = str(name or "subgraph")
         self._owned = nn.ModuleList()
         self._refs_materialized = False
@@ -1528,16 +1528,20 @@ class GraphSequential(nn.Module):
 
     @staticmethod
     def ref(
-        module: nn.Module, *args: Any, name: str | None = None
+        module: nn.Module,
+        *args: Any,
+        name: str | None = None,
     ) -> BorrowedModule:
-        del args
+        _ = args
         return BorrowedModule(module=module, name=name)
 
     @staticmethod
     def own(
-        module: nn.Module, *args: Any, name: str | None = None
+        module: nn.Module,
+        *args: Any,
+        name: str | None = None,
     ) -> OwnedModule:
-        del args
+        _ = args
         return OwnedModule(module=module, name=name)
 
     @staticmethod
@@ -1545,8 +1549,12 @@ class GraphSequential(nn.Module):
         return ModulePath(path=str(path), name=name)
 
     @staticmethod
-    def mean(dim: int = 1, *args: Any, keepdim: bool = False) -> OwnedModule:
-        del args
+    def mean(
+        dim: int = 1,
+        *args: Any,
+        keepdim: bool = False,
+    ) -> OwnedModule:
+        _ = args
         return OwnedModule(
             module=ReduceMean(dim=int(dim), keepdim=bool(keepdim)), name="mean"
         )
@@ -1802,16 +1810,16 @@ class GraphSequential(nn.Module):
     def _parse_step(
         raw: object,
     ) -> tuple[object, tuple[Any, ...], dict[str, Any]]:
-        if isinstance(raw, (tuple, list)):
-            if len(raw) == 2 and isinstance(raw[1], dict):
-                return raw[0], (), dict(raw[1])
-            if (
-                len(raw) == 3
-                and isinstance(raw[1], (tuple, list))
-                and isinstance(raw[2], dict)
+        match raw:
+            case (step, kwargs) | [step, kwargs] if isinstance(kwargs, dict):
+                return step, (), dict(kwargs)
+            case (step, extra_args, kwargs) | [step, extra_args, kwargs] if (
+                isinstance(extra_args, (tuple, list))
+                and isinstance(kwargs, dict)
             ):
-                return raw[0], tuple(raw[1]), dict(raw[2])
-        return raw, (), {}
+                return step, tuple(extra_args), dict(kwargs)
+            case _:
+                return raw, (), {}
 
     @staticmethod
     def _split_step(
@@ -1849,7 +1857,7 @@ class GraphSequential(nn.Module):
     ) -> tuple[str | None, object | None]:
         if out_shape is None:
             return None, None
-        if isinstance(out_shape, dict):
+        elif isinstance(out_shape, dict):
             spec: dict[str, object] = {}
             for k, v in out_shape.items():
                 if v is None:
@@ -1857,7 +1865,7 @@ class GraphSequential(nn.Module):
                 else:
                     spec[str(k)] = tuple(int(x) for x in v)
             return "dict", spec
-        if (
+        elif (
             isinstance(out_shape, (list, tuple))
             and out_shape
             and isinstance(out_shape[0], (list, tuple, type(None)))

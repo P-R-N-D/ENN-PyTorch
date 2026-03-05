@@ -60,10 +60,10 @@ def has_meta_or_fake_tensors(state_dict: object) -> bool:
         items = None
     if not items:
         return False
-    for _, v in items:
-        if torch.is_tensor(v) and is_meta_or_fake_tensor(v):
-            return True
-    return False
+    return any(
+        torch.is_tensor(value) and is_meta_or_fake_tensor(value)
+        for _, value in items
+    )
 
 
 @contextlib.contextmanager
@@ -742,7 +742,7 @@ def _pad_sample(
 
 
 def _onnx_options(kwargs: object, *args: Any, target: str = "onnx") -> object:
-    del args
+    _ = args
     target_l = str(target or "onnx").strip().lower()
     defaults = {
         "tensorrt": (18, True, True, True, []),
@@ -750,8 +750,11 @@ def _onnx_options(kwargs: object, *args: Any, target: str = "onnx") -> object:
         "default": (18, False, True, False, []),
     }
     key = target_l.replace("-", "").replace("_", "")
-    if key == "trt":
-        key = "tensorrt"
+    match key:
+        case "trt":
+            key = "tensorrt"
+        case _:
+            pass
     d_opset, d_dyn, d_pref, d_simp, d_fb = defaults.get(
         target_l, defaults.get(key, defaults["default"])
     )
@@ -779,14 +782,15 @@ def _onnx_options(kwargs: object, *args: Any, target: str = "onnx") -> object:
 
     opset = int(kwargs.get("opset_version", d_opset))
     fb = kwargs.get("opset_fallback", d_fb)
-    if not fb:
-        fallback: list[int] = []
-    elif isinstance(fb, str):
-        fallback = [int(x) for x in re.split(r"[\s,]+", fb) if x]
-    elif isinstance(fb, (list, tuple)):
-        fallback = [int(x) for x in fb]
-    else:
-        fallback = [int(fb)]
+    match fb:
+        case None | False:
+            fallback = []
+        case str():
+            fallback = [int(x) for x in re.split(r"[\s,]+", fb) if x]
+        case list() | tuple():
+            fallback = [int(x) for x in fb]
+        case _:
+            fallback = [int(fb)]
     clean_fb: list[int] = []
     for v in fallback:
         iv = int(v)
@@ -1519,7 +1523,7 @@ class TorchInductor(Format):
         *args: Any,
         **kwargs: Any,
     ) -> object:
-        del args
+        _ = args
         try:
             import torch.export
 
@@ -1599,7 +1603,7 @@ class TorchExport(Format):
         *args: Any,
         **kwargs: Any,
     ) -> object:
-        del args
+        _ = args
         try:
             import torch.export
 
@@ -1871,7 +1875,7 @@ class TensorRT(Format):
         *args: Any,
         **kwargs: Any,
     ) -> object:
-        del args
+        _ = args
         dst = Path(dst)
         if not torch.cuda.is_available():
             raise ImportError(
@@ -2139,7 +2143,7 @@ class LiteRT(Format):
         *args: Any,
         **kwargs: Any,
     ) -> object:
-        del args
+        _ = args
         dst = Path(dst)
         prefer_ai_edge = bool(
             kwargs.get(
@@ -2230,7 +2234,7 @@ class TensorFlow(Format):
         *args: Any,
         **kwargs: Any,
     ) -> object:
-        del args
+        _ = args
         is_required("onnx2tf", "pip install onnx2tf")
         dst = Path(dst)
         suffix = dst.suffix.lower()

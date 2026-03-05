@@ -60,11 +60,15 @@ _LOGGER = logging.getLogger(__name__)
 
 
 def _env_flag(key: str, default: bool = False) -> bool:
-    v = os.environ.get(key, None)
-    if v is None:
+    value = os.environ.get(key, None)
+    if value is None:
         return bool(default)
-    s = str(v).strip().lower()
-    return s in ("1", "true", "t", "yes", "y", "on")
+
+    match str(value).strip().lower():
+        case "1" | "true" | "t" | "yes" | "y" | "on":
+            return True
+        case _:
+            return False
 
 
 @functools.lru_cache(maxsize=8)
@@ -187,12 +191,14 @@ def __getattr__(name: str) -> Any:
         lock = g.get(name, None)
         if lock is not None:
             return lock
+
         with _LAZY_LOCK_INIT_LOCK:
             lock = g.get(name, None)
             if lock is None:
                 lock = threading.Lock()
                 g[name] = lock
         return lock
+
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
@@ -298,7 +304,7 @@ def _log_msg(
             if logger
             else getattr(_LOGGER, level)(msg)
         )
-    except:
+    except Exception:
         getattr(_LOGGER, level)(msg)
 
 
@@ -888,34 +894,28 @@ def available_device_memory(
         if total_b is not None and int(total_b) > 0 and free_b is not None:
             used_b = max(0, int(total_b) - int(free_b))
             return 100.0 * float(used_b) / float(total_b)
-    except:
+    except Exception:
         pass
 
     try:
         mod = _acc_mod(dev.type)
-        if dev.type == "cuda":
-            props = _call(mod.get_device_properties, dev.index or 0)
-            total, used = (
-                getattr(props, "total_memory", 0),
-                _call(mod.memory_allocated, dev),
-            )
-        elif dev.type == "xpu":
-            props = _call(mod.get_device_properties, dev.index or 0)
-            total, used = (
-                getattr(props, "total_memory", 0),
-                _call(mod.memory_allocated, dev),
-            )
-        elif dev.type == "mps":
-            total, used = (
-                _call(mod.recommended_max_memory),
-                _call(mod.current_allocated_memory),
-            )
-        else:
-            return None
+        match dev.type:
+            case "cuda" | "xpu":
+                props = _call(mod.get_device_properties, dev.index or 0)
+                total, used = (
+                    getattr(props, "total_memory", 0),
+                    _call(mod.memory_allocated, dev),
+                )
+            case "mps":
+                total, used = (
+                    _call(mod.recommended_max_memory),
+                    _call(mod.current_allocated_memory),
+                )
+            case _:
+                return None
         return (100.0 * used / total) if total and used is not None else None
-    except:
+    except Exception:
         return None
-    return None
 
 
 def available_accelerator_memory(
@@ -937,15 +937,18 @@ def available_accelerator_memory(
         return None
     mod = _acc_mod(dev.type)
     try:
-        if dev.type in ("cuda", "xpu"):
-            props = _call(
-                mod.get_device_properties,
-                dev.index if dev.index is not None else 0,
-            )
-            return int(props.total_memory) if props else None
-        if dev.type == "mps":
-            return int(_call(mod.recommended_max_memory))
-    except:
+        match dev.type:
+            case "cuda" | "xpu":
+                props = _call(
+                    mod.get_device_properties,
+                    dev.index if dev.index is not None else 0,
+                )
+                return int(props.total_memory) if props else None
+            case "mps":
+                return int(_call(mod.recommended_max_memory))
+            case _:
+                return None
+    except Exception:
         pass
     return None
 
@@ -971,7 +974,6 @@ def allocated_accelerator_memory(
         v = _call(mod.memory_allocated, dev)
 
     return max(0, int(v)) if v is not None else None
-    return None
 
 
 def flush_accelerator_memory_stats(device: Union[torch.device, str]) -> None:
@@ -1014,7 +1016,6 @@ def accelerator_max_allocated_memory(
         v = _call(mod.max_memory_allocated, dev)
 
     return max(0, int(v)) if v is not None else None
-    return None
 
 
 def collect_accelerator_ipc() -> None:
@@ -1053,7 +1054,7 @@ def sync_accelerator(device: Union[torch.device, str]) -> None:
                 _call(mod.synchronize)
             else:
                 _call(mod.synchronize, dev)
-    except:
+    except Exception:
         pass
 
 
@@ -1187,7 +1188,7 @@ def current_accelerator_stream(device: torch.device) -> object | None:
             if mod and hasattr(mod, "current_stream")
             else None
         )
-    except:
+    except Exception:
         return None
 
 
@@ -1353,7 +1354,7 @@ def get_runtime_cfg() -> SimpleNamespace:
 
 
 @contextlib.contextmanager
-def runtime_cfg_override(**kwargs: object):
+def runtime_cfg_override(**kwargs: Any):
     if not kwargs:
         yield get_runtime_cfg()
         return
@@ -1372,7 +1373,7 @@ def set_runtime_cfg(
     key: str | dict[str, object] | None = None,
     value: object | None = None,
     /,
-    **kwargs: object,
+    **kwargs: Any,
 ) -> SimpleNamespace:
     cfg = _RUNTIME_CFG
 

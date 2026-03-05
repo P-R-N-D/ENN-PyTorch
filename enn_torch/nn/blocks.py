@@ -6,7 +6,7 @@ import logging
 import os
 import warnings
 from importlib import import_module
-from typing import Any, Callable, Dict, List, Optional, Self, Sequence, Tuple
+from typing import Any, Callable, Dict, Optional, Self, Sequence, Tuple
 
 import torch
 import torch.nn as nn
@@ -16,8 +16,21 @@ from ..core.datatypes import env_bool, env_int
 from ..runtime.autobatch import diag_emit
 from ..runtime.distributed import _from_hsdp_module
 from .activations import GeGLU
-from .graph import coerce_checkpoint, is_checkpoint, is_export_or_trace, is_symbolic, canonicalize_compile_mode, torch_compiler_disable
-from .layers import CrossAttention, DilatedAttention, LatentAttention, Retention, norm_layer
+from .graph import (
+    canonicalize_compile_mode,
+    coerce_checkpoint,
+    is_checkpoint,
+    is_export_or_trace,
+    is_symbolic,
+    torch_compiler_disable,
+)
+from .layers import (
+    CrossAttention,
+    DilatedAttention,
+    LatentAttention,
+    Retention,
+    norm_layer,
+)
 _LOGGER = logging.getLogger(__name__)
 _ENN_DIAG_MICROBATCH_LOGGED = False
 _PRESET_ALIASES: dict[str, str] = {
@@ -198,7 +211,10 @@ _ENN_COERCE_NONFINITE_DUMPED: int = 0
 
 
 def _coerce_tensor(
-    t: torch.Tensor, *args: object, enabled: bool, inplace: bool
+    t: torch.Tensor,
+    *args: Any,
+    enabled: bool,
+    inplace: bool,
 ) -> torch.Tensor:
     if (not enabled) or (not (t.is_floating_point() or t.is_complex())):
         return t
@@ -274,7 +290,7 @@ def _prealloc_microbatch(
     inp: torch.Tensor,
     microbatch: int,
     run_fn: Callable[[torch.Tensor], torch.Tensor | Sequence[torch.Tensor]],
-    *args: object,
+    *args: Any,
     pad_to: Optional[int] = None,
     out_dtype: Optional[torch.dtype] = None,
     cast_slice: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
@@ -282,6 +298,7 @@ def _prealloc_microbatch(
     static_in_zero: bool = True,
     stage: str = "microbatch",
 ) -> torch.Tensor | tuple[torch.Tensor, ...]:
+    _ = args
     if inp.ndim < 1:
         raise ValueError(f"{stage}: expected batched input, got {inp.shape}")
     total_b = int(inp.shape[0])
@@ -427,7 +444,7 @@ class Perceiver(nn.Module):
             drop_path: float,
         ) -> None:
             super().__init__()
-            del args
+            _ = args
             if d_model % nhead != 0:
                 raise ValueError(
                     f"d_model ({d_model}) must be divisible by nhead ({nhead})"
@@ -465,7 +482,7 @@ class Perceiver(nn.Module):
             prefix: str,
             *args: Any,
         ) -> None:
-            del args
+            _ = args
             did_remap = False
             legacy_roots = ("norm1", "qkv", "out_proj")
             for root in legacy_roots:
@@ -510,7 +527,7 @@ class Perceiver(nn.Module):
             **kwargs: Any,
         ) -> None:
             super().__init__()
-            del args, kwargs
+            _ = args, kwargs
             self.d_model = int(d_model)
             self.nhead = int(nhead)
             if self.d_model % max(1, self.nhead) != 0:
@@ -552,7 +569,7 @@ class Perceiver(nn.Module):
             prefix: str,
             *args: Any,
         ) -> None:
-            del args
+            _ = args
             did_remap = False
             legacy_roots = (
                 "q_proj",
@@ -604,7 +621,7 @@ class Perceiver(nn.Module):
         prefix: str,
         *args: Any,
     ) -> None:
-        del state_dict
+        _ = state_dict
         setattr(module, "_enn_load_prefix", prefix)
         strict: Optional[bool] = None
         if len(args) >= 2 and isinstance(args[1], bool):
@@ -668,7 +685,7 @@ class Perceiver(nn.Module):
         **kwargs: Any,
     ) -> None:
         super().__init__()
-        del args, kwargs
+        _ = args, kwargs
         self.d_model = int(d_model)
         self.nhead = int(nhead)
         self.num_latents = max(1, int(num_latents))

@@ -15,7 +15,11 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Mapping, Optional, Self, Tuple, Union
 
 import torch
-from ..core.datatypes import default_underflow_action, normalize_underflow_action, env_bool
+from ..core.datatypes import (
+    default_underflow_action,
+    env_bool,
+    normalize_underflow_action,
+)
 from ..nn.graph import clear_model_cache
 from .concurrency import Mutex
 from .system import (
@@ -40,19 +44,20 @@ _qp = None
 
 
 def _env_disable_fp8() -> bool:
-    v = os.getenv("ENN_DISABLE_FP8")
-    if v is None:
-        return False
-    return v.strip().lower() in ("1", "true", "yes", "y", "on")
+    return bool(env_bool("ENN_DISABLE_FP8", default=False))
 
 
 def __getattr__(name: str) -> Any:
-    if name == "PrecisionPolicy":
-        raise AttributeError(
-            "PrecisionPolicy has moved to enn_torch.core.policies; "
-            "import it from that module instead."
-        )
-    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    match name:
+        case "PrecisionPolicy":
+            raise AttributeError(
+                "PrecisionPolicy has moved to enn_torch.core.policies; "
+                "import it from that module instead."
+            )
+        case _:
+            raise AttributeError(
+                f"module {__name__!r} has no attribute {name!r}"
+            )
 
 
 def _import_torchao_quantization() -> None:
@@ -154,7 +159,7 @@ def _to_serializable(x: Any) -> Any:
         return x
     try:
         return float(x)
-    except:
+    except (TypeError, ValueError):
         return str(x)
 
 
@@ -199,11 +204,12 @@ def _validate_dtype_safety(
     underflow_action: Optional[str] = None,
     **kwargs: Any,
 ) -> Tuple[bool, str]:
+    _ = args, kwargs
     if not (meta and getattr(meta, "has_scale", False)):
         return True, "no-scale"
-    if not isinstance(dtype, torch.dtype):
+    elif not isinstance(dtype, torch.dtype):
         return False, "not-dtype"
-    if getattr(meta, "has_nonfinite", False):
+    elif getattr(meta, "has_nonfinite", False):
         return False, "nonfinite-data"
 
     max_abs = getattr(meta, "scale_max_abs", None)
@@ -214,7 +220,7 @@ def _validate_dtype_safety(
             return False, "no-scale-range"
         try:
             mn_f, mx_f = float(mn), float(mx)
-        except:
+        except (TypeError, ValueError):
             return False, "minmax-not-float"
         if not (math.isfinite(mn_f) and math.isfinite(mx_f)):
             return False, "minmax-nonfinite"
@@ -222,7 +228,7 @@ def _validate_dtype_safety(
     else:
         try:
             max_abs_f = float(abs(max_abs))
-        except:
+        except (TypeError, ValueError):
             return False, "max-abs-not-float"
         if not math.isfinite(max_abs_f):
             return False, "max-abs-nonfinite"
@@ -256,7 +262,7 @@ def _validate_dtype_safety(
         ):
             try:
                 mp_f = float(mp)
-            except:
+            except (TypeError, ValueError):
                 return False, "min-pos-not-float"
             if (
                 math.isfinite(mp_f)
@@ -288,7 +294,7 @@ def _validate_dtype_safety(
     ) is not None:
         try:
             mn_f, mx_f = float(mn), float(mx)
-        except:
+        except (TypeError, ValueError):
             return False, "int-minmax-not-float"
         if mn_f < float(info.min) or mx_f > float(info.max):
             return (
@@ -488,13 +494,14 @@ class StatelessAutocast:
     def _fp8_backend(
         cls: type[Self],
         pref: Optional[str],
-        *args: object,
+        *args: Any,
         device: Optional[torch.device] = None,
-        **kwargs: object,
+        **kwargs: Any,
     ) -> Optional[str]:
+        _ = args, kwargs
         if _env_disable_fp8():
             return None
-        if isinstance(pref, str) and pref.strip().lower() in {
+        elif isinstance(pref, str) and pref.strip().lower() in {
             "off",
             "none",
             "disabled",
@@ -507,10 +514,11 @@ class StatelessAutocast:
     def _int_backend(
         cls: type[Self],
         pref: Optional[str],
-        *args: object,
+        *args: Any,
         device: Optional[torch.device] = None,
-        **kwargs: object,
+        **kwargs: Any,
     ) -> Optional[str]:
+        _ = pref, args, device, kwargs
         cls._preferred_int_backend = "ao"
         return "ao"
 

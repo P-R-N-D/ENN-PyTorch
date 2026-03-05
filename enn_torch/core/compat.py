@@ -7,12 +7,13 @@ from types import ModuleType
 from typing import Any, Iterator, Self
 
 import torch
+from torch import nn
+
 from ..nn.graph import compile_distributed_safe
 from .concurrency import Mutex
-from torch import nn
+
 _PATCH_LOCK = Mutex(reentrant=True)
 _TORCH_COMPAT: TorchCompat | None = None
-RMSNorm = getattr(nn, "RMSNorm", None)
 
 
 def _fmin_impl(
@@ -31,15 +32,26 @@ def _nan_mm_impl(
     op: str,
     fill: float | str,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    kwargs: dict[str, Any] = (
+        {"dim": dim, "keepdim": keepdim} if dim is not None else {}
+    )
     if isinstance(x, torch.Tensor) and not tm.is_floating_point(x):
-        return getattr(x, op)(
-            **({"dim": dim, "keepdim": keepdim} if dim is not None else {})
-        )
+        return getattr(x, op)(**kwargs)
+
+    match op:
+        case "min" | "max":
+            pass
+        case _:
+            msg = f"Unsupported reduction operator: {op}"
+            raise ValueError(msg)
+
     mask = tm.isfinite(x)
     xp = tm.where(mask, x, tm.full_like(x, float(fill)))
+
     if dim is None:
         res = getattr(xp, op)()
         return tm.where(mask.any(), res, tm.full_like(res, float("nan")))
+
     val, idx = getattr(xp, op)(dim=dim, keepdim=keepdim)
     valid = mask.any(dim=dim, keepdim=keepdim)
     return tm.where(valid, val, tm.full_like(val, float("nan"))), tm.where(
@@ -70,10 +82,11 @@ def _nansum_impl(
     x: torch.Tensor,
     dim: int | None = None,
     keepdim: bool = False,
-    *args: object,
+    *args: Any,
     dtype: torch.dtype | str | None = None,
-    **kwargs: object,
+    **kwargs: Any,
 ) -> torch.Tensor:
+    _ = args
     if dtype and not isinstance(dtype, torch.dtype):
         with suppress(Exception):
             dtype = getattr(torch, str(dtype).split(".")[-1], None)
@@ -136,7 +149,7 @@ class _StochasticDepthFallback(nn.Module):
     def forward(self: Self, x: torch.Tensor) -> torch.Tensor:
         if not self.training or self.p <= 0.0:
             return x
-        if (keep := 1.0 - self.p) <= 0.0:
+        elif (keep := 1.0 - self.p) <= 0.0:
             return torch.zeros_like(x)
         shape = (
             (x.shape[0],) + (1,) * (x.dim() - 1)
@@ -168,17 +181,19 @@ class TorchCompat:
                 setattr(self.nn_module, "RMSNorm", _RMSNormFallback)
             RMSNorm = getattr(self.nn_module, "RMSNorm", None)
 
-            patches = [
+            patches: tuple[tuple[str, Any], ...] = (
                 ("fmin", _fmin_impl),
                 ("nanmin", _nanmin_impl),
                 ("nanmax", _nanmax_impl),
                 ("nansum", _nansum_impl),
-            ]
+            )
             for name, impl in patches:
                 if not hasattr(self.module, name):
                     setattr(self.module, name, partial(impl, self.module))
             compile_distributed_safe()
 
+
+RMSNorm = getattr(nn, "RMSNorm", None)
 
 StochasticDepth = (
     getattr(nn, "StochasticDepth", None) or _StochasticDepthFallback

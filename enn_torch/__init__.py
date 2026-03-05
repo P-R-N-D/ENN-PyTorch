@@ -9,6 +9,7 @@ if TYPE_CHECKING:
 
     from .core.config import ModelConfig
     from .core.config import RuntimeConfig
+    from .nn.embedding import Embedding
     from .nn.wrappers import Model
 
 __all__ = [
@@ -18,8 +19,11 @@ __all__ = [
     "runtime",
     "load_model",
     "load_weights",
+    "new_embedding",
     "new_model",
+    "load_embedding",
     "save_model",
+    "save_embedding",
     "train",
     "predict",
     "ModelConfig",
@@ -39,6 +43,12 @@ def new_model(*args: Any, **kwargs: Any) -> Model:
     return workflows.new_model(*args, **kwargs)
 
 
+def new_embedding(*args: Any, **kwargs: Any) -> Embedding:
+    from .runtime import workflows
+
+    return workflows.new_embedding(*args, **kwargs)
+
+
 def load_model(*args: Any, **kwargs: Any) -> Model:
     from .runtime import workflows
 
@@ -51,10 +61,22 @@ def load_weights(*args: Any, **kwargs: Any) -> object:
     return workflows.load_weights(*args, **kwargs)
 
 
+def load_embedding(*args: Any, **kwargs: Any) -> Embedding:
+    from .runtime import workflows
+
+    return workflows.load_embedding(*args, **kwargs)
+
+
 def save_model(*args: Any, **kwargs: Any) -> str:
     from .runtime import workflows
 
     return workflows.save_model(*args, **kwargs)
+
+
+def save_embedding(*args: Any, **kwargs: Any) -> dict[str, Any]:
+    from .runtime import workflows
+
+    return workflows.save_embedding(*args, **kwargs)
 
 
 def train(*args: Any, **kwargs: Any) -> Model:

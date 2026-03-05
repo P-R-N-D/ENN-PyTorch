@@ -63,12 +63,13 @@ def _coerce_model_averaging(
     _ = args
     if value is None:
         return None
-    if isinstance(value, str):
-        s = value.strip().lower()
-        if s in ("auto", "ema", "swa"):
-            return s
-        if s in ("none", "null", "off", "false", "0", ""):
-            return None
+    elif isinstance(value, str):
+        state = value.strip().lower()
+        match state:
+            case "auto" | "ema" | "swa":
+                return state
+            case "none" | "null" | "off" | "false" | "0" | "":
+                return None
     raise ValueError(
         f"{name} must be one of None|'auto'|'ema'|'swa' (got {value!r})"
     )
@@ -80,32 +81,42 @@ def _coerce_preset(
     _ = args
     if value is None:
         return None
-    if isinstance(value, str):
-        s = value.strip().lower()
-        if s in ("none", "null", "off", "false", "0", ""):
+    elif isinstance(value, str):
+        state = value.strip().lower()
+        if state in ("none", "null", "off", "false", "0", ""):
             return None
-        key = s.replace("_", "-").replace(" ", "-")
-        if key in ("ss", "spatial", "sxs"):
-            return "spatial"
-        if key in ("tt", "temporal", "txt"):
-            return "temporal"
-        if any(x in key for x in ("st", "ts", "spatial", "temporal")):
-            return "spatiotemporal"
+
+        key = state.replace("_", "-").replace(" ", "-")
+        match key:
+            case "ss" | "spatial" | "sxs":
+                return "spatial"
+            case "tt" | "temporal" | "txt":
+                return "temporal"
+            case _ if any(
+                marker in key
+                for marker in ("st", "ts", "spatial", "temporal")
+            ):
+                return "spatiotemporal"
     raise ValueError(
         f"{name} must be one of None|'spatial'|'temporal'|'spatiotemporal' (got {value!r})"
     )
 
+
 def _coerce_bool(value: Any, *args: Any, name: str, **kwargs: Any) -> bool:
+    _ = args, kwargs
     if isinstance(value, bool):
         return value
-    if isinstance(value, (int, float)):
+    elif isinstance(value, (int, float)):
         return bool(value)
-    s = str(value).strip().lower()
-    if s in ("true", "1", "yes", "y", "on", "t"):
-        return True
-    if s in ("false", "0", "no", "n", "off", "f"):
-        return False
-    raise TypeError(f"{name} invalid bool")
+
+    state = str(value).strip().lower()
+    match state:
+        case "true" | "1" | "yes" | "y" | "on" | "t":
+            return True
+        case "false" | "0" | "no" | "n" | "off" | "f":
+            return False
+        case _:
+            raise TypeError(f"{name} invalid bool")
 
 
 def _coerce_num(
@@ -139,6 +150,7 @@ def _coerce_int(
     maximum: Optional[int] = None,
     **kwargs: Any,
 ) -> int:
+    _ = args, kwargs
     return _coerce_num(value, int, name, minimum, maximum)
 
 
@@ -151,6 +163,7 @@ def _coerce_float(
     finite: bool = True,
     **kwargs: Any,
 ) -> float:
+    _ = args, kwargs
     return _coerce_num(value, float, name, minimum, maximum, finite)
 
 
@@ -185,6 +198,7 @@ def _coerce_int_sequence(
     name: str = "out_shape",
     minimum: Optional[int] = None,
 ) -> Tuple[int, ...]:
+    _ = args
     try:
         return tuple(_coerce_num(x, int, name, min=minimum) for x in xs)
     except TypeError as exc:
@@ -240,9 +254,9 @@ def _is_source_spec(obj: Any) -> bool:
 def _effective_source_count(sources: Any) -> int:
     if not sources:
         return 0
-    if isinstance(sources, (list, tuple)) or (
-        isinstance(sources, Mapping) and not _is_source_spec(sources)
-    ):
+    elif isinstance(sources, (list, tuple)):
+        return len(sources)
+    elif isinstance(sources, Mapping) and not _is_source_spec(sources):
         return len(sources)
     return 1
 
@@ -687,13 +701,17 @@ def coerce_runtime_config(
         data = dict(config)
     else:
         raise TypeError("runtime configuration must be RuntimeConfig or dict")
+
     mode_value = data.pop("mode", None)
     if mode_value is None:
         raise ValueError("runtime configuration missing mode")
+
     mode = str(mode_value).lower()
-    if mode not in ("train", "predict", "infer"):
-        raise ValueError(f"invalid runtime mode: {mode_value}")
-    return RuntimeConfig.from_partial(mode=mode, **data)
+    match mode:
+        case "train" | "predict" | "infer":
+            return RuntimeConfig.from_partial(mode=mode, **data)
+        case _:
+            raise ValueError(f"invalid runtime mode: {mode_value}")
 
 
 def runtime_config(

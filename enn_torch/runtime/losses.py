@@ -497,7 +497,14 @@ class CRPSLoss(nn.Module):
             [c for c in candidates if c <= cap] or [candidates[0]]
         )
         row_bytes = max(1, int(B) * int(S) * int(out_elem_size))
-        tgt = 1 if S <= 256 else (2 if S <= 512 else (4 if S <= 1024 else 8))
+        if S <= 256:
+            tgt = 1
+        elif S <= 512:
+            tgt = 2
+        elif S <= 1024:
+            tgt = 4
+        else:
+            tgt = 8
         req = min(S, max(1, (S + tgt - 1) // tgt))
         for budget in allowed:
             if max(1, min(S, int(budget // row_bytes))) >= req:
@@ -512,14 +519,17 @@ class CRPSLoss(nn.Module):
         out_elem_size = max(4, int(samples.element_size()))
         dev = samples.device
         dev_idx = -1
-        if dev.type == "cuda":
-            from .system import get_accelerator_index
+        match dev.type:
+            case "cuda":
+                from .system import get_accelerator_index
 
-            dev_idx = (
-                int(dev.index)
-                if dev.index is not None
-                else int(get_accelerator_index("cuda"))
-            )
+                dev_idx = (
+                    int(dev.index)
+                    if dev.index is not None
+                    else int(get_accelerator_index("cuda"))
+                )
+            case _:
+                pass
         key = (dev.type, dev_idx, int(B), int(S), int(out_elem_size))
         if (
             self._energy_cdist_cache_key == key
@@ -578,11 +588,13 @@ class CRPSLoss(nn.Module):
     def forward(
         self: Self, pred: torch.Tensor, target: torch.Tensor
     ) -> torch.Tensor:
-        return (
-            self._crps_normal(pred, target)
-            if self.mode == "normal"
-            else self._crps_energy(pred, target)
-        )
+        match self.mode:
+            case "normal":
+                return self._crps_normal(pred, target)
+            case "energy":
+                return self._crps_energy(pred, target)
+            case _:
+                raise ValueError(f"Invalid mode {self.mode}")
 
 
 class DistributionLoss(nn.Module):
@@ -675,37 +687,38 @@ class DistributionLoss(nn.Module):
         dims = _canonize_dims(pred, dims)
         red = torch.median if self.skew else torch.mean
 
-        if self.mu_mode == "target":
-            x = target
-        elif self.mu_mode == "pred":
-            x = pred
-        elif self.mu_mode == "error":
-            x = pred - target
-        elif self.mu_mode == "pooled":
-            mu = (
-                0.5
-                * (
-                    _median_over_dims(target, dims)
-                    + _median_over_dims(pred, dims)
+        match self.mu_mode:
+            case "target":
+                x = target
+            case "pred":
+                x = pred
+            case "error":
+                x = pred - target
+            case "pooled":
+                mu = (
+                    0.5
+                    * (
+                        _median_over_dims(target, dims)
+                        + _median_over_dims(pred, dims)
+                    )
+                    if self.skew
+                    else 0.5
+                    * (
+                        target.mean(dim=dims, keepdim=True)
+                        + pred.mean(dim=dims, keepdim=True)
+                    )
                 )
-                if self.skew
-                else 0.5
-                * (
-                    target.mean(dim=dims, keepdim=True)
-                    + pred.mean(dim=dims, keepdim=True)
-                )
-            )
-            return mu.detach() if self.detach_stats else mu
-        elif self.mu_mode == "provided":
-            if self.mu is None:
-                raise ValueError("mu required")
-            mu = self._expand_params(self.mu, pred)
-            return mu.detach() if self.detach_stats else mu
-        elif self.mu_mode == "none":
-            mu = torch.zeros(1, device=pred.device, dtype=pred.dtype)
-            return mu.detach() if self.detach_stats else mu
-        else:
-            raise ValueError(f"Invalid mu_mode {self.mu_mode}")
+                return mu.detach() if self.detach_stats else mu
+            case "provided":
+                if self.mu is None:
+                    raise ValueError("mu required")
+                mu = self._expand_params(self.mu, pred)
+                return mu.detach() if self.detach_stats else mu
+            case "none":
+                mu = torch.zeros(1, device=pred.device, dtype=pred.dtype)
+                return mu.detach() if self.detach_stats else mu
+            case _:
+                raise ValueError(f"Invalid mu_mode {self.mu_mode}")
         mu = (
             _median_over_dims(x, dims)
             if self.skew
@@ -728,21 +741,22 @@ class DistributionLoss(nn.Module):
                 else self._safe_std(t, dims, self.ddof, self.eps)
             )
 
-        if self.std_mode == "target":
-            std = _get_s(target)
-        elif self.std_mode == "pred":
-            std = _get_s(pred)
-        elif self.std_mode == "pooled":
-            st, sp = _get_s(target), _get_s(pred)
-            std = torch.sqrt((0.5 * (st**2 + sp**2)).clamp(min=self.eps**2))
-        elif self.std_mode == "provided":
-            if self.std is None:
-                raise ValueError("std required")
-            std = self._expand_params(self.std, pred)
-        elif self.std_mode == "none":
-            std = torch.ones(1, device=pred.device, dtype=pred.dtype)
-        else:
-            raise ValueError(f"Invalid std_mode {self.std_mode}")
+        match self.std_mode:
+            case "target":
+                std = _get_s(target)
+            case "pred":
+                std = _get_s(pred)
+            case "pooled":
+                st, sp = _get_s(target), _get_s(pred)
+                std = torch.sqrt((0.5 * (st**2 + sp**2)).clamp(min=self.eps**2))
+            case "provided":
+                if self.std is None:
+                    raise ValueError("std required")
+                std = self._expand_params(self.std, pred)
+            case "none":
+                std = torch.ones(1, device=pred.device, dtype=pred.dtype)
+            case _:
+                raise ValueError(f"Invalid std_mode {self.std_mode}")
         if self.detach_stats:
             std = std.detach()
         return torch.clamp(std, min=self.eps)
@@ -767,15 +781,17 @@ class DistributionLoss(nn.Module):
         raise NotImplementedError
 
     def _apply_penalty(self: Self, margin: torch.Tensor) -> torch.Tensor:
-        if self.penalty == "hinge":
-            return torch.clamp(margin, min=0.0).pow(self.hinge_power)
-        if self.penalty == "tau":
-            tau = max(self.tau, self.eps)
-            return F.softplus(margin / tau) * tau
-        if self.penalty in ("soft", "softplus"):
-            beta = max(self.tau, self.eps)
-            return F.softplus(beta * margin) / beta
-        raise ValueError("Invalid penalty")
+        match self.penalty:
+            case "hinge":
+                return torch.clamp(margin, min=0.0).pow(self.hinge_power)
+            case "tau":
+                tau = max(self.tau, self.eps)
+                return F.softplus(margin / tau) * tau
+            case "soft" | "softplus":
+                beta = max(self.tau, self.eps)
+                return F.softplus(beta * margin) / beta
+            case _:
+                raise ValueError("Invalid penalty")
 
     def forward(
         self: Self, pred: torch.Tensor, target: torch.Tensor
@@ -1312,7 +1328,7 @@ class TiledLoss(nn.Module):
         try:
             if self.mask_mode == "finite":
                 return expand_to_pred(torch.isfinite(target), pred)
-            if self.mask_mode == "neq" and self.mask_value is not None:
+            elif self.mask_mode == "neq" and self.mask_value is not None:
                 return expand_to_pred(
                     target != target.new_tensor(self.mask_value), pred
                 )
