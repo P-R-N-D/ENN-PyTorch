@@ -1,42 +1,25 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
-# =============================================================================
-# 1. Standard Library Imports
-# =============================================================================
 import contextlib
 import importlib
 import inspect
 import warnings
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Callable, Mapping
 from functools import partial
-from typing import Any, TypeVar
+from typing import Any, Iterator, TypeVar
 
-# =============================================================================
-# 2. Third-Party Imports
-# =============================================================================
 import torch
-
-# =============================================================================
-# 3. Local Imports
-# =============================================================================
 from .system import is_pin_supported
-
-
-# =============================================================================
-# Globals & Constants
-# =============================================================================
-_T = TypeVar("_T")
-
 try:
     import torch._dynamo as _dynamo
-except ImportError:
+except Exception:
     _dynamo = None
 
 
-# =============================================================================
-# Internal Helpers
-# =============================================================================
+_T = TypeVar("_T")
+
+
 def _optional_attr(
     module: str,
     attr: str,
@@ -49,17 +32,14 @@ def _optional_attr(
             return default
     except Exception:
         return default
-        
     try:
         mod = importlib.import_module(module)
     except Exception:
         return default
-        
     try:
         val = getattr(mod, attr)
     except Exception:
         return default
-        
     if predicate is not None and not predicate(val):
         return default
     return val
@@ -89,41 +69,40 @@ def _call_from_buffer(
         return fn(**kw)
 
 
-# =============================================================================
-# Core Tensor Operations
-# =============================================================================
 def to_torch_tensor(obj: Any) -> torch.Tensor:
-    match obj:
-        case torch.Tensor():
-            return obj
-        case _:
-            for attr in ("to_torch_tensor", "to_torch", "to_tensor", "as_tensor"):
-                with contextlib.suppress(Exception):
-                    fn = getattr(obj, attr, None)
-                    if callable(fn):
-                        t = fn()
-                        if isinstance(t, torch.Tensor):
-                            return t
-                        return torch.as_tensor(t)
-            return torch.as_tensor(obj)
+    if isinstance(obj, torch.Tensor):
+        return obj
+    for attr in ("to_torch_tensor", "to_torch", "to_tensor", "as_tensor"):
+        try:
+            fn = getattr(obj, attr, None)
+        except Exception:
+            fn = None
+        if callable(fn):
+            try:
+                t = fn()
+            except TypeError:
+                continue
+            except Exception:
+                continue
+            if isinstance(t, torch.Tensor):
+                return t
+            try:
+                return torch.as_tensor(t)
+            except Exception:
+                continue
+    return torch.as_tensor(obj)
 
 
 def is_fake_tensor(value: Any) -> bool:
-    match value:
-        case torch.Tensor():
-            if callable(_tdx_is_fake) and (res := _tdx_is_fake(value)):
-                return bool(res)
-            return isinstance(value, FakeTensor)
-        case _:
-            return False
+    if not isinstance(value, torch.Tensor):
+        return False
+    if _tdx_is_fake and (res := _tdx_is_fake(value)):
+        return bool(res)
+    return isinstance(value, FakeTensor)
 
 
 def is_meta_tensor(value: Any) -> bool:
-    match value:
-        case torch.Tensor():
-            return bool(getattr(value, "is_meta", False))
-        case _:
-            return False
+    return isinstance(value, torch.Tensor) and getattr(value, "is_meta", False)
 
 
 def is_meta_or_fake_tensor(value: Any) -> bool:
@@ -132,57 +111,56 @@ def is_meta_or_fake_tensor(value: Any) -> bool:
 
 def validate_no_meta_tensors(module: object) -> None:
     hits: list[str] = []
-    for name, param in getattr(module, "named_parameters", lambda **_: [])(recurse=True):
+    for name, param in getattr(module, "named_parameters", lambda **_: [])(
+        recurse=True
+    ):
         if is_meta_or_fake_tensor(param):
             hits.append(f"param {name} shape={tuple(param.shape)}")
-            
-    for name, buffer in getattr(module, "named_buffers", lambda **_: [])(recurse=True):
+    for name, buffer in getattr(module, "named_buffers", lambda **_: [])(
+        recurse=True
+    ):
         if is_meta_or_fake_tensor(buffer):
             hits.append(f"buffer {name} shape={tuple(buffer.shape)}")
-            
     if hits:
         raise RuntimeError("Found meta tensors in model:\n" + "\n".join(hits))
 
 
-def hook_meta_monitor(module: object, inputs: object, warn_only: object) -> None:
+def hook_meta_monitor(
+    module: object, inputs: object, warn_only: object
+) -> None:
     try:
         iterator = iter(inputs)
-    except TypeError:
+    except Exception:
         iterator = iter(())
-        
     for arg in iterator:
-        match arg:
-            case torch.Tensor() if is_meta_or_fake_tensor(arg):
-                message = f"[META] {module.__class__.__name__} got meta input"
-                if warn_only:
-                    warnings.warn(message, stacklevel=3)
-                    return
-                raise RuntimeError(message)
-            case _:
-                pass
+        if isinstance(arg, torch.Tensor) and is_meta_or_fake_tensor(arg):
+            message = f"[META] {module.__class__.__name__} got meta input"
+            if warn_only:
+                warnings.warn(message, stacklevel=3)
+                return
+            raise RuntimeError(message)
 
 
 def enable_meta_monitor(model: object) -> None:
     try:
         from .datatypes import env_first
-    except ImportError:
+    except Exception:
         env_first = None
 
     mode = "off"
     if callable(env_first):
-        mode = str(env_first(("ENN_META_MONITOR", "ENN_META_HOOK"), default="off") or "off")
-        
+        mode = str(
+            env_first(("ENN_META_MONITOR", "ENN_META_HOOK"), default="off")
+            or "off"
+        )
     mode = mode.strip().lower()
     if mode in {"0", "", "false", "off"}:
         return
-        
     warn_only = mode in {"warn", "warning"}
-    
     try:
-        mods = getattr(model, "modules", lambda: [])()
+        mods = model.modules()
     except Exception:
         mods = ()
-        
     for submodule in mods:
         try:
             submodule.register_forward_pre_hook(
@@ -195,11 +173,13 @@ def enable_meta_monitor(model: object) -> None:
             )
 
 
-def validate_no_fake_dtensor(root: object, *args: object, **kwargs: object) -> None:
+def validate_no_fake_dtensor(
+    root: object, *args: object, **kwargs: object
+) -> None:
     del args, kwargs
     try:
         import torch.nn as nn
-    except ImportError:
+    except Exception:
         nn = None
 
     bad: list[str] = []
@@ -208,7 +188,6 @@ def validate_no_fake_dtensor(root: object, *args: object, **kwargs: object) -> N
             continue
         if nn is None and module.__class__.__name__ != "LayerNorm":
             continue
-            
         for attr in ("weight", "bias"):
             tensor = getattr(module, attr, None)
             if tensor is None:
@@ -216,9 +195,11 @@ def validate_no_fake_dtensor(root: object, *args: object, **kwargs: object) -> N
             if is_meta_or_fake_tensor(tensor):
                 module_name = name or module.__class__.__name__
                 bad.append(f"{module_name}.{attr}{tuple(tensor.shape)}")
-                
     if bad:
-        raise RuntimeError("LayerNorm parameters must be materialized as a real Tensor: " + ", ".join(bad))
+        raise RuntimeError(
+            "LayerNorm parameters must be materialized as a real Tensor: "
+            + ", ".join(bad)
+        )
 
 
 def coerce_tensor(
@@ -227,88 +208,102 @@ def coerce_tensor(
     materialize_meta: bool = True,
     make_contiguous: bool = True,
 ) -> object:
-    match value:
-        case torch.Tensor():
-            t = value.to_local() if hasattr(value, "to_local") else value
-            if materialize_meta and is_meta_or_fake_tensor(t):
-                t = torch.zeros(t.shape, dtype=t.dtype, device="cpu")
-            t = t.detach()
-            if t.device.type != "cpu":
-                t = t.to(device="cpu")
-            if make_contiguous and not t.is_contiguous():
-                t = t.contiguous()
-            return t
-        case list() | tuple():
-            out = [
-                coerce_tensor(v, materialize_meta=materialize_meta, make_contiguous=make_contiguous)
-                for v in value
-            ]
-            return type(value)(*out) if hasattr(value, "_fields") else type(value)(out)
-        case Mapping():
-            return type(value)(
-                (k, coerce_tensor(v, materialize_meta=materialize_meta, make_contiguous=make_contiguous))
-                for k, v in value.items()
+    if isinstance(value, torch.Tensor):
+        t = value.to_local() if hasattr(value, "to_local") else value
+        if materialize_meta and is_meta_or_fake_tensor(t):
+            t = torch.zeros(t.shape, dtype=t.dtype, device="cpu")
+        t = t.detach()
+        if t.device.type != "cpu":
+            t = t.to(device="cpu")
+        if make_contiguous and not t.is_contiguous():
+            t = t.contiguous()
+        return t
+    if isinstance(value, (list, tuple)):
+        out = [
+            coerce_tensor(
+                v,
+                materialize_meta=materialize_meta,
+                make_contiguous=make_contiguous,
             )
-        case _:
-            return value
+            for v in value
+        ]
+        return (
+            type(value)(*out)
+            if hasattr(value, "_fields")
+            else type(value)(out)
+        )
+    if isinstance(value, Mapping):
+        return type(value)(
+            (
+                k,
+                coerce_tensor(
+                    v,
+                    materialize_meta=materialize_meta,
+                    make_contiguous=make_contiguous,
+                ),
+            )
+            for k, v in value.items()
+        )
+    return value
 
 
 def extract_tensor(out: object) -> torch.Tensor:
     def _to_plain(t: torch.Tensor) -> torch.Tensor:
         if _dynamo_is_compiling():
             return t
-        with contextlib.suppress(Exception):
+        try:
             if hasattr(t, "to_local"):
                 tl = t.to_local()
                 if isinstance(tl, torch.Tensor):
                     t = tl
-                    
-        fn_disable = getattr(sys.modules[__name__], "_disable_functional_mode", None)
-        fn_unwrap = getattr(sys.modules[__name__], "_mb_unwrap_functional_tensor", None)
-        
+        except Exception:
+            pass
+        fn_disable = _disable_functional_mode
+        fn_unwrap = _mb_unwrap_functional_tensor
         if callable(fn_disable) and callable(fn_unwrap):
             with contextlib.suppress(Exception):
                 with fn_disable():
                     u = fn_unwrap(t)
                     if isinstance(u, torch.Tensor):
-                        return u
+                        t = u
         return t
 
-    match out:
-        case _ if isinstance(out, TensorDictBase):
-            y = out.get("pred", None)
-            if not isinstance(y, torch.Tensor):
-                y = next((v for v in out.values() if isinstance(v, torch.Tensor)), None)
-            if isinstance(y, torch.Tensor):
-                return _to_plain(y)
-            raise RuntimeError("TensorDict output missing tensors")
-        case torch.Tensor():
-            return _to_plain(out)
-        case tuple() | list() if len(out) > 0:
-            if isinstance(out[0], torch.Tensor):
-                return _to_plain(out[0])
-            y = next((v for v in out if isinstance(v, torch.Tensor)), None)
-            if isinstance(y, torch.Tensor):
-                return _to_plain(y)
-            raise RuntimeError("Sequence output missing tensors")
-        case _:
-            raise RuntimeError(f"Unsupported output type: {type(out)}")
+    if isinstance(out, TensorDictBase):
+        y = out.get("pred", None)
+        if not isinstance(y, torch.Tensor):
+            y = next(
+                (v for v in out.values() if isinstance(v, torch.Tensor)), None
+            )
+        if isinstance(y, torch.Tensor):
+            return _to_plain(y)
+        raise RuntimeError("TensorDict output missing tensors")
+    if isinstance(out, torch.Tensor):
+        return _to_plain(out)
+    if isinstance(out, (tuple, list)) and len(out) > 0:
+        if isinstance(out[0], torch.Tensor):
+            return _to_plain(out[0])
+        y = next((v for v in out if isinstance(v, torch.Tensor)), None)
+        if isinstance(y, torch.Tensor):
+            return _to_plain(y)
+        raise RuntimeError("Sequence output missing tensors")
+    raise RuntimeError(f"Unsupported output type: {type(out)}")
 
 
 def to_tensor_like(x: Any, ref: torch.Tensor) -> torch.Tensor:
-    match x:
-        case torch.Tensor():
-            return x.to(device=ref.device, dtype=ref.dtype)
-        case _:
-            return torch.tensor(x, device=ref.device, dtype=ref.dtype)
+    return (
+        x.to(device=ref.device, dtype=ref.dtype)
+        if torch.is_tensor(x)
+        else torch.tensor(x, device=ref.device, dtype=ref.dtype)
+    )
 
 
 @contextlib.contextmanager
-def from_buffer(*args: Any, coerce_requires_grad: bool = True) -> Iterator[None]:
+def from_buffer(
+    *args: Any, coerce_requires_grad: bool = True
+) -> Iterator[None]:
     if not hasattr(torch, "frombuffer"):
         yield
         return
-        
     _original = torch.frombuffer
 
     def _patched(
@@ -327,21 +322,35 @@ def from_buffer(*args: Any, coerce_requires_grad: bool = True) -> Iterator[None]
             if int(count) == 0:
                 return torch.zeros((0,), dtype=dtype)
             if nbytes <= off:
-                n = int(count) if isinstance(count, int) and int(count) > 0 else 0
+                n = (
+                    int(count)
+                    if isinstance(count, int) and int(count) > 0
+                    else 0
+                )
                 return torch.zeros((n,), dtype=dtype)
             readonly = bool(getattr(mv, "readonly", False))
         except Exception:
             readonly = False
-            
         if readonly:
             with warnings.catch_warnings():
-                warnings.filterwarnings("ignore", message=r".*buffer is not writable.*")
-                return _call_from_buffer(
-                    _original, buffer, dtype=dtype, count=count, offset=offset, requires_grad=requires_grad
+                warnings.filterwarnings(
+                    "ignore", message=r".*buffer is not writable.*"
                 )
-                
+                return _call_from_buffer(
+                    _original,
+                    buffer,
+                    dtype=dtype,
+                    count=count,
+                    offset=offset,
+                    requires_grad=requires_grad,
+                )
         return _call_from_buffer(
-            _original, buffer, dtype=dtype, count=count, offset=offset, requires_grad=requires_grad
+            _original,
+            buffer,
+            dtype=dtype,
+            count=count,
+            offset=offset,
+            requires_grad=requires_grad,
         )
 
     setattr(torch, "frombuffer", _patched)
@@ -352,17 +361,19 @@ def from_buffer(*args: Any, coerce_requires_grad: bool = True) -> Iterator[None]
 
 
 def symint_safe_expand(
-    t: torch.Tensor, target_shape: tuple[object, ...] | list[object] | torch.Size
+    t: torch.Tensor,
+    target_shape: tuple[object, ...] | list[object] | torch.Size,
 ) -> torch.Tensor:
     target = tuple(target_shape)
-    src = tuple(t.shape)
-    if src == target:
+    if tuple(t.shape) == target:
         return t
+    src = tuple(t.shape)
     if len(target) < len(src):
         return t.expand(target)
-        
     src_aligned = (1,) * (len(target) - len(src)) + src
-    sizes: list[object] = [-1 if s_dim == t_dim else t_dim for s_dim, t_dim in zip(src_aligned, target)]
+    sizes: list[object] = []
+    for s_dim, t_dim in zip(src_aligned, target):
+        sizes.append(-1 if s_dim == t_dim else t_dim)
     return t.expand(tuple(sizes))
 
 
@@ -370,41 +381,66 @@ def symint_safe_expand_as(t: torch.Tensor, ref: torch.Tensor) -> torch.Tensor:
     return symint_safe_expand(t, ref.shape)
 
 
+_disable_functional_mode = _optional_attr(
+    "torch._subclasses.functional_tensor",
+    "disable_functional_mode",
+    None,
+    predicate=callable,
+)
+_mb_unwrap_functional_tensor = _optional_attr(
+    "torch._subclasses.functional_tensor",
+    "mb_unwrap_functional_tensor",
+    None,
+    predicate=callable,
+)
+_tdx_is_fake = _optional_attr(
+    "torchdistx.fake", "is_fake", None, predicate=callable
+)
+FakeTensor = _optional_attr(
+    "torch._subclasses.fake_tensor",
+    "FakeTensor",
+    (),
+    predicate=inspect.isclass,
+)
+TensorDictBase = _optional_attr(
+    "tensordict", "TensorDictBase", (), predicate=inspect.isclass
+)
+
+
 def to_device_recursive(obj: object, dev: object) -> object:
-    match obj:
-        case torch.Tensor():
-            dev_type = getattr(dev, "type", None)
-            non_blocking = bool(dev_type and is_pin_supported(str(dev_type)))
-            try:
-                return obj.to(device=dev, non_blocking=non_blocking)
-            except TypeError:
-                return obj.to(device=dev)
-        case _ if isinstance(obj, TensorDictBase):
+    if isinstance(obj, torch.Tensor):
+        dev_type = getattr(dev, "type", None)
+        non_blocking = bool(dev_type and is_pin_supported(str(dev_type)))
+        try:
+            return obj.to(device=dev, non_blocking=non_blocking)
+        except TypeError:
             return obj.to(device=dev)
-        case Mapping():
-            return {k: to_device_recursive(v, dev) for k, v in obj.items()}
-        case list() | tuple():
-            seq = [to_device_recursive(v, dev) for v in obj]
-            return type(obj)(seq)
-        case _:
-            return obj
+    if isinstance(obj, TensorDictBase):
+        return obj.to(device=dev)
+    if isinstance(obj, Mapping):
+        return {k: to_device_recursive(v, dev) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        seq = [to_device_recursive(v, dev) for v in obj]
+        return type(obj)(seq)
+    return obj
 
 
 def touch_tensors(obj: object) -> None:
-    match obj:
-        case torch.Tensor():
-            _ = obj.sum()
-        case _ if isinstance(obj, TensorDictBase):
-            for v in obj.values():
-                touch_tensors(v)
-        case Mapping():
-            for v in obj.values():
-                touch_tensors(v)
-        case list() | tuple():
-            for v in obj:
-                touch_tensors(v)
-        case _:
-            pass
+    if isinstance(obj, torch.Tensor):
+        _ = obj.sum()
+        return
+    if isinstance(obj, TensorDictBase):
+        for v in obj.values():
+            touch_tensors(v)
+        return
+    if isinstance(obj, Mapping):
+        for v in obj.values():
+            touch_tensors(v)
+        return
+    if isinstance(obj, (list, tuple)):
+        for v in obj:
+            touch_tensors(v)
+        return
 
 
 def compute_batch_bytes_per_sample(obj: object) -> tuple[int | None, int]:
@@ -414,58 +450,24 @@ def compute_batch_bytes_per_sample(obj: object) -> tuple[int | None, int]:
 
     while stack:
         o = stack.pop()
-        match o:
-            case torch.Tensor():
-                if o.numel() <= 0:
-                    continue
-                b = int(o.shape[0]) if o.ndim >= 1 else 1
-                if batch_dim is None:
-                    batch_dim = b
-                    
-                one = o[:1] if (o.ndim >= 1 and b > 0) else o.reshape(1, -1)
-                bytes_per_sample += int(one.nelement()) * int(one.element_size())
-            case _ if isinstance(o, TensorDictBase):
-                stack.extend(list(o.values()))
-            case Mapping():
-                stack.extend(list(o.values()))
-            case list() | tuple():
-                stack.extend(list(o))
-            case _:
-                pass
+        if isinstance(o, torch.Tensor):
+            if o.numel() <= 0:
+                continue
+            b = int(o.shape[0]) if o.ndim >= 1 else 1
+            if batch_dim is None:
+                batch_dim = b
+            if o.ndim >= 1 and b > 0:
+                one = o[:1]
+            else:
+                one = o.reshape(1, -1)
+            bytes_per_sample += int(one.nelement()) * int(one.element_size())
+        elif isinstance(o, TensorDictBase):
+            stack.extend(list(o.values()))
+        elif isinstance(o, Mapping):
+            stack.extend(list(o.values()))
+        elif isinstance(o, (list, tuple)):
+            stack.extend(list(o))
 
     if bytes_per_sample <= 0:
         return (None, 0)
     return (batch_dim, bytes_per_sample)
-
-
-# =============================================================================
-# Deferred & Lazy Declarations
-# =============================================================================
-_disable_functional_mode = _optional_attr(
-    "torch._subclasses.functional_tensor",
-    "disable_functional_mode",
-    None,
-    predicate=callable,
-)
-
-_mb_unwrap_functional_tensor = _optional_attr(
-    "torch._subclasses.functional_tensor",
-    "mb_unwrap_functional_tensor",
-    None,
-    predicate=callable,
-)
-
-_tdx_is_fake = _optional_attr(
-    "torchdistx.fake", "is_fake", None, predicate=callable
-)
-
-FakeTensor = _optional_attr(
-    "torch._subclasses.fake_tensor",
-    "FakeTensor",
-    (),
-    predicate=inspect.isclass,
-)
-
-TensorDictBase = _optional_attr(
-    "tensordict", "TensorDictBase", (), predicate=inspect.isclass
-)
