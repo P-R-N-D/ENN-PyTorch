@@ -23,7 +23,7 @@ from ..nn.graph import compile_distributed_safe
 
 
 # =============================================================================
-# Globals & Constants
+# Globals & Constants Constants
 # =============================================================================
 _PATCH_LOCK = Mutex(reentrant=True)
 _TORCH_COMPAT: TorchCompat | None = None
