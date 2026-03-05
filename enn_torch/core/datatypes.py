@@ -1,119 +1,72 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
+# =============================================================================
+# 1. Standard Library Imports
+# =============================================================================
 import contextlib
 import json
 import os
 import tempfile
 from collections.abc import Callable, Sequence
 from pathlib import Path
-from typing import Any, TypeAlias
+from typing import Any, Dict, List, Optional, TypeAlias, Union
 
+# =============================================================================
+# 2. Third-Party Imports
+# =============================================================================
 import numpy
 import torch
+
+
+# =============================================================================
+# Type Aliases
+# =============================================================================
+JsonPrimitive: TypeAlias = Union[str, int, float, bool, None]
+JsonValue: TypeAlias = Union[JsonPrimitive, List["JsonValue"], Dict[str, "JsonValue"]]
+PathLike: TypeAlias = Union[str, os.PathLike[str], Path]
+
+
+# =============================================================================
+# Globals & Constants
+# =============================================================================
 _CANONICAL_DTYPES: dict[str, dict[str, Any]] = {
-    "float64": {
-        "torch": torch.float64,
-        "numpy": numpy.float64,
-        "python": float,
-    },
-    "float32": {
-        "torch": torch.float32,
-        "numpy": numpy.float32,
-        "python": float,
-    },
-    "float16": {
-        "torch": torch.float16,
-        "numpy": numpy.float16,
-        "python": float,
-    },
-    "bfloat16": {
-        "torch": getattr(torch, "bfloat16", torch.float32),
-        "numpy": numpy.float32,
-        "python": float,
-    },
-    "int64": {
-        "torch": torch.int64,
-        "numpy": numpy.int64,
-        "python": int,
-    },
-    "int32": {
-        "torch": torch.int32,
-        "numpy": numpy.int32,
-        "python": int,
-    },
-    "int16": {
-        "torch": torch.int16,
-        "numpy": numpy.int16,
-        "python": int,
-    },
-    "int8": {
-        "torch": torch.int8,
-        "numpy": numpy.int8,
-        "python": int,
-    },
-    "uint8": {
-        "torch": torch.uint8,
-        "numpy": numpy.uint8,
-        "python": int,
-    },
-    "bool": {
-        "torch": torch.bool,
-        "numpy": numpy.bool_,
-        "python": bool,
-    },
+    "float64": {"torch": torch.float64, "numpy": numpy.float64, "python": float},
+    "float32": {"torch": torch.float32, "numpy": numpy.float32, "python": float},
+    "float16": {"torch": torch.float16, "numpy": numpy.float16, "python": float},
+    "bfloat16": {"torch": getattr(torch, "bfloat16", torch.float32), "numpy": numpy.float32, "python": float},
+    "int64": {"torch": torch.int64, "numpy": numpy.int64, "python": int},
+    "int32": {"torch": torch.int32, "numpy": numpy.int32, "python": int},
+    "int16": {"torch": torch.int16, "numpy": numpy.int16, "python": int},
+    "int8": {"torch": torch.int8, "numpy": numpy.int8, "python": int},
+    "uint8": {"torch": torch.uint8, "numpy": numpy.uint8, "python": int},
+    "bool": {"torch": torch.bool, "numpy": numpy.bool_, "python": bool},
 }
-_DEF_UNDERFLOW_ACTIONS = {"allow", "warn", "forbid"}
+
+_DEF_UNDERFLOW_ACTIONS = frozenset({"allow", "warn", "forbid"})
+
 _DTYPE_ALIASES: dict[str, str] = {
-    "float": "float32",
-    "float_": "float32",
-    "double": "float64",
-    "fp64": "float64",
-    "float32": "float32",
-    "fp32": "float32",
-    "float64": "float64",
-    "float16": "float16",
-    "half": "float16",
-    "halffloat": "float16",
-    "fp16": "float16",
-    "boolean": "bool",
-    "bool_": "bool",
-    "bool": "bool",
-    "bf16": "bfloat16",
-    "bfloat16": "bfloat16",
-    "f16": "float16",
-    "f32": "float32",
-    "f64": "float64",
-    "long": "int64",
-    "int": "int32",
-    "short": "int16",
-    "char": "int8",
-    "byte": "uint8",
-    "i8": "int8",
-    "i16": "int16",
-    "i32": "int32",
-    "i64": "int64",
-    "u8": "uint8",
+    "float": "float32", "float_": "float32", "double": "float64", "fp64": "float64",
+    "float32": "float32", "fp32": "float32", "float64": "float64", "float16": "float16",
+    "half": "float16", "halffloat": "float16", "fp16": "float16", "boolean": "bool",
+    "bool_": "bool", "bool": "bool", "bf16": "bfloat16", "bfloat16": "bfloat16",
+    "f16": "float16", "f32": "float32", "f64": "float64", "long": "int64",
+    "int": "int32", "short": "int16", "char": "int8", "byte": "uint8",
+    "i8": "int8", "i16": "int16", "i32": "int32", "i64": "int64", "u8": "uint8",
 }
+
 _PLATFORM_ALIASES: dict[str, str] = {
-    "torch": "torch",
-    "pytorch": "torch",
-    "numpy": "numpy",
-    "np": "numpy",
-    "python": "python",
-    "native": "python",
-    "name": "name",
-    "canonical": "name",
+    "torch": "torch", "pytorch": "torch", "numpy": "numpy", "np": "numpy",
+    "python": "python", "native": "python", "name": "name", "canonical": "name",
 }
+
 _FALSE = frozenset({"0", "false", "no", "n", "off", "disable", "disabled"})
 _TRUE = frozenset({"1", "true", "yes", "y", "on", "enable", "enabled"})
-JsonPrimitive: TypeAlias = str | int | float | bool | None
-JsonValue: TypeAlias = (
-    JsonPrimitive | list["JsonValue"] | dict[str, "JsonValue"]
-)
-PathLike: TypeAlias = str | os.PathLike[str] | Path
 
 
+# =============================================================================
+# Internal Environment & Parsing Helpers
+# =============================================================================
 def _env_cast(name: str, cast: Callable[[str], Any], default: Any) -> Any:
     s = env_str(name)
     if s is None:
@@ -127,50 +80,60 @@ def _env_cast(name: str, cast: Callable[[str], Any], default: Any) -> Any:
 def _env_clean(value: object | None) -> str | None:
     if value is None:
         return None
-    if isinstance(value, (bytes, bytearray)):
-        value = value.decode(errors="ignore")
-    s = str(value).replace("\\r\\n", "\n").replace("\\n", "\n").strip()
+        
+    match value:
+        case bytes() | bytearray():
+            value_str = value.decode(errors="ignore")
+        case _:
+            value_str = str(value)
+            
+    s = value_str.replace("\\r\\n", "\n").replace("\\n", "\n").strip()
     return s or None
 
 
 def _canonical_dtype(src: Any) -> str:
     if src is None:
         raise TypeError("dtype cannot be None")
-    if isinstance(src, torch.dtype):
-        key = str(src)
-    elif isinstance(src, str):
-        key = src
-    elif isinstance(src, numpy.dtype):
-        key = src.name
-    else:
-        try:
-            key = numpy.dtype(src).name
-        except Exception:
+        
+    match src:
+        case torch.dtype():
             key = str(src)
+        case str():
+            key = src
+        case numpy.dtype():
+            key = src.name
+        case _:
+            try:
+                key = numpy.dtype(src).name  # type: ignore
+            except Exception:
+                key = str(src)
+                
     key = key.strip().lower()
+    
     if key.startswith("torch."):
         key = key.split(".", 1)[1]
-    if key.startswith("numpy."):
+    elif key.startswith("numpy."):
         key = key.split(".", 1)[1]
-    if key.startswith("dtype(") and key.endswith(")"):
+    elif key.startswith("dtype(") and key.endswith(")"):
         inner = key[5:].strip("()").strip().strip("'\"")
         if inner:
             key = inner
+            
     key = key.lstrip("<>|=")
     canonical = _DTYPE_ALIASES.get(key, key)
+    
     if canonical not in _CANONICAL_DTYPES:
         raise TypeError(f"unsupported dtype: {src!r} (normalized key={key!r})")
+        
     return canonical
 
 
 @contextlib.contextmanager
-def _atomic_swap(path: PathLike) -> None:
+def _atomic_swap(path: PathLike) -> getattr(contextlib, "AbstractContextManager", Any):
     p = os.fspath(path)
     parent = os.path.dirname(p) or "."
     os.makedirs(parent, exist_ok=True)
-    fd, tmp_name = tempfile.mkstemp(
-        prefix=os.path.basename(p) + ".", suffix=".tmp", dir=parent
-    )
+    fd, tmp_name = tempfile.mkstemp(prefix=os.path.basename(p) + ".", suffix=".tmp", dir=parent)
     os.close(fd)
     try:
         yield tmp_name
@@ -180,19 +143,29 @@ def _atomic_swap(path: PathLike) -> None:
             os.remove(tmp_name)
 
 
+# =============================================================================
+# Public Utility Functions
+# =============================================================================
 def parse_bool(value: object) -> bool | None:
     if value is None:
         return None
-    if isinstance(value, (bytes, bytearray)):
-        value = value.decode(errors="ignore")
-    s = str(value).replace("\\r\\n", "\n").replace("\\n", "\n").strip().lower()
+        
+    match value:
+        case bytes() | bytearray():
+            s = value.decode(errors="ignore").replace("\\r\\n", "\n").replace("\\n", "\n").strip().lower()
+        case _:
+            s = str(value).replace("\\r\\n", "\n").replace("\\n", "\n").strip().lower()
+            
     if not s:
         return None
-    if s in _TRUE:
-        return True
-    if s in _FALSE:
-        return False
-    return None
+        
+    match s:
+        case s_val if s_val in _TRUE:
+            return True
+        case s_val if s_val in _FALSE:
+            return False
+        case _:
+            return None
 
 
 def env_str(name: str, default: str | None = None) -> str | None:
@@ -201,17 +174,13 @@ def env_str(name: str, default: str | None = None) -> str | None:
 
 
 def env_bool(name: str | Sequence[str], default: bool = False) -> bool:
-    raw: object | None
-    if isinstance(name, Sequence) and not isinstance(
-        name, (str, bytes, bytearray)
-    ):
-        raw = env_first(list(name), default=None)
+    if isinstance(name, Sequence) and not isinstance(name, (str, bytes, bytearray)):
+        raw: object | None = env_first(list(name), default=None)
     else:
         raw = os.environ.get(str(name))
+        
     v = parse_bool(raw)
-    if v is None:
-        return bool(default)
-    return bool(v)
+    return bool(v) if v is not None else bool(default)
 
 
 def env_int(name: str, default: int = 0) -> int:
@@ -233,20 +202,21 @@ def env_first(keys: Sequence[str], default: str | None = None) -> str | None:
 def env_flag(*keys: str, default: bool = False) -> bool:
     if not keys:
         return bool(default)
+        
     raw = env_first(keys)
     v = parse_bool(raw)
+    
     if v is not None:
         return bool(v)
     if raw is None:
         return bool(default)
+        
     return bool(str(raw).strip())
 
 
 def env_first_bool(keys: Sequence[str], default: bool = False) -> bool:
     v = parse_bool(env_first(keys))
-    if v is None:
-        return bool(default)
-    return bool(v)
+    return bool(v) if v is not None else bool(default)
 
 
 def env_first_int(keys: Sequence[str], default: int = 0) -> int:
@@ -274,20 +244,20 @@ def to_platform_dtype(src: Any, platform: str) -> Any:
     normalized = _PLATFORM_ALIASES.get(platform_key)
     if normalized is None:
         raise ValueError(f"unsupported platform: {platform!r}")
+        
     canonical = _canonical_dtype(src)
-    if normalized == "name":
-        return canonical
-    mapping = _CANONICAL_DTYPES.get(canonical)
-    if mapping is None:
-        raise TypeError(
-            f"unsupported dtype conversion: {src!r} -> {platform!r}"
-        )
-    try:
-        return mapping[normalized]
-    except KeyError as e:
-        raise TypeError(
-            f"unsupported dtype conversion: {src!r} -> {platform!r}"
-        ) from e
+    
+    match normalized:
+        case "name":
+            return canonical
+        case _:
+            mapping = _CANONICAL_DTYPES.get(canonical)
+            if mapping is None:
+                raise TypeError(f"unsupported dtype conversion: {src!r} -> {platform!r}")
+            try:
+                return mapping[normalized]
+            except KeyError as e:
+                raise TypeError(f"unsupported dtype conversion: {src!r} -> {platform!r}") from e
 
 
 def parse_torch_dtype(src: Any) -> torch.dtype | None:
@@ -295,22 +265,28 @@ def parse_torch_dtype(src: Any) -> torch.dtype | None:
         return None
     if isinstance(src, torch.dtype):
         return src
+        
     try:
         return to_platform_dtype(src, "torch")
     except Exception:
         pass
+        
     try:
         key = str(src).strip()
     except Exception:
         return None
+        
     if not key:
         return None
+        
     if key.startswith("torch."):
         key = key.split(".", 1)[1]
+        
     with contextlib.suppress(Exception):
         dt = getattr(torch, key)
         if isinstance(dt, torch.dtype):
             return dt
+            
     return None
 
 
@@ -329,27 +305,27 @@ def read_json(path: PathLike) -> JsonValue:
 
 
 def coerce_json(obj: object) -> JsonValue:
-    if obj is None or isinstance(obj, (str, int, float, bool)):
-        return obj
-    if isinstance(obj, (torch.device, Path, torch.dtype)):
-        return str(obj)
-    if isinstance(obj, torch.Tensor):
-        return {
-            "__tensor__": True,
-            "shape": list(map(int, obj.shape)),
-            "dtype": str(obj.dtype),
-            "device": str(obj.device),
-        }
-    if isinstance(obj, dict):
-        return {str(k): coerce_json(v) for k, v in obj.items()}
-    if isinstance(obj, (list, tuple, set)):
-        return [coerce_json(v) for v in obj]
-    return str(obj)
+    match obj:
+        case None | str() | int() | float() | bool():
+            return obj
+        case torch.device() | Path() | torch.dtype():
+            return str(obj)
+        case torch.Tensor():
+            return {
+                "__tensor__": True,
+                "shape": list(map(int, obj.shape)),
+                "dtype": str(obj.dtype),
+                "device": str(obj.device),
+            }
+        case dict():
+            return {str(k): coerce_json(v) for k, v in obj.items()} # type: ignore
+        case list() | tuple() | set():
+            return [coerce_json(v) for v in obj] # type: ignore
+        case _:
+            return str(obj)
 
 
-def write_json(
-    path: PathLike, payload: Any, *args: Any, indent: int | None = 2
-) -> None:
+def write_json(path: PathLike, payload: Any, *args: Any, indent: int | None = 2) -> None:
     with _atomic_swap(path) as tmp, open(tmp, "w", encoding="utf-8") as f:
         json.dump(payload, f, indent=indent)
 
@@ -360,25 +336,22 @@ def save_temp(path: PathLike, payload: Any, **opts: Any) -> None:
 
 
 def default_underflow_action() -> str:
-    raw = (
-        str(
-            env_first(
-                ("ENN_DATA_UNDERFLOW_ACTION", "ENN_UNDERFLOW_ACTION"),
-                default="warn",
-            )
-            or "warn"
-        )
-        .strip()
-        .lower()
-    )
-    return raw if raw in _DEF_UNDERFLOW_ACTIONS else "warn"
+    raw = str(
+        env_first(("ENN_DATA_UNDERFLOW_ACTION", "ENN_UNDERFLOW_ACTION"), default="warn") or "warn"
+    ).strip().lower()
+    
+    match raw:
+        case r if r in _DEF_UNDERFLOW_ACTIONS:
+            return r
+        case _:
+            return "warn"
 
 
-def normalize_underflow_action(
-    value: object, *args: Any, default: str = "warn"
-) -> str:
+def normalize_underflow_action(value: object, *args: Any, default: str = "warn") -> str:
     r = str(value if value is not None else default).strip().lower()
-    if r in _DEF_UNDERFLOW_ACTIONS:
-        return r
-    d = str(default).strip().lower()
-    return d if d in _DEF_UNDERFLOW_ACTIONS else "warn"
+    match r:
+        case r_val if r_val in _DEF_UNDERFLOW_ACTIONS:
+            return r_val
+        case _:
+            d = str(default).strip().lower()
+            return d if d in _DEF_UNDERFLOW_ACTIONS else "warn"
