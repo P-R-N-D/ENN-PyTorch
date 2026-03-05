@@ -217,7 +217,7 @@ StochasticDepth = getattr(nn, "StochasticDepth", None) or _StochasticDepthFallba
 try:
     from torch.nn.attention import SDPBackend, sdpa_kernel
 except ImportError:
-    SDPBackend = _SDPBackendFallback  # type: ignore
+    SDPBackend = _SDPBackendFallback
 
     @contextmanager
     def sdpa_kernel(*backends: Any) -> Iterator[None]:
