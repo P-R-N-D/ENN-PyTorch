@@ -26,7 +26,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from ..core.concurrency import Mutex, is_gil_enabled
 from ..core.config import ModelConfig
-from ..core.datatypes import env_bool, env_first_int, env_int, env_str, env_float
+from ..core.datatypes import env_bool, env_first_int, env_int, env_str, env_float, sanitize_single_line
 from ..runtime.autobatch import diag_emit
 from ..core.policies import LossWeightPolicy, PrecisionPolicy
 from ..core.precision import AutocastState, StatefulAutocast, StatelessAutocast
@@ -743,7 +743,7 @@ class Template(nn.Module):
     @staticmethod
     def _coerce_key_name(name: object) -> str:
         s = "" if name is None else str(name)
-        s = s.replace("\r", "").replace("\n", "").strip()
+        s = sanitize_single_line(s)
         if "." in s:
             s = s.replace(".", "_")
         return s
@@ -1643,7 +1643,7 @@ class Fuser(nn.Module):
 
     def _normalize_task_name(self: Self, value: object) -> str:
         s = "" if value is None else str(value)
-        s = s.replace("\r", "").replace("\n", "").strip()
+        s = sanitize_single_line(s)
         if "." in s:
             s = s.replace(".", "_")
         return s

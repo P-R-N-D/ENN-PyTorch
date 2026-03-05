@@ -51,7 +51,7 @@ from ..core.config import (
     coerce_model_config,
     runtime_config,
 )
-from ..core.datatypes import env_bool, read_json
+from ..core.datatypes import env_bool, normalize_windows_paste_path, read_json
 from ..core.policies import WorkerPolicy
 from ..core.system import _start_context, new_dir, optimal_start_method
 from ..core.tensor import coerce_tensor, is_meta_or_fake_tensor
@@ -192,22 +192,6 @@ def _drop_runtime_only_state_keys(sd: Mapping[str, Any]) -> Mapping[str, Any]:
     return out
 
 
-def _normalize_windows_paste(value: PathLike) -> PathLike:
-    if isinstance(value, str):
-        value = (
-            value.replace("\\r\\n", "\n")
-            .replace("\\n", "\n")
-            .replace("\\r", "\n")
-        )
-        value = value.replace("\r\n", "\n").replace("\r", "\n")
-        value = value.strip()
-        if "\n" in value:
-            lines = [
-                line.strip() for line in value.split("\n") if line.strip()
-            ]
-            value = lines[0] if lines else ""
-    return value
-
 
 def _read_safetensors_embedded_meta(p: Path) -> Mapping[str, Any] | None:
     is_required(
@@ -248,7 +232,7 @@ def export_safetensors_single(
     )
     from safetensors.torch import save_file as save_tensors
 
-    p = Path(_normalize_windows_paste(path))
+    p = Path(normalize_windows_paste_path(path))
     if not p.suffix:
         p = p.with_suffix(".safetensors")
     p.parent.mkdir(parents=True, exist_ok=True)
@@ -1927,7 +1911,7 @@ def load_weights(
     mmap: bool | None = True,
     rebuild_tasks: bool = False,
 ) -> Mapping[str, Any] | None:
-    p = Path(_normalize_windows_paste(checkpoint_path))
+    p = Path(normalize_windows_paste_path(checkpoint_path))
 
     side_meta: Mapping[str, Any] | None = None
     with contextlib.suppress(Exception):
@@ -2404,7 +2388,7 @@ def load_model(
         if strict:
             raise RuntimeError(f"[ENN] load_model: non-finite parameters detected ({where}): {first_bad}")
 
-    p = Path(_normalize_windows_paste(checkpoint_path))
+    p = Path(normalize_windows_paste_path(checkpoint_path))
     side_meta: Mapping[str, Any] | None = None
     with contextlib.suppress(Exception):
         if p.is_file() and p.suffix.lower() in (".pt", ".pth"):
@@ -2657,7 +2641,7 @@ def save_model(
     from .io import Builder
     from .io import Exporter
 
-    p = Path(_normalize_windows_paste(path))
+    p = Path(normalize_windows_paste_path(path))
     if Builder.is_target_native(p):
         if args:
             raise TypeError(

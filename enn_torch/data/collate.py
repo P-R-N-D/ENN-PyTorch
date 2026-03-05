@@ -36,6 +36,7 @@ from ..core.datatypes import (
     parse_torch_dtype,
     read_json,
     save_temp,
+    sanitize_single_line,
     write_json,
 )
 from ..core.system import Memory
@@ -199,7 +200,7 @@ def _td_batch_size_from_X(x: Any) -> list[int]:
 def _coerce_path(path: PathLike) -> Optional[str]:
     if path is None:
         return None
-    p = str(path).replace("\r", "").replace("\n", "").strip()
+    p = sanitize_single_line(path)
     if not p or p.lower() in ("none", "null", "nil"):
         return None
     return os.path.abspath(os.path.expanduser(p))

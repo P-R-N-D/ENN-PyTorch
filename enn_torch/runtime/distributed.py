@@ -29,7 +29,7 @@ from typing import Any, Callable, Iterable, Mapping
 import torch
 import torch.distributed as dist
 from ..core.concurrency import Mutex, is_gil_enabled
-from ..core.datatypes import PathLike, env_bool, env_int, save_temp, write_json
+from ..core.datatypes import PathLike, env_bool, env_int, sanitize_single_line, save_temp, write_json
 from ..core.system import (
     CPU,
     Memory,
@@ -298,10 +298,7 @@ class _LineProgress:
 
     @staticmethod
     def _normalize_text(v: Any) -> str:
-        s = str(v or "")
-        s = s.replace("\\r\\n", " ").replace("\\n", " ").replace("\\r", " ")
-        s = s.replace(chr(13), " ").replace(chr(10), " ")
-        return " ".join(s.split())
+        return " ".join(sanitize_single_line(v, replacement=" ").split())
 
     @staticmethod
     def _fmt_hms(sec: float) -> str:
@@ -2438,8 +2435,7 @@ class ProcessBroker:
         backend_clean: object = backend
         b = str(backend) if backend is not None else ""
         if isinstance(backend, str):
-            s = backend.replace("\\n", "").replace("\n", "").replace("\r", "")
-            s = s.strip()
+            s = sanitize_single_line(backend)
             parts = [p.strip() for p in s.split(",") if p.strip()]
             if len(parts) > 1 and all(":" in p for p in parts):
                 norm_parts: list[str] = []
@@ -2454,8 +2450,7 @@ class ProcessBroker:
             backend_clean = s
             b = s
         else:
-            b = b.replace("\\n", "").replace("\n", "").replace("\r", "")
-            b = b.strip().lower()
+            b = sanitize_single_line(b).lower()
 
         if env_bool("ENN_DISABLE_PG_CPU_BACKEND", False):
             return backend_clean
@@ -2475,8 +2470,7 @@ class ProcessBroker:
     ) -> None:
         backend_pg = cls._coerce_process_group_backend(backend, device)
         b = str(backend_pg) if backend_pg is not None else ""
-        b = b.replace("\\n", "").replace("\n", "").replace("\r", "")
-        b = b.lower()
+        b = sanitize_single_line(b).lower()
         if "," in b and ":" in b:
             for part in (p.strip() for p in b.split(",") if p.strip()):
                 _dev, _, be = part.partition(":")
@@ -2531,9 +2525,7 @@ class ProcessBroker:
         dev_id = None
         dev_type = getattr(device, "type", "cpu")
         backend_name = str(backend) if backend is not None else ""
-        backend_name = (
-            backend_name.replace("\\n", "").replace("\n", "").replace("\r", "")
-        ).lower()
+        backend_name = sanitize_single_line(backend_name).lower()
         if backend_name in ("nccl", "xccl") and dev_type in ("cuda", "xpu"):
             index = (
                 device.index
