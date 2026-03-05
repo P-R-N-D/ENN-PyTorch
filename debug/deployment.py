@@ -60,6 +60,39 @@ def _stats_np(arr: np.ndarray) -> dict[str, float | list[int]]:
     }
 
 
+def _label_variation_by_x(td_train: TensorDict) -> dict[str, Any]:
+    x = td_train["X"].detach().cpu().numpy()
+    y = td_train["Y"].detach().cpu().numpy()
+    y_flat = y.reshape(y.shape[0], -1)
+    names = ("month", "weekday_type", "direction")
+    by_x: dict[str, dict[str, float]] = {}
+    for i, name in enumerate(names):
+        vals = sorted({int(v) for v in x[:, i]})
+        stats: dict[str, float] = {}
+        for v in vals:
+            mask = x[:, i] == v
+            yy = y_flat[mask]
+            stats[f"{int(v)}_mean"] = float(np.mean(yy))
+            stats[f"{int(v)}_std"] = float(np.std(yy))
+            stats[f"{int(v)}_n"] = float(int(mask.sum()))
+        by_x[name] = stats
+
+    pair_diffs: list[float] = []
+    n = int(y_flat.shape[0])
+    for i in range(n):
+        for j in range(i + 1, n):
+            diff_x = int(np.sum(x[i] != x[j]))
+            if diff_x == 1:
+                pair_diffs.append(float(np.mean(np.abs(y_flat[i] - y_flat[j]))))
+    out: dict[str, Any] = {"by_x": by_x, "pairs_diff_x_eq_1_count": int(len(pair_diffs))}
+    if pair_diffs:
+        arr = np.asarray(pair_diffs, dtype=np.float64)
+        out["pairs_diff_x_eq_1_mean_abs_y_diff"] = float(arr.mean())
+        out["pairs_diff_x_eq_1_p90_abs_y_diff"] = float(np.percentile(arr, 90))
+        out["pairs_diff_x_eq_1_max_abs_y_diff"] = float(arr.max())
+    return out
+
+
 def _build_model_and_sample(
     device: torch.device,
 ) -> tuple[dict[str, Any], TensorDict, torch.nn.Module, torch.Tensor]:
@@ -630,6 +663,7 @@ def export_and_validate(
     try:
         y = td_train["Y"].detach().cpu().numpy()
         validation["label_stats"] = _stats_np(y)
+        validation["label_variation_by_x"] = _label_variation_by_x(td_train)
     except Exception as exc:
         validation["label_stats_error"] = repr(exc)
     pt2_path = targets["pt2"]
