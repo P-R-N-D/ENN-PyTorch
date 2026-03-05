@@ -2546,6 +2546,192 @@ class SigmoidGate(nn.Module):
         )
 
 
+class Embedder(nn.Module):
+    def __init__(
+        self,
+        *,
+        in_dim: int,
+        continuous_idx: Sequence[int] = (),
+        categorical: Sequence[Mapping[str, Any]] = (),
+    ) -> None:
+        super().__init__()
+        self.in_dim = int(in_dim)
+        self.continuous_idx = tuple(int(i) for i in continuous_idx)
+        if self.continuous_idx:
+            self.register_buffer(
+                "_cont_idx",
+                torch.tensor(self.continuous_idx, dtype=torch.long),
+                persistent=False,
+            )
+        else:
+            self.register_buffer(
+                "_cont_idx",
+                torch.empty((0,), dtype=torch.long),
+                persistent=False,
+            )
+
+        cats: list[dict[str, Any]] = []
+        for c in categorical:
+            cats.append(dict(c))
+        self._cats = cats
+
+        used: set[int] = set()
+        for i in self.continuous_idx:
+            if i < 0 or i >= self.in_dim:
+                raise ValueError(
+                    f"continuous_idx contains out-of-range idx={i} for in_dim={self.in_dim}"
+                )
+            used.add(i)
+
+        self._embeds = nn.ModuleList()
+        self._cat_out_dims: list[int] = []
+        for c in self._cats:
+            if "idx" not in c and "span" not in c:
+                raise ValueError("categorical spec must include either 'idx' or 'span'")
+
+            mode = str(c.get("mode") or ("onehot" if "span" in c else "index")).strip().lower()
+            c["mode"] = mode
+            name = str(c.get("name") or f"cat{len(self._embeds)}")
+            c["name"] = name
+
+            num = int(c.get("num_embeddings") or c.get("num") or 0)
+            dim = int(c.get("embedding_dim") or c.get("dim") or 0)
+            if num <= 0 or dim <= 0:
+                raise ValueError(
+                    f"categorical spec {name} must set num_embeddings>0 and embedding_dim>0"
+                )
+
+            if mode == "index":
+                idx = int(c["idx"])
+                if idx < 0 or idx >= self.in_dim:
+                    raise ValueError(
+                        f"categorical idx out of range: {name}.idx={idx} for in_dim={self.in_dim}"
+                    )
+                if idx in used:
+                    raise ValueError(
+                        f"feature index collision at idx={idx} for categorical '{name}'"
+                    )
+                used.add(idx)
+            else:
+                span = tuple(int(v) for v in c.get("span") or ())
+                if len(span) != 2:
+                    raise ValueError(
+                        f"categorical spec {name} mode={mode} requires span=(start,end)"
+                    )
+                start, end = span
+                if start < 0 or end <= start or end > self.in_dim:
+                    raise ValueError(
+                        f"invalid span for {name}: {span} for in_dim={self.in_dim}"
+                    )
+                for idx in range(start, end):
+                    if idx in used:
+                        raise ValueError(
+                            f"feature index collision at idx={idx} within span for categorical '{name}'"
+                        )
+                    used.add(idx)
+                if (end - start) != num:
+                    raise ValueError(
+                        f"categorical {name} span width ({end-start}) must equal num_embeddings ({num})"
+                    )
+
+            emb = nn.Embedding(num_embeddings=num, embedding_dim=dim)
+            self._embeds.append(emb)
+            self._cat_out_dims.append(dim)
+
+        self.out_dim = int(len(self.continuous_idx) + sum(self._cat_out_dims))
+
+    @property
+    def uses_x_norm(self) -> bool:
+        if self.continuous_idx:
+            return True
+        for c in self._cats:
+            if str(c.get("mode") or "").lower() in {"onehot", "multi_hot", "multihot"}:
+                return True
+        return False
+
+    def forward(self, x_raw: torch.Tensor, *, x_norm: torch.Tensor | None = None) -> torch.Tensor:
+        if x_raw.dim() == 1:
+            x_raw = x_raw.view(1, -1)
+        if x_raw.dim() != 2:
+            raise ValueError(
+                f"Embedder expects a 2D tensor [B, in_dim], got {tuple(x_raw.shape)}"
+            )
+        if int(x_raw.shape[1]) != int(self.in_dim):
+            raise ValueError(
+                f"Embedder expects in_dim={self.in_dim}, got x_raw.shape[1]={int(x_raw.shape[1])}"
+            )
+
+        x_cont_src = x_norm if x_norm is not None else x_raw
+
+        parts: list[torch.Tensor] = []
+        if self.continuous_idx:
+            cont = x_cont_src.index_select(dim=1, index=self._cont_idx)
+            if cont.dtype not in (torch.float16, torch.bfloat16, torch.float32, torch.float64):
+                cont = cont.to(dtype=torch.float32)
+            parts.append(cont)
+
+        for emb, c in zip(self._embeds, self._cats):
+            mode = str(c.get("mode") or "index").lower()
+            if mode == "index":
+                idx = int(c["idx"])
+                offset = int(c.get("offset") or 0)
+                clamp = bool(c.get("clamp") or False)
+                ids = x_raw[:, idx].to(dtype=torch.long)
+                if offset:
+                    ids = ids + int(offset)
+                if clamp:
+                    ids = ids.clamp(min=0, max=int(emb.num_embeddings) - 1)
+                parts.append(emb(ids))
+            elif mode in {"onehot", "multi_hot", "multihot"}:
+                span = tuple(int(v) for v in c.get("span") or ())
+                start, end = span
+                one = x_cont_src[:, start:end]
+                if one.dtype not in (torch.float16, torch.bfloat16, torch.float32, torch.float64):
+                    one = one.to(dtype=torch.float32)
+                parts.append(one.matmul(emb.weight))
+            else:
+                raise ValueError(
+                    f"unsupported categorical mode={mode} for {c.get('name')}"
+                )
+
+        if not parts:
+            return torch.empty(
+                (int(x_raw.shape[0]), 0), device=x_raw.device, dtype=torch.float32
+            )
+
+        out = torch.cat(parts, dim=1)
+        return out
+
+    @classmethod
+    def from_spec(cls, spec: Mapping[str, Any], *, in_dim: int) -> "Embedder":
+        cats = spec.get("categorical") or spec.get("cats") or ()
+        cont = None
+        if "continuous_idx" in spec:
+            cont = spec.get("continuous_idx")
+        elif "continuous" in spec:
+            cont = spec.get("continuous")
+        if cont is None:
+            used: set[int] = set()
+            for c in cats or ():
+                try:
+                    if "idx" in c:
+                        used.add(int(c["idx"]))
+                    elif "span" in c:
+                        s = c.get("span")
+                        if s is not None and len(s) == 2:
+                            start, end = int(s[0]), int(s[1])
+                            for i in range(start, end):
+                                used.add(int(i))
+                except Exception:
+                    continue
+            cont = [i for i in range(int(in_dim)) if int(i) not in used]
+        return cls(
+            in_dim=int(in_dim),
+            continuous_idx=tuple(int(i) for i in (cont or ())),
+            categorical=tuple(cats or ()),
+        )
+
+
 class Scaler(nn.Module):
     def __init__(self: Self, eps: float = 1e-6) -> None:
         super().__init__()
