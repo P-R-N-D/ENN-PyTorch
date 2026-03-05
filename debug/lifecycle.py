@@ -3,13 +3,14 @@ from __future__ import annotations
 
 import contextlib
 import importlib
+import itertools
 import os
 import re
 import sys
 import threading
 import time
 from types import ModuleType
-from typing import Any, Callable, Dict, List, Sequence, Tuple, TypeVar
+from typing import Any, Callable, TypeVar
 
 import numpy as np
 import psutil
@@ -18,8 +19,7 @@ from tensordict import TensorDict
 
 from enn_torch.core.config import ModelConfig, PatchConfig
 from enn_torch.core.system import get_device
-from enn_torch.nn.layers import Embedding
-from enn_torch.runtime.workflows import new_model, predict, train
+from enn_torch.runtime.workflows import new_embedding, new_model, predict, train
 
 COL_DIR = "방향"
 COL_ROUTE = "노선"
@@ -37,6 +37,36 @@ DIR_DOWN = "하행"
 DIR_UP = "상행"
 HOUR_SUFFIX = "시"
 T = TypeVar("T")
+HOURS: tuple[str, ...] = tuple(f"{hour:02d}{HOUR_SUFFIX}" for hour in range(24))
+X_FEATURE_NAMES: tuple[str, ...] = ("month", "weekday_type", "direction")
+EMBED_SPEC: dict[str, list[object]] = {
+    "continuous_idx": [],
+    "categorical": [
+        {
+            "name": "month",
+            "idx": 0,
+            "num_embeddings": 12,
+            "embedding_dim": 4,
+            "offset": -1,
+            "clamp": True,
+        },
+        {
+            "name": "weekday",
+            "idx": 1,
+            "num_embeddings": 7,
+            "embedding_dim": 3,
+            "clamp": True,
+        },
+        {
+            "name": "direction",
+            "idx": 2,
+            "num_embeddings": 2,
+            "embedding_dim": 2,
+            "clamp": True,
+        },
+    ],
+}
+
 
 def _normalize_pasted_text(val: object) -> str:
     return (
@@ -80,21 +110,16 @@ def parse_sheet_name(name: str) -> tuple[int, str]:
         raise ValueError(f"Could not find month in sheet name: {cleaned_name}")
     month = int(m.group(1))
     name_clean = cleaned_name.replace(m.group(0), "")
-    day_kind = None
-    for k in DAY_MAP.keys():
-        if k in name_clean:
-            day_kind = k
-            break
+    day_kind = next((day for day in DAY_MAP if day in name_clean), None)
     if day_kind is None:
         raise ValueError(f"Could not find weekday in sheet name: {cleaned_name}")
     return month, day_kind
 
 
-def build_dataset(xlsx_path: str) -> Dict[str, Any]:
+def build_dataset(xlsx_path: str) -> dict[str, Any]:
     pd, load_workbook = _require_tabular_deps()
-    HOURS = [f"{h:02d}{HOUR_SUFFIX}" for h in range(24)]
     wb = load_workbook(xlsx_path, read_only=True, data_only=True)
-    sheet_names: Sequence[str] = list(wb.sheetnames)
+    sheet_names: list[str] = list(wb.sheetnames)
     wb.close()
     frames: list[pd.DataFrame] = []
     for sh in sheet_names:
@@ -110,8 +135,8 @@ def build_dataset(xlsx_path: str) -> Dict[str, Any]:
             continue
         try:
             month, day_kind = parse_sheet_name(sh)
-        except Exception as e:
-            print(f"[warn] skipping sheet with bad name {sh!r}: {e}")
+        except ValueError as error:
+            print(f"[warn] skipping sheet with bad name {sh!r}: {error}")
             continue
         if COL_ROUTE not in df.columns:
             df[COL_ROUTE] = "수도권제1순환선"
@@ -143,16 +168,10 @@ def build_dataset(xlsx_path: str) -> Dict[str, Any]:
     )
     long_df["지표"] = long_df["지표"].astype(float)
     long_df["요일타입_id"] = long_df["일종"].map(DAY_MAP).astype(int)
-    long_df["방향_id"] = (
-        long_df[COL_DIR].map({DIR_UP: 0, DIR_DOWN: 1}).astype(int)
-    )
-    long_df["canonical_section"] = long_df[COL_SECTION].apply(
-        _canonical_section
-    )
+    long_df["방향_id"] = long_df[COL_DIR].map({DIR_UP: 0, DIR_DOWN: 1}).astype(int)
+    long_df["canonical_section"] = long_df[COL_SECTION].apply(_canonical_section)
     long_df["seg_key"] = (
-        long_df[COL_ROUTE].astype(str).str.strip()
-        + "|"
-        + long_df["canonical_section"]
+        long_df[COL_ROUTE].astype(str).str.strip() + "|" + long_df["canonical_section"]
     )
     seg_meta = (
         long_df[["seg_key", COL_ROUTE, "canonical_section"]]
@@ -161,9 +180,7 @@ def build_dataset(xlsx_path: str) -> Dict[str, Any]:
         .reset_index(drop=True)
     )
     seg_meta["seg_idx"] = np.arange(len(seg_meta), dtype=np.int64)
-    long_df = long_df.merge(
-        seg_meta[["seg_key", "seg_idx"]], on="seg_key", how="left"
-    )
+    long_df = long_df.merge(seg_meta[["seg_key", "seg_idx"]], on="seg_key", how="left")
     S_orig = int(seg_meta.shape[0])
     T_orig = 24
     group_cols = ["월", "요일타입_id", "방향_id"]
@@ -173,7 +190,7 @@ def build_dataset(xlsx_path: str) -> Dict[str, Any]:
         .sort_values(group_cols)
         .reset_index(drop=True)
     )
-    X_keys: List[Tuple[int, int, int]] = [
+    X_keys: list[tuple[int, int, int]] = [
         tuple(map(int, row)) for row in groups_df.to_numpy()
     ]
     B = len(X_keys)
@@ -197,18 +214,14 @@ def build_dataset(xlsx_path: str) -> Dict[str, Any]:
     y_vals = y_full[list(range(T_orig))].to_numpy(dtype=np.float32)
     Y_np = y_vals.reshape(B, S_orig, T_orig)
     row_map = (
-        long_df.groupby(group_cols + ["seg_idx"])["row_in_sheet"]
-        .min()
-        .reset_index()
+        long_df.groupby(group_cols + ["seg_idx"])["row_in_sheet"].min().reset_index()
     )
     row_full = (
         full_grid.merge(row_map, on=group_cols + ["seg_idx"], how="left")
         .fillna(-1)
         .sort_values(group_cols + ["seg_idx"])
     )
-    row_ids_np = (
-        row_full["row_in_sheet"].to_numpy(dtype=np.int64).reshape(B, S_orig)
-    )
+    row_ids_np = row_full["row_in_sheet"].to_numpy(dtype=np.int64).reshape(B, S_orig)
     grid_dim = max(S_orig, T_orig)
     Y_pad = np.zeros((B, grid_dim, grid_dim), dtype=np.float32)
     Y_pad[:, :S_orig, :T_orig] = Y_np
@@ -234,8 +247,8 @@ def build_dataset(xlsx_path: str) -> Dict[str, Any]:
 
 
 def monitor_run(fn: Callable[[], T]) -> tuple[T, dict[str, object]]:
-    cpu_samples: List[List[float]] = []
-    mem_series: List[int] = []
+    cpu_samples: list[list[float]] = []
+    mem_series: list[int] = []
     mem_peak = 0
     stop = threading.Event()
     proc = psutil.Process()
@@ -284,7 +297,7 @@ def monitor_run(fn: Callable[[], T]) -> tuple[T, dict[str, object]]:
 
 def summarize_x_y_distribution(
     td_train: TensorDict,
-    group_keys: Sequence[Tuple[int, int, int]],
+    group_keys: list[tuple[int, int, int]],
     s_orig: int,
     t_orig: int,
 ) -> None:
@@ -306,11 +319,10 @@ def summarize_x_y_distribution(
         )
     )
 
-    x_names = ["month", "weekday_type", "direction"]
-    for i, name in enumerate(x_names):
-        values = sorted(set(int(v) for v in x_np[:, i]))
+    for i, name in enumerate(X_FEATURE_NAMES):
+        values = np.unique(x_np[:, i].astype(np.int64))
         print(f"[analysis] Y distribution by X.{name}")
-        for v in values:
+        for v in values.tolist():
             mask = x_np[:, i] == v
             y_grp = y_flat[mask]
             print(
@@ -326,20 +338,27 @@ def summarize_x_y_distribution(
             )
 
     pair_dists: list[tuple[tuple[int, int], float]] = []
-    for i in range(y_flat.shape[0]):
-        for j in range(i + 1, y_flat.shape[0]):
-            diff_x = np.sum(x_np[i] != x_np[j])
-            if diff_x == 1:
-                dist = float(np.mean(np.abs(y_flat[i] - y_flat[j])))
-                pair_dists.append(((i, j), dist))
+    for i, j in itertools.combinations(range(y_flat.shape[0]), 2):
+        if int(np.count_nonzero(x_np[i] != x_np[j])) != 1:
+            continue
+        dist = float(np.mean(np.abs(y_flat[i] - y_flat[j])))
+        pair_dists.append(((i, j), dist))
 
     if pair_dists:
         pair_dists.sort(key=lambda x: x[1], reverse=True)
-        print("[analysis] top 5 pairs where X differs by exactly one feature (mean |ΔY|)")
+        print(
+            "[analysis] top 5 pairs where X differs by exactly one feature (mean |ΔY|)"
+        )
         for (i, j), dist in pair_dists[:5]:
             print(
                 "  idx(%d,%d) X=%s vs %s -> mean|ΔY|=%.4f"
-                % (i, j, tuple(map(int, group_keys[i])), tuple(map(int, group_keys[j])), dist)
+                % (
+                    i,
+                    j,
+                    tuple(map(int, group_keys[i])),
+                    tuple(map(int, group_keys[j])),
+                    dist,
+                )
             )
 
 
@@ -388,15 +407,7 @@ def main() -> None:
         preset="spatiotemporal",
         compile_mode="disabled",
     )
-    EMBED_SPEC = {
-        "continuous_idx": [],
-        "categorical": [
-            {"name": "month", "idx": 0, "num_embeddings": 12, "embedding_dim": 4, "offset": -1, "clamp": True},
-            {"name": "weekday", "idx": 1, "num_embeddings": 7, "embedding_dim": 3, "clamp": True},
-            {"name": "direction", "idx": 2, "num_embeddings": 2, "embedding_dim": 2, "clamp": True},
-        ],
-    }
-    embedding = Embedding.from_spec(EMBED_SPEC, in_dim=int(td_train["X"].shape[1]))
+    embedding = new_embedding(int(td_train["X"].shape[1]), embedding=EMBED_SPEC)
     model = new_model(
         in_dim=td_train["X"].shape[1],
         out_shape=(S, T),
@@ -436,9 +447,7 @@ def main() -> None:
     print("train duration (s):", train_metrics["duration_s"])
     print("train CPU avg per core:", train_metrics["cpu_avg"])
     print("train CPU peak per core:", train_metrics["cpu_peak"])
-    print(
-        "train peak RSS MB:", round(train_metrics["mem_peak"] / (1024**2), 2)
-    )
+    print("train peak RSS MB:", round(train_metrics["mem_peak"] / (1024**2), 2))
     hist = []
     with contextlib.suppress(Exception):
         hist = trained_model.history()
@@ -467,14 +476,13 @@ def main() -> None:
     print("predict duration (s):", pred_metrics["duration_s"])
     print("predict CPU avg per core:", pred_metrics["cpu_avg"])
     print("predict CPU peak per core:", pred_metrics["cpu_peak"])
-    print(
-        "predict peak RSS MB:", round(pred_metrics["mem_peak"] / (1024**2), 2)
-    )
-    Y_pred = pred_result["Y"]
-    if hasattr(Y_pred, "detach"):
-        Y_pred_t = Y_pred.detach().cpu()
-    else:
-        Y_pred_t = torch.as_tensor(Y_pred)
+    print("predict peak RSS MB:", round(pred_metrics["mem_peak"] / (1024**2), 2))
+    y_pred = pred_result["Y"]
+    match hasattr(y_pred, "detach"):
+        case True:
+            Y_pred_t = y_pred.detach().cpu()
+        case False:
+            Y_pred_t = torch.as_tensor(y_pred)
     print("Prediction tensor shape:", tuple(Y_pred_t.shape))
     print(
         "Prediction stats: min=%.4f max=%.4f mean=%.4f std=%.4f"

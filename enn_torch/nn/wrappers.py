@@ -26,7 +26,14 @@ import torch.nn as nn
 import torch.nn.functional as F
 from ..core.concurrency import Mutex, is_gil_enabled
 from ..core.config import ModelConfig
-from ..core.datatypes import env_bool, env_first_int, env_int, env_str, env_float, sanitize_single_line
+from ..core.datatypes import (
+    env_bool,
+    env_first_int,
+    env_float,
+    env_int,
+    env_str,
+    sanitize_single_line,
+)
 from ..runtime.autobatch import diag_emit
 from ..core.policies import LossWeightPolicy, PrecisionPolicy
 from ..core.precision import AutocastState, StatefulAutocast, StatelessAutocast
@@ -678,7 +685,7 @@ class Template(nn.Module):
         **kwargs: Any,
     ) -> None:
         super().__init__()
-        del args, kwargs
+        _ = (args, kwargs)
         self.template_name: str = self._coerce_template_name(name)
         self.submodel_name: str = self._coerce_submodel_name(submodel_name)
         self._submodel_attr: str = ""
@@ -732,13 +739,15 @@ class Template(nn.Module):
     @staticmethod
     def _coerce_mode(mode: str) -> str:
         m = str(mode or "spatial").strip().lower()
-        if m in {"s", "spatial", "ss", "sxs"}:
-            return "spatial"
-        if m in {"t", "temporal", "tt", "txt"}:
-            return "temporal"
-        raise ValueError(
-            f"Unknown mode '{mode}' (expected 'spatial' or 'temporal')"
-        )
+        match m:
+            case "s" | "spatial" | "ss" | "sxs":
+                return "spatial"
+            case "t" | "temporal" | "tt" | "txt":
+                return "temporal"
+            case _:
+                raise ValueError(
+                    f"Unknown mode '{mode}' (expected 'spatial' or 'temporal')"
+                )
 
     @staticmethod
     def _coerce_key_name(name: object) -> str:
@@ -778,14 +787,15 @@ class Template(nn.Module):
             self.detach_submodel()
         setattr(self, attr, submodel)
         with contextlib.suppress(Exception):
-            dev: Optional[torch.device] = None
-            for p in self.parameters(recurse=False):
-                dev = p.device
-                break
-            if dev is None:
-                for b in self.buffers(recurse=False):
-                    dev = b.device
-                    break
+            param_dev = next(
+                (param.device for param in self.parameters(recurse=False)),
+                None,
+            )
+            buffer_dev = next(
+                (buffer.device for buffer in self.buffers(recurse=False)),
+                None,
+            )
+            dev = param_dev if param_dev is not None else buffer_dev
             if dev is not None:
                 cast(nn.Module, submodel).to(device=dev)
         self._submodel_attr = attr
@@ -895,7 +905,7 @@ class Template(nn.Module):
         causal_mask: Optional[torch.Tensor] = None,
         **kwargs: Any,
     ) -> Any:
-        del args, kwargs
+        _ = (args, kwargs)
         tokens = self._tokenize_export(x) if is_export_or_trace() else self._tokenize(x)
         m = str(self.mode)
         if m == "spatial":
@@ -1059,7 +1069,7 @@ class SubFuser(nn.Module):
         **kwargs: Any,
     ) -> None:
         super().__init__()
-        del args, kwargs
+        _ = (args, kwargs)
         self.tokens = max(1, int(tokens))
         self.reduction = self._coerce_reduction(reduction)
         self._children: list[str] = (
@@ -1111,13 +1121,15 @@ class SubFuser(nn.Module):
     @staticmethod
     def _coerce_reduction(reduction: str) -> str:
         r = str(reduction or "mean").strip().lower()
-        if r in {"mean", "avg", "average", "weighted_mean", "weighted"}:
-            return "mean"
-        if r in {"linear", "lin", "cooperative", "axbycz"}:
-            return "linear"
-        raise ValueError(
-            f"Unknown reduction {reduction!r} (expected 'mean' or 'linear')"
-        )
+        match r:
+            case "mean" | "avg" | "average" | "weighted_mean" | "weighted":
+                return "mean"
+            case "linear" | "lin" | "cooperative" | "axbycz":
+                return "linear"
+            case _:
+                raise ValueError(
+                    f"Unknown reduction {reduction!r} (expected 'mean' or 'linear')"
+                )
 
     def set_reduction(self: Self, reduction: str) -> None:
         self.reduction = self._coerce_reduction(reduction)
@@ -1223,7 +1235,7 @@ class SubFuser(nn.Module):
         fn(target, *args, **kwargs)
 
     def forward(self: Self, *args: Any, **kwargs: Any) -> Any:
-        del args, kwargs
+        _ = (args, kwargs)
         raise RuntimeError(
             "SubFuser is a topology node and must be executed via Fuser.forward()"
         )
@@ -1264,7 +1276,7 @@ class Fuser(nn.Module):
         **kwargs: Any,
     ) -> None:
         super().__init__()
-        del args, kwargs
+        _ = (args, kwargs)
         self.in_dim = int(in_dim)
         self.out_shape = tuple((int(v) for v in out_shape))
         self.out_dim = int(math.prod(self.out_shape) if self.out_shape else 1)
@@ -1923,7 +1935,7 @@ class Fuser(nn.Module):
         include_self: bool = False,
         **kwargs: Any,
     ) -> list[str]:
-        del args, kwargs
+        _ = (args, kwargs)
         if node_spec is None or node_spec is self or (
             isinstance(node_spec, str) and not node_spec.strip()
         ):
@@ -1988,7 +2000,7 @@ class Fuser(nn.Module):
         children: Optional[Sequence[str]] = None,
         **kwargs: Any,
     ) -> str:
-        del args
+        _ = args
         kind_raw = str(kwargs.pop("type", kind) or kind).strip().lower()
         if kind_raw in {"task", "template", "leaf"}:
             return self.add_task(name, parent=parent, **kwargs)
@@ -2019,7 +2031,7 @@ class Fuser(nn.Module):
         )
 
     def update(self: Self, node_spec: str, *args: Any, **kwargs: Any) -> str:
-        del args
+        _ = args
         node = self.get(node_spec)
         if node is None:
             raise KeyError(
@@ -2040,7 +2052,7 @@ class Fuser(nn.Module):
         return key
 
     def remove(self: Self, node_spec: str, *args: Any, strict: bool = False, **kwargs: Any) -> None:
-        del args, kwargs
+        _ = (args, kwargs)
         node = self.get(node_spec)
         if node is None:
             if strict:
@@ -2591,7 +2603,7 @@ class Fuser(nn.Module):
     def remove_task(
         self: Self, task_name: str, *args: Any, strict: bool = False
     ) -> None:
-        del args
+        _ = args
         if strict and not self.tasks:
             raise KeyError("No tasks are configured")
         try:
@@ -2640,7 +2652,7 @@ class Fuser(nn.Module):
         task_id: Optional[str] = None,
         **kwargs: Any,
     ) -> str:
-        del args, kwargs
+        _ = (args, kwargs)
         preferred = name
         if preferred is None or not str(preferred).strip():
             preferred = task_id
@@ -2714,7 +2726,7 @@ class Fuser(nn.Module):
         eps: object = _META_UNSET,
         **kwargs: Any,
     ) -> str:
-        del args, kwargs
+        _ = (args, kwargs)
         key = self.resolve_task_name(taskset_name)
         node = self.tasks[key]
         if not isinstance(node, SubFuser):
@@ -2825,7 +2837,7 @@ class Fuser(nn.Module):
         strict: bool = False,
         **kwargs: Any,
     ) -> None:
-        del args, kwargs
+        _ = (args, kwargs)
         if strict and not self.tasks:
             raise KeyError("No tasks are configured")
         try:
@@ -3091,7 +3103,7 @@ class Fuser(nn.Module):
         causal_mask: Optional[torch.Tensor] = None,
         **kwargs: Any,
     ) -> Any:
-        del args, kwargs
+        _ = (args, kwargs)
         plan = self._get_exec_plan()
         roots = [str(r) for r in (plan.get("roots") or []) if str(r) in self.tasks]
         order = [str(n) for n in (plan.get("order") or []) if str(n) in self.tasks]
@@ -3329,7 +3341,7 @@ class Fuser(nn.Module):
         causal_mask: Optional[torch.Tensor] = None,
         **kwargs: Any,
     ) -> Any:
-        del args, kwargs
+        _ = (args, kwargs)
         plan = self._get_exec_plan()
         if bool(plan.get("has_tasksets")) or bool(plan.get("has_linear")):
             return self._forward_topology(
@@ -3849,7 +3861,7 @@ class Fuser(nn.Module):
         causal_mask: Optional[torch.Tensor] = None,
         **kwargs: Any,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        del args, kwargs
+        _ = (args, kwargs)
         plan = getattr(self, "_exec_plan", None)
         if not isinstance(plan, dict):
             plan = self._build_exec_plan_unlocked()
@@ -6689,8 +6701,13 @@ class Model(nn.Module):
                 with contextlib.suppress(Exception):
                     _reshard()
 
-    def load_state_dict(self, state_dict, *args, **kwargs):
-        def _ensure_scaler_shapes(model, sd):
+    def load_state_dict(
+        self: Self,
+        state_dict: Mapping[str, Any],
+        *args: Any,
+        **kwargs: Any,
+    ) -> Any:
+        def _ensure_scaler_shapes(model: nn.Module, sd: Mapping[str, Any]) -> None:
             if not isinstance(sd, dict):
                 return
 
@@ -6793,11 +6810,11 @@ class Model(nn.Module):
         return super().load_state_dict(state_dict, *args, **kwargs)
 
     def list_tasks(self: Self, *args: Any, by: str = "name") -> list[str]:
-        del args
+        _ = args
         return self.fuser.get_subtree(by=by)
 
     def list(self: Self, *args: Any, by: str = "name") -> list[str]:
-        del args
+        _ = args
         return self.fuser.get_subtree(by=by)
 
     def get(
@@ -6826,7 +6843,7 @@ class Model(nn.Module):
         include_self: bool = False,
         **kwargs: Any,
     ) -> list[str]:
-        del args, kwargs
+        _ = (args, kwargs)
         return self.fuser.get_subtree(node_spec, by=by, include_self=include_self)
 
     def attach(self: Self, node_spec: str, parent: Optional[str] = None) -> str:

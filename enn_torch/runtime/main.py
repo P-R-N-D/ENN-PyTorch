@@ -2,25 +2,23 @@
 from __future__ import annotations
 
 import contextlib
-import json
-import datetime
 import gc
 import glob
 import importlib
 import inspect
 import itertools
+import json
 import logging
 import math
 import os
 import platform
 import re
-import socket
 import sys
-import threading
 import tempfile
+import threading
 import time
 import warnings
-from collections.abc import Mapping, MutableMapping
+from collections.abc import MutableMapping
 from dataclasses import replace
 from functools import partial
 from pathlib import Path
@@ -30,13 +28,7 @@ import torch
 import torch.distributed
 import torch.nn as nn
 from tensordict import TensorDictBase
-from torch.distributed.checkpoint import FileSystemReader, load
 from torch.distributed.elastic.control_plane import worker_main
-from torch.distributed.checkpoint.state_dict import (
-    StateDictOptions,
-    get_model_state_dict,
-    set_model_state_dict,
-)
 
 from ..core.concurrency import (
     Mutex,
@@ -50,7 +42,6 @@ from ..core.concurrency import (
 from ..core.config import RuntimeConfig, coerce_model_config
 from ..core.datatypes import (
     env_bool,
-    env_first,
     env_first_int,
     env_float,
     env_int,
@@ -63,7 +54,6 @@ from ..core.precision import (
     cast_batchnorm_buffers_dtype as _cast_batchnorm_buffers_dtype,
     cast_float_dtype as _cast_float_dtype,
     preload_layers as _preload_layers,
-    unify_model_dtype as _unify_model_dtype,
     validate_model_dtype_unity as _validate_model_dtype_unity,
 )
 from ..core.system import (
@@ -71,24 +61,16 @@ from ..core.system import (
     Memory,
     Monitor,
     accelerator_max_allocated_memory,
-    accelerator_stream,
     accelerator_type,
-    allocated_accelerator_memory,
-    available_device_memory,
     empty_device_cache,
     flush_accelerator_memory_stats,
-    get_accelerator_index,
     get_device,
-    get_num_accelerators,
     init_python_path,
     is_accelerator_available,
-    is_accelerator_timer_supported,
-    is_cuda_bf16_supported,
     is_oom_error,
     is_pin_supported,
     new_accelerator_event,
     posix_time,
-    set_accelerator_index,
     set_float32_precision,
     sync_accelerator,
 )
@@ -96,9 +78,7 @@ from ..core.tensor import (
     compute_batch_bytes_per_sample as _compute_batch_bytes_per_sample,
     enable_meta_monitor as _enable_meta_monitor,
     is_meta_or_fake_tensor,
-    to_device_recursive as _to_device_recursive,
     to_torch_tensor,
-    touch_tensors as _touch_tensors,
     validate_no_fake_dtensor as _validate_no_fake_dtensor,
     validate_no_meta_tensors as _validate_no_meta_tensors,
 )
@@ -113,10 +93,11 @@ from ..nn.graph import (
     cudagraph_mark_step_end,
     from_checkpoint,
     inference_mode,
+    is_symbolic,
     to_checkpoint,
     to_submodule,
 )
-from ..nn.layers import Recorder, resize_scaler_buffer
+from ..nn.layers import Recorder
 from ..nn.profiler import (
     FlopCounter,
     get_torch_profiler as _get_torch_profiler,
@@ -139,9 +120,10 @@ from .distributed import (
     distributed_all_reduce_sum as _reduce_sum,
     distributed_barrier,
     distributed_sync,
+    get_accel_group,
     get_distributed_mesh,
     get_group_world_size as _get_world_size,
-    get_accel_group,
+    get_rank,
     get_world_size,
     is_distributed,
     joining,
@@ -149,7 +131,6 @@ from .distributed import (
     resolve_process_group as _validate_distributed_group,
     to_hsdp_module,
 )
-from .io import _filtered_warnings, _torch_load_checkpoint
 from .losses import (
     CRPSLoss,
     DataFidelityLoss,
@@ -181,6 +162,7 @@ except Exception:
 
 try:
     from tensordict.nn.functional_modules import _exclude_td_from_pytree
+
     _exclude_td_from_pytree().set()
 except Exception:
     pass
@@ -193,9 +175,7 @@ _LOGGER = logging.getLogger(__name__)
 _float8_log = ProcessBroker.rank0_logger(_LOGGER)
 _EXPORT_RETURN_LOCK = threading.Lock()
 JsonPrimitive: TypeAlias = str | int | float | bool | None
-JsonValue: TypeAlias = (
-    JsonPrimitive | list["JsonValue"] | dict[str, "JsonValue"]
-)
+JsonValue: TypeAlias = JsonPrimitive | list["JsonValue"] | dict[str, "JsonValue"]
 MB_DIV = 1024.0 * 1024.0
 PathLike: TypeAlias = str | os.PathLike[str] | Path
 ReturnSink: TypeAlias = MutableMapping[str, object]
@@ -203,15 +183,30 @@ TorchDeviceLike: TypeAlias = torch.device | str | int
 
 
 def _env_bool(key: str, default: bool = False) -> bool:
-    v = os.environ.get(key, None)
-    if v is None:
+    value = os.environ.get(key)
+    if value is None:
         return bool(default)
-    s = str(v).strip().lower()
-    if s in ("1", "true", "t", "yes", "y", "on"):
-        return True
-    if s in ("0", "false", "f", "no", "n", "off", ""):
-        return False
-    return bool(default)
+    normalized = str(value).strip().lower()
+    match normalized:
+        case "1" | "true" | "t" | "yes" | "y" | "on":
+            return True
+        case "0" | "false" | "f" | "no" | "n" | "off" | "":
+            return False
+        case _:
+            return bool(default)
+
+
+def _device_mem_get_info(device: torch.device) -> tuple[int | None, int | None]:
+    with contextlib.suppress(Exception):
+        info = getattr(Memory, "device_mem_get_info", None)
+        if callable(info):
+            result = info(device)
+            if isinstance(result, tuple) and len(result) >= 2:
+                free, total = result[0], result[1]
+                free_i = int(free) if isinstance(free, (int, float)) else None
+                total_i = int(total) if isinstance(total, (int, float)) else None
+                return free_i, total_i
+    return None, None
 
 
 def _sync_torchinductor_cache_globals(cache_dir: str) -> None:
@@ -236,29 +231,29 @@ def _sync_torchinductor_cache_globals(cache_dir: str) -> None:
             _cc.cache_dir()
 
 
-def _normalize_model_averaging(
-    x: object, *, default: str = "auto"
-) -> str | None:
+def _normalize_model_averaging(x: object, *, default: str = "auto") -> str | None:
     if default is None:
         raise ValueError("default model_averaging must not be None")
     if x is None:
         return None
-    if isinstance(x, str):
-        s = x.strip().lower()
-        if s in ("auto", "ema", "swa"):
-            return s
-        if s in ("none", "null", "off", "false", "0", ""):
+    if not isinstance(x, str):
+        raise ValueError(
+            f"Invalid model_averaging={x!r}. Expected None|'auto'|'ema'|'swa'."
+        )
+    normalized = x.strip().lower()
+    match normalized:
+        case "auto" | "ema" | "swa":
+            return normalized
+        case "none" | "null" | "off" | "false" | "0" | "":
             return None
-    raise ValueError(
-        f"Invalid model_averaging={x!r}. Expected None|'auto'|'ema'|'swa'."
-    )
+        case _:
+            raise ValueError(
+                f"Invalid model_averaging={x!r}. Expected None|'auto'|'ema'|'swa'."
+            )
 
 
 def _has_bn_modules(model: Any) -> bool:
     try:
-        import torch
-        from torch import nn
-
         if not isinstance(model, nn.Module):
             return False
         bn_types = (
@@ -267,17 +262,12 @@ def _has_bn_modules(model: Any) -> bool:
             nn.BatchNorm3d,
             getattr(nn, "SyncBatchNorm", nn.BatchNorm1d),
         )
-        for m in model.modules():
-            if isinstance(m, bn_types):
-                return True
+        return any(isinstance(module, bn_types) for module in model.modules())
     except Exception:
         return False
-    return False
 
 
-def _resolve_model_averaging(
-    model: Any, requested: object
-) -> tuple[str | None, bool]:
+def _resolve_model_averaging(model: Any, requested: object) -> tuple[str | None, bool]:
     req = _normalize_model_averaging(requested, default="auto")
     has_bn = _has_bn_modules(model)
     if req is None:
@@ -313,9 +303,7 @@ def _atomic_torch_save(obj: object, path: str) -> None:
 def _mark_ephemeral_ckpt_dir(d: str) -> None:
     try:
         os.makedirs(d, exist_ok=True)
-        with open(
-            os.path.join(d, ".enn_ephemeral_ckpt"), "w", encoding="utf-8"
-        ) as f:
+        with open(os.path.join(d, ".enn_ephemeral_ckpt"), "w", encoding="utf-8") as f:
             f.write("1\n")
     except Exception:
         pass
@@ -376,9 +364,7 @@ def _schedule(
     **kwargs: Any,
 ) -> float:
     if warmup_steps > 0 and step < warmup_steps:
-        return start_factor + (1.0 - start_factor) * (
-            step / max(1, warmup_steps)
-        )
+        return start_factor + (1.0 - start_factor) * (step / max(1, warmup_steps))
     t = step - warmup_steps
     frac_min = emin / base if base > 0.0 else 0.0
     return frac_min + (1.0 - frac_min) * 0.5 * (
@@ -658,13 +644,13 @@ def epochs(
     from ..data.nodes import Sampler
 
     ddp_fallback: bool = bool(kwargs.pop("ddp_fallback", False))
+    dist_policy = DistributedPolicy.from_env()
+    run_id = str(kwargs.pop("run_id", f"train-{os.getpid()}"))
     if train_loader is None:
         raise RuntimeError("epochs requires a training dataloader")
     model_for_grads = model.module if hasattr(model, "module") else model
     world_sz = int(get_world_size(device)) if is_distributed() else 1
-    meta = (
-        dataset if isinstance(dataset, Dataset) else Dataset.for_device(device)
-    )
+    meta = dataset if isinstance(dataset, Dataset) else Dataset.for_device(device)
 
     optim_diag = env_bool("ENN_OPTIMIZER_DIAG_NONFINITE", default=False)
     optim_diag_every = max(1, int(env_int("ENN_OPTIMIZER_DIAG_EVERY", 1) or 1))
@@ -672,12 +658,8 @@ def epochs(
     nonfinite_fail_fast = env_bool("ENN_FAIL_FAST_NONFINITE", default=False)
     nonfinite_skip_step = env_bool("ENN_SKIP_STEP_ON_NONFINITE", default=False)
     nonfinite_dump_dir = str(env_str("ENN_NONFINITE_DUMP_DIR") or "").strip()
-    nonfinite_dump_limit = max(
-        0, int(env_int("ENN_NONFINITE_DUMP_LIMIT", 4) or 4)
-    )
-    nonfinite_dump_all_ranks = env_bool(
-        "ENN_NONFINITE_DUMP_ALL_RANKS", default=False
-    )
+    nonfinite_dump_limit = max(0, int(env_int("ENN_NONFINITE_DUMP_LIMIT", 4) or 4))
+    nonfinite_dump_all_ranks = env_bool("ENN_NONFINITE_DUMP_ALL_RANKS", default=False)
     nonfinite_dumped = 0
     strict_sanitize = env_bool("ENN_SANITIZE_NAN_STRICT", default=False)
 
@@ -789,6 +771,7 @@ def epochs(
             return str(path)
         except Exception:
             return None
+
     autocast_dtype = None
     with contextlib.suppress(Exception):
         import inspect
@@ -804,18 +787,14 @@ def epochs(
             except Exception:
                 autocast_dtype = f(device)
     with contextlib.suppress(Exception):
-        set_float32_precision(
-            device, dtype=param_dtype, autocast_dtype=autocast_dtype
-        )
+        set_float32_precision(device, dtype=param_dtype, autocast_dtype=autocast_dtype)
     cpu_pool = None
     pool_capacity = 0
     if is_pin_supported(str(getattr(device, "type", "cpu"))):
         with contextlib.suppress(Exception):
             Memory.prefer_local_numa()
         try:
-            cpu_pool_cap = max(
-                2, int(env_int("ENN_RUNTIME_PIN_POOL_CAPACITY", 8))
-            )
+            cpu_pool_cap = max(2, int(env_int("ENN_RUNTIME_PIN_POOL_CAPACITY", 8)))
             cpu_pool = TensorPagePool(capacity=cpu_pool_cap)
             pool_capacity = int(getattr(cpu_pool, "capacity", 8))
         except Exception:
@@ -827,11 +806,7 @@ def epochs(
         v = getattr(Sampler, "_per_sample_mem_bytes", 0)
         if isinstance(v, int) and v > 0:
             est_bytes_per_sample = int(v)
-    if (
-        per_batch is None
-        or int(per_batch) <= 0
-        or est_bytes_per_sample is None
-    ):
+    if per_batch is None or int(per_batch) <= 0 or est_bytes_per_sample is None:
         try:
             it = iter(train_loader)
             sample = next(it)
@@ -880,14 +855,10 @@ def epochs(
     dev_budget_min_bytes = max(0, int(dev_budget_min_bytes))
     host_budget_min_bytes = max(0, int(host_budget_min_bytes))
     dev_budget_max_bytes = (
-        None
-        if dev_budget_max_bytes is None
-        else max(0, int(dev_budget_max_bytes))
+        None if dev_budget_max_bytes is None else max(0, int(dev_budget_max_bytes))
     )
     host_budget_max_bytes = (
-        None
-        if host_budget_max_bytes is None
-        else max(0, int(host_budget_max_bytes))
+        None if host_budget_max_bytes is None else max(0, int(host_budget_max_bytes))
     )
     if dev_budget_max_bytes is not None and int(dev_budget_max_bytes) <= 0:
         dev_budget_max_bytes = None
@@ -923,9 +894,7 @@ def epochs(
                 device_budget_ratio=float(dev_budget_ratio),
                 device_budget_min_bytes=int(dev_budget_min_bytes),
                 device_budget_max_bytes=(
-                    None
-                    if dev_budget_max_bytes is None
-                    else int(dev_budget_max_bytes)
+                    None if dev_budget_max_bytes is None else int(dev_budget_max_bytes)
                 ),
             )
         except Exception:
@@ -945,10 +914,7 @@ def epochs(
                 if host_total is not None and host_total > 0:
                     safe_host_total = int(host_total)
             safe_dev_bytes, safe_dev_total = _device_mem_get_info(device)
-            if (
-                tpl.device_budget_max_bytes is None
-                or tpl.host_budget_max_bytes is None
-            ):
+            if tpl.device_budget_max_bytes is None or tpl.host_budget_max_bytes is None:
                 try:
                     target_total_samples = max(1, int(per_batch or 1)) * max(
                         1, int(min_grad_accum)
@@ -956,25 +922,15 @@ def epochs(
                     new_dev_cap = tpl.device_budget_max_bytes
                     new_host_cap = tpl.host_budget_max_bytes
                     if new_dev_cap is None and int(tpl.sample_bytes or 0) > 0:
-                        base_dev = int(tpl.sample_bytes) * int(
-                            target_total_samples
-                        )
+                        base_dev = int(tpl.sample_bytes) * int(target_total_samples)
                         cap_dev = int(float(base_dev) * float(budget_slack))
-                        if (
-                            safe_dev_total is not None
-                            and int(safe_dev_total) > 0
-                        ):
+                        if safe_dev_total is not None and int(safe_dev_total) > 0:
                             cap_dev = min(int(cap_dev), int(safe_dev_total))
                         cap_dev = max(0, int(cap_dev))
                         new_dev_cap = None if cap_dev <= 0 else cap_dev
-                    if (
-                        new_host_cap is None
-                        and int(tpl.host_sample_bytes or 0) > 0
-                    ):
+                    if new_host_cap is None and int(tpl.host_sample_bytes or 0) > 0:
                         inflight = int(tpl.host_inflight_batches_per_proc())
-                        lw = max(
-                            1, int(getattr(tpl, "local_world_size", 1) or 1)
-                        )
+                        lw = max(1, int(getattr(tpl, "local_world_size", 1) or 1))
                         base_host = (
                             int(tpl.host_sample_bytes)
                             * max(1, inflight)
@@ -982,10 +938,7 @@ def epochs(
                             * int(target_total_samples)
                         )
                         cap_host = int(float(base_host) * float(budget_slack))
-                        if (
-                            safe_host_total is not None
-                            and int(safe_host_total) > 0
-                        ):
+                        if safe_host_total is not None and int(safe_host_total) > 0:
                             cap_host = min(int(cap_host), int(safe_host_total))
                         cap_host = max(0, int(cap_host))
                         new_host_cap = None if cap_host <= 0 else cap_host
@@ -993,7 +946,7 @@ def epochs(
                         new_dev_cap != tpl.device_budget_max_bytes
                         or new_host_cap != tpl.host_budget_max_bytes
                     ):
-                        tpl = dataclasses.replace(
+                        tpl = replace(
                             tpl,
                             device_budget_max_bytes=new_dev_cap,
                             host_budget_max_bytes=new_host_cap,
@@ -1008,9 +961,7 @@ def epochs(
                     host_total=safe_host_total,
                 )
                 if total_samples_cap > 0:
-                    max_from_mem = max(
-                        1, int(total_samples_cap) // int(per_batch or 1)
-                    )
+                    max_from_mem = max(1, int(total_samples_cap) // int(per_batch or 1))
         except Exception:
             safe_host_bytes = None
             safe_host_total = None
@@ -1029,17 +980,13 @@ def epochs(
     delta_gate_auto_step_total = 0
     with contextlib.suppress(Exception):
         target_for_autok = model.module if hasattr(model, "module") else model
-        step_buf = getattr(
-            target_for_autok, "delta_gate_auto_k_step_buf", None
-        )
+        step_buf = getattr(target_for_autok, "delta_gate_auto_k_step_buf", None)
         if isinstance(step_buf, torch.Tensor):
             delta_gate_auto_step_total = int(step_buf.item())
     util_adjust_interval = 0
     util_warmup_steps = 0
     if buffers_dtype is not None:
-        target_for_buffers = (
-            model.module if hasattr(model, "module") else model
-        )
+        target_for_buffers = model.module if hasattr(model, "module") else model
         _cast_batchnorm_buffers_dtype(target_for_buffers, buffers_dtype)
     model_for_hist = model.module if hasattr(model, "module") else model
     hist = None
@@ -1067,16 +1014,11 @@ def epochs(
                 pretty = None
                 with contextlib.suppress(Exception):
                     if os.path.exists("/etc/os-release"):
-                        with open(
-                            "/etc/os-release", "r", encoding="utf-8"
-                        ) as f:
+                        with open("/etc/os-release", "r", encoding="utf-8") as f:
                             for line in f:
                                 if line.startswith("PRETTY_NAME="):
                                     pretty = (
-                                        line.strip()
-                                        .split("=", 1)[1]
-                                        .strip()
-                                        .strip('"')
+                                        line.strip().split("=", 1)[1].strip().strip('"')
                                     )
                                     break
                 os_full = pretty or f"{os_name} {platform.release()}"
@@ -1126,20 +1068,13 @@ def epochs(
     pinned_ok = bool(is_pin_supported(dev_type))
     backend = accelerator_type(dev_type)
     stream_fn = (
-        getattr(backend, "current_stream", None)
-        if backend is not None
-        else None
+        getattr(backend, "current_stream", None) if backend is not None else None
     )
     Event = getattr(backend, "Event", None) if backend is not None else None
     can_stream_release = bool(
-        pinned_ok
-        and non_blocking_ok
-        and callable(stream_fn)
-        and (Event is not None)
+        pinned_ok and non_blocking_ok and callable(stream_fn) and (Event is not None)
     )
-    make_fence_event = partial(
-        new_accelerator_event, device, enable_timing=False
-    )
+    make_fence_event = partial(new_accelerator_event, device, enable_timing=False)
     use_timer = Monitor.is_event_timer_available(device)
     timer_sync = (not use_timer) and bool(
         Monitor.is_clock_synchronized(str(dev_type or "cpu"))
@@ -1279,15 +1214,11 @@ def epochs(
             env_bool("ENN_TORCH_PROFILE", False),
         )
         prof_all_ranks = env_bool("ENN_TORCH_PROFILE_ALL_RANKS", False)
-        prof_rank = (
-            int(torch.distributed.get_rank()) if is_distributed() else 0
-        )
+        prof_rank = int(torch.distributed.get_rank()) if is_distributed() else 0
         if prof_enabled and (prof_all_ranks or prof_rank == 0):
             prof_dir = env_str("ENN_TORCH_PROFILE_DIR")
             if not prof_dir:
-                prof_dir = os.path.join(
-                    str(ops.ckpt_dir or "."), "torch_profiler"
-                )
+                prof_dir = os.path.join(str(ops.ckpt_dir or "."), "torch_profiler")
             torch_prof = _get_torch_profiler(
                 enabled=True,
                 tag=f"train-{str(run_id)}",
@@ -1304,7 +1235,9 @@ def epochs(
             if val_loader is not None
             else None
         )
-        ckpt_busy_policy = str(env_str("ENN_DCP_BUSY_POLICY", "skip") or "skip").strip().lower()
+        ckpt_busy_policy = (
+            str(env_str("ENN_DCP_BUSY_POLICY", "skip") or "skip").strip().lower()
+        )
         ckpt_block_last_epoch = env_bool("ENN_DCP_BLOCK_IF_BUSY_LAST_EPOCH", True)
         ckpt_log_busy = env_bool("ENN_DCP_LOG_BUSY", False)
         for epoch_idx in range(int(total_epochs)):
@@ -1327,9 +1260,7 @@ def epochs(
                     if callable(fn):
                         fn(int(epoch_idx))
             if is_distributed() and env_bool("ENN_DIST_SYNC_EPOCH", False):
-                target_module = (
-                    model.module if hasattr(model, "module") else model
-                )
+                target_module = model.module if hasattr(model, "module") else model
                 distributed_sync(target_module, device=device)
             flop_breakdown_epoch = {}
             io_time = 0.0
@@ -1371,11 +1302,7 @@ def epochs(
                     dl_len = None
                     with contextlib.suppress(Exception):
                         dl_len = len(train_loader)
-                    r = (
-                        int(torch.distributed.get_rank())
-                        if is_distributed()
-                        else 0
-                    )
+                    r = int(torch.distributed.get_rank()) if is_distributed() else 0
                     w = int(get_world_size(device)) if is_distributed() else 1
                     with contextlib.suppress(Exception):
                         chain = []
@@ -1442,9 +1369,7 @@ def epochs(
                     itertools.chain([_first_raw], train_iter)
                 ):
                     train_accum_since_last += (
-                        max(1, _infer_batch_samples(_raw))
-                        if use_sample_progress
-                        else 1
+                        max(1, _infer_batch_samples(_raw)) if use_sample_progress else 1
                     )
                     while True:
                         mark_cudagraph = False
@@ -1481,9 +1406,9 @@ def epochs(
                                     X.element_size() * X.nelement()
                                     + Y.element_size() * Y.nelement()
                                 )
-                            should_sync = ((step_idx + 1) % max(
-                                1, grad_accum_steps
-                            ) == 0) or (
+                            should_sync = (
+                                (step_idx + 1) % max(1, grad_accum_steps) == 0
+                            ) or (
                                 (int(total_batches) > 0)
                                 and ((step_idx + 1) == int(total_batches))
                             )
@@ -1497,8 +1422,7 @@ def epochs(
                                 t_comp_s = time.perf_counter_ns()
                             with no_sync(
                                 model,
-                                enable=grad_accum_steps > 1
-                                and (not should_sync),
+                                enable=grad_accum_steps > 1 and (not should_sync),
                             ):
                                 with flop_counter_train.step(
                                     display=False
@@ -1550,14 +1474,10 @@ def epochs(
                                     ):
                                         loss_top_val = loss_top_val.mean()
                                     if (
-                                        isinstance(
-                                            loss_bottom_val, torch.Tensor
-                                        )
+                                        isinstance(loss_bottom_val, torch.Tensor)
                                         and loss_bottom_val.ndim > 0
                                     ):
-                                        loss_bottom_val = (
-                                            loss_bottom_val.mean()
-                                        )
+                                        loss_bottom_val = loss_bottom_val.mean()
 
                                     if loss_val is None:
                                         raise RuntimeError(
@@ -1574,9 +1494,7 @@ def epochs(
                                             device=device, dtype=param_dtype
                                         )
                                     accum_scale = max(1, grad_accum_steps)
-                                    loss_for_backprop = loss_val / float(
-                                        accum_scale
-                                    )
+                                    loss_for_backprop = loss_val / float(accum_scale)
                                     scaler.scale(loss_for_backprop).backward()
 
                                     t_kern_step = 0.0
@@ -1588,26 +1506,21 @@ def epochs(
                                         if timer_sync:
                                             sync_accelerator(device)
                                         t_kern_step = (
-                                            float(t_kern_e - t_kern_s)
-                                            / 1000000000.0
+                                            float(t_kern_e - t_kern_s) / 1000000000.0
                                         )
                                     if (
                                         loss_top_val is not None
                                         or loss_bottom_val is not None
                                     ):
                                         lw_count += 1
-                                        if isinstance(
-                                            loss_top_val, torch.Tensor
-                                        ):
+                                        if isinstance(loss_top_val, torch.Tensor):
                                             v = loss_top_val.detach()
                                             lw_top_sum = (
                                                 v
                                                 if lw_top_sum is None
                                                 else lw_top_sum + v
                                             )
-                                        if isinstance(
-                                            loss_bottom_val, torch.Tensor
-                                        ):
+                                        if isinstance(loss_bottom_val, torch.Tensor):
                                             v = loss_bottom_val.detach()
                                             lw_bottom_sum = (
                                                 v
@@ -1637,12 +1550,16 @@ def epochs(
                                             or nonfinite_skip_step
                                             or bool(nonfinite_dump_dir)
                                         ):
-                                            bad_p0 = _first_nonfinite_param(model_for_grads)
+                                            bad_p0 = _first_nonfinite_param(
+                                                model_for_grads
+                                            )
                                             if bad_p0 is not None:
                                                 dump_path = _maybe_dump_nonfinite(
                                                     epoch=int(epoch_idx),
                                                     step_idx=int(step_idx),
-                                                    step_total=int(delta_gate_auto_step_total),
+                                                    step_total=int(
+                                                        delta_gate_auto_step_total
+                                                    ),
                                                     bad=str("param:" + str(bad_p0)),
                                                     X=X,
                                                     Y=Y,
@@ -1673,7 +1590,9 @@ def epochs(
                                                         int(step_idx),
                                                         int(delta_gate_auto_step_total),
                                                     )
-                                                    optimizer.zero_grad(set_to_none=True)
+                                                    optimizer.zero_grad(
+                                                        set_to_none=True
+                                                    )
                                                     with contextlib.suppress(Exception):
                                                         scaler.update()
                                                     train_accum_since_last = 0
@@ -1697,9 +1616,7 @@ def epochs(
                                                     bad,
                                                     int(epoch_idx),
                                                     int(step_idx),
-                                                    int(
-                                                        delta_gate_auto_step_total
-                                                    ),
+                                                    int(delta_gate_auto_step_total),
                                                     type(optimizer).__name__,
                                                 )
                                                 if dump_path:
@@ -1716,49 +1633,85 @@ def epochs(
                                                         "[OPTIM][nonfinite] skipping optimizer step (epoch=%d, step_idx=%d, step=%d)",
                                                         int(epoch_idx),
                                                         int(step_idx),
-                                                        int(
-                                                            delta_gate_auto_step_total
-                                                        ),
+                                                        int(delta_gate_auto_step_total),
                                                     )
                                                     optimizer.zero_grad(
                                                         set_to_none=True
                                                     )
-                                                    with contextlib.suppress(
-                                                        Exception
-                                                    ):
+                                                    with contextlib.suppress(Exception):
                                                         scaler.update()
                                                     train_accum_since_last = 0
                                                     break
                                         scaler.step(optimizer)
-                                        if strict_sanitize or nonfinite_fail_fast or bool(nonfinite_dump_dir):
-                                            bad_p_post = _first_nonfinite_param(model_for_grads)
+                                        if (
+                                            strict_sanitize
+                                            or nonfinite_fail_fast
+                                            or bool(nonfinite_dump_dir)
+                                        ):
+                                            bad_p_post = _first_nonfinite_param(
+                                                model_for_grads
+                                            )
                                             if bad_p_post is not None:
-                                                bad_s = _first_nonfinite_optim_state(optimizer)
+                                                bad_s = _first_nonfinite_optim_state(
+                                                    optimizer
+                                                )
                                                 p_t = None
                                                 with contextlib.suppress(Exception):
-                                                    for n, p in model_for_grads.named_parameters(recurse=True):
+                                                    for (
+                                                        n,
+                                                        p,
+                                                    ) in model_for_grads.named_parameters(
+                                                        recurse=True
+                                                    ):
                                                         if n == bad_p_post:
                                                             p_t = p
                                                             break
-                                                extra = {"where": "post_step_param", "param": str(bad_p_post)}
+                                                extra = {
+                                                    "where": "post_step_param",
+                                                    "param": str(bad_p_post),
+                                                }
                                                 if bad_s is not None:
-                                                    extra["optim_state_first_bad"] = str(bad_s)
+                                                    extra["optim_state_first_bad"] = (
+                                                        str(bad_s)
+                                                    )
                                                 if torch.is_tensor(p_t):
                                                     with torch.no_grad():
                                                         tt = p_t.detach()
                                                         extra["dtype"] = str(tt.dtype)
-                                                        with contextlib.suppress(Exception):
-                                                            extra["shape"] = [int(x) for x in tuple(tt.shape)]
+                                                        with contextlib.suppress(
+                                                            Exception
+                                                        ):
+                                                            extra["shape"] = [
+                                                                int(x)
+                                                                for x in tuple(tt.shape)
+                                                            ]
                                                         if tt.is_floating_point():
-                                                            with contextlib.suppress(Exception):
-                                                                extra["nan"] = int(torch.isnan(tt).sum().item())
-                                                            with contextlib.suppress(Exception):
-                                                                extra["inf"] = int(torch.isinf(tt).sum().item())
+                                                            with contextlib.suppress(
+                                                                Exception
+                                                            ):
+                                                                extra["nan"] = int(
+                                                                    torch.isnan(tt)
+                                                                    .sum()
+                                                                    .item()
+                                                                )
+                                                            with contextlib.suppress(
+                                                                Exception
+                                                            ):
+                                                                extra["inf"] = int(
+                                                                    torch.isinf(tt)
+                                                                    .sum()
+                                                                    .item()
+                                                                )
                                                 dump_path = _maybe_dump_nonfinite(
                                                     epoch=int(epoch_idx),
                                                     step_idx=int(step_idx),
-                                                    step_total=int(delta_gate_auto_step_total),
-                                                    bad=str("post_step_param:" + str(bad_p_post)),
+                                                    step_total=int(
+                                                        delta_gate_auto_step_total
+                                                    ),
+                                                    bad=str(
+                                                        "post_step_param:"
+                                                        + str(bad_p_post)
+                                                    ),
                                                     X=X,
                                                     Y=Y,
                                                     Y_flat=Y_flat,
@@ -1775,16 +1728,36 @@ def epochs(
                                                     str(bad_s),
                                                 )
                                                 if dump_path:
-                                                    _LOGGER.error("[OPTIM][nonfinite] dumped to: %s", str(dump_path))
-                                                if strict_sanitize or nonfinite_fail_fast:
+                                                    _LOGGER.error(
+                                                        "[OPTIM][nonfinite] dumped to: %s",
+                                                        str(dump_path),
+                                                    )
+                                                if (
+                                                    strict_sanitize
+                                                    or nonfinite_fail_fast
+                                                ):
                                                     raise RuntimeError(
                                                         f"Non-finite parameter after optimizer.step: {bad_p_post} (epoch={int(epoch_idx)}, step_idx={int(step_idx)}, step={int(delta_gate_auto_step_total)})"
                                                     )
-                                        if optim_diag and (int(delta_gate_auto_step_total) % int(optim_diag_every) == 0):
-                                            bad_p = _first_nonfinite_param(model_for_grads)
+                                        if optim_diag and (
+                                            int(delta_gate_auto_step_total)
+                                            % int(optim_diag_every)
+                                            == 0
+                                        ):
+                                            bad_p = _first_nonfinite_param(
+                                                model_for_grads
+                                            )
                                             if bad_p is not None:
-                                                bad_s = _first_nonfinite_optim_state(optimizer)
-                                                _LOGGER.error("[OPTIM][nonfinite] post-step param non-finite: %s (step=%d, opt=%s, state=%s)", bad_p, int(delta_gate_auto_step_total), type(optimizer).__name__, str(bad_s))
+                                                bad_s = _first_nonfinite_optim_state(
+                                                    optimizer
+                                                )
+                                                _LOGGER.error(
+                                                    "[OPTIM][nonfinite] post-step param non-finite: %s (step=%d, opt=%s, state=%s)",
+                                                    bad_p,
+                                                    int(delta_gate_auto_step_total),
+                                                    type(optimizer).__name__,
+                                                    str(bad_s),
+                                                )
                                         scaler.update()
                                         optimizer.zero_grad(set_to_none=True)
                                         ema_target = (
@@ -1818,23 +1791,17 @@ def epochs(
                                             setattr(
                                                 inst_step,
                                                 "_enn_step_total",
-                                                int(
-                                                    delta_gate_auto_step_total
-                                                ),
+                                                int(delta_gate_auto_step_total),
                                             )
                                         peak = None
                                         free = None
                                         total = None
                                         with contextlib.suppress(Exception):
                                             peak = int(
-                                                accelerator_max_allocated_memory(
-                                                    device
-                                                )
+                                                accelerator_max_allocated_memory(device)
                                             )
                                         with contextlib.suppress(Exception):
-                                            free, total = _device_mem_get_info(
-                                                device
-                                            )
+                                            free, total = _device_mem_get_info(device)
                                         if (
                                             isinstance(peak, int)
                                             and peak > 0
@@ -1854,22 +1821,16 @@ def epochs(
                                             ema = (
                                                 frac
                                                 if prev_ema <= 0.0
-                                                else (
-                                                    0.9 * prev_ema + 0.1 * frac
-                                                )
+                                                else (0.9 * prev_ema + 0.1 * frac)
                                             )
-                                            with contextlib.suppress(
-                                                Exception
-                                            ):
+                                            with contextlib.suppress(Exception):
                                                 setattr(
                                                     inst_step,
                                                     "_enn_peak_ema",
                                                     float(ema),
                                                 )
-                                            spike = (
-                                                prev_ema > 0.0
-                                                and frac
-                                                > max(0.92, prev_ema * 1.25)
+                                            spike = prev_ema > 0.0 and frac > max(
+                                                0.92, prev_ema * 1.25
                                             )
                                             if frac > 0.92 or spike:
                                                 to_checkpoint(
@@ -1883,14 +1844,10 @@ def epochs(
                                                 )
                                         from_checkpoint(
                                             model,
-                                            step_total=int(
-                                                delta_gate_auto_step_total
-                                            ),
+                                            step_total=int(delta_gate_auto_step_total),
                                         )
                                         if scheduler_step_per_batch:
-                                            with contextlib.suppress(
-                                                Exception
-                                            ):
+                                            with contextlib.suppress(Exception):
                                                 sched.step()
                                         if lw_count > 0:
                                             top_avg_t = (
@@ -1906,19 +1863,12 @@ def epochs(
                                             if is_distributed():
                                                 ws = _get_world_size(train_pg)
                                                 if top_avg_t is not None:
-                                                    _reduce_sum(
-                                                        top_avg_t, train_pg
-                                                    )
-                                                    top_avg_t = (
-                                                        top_avg_t / float(ws)
-                                                    )
+                                                    _reduce_sum(top_avg_t, train_pg)
+                                                    top_avg_t = top_avg_t / float(ws)
                                                 if bottom_avg_t is not None:
-                                                    _reduce_sum(
-                                                        bottom_avg_t, train_pg
-                                                    )
-                                                    bottom_avg_t = (
-                                                        bottom_avg_t
-                                                        / float(ws)
+                                                    _reduce_sum(bottom_avg_t, train_pg)
+                                                    bottom_avg_t = bottom_avg_t / float(
+                                                        ws
                                                     )
                                             loss_controller.update(
                                                 top_avg_t, bottom_avg_t
@@ -1930,9 +1880,7 @@ def epochs(
                                     with contextlib.suppress(Exception):
                                         step_flops = max(
                                             0.0,
-                                            float(
-                                                train_counter.get_total_flops()
-                                            ),
+                                            float(train_counter.get_total_flops()),
                                         )
                                     flops += float(step_flops)
                                     tflops_seen += 1
@@ -1949,13 +1897,9 @@ def epochs(
                                             name,
                                             value,
                                         ) in breakdown_getter().items():
-                                            with contextlib.suppress(
-                                                Exception
-                                            ):
+                                            with contextlib.suppress(Exception):
                                                 flop_breakdown_epoch[name] = (
-                                                    flop_breakdown_epoch.get(
-                                                        name, 0.0
-                                                    )
+                                                    flop_breakdown_epoch.get(name, 0.0)
                                                     + float(value)
                                                 )
                             if should_sync:
@@ -1979,15 +1923,13 @@ def epochs(
                                     )
                                     if callable(maybe_upgrade):
                                         maybe_upgrade(
-                                            step_total=int(
-                                                delta_gate_auto_step_total
-                                            ),
+                                            step_total=int(delta_gate_auto_step_total),
                                             logger=_LOGGER,
                                         )
                                 match device.type:
                                     case "cuda":
-                                        util_now, mem_now = (
-                                            Monitor.gpu_nvml_utils(device)
+                                        util_now, mem_now = Monitor.gpu_nvml_utils(
+                                            device
                                         )
                                     case "xpu":
                                         util_now, mem_now = (
@@ -2007,24 +1949,20 @@ def epochs(
                                         gpu_util_ema = util_now
                                     else:
                                         gpu_util_ema = (
-                                            (1.0 - util_alpha) * gpu_util_ema
-                                            + util_alpha * util_now
-                                        )
+                                            1.0 - util_alpha
+                                        ) * gpu_util_ema + util_alpha * util_now
                                 if mem_now is not None:
                                     mem_now = float(mem_now)
                                     if mem_util_ema is None:
                                         mem_util_ema = mem_now
                                     else:
                                         mem_util_ema = (
-                                            (1.0 - util_alpha) * mem_util_ema
-                                            + util_alpha * mem_now
-                                        )
+                                            1.0 - util_alpha
+                                        ) * mem_util_ema + util_alpha * mem_now
                                 if (
                                     util_adjust_interval > 0
                                     and global_step >= util_warmup_steps
-                                    and (
-                                        global_step % util_adjust_interval == 0
-                                    )
+                                    and (global_step % util_adjust_interval == 0)
                                 ):
                                     new_grad_accum = grad_accum_steps
                                     util_frac = None
@@ -2038,34 +1976,25 @@ def epochs(
                                             0.0, min(1.0, mem_util_ema / 100.0)
                                         )
                                     if util_frac is None:
-                                        total_t_local = float(
-                                            io_time + comp_time
-                                        )
+                                        total_t_local = float(io_time + comp_time)
                                         if total_t_local > 0.0:
                                             util_frac = max(
                                                 0.0,
                                                 min(
                                                     1.0,
-                                                    float(comp_time)
-                                                    / total_t_local,
+                                                    float(comp_time) / total_t_local,
                                                 ),
                                             )
                                         else:
                                             util_frac = 0.0
                                     if util_frac is not None:
                                         if mem_frac is not None:
-                                            if (
-                                                util_frac < 0.88
-                                                and mem_frac < 0.9
-                                            ):
+                                            if util_frac < 0.88 and mem_frac < 0.9:
                                                 new_grad_accum = min(
                                                     max_grad_accum,
                                                     grad_accum_steps + 1,
                                                 )
-                                            elif (
-                                                util_frac > 0.97
-                                                or mem_frac > 0.92
-                                            ):
+                                            elif util_frac > 0.97 or mem_frac > 0.92:
                                                 new_grad_accum = max(
                                                     min_grad_accum,
                                                     grad_accum_steps - 1,
@@ -2091,9 +2020,7 @@ def epochs(
                                         and host_avail_now > 0
                                     ):
                                         raw_min_free = str(
-                                            os.environ.get(
-                                                "ENN_HOST_MIN_FREE_MB", ""
-                                            )
+                                            os.environ.get("ENN_HOST_MIN_FREE_MB", "")
                                             or ""
                                         ).strip()
                                         min_free_mb = None
@@ -2126,8 +2053,7 @@ def epochs(
                                                 and host_total_now > 0
                                             ):
                                                 total_mb = int(
-                                                    int(host_total_now)
-                                                    // (1024 * 1024)
+                                                    int(host_total_now) // (1024 * 1024)
                                                 )
                                                 cand = int(total_mb * ratio)
                                                 min_free_mb = max(
@@ -2201,9 +2127,7 @@ def epochs(
 
                                                     sysname = _platform.system()
                                                     if sysname == "Linux":
-                                                        libc = ctypes.CDLL(
-                                                            "libc.so.6"
-                                                        )
+                                                        libc = ctypes.CDLL("libc.so.6")
                                                         trim = getattr(
                                                             libc, "malloc_trim", None
                                                         )
@@ -2294,17 +2218,14 @@ def epochs(
                                 comp_ev_e.record()
                                 comp_ev_e.synchronize()
                                 comp_time += (
-                                    float(comp_ev_s.elapsed_time(comp_ev_e))
-                                    / 1000.0
+                                    float(comp_ev_s.elapsed_time(comp_ev_e)) / 1000.0
                                 )
-                                if (
-                                    kern_ev_s is not None
-                                    and kern_ev_e is not None
-                                ):
+                                if kern_ev_s is not None and kern_ev_e is not None:
                                     with contextlib.suppress(Exception):
-                                        t_kern_step = float(
-                                            kern_ev_s.elapsed_time(kern_ev_e)
-                                        ) / 1000.0
+                                        t_kern_step = (
+                                            float(kern_ev_s.elapsed_time(kern_ev_e))
+                                            / 1000.0
+                                        )
                             else:
                                 if timer_sync:
                                     sync_accelerator(device)
@@ -2314,29 +2235,17 @@ def epochs(
                             kern_time += float(t_kern_step)
                             if local_rank == 0 and should_sync:
                                 io_elapsed = prev_io_time + float(io_time)
-                                io_transferred = prev_io_bytes + float(
-                                    io_bytes
-                                )
-                                comp_elapsed = prev_comp_time + float(
-                                    comp_time
-                                )
+                                io_transferred = prev_io_bytes + float(io_bytes)
+                                comp_elapsed = prev_comp_time + float(comp_time)
                                 mbps_cur = (
-                                    io_transferred
-                                    / max(io_elapsed, 1e-06)
-                                    / MB_DIV
+                                    io_transferred / max(io_elapsed, 1e-06) / MB_DIV
                                 )
-                                flops_used = prev_flops_tflops + float(
-                                    flops_tflops
-                                )
-                                kern_used = prev_kern_tflops + float(
-                                    kern_tflops
-                                )
+                                flops_used = prev_flops_tflops + float(flops_tflops)
+                                kern_used = prev_kern_tflops + float(kern_tflops)
                                 denom = (
                                     kern_used
                                     if kern_used > 0.0
-                                    else (
-                                        prev_kern_time + float(kern_time)
-                                    )
+                                    else (prev_kern_time + float(kern_time))
                                 )
                                 if denom <= 0.0:
                                     denom = comp_elapsed
@@ -2356,8 +2265,7 @@ def epochs(
                                 try:
                                     if (
                                         train_steps <= 0
-                                        or step_idx
-                                        % max(1, int(train_steps * 0.01))
+                                        or step_idx % max(1, int(train_steps * 0.01))
                                         == 0
                                     ):
                                         x_rec = X
@@ -2388,13 +2296,9 @@ def epochs(
                                                         )
                                                         and y_flat.ndim != 2
                                                     ):
-                                                        y_flat = (
-                                                            y_flat.reshape(
-                                                                y_flat.shape[
-                                                                    0
-                                                                ],
-                                                                -1,
-                                                            )
+                                                        y_flat = y_flat.reshape(
+                                                            y_flat.shape[0],
+                                                            -1,
                                                         )
                                                     need_denorm = True
                                                     scale_max = getattr(
@@ -2411,8 +2315,7 @@ def epochs(
                                                             y_flat,
                                                             torch.Tensor,
                                                         )
-                                                        and scale_max
-                                                        is not None
+                                                        and scale_max is not None
                                                     ):
                                                         with contextlib.suppress(
                                                             Exception
@@ -2425,34 +2328,25 @@ def epochs(
                                                             )
                                                             if (
                                                                 max_obs
-                                                                >= float(
-                                                                    scale_max
-                                                                )
+                                                                >= float(scale_max)
                                                                 * 0.5
                                                             ):
-                                                                need_denorm = (
-                                                                    False
-                                                                )
+                                                                need_denorm = False
                                                     if need_denorm:
-                                                        y_rec = dy(
-                                                            y_flat
-                                                        ).view_as(y_rec)
+                                                        y_rec = dy(y_flat).view_as(
+                                                            y_rec
+                                                        )
                                         hist.record_batch(x_rec, y_rec)
                                 except Exception:
                                     pass
                             if torch_prof is not None:
                                 torch_prof.step()
                             t_fetch_start = time.perf_counter_ns()
-                            if (
-                                cpu_pool is not None
-                                and step_idx + 1 & 255 == 0
-                            ):
+                            if cpu_pool is not None and step_idx + 1 & 255 == 0:
                                 with contextlib.suppress(Exception):
                                     cpu_pool.collect()
                             with contextlib.suppress(Exception):
-                                _clear_oom_retries(
-                                    train_loader, "train", step_idx
-                                )
+                                _clear_oom_retries(train_loader, "train", step_idx)
                             break
                         except RuntimeError as e:
                             if is_oom_error(e):
@@ -2477,9 +2371,7 @@ def epochs(
                                 cudagraph_mark_step_end()
             if lw_count > 0:
                 top_avg_t = (
-                    lw_top_sum / float(lw_count)
-                    if lw_top_sum is not None
-                    else None
+                    lw_top_sum / float(lw_count) if lw_top_sum is not None else None
                 )
                 bottom_avg_t = (
                     lw_bottom_sum / float(lw_count)
@@ -2545,7 +2437,9 @@ def epochs(
                             type(optimizer).__name__,
                         )
                         if dump_path:
-                            _LOGGER.error("[OPTIM][nonfinite] dumped to: %s", str(dump_path))
+                            _LOGGER.error(
+                                "[OPTIM][nonfinite] dumped to: %s", str(dump_path)
+                            )
                         if nonfinite_fail_fast:
                             raise RuntimeError(
                                 f"Non-finite parameters detected (param={bad_p0}, epoch={int(epoch_idx)}, step_idx={int(step_idx)}, step={int(delta_gate_auto_step_total)})."
@@ -2596,11 +2490,18 @@ def epochs(
                             train_accum_since_last = 0
                 if bad is None or (not nonfinite_skip_step):
                     scaler.step(optimizer)
-                    if strict_sanitize or nonfinite_fail_fast or bool(nonfinite_dump_dir):
+                    if (
+                        strict_sanitize
+                        or nonfinite_fail_fast
+                        or bool(nonfinite_dump_dir)
+                    ):
                         bad_p_post = _first_nonfinite_param(model_for_grads)
                         if bad_p_post is not None:
                             bad_s = _first_nonfinite_optim_state(optimizer)
-                            extra = {"where": "post_step_param_tail", "param": str(bad_p_post)}
+                            extra = {
+                                "where": "post_step_param_tail",
+                                "param": str(bad_p_post),
+                            }
                             if bad_s is not None:
                                 extra["optim_state_first_bad"] = str(bad_s)
                             dump_path = _maybe_dump_nonfinite(
@@ -2620,16 +2521,26 @@ def epochs(
                                 str(bad_s),
                             )
                             if dump_path:
-                                _LOGGER.error("[OPTIM][nonfinite] dumped to: %s", str(dump_path))
+                                _LOGGER.error(
+                                    "[OPTIM][nonfinite] dumped to: %s", str(dump_path)
+                                )
                             if strict_sanitize or nonfinite_fail_fast:
                                 raise RuntimeError(
                                     f"Non-finite parameter after optimizer.step (tail): {bad_p_post} (epoch={int(epoch_idx)}, step_idx={int(step_idx)}, step={int(delta_gate_auto_step_total)})"
                                 )
-                if optim_diag and (int(delta_gate_auto_step_total) % int(optim_diag_every) == 0):
+                if optim_diag and (
+                    int(delta_gate_auto_step_total) % int(optim_diag_every) == 0
+                ):
                     bad_p = _first_nonfinite_param(model_for_grads)
                     if bad_p is not None:
                         bad_s = _first_nonfinite_optim_state(optimizer)
-                        _LOGGER.error("[OPTIM][nonfinite] post-step param non-finite: %s (step=%d, opt=%s, state=%s)", bad_p, int(delta_gate_auto_step_total), type(optimizer).__name__, str(bad_s))
+                        _LOGGER.error(
+                            "[OPTIM][nonfinite] post-step param non-finite: %s (step=%d, opt=%s, state=%s)",
+                            bad_p,
+                            int(delta_gate_auto_step_total),
+                            type(optimizer).__name__,
+                            str(bad_s),
+                        )
                 if bad is None or (not nonfinite_skip_step):
                     scaler.update()
                     optimizer.zero_grad(set_to_none=True)
@@ -2640,9 +2551,7 @@ def epochs(
                         io_elapsed = prev_io_time + float(io_time)
                         io_transferred = prev_io_bytes + float(io_bytes)
                         comp_elapsed = prev_comp_time + float(comp_time)
-                        mbps_cur = (
-                            io_transferred / max(io_elapsed, 1e-06) / MB_DIV
-                        )
+                        mbps_cur = io_transferred / max(io_elapsed, 1e-06) / MB_DIV
                         flops_used = prev_flops_tflops + float(flops_tflops)
                         kern_used = prev_kern_tflops + float(kern_tflops)
                         denom = (
@@ -2653,9 +2562,7 @@ def epochs(
                         if denom <= 0.0:
                             denom = comp_elapsed
                         tflops_cur = (
-                            flops_used
-                            / max(float(denom), 1e-06)
-                            / 1000000000000.0
+                            flops_used / max(float(denom), 1e-06) / 1000000000000.0
                         )
                         ProcessBroker.update_progress_bar(
                             status_bar,
@@ -2699,9 +2606,7 @@ def epochs(
                                         raise RuntimeError(
                                             f"labels.ndim={Y.ndim} (expect >= 1). got shape={tuple(Y.shape)}"
                                         )
-                                    wait_s = (
-                                        t_ready - t_fetch_start
-                                    ) / 1000000000.0
+                                    wait_s = (t_ready - t_fetch_start) / 1000000000.0
                                     io_time += float(wait_s + h2d_s)
                                     with contextlib.suppress(Exception):
                                         io_bytes += float(
@@ -2723,9 +2628,7 @@ def epochs(
                                             cudagraph_mark_step_begin()
                                             mark_cudagraph = True
                                         with StatelessAutocast.float(device):
-                                            Yv_flat = Y.reshape(
-                                                Y.shape[0], -1
-                                            ).to(
+                                            Yv_flat = Y.reshape(Y.shape[0], -1).to(
                                                 device,
                                                 dtype=param_dtype,
                                                 non_blocking=non_blocking_ok,
@@ -2765,11 +2668,7 @@ def epochs(
                                         comp_ev_e.record()
                                         comp_ev_e.synchronize()
                                         comp_time += (
-                                            float(
-                                                comp_ev_s.elapsed_time(
-                                                    comp_ev_e
-                                                )
-                                            )
+                                            float(comp_ev_s.elapsed_time(comp_ev_e))
                                             / 1000.0
                                         )
                                     else:
@@ -2781,9 +2680,7 @@ def epochs(
                                     with contextlib.suppress(Exception):
                                         flops += max(
                                             0.0,
-                                            float(
-                                                val_counter.get_total_flops()
-                                            ),
+                                            float(val_counter.get_total_flops()),
                                         )
                                     breakdown_getter = getattr(
                                         val_counter,
@@ -2795,25 +2692,15 @@ def epochs(
                                             name,
                                             value,
                                         ) in breakdown_getter().items():
-                                            with contextlib.suppress(
-                                                Exception
-                                            ):
+                                            with contextlib.suppress(Exception):
                                                 flop_breakdown_epoch[name] = (
-                                                    flop_breakdown_epoch.get(
-                                                        name, 0.0
-                                                    )
+                                                    flop_breakdown_epoch.get(name, 0.0)
                                                     + float(value)
                                                 )
                                     if local_rank == 0:
-                                        io_elapsed = prev_io_time + float(
-                                            io_time
-                                        )
-                                        io_transferred = prev_io_bytes + float(
-                                            io_bytes
-                                        )
-                                        comp_elapsed = prev_comp_time + float(
-                                            comp_time
-                                        )
+                                        io_elapsed = prev_io_time + float(io_time)
+                                        io_transferred = prev_io_bytes + float(io_bytes)
+                                        comp_elapsed = prev_comp_time + float(comp_time)
                                         flop_total = prev_flops + float(flops)
                                         mbps_cur = (
                                             io_transferred
@@ -2838,16 +2725,11 @@ def epochs(
                                     if torch_prof is not None:
                                         torch_prof.step()
                                     t_fetch_start = time.perf_counter_ns()
-                                    if (
-                                        cpu_pool is not None
-                                        and _vstep + 1 & 255 == 0
-                                    ):
+                                    if cpu_pool is not None and _vstep + 1 & 255 == 0:
                                         with contextlib.suppress(Exception):
                                             cpu_pool.collect()
                                     with contextlib.suppress(Exception):
-                                        _clear_oom_retries(
-                                            val_loader, "val", _vstep
-                                        )
+                                        _clear_oom_retries(val_loader, "val", _vstep)
                                     break
                                 except RuntimeError as e:
                                     if is_oom_error(e):
@@ -2882,9 +2764,7 @@ def epochs(
                     device=device,
                     dtype=stats_dtype,
                 )
-                torch.distributed.all_reduce(
-                    stats, op=torch.distributed.ReduceOp.SUM
-                )
+                torch.distributed.all_reduce(stats, op=torch.distributed.ReduceOp.SUM)
                 world = max(1, get_world_size(device))
                 stats /= world
                 stats_cpu = stats.detach().cpu()
@@ -3010,7 +2890,8 @@ def epochs(
                     "device": str(device),
                     "torch": str(getattr(torch, "__version__", "")),
                     "py_tag": str(
-                        getattr(getattr(sys, "implementation", None), "cache_tag", "") or ""
+                        getattr(getattr(sys, "implementation", None), "cache_tag", "")
+                        or ""
                     ),
                     "no_gil": bool(CPU.is_no_gil_enforced()),
                     "gil_enabled": bool(CPU.is_gil_enabled()),
@@ -3029,7 +2910,11 @@ def epochs(
 
     model_for_scaler = model.module if hasattr(model, "module") else model
     scaler_y_device = model_for_scaler.scaler.y_mean.device
-    calib_src = calibration_loader if calibration_loader is not None else (val_loader or train_loader)
+    calib_src = (
+        calibration_loader
+        if calibration_loader is not None
+        else (val_loader or train_loader)
+    )
     if calib_src is None:
         end_kst_ns = posix_time()
         return None
@@ -3392,10 +3277,18 @@ def epochs(
                 total_n += n_batch
                 feat = int(z_pred.shape[1])
                 if sum_x is None:
-                    sum_x = torch.zeros((feat,), device=accum_device, dtype=torch.float64)
-                    sum_y = torch.zeros((feat,), device=accum_device, dtype=torch.float64)
-                    sum_x2 = torch.zeros((feat,), device=accum_device, dtype=torch.float64)
-                    sum_xy = torch.zeros((feat,), device=accum_device, dtype=torch.float64)
+                    sum_x = torch.zeros(
+                        (feat,), device=accum_device, dtype=torch.float64
+                    )
+                    sum_y = torch.zeros(
+                        (feat,), device=accum_device, dtype=torch.float64
+                    )
+                    sum_x2 = torch.zeros(
+                        (feat,), device=accum_device, dtype=torch.float64
+                    )
+                    sum_xy = torch.zeros(
+                        (feat,), device=accum_device, dtype=torch.float64
+                    )
 
                 if int(target_chunk_bytes) <= 0:
                     chunk_f = feat
@@ -3407,8 +3300,12 @@ def epochs(
                 if chunk_f >= feat:
                     sum_x += _to_accum(z_pred.sum(dim=0, dtype=torch.float64))
                     sum_y += _to_accum(z_true.sum(dim=0, dtype=torch.float64))
-                    sum_x2 += _to_accum((z_pred * z_pred).sum(dim=0, dtype=torch.float64))
-                    sum_xy += _to_accum((z_pred * z_true).sum(dim=0, dtype=torch.float64))
+                    sum_x2 += _to_accum(
+                        (z_pred * z_pred).sum(dim=0, dtype=torch.float64)
+                    )
+                    sum_xy += _to_accum(
+                        (z_pred * z_true).sum(dim=0, dtype=torch.float64)
+                    )
                 else:
                     for j in range(0, feat, chunk_f):
                         j2 = j + chunk_f
@@ -3416,8 +3313,12 @@ def epochs(
                         zt = z_true[:, j:j2]
                         sum_x[j:j2] += _to_accum(zp.sum(dim=0, dtype=torch.float64))
                         sum_y[j:j2] += _to_accum(zt.sum(dim=0, dtype=torch.float64))
-                        sum_x2[j:j2] += _to_accum((zp * zp).sum(dim=0, dtype=torch.float64))
-                        sum_xy[j:j2] += _to_accum((zp * zt).sum(dim=0, dtype=torch.float64))
+                        sum_x2[j:j2] += _to_accum(
+                            (zp * zp).sum(dim=0, dtype=torch.float64)
+                        )
+                        sum_xy[j:j2] += _to_accum(
+                            (zp * zt).sum(dim=0, dtype=torch.float64)
+                        )
 
                 seen_batches += 1
                 seen_samples += int(B)
@@ -3464,7 +3365,9 @@ def epochs(
                     total_n,
                     seen_batches,
                     seen_samples,
-                ) = run_fn(sum_x, sum_y, sum_x2, sum_xy, total_n, seen_batches, seen_samples)
+                ) = run_fn(
+                    sum_x, sum_y, sum_x2, sum_xy, total_n, seen_batches, seen_samples
+                )
             except BaseException as e:
                 suppress_exc = False
                 with contextlib.suppress(Exception):
@@ -3483,7 +3386,9 @@ def epochs(
                 total_n,
                 seen_batches,
                 seen_samples,
-            ) = run_fn(sum_x, sum_y, sum_x2, sum_xy, total_n, seen_batches, seen_samples)
+            ) = run_fn(
+                sum_x, sum_y, sum_x2, sum_xy, total_n, seen_batches, seen_samples
+            )
     finally:
         if calib_bar is not None:
             calib_bar.close()
@@ -3574,7 +3479,9 @@ def epochs(
                     z_true = scaler.normalize_y(y_true)
                     zt64 = z_true.to(device=accum_device, dtype=torch.float64)
 
-                    local_vote = bool(pred_is_z_fixed) if pred_is_z_fixed is not None else False
+                    local_vote = (
+                        bool(pred_is_z_fixed) if pred_is_z_fixed is not None else False
+                    )
                     vote_valid = 0.0
                     local_err_z_sum = 0.0
                     local_err_y_sum = 0.0
@@ -3592,15 +3499,25 @@ def epochs(
                         with contextlib.suppress(Exception):
                             zt0 = z_true.detach().to(dtype=torch.float32)
                             z_as_z = ypf.detach().to(dtype=torch.float32)
-                            z_as_y = scaler.normalize_y(ypf).detach().to(dtype=torch.float32)
-                            valid = torch.isfinite(zt0) & torch.isfinite(z_as_z) & torch.isfinite(z_as_y)
+                            z_as_y = (
+                                scaler.normalize_y(ypf).detach().to(dtype=torch.float32)
+                            )
+                            valid = (
+                                torch.isfinite(zt0)
+                                & torch.isfinite(z_as_z)
+                                & torch.isfinite(z_as_y)
+                            )
                             if valid.any():
                                 dz0 = z_as_z - zt0
                                 dz1 = z_as_y - zt0
                                 e0 = (dz0[valid] * dz0[valid]).sum()
                                 e1 = (dz1[valid] * dz1[valid]).sum()
                                 n0 = int(valid.sum().item())
-                                if n0 > 0 and torch.isfinite(e0).all() and torch.isfinite(e1).all():
+                                if (
+                                    n0 > 0
+                                    and torch.isfinite(e0).all()
+                                    and torch.isfinite(e1).all()
+                                ):
                                     local_err_z_sum = float(e0.item())
                                     local_err_y_sum = float(e1.item())
                                     local_err_n = float(n0)
@@ -3626,7 +3543,11 @@ def epochs(
                         g_n = float(pack[2].item())
                         g_vote_sum = float(pack[3].item())
                         g_vote_n = float(pack[4].item())
-                        if g_n > 0.0 and math.isfinite(g_err_z) and math.isfinite(g_err_y):
+                        if (
+                            g_n > 0.0
+                            and math.isfinite(g_err_z)
+                            and math.isfinite(g_err_y)
+                        ):
                             pred_is_z_fixed = bool(g_err_z <= g_err_y)
                         elif g_vote_n > 0.0:
                             pred_is_z_fixed = bool((g_vote_sum * 2.0) >= g_vote_n)
@@ -3640,7 +3561,9 @@ def epochs(
                     zp64 = z_pred.to(device=accum_device, dtype=torch.float64)
 
                     yt64 = y_true.to(device=accum_device, dtype=torch.float64)
-                    allow_neg_targets = bool(env_bool("ENN_OUTPUT_AB_ALLOW_NEGATIVE_TARGETS", default=False))
+                    allow_neg_targets = bool(
+                        env_bool("ENN_OUTPUT_AB_ALLOW_NEGATIVE_TARGETS", default=False)
+                    )
                     valid = torch.isfinite(yt64)
                     if not allow_neg_targets:
                         valid = valid & (yt64 >= 0.0)
@@ -3668,10 +3591,18 @@ def epochs(
 
                     if sum_pz is None:
                         feat_y = int(zp64.shape[1])
-                        sum_pz = torch.zeros((feat_y,), device=accum_device, dtype=torch.float64)
-                        sum_pz2 = torch.zeros((feat_y,), device=accum_device, dtype=torch.float64)
-                        sum_tz = torch.zeros((feat_y,), device=accum_device, dtype=torch.float64)
-                        sum_tz2 = torch.zeros((feat_y,), device=accum_device, dtype=torch.float64)
+                        sum_pz = torch.zeros(
+                            (feat_y,), device=accum_device, dtype=torch.float64
+                        )
+                        sum_pz2 = torch.zeros(
+                            (feat_y,), device=accum_device, dtype=torch.float64
+                        )
+                        sum_tz = torch.zeros(
+                            (feat_y,), device=accum_device, dtype=torch.float64
+                        )
+                        sum_tz2 = torch.zeros(
+                            (feat_y,), device=accum_device, dtype=torch.float64
+                        )
 
                     sum_pz += zp64.sum(dim=0, dtype=torch.float64)
                     sum_pz2 += (zp64 * zp64).sum(dim=0, dtype=torch.float64)
@@ -3698,9 +3629,13 @@ def epochs(
                 pred_is_z_synced = True
 
             if is_distributed():
-                feat_local = int(sum_pz.shape[0]) if isinstance(sum_pz, torch.Tensor) else 0
+                feat_local = (
+                    int(sum_pz.shape[0]) if isinstance(sum_pz, torch.Tensor) else 0
+                )
                 big_feat = float(1.0e30)
-                feat_t_max = torch.tensor(float(feat_local), device="cpu", dtype=torch.float64)
+                feat_t_max = torch.tensor(
+                    float(feat_local), device="cpu", dtype=torch.float64
+                )
                 feat_t_min = torch.tensor(
                     float(feat_local) if int(feat_local) > 0 else big_feat,
                     device="cpu",
@@ -3727,17 +3662,55 @@ def epochs(
                 if feat_y <= 0:
                     feat_y = 1
 
-                if sum_pz is None or sum_pz2 is None or sum_tz is None or sum_tz2 is None:
-                    sum_pz = torch.zeros((feat_y,), device=accum_device, dtype=torch.float64)
-                    sum_pz2 = torch.zeros((feat_y,), device=accum_device, dtype=torch.float64)
-                    sum_tz = torch.zeros((feat_y,), device=accum_device, dtype=torch.float64)
-                    sum_tz2 = torch.zeros((feat_y,), device=accum_device, dtype=torch.float64)
+                if (
+                    sum_pz is None
+                    or sum_pz2 is None
+                    or sum_tz is None
+                    or sum_tz2 is None
+                ):
+                    sum_pz = torch.zeros(
+                        (feat_y,), device=accum_device, dtype=torch.float64
+                    )
+                    sum_pz2 = torch.zeros(
+                        (feat_y,), device=accum_device, dtype=torch.float64
+                    )
+                    sum_tz = torch.zeros(
+                        (feat_y,), device=accum_device, dtype=torch.float64
+                    )
+                    sum_tz2 = torch.zeros(
+                        (feat_y,), device=accum_device, dtype=torch.float64
+                    )
 
-                if z_min_obs is None or z_max_obs is None or y_min_obs is None or y_max_obs is None:
-                    z_min_obs = torch.full((feat_y,), float("inf"), device=accum_device, dtype=torch.float64)
-                    z_max_obs = torch.full((feat_y,), float("-inf"), device=accum_device, dtype=torch.float64)
-                    y_min_obs = torch.full((feat_y,), float("inf"), device=accum_device, dtype=torch.float64)
-                    y_max_obs = torch.full((feat_y,), float("-inf"), device=accum_device, dtype=torch.float64)
+                if (
+                    z_min_obs is None
+                    or z_max_obs is None
+                    or y_min_obs is None
+                    or y_max_obs is None
+                ):
+                    z_min_obs = torch.full(
+                        (feat_y,),
+                        float("inf"),
+                        device=accum_device,
+                        dtype=torch.float64,
+                    )
+                    z_max_obs = torch.full(
+                        (feat_y,),
+                        float("-inf"),
+                        device=accum_device,
+                        dtype=torch.float64,
+                    )
+                    y_min_obs = torch.full(
+                        (feat_y,),
+                        float("inf"),
+                        device=accum_device,
+                        dtype=torch.float64,
+                    )
+                    y_max_obs = torch.full(
+                        (feat_y,),
+                        float("-inf"),
+                        device=accum_device,
+                        dtype=torch.float64,
+                    )
 
                 n_t2 = torch.tensor(int(n_z), device="cpu", dtype=torch.int64)
                 _dist_all_reduce_sum_(n_t2)
@@ -3751,7 +3724,13 @@ def epochs(
                 _dist_all_reduce_min_(y_min_obs)
                 _dist_all_reduce_max_(y_max_obs)
 
-            if int(n_z) > 0 and sum_pz is not None and sum_pz2 is not None and sum_tz is not None and sum_tz2 is not None:
+            if (
+                int(n_z) > 0
+                and sum_pz is not None
+                and sum_pz2 is not None
+                and sum_tz is not None
+                and sum_tz2 is not None
+            ):
                 n2 = float(int(n_z))
                 pred_mean = sum_pz / n2
                 pred_var = (sum_pz2 / n2 - pred_mean * pred_mean).clamp_min(
@@ -3771,7 +3750,11 @@ def epochs(
                 clip_src = "unset"
 
                 try:
-                    use_quant = bool(getattr(model_for_scaler, "delta_gate_bounds_use_quantile", False))
+                    use_quant = bool(
+                        getattr(
+                            model_for_scaler, "delta_gate_bounds_use_quantile", False
+                        )
+                    )
                 except Exception:
                     use_quant = False
                 if use_quant:
@@ -3779,32 +3762,48 @@ def epochs(
                     qh = getattr(scaler, "y_q_high", None)
                     if isinstance(ql, torch.Tensor) and isinstance(qh, torch.Tensor):
                         with contextlib.suppress(Exception):
-                            if bool(torch.isfinite(ql).all().item()) and bool(torch.isfinite(qh).all().item()):
+                            if bool(torch.isfinite(ql).all().item()) and bool(
+                                torch.isfinite(qh).all().item()
+                            ):
                                 clip_low_y, clip_high_y = ql, qh
                                 clip_src = "quantile"
 
                 try:
-                    ext_abs = float(os.environ.get("ENN_SCALER_BOUNDS_EXTREME_ABS", "") or 1e307)
+                    ext_abs = float(
+                        os.environ.get("ENN_SCALER_BOUNDS_EXTREME_ABS", "") or 1e307
+                    )
 
                     def _ok_bound(t: object) -> bool:
                         if not isinstance(t, torch.Tensor):
                             return False
                         if is_symbolic() or is_meta_or_fake_tensor(t):
                             return True
-                        return bool(torch.isfinite(t).all().item()) and bool((t.abs() < ext_abs).all().item())
+                        return bool(torch.isfinite(t).all().item()) and bool(
+                            (t.abs() < ext_abs).all().item()
+                        )
 
                     low_ok = _ok_bound(clip_low_y)
                     high_ok = _ok_bound(clip_high_y)
-                    if not bool(env_bool("ENN_OUTPUT_AB_ALLOW_NEGATIVE_TARGETS", default=False)):
+                    if not bool(
+                        env_bool("ENN_OUTPUT_AB_ALLOW_NEGATIVE_TARGETS", default=False)
+                    ):
                         with contextlib.suppress(Exception):
-                            if isinstance(clip_low_y, torch.Tensor) and bool((clip_low_y < 0).any().item()):
+                            if isinstance(clip_low_y, torch.Tensor) and bool(
+                                (clip_low_y < 0).any().item()
+                            ):
                                 low_ok = False
-                            if isinstance(clip_high_y, torch.Tensor) and bool((clip_high_y < 0).any().item()):
+                            if isinstance(clip_high_y, torch.Tensor) and bool(
+                                (clip_high_y < 0).any().item()
+                            ):
                                 high_ok = False
                 except Exception:
                     low_ok = False
                     high_ok = False
-                if (low_ok and high_ok) and isinstance(clip_low_y, torch.Tensor) and isinstance(clip_high_y, torch.Tensor):
+                if (
+                    (low_ok and high_ok)
+                    and isinstance(clip_low_y, torch.Tensor)
+                    and isinstance(clip_high_y, torch.Tensor)
+                ):
                     with contextlib.suppress(Exception):
                         clip_low = scaler.normalize_y(clip_low_y)
                         clip_high = scaler.normalize_y(clip_high_y)
@@ -3813,7 +3812,11 @@ def epochs(
                         else:
                             clip_src = "y_minmax"
 
-                if (clip_low is None or clip_high is None) and isinstance(z_min_obs, torch.Tensor) and isinstance(z_max_obs, torch.Tensor):
+                if (
+                    (clip_low is None or clip_high is None)
+                    and isinstance(z_min_obs, torch.Tensor)
+                    and isinstance(z_max_obs, torch.Tensor)
+                ):
                     clip_low = z_min_obs
                     clip_high = z_max_obs
                     clip_src = "z_obs"
@@ -3827,31 +3830,49 @@ def epochs(
                     clip_src = "ref_k"
 
                 with contextlib.suppress(Exception):
-                    if isinstance(clip_low, torch.Tensor) and isinstance(clip_high, torch.Tensor):
-                        clip_low = clip_low.to(device=accum_device, dtype=torch.float64).reshape(-1)
-                        clip_high = clip_high.to(device=accum_device, dtype=torch.float64).reshape(-1)
+                    if isinstance(clip_low, torch.Tensor) and isinstance(
+                        clip_high, torch.Tensor
+                    ):
+                        clip_low = clip_low.to(
+                            device=accum_device, dtype=torch.float64
+                        ).reshape(-1)
+                        clip_high = clip_high.to(
+                            device=accum_device, dtype=torch.float64
+                        ).reshape(-1)
                         lo2 = torch.minimum(clip_low, clip_high)
                         hi2 = torch.maximum(clip_low, clip_high)
                         clip_low, clip_high = lo2, hi2
 
                         bad = (~torch.isfinite(clip_low)) | (~torch.isfinite(clip_high))
                         if bad.any():
-                            k = float(os.environ.get("ENN_OUTPUT_AB_FALLBACK_K", "") or 8.0)
+                            k = float(
+                                os.environ.get("ENN_OUTPUT_AB_FALLBACK_K", "") or 8.0
+                            )
                             k = max(2.0, min(12.0, k))
-                            rm = ref_mean.to(device=accum_device, dtype=torch.float64).reshape(-1)
-                            rs = ref_std.to(device=accum_device, dtype=torch.float64).reshape(-1)
+                            rm = ref_mean.to(
+                                device=accum_device, dtype=torch.float64
+                            ).reshape(-1)
+                            rs = ref_std.to(
+                                device=accum_device, dtype=torch.float64
+                            ).reshape(-1)
                             fb_lo = rm - k * rs
                             fb_hi = rm + k * rs
                             clip_low = torch.where(bad, fb_lo, clip_low)
                             clip_high = torch.where(bad, fb_hi, clip_high)
 
-                        rm = ref_mean.to(device=accum_device, dtype=torch.float64).reshape(-1)
+                        rm = ref_mean.to(
+                            device=accum_device, dtype=torch.float64
+                        ).reshape(-1)
                         ok = (rm >= clip_low) & (rm <= clip_high)
                         frac_ok = float(ok.float().mean().item()) if ok.numel() else 1.0
                         if frac_ok < 0.90:
-                            k = float(os.environ.get("ENN_OUTPUT_AB_FALLBACK_K", "") or 8.0)
+                            k = float(
+                                os.environ.get("ENN_OUTPUT_AB_FALLBACK_K", "") or 8.0
+                            )
                             k = max(2.0, min(12.0, k))
-                            rs = ref_std.to(device=accum_device, dtype=torch.float64).reshape(-1)
+                            rs = ref_std.to(
+                                device=accum_device, dtype=torch.float64
+                            ).reshape(-1)
                             clip_low = rm - k * rs
                             clip_high = rm + k * rs
                             clip_src = "sanity_ref_k"
@@ -3868,14 +3889,29 @@ def epochs(
                     enable=True,
                 )
 
-                if env_bool(("ENN_PRED_DIAG_OVERWRITE", "ENN_OUTPUT_AB_DIAG"), default=False):
+                if env_bool(
+                    ("ENN_PRED_DIAG_OVERWRITE", "ENN_OUTPUT_AB_DIAG"), default=False
+                ):
                     with contextlib.suppress(Exception):
+
                         def _q3(x: torch.Tensor) -> dict[str, float]:
-                            xf = x.detach().to(device="cpu", dtype=torch.float32).reshape(-1)
+                            xf = (
+                                x.detach()
+                                .to(device="cpu", dtype=torch.float32)
+                                .reshape(-1)
+                            )
                             if xf.numel() == 0:
-                                return {"p0": float("nan"), "p50": float("nan"), "p100": float("nan")}
+                                return {
+                                    "p0": float("nan"),
+                                    "p50": float("nan"),
+                                    "p100": float("nan"),
+                                }
                             q = torch.quantile(xf, torch.tensor([0.0, 0.5, 1.0]))
-                            return {"p0": float(q[0].item()), "p50": float(q[1].item()), "p100": float(q[2].item())}
+                            return {
+                                "p0": float(q[0].item()),
+                                "p50": float(q[1].item()),
+                                "p100": float(q[2].item()),
+                            }
 
                         batch0 = None
                         for _b in _iter_raw(calib_src):
@@ -3884,7 +3920,9 @@ def epochs(
                         if batch0 is not None:
                             xb0, yb0 = collate.get_row(batch0, labels_required=True)
                             x0 = torch.atleast_2d(xb0.to(device))
-                            y0 = torch.atleast_2d(yb0.to(device)).reshape(int(x0.shape[0]), -1)
+                            y0 = torch.atleast_2d(yb0.to(device)).reshape(
+                                int(x0.shape[0]), -1
+                            )
 
                             with inference_mode(model), StatelessAutocast.float(device):
                                 z0 = model(
@@ -3896,16 +3934,22 @@ def epochs(
                                 )
                                 if isinstance(z0, tuple):
                                     z0 = z0[0]
-                                z0 = torch.as_tensor(z0, device=device).reshape(int(x0.shape[0]), -1)
+                                z0 = torch.as_tensor(z0, device=device).reshape(
+                                    int(x0.shape[0]), -1
+                                )
                                 z0_cal = scaler.calibrate(z0)
                                 y0_hat = scaler.denormalize_y(z0_cal)
 
                             clip_y_lo = clip_y_hi = None
                             with contextlib.suppress(Exception):
                                 if isinstance(clip_low, torch.Tensor):
-                                    clip_y_lo = scaler.denormalize_y(clip_low.to(device=device, dtype=torch.float64))
+                                    clip_y_lo = scaler.denormalize_y(
+                                        clip_low.to(device=device, dtype=torch.float64)
+                                    )
                                 if isinstance(clip_high, torch.Tensor):
-                                    clip_y_hi = scaler.denormalize_y(clip_high.to(device=device, dtype=torch.float64))
+                                    clip_y_hi = scaler.denormalize_y(
+                                        clip_high.to(device=device, dtype=torch.float64)
+                                    )
 
                             payload = {
                                 "tag": "output_ab_diag",
@@ -3920,21 +3964,44 @@ def epochs(
                                 "pred_std": _q3(pred_std),
                                 "ref_mean": _q3(ref_mean),
                                 "ref_std": _q3(ref_std),
-                                "clip_low_z": _q3(clip_low) if isinstance(clip_low, torch.Tensor) else None,
-                                "clip_high_z": _q3(clip_high) if isinstance(clip_high, torch.Tensor) else None,
-                                "clip_low_y": _q3(clip_y_lo) if isinstance(clip_y_lo, torch.Tensor) else None,
-                                "clip_high_y": _q3(clip_y_hi) if isinstance(clip_y_hi, torch.Tensor) else None,
-                                "y_min_obs": _q3(y_min_obs) if isinstance(y_min_obs, torch.Tensor) else None,
-                                "y_max_obs": _q3(y_max_obs) if isinstance(y_max_obs, torch.Tensor) else None,
-                                "z_min_obs": _q3(z_min_obs) if isinstance(z_min_obs, torch.Tensor) else None,
-                                "z_max_obs": _q3(z_max_obs) if isinstance(z_max_obs, torch.Tensor) else None,
+                                "clip_low_z": _q3(clip_low)
+                                if isinstance(clip_low, torch.Tensor)
+                                else None,
+                                "clip_high_z": _q3(clip_high)
+                                if isinstance(clip_high, torch.Tensor)
+                                else None,
+                                "clip_low_y": _q3(clip_y_lo)
+                                if isinstance(clip_y_lo, torch.Tensor)
+                                else None,
+                                "clip_high_y": _q3(clip_y_hi)
+                                if isinstance(clip_y_hi, torch.Tensor)
+                                else None,
+                                "y_min_obs": _q3(y_min_obs)
+                                if isinstance(y_min_obs, torch.Tensor)
+                                else None,
+                                "y_max_obs": _q3(y_max_obs)
+                                if isinstance(y_max_obs, torch.Tensor)
+                                else None,
+                                "z_min_obs": _q3(z_min_obs)
+                                if isinstance(z_min_obs, torch.Tensor)
+                                else None,
+                                "z_max_obs": _q3(z_max_obs)
+                                if isinstance(z_max_obs, torch.Tensor)
+                                else None,
                                 "y_out_scale": _q3(getattr(scaler, "y_out_scale")),
                                 "y_out_bias": _q3(getattr(scaler, "y_out_bias")),
                             }
-                            dump_dir = os.environ.get("ENN_PRED_OVERWRITE_DUMP_DIR", "") or os.environ.get("ENN_NONFINITE_DUMP_DIR", "")
+                            dump_dir = os.environ.get(
+                                "ENN_PRED_OVERWRITE_DUMP_DIR", ""
+                            ) or os.environ.get("ENN_NONFINITE_DUMP_DIR", "")
                             if dump_dir:
                                 os.makedirs(dump_dir, exist_ok=True)
-                                rid = str(os.environ.get("ENN_RUN_ID", "") or "run").strip() or "run"
+                                rid = (
+                                    str(
+                                        os.environ.get("ENN_RUN_ID", "") or "run"
+                                    ).strip()
+                                    or "run"
+                                )
                                 path = os.path.join(
                                     dump_dir,
                                     f"output_ab_diag.rank{int(get_rank() or 0)}.{rid}.json",
@@ -3954,7 +4021,9 @@ def epochs(
         util_fallback = (
             util_from_sps
             if util_from_sps > 0.0
-            else prev_comp_time / total_t if total_t > 0.0 else 0.0
+            else prev_comp_time / total_t
+            if total_t > 0.0
+            else 0.0
         )
         gpu_util_frac = None
         mem_util_frac = None
@@ -3963,9 +4032,7 @@ def epochs(
         if mem_util_ema is not None:
             mem_util_frac = max(0.0, min(1.0, mem_util_ema / 100.0))
         if dev_t != "cpu":
-            util_for_cap = (
-                gpu_util_frac if gpu_util_frac is not None else util_fallback
-            )
+            util_for_cap = gpu_util_frac if gpu_util_frac is not None else util_fallback
             util_for_cap = max(0.0, min(1.0, util_for_cap))
             try:
                 if train_loader is not None:
@@ -4027,19 +4094,14 @@ def epochs(
         if isinstance(hist, Recorder):
             try:
                 end_sec = round(float(end_kst_ns) / 1000000000.0, 6)
-                world = (
-                    max(1, get_world_size(device)) if is_distributed() else 1
-                )
+                world = max(1, get_world_size(device)) if is_distributed() else 1
                 hist.end_session(end_sec, peers=world)
 
                 try:
                     if ops.ckpt_dir and (
-                        not is_distributed()
-                        or int(torch.distributed.get_rank()) == 0
+                        not is_distributed() or int(torch.distributed.get_rank()) == 0
                     ):
-                        hist_path = os.path.join(
-                            str(ops.ckpt_dir), "history.json"
-                        )
+                        hist_path = os.path.join(str(ops.ckpt_dir), "history.json")
                         collate.write_json(hist_path, hist.save(), indent=2)
                         ret_dir = os.environ.get("ENN_RETURN_DIR") or ""
                         if ret_dir and str(ret_dir) != str(ops.ckpt_dir):
@@ -4125,16 +4187,10 @@ def infer(
     )
     dev_type = str(getattr(device, "type", "cpu"))
     use_async_write = bool(env_bool("ENN_PRED_ASYNC_WRITE", True))
-    use_mmt_pred_parts = bool(
-        env_bool("ENN_PRED_MMT_PARTS", dev_type != "cpu")
-    )
+    use_mmt_pred_parts = bool(env_bool("ENN_PRED_MMT_PARTS", dev_type != "cpu"))
     if not use_async_write:
         use_mmt_pred_parts = False
-    cache = (
-        TensorSpooler(chunk_dir, max_queue=cache_q)
-        if use_async_write
-        else None
-    )
+    cache = TensorSpooler(chunk_dir, max_queue=cache_q) if use_async_write else None
     target_rows = int(env_int("ENN_PRED_CHUNK_ROWS", 0))
     if target_rows <= 0:
         out_shape = tuple((int(x) for x in ops.out_shape or ()))
@@ -4144,9 +4200,7 @@ def infer(
         est_row_bytes = max(1, out_numel * 4)
         target_bytes = int(env_int("ENN_PRED_CHUNK_BYTES", 64 * 1024 * 1024))
         target_rows = max(256, min(65536, target_bytes // est_row_bytes))
-    dev_obj = (
-        device if isinstance(device, torch.device) else torch.device(device)
-    )
+    dev_obj = device if isinstance(device, torch.device) else torch.device(device)
     run_model: torch.nn.Module = model
     if (
         is_distributed()
@@ -4166,10 +4220,9 @@ def infer(
             sync_module_states=True,
         )
     run_model.eval()
-    module_eval = (
-        run_model.module if hasattr(run_model, "module") else run_model
-    )
+    module_eval = run_model.module if hasattr(run_model, "module") else run_model
     distributed_sync(module_eval, device=dev_obj)
+
     def _unwrap_uncompiled_model_handle(m: torch.nn.Module) -> torch.nn.Module:
         cur = m
         seen: set[int] = set()
@@ -4210,8 +4263,7 @@ def infer(
     )
 
     cg_enabled = bool(
-        dev_type == "cuda"
-        and getattr(module_eval, "_compile_cudagraphs", False)
+        dev_type == "cuda" and getattr(module_eval, "_compile_cudagraphs", False)
     )
     _pred_compile_mode = ""
     with contextlib.suppress(Exception):
@@ -4244,20 +4296,13 @@ def infer(
     pinned_ok = bool(is_pin_supported(dev_type))
     backend = accelerator_type(dev_type)
     stream_fn = (
-        getattr(backend, "current_stream", None)
-        if backend is not None
-        else None
+        getattr(backend, "current_stream", None) if backend is not None else None
     )
     Event = getattr(backend, "Event", None) if backend is not None else None
     can_stream_release = bool(
-        pinned_ok
-        and non_blocking_ok
-        and callable(stream_fn)
-        and (Event is not None)
+        pinned_ok and non_blocking_ok and callable(stream_fn) and (Event is not None)
     )
-    make_fence_event = partial(
-        new_accelerator_event, device, enable_timing=False
-    )
+    make_fence_event = partial(new_accelerator_event, device, enable_timing=False)
     cpu_pool = None
     if pinned_ok and TensorPagePool is not None:
         with contextlib.suppress(Exception):
@@ -4342,12 +4387,20 @@ def infer(
             broadcast_checked = False
             detect_broadcast = bool(env_bool("ENN_PRED_DETECT_BATCH_BROADCAST", True))
             broadcast_atol = float(env_float("ENN_PRED_BROADCAST_ATOL", 1e-6))
-            broadcast_match_frac = float(env_float("ENN_PRED_BROADCAST_MATCH_FRAC", 0.995))
+            broadcast_match_frac = float(
+                env_float("ENN_PRED_BROADCAST_MATCH_FRAC", 0.995)
+            )
             broadcast_rel_mean = float(env_float("ENN_PRED_BROADCAST_REL_MEAN", 1e-5))
-            broadcast_sample_max = max(0, int(env_int("ENN_PRED_BROADCAST_SAMPLE_MAX", 16384) or 16384))
-            broadcast_probe_k = max(2, int(env_int("ENN_PRED_BROADCAST_PROBE_K", 4) or 4))
+            broadcast_sample_max = max(
+                0, int(env_int("ENN_PRED_BROADCAST_SAMPLE_MAX", 16384) or 16384)
+            )
+            broadcast_probe_k = max(
+                2, int(env_int("ENN_PRED_BROADCAST_PROBE_K", 4) or 4)
+            )
             _dbg_diag_enabled = bool(env_bool("ENN_PRED_COLLAPSE_DIAG", default=False))
-            _dbg_raw_fallback = bool(env_bool("ENN_PRED_COLLAPSE_FALLBACK_RAW", default=False))
+            _dbg_raw_fallback = bool(
+                env_bool("ENN_PRED_COLLAPSE_FALLBACK_RAW", default=False)
+            )
             detect_partial_broadcast = bool(
                 env_bool(
                     "ENN_PRED_DETECT_PARTIAL_BROADCAST",
@@ -4403,38 +4456,63 @@ def infer(
                     numel = int(diff.numel())
                     st["y_numel"] = float(numel)
                     if numel <= 0:
-                        st.update({"y_max": 0.0, "y_mean": 0.0, "y_match_frac": 1.0, "y_scale": 1.0, "y_rel_mean": 0.0, "sample_n": 0.0, "sampled": 0.0})
+                        st.update(
+                            {
+                                "y_max": 0.0,
+                                "y_mean": 0.0,
+                                "y_match_frac": 1.0,
+                                "y_scale": 1.0,
+                                "y_rel_mean": 0.0,
+                                "sample_n": 0.0,
+                                "sampled": 0.0,
+                            }
+                        )
                         return True, st
 
-                    if int(broadcast_sample_max) > 0 and numel > int(broadcast_sample_max):
+                    if int(broadcast_sample_max) > 0 and numel > int(
+                        broadcast_sample_max
+                    ):
                         flat = diff.reshape(-1)
                         sample_n = int(broadcast_sample_max)
                         if sample_n <= 1:
                             if numel <= 1:
                                 sample = flat[:1].clone()
                             else:
-                                idx = torch.tensor([0, numel - 1], device=flat.device, dtype=torch.long)
+                                idx = torch.tensor(
+                                    [0, numel - 1], device=flat.device, dtype=torch.long
+                                )
                                 sample = flat.index_select(0, idx)
                         else:
-                            idx = torch.arange(sample_n, device=flat.device, dtype=torch.long)
+                            idx = torch.arange(
+                                sample_n, device=flat.device, dtype=torch.long
+                            )
                             idx = (idx * (numel - 1)) // (sample_n - 1)
                             sample = flat.index_select(0, idx)
                         st["sampled"] = 1.0
                         st["sample_n"] = float(int(sample.numel()))
                         mean_abs = float(sample.mean().item())
-                        match_frac = float((sample <= float(atol)).to(dtype=torch.float32).mean().item())
+                        match_frac = float(
+                            (sample <= float(atol))
+                            .to(dtype=torch.float32)
+                            .mean()
+                            .item()
+                        )
                     else:
                         st["sampled"] = 0.0
                         st["sample_n"] = float(numel)
                         mean_abs = float(diff.mean().item())
-                        match_frac = float((diff <= float(atol)).to(dtype=torch.float32).mean().item())
+                        match_frac = float(
+                            (diff <= float(atol)).to(dtype=torch.float32).mean().item()
+                        )
 
                     max_abs = float(diff.max().item())
                     st["y_max"] = float(max_abs)
                     st["y_mean"] = float(mean_abs)
                     st["y_match_frac"] = float(match_frac)
 
-                    y_scale = float(torch.maximum(y0.abs().mean(), y1.abs().mean()).item())
+                    y_scale = float(
+                        torch.maximum(y0.abs().mean(), y1.abs().mean()).item()
+                    )
                     if (not math.isfinite(y_scale)) or y_scale <= 0.0:
                         y_scale = 1.0
                     st["y_scale"] = float(y_scale)
@@ -4443,12 +4521,15 @@ def infer(
 
                     if float(max_abs) <= float(atol):
                         return True, st
-                    if float(match_frac) >= float(broadcast_match_frac) and float(rel_mean) <= float(broadcast_rel_mean):
+                    if float(match_frac) >= float(broadcast_match_frac) and float(
+                        rel_mean
+                    ) <= float(broadcast_rel_mean):
                         return True, st
                     return False, st
                 except Exception:
                     st["error"] = 1.0
                     return False, st
+
             collapse_stage_diag_enabled = bool(
                 env_bool("ENN_PRED_COLLAPSE_STAGE_DIAG", default=True)
             )
@@ -4463,7 +4544,9 @@ def infer(
                     default=env_bool("ENN_SANITIZE_NAN_STRICT", default=False),
                 )
             )
-            diag_overwrite_n = max(1, int(env_int("ENN_PRED_DIAG_OVERWRITE_SAMPLE", 256)))
+            diag_overwrite_n = max(
+                1, int(env_int("ENN_PRED_DIAG_OVERWRITE_SAMPLE", 256))
+            )
             prev_pred_ref: torch.Tensor | None = None
             prev_pred_sample_cpu: torch.Tensor | None = None
             prev_pred_ptr: int | None = None
@@ -4488,8 +4571,8 @@ def infer(
                             x = x.reshape(-1)
                         except Exception:
                             x = x.flatten()
-                        if getattr(getattr(x, 'device', None), 'type', None) != 'cpu':
-                            x = x.to(device='cpu')
+                        if getattr(getattr(x, "device", None), "type", None) != "cpu":
+                            x = x.to(device="cpu")
                         n = int(min(int(head), int(x.numel())))
                         vals = x[:n].tolist()
                         out_vals: list[object] = []
@@ -4498,7 +4581,7 @@ def infer(
                                 out_vals.append(int(v))
                             except Exception:
                                 out_vals.append(v)
-                        return {'type': 'tensor', 'n': int(x.numel()), 'head': out_vals}
+                        return {"type": "tensor", "n": int(x.numel()), "head": out_vals}
                     if isinstance(ids, (list, tuple)):
                         vals = list(ids)[: int(head)]
                         out_vals: list[object] = []
@@ -4507,25 +4590,29 @@ def infer(
                                 out_vals.append(int(v))
                             except Exception:
                                 out_vals.append(v)
-                        return {'type': type(ids).__name__, 'n': int(len(ids)), 'head': out_vals}
+                        return {
+                            "type": type(ids).__name__,
+                            "n": int(len(ids)),
+                            "head": out_vals,
+                        }
                     if isinstance(ids, dict):
                         keys = list(ids.keys())
-                        return {'type': 'dict', 'keys_head': keys[: int(head)]}
+                        return {"type": "dict", "keys_head": keys[: int(head)]}
                 except Exception:
                     pass
                 r = repr(ids)
                 if len(r) > 200:
-                    r = r[:200] + '...'
-                return {'type': type(ids).__name__, 'repr': r}
+                    r = r[:200] + "..."
+                return {"type": type(ids).__name__, "repr": r}
 
             def _x_diag(X: object, *, head_rows: int = 4, head_cols: int = 8) -> object:
                 if not torch.is_tensor(X):
-                    return {'type': type(X).__name__}
+                    return {"type": type(X).__name__}
                 x = X.detach()
                 info: dict[str, object] = {
-                    'shape': [int(v) for v in tuple(x.shape)],
-                    'dtype': str(x.dtype),
-                    'device': str(x.device),
+                    "shape": [int(v) for v in tuple(x.shape)],
+                    "dtype": str(x.dtype),
+                    "device": str(x.device),
                 }
                 try:
                     if x.ndim >= 2:
@@ -4533,32 +4620,80 @@ def infer(
                         if rr <= 0:
                             return info
                         xr = x[:rr]
-                        if getattr(getattr(xr, 'device', None), 'type', None) != 'cpu':
-                            xr = xr.to('cpu')
+                        if getattr(getattr(xr, "device", None), "type", None) != "cpu":
+                            xr = xr.to("cpu")
                         if isinstance(xr, torch.Tensor) and xr.dtype != torch.float32:
                             xr = xr.to(dtype=torch.float32)
-                        cc = int(min(int(head_cols), int(xr.shape[1]))) if xr.ndim >= 2 else 0
+                        cc = (
+                            int(min(int(head_cols), int(xr.shape[1])))
+                            if xr.ndim >= 2
+                            else 0
+                        )
                         rows: list[dict[str, object]] = []
                         for i in range(rr):
                             row_full = xr[i].reshape(-1)
-                            s = float(row_full.sum().item()) if int(row_full.numel()) > 0 else 0.0
-                            mean = float(row_full.mean().item()) if int(row_full.numel()) > 0 else 0.0
-                            std = float(row_full.std(unbiased=False).item()) if int(row_full.numel()) > 1 else 0.0
-                            vals = [float(v) for v in row_full[:cc].tolist()] if cc > 0 else []
-                            rows.append({'row': int(i), 'vals': vals, 'stats': {'sum': s, 'mean': mean, 'std': std, 'numel': int(row_full.numel())}})
-                        info['head'] = rows
+                            s = (
+                                float(row_full.sum().item())
+                                if int(row_full.numel()) > 0
+                                else 0.0
+                            )
+                            mean = (
+                                float(row_full.mean().item())
+                                if int(row_full.numel()) > 0
+                                else 0.0
+                            )
+                            std = (
+                                float(row_full.std(unbiased=False).item())
+                                if int(row_full.numel()) > 1
+                                else 0.0
+                            )
+                            vals = (
+                                [float(v) for v in row_full[:cc].tolist()]
+                                if cc > 0
+                                else []
+                            )
+                            rows.append(
+                                {
+                                    "row": int(i),
+                                    "vals": vals,
+                                    "stats": {
+                                        "sum": s,
+                                        "mean": mean,
+                                        "std": std,
+                                        "numel": int(row_full.numel()),
+                                    },
+                                }
+                            )
+                        info["head"] = rows
                     else:
                         flat = x.reshape(-1)
-                        if getattr(getattr(flat, 'device', None), 'type', None) != 'cpu':
-                            flat = flat.to('cpu')
-                        if isinstance(flat, torch.Tensor) and flat.dtype != torch.float32:
+                        if (
+                            getattr(getattr(flat, "device", None), "type", None)
+                            != "cpu"
+                        ):
+                            flat = flat.to("cpu")
+                        if (
+                            isinstance(flat, torch.Tensor)
+                            and flat.dtype != torch.float32
+                        ):
                             flat = flat.to(dtype=torch.float32)
                         n = int(min(32, int(flat.numel())))
-                        info['head'] = [float(v) for v in flat[:n].tolist()]
+                        info["head"] = [float(v) for v in flat[:n].tolist()]
                         s = float(flat.sum().item()) if int(flat.numel()) > 0 else 0.0
-                        mean = float(flat.mean().item()) if int(flat.numel()) > 0 else 0.0
-                        std = float(flat.std(unbiased=False).item()) if int(flat.numel()) > 1 else 0.0
-                        info['stats'] = {'sum': s, 'mean': mean, 'std': std, 'numel': int(flat.numel())}
+                        mean = (
+                            float(flat.mean().item()) if int(flat.numel()) > 0 else 0.0
+                        )
+                        std = (
+                            float(flat.std(unbiased=False).item())
+                            if int(flat.numel()) > 1
+                            else 0.0
+                        )
+                        info["stats"] = {
+                            "sum": s,
+                            "mean": mean,
+                            "std": std,
+                            "numel": int(flat.numel()),
+                        }
                 except Exception:
                     pass
                 return info
@@ -4568,17 +4703,17 @@ def infer(
                     return None
                 try:
                     v = xrow.detach().reshape(-1)
-                    if getattr(getattr(v, 'device', None), 'type', None) != 'cpu':
-                        v = v.to('cpu')
+                    if getattr(getattr(v, "device", None), "type", None) != "cpu":
+                        v = v.to("cpu")
                     if isinstance(v, torch.Tensor) and v.dtype != torch.float32:
                         v = v.to(dtype=torch.float32)
                     n = int(v.numel())
                     if n <= 0:
-                        return {'sum': 0.0, 'mean': 0.0, 'std': 0.0, 'numel': 0}
+                        return {"sum": 0.0, "mean": 0.0, "std": 0.0, "numel": 0}
                     s = float(v.sum().item())
                     mean = float(v.mean().item())
                     std = float(v.std(unbiased=False).item()) if n > 1 else 0.0
-                    return {'sum': s, 'mean': mean, 'std': std, 'numel': n}
+                    return {"sum": s, "mean": mean, "std": std, "numel": n}
                 except Exception:
                     return None
 
@@ -4595,29 +4730,31 @@ def infer(
                 return list(reversed(out))
 
             def _overwrite_dump_dir() -> str:
-                d = env_str('ENN_PRED_OVERWRITE_DUMP_DIR')
+                d = env_str("ENN_PRED_OVERWRITE_DUMP_DIR")
                 if d:
                     return str(d)
-                d = env_str('ENN_NONFINITE_DUMP_DIR')
+                d = env_str("ENN_NONFINITE_DUMP_DIR")
                 if d:
-                    return os.path.join(str(d), 'pred_overwrite')
-                return os.path.join(str(chunk_dir), 'pred_overwrite')
+                    return os.path.join(str(d), "pred_overwrite")
+                return os.path.join(str(chunk_dir), "pred_overwrite")
 
             def _dump_overwrite_diag(payload: dict[str, object]) -> str | None:
                 try:
                     ddir = _overwrite_dump_dir()
                     os.makedirs(ddir, exist_ok=True)
-                    fn = payload.get('filename')
+                    fn = payload.get("filename")
                     if not isinstance(fn, str) or not fn:
                         ts = int(time.time() * 1000)
-                        fn = f'overwrite_rank{int(rank)}_{ts}.json'
+                        fn = f"overwrite_rank{int(rank)}_{ts}.json"
                     path = os.path.join(ddir, fn)
-                    with open(path, 'w', encoding='utf-8') as f:
+                    with open(path, "w", encoding="utf-8") as f:
                         json.dump(payload, f, ensure_ascii=False, indent=2, default=str)
                     return path
                 except Exception:
                     with contextlib.suppress(Exception):
-                        _LOGGER.exception('[infer][overwrite-diag] failed to write overwrite dump')
+                        _LOGGER.exception(
+                            "[infer][overwrite-diag] failed to write overwrite dump"
+                        )
                     return None
 
             def _tensor_diag(t: object, *, sample_n: int = 64) -> dict[str, object]:
@@ -4650,7 +4787,16 @@ def infer(
                     if not (xf.is_floating_point() or xf.is_complex()):
                         xf = xf.to(dtype=torch.float32)
                     out["abs_max"] = float(xf.abs().max().item())
-                    out["std_mean"] = float(xf.reshape(xf.shape[0], -1).std(dim=1, unbiased=False).mean().item()) if xf.dim() >= 2 else float(xf.std(unbiased=False).item())
+                    out["std_mean"] = (
+                        float(
+                            xf.reshape(xf.shape[0], -1)
+                            .std(dim=1, unbiased=False)
+                            .mean()
+                            .item()
+                        )
+                        if xf.dim() >= 2
+                        else float(xf.std(unbiased=False).item())
+                    )
                     out["min"] = float(xf.min().item())
                     out["max"] = float(xf.max().item())
                 except Exception:
@@ -4688,7 +4834,9 @@ def infer(
                 except Exception:
                     return None
 
-            def _brief_tensor(t: object, *, max_elems: int = 64) -> dict[str, object] | None:
+            def _brief_tensor(
+                t: object, *, max_elems: int = 64
+            ) -> dict[str, object] | None:
                 try:
                     if not isinstance(t, torch.Tensor):
                         return None
@@ -4745,10 +4893,18 @@ def infer(
                     return
                 if collapse_stage_diag_once and _collapse_stage_diag_done:
                     return
-                if not isinstance(Xi2, torch.Tensor) or Xi2.ndim < 2 or int(Xi2.shape[0]) < 2:
+                if (
+                    not isinstance(Xi2, torch.Tensor)
+                    or Xi2.ndim < 2
+                    or int(Xi2.shape[0]) < 2
+                ):
                     return
                 try:
-                    m0 = _unwrap_to_model_core(run_model_uncompiled if "run_model_uncompiled" in locals() else run_model)
+                    m0 = _unwrap_to_model_core(
+                        run_model_uncompiled
+                        if "run_model_uncompiled" in locals()
+                        else run_model
+                    )
                     m0 = _unwrap_to_model_core(m0)
                     fn = getattr(m0, "_run_forward_core", None)
                     if not callable(fn):
@@ -4769,8 +4925,12 @@ def infer(
                     )
                     with contextlib.suppress(Exception):
                         sig = inspect.signature(fn)
-                        kwargs = {k: v for k, v in kwargs.items() if k in sig.parameters}
-                    _prev_diag_env = os.environ.get("ENN_PRED_COLLAPSE_STAGE_DIAG", None)
+                        kwargs = {
+                            k: v for k, v in kwargs.items() if k in sig.parameters
+                        }
+                    _prev_diag_env = os.environ.get(
+                        "ENN_PRED_COLLAPSE_STAGE_DIAG", None
+                    )
                     os.environ["ENN_PRED_COLLAPSE_STAGE_DIAG"] = "1"
                     try:
                         with torch.no_grad():
@@ -4781,7 +4941,9 @@ def infer(
                                 os.environ.pop("ENN_PRED_COLLAPSE_STAGE_DIAG", None)
                         else:
                             os.environ["ENN_PRED_COLLAPSE_STAGE_DIAG"] = _prev_diag_env
-                    nonfinite_pre_sanitize = getattr(m0, "_enn_nonfinite_pre_sanitize", None)
+                    nonfinite_pre_sanitize = getattr(
+                        m0, "_enn_nonfinite_pre_sanitize", None
+                    )
                     fuser_diag = None
                     perceiver_diag = None
                     with contextlib.suppress(Exception):
@@ -4791,13 +4953,29 @@ def infer(
                         perceiver_diag = getattr(p0, "_enn_last_perceiver_diag", None)
                     if not (isinstance(out, tuple) and len(out) >= 8):
                         return
-                    pred, _next_state, p, assembled, enhanced, delta, tokens, refined = out[:8]
-                    y_hat = assembled + (delta * 0.5 if (p is None) else (p.to(dtype=assembled.dtype) * delta))
+                    (
+                        pred,
+                        _next_state,
+                        p,
+                        assembled,
+                        enhanced,
+                        delta,
+                        tokens,
+                        refined,
+                    ) = out[:8]
+                    y_hat = assembled + (
+                        delta * 0.5
+                        if (p is None)
+                        else (p.to(dtype=assembled.dtype) * delta)
+                    )
                     pred_denorm_uncal = None
                     with contextlib.suppress(Exception):
                         scaler = getattr(m0, "scaler", None)
                         if scaler is not None and hasattr(scaler, "denormalize_y"):
-                            pred_denorm_uncal = scaler.denormalize_y(y_hat).reshape(int(y_hat.shape[0]), *tuple(getattr(m0, "out_shape", ())))
+                            pred_denorm_uncal = scaler.denormalize_y(y_hat).reshape(
+                                int(y_hat.shape[0]),
+                                *tuple(getattr(m0, "out_shape", ())),
+                            )
                     tokenize_pre: dict[str, object] = {}
                     tokenize_post_blk0: dict[str, object] = {}
                     tokenize_meta: dict[str, object] = {}
@@ -4809,33 +4987,53 @@ def infer(
                     fuser_attn_bias_segments: dict[str, object] = {}
                     try:
                         fuser = getattr(m0, "fuser", None)
-                        tasks = getattr(fuser, "tasks", None) if fuser is not None else None
+                        tasks = (
+                            getattr(fuser, "tasks", None) if fuser is not None else None
+                        )
                         if isinstance(tasks, torch.nn.ModuleDict):
                             B2 = int(Xi2.shape[0])
                             import math as _math
+
                             w_eff_map: dict[str, float] = {}
                             for name, tmpl in tasks.items():
                                 tok = getattr(tmpl, "tokenizer", None)
                                 t_tokens = getattr(tmpl, "tokens", None)
                                 t_dmodel = getattr(tmpl, "d_model", None)
-                                if callable(tok) and isinstance(t_tokens, int) and isinstance(t_dmodel, int):
+                                if (
+                                    callable(tok)
+                                    and isinstance(t_tokens, int)
+                                    and isinstance(t_dmodel, int)
+                                ):
                                     with torch.no_grad():
                                         t = tok(Xi2.contiguous())
-                                    t = t.reshape(B2, int(t_tokens), int(t_dmodel)).contiguous()
+                                    t = t.reshape(
+                                        B2, int(t_tokens), int(t_dmodel)
+                                    ).contiguous()
                                     tokenize_pre[str(name)] = _brief_tensor(t)
                                     tokenize_meta[str(name)] = {
                                         "mode": str(getattr(tmpl, "mode", "")),
-                                        "in_dim": int(getattr(tmpl, "in_dim", -1) or -1),
-                                        "tokens": int(getattr(tmpl, "tokens", -1) or -1),
-                                        "d_model": int(getattr(tmpl, "d_model", -1) or -1),
+                                        "in_dim": int(
+                                            getattr(tmpl, "in_dim", -1) or -1
+                                        ),
+                                        "tokens": int(
+                                            getattr(tmpl, "tokens", -1) or -1
+                                        ),
+                                        "d_model": int(
+                                            getattr(tmpl, "d_model", -1) or -1
+                                        ),
                                         "nhead": int(getattr(tmpl, "nhead", -1) or -1),
                                         "depth": int(getattr(tmpl, "depth", -1) or -1),
                                     }
                                     with contextlib.suppress(Exception):
                                         blocks = getattr(tmpl, "blocks", None)
-                                        if isinstance(blocks, torch.nn.ModuleList) and len(blocks) > 0:
+                                        if (
+                                            isinstance(blocks, torch.nn.ModuleList)
+                                            and len(blocks) > 0
+                                        ):
                                             blk0 = blocks[0]
-                                            mode0 = str(getattr(tmpl, "mode", "spatial"))
+                                            mode0 = str(
+                                                getattr(tmpl, "mode", "spatial")
+                                            )
                                             kw0: dict[str, object] = {}
                                             with contextlib.suppress(Exception):
                                                 ps = inspect.signature(blk0).parameters
@@ -4849,11 +5047,15 @@ def infer(
                                                 y0 = blk0(t, **kw0)
                                             if isinstance(y0, tuple):
                                                 y0 = y0[0]
-                                            tokenize_post_blk0[str(name)] = _brief_tensor(y0)
+                                            tokenize_post_blk0[str(name)] = (
+                                                _brief_tensor(y0)
+                                            )
                                     with contextlib.suppress(Exception):
                                         kwt: dict[str, object] = {"causal_mask": None}
                                         with contextlib.suppress(Exception):
-                                            ps_t = inspect.signature(tmpl.forward).parameters
+                                            ps_t = inspect.signature(
+                                                tmpl.forward
+                                            ).parameters
                                             if "state" in ps_t:
                                                 kwt["state"] = None
                                             if "return_state" in ps_t:
@@ -4863,8 +5065,16 @@ def infer(
                                         if isinstance(tout, tuple):
                                             tout = tout[0]
                                         if torch.is_tensor(tout):
-                                            template_out[str(name)] = _brief_tensor(tout)
-                                            n_tok = int(tout.shape[1]) if tout.dim() >= 2 else int(getattr(tmpl, "tokens", 1) or 1)
+                                            template_out[str(name)] = _brief_tensor(
+                                                tout
+                                            )
+                                            n_tok = (
+                                                int(tout.shape[1])
+                                                if tout.dim() >= 2
+                                                else int(
+                                                    getattr(tmpl, "tokens", 1) or 1
+                                                )
+                                            )
                                             template_token_count[str(name)] = int(n_tok)
                                             w = getattr(tmpl, "weight", None)
                                             eps = getattr(tmpl, "eps", None)
@@ -4872,20 +5082,28 @@ def infer(
                                             ev = 1e-6
                                             with contextlib.suppress(Exception):
                                                 if torch.is_tensor(w):
-                                                    wv = float(w.detach().float().item())
+                                                    wv = float(
+                                                        w.detach().float().item()
+                                                    )
                                             with contextlib.suppress(Exception):
                                                 if torch.is_tensor(eps):
-                                                    ev = float(eps.detach().float().item())
+                                                    ev = float(
+                                                        eps.detach().float().item()
+                                                    )
                                             template_weight_raw[str(name)] = float(wv)
                                             w_eff = max(float(wv), float(ev))
                                             w_eff_map[str(name)] = w_eff
-                                            template_logit_bias[str(name)] = float(_math.log(w_eff / float(max(1, n_tok))))
+                                            template_logit_bias[str(name)] = float(
+                                                _math.log(w_eff / float(max(1, n_tok)))
+                                            )
                             s = float(sum(w_eff_map.values())) if w_eff_map else 0.0
                             if s > 0.0:
                                 for k, w_eff in w_eff_map.items():
                                     template_prior_mass[k] = float(w_eff / s)
                             with contextlib.suppress(Exception):
-                                if fuser is not None and callable(getattr(fuser, "_build_attn_bias", None)):
+                                if fuser is not None and callable(
+                                    getattr(fuser, "_build_attn_bias", None)
+                                ):
                                     token_sets = []
                                     names = []
                                     for name, _ in tasks.items():
@@ -4899,13 +5117,18 @@ def infer(
                                                 token_sets.append(tout)
                                                 names.append(str(name))
                                     if token_sets:
-                                        am = fuser._build_attn_bias(names, token_sets, device=token_sets[0].device, dtype=token_sets[0].dtype)
+                                        am = fuser._build_attn_bias(
+                                            names,
+                                            token_sets,
+                                            device=token_sets[0].device,
+                                            dtype=token_sets[0].dtype,
+                                        )
                                         if torch.is_tensor(am) and am.numel() > 0:
                                             last = am.reshape(-1, am.shape[-1])[0]
                                             off = 0
                                             for nm, ts in zip(names, token_sets):
                                                 n_tok = int(ts.shape[1])
-                                                seg = last[off:off + n_tok]
+                                                seg = last[off : off + n_tok]
                                                 off += n_tok
                                                 fuser_attn_bias_segments[nm] = {
                                                     "min": float(seg.min().item()),
@@ -4929,10 +5152,16 @@ def infer(
                         "diff_assembled_z": float(_pair_diff_max(assembled) or 0.0),
                         "diff_refined": float(_pair_diff_max(refined) or 0.0),
                         "diff_delta": float(_pair_diff_max(delta) or 0.0),
-                        "diff_p": float(_pair_diff_max(p) if isinstance(p, torch.Tensor) else 0.0),
+                        "diff_p": float(
+                            _pair_diff_max(p) if isinstance(p, torch.Tensor) else 0.0
+                        ),
                         "diff_y_hat_z": float(_pair_diff_max(y_hat) or 0.0),
                         "diff_pred_final": float(_pair_diff_max(pred) or 0.0),
-                        "diff_pred_denorm_uncal": float(_pair_diff_max(pred_denorm_uncal) if isinstance(pred_denorm_uncal, torch.Tensor) else 0.0),
+                        "diff_pred_denorm_uncal": float(
+                            _pair_diff_max(pred_denorm_uncal)
+                            if isinstance(pred_denorm_uncal, torch.Tensor)
+                            else 0.0
+                        ),
                         "X": _brief_tensor(Xi2),
                         "tokenize_pre": tokenize_pre,
                         "tokenize_meta": tokenize_meta,
@@ -5019,9 +5248,15 @@ def infer(
                 if str(dev_type) != "cuda":
                     return
                 try:
-                    m0 = _unwrap_for_stage_diag(locals().get("run_model_uncompiled", None))
+                    m0 = _unwrap_for_stage_diag(
+                        locals().get("run_model_uncompiled", None)
+                    )
                     m1 = _unwrap_for_stage_diag(locals().get("run_model", None))
-                    mod = m0 if (m0 is not None and hasattr(m0, "_run_forward_core")) else m1
+                    mod = (
+                        m0
+                        if (m0 is not None and hasattr(m0, "_run_forward_core"))
+                        else m1
+                    )
                     if mod is None or (not hasattr(mod, "_run_forward_core")):
                         return
                     fn = getattr(mod, "_run_forward_core", None)
@@ -5029,7 +5264,16 @@ def infer(
                         return
 
                     with torch.no_grad():
-                        pred_denorm, _st, p, assembled, enhanced, delta, tokens, refined = fn(
+                        (
+                            pred_denorm,
+                            _st,
+                            p,
+                            assembled,
+                            enhanced,
+                            delta,
+                            tokens,
+                            refined,
+                        ) = fn(
                             Xi2,
                             export=False,
                             temporal_state=None,
@@ -5048,13 +5292,23 @@ def infer(
                             out_dim *= max(1, int(d))
                         if bool(calibrate_pred_output):
                             sc = getattr(mod, "scaler", None)
-                            if sc is not None and hasattr(sc, "calibrate") and hasattr(sc, "denormalize_y"):
+                            if (
+                                sc is not None
+                                and hasattr(sc, "calibrate")
+                                and hasattr(sc, "denormalize_y")
+                            ):
                                 y_cal = sc.calibrate(y_hat)
-                                pred_runtime = sc.denormalize_y(y_cal).reshape(int(y_hat.shape[0]), *out_shape)
+                                pred_runtime = sc.denormalize_y(y_cal).reshape(
+                                    int(y_hat.shape[0]), *out_shape
+                                )
                             else:
-                                pred_runtime = y_hat.reshape(int(y_hat.shape[0]), out_dim).reshape(int(y_hat.shape[0]), *out_shape)
+                                pred_runtime = y_hat.reshape(
+                                    int(y_hat.shape[0]), out_dim
+                                ).reshape(int(y_hat.shape[0]), *out_shape)
                         else:
-                            pred_runtime = y_hat.reshape(int(y_hat.shape[0]), out_dim).reshape(int(y_hat.shape[0]), *out_shape)
+                            pred_runtime = y_hat.reshape(
+                                int(y_hat.shape[0]), out_dim
+                            ).reshape(int(y_hat.shape[0]), *out_shape)
 
                     diag: dict[str, object] = {
                         "where": str(where),
@@ -5069,7 +5323,9 @@ def infer(
                         "context_z": _tensor_diag(assembled),
                         "refined": _tensor_diag(refined),
                         "delta_z": _tensor_diag(delta),
-                        "p": _tensor_diag(p) if torch.is_tensor(p) else {"type": "None"},
+                        "p": _tensor_diag(p)
+                        if torch.is_tensor(p)
+                        else {"type": "None"},
                         "y_hat_z": _tensor_diag(y_hat),
                         "pred_runtime": _tensor_diag(pred_runtime),
                         "pred_denorm_uncal": _tensor_diag(pred_denorm),
@@ -5087,30 +5343,65 @@ def infer(
                         with contextlib.suppress(Exception):
                             fdiag = None
                             pdiag = None
-                            mm = run_model.module if hasattr(run_model, "module") else run_model
-                            fuser = getattr(mm, "fuser", None) or getattr(mm, "processor", None)
+                            mm = (
+                                run_model.module
+                                if hasattr(run_model, "module")
+                                else run_model
+                            )
+                            fuser = getattr(mm, "fuser", None) or getattr(
+                                mm, "processor", None
+                            )
                             if fuser is not None:
                                 fdiag = getattr(fuser, "_enn_last_fuser_diag", None)
                                 perceiver = getattr(fuser, "perceiver", None)
                                 if perceiver is not None:
-                                    pdiag = getattr(perceiver, "_enn_last_perceiver_diag", None)
+                                    pdiag = getattr(
+                                        perceiver, "_enn_last_perceiver_diag", None
+                                    )
 
                             raw_stage = None
                             with contextlib.suppress(Exception):
                                 core = getattr(mm, "_run_forward_core", None)
                                 if callable(core):
                                     Xi_raw = Xi2[:2].detach()
-                                    _raw_pred, _raw_st, _raw_p, raw_assembled, _raw_enhanced, _raw_delta, raw_tokens, _raw_refined = core(
+                                    (
+                                        _raw_pred,
+                                        _raw_st,
+                                        _raw_p,
+                                        raw_assembled,
+                                        _raw_enhanced,
+                                        _raw_delta,
+                                        raw_tokens,
+                                        _raw_refined,
+                                    ) = core(
                                         Xi_raw,
                                         export=False,
                                         sanitize_nan=False,
                                         calibrate_output=bool(calibrate_pred_output),
                                     )
                                     raw_stage = {
-                                        "raw_tokens_nonfinite": int((~torch.isfinite(raw_tokens)).sum().item()) if raw_tokens.is_floating_point() else 0,
-                                        "raw_context_nonfinite": int((~torch.isfinite(raw_assembled)).sum().item()) if raw_assembled.is_floating_point() else 0,
-                                        "raw_tokens_absmax": float(raw_tokens.abs().max().item()) if raw_tokens.numel() else 0.0,
-                                        "raw_context_absmax": float(raw_assembled.abs().max().item()) if raw_assembled.numel() else 0.0,
+                                        "raw_tokens_nonfinite": int(
+                                            (~torch.isfinite(raw_tokens)).sum().item()
+                                        )
+                                        if raw_tokens.is_floating_point()
+                                        else 0,
+                                        "raw_context_nonfinite": int(
+                                            (~torch.isfinite(raw_assembled))
+                                            .sum()
+                                            .item()
+                                        )
+                                        if raw_assembled.is_floating_point()
+                                        else 0,
+                                        "raw_tokens_absmax": float(
+                                            raw_tokens.abs().max().item()
+                                        )
+                                        if raw_tokens.numel()
+                                        else 0.0,
+                                        "raw_context_absmax": float(
+                                            raw_assembled.abs().max().item()
+                                        )
+                                        if raw_assembled.numel()
+                                        else 0.0,
                                     }
 
                             diag.setdefault("hooks", {})
@@ -5154,6 +5445,7 @@ def infer(
                     _collapse_stage_diag_done = True
                 except Exception:
                     return
+
             collapse_force_fp32 = bool(
                 env_bool("ENN_PRED_COLLAPSE_FORCE_FP32", default=False)
             )
@@ -5163,22 +5455,32 @@ def infer(
             collapse_fp32_active = False
             collapse_diag = bool(env_bool("ENN_PRED_COLLAPSE_DIAG", True))
             collapse_diag_save = bool(env_bool("ENN_PRED_COLLAPSE_DIAG_SAVE", True))
-            collapse_diag_max_elems = int(env_int("ENN_PRED_COLLAPSE_DIAG_MAX_ELEMS", 64) or 64)
+            collapse_diag_max_elems = int(
+                env_int("ENN_PRED_COLLAPSE_DIAG_MAX_ELEMS", 64) or 64
+            )
             collapse_diag_once = bool(env_bool("ENN_PRED_COLLAPSE_DIAG_ONCE", True))
             collapse_diag_scaler = bool(env_bool("ENN_PRED_COLLAPSE_DIAG_SCALER", True))
-            collapse_diag_always_once = bool(env_bool("ENN_PRED_COLLAPSE_DIAG_ALWAYS_ONCE", True))
+            collapse_diag_always_once = bool(
+                env_bool("ENN_PRED_COLLAPSE_DIAG_ALWAYS_ONCE", True)
+            )
             _collapse_diag_done = False
             _collapse_diag_probe_done = False
 
-            _collapse_diag_out_dir = (
-                str(os.environ.get("ENN_PRED_COLLAPSE_DIAG_DIR") or "").strip()
-            )
+            _collapse_diag_out_dir = str(
+                os.environ.get("ENN_PRED_COLLAPSE_DIAG_DIR") or ""
+            ).strip()
             if not _collapse_diag_out_dir:
-                _collapse_diag_out_dir = str(os.environ.get("ENN_RETURN_DIR") or "").strip()
+                _collapse_diag_out_dir = str(
+                    os.environ.get("ENN_RETURN_DIR") or ""
+                ).strip()
             if not _collapse_diag_out_dir:
-                _collapse_diag_out_dir = os.path.join(tempfile.gettempdir(), "enn_collapse_diag")
+                _collapse_diag_out_dir = os.path.join(
+                    tempfile.gettempdir(), "enn_collapse_diag"
+                )
 
-            def _maybe_write_diag_copy(filename: str, payload: dict[str, object]) -> None:
+            def _maybe_write_diag_copy(
+                filename: str, payload: dict[str, object]
+            ) -> None:
                 with contextlib.suppress(Exception):
                     out_dir = str(_collapse_diag_out_dir or "").strip()
                     if not out_dir:
@@ -5208,7 +5510,11 @@ def infer(
                         with contextlib.suppress(Exception):
                             v = tt
                             if v.dim() >= 2:
-                                s2 = v.to(dtype=torch.float32).std(dim=-1, unbiased=False).mean()
+                                s2 = (
+                                    v.to(dtype=torch.float32)
+                                    .std(dim=-1, unbiased=False)
+                                    .mean()
+                                )
                             else:
                                 s2 = v.to(dtype=torch.float32).std(unbiased=False)
                             d["std_mean"] = float(s2.item())
@@ -5225,7 +5531,12 @@ def infer(
                         if k > 0:
                             sample = flat[:k]
                             if sample.is_floating_point():
-                                d["sample"] = [float(x) for x in sample.to(dtype=torch.float32).cpu().tolist()]
+                                d["sample"] = [
+                                    float(x)
+                                    for x in sample.to(dtype=torch.float32)
+                                    .cpu()
+                                    .tolist()
+                                ]
                             else:
                                 d["sample"] = [int(x) for x in sample.cpu().tolist()]
                     return d
@@ -5234,7 +5545,9 @@ def infer(
 
             def _max_abs_diff(a: torch.Tensor, b: torch.Tensor) -> float:
                 try:
-                    if not (isinstance(a, torch.Tensor) and isinstance(b, torch.Tensor)):
+                    if not (
+                        isinstance(a, torch.Tensor) and isinstance(b, torch.Tensor)
+                    ):
                         return float("nan")
                     if a.numel() == 0 or b.numel() == 0:
                         return 0.0
@@ -5273,26 +5586,42 @@ def infer(
                         return None
                     out: dict[str, object] = {}
                     out["calib_mode"] = str(getattr(sc, "calib_mode", ""))
-                    out["output_ab_enabled"] = bool(getattr(sc, "output_ab_enabled", False))
-                    out["force_fp64_on_cuda"] = bool(getattr(sc, "_output_ab_force_fp64_on_cuda", False))
+                    out["output_ab_enabled"] = bool(
+                        getattr(sc, "output_ab_enabled", False)
+                    )
+                    out["force_fp64_on_cuda"] = bool(
+                        getattr(sc, "_output_ab_force_fp64_on_cuda", False)
+                    )
                     out["fp64_reason"] = str(getattr(sc, "_output_ab_fp64_reason", ""))
 
-                    max_elems = max(1, int(env_int("ENN_PRED_COLLAPSE_DIAG_SCALER_MAX_ELEMS", 4096) or 4096))
+                    max_elems = max(
+                        1,
+                        int(
+                            env_int("ENN_PRED_COLLAPSE_DIAG_SCALER_MAX_ELEMS", 4096)
+                            or 4096
+                        ),
+                    )
 
                     def _as_vec(t: object) -> torch.Tensor | None:
                         if not isinstance(t, torch.Tensor):
                             return None
                         return t.detach().reshape(-1)
 
-                    def _sample_vec(v: torch.Tensor) -> tuple[torch.Tensor, bool, int, int]:
+                    def _sample_vec(
+                        v: torch.Tensor,
+                    ) -> tuple[torch.Tensor, bool, int, int]:
                         n = int(v.numel())
                         if n <= 0:
                             return v, False, 0, 0
                         if n > max_elems:
                             if int(max_elems) == 1:
-                                idx = torch.tensor([n - 1], device=v.device, dtype=torch.long)
+                                idx = torch.tensor(
+                                    [n - 1], device=v.device, dtype=torch.long
+                                )
                             else:
-                                idx = torch.arange(max_elems, device=v.device, dtype=torch.long)
+                                idx = torch.arange(
+                                    max_elems, device=v.device, dtype=torch.long
+                                )
                                 idx = (idx * (n - 1)) // max(1, (max_elems - 1))
                             vv = v.index_select(0, idx)
                             return vv, True, int(vv.numel()), n
@@ -5307,19 +5636,39 @@ def infer(
                             return a[:0], b[:0], False, 0, na, nb, False
                         if na == 1 and nb > 1:
                             bb, sampled, sample_n, _ = _sample_vec(b)
-                            return a[:1], bb, bool(sampled), int(sample_n), na, nb, False
+                            return (
+                                a[:1],
+                                bb,
+                                bool(sampled),
+                                int(sample_n),
+                                na,
+                                nb,
+                                False,
+                            )
                         if nb == 1 and na > 1:
                             aa, sampled, sample_n, _ = _sample_vec(a)
-                            return aa, b[:1], bool(sampled), int(sample_n), na, nb, False
+                            return (
+                                aa,
+                                b[:1],
+                                bool(sampled),
+                                int(sample_n),
+                                na,
+                                nb,
+                                False,
+                            )
 
                         n_base = int(min(na, nb))
                         mismatch = bool((na != nb) and (na != 1) and (nb != 1))
                         sample_n = int(min(int(max_elems), n_base))
                         if n_base > sample_n:
                             if sample_n <= 1:
-                                idx = torch.tensor([n_base - 1], device=a.device, dtype=torch.long)
+                                idx = torch.tensor(
+                                    [n_base - 1], device=a.device, dtype=torch.long
+                                )
                             else:
-                                idx = torch.arange(sample_n, device=a.device, dtype=torch.long)
+                                idx = torch.arange(
+                                    sample_n, device=a.device, dtype=torch.long
+                                )
                                 idx = (idx * (n_base - 1)) // max(1, (sample_n - 1))
                             aa = a[:n_base].index_select(0, idx)
                             bb = b[:n_base].index_select(0, idx)
@@ -5344,9 +5693,13 @@ def infer(
                         if vv.is_floating_point():
                             vv64 = vv.to(dtype=torch.float64)
                             finite = torch.isfinite(vv64)
-                            d["finite_frac"] = float(finite.to(dtype=torch.float32).mean().item())
+                            d["finite_frac"] = float(
+                                finite.to(dtype=torch.float32).mean().item()
+                            )
                             with contextlib.suppress(Exception):
-                                d["zero_frac_fp64"] = float((vv64 == 0).to(dtype=torch.float32).mean().item())
+                                d["zero_frac_fp64"] = float(
+                                    (vv64 == 0).to(dtype=torch.float32).mean().item()
+                                )
                             if bool(finite.any().item()):
                                 vvf = vv64[finite]
                                 d["min"] = float(vvf.min().item())
@@ -5354,7 +5707,9 @@ def infer(
                                 d["mean"] = float(vvf.mean().item())
                                 d["abs_max"] = float(vvf.abs().max().item())
                             vv32 = vv.to(dtype=torch.float32)
-                            d["zero_frac_fp32"] = float((vv32 == 0).to(dtype=torch.float32).mean().item())
+                            d["zero_frac_fp32"] = float(
+                                (vv32 == 0).to(dtype=torch.float32).mean().item()
+                            )
                         else:
                             with contextlib.suppress(Exception):
                                 d["min"] = int(vv.min().item())
@@ -5369,7 +5724,9 @@ def infer(
                     if s is not None:
                         out["y_out_scale"] = _vec_stats("y_out_scale", s)
                         with contextlib.suppress(Exception):
-                            out["scale_zero_frac_fp32"] = float(out["y_out_scale"].get("zero_frac_fp32", 0.0))
+                            out["scale_zero_frac_fp32"] = float(
+                                out["y_out_scale"].get("zero_frac_fp32", 0.0)
+                            )
                     if b is not None:
                         out["y_out_bias"] = _vec_stats("y_out_bias", b)
                     if lo is not None:
@@ -5379,7 +5736,15 @@ def infer(
 
                     if (lo is not None) and (hi is not None):
                         try:
-                            lo_s, hi_s, clip_sampled, clip_sample_n, n_lo, n_hi, clip_mismatch = _sample_pair(lo, hi)
+                            (
+                                lo_s,
+                                hi_s,
+                                clip_sampled,
+                                clip_sample_n,
+                                n_lo,
+                                n_hi,
+                                clip_mismatch,
+                            ) = _sample_pair(lo, hi)
                             out["clip_sampled"] = bool(clip_sampled)
                             out["clip_sample_n"] = int(clip_sample_n)
                             out["clip_numel_low"] = int(n_lo)
@@ -5398,8 +5763,12 @@ def infer(
                                 lo32 = lo32[:n2]
                                 hi32 = hi32[:n2]
                                 span32 = hi32 - lo32
-                                out["clip0_frac_fp32"] = float((span32 == 0).to(dtype=torch.float32).mean().item())
-                                out["clip_neg_frac_fp32"] = float((span32 < 0).to(dtype=torch.float32).mean().item())
+                                out["clip0_frac_fp32"] = float(
+                                    (span32 == 0).to(dtype=torch.float32).mean().item()
+                                )
+                                out["clip_neg_frac_fp32"] = float(
+                                    (span32 < 0).to(dtype=torch.float32).mean().item()
+                                )
                         except Exception as e:
                             out["clip_fp32_error"] = f"{type(e).__name__}: {e}"
 
@@ -5421,8 +5790,13 @@ def infer(
                 if not collapse_diag:
                     return
                 is_probe = str(where).startswith("probe")
-                if consume_once and is_probe and env_bool(
-                    "ENN_PRED_COLLAPSE_DIAG_PROBE_DOES_NOT_CONSUME_ONCE", default=True
+                if (
+                    consume_once
+                    and is_probe
+                    and env_bool(
+                        "ENN_PRED_COLLAPSE_DIAG_PROBE_DOES_NOT_CONSUME_ONCE",
+                        default=True,
+                    )
                 ):
                     consume_once = False
                 if consume_once:
@@ -5448,17 +5822,19 @@ def infer(
                         if int(getattr(preds2, "shape", (0,))[0]) >= 2:
                             d0 = (preds2[0] - preds2[1]).detach().abs()
                             diag["y_eq_frac_atol"] = float(
-                                (d0 <= float(broadcast_atol)).to(dtype=torch.float32).mean().item()
+                                (d0 <= float(broadcast_atol))
+                                .to(dtype=torch.float32)
+                                .mean()
+                                .item()
                             )
                             diag["y_eq_count_atol"] = int(
                                 (d0 <= float(broadcast_atol)).sum().item()
                             )
                             diag["y_numel"] = int(d0.numel())
                             d_flat = d0.reshape(-1)
-                            if (
-                                int(broadcast_sample_max) > 0
-                                and int(d_flat.numel()) > int(broadcast_sample_max)
-                            ):
+                            if int(broadcast_sample_max) > 0 and int(
+                                d_flat.numel()
+                            ) > int(broadcast_sample_max):
                                 sample_n = int(broadcast_sample_max)
                                 if sample_n <= 1:
                                     if int(d_flat.numel()) <= 1:
@@ -5486,7 +5862,10 @@ def infer(
                                 diag["y_diff_quantile_sampled"] = 0
                                 diag["y_diff_quantile_n"] = int(d_flat.numel())
                             d_cpu = d_flat.to(dtype=torch.float32)
-                            if getattr(getattr(d_cpu, "device", None), "type", None) != "cpu":
+                            if (
+                                getattr(getattr(d_cpu, "device", None), "type", None)
+                                != "cpu"
+                            ):
                                 d_cpu = d_cpu.to(device="cpu")
                             if int(d_cpu.numel()) > 0:
                                 qs = torch.tensor([0.5, 0.9, 0.99], dtype=torch.float32)
@@ -5516,14 +5895,22 @@ def infer(
                     except Exception as e:
                         diag["Y_raw_error"] = f"{type(e).__name__}: {e}"
                     try:
-                        if bool(force_uncompiled) and (run_model_uncompiled is not None) and (run_model_uncompiled is not run_model):
-                            out_uc = run_model_uncompiled(Xi2, calibrate_output=True, return_loss=False)
+                        if (
+                            bool(force_uncompiled)
+                            and (run_model_uncompiled is not None)
+                            and (run_model_uncompiled is not run_model)
+                        ):
+                            out_uc = run_model_uncompiled(
+                                Xi2, calibrate_output=True, return_loss=False
+                            )
                             if isinstance(out_uc, tuple):
                                 out_uc = out_uc[0]
                             if isinstance(out_uc, torch.Tensor):
                                 diag["Y_uncompiled"] = _brief_stats(out_uc)
                                 if int(out_uc.shape[0]) >= 2:
-                                    diag["y_diff_uncompiled"] = _max_abs_diff(out_uc[0], out_uc[1])
+                                    diag["y_diff_uncompiled"] = _max_abs_diff(
+                                        out_uc[0], out_uc[1]
+                                    )
                     except Exception as e:
                         diag["Y_uncompiled_error"] = f"{type(e).__name__}: {e}"
                 finally:
@@ -5539,13 +5926,17 @@ def infer(
                         with contextlib.suppress(Exception):
                             os.makedirs(str(chunk_dir), exist_ok=True)
                             base = f"collapse_diag.rank{int(rank)}.batch{int(seen_batches):06d}"
-                            safe_where = re.sub(r"[^0-9A-Za-z_.-]+", "-", str(where))[:80] or "where"
+                            safe_where = (
+                                re.sub(r"[^0-9A-Za-z_.-]+", "-", str(where))[:80]
+                                or "where"
+                            )
                             fname = f"{base}.json"
                             fp0 = os.path.join(str(chunk_dir), fname)
                             if not bool(consume_once):
                                 fname = f"{base}.{safe_where}.json"
                             elif os.path.exists(fp0) and env_bool(
-                                "ENN_PRED_COLLAPSE_DIAG_APPEND_WHERE_ON_COLLISION", default=True
+                                "ENN_PRED_COLLAPSE_DIAG_APPEND_WHERE_ON_COLLISION",
+                                default=True,
                             ):
                                 fname = f"{base}.{safe_where}.json"
                             fp = os.path.join(str(chunk_dir), fname)
@@ -5555,7 +5946,9 @@ def infer(
 
             collapse_switched_uncompiled = False
             calibrate_pred_output = bool(env_bool("ENN_PRED_CALIBRATE_OUTPUT", True))
-            collapse_fallback_raw = bool(env_bool("ENN_PRED_COLLAPSE_FALLBACK_RAW", True))
+            collapse_fallback_raw = bool(
+                env_bool("ENN_PRED_COLLAPSE_FALLBACK_RAW", True)
+            )
             collapse_abort = bool(
                 env_bool(
                     "ENN_PRED_COLLAPSE_ABORT",
@@ -5570,7 +5963,9 @@ def infer(
             pred_cg_strict_sync = bool(
                 env_bool(
                     "ENN_PRED_CUDAGRAPH_STRICT_SYNC",
-                    default=bool(dev_type == "cuda" and (cg_enabled or td_cg_candidate)),
+                    default=bool(
+                        dev_type == "cuda" and (cg_enabled or td_cg_candidate)
+                    ),
                 )
             )
 
@@ -5618,7 +6013,10 @@ def infer(
                         if bool(force_fp32) or bool(collapse_fp32_active):
                             with StatelessAutocast.suspend(device):
                                 x_fp32 = x
-                                if torch.is_tensor(x_fp32) and x_fp32.dtype != torch.float32:
+                                if (
+                                    torch.is_tensor(x_fp32)
+                                    and x_fp32.dtype != torch.float32
+                                ):
                                     x_fp32 = x_fp32.to(dtype=torch.float32)
                                 return mm(
                                     x_fp32,
@@ -5639,6 +6037,7 @@ def infer(
                     is_cg_trees = False
                     try:
                         import traceback as _tb
+
                         tb = _tb.format_exc()
                         is_cg_trees = "torch/_inductor/cudagraph_trees.py" in tb
                     except Exception:
@@ -5649,7 +6048,10 @@ def infer(
                     ):
                         try:
                             import torch._inductor.config as _icfg
-                            if env_bool("ENN_PRED_LOG_CUDAGRAPH_RECOVERY", default=False):
+
+                            if env_bool(
+                                "ENN_PRED_LOG_CUDAGRAPH_RECOVERY", default=False
+                            ):
                                 _LOGGER.error(
                                     "[infer] inductor cudagraph_trees assertion hit; retrying with triton.cudagraph_trees=0 (keep cudagraphs). "
                                     "Set ENN_PRED_RETRY_ON_CUDAGRAPH_TREES_ASSERT=0 to disable."
@@ -5663,13 +6065,19 @@ def infer(
                     ):
                         try:
                             import torch._inductor.config as _icfg
-                            if env_bool("ENN_PRED_LOG_CUDAGRAPH_RECOVERY", default=False):
+
+                            if env_bool(
+                                "ENN_PRED_LOG_CUDAGRAPH_RECOVERY", default=False
+                            ):
                                 _LOGGER.error(
                                     "[infer] inductor cudagraph_trees assertion persists; retrying with triton.cudagraphs=0 (no cudagraph capture, keep compile). "
                                     "Set ENN_PRED_RETRY_ON_CUDAGRAPH_DISABLE_ASSERT=0 to disable."
                                 )
                             with _icfg.patch(
-                                {"triton.cudagraph_trees": False, "triton.cudagraphs": False}
+                                {
+                                    "triton.cudagraph_trees": False,
+                                    "triton.cudagraphs": False,
+                                }
                             ):
                                 return _invoke_predict(m)
                         except Exception:
@@ -5692,7 +6100,10 @@ def infer(
                         force_eager = True
                         mm_fb = (
                             run_model_uncompiled
-                            if (run_model_uncompiled is not None and run_model_uncompiled is not run_model)
+                            if (
+                                run_model_uncompiled is not None
+                                and run_model_uncompiled is not run_model
+                            )
                             else m
                         )
                         return _invoke_predict(mm_fb)
@@ -5722,7 +6133,10 @@ def infer(
                         force_eager = True
                         mm_fb = (
                             run_model_uncompiled
-                            if (run_model_uncompiled is not None and run_model_uncompiled is not run_model)
+                            if (
+                                run_model_uncompiled is not None
+                                and run_model_uncompiled is not run_model
+                            )
                             else m
                         )
                         return _invoke_predict(mm_fb)
@@ -5788,7 +6202,11 @@ def infer(
                     if (force_eager and callable(eager_ctx_factory))
                     else contextlib.nullcontext()
                 )
-                uc = bool(force_uncompiled) if use_uncompiled is None else bool(use_uncompiled)
+                uc = (
+                    bool(force_uncompiled)
+                    if use_uncompiled is None
+                    else bool(use_uncompiled)
+                )
                 with ctx:
                     if (
                         force_eager
@@ -5807,7 +6225,9 @@ def infer(
                         )
                     else:
                         out = _run_model_predict_with_calibration(
-                            x, calibrate_output=bool(calibrate_pred_output), use_uncompiled=uc
+                            x,
+                            calibrate_output=bool(calibrate_pred_output),
+                            use_uncompiled=uc,
                         )
                 if isinstance(out, tuple):
                     out = out[0]
@@ -5845,7 +6265,12 @@ def infer(
 
             def _td_cudagraph(bs_now: int, X_now: torch.Tensor) -> None:
                 nonlocal td_cg_active, td_cg_disabled, td_cg_mb, td_cg_mod
-                nonlocal td_cg_pad_buf, td_cg_seen, td_cg_max_bs, td_cg_target, td_cg_x_inner_shape
+                nonlocal \
+                    td_cg_pad_buf, \
+                    td_cg_seen, \
+                    td_cg_max_bs, \
+                    td_cg_target, \
+                    td_cg_x_inner_shape
                 if (
                     td_cg_disabled
                     or td_cg_active
@@ -5865,9 +6290,7 @@ def infer(
                 if mb_cap is None:
                     return
                 mb_cap = int(max(1, int(mb_cap)))
-                td_cg_x_inner_shape = tuple(
-                    int(d) for d in tuple(X_now.shape[1:])
-                )
+                td_cg_x_inner_shape = tuple(int(d) for d in tuple(X_now.shape[1:]))
                 td_cg_mb = int(mb_cap)
                 td_cg_pad_buf = X_now.new_empty(
                     (int(td_cg_mb),) + tuple(td_cg_x_inner_shape)
@@ -5887,13 +6310,15 @@ def infer(
                         for _ in range(int(prewarm)):
                             _ = _td_predict(td_cg_pad_buf)
 
-                    td_cg_mod = TD_CudaGraphModule(
-                        _td_predict, warmup=0, device=device
-                    )
+                    td_cg_mod = TD_CudaGraphModule(_td_predict, warmup=0, device=device)
 
-                    _compile_disable = getattr(getattr(torch, "compiler", None), "disable", None)
+                    _compile_disable = getattr(
+                        getattr(torch, "compiler", None), "disable", None
+                    )
                     _compile_disable_ctx = (
-                        _compile_disable() if callable(_compile_disable) else contextlib.nullcontext()
+                        _compile_disable()
+                        if callable(_compile_disable)
+                        else contextlib.nullcontext()
                     )
                     with _compile_disable_ctx:
                         for _ in range(3):
@@ -5924,11 +6349,7 @@ def infer(
             try:
                 _first_batch = next(data_iter)
             except StopIteration:
-                r = (
-                    int(torch.distributed.get_rank())
-                    if is_distributed()
-                    else 0
-                )
+                r = int(torch.distributed.get_rank()) if is_distributed() else 0
                 w = int(get_world_size(device)) if is_distributed() else 1
                 with contextlib.suppress(Exception):
                     chain = []
@@ -5949,9 +6370,7 @@ def infer(
                         if nxt is None or nxt is cur:
                             break
                         cur = nxt
-                    _LOGGER.error(
-                        "[DIAG] infer: loader chain: %s", " -> ".join(chain)
-                    )
+                    _LOGGER.error("[DIAG] infer: loader chain: %s", " -> ".join(chain))
                     base = getattr(data_loader, "_base_iterable", None)
                     if base is not None:
                         try:
@@ -6017,23 +6436,15 @@ def infer(
                 except Exception:
                     raise
                 X = torch.atleast_2d(X)
-                bs = (
-                    int(getattr(X, "shape", [0])[0])
-                    if hasattr(X, "shape")
-                    else 0
-                )
+                bs = int(getattr(X, "shape", [0])[0]) if hasattr(X, "shape") else 0
                 if (not first_batch_info) and seen_batches == 1:
                     with contextlib.suppress(Exception):
                         first_batch_info["batch_type"] = type(batch).__name__
                         first_batch_info["X_shape"] = [
                             int(x) for x in getattr(X, "shape", ())
                         ]
-                        first_batch_info["X_dtype"] = str(
-                            getattr(X, "dtype", None)
-                        )
-                        first_batch_info["X_device"] = str(
-                            getattr(X, "device", None)
-                        )
+                        first_batch_info["X_dtype"] = str(getattr(X, "dtype", None))
+                        first_batch_info["X_device"] = str(getattr(X, "device", None))
                         if row_ids is not None and hasattr(row_ids, "shape"):
                             first_batch_info["row_ids_shape"] = [
                                 int(x) for x in getattr(row_ids, "shape", ())
@@ -6046,7 +6457,12 @@ def infer(
                     if status_bar is not None:
                         status_bar.update(1)
                     continue
-                if (not force_single) and (not force_eager) and (not td_cg_disabled) and (not td_cg_active):
+                if (
+                    (not force_single)
+                    and (not force_eager)
+                    and (not td_cg_disabled)
+                    and (not td_cg_active)
+                ):
                     _td_cudagraph(int(bs), X)
                 if row_ids is None:
                     if row_ids_buf is None or int(row_ids_buf.numel()) < bs:
@@ -6100,7 +6516,9 @@ def infer(
                         td_cg_x_inner_shape = None
                         use_td_cg = False
                 mb = (
-                    1 if force_single else (int(td_cg_mb) if use_td_cg else int(mb_eager))
+                    1
+                    if force_single
+                    else (int(td_cg_mb) if use_td_cg else int(mb_eager))
                 )
                 predict_fn = td_cg_mod if use_td_cg else _td_predict
                 start = 0
@@ -6123,9 +6541,16 @@ def infer(
                             Xi2_probe = X[:2].detach()
                             out_probe = _td_predict(
                                 Xi2_probe,
-                                calibrate_output=(bool(calibrate_pred_output) if "calibrate_pred_output" in locals() else None),
+                                calibrate_output=(
+                                    bool(calibrate_pred_output)
+                                    if "calibrate_pred_output" in locals()
+                                    else None
+                                ),
                             )
-                            if isinstance(out_probe, torch.Tensor) and int(out_probe.shape[0]) >= 2:
+                            if (
+                                isinstance(out_probe, torch.Tensor)
+                                and int(out_probe.shape[0]) >= 2
+                            ):
                                 xdp = (Xi2_probe[0] - Xi2_probe[1]).abs().max()
                                 ydp = (out_probe[0] - out_probe[1]).abs().max()
                                 _diag_collapse_once(
@@ -6213,7 +6638,8 @@ def infer(
                         if (
                             pred_cg_strict_sync
                             and reuse_risk
-                            and getattr(getattr(Xi_run, "device", None), "type", None) == "cuda"
+                            and getattr(getattr(Xi_run, "device", None), "type", None)
+                            == "cuda"
                         ):
                             sync_accelerator(dev_obj)
                         if dev_type == "cuda":
@@ -6222,7 +6648,8 @@ def infer(
                         if (
                             pred_cg_strict_sync
                             and reuse_risk
-                            and getattr(getattr(out, "device", None), "type", None) == "cuda"
+                            and getattr(getattr(out, "device", None), "type", None)
+                            == "cuda"
                         ):
                             sync_accelerator(dev_obj)
                         if isinstance(out, torch.Tensor):
@@ -6259,12 +6686,15 @@ def infer(
                             cudagraph_mark_step_end()
                     preds = out
                     if not isinstance(preds, torch.Tensor):
-                        raise RuntimeError(
-                            "infer: unexpected model output type"
-                        )
+                        raise RuntimeError("infer: unexpected model output type")
                     if pad_n > 0 and int(preds.shape[0]) == int(mb):
                         preds = preds[:n_i]
-                    if diag_overwrite and isinstance(preds, torch.Tensor) and getattr(getattr(preds, "device", None), "type", None) == "cuda":
+                    if (
+                        diag_overwrite
+                        and isinstance(preds, torch.Tensor)
+                        and getattr(getattr(preds, "device", None), "type", None)
+                        == "cuda"
+                    ):
                         reuse_risk_diag = bool(cg_enabled) or bool(use_td_cg)
                         if reuse_risk_diag:
                             cur_batch = int(seen_batches)
@@ -6273,7 +6703,11 @@ def infer(
                             with contextlib.suppress(Exception):
                                 cur_ptr = int(preds.data_ptr())
 
-                            if prev_pred_ptr is not None and cur_ptr is not None and int(cur_ptr) == int(prev_pred_ptr):
+                            if (
+                                prev_pred_ptr is not None
+                                and cur_ptr is not None
+                                and int(cur_ptr) == int(prev_pred_ptr)
+                            ):
                                 _LOGGER.warning(
                                     "[infer][overwrite-diag] output data_ptr reused: prev_batch=%s prev_slice=%s curr_batch=%s curr_slice=%s ptr=0x%x cg=%s td_cg=%s",
                                     prev_pred_step,
@@ -6291,14 +6725,32 @@ def infer(
                             prev0 = prev_pred_sample_cpu
                             if prev_pred_ref is not None and prev0 is not None:
                                 try:
-                                    cur_prev = prev_pred_ref.detach().reshape(-1)[: int(diag_overwrite_n)]
-                                    if getattr(getattr(cur_prev, "device", None), "type", None) != "cpu":
+                                    cur_prev = prev_pred_ref.detach().reshape(-1)[
+                                        : int(diag_overwrite_n)
+                                    ]
+                                    if (
+                                        getattr(
+                                            getattr(cur_prev, "device", None),
+                                            "type",
+                                            None,
+                                        )
+                                        != "cpu"
+                                    ):
                                         cur_prev = cur_prev.to(device="cpu")
-                                    if isinstance(cur_prev, torch.Tensor) and cur_prev.dtype != torch.float32:
+                                    if (
+                                        isinstance(cur_prev, torch.Tensor)
+                                        and cur_prev.dtype != torch.float32
+                                    ):
                                         cur_prev = cur_prev.to(dtype=torch.float32)
-                                    if isinstance(prev0, torch.Tensor) and prev0.dtype != torch.float32:
+                                    if (
+                                        isinstance(prev0, torch.Tensor)
+                                        and prev0.dtype != torch.float32
+                                    ):
                                         prev0 = prev0.to(dtype=torch.float32)
-                                    if int(cur_prev.numel()) == int(prev0.numel()) and int(cur_prev.numel()) > 0:
+                                    if (
+                                        int(cur_prev.numel()) == int(prev0.numel())
+                                        and int(cur_prev.numel()) > 0
+                                    ):
                                         diff = (cur_prev - prev0).abs()
                                         dmax, imax = diff.max(dim=0)
                                         overwrite_max = float(dmax.item())
@@ -6310,7 +6762,9 @@ def infer(
                                     prev_d = None
                                     cur_d = None
                                     with contextlib.suppress(Exception):
-                                        prev_d = _tensor_diag(prev_pred_ref, sample_n=16)
+                                        prev_d = _tensor_diag(
+                                            prev_pred_ref, sample_n=16
+                                        )
                                     with contextlib.suppress(Exception):
                                         cur_d = _tensor_diag(preds, sample_n=16)
                                     _LOGGER.exception(
@@ -6319,8 +6773,16 @@ def infer(
                                         prev_pred_slice,
                                         cur_batch,
                                         cur_slice,
-                                        (f"0x{int(prev_pred_ptr):x}" if prev_pred_ptr is not None else None),
-                                        (f"0x{int(cur_ptr):x}" if cur_ptr is not None else None),
+                                        (
+                                            f"0x{int(prev_pred_ptr):x}"
+                                            if prev_pred_ptr is not None
+                                            else None
+                                        ),
+                                        (
+                                            f"0x{int(cur_ptr):x}"
+                                            if cur_ptr is not None
+                                            else None
+                                        ),
                                         bool(cg_enabled),
                                         bool(use_td_cg),
                                         _ids_diag(prev_pred_rows_cpu),
@@ -6333,11 +6795,30 @@ def infer(
                                             "infer: overwrite diagnostic failed while ENN_PRED_DIAG_OVERWRITE_ABORT=1. Cannot guarantee cudagraph safety; aborting."
                                         ) from e
                                 if overwrite_max is not None:
-                                    prev_shape = [int(v) for v in tuple(getattr(prev_pred_ref, "shape", ()))] if prev_pred_ref is not None else []
-                                    multi = _unravel_index(int(overwrite_idx or 0), prev_shape) if prev_shape else []
+                                    prev_shape = (
+                                        [
+                                            int(v)
+                                            for v in tuple(
+                                                getattr(prev_pred_ref, "shape", ())
+                                            )
+                                        ]
+                                        if prev_pred_ref is not None
+                                        else []
+                                    )
+                                    multi = (
+                                        _unravel_index(
+                                            int(overwrite_idx or 0), prev_shape
+                                        )
+                                        if prev_shape
+                                        else []
+                                    )
                                     row_in_prev = int(multi[0]) if multi else 0
-                                    axis1_idx = int(multi[1]) if len(multi) >= 2 else None
-                                    axis2_idx = int(multi[2]) if len(multi) >= 3 else None
+                                    axis1_idx = (
+                                        int(multi[1]) if len(multi) >= 2 else None
+                                    )
+                                    axis2_idx = (
+                                        int(multi[2]) if len(multi) >= 3 else None
+                                    )
                                     row_id = None
                                     x_row_head = None
                                     x_row_stats = None
@@ -6351,43 +6832,83 @@ def infer(
                                     curr_x_run_source = None
                                     with contextlib.suppress(Exception):
                                         if Xi_run is Xi:
-                                            curr_x_run_source = 'Xi'
-                                        elif use_td_cg and (td_cg_pad_buf is not None) and (Xi_run is td_cg_pad_buf):
-                                            curr_x_run_source = 'td_cg_pad_buf'
+                                            curr_x_run_source = "Xi"
+                                        elif (
+                                            use_td_cg
+                                            and (td_cg_pad_buf is not None)
+                                            and (Xi_run is td_cg_pad_buf)
+                                        ):
+                                            curr_x_run_source = "td_cg_pad_buf"
                                         elif Xi_pad is not None and (Xi_run is Xi_pad):
-                                            curr_x_run_source = 'pad_buf'
+                                            curr_x_run_source = "pad_buf"
                                         else:
-                                            curr_x_run_source = 'other'
+                                            curr_x_run_source = "other"
 
                                     with contextlib.suppress(Exception):
-                                        if prev_pred_rows_cpu is not None and int(prev_pred_rows_cpu.numel()) > row_in_prev:
-                                            row_id = int(prev_pred_rows_cpu[row_in_prev].item())
+                                        if (
+                                            prev_pred_rows_cpu is not None
+                                            and int(prev_pred_rows_cpu.numel())
+                                            > row_in_prev
+                                        ):
+                                            row_id = int(
+                                                prev_pred_rows_cpu[row_in_prev].item()
+                                            )
                                     with contextlib.suppress(Exception):
-                                        if prev_pred_X_cpu is not None and int(prev_pred_X_cpu.shape[0]) > row_in_prev:
+                                        if (
+                                            prev_pred_X_cpu is not None
+                                            and int(prev_pred_X_cpu.shape[0])
+                                            > row_in_prev
+                                        ):
                                             xrow = prev_pred_X_cpu[row_in_prev]
                                             xflat = xrow.detach().reshape(-1)
                                             n = int(min(16, int(xflat.numel())))
-                                            x_row_head = [float(v) for v in xflat[:n].tolist()]
+                                            x_row_head = [
+                                                float(v) for v in xflat[:n].tolist()
+                                            ]
                                             x_row_stats = _row_stats(xrow)
                                     with contextlib.suppress(Exception):
-                                        if prev_pred_X_run_cpu is not None and int(prev_pred_X_run_cpu.shape[0]) > row_in_prev:
+                                        if (
+                                            prev_pred_X_run_cpu is not None
+                                            and int(prev_pred_X_run_cpu.shape[0])
+                                            > row_in_prev
+                                        ):
                                             xrow = prev_pred_X_run_cpu[row_in_prev]
                                             xflat = xrow.detach().reshape(-1)
                                             n = int(min(16, int(xflat.numel())))
-                                            x_run_row_head = [float(v) for v in xflat[:n].tolist()]
+                                            x_run_row_head = [
+                                                float(v) for v in xflat[:n].tolist()
+                                            ]
                                             x_run_row_stats = _row_stats(xrow)
 
                                     prev_val = None
                                     cur_val = None
                                     with contextlib.suppress(Exception):
-                                        if prev0 is not None and overwrite_idx is not None and int(prev0.numel()) > int(overwrite_idx):
-                                            prev_val = float(prev0[int(overwrite_idx)].item())
+                                        if (
+                                            prev0 is not None
+                                            and overwrite_idx is not None
+                                            and int(prev0.numel()) > int(overwrite_idx)
+                                        ):
+                                            prev_val = float(
+                                                prev0[int(overwrite_idx)].item()
+                                            )
                                     with contextlib.suppress(Exception):
-                                        if cur_prev is not None and overwrite_idx is not None and int(cur_prev.numel()) > int(overwrite_idx):
-                                            cur_val = float(cur_prev[int(overwrite_idx)].item())
+                                        if (
+                                            cur_prev is not None
+                                            and overwrite_idx is not None
+                                            and int(cur_prev.numel())
+                                            > int(overwrite_idx)
+                                        ):
+                                            cur_val = float(
+                                                cur_prev[int(overwrite_idx)].item()
+                                            )
 
-                                    prev_d = _tensor_diag(prev_pred_ref, sample_n=min(32, int(diag_overwrite_n)))
-                                    cur_d = _tensor_diag(preds, sample_n=min(32, int(diag_overwrite_n)))
+                                    prev_d = _tensor_diag(
+                                        prev_pred_ref,
+                                        sample_n=min(32, int(diag_overwrite_n)),
+                                    )
+                                    cur_d = _tensor_diag(
+                                        preds, sample_n=min(32, int(diag_overwrite_n))
+                                    )
                                     payload: dict[str, object] = {
                                         "kind": "pred_overwrite",
                                         "rank": int(rank),
@@ -6398,8 +6919,16 @@ def infer(
                                         "prev_slice": prev_pred_slice,
                                         "curr_batch": cur_batch,
                                         "curr_slice": cur_slice,
-                                        "prev_ptr": (f"0x{int(prev_pred_ptr):x}" if prev_pred_ptr is not None else None),
-                                        "curr_ptr": (f"0x{int(cur_ptr):x}" if cur_ptr is not None else None),
+                                        "prev_ptr": (
+                                            f"0x{int(prev_pred_ptr):x}"
+                                            if prev_pred_ptr is not None
+                                            else None
+                                        ),
+                                        "curr_ptr": (
+                                            f"0x{int(cur_ptr):x}"
+                                            if cur_ptr is not None
+                                            else None
+                                        ),
                                         "row_id": row_id,
                                         "row_in_prev": row_in_prev,
                                         "multi_index": multi,
@@ -6409,33 +6938,67 @@ def infer(
                                         "x_row_stats": x_row_stats,
                                         "x_run_row_head": x_run_row_head,
                                         "x_run_row_stats": x_run_row_stats,
-                                        "prev_pad_n": int(prev_pred_pad_n) if prev_pred_pad_n is not None else None,
+                                        "prev_pad_n": int(prev_pred_pad_n)
+                                        if prev_pred_pad_n is not None
+                                        else None,
                                         "curr_pad_n": int(pad_n),
-                                        "prev_mb": int(prev_pred_mb) if prev_pred_mb is not None else None,
+                                        "prev_mb": int(prev_pred_mb)
+                                        if prev_pred_mb is not None
+                                        else None,
                                         "curr_mb": int(mb),
-                                        "prev_n_i": int(prev_pred_n_i) if prev_pred_n_i is not None else None,
+                                        "prev_n_i": int(prev_pred_n_i)
+                                        if prev_pred_n_i is not None
+                                        else None,
                                         "curr_n_i": int(n_i),
-                                        "prev_X_run_ptr": (f"0x{int(prev_pred_X_run_ptr):x}" if prev_pred_X_run_ptr is not None else None),
-                                        "curr_X_run_ptr": (f"0x{int(curr_x_run_ptr):x}" if curr_x_run_ptr is not None else None),
+                                        "prev_X_run_ptr": (
+                                            f"0x{int(prev_pred_X_run_ptr):x}"
+                                            if prev_pred_X_run_ptr is not None
+                                            else None
+                                        ),
+                                        "curr_X_run_ptr": (
+                                            f"0x{int(curr_x_run_ptr):x}"
+                                            if curr_x_run_ptr is not None
+                                            else None
+                                        ),
                                         "prev_X_run_source": prev_pred_X_run_source,
                                         "curr_X_run_source": curr_x_run_source,
-                                        "prev_X_run_diag": _x_diag(prev_pred_X_run_cpu) if prev_pred_X_run_cpu is not None else None,
+                                        "prev_X_run_diag": _x_diag(prev_pred_X_run_cpu)
+                                        if prev_pred_X_run_cpu is not None
+                                        else None,
                                         "curr_X_run_diag": _x_diag(Xi_run),
                                         "overwrite_max": float(overwrite_max),
-                                        "overwrite_sample_index": int(overwrite_idx or 0),
+                                        "overwrite_sample_index": int(
+                                            overwrite_idx or 0
+                                        ),
                                         "prev_value_at_max": prev_val,
                                         "curr_value_at_max": cur_val,
-                                        "prev_row_ids_diag": _ids_diag(prev_pred_rows_cpu),
+                                        "prev_row_ids_diag": _ids_diag(
+                                            prev_pred_rows_cpu
+                                        ),
                                         "curr_row_ids_diag": _ids_diag(rows_i),
-                                        "prev_X_diag": _x_diag(prev_pred_X_cpu) if prev_pred_X_cpu is not None else None,
+                                        "prev_X_diag": _x_diag(prev_pred_X_cpu)
+                                        if prev_pred_X_cpu is not None
+                                        else None,
                                         "curr_X_diag": _x_diag(Xi),
                                         "prev_pred_diag": prev_d,
                                         "curr_pred_diag": cur_d,
                                     }
 
-                                    _row_part = f"row{row_id}" if row_id is not None else "rowNA"
-                                    _a1_part = f"a1{int(axis1_idx)}" if axis1_idx is not None else "a1NA"
-                                    _a2_part = f"a2{int(axis2_idx)}" if axis2_idx is not None else "a2NA"
+                                    _row_part = (
+                                        f"row{row_id}"
+                                        if row_id is not None
+                                        else "rowNA"
+                                    )
+                                    _a1_part = (
+                                        f"a1{int(axis1_idx)}"
+                                        if axis1_idx is not None
+                                        else "a1NA"
+                                    )
+                                    _a2_part = (
+                                        f"a2{int(axis2_idx)}"
+                                        if axis2_idx is not None
+                                        else "a2NA"
+                                    )
                                     payload["filename"] = (
                                         f"overwrite_rank{int(rank)}_prevb{prev_pred_step}_prevsl{prev_pred_slice}_curb{cur_batch}_cursl{cur_slice}_"
                                         f"prevptr{int(prev_pred_ptr) if prev_pred_ptr is not None else 0:x}_curptr{int(cur_ptr) if cur_ptr is not None else 0:x}_"
@@ -6450,8 +7013,16 @@ def infer(
                                         prev_pred_slice,
                                         cur_batch,
                                         cur_slice,
-                                        (f"0x{int(prev_pred_ptr):x}" if prev_pred_ptr is not None else None),
-                                        (f"0x{int(cur_ptr):x}" if cur_ptr is not None else None),
+                                        (
+                                            f"0x{int(prev_pred_ptr):x}"
+                                            if prev_pred_ptr is not None
+                                            else None
+                                        ),
+                                        (
+                                            f"0x{int(cur_ptr):x}"
+                                            if cur_ptr is not None
+                                            else None
+                                        ),
                                         row_id,
                                         multi,
                                         axis1_idx,
@@ -6473,16 +7044,33 @@ def infer(
                             prev_pred_ref = preds
                             prev_pred_step = cur_batch
                             prev_pred_slice = cur_slice
-                            prev_pred_ptr = int(cur_ptr) if cur_ptr is not None else None
+                            prev_pred_ptr = (
+                                int(cur_ptr) if cur_ptr is not None else None
+                            )
                             with contextlib.suppress(Exception):
-                                prev_pred_rows_cpu = rows_i.detach().to(device='cpu', dtype=torch.int64).reshape(-1).clone()
+                                prev_pred_rows_cpu = (
+                                    rows_i.detach()
+                                    .to(device="cpu", dtype=torch.int64)
+                                    .reshape(-1)
+                                    .clone()
+                                )
                             with contextlib.suppress(Exception):
                                 xcpu = Xi.detach()
-                                if getattr(getattr(xcpu, 'device', None), 'type', None) != 'cpu':
-                                    xcpu = xcpu.to('cpu')
-                                if isinstance(xcpu, torch.Tensor) and xcpu.dtype != torch.float32:
+                                if (
+                                    getattr(getattr(xcpu, "device", None), "type", None)
+                                    != "cpu"
+                                ):
+                                    xcpu = xcpu.to("cpu")
+                                if (
+                                    isinstance(xcpu, torch.Tensor)
+                                    and xcpu.dtype != torch.float32
+                                ):
                                     xcpu = xcpu.to(dtype=torch.float32)
-                                prev_pred_X_cpu = xcpu.clone() if isinstance(xcpu, torch.Tensor) else None
+                                prev_pred_X_cpu = (
+                                    xcpu.clone()
+                                    if isinstance(xcpu, torch.Tensor)
+                                    else None
+                                )
                                 prev_pred_pad_n = int(pad_n)
                                 prev_pred_mb = int(mb)
                                 prev_pred_n_i = int(n_i)
@@ -6491,31 +7079,65 @@ def infer(
                                         prev_pred_X_run_ptr = int(Xi_run.data_ptr())
                                 with contextlib.suppress(Exception):
                                     if Xi_run is Xi:
-                                        prev_pred_X_run_source = 'Xi'
-                                    elif use_td_cg and (td_cg_pad_buf is not None) and (Xi_run is td_cg_pad_buf):
-                                        prev_pred_X_run_source = 'td_cg_pad_buf'
+                                        prev_pred_X_run_source = "Xi"
+                                    elif (
+                                        use_td_cg
+                                        and (td_cg_pad_buf is not None)
+                                        and (Xi_run is td_cg_pad_buf)
+                                    ):
+                                        prev_pred_X_run_source = "td_cg_pad_buf"
                                     elif Xi_pad is not None and (Xi_run is Xi_pad):
-                                        prev_pred_X_run_source = 'pad_buf'
+                                        prev_pred_X_run_source = "pad_buf"
                                     else:
-                                        prev_pred_X_run_source = 'other'
+                                        prev_pred_X_run_source = "other"
                                 with contextlib.suppress(Exception):
                                     xrun_cpu = Xi_run.detach()
-                                    if getattr(getattr(xrun_cpu, 'device', None), 'type', None) != 'cpu':
-                                        xrun_cpu = xrun_cpu.to('cpu')
-                                    if isinstance(xrun_cpu, torch.Tensor) and xrun_cpu.dtype != torch.float32:
+                                    if (
+                                        getattr(
+                                            getattr(xrun_cpu, "device", None),
+                                            "type",
+                                            None,
+                                        )
+                                        != "cpu"
+                                    ):
+                                        xrun_cpu = xrun_cpu.to("cpu")
+                                    if (
+                                        isinstance(xrun_cpu, torch.Tensor)
+                                        and xrun_cpu.dtype != torch.float32
+                                    ):
                                         xrun_cpu = xrun_cpu.to(dtype=torch.float32)
-                                    if isinstance(xrun_cpu, torch.Tensor) and int(xrun_cpu.shape[0]) >= int(n_i):
+                                    if isinstance(xrun_cpu, torch.Tensor) and int(
+                                        xrun_cpu.shape[0]
+                                    ) >= int(n_i):
                                         xrun_cpu = xrun_cpu[: int(n_i)]
-                                    prev_pred_X_run_cpu = xrun_cpu.clone() if isinstance(xrun_cpu, torch.Tensor) else None
+                                    prev_pred_X_run_cpu = (
+                                        xrun_cpu.clone()
+                                        if isinstance(xrun_cpu, torch.Tensor)
+                                        else None
+                                    )
                             with contextlib.suppress(Exception):
-                                samp = preds.detach().reshape(-1)[: int(diag_overwrite_n)]
-                                if getattr(getattr(samp, "device", None), "type", None) != "cpu":
+                                samp = preds.detach().reshape(-1)[
+                                    : int(diag_overwrite_n)
+                                ]
+                                if (
+                                    getattr(getattr(samp, "device", None), "type", None)
+                                    != "cpu"
+                                ):
                                     samp = samp.to(device="cpu")
-                                if isinstance(samp, torch.Tensor) and samp.dtype != torch.float32:
+                                if (
+                                    isinstance(samp, torch.Tensor)
+                                    and samp.dtype != torch.float32
+                                ):
                                     samp = samp.to(dtype=torch.float32)
-                                if isinstance(samp, torch.Tensor) and (not samp.is_contiguous()):
+                                if isinstance(samp, torch.Tensor) and (
+                                    not samp.is_contiguous()
+                                ):
                                     samp = samp.contiguous()
-                                prev_pred_sample_cpu = samp.clone() if isinstance(samp, torch.Tensor) else None
+                                prev_pred_sample_cpu = (
+                                    samp.clone()
+                                    if isinstance(samp, torch.Tensor)
+                                    else None
+                                )
                     if (
                         (not force_single)
                         and bool(detect_broadcast)
@@ -6529,7 +7151,9 @@ def infer(
                             x0 = Xi[0].detach()
                             y0 = preds[0].detach()
                             n_pred = int(getattr(preds, "shape", (0,))[0])
-                            probe_k = int(min(int(broadcast_probe_k), int(n_i), int(n_pred)))
+                            probe_k = int(
+                                min(int(broadcast_probe_k), int(n_i), int(n_pred))
+                            )
                             pair_stats: list[dict[str, float]] = []
                             best_i = 1
                             best_match = -1.0
@@ -6542,19 +7166,31 @@ def infer(
                             for pi in range(1, int(probe_k)):
                                 xi = Xi[pi].detach()
                                 x_di = (x0 - xi).abs().max()
-                                xdv = float(x_di.item()) if torch.is_tensor(x_di) else float("nan")
+                                xdv = (
+                                    float(x_di.item())
+                                    if torch.is_tensor(x_di)
+                                    else float("nan")
+                                )
                                 if (not math.isfinite(xdv)) or (xdv <= 0.0):
                                     continue
                                 yi = preds[pi].detach()
-                                is_like, st = _broadcast_like(y0, yi, atol=float(broadcast_atol))
+                                is_like, st = _broadcast_like(
+                                    y0, yi, atol=float(broadcast_atol)
+                                )
                                 pair_stats.append(
                                     {
                                         "i": float(pi),
                                         "x_diff": float(xdv),
                                         "y_max": float(st.get("y_max", float("nan"))),
-                                        "y_match_frac": float(st.get("y_match_frac", float("nan"))),
-                                        "y_rel_mean": float(st.get("y_rel_mean", float("nan"))),
-                                        "sample_n": float(st.get("sample_n", float("nan"))),
+                                        "y_match_frac": float(
+                                            st.get("y_match_frac", float("nan"))
+                                        ),
+                                        "y_rel_mean": float(
+                                            st.get("y_rel_mean", float("nan"))
+                                        ),
+                                        "sample_n": float(
+                                            st.get("sample_n", float("nan"))
+                                        ),
                                     }
                                 )
                                 mf = float(st.get("y_match_frac", -1.0))
@@ -6569,8 +7205,14 @@ def infer(
                                     sel_bstats = st
                                     break
 
-                            if (not sel_kind) and bool(detect_partial_broadcast) and (best_bstats is not None):
-                                if (best_match >= float(partial_broadcast_match_frac)) and (best_x_diff_val > 0.0):
+                            if (
+                                (not sel_kind)
+                                and bool(detect_partial_broadcast)
+                                and (best_bstats is not None)
+                            ):
+                                if (
+                                    best_match >= float(partial_broadcast_match_frac)
+                                ) and (best_x_diff_val > 0.0):
                                     sel_i = int(best_i)
                                     sel_kind = "partial_like"
                                     sel_bstats = best_bstats
@@ -6586,11 +7228,19 @@ def infer(
                                 and int(sel_i) < int(n_pred)
                             ):
                                 with contextlib.suppress(Exception):
-                                    idx2 = torch.tensor([0, int(sel_i)], device=Xi.device, dtype=torch.long)
+                                    idx2 = torch.tensor(
+                                        [0, int(sel_i)],
+                                        device=Xi.device,
+                                        dtype=torch.long,
+                                    )
                                     Xi2_sel = Xi.index_select(0, idx2)
                                     preds2_sel = preds.index_select(0, idx2)
                                     xds = (Xi2_sel[0] - Xi2_sel[1]).abs().max()
-                                    _, st_s = _broadcast_like(preds2_sel[0], preds2_sel[1], atol=float(broadcast_atol))
+                                    _, st_s = _broadcast_like(
+                                        preds2_sel[0],
+                                        preds2_sel[1],
+                                        atol=float(broadcast_atol),
+                                    )
                                     _diag_collapse_once(
                                         Xi2=Xi2_sel.detach(),
                                         preds2=preds2_sel.detach(),
@@ -6601,8 +7251,12 @@ def infer(
                                             "probe_kind": str(sel_kind or "probe"),
                                             "probe_pairs": pair_stats,
                                             "probe_selected_i": int(sel_i),
-                                            "probe_selected_match_frac": float(st_s.get("y_match_frac", float("nan"))),
-                                            "probe_selected_rel_mean": float(st_s.get("y_rel_mean", float("nan"))),
+                                            "probe_selected_match_frac": float(
+                                                st_s.get("y_match_frac", float("nan"))
+                                            ),
+                                            "probe_selected_rel_mean": float(
+                                                st_s.get("y_rel_mean", float("nan"))
+                                            ),
                                         },
                                     )
 
@@ -6618,7 +7272,8 @@ def infer(
                                 )
                                 y_diff = float(bstats.get("y_max", float("nan")))
                                 trigger_fallback = bool(is_broadcast_like) or (
-                                    (str(sel_kind) == "partial_like") and bool(partial_broadcast_force_single)
+                                    (str(sel_kind) == "partial_like")
+                                    and bool(partial_broadcast_force_single)
                                 )
                                 if bool(trigger_fallback):
                                     _dump_collapse_stage_diag_from_model(
@@ -6648,19 +7303,28 @@ def infer(
                                     if eager_on_broadcast:
                                         force_eager = True
 
-                                    if bool(env_bool("ENN_PRED_BROADCAST_FORCE_UNCOMPILED", default=True)) and (not bool(force_uncompiled)):
+                                    if bool(
+                                        env_bool(
+                                            "ENN_PRED_BROADCAST_FORCE_UNCOMPILED",
+                                            default=True,
+                                        )
+                                    ) and (not bool(force_uncompiled)):
                                         force_uncompiled = True
                                         _LOGGER.warning(
                                             "[infer] broadcast-like: forcing uncompiled model for correctness (ENN_PRED_BROADCAST_FORCE_UNCOMPILED=1)."
                                         )
 
                                     if str(sel_kind) == "partial_like":
-                                        if bool(partial_broadcast_force_uncompiled) and (not bool(force_uncompiled)):
+                                        if bool(
+                                            partial_broadcast_force_uncompiled
+                                        ) and (not bool(force_uncompiled)):
                                             force_uncompiled = True
                                             _LOGGER.warning(
                                                 "[infer] partial-broadcast: forcing uncompiled model for correctness (ENN_PRED_PARTIAL_BROADCAST_FORCE_UNCOMPILED=1)."
                                             )
-                                        if bool(partial_broadcast_force_eager) and (not bool(force_eager)):
+                                        if bool(partial_broadcast_force_eager) and (
+                                            not bool(force_eager)
+                                        ):
                                             force_eager = True
                                             _LOGGER.warning(
                                                 "[infer] partial-broadcast: forcing eager mode for correctness (ENN_PRED_PARTIAL_BROADCAST_FORCE_EAGER=1)."
@@ -6679,12 +7343,18 @@ def infer(
                                     with contextlib.suppress(Exception):
                                         setattr(model, "microbatch", 1)
                                     with contextlib.suppress(Exception):
-                                        if torch.is_tensor(preds) and getattr(preds.device, "type", None) == "cuda":
+                                        if (
+                                            torch.is_tensor(preds)
+                                            and getattr(preds.device, "type", None)
+                                            == "cuda"
+                                        ):
                                             _preds_tmp = preds
                                             preds = None
                                             del _preds_tmp
                                             empty_device_cache(
-                                                device=dev_obj, do_gc=False, min_interval_s=0.0
+                                                device=dev_obj,
+                                                do_gc=False,
+                                                min_interval_s=0.0,
                                             )
                                     x1_buf = Xi.new_empty((1,) + tuple(Xi.shape[1:]))
                                     preds_fix_cpu: torch.Tensor | None = None
@@ -6692,24 +7362,37 @@ def infer(
                                         x1_buf.copy_(Xi[j : j + 1])
                                         if (
                                             pred_cg_strict_sync
-                                            and getattr(x1_buf.device, "type", None) == "cuda"
+                                            and getattr(x1_buf.device, "type", None)
+                                            == "cuda"
                                         ):
                                             sync_accelerator(dev_obj)
                                         if dev_type == "cuda":
                                             cudagraph_mark_step_begin()
                                         pj = _td_predict(
                                             x1_buf,
-                                            calibrate_output=(bool(calibrate_pred_output) if "calibrate_pred_output" in locals() else None),
+                                            calibrate_output=(
+                                                bool(calibrate_pred_output)
+                                                if "calibrate_pred_output" in locals()
+                                                else None
+                                            ),
                                         )
                                         if dev_type == "cuda":
                                             cudagraph_mark_step_end()
                                         if (
                                             pred_cg_strict_sync
-                                            and getattr(getattr(pj, "device", None), "type", None) == "cuda"
+                                            and getattr(
+                                                getattr(pj, "device", None),
+                                                "type",
+                                                None,
+                                            )
+                                            == "cuda"
                                         ):
                                             sync_accelerator(dev_obj)
                                         pj_cpu = pj.detach()
-                                        if getattr(pj_cpu.device, "type", None) != "cpu":
+                                        if (
+                                            getattr(pj_cpu.device, "type", None)
+                                            != "cpu"
+                                        ):
                                             pj_cpu = pj_cpu.to(device="cpu")
                                         with contextlib.suppress(Exception):
                                             pj_cpu = pj_cpu.contiguous()
@@ -6719,20 +7402,37 @@ def infer(
                                                 (int(n_i),) + tuple(pj_cpu.shape[1:])
                                             )
                                         preds_fix_cpu[j : j + 1].copy_(pj_cpu[:1])
-                                    preds = preds_fix_cpu if preds_fix_cpu is not None else preds
+                                    preds = (
+                                        preds_fix_cpu
+                                        if preds_fix_cpu is not None
+                                        else preds
+                                    )
                                     with contextlib.suppress(Exception):
                                         if int(preds.shape[0]) >= 2:
                                             y0b = preds[0].detach()
                                             y1b = preds[1].detach()
-                                            is_broadcast_like2, bstats2 = _broadcast_like(
-                                                y0b, y1b, atol=float(broadcast_atol)
+                                            is_broadcast_like2, bstats2 = (
+                                                _broadcast_like(
+                                                    y0b, y1b, atol=float(broadcast_atol)
+                                                )
                                             )
-                                            ydiff2 = float(bstats2.get("y_max", float("nan")))
-                                            mf2 = float(bstats2.get("y_match_frac", float("nan")))
+                                            ydiff2 = float(
+                                                bstats2.get("y_max", float("nan"))
+                                            )
+                                            mf2 = float(
+                                                bstats2.get(
+                                                    "y_match_frac", float("nan")
+                                                )
+                                            )
                                             partial_like2 = bool(
                                                 detect_partial_broadcast
                                                 and math.isfinite(mf2)
-                                                and (mf2 >= float(partial_broadcast_after_fix_match_frac))
+                                                and (
+                                                    mf2
+                                                    >= float(
+                                                        partial_broadcast_after_fix_match_frac
+                                                    )
+                                                )
                                                 and ("x_diff" in locals())
                                                 and (float(x_diff.item()) > 0.0)
                                                 and (str(dev_type) == "cuda")
@@ -6746,7 +7446,9 @@ def infer(
                                                     "[infer] partial-broadcast persists after per-sample fallback (match_frac=%.5f); retrying this batch per-sample with fp32+no-autocast.",
                                                     float(mf2),
                                                 )
-                                                preds_fix_fp32_once: torch.Tensor | None = None
+                                                preds_fix_fp32_once: (
+                                                    torch.Tensor | None
+                                                ) = None
                                                 try:
                                                     for j in range(int(n_i)):
                                                         x1_buf.copy_(Xi[j : j + 1])
@@ -6754,35 +7456,76 @@ def infer(
                                                             cudagraph_mark_step_begin()
                                                         pj_fp32_once = _td_predict(
                                                             x1_buf,
-                                                            calibrate_output=(bool(calibrate_pred_output) if "calibrate_pred_output" in locals() else True),
+                                                            calibrate_output=(
+                                                                bool(
+                                                                    calibrate_pred_output
+                                                                )
+                                                                if "calibrate_pred_output"
+                                                                in locals()
+                                                                else True
+                                                            ),
                                                             use_uncompiled=True,
                                                             force_fp32=True,
                                                         )
                                                         if dev_type == "cuda":
                                                             cudagraph_mark_step_end()
                                                         pj_cpu = pj_fp32_once.detach()
-                                                        if getattr(pj_cpu.device, "type", None) != "cpu":
-                                                            pj_cpu = pj_cpu.to(device="cpu")
-                                                        with contextlib.suppress(Exception):
+                                                        if (
+                                                            getattr(
+                                                                pj_cpu.device,
+                                                                "type",
+                                                                None,
+                                                            )
+                                                            != "cpu"
+                                                        ):
+                                                            pj_cpu = pj_cpu.to(
+                                                                device="cpu"
+                                                            )
+                                                        with contextlib.suppress(
+                                                            Exception
+                                                        ):
                                                             pj_cpu = pj_cpu.contiguous()
                                                         pj_cpu = pj_cpu.clone()
                                                         if preds_fix_fp32_once is None:
-                                                            preds_fix_fp32_once = pj_cpu.new_empty(
-                                                                (int(n_i),) + tuple(pj_cpu.shape[1:])
+                                                            preds_fix_fp32_once = (
+                                                                pj_cpu.new_empty(
+                                                                    (int(n_i),)
+                                                                    + tuple(
+                                                                        pj_cpu.shape[1:]
+                                                                    )
+                                                                )
                                                             )
-                                                        preds_fix_fp32_once[j : j + 1].copy_(pj_cpu[:1])
+                                                        preds_fix_fp32_once[
+                                                            j : j + 1
+                                                        ].copy_(pj_cpu[:1])
 
                                                     if (
                                                         preds_fix_fp32_once is not None
-                                                        and int(preds_fix_fp32_once.shape[0]) >= 2
-                                                    ):
-                                                        _, st_fp32_once = _broadcast_like(
-                                                            preds_fix_fp32_once[0],
-                                                            preds_fix_fp32_once[1],
-                                                            atol=float(broadcast_atol),
+                                                        and int(
+                                                            preds_fix_fp32_once.shape[0]
                                                         )
-                                                        mf_fp32 = float(st_fp32_once.get("y_match_frac", float("nan")))
-                                                        yd_fp32 = float(st_fp32_once.get("y_max", float("nan")))
+                                                        >= 2
+                                                    ):
+                                                        _, st_fp32_once = (
+                                                            _broadcast_like(
+                                                                preds_fix_fp32_once[0],
+                                                                preds_fix_fp32_once[1],
+                                                                atol=float(
+                                                                    broadcast_atol
+                                                                ),
+                                                            )
+                                                        )
+                                                        mf_fp32 = float(
+                                                            st_fp32_once.get(
+                                                                "y_match_frac",
+                                                                float("nan"),
+                                                            )
+                                                        )
+                                                        yd_fp32 = float(
+                                                            st_fp32_once.get(
+                                                                "y_max", float("nan")
+                                                            )
+                                                        )
                                                         _LOGGER.warning(
                                                             "[infer] fp32 retry sanity (this batch): match_frac=%.5f (was %.5f) max|Y0-Y1|=%.6g (was %.6g)",
                                                             float(mf_fp32),
@@ -6793,18 +7536,39 @@ def infer(
                                                         improved = bool(
                                                             math.isfinite(mf_fp32)
                                                             and math.isfinite(mf2)
-                                                            and (mf_fp32 <= float(mf2) - float(partial_broadcast_fp32_min_gain))
+                                                            and (
+                                                                mf_fp32
+                                                                <= float(mf2)
+                                                                - float(
+                                                                    partial_broadcast_fp32_min_gain
+                                                                )
+                                                            )
                                                         )
                                                         if bool(improved):
                                                             preds = preds_fix_fp32_once
-                                                            if bool(partial_broadcast_fp32_persist):
-                                                                collapse_fp32_active = True
-                                                            with contextlib.suppress(Exception):
+                                                            if bool(
+                                                                partial_broadcast_fp32_persist
+                                                            ):
+                                                                collapse_fp32_active = (
+                                                                    True
+                                                                )
+                                                            with contextlib.suppress(
+                                                                Exception
+                                                            ):
                                                                 _diag_collapse_once(
                                                                     Xi2=Xi[:2].detach(),
-                                                                    preds2=preds[:2].detach(),
-                                                                    x_diff=float(x_diff.item()) if "x_diff" in locals() else float("nan"),
-                                                                    y_diff=float(yd_fp32),
+                                                                    preds2=preds[
+                                                                        :2
+                                                                    ].detach(),
+                                                                    x_diff=float(
+                                                                        x_diff.item()
+                                                                    )
+                                                                    if "x_diff"
+                                                                    in locals()
+                                                                    else float("nan"),
+                                                                    y_diff=float(
+                                                                        yd_fp32
+                                                                    ),
                                                                     where="after_per_sample_fp32_retry",
                                                                 )
                                                 except RuntimeError as e:
@@ -6819,7 +7583,9 @@ def infer(
                                                     _diag_collapse_once(
                                                         Xi2=Xi[:2].detach(),
                                                         preds2=preds[:2].detach(),
-                                                        x_diff=float(x_diff.item()) if "x_diff" in locals() else float("nan"),
+                                                        x_diff=float(x_diff.item())
+                                                        if "x_diff" in locals()
+                                                        else float("nan"),
                                                         y_diff=float(ydiff2),
                                                         where="after_per_sample_fix",
                                                     )
@@ -6834,7 +7600,9 @@ def infer(
                                                     y_diff_cal=float(ydiff2),
                                                 )
                                                 if _maybe_enable_fp32_collapse_fallback():
-                                                    preds_fix_fp32: torch.Tensor | None = None
+                                                    preds_fix_fp32: (
+                                                        torch.Tensor | None
+                                                    ) = None
                                                     for j in range(int(n_i)):
                                                         x1_buf.copy_(Xi[j : j + 1])
                                                         if cg_enabled:
@@ -6848,33 +7616,83 @@ def infer(
                                                         if cg_enabled:
                                                             cudagraph_mark_step_end()
                                                         pj_fp32_cpu = pj_fp32.detach()
-                                                        if getattr(pj_fp32_cpu.device, "type", None) != "cpu":
-                                                            pj_fp32_cpu = pj_fp32_cpu.to(device="cpu")
-                                                        with contextlib.suppress(Exception):
-                                                            pj_fp32_cpu = pj_fp32_cpu.contiguous()
-                                                        pj_fp32_cpu = pj_fp32_cpu.clone()
+                                                        if (
+                                                            getattr(
+                                                                pj_fp32_cpu.device,
+                                                                "type",
+                                                                None,
+                                                            )
+                                                            != "cpu"
+                                                        ):
+                                                            pj_fp32_cpu = (
+                                                                pj_fp32_cpu.to(
+                                                                    device="cpu"
+                                                                )
+                                                            )
+                                                        with contextlib.suppress(
+                                                            Exception
+                                                        ):
+                                                            pj_fp32_cpu = (
+                                                                pj_fp32_cpu.contiguous()
+                                                            )
+                                                        pj_fp32_cpu = (
+                                                            pj_fp32_cpu.clone()
+                                                        )
                                                         if preds_fix_fp32 is None:
                                                             preds_fix_fp32 = pj_fp32_cpu.new_empty(
-                                                                (int(n_i),) + tuple(pj_fp32_cpu.shape[1:])
+                                                                (int(n_i),)
+                                                                + tuple(
+                                                                    pj_fp32_cpu.shape[
+                                                                        1:
+                                                                    ]
+                                                                )
                                                             )
-                                                        preds_fix_fp32[j : j + 1].copy_(pj_fp32_cpu[:1])
-                                                    if preds_fix_fp32 is not None and int(preds_fix_fp32.shape[0]) >= 2:
-                                                        is_like_fp32, st_fp32 = _broadcast_like(
-                                                            preds_fix_fp32[0],
-                                                            preds_fix_fp32[1],
-                                                            atol=float(broadcast_atol),
+                                                        preds_fix_fp32[j : j + 1].copy_(
+                                                            pj_fp32_cpu[:1]
                                                         )
-                                                        dy_fp32 = float(st_fp32.get("y_max", float("nan")))
+                                                    if (
+                                                        preds_fix_fp32 is not None
+                                                        and int(preds_fix_fp32.shape[0])
+                                                        >= 2
+                                                    ):
+                                                        is_like_fp32, st_fp32 = (
+                                                            _broadcast_like(
+                                                                preds_fix_fp32[0],
+                                                                preds_fix_fp32[1],
+                                                                atol=float(
+                                                                    broadcast_atol
+                                                                ),
+                                                            )
+                                                        )
+                                                        dy_fp32 = float(
+                                                            st_fp32.get(
+                                                                "y_max", float("nan")
+                                                            )
+                                                        )
                                                         _LOGGER.warning(
                                                             "[infer] fp32 fallback sanity (this batch): max|Y0-Y1|=%.6g match_frac=%.5f rel_mean=%.3e",
                                                             float(dy_fp32),
-                                                            float(st_fp32.get("y_match_frac", float("nan"))),
-                                                            float(st_fp32.get("y_rel_mean", float("nan"))),
+                                                            float(
+                                                                st_fp32.get(
+                                                                    "y_match_frac",
+                                                                    float("nan"),
+                                                                )
+                                                            ),
+                                                            float(
+                                                                st_fp32.get(
+                                                                    "y_rel_mean",
+                                                                    float("nan"),
+                                                                )
+                                                            ),
                                                         )
                                                         if not bool(is_like_fp32):
                                                             preds = preds_fix_fp32
-                                                            if not bool(collapse_force_fp32_persist):
-                                                                collapse_fp32_active = False
+                                                            if not bool(
+                                                                collapse_force_fp32_persist
+                                                            ):
+                                                                collapse_fp32_active = (
+                                                                    False
+                                                                )
                                                         else:
                                                             if bool(collapse_abort):
                                                                 raise RuntimeError(
@@ -6886,16 +7704,23 @@ def infer(
                                                     (not collapse_switched_uncompiled)
                                                     and bool(collapse_force_uncompiled)
                                                     and (not bool(force_uncompiled))
-                                                    and (run_model_uncompiled is not run_model)
+                                                    and (
+                                                        run_model_uncompiled
+                                                        is not run_model
+                                                    )
                                                 ):
                                                     collapse_switched_uncompiled = True
                                                     _LOGGER.warning(
                                                         "[infer] collapse persisted; retrying this batch per-sample on uncompiled model (ENN_PRED_COLLAPSE_FORCE_UNCOMPILED=1)."
                                                     )
-                                                    prev_force_uncompiled = bool(force_uncompiled)
+                                                    prev_force_uncompiled = bool(
+                                                        force_uncompiled
+                                                    )
                                                     force_uncompiled = True
 
-                                                    preds_fix_uc: Optional[torch.Tensor] = None
+                                                    preds_fix_uc: Optional[
+                                                        torch.Tensor
+                                                    ] = None
                                                     for j in range(int(n_i)):
                                                         x1_buf.copy_(Xi[j : j + 1])
                                                         if dev_type == "cuda":
@@ -6903,35 +7728,79 @@ def infer(
                                                         pj_uc = _td_predict(x1_buf)
                                                         if dev_type == "cuda":
                                                             cudagraph_mark_step_end()
-                                                        if getattr(pj_uc.device, "type", None) == "cuda":
+                                                        if (
+                                                            getattr(
+                                                                pj_uc.device,
+                                                                "type",
+                                                                None,
+                                                            )
+                                                            == "cuda"
+                                                        ):
                                                             sync_accelerator(dev_obj)
                                                         pj_uc_cpu = pj_uc.detach()
-                                                        if getattr(pj_uc_cpu.device, "type", None) != "cpu":
-                                                            pj_uc_cpu = pj_uc_cpu.to(device="cpu")
-                                                        with contextlib.suppress(Exception):
-                                                            pj_uc_cpu = pj_uc_cpu.contiguous()
+                                                        if (
+                                                            getattr(
+                                                                pj_uc_cpu.device,
+                                                                "type",
+                                                                None,
+                                                            )
+                                                            != "cpu"
+                                                        ):
+                                                            pj_uc_cpu = pj_uc_cpu.to(
+                                                                device="cpu"
+                                                            )
+                                                        with contextlib.suppress(
+                                                            Exception
+                                                        ):
+                                                            pj_uc_cpu = (
+                                                                pj_uc_cpu.contiguous()
+                                                            )
                                                         pj_uc_cpu = pj_uc_cpu.clone()
                                                         if preds_fix_uc is None:
-                                                            preds_fix_uc = pj_uc_cpu.new_empty(
-                                                                (int(n_i),) + tuple(pj_uc_cpu.shape[1:])
+                                                            preds_fix_uc = (
+                                                                pj_uc_cpu.new_empty(
+                                                                    (int(n_i),)
+                                                                    + tuple(
+                                                                        pj_uc_cpu.shape[
+                                                                            1:
+                                                                        ]
+                                                                    )
+                                                                )
                                                             )
-                                                        preds_fix_uc[j : j + 1].copy_(pj_uc_cpu[:1])
+                                                        preds_fix_uc[j : j + 1].copy_(
+                                                            pj_uc_cpu[:1]
+                                                        )
 
                                                     if preds_fix_uc is not None:
                                                         preds = preds_fix_uc
-                                                        with contextlib.suppress(Exception):
+                                                        with contextlib.suppress(
+                                                            Exception
+                                                        ):
                                                             if int(preds.shape[0]) >= 2:
-                                                                is_like_uc, st_uc = _broadcast_like(
-                                                                    preds[0], preds[1], atol=float(broadcast_atol)
+                                                                is_like_uc, st_uc = (
+                                                                    _broadcast_like(
+                                                                        preds[0],
+                                                                        preds[1],
+                                                                        atol=float(
+                                                                            broadcast_atol
+                                                                        ),
+                                                                    )
                                                                 )
-                                                                dy_uc = float(st_uc.get("y_max", float("nan")))
+                                                                dy_uc = float(
+                                                                    st_uc.get(
+                                                                        "y_max",
+                                                                        float("nan"),
+                                                                    )
+                                                                )
                                                                 if not bool(is_like_uc):
                                                                     _LOGGER.warning(
                                                                         "[infer] uncompiled per-sample resolved collapse for this batch; keeping force_eager=1 and force_uncompiled=1."
                                                                     )
                                                                     force_eager = True
                                                                 else:
-                                                                    force_uncompiled = bool(prev_force_uncompiled)
+                                                                    force_uncompiled = bool(
+                                                                        prev_force_uncompiled
+                                                                    )
                                                 if (
                                                     (not collapse_switched_raw)
                                                     and bool(collapse_fallback_raw)
@@ -6941,47 +7810,106 @@ def infer(
                                                     _LOGGER.warning(
                                                         "[infer] collapse persisted; retrying this batch per-sample with calibrate_output=False (ENN_PRED_COLLAPSE_FALLBACK_RAW=1)."
                                                     )
-                                                    preds_fix2: torch.Tensor | None = None
+                                                    preds_fix2: torch.Tensor | None = (
+                                                        None
+                                                    )
                                                     for j in range(int(n_i)):
                                                         x1_buf.copy_(Xi[j : j + 1])
                                                         if dev_type == "cuda":
                                                             cudagraph_mark_step_begin()
-                                                        pj2 = _td_predict(x1_buf, calibrate_output=False)
+                                                        pj2 = _td_predict(
+                                                            x1_buf,
+                                                            calibrate_output=False,
+                                                        )
                                                         if dev_type == "cuda":
                                                             cudagraph_mark_step_end()
                                                         pj2_cpu = pj2.detach()
-                                                        if getattr(pj2_cpu.device, "type", None) != "cpu":
-                                                            pj2_cpu = pj2_cpu.to(device="cpu")
-                                                        with contextlib.suppress(Exception):
-                                                            pj2_cpu = pj2_cpu.contiguous()
+                                                        if (
+                                                            getattr(
+                                                                pj2_cpu.device,
+                                                                "type",
+                                                                None,
+                                                            )
+                                                            != "cpu"
+                                                        ):
+                                                            pj2_cpu = pj2_cpu.to(
+                                                                device="cpu"
+                                                            )
+                                                        with contextlib.suppress(
+                                                            Exception
+                                                        ):
+                                                            pj2_cpu = (
+                                                                pj2_cpu.contiguous()
+                                                            )
                                                         pj2_cpu = pj2_cpu.clone()
                                                         if preds_fix2 is None:
-                                                            preds_fix2 = pj2_cpu.new_empty(
-                                                                (int(n_i),) + tuple(pj2_cpu.shape[1:])
+                                                            preds_fix2 = (
+                                                                pj2_cpu.new_empty(
+                                                                    (int(n_i),)
+                                                                    + tuple(
+                                                                        pj2_cpu.shape[
+                                                                            1:
+                                                                        ]
+                                                                    )
+                                                                )
                                                             )
-                                                        preds_fix2[j : j + 1].copy_(pj2_cpu[:1])
+                                                        preds_fix2[j : j + 1].copy_(
+                                                            pj2_cpu[:1]
+                                                        )
                                                     if preds_fix2 is not None:
                                                         preds = preds_fix2
-                                                        with contextlib.suppress(Exception):
-                                                            if isinstance(preds, torch.Tensor) and (not preds.is_contiguous()):
-                                                                preds = preds.contiguous()
+                                                        with contextlib.suppress(
+                                                            Exception
+                                                        ):
+                                                            if isinstance(
+                                                                preds, torch.Tensor
+                                                            ) and (
+                                                                not preds.is_contiguous()
+                                                            ):
+                                                                preds = (
+                                                                    preds.contiguous()
+                                                                )
                                                         _LOGGER.warning(
                                                             "[infer] using calibrate_output=False per-sample predictions for output of this batch."
                                                         )
-                                                    if preds_fix2 is not None and int(preds_fix2.shape[0]) >= 2:
-                                                        is_like_raw, st_raw = _broadcast_like(
-                                                            preds_fix2[0],
-                                                            preds_fix2[1],
-                                                            atol=float(broadcast_atol),
+                                                    if (
+                                                        preds_fix2 is not None
+                                                        and int(preds_fix2.shape[0])
+                                                        >= 2
+                                                    ):
+                                                        is_like_raw, st_raw = (
+                                                            _broadcast_like(
+                                                                preds_fix2[0],
+                                                                preds_fix2[1],
+                                                                atol=float(
+                                                                    broadcast_atol
+                                                                ),
+                                                            )
                                                         )
-                                                        dy2 = float(st_raw.get("y_max", float("nan")))
+                                                        dy2 = float(
+                                                            st_raw.get(
+                                                                "y_max", float("nan")
+                                                            )
+                                                        )
                                                         _LOGGER.warning(
                                                             "[infer] calibrate_output=False sanity (this batch only): max|Y0-Y1|=%.6g match_frac=%.5f rel_mean=%.3e",
                                                             float(dy2),
-                                                            float(st_raw.get("y_match_frac", float("nan"))),
-                                                            float(st_raw.get("y_rel_mean", float("nan"))),
+                                                            float(
+                                                                st_raw.get(
+                                                                    "y_match_frac",
+                                                                    float("nan"),
+                                                                )
+                                                            ),
+                                                            float(
+                                                                st_raw.get(
+                                                                    "y_rel_mean",
+                                                                    float("nan"),
+                                                                )
+                                                            ),
                                                         )
-                                                        if bool(is_like_raw) and bool(collapse_abort):
+                                                        if bool(is_like_raw) and bool(
+                                                            collapse_abort
+                                                        ):
                                                             raise _InferCollapseAbort(
                                                                 "infer: collapse persisted even in calibrate_output=False path; "
                                                                 "this indicates a true model/preprocess collapse. "
@@ -6999,16 +7927,25 @@ def infer(
                         if rows_i.device.type == "cpu"
                         else rows_i.to(device="cpu")
                     )
-                    force_cpu_default = bool(use_async_write) and bool(dev_type in ("cuda", "xpu"))
-                    force_cpu = env_bool("ENN_PRED_FORCE_CPU_COPY", default=force_cpu_default)
+                    force_cpu_default = bool(use_async_write) and bool(
+                        dev_type in ("cuda", "xpu")
+                    )
+                    force_cpu = env_bool(
+                        "ENN_PRED_FORCE_CPU_COPY", default=force_cpu_default
+                    )
                     need_cpu_copy = bool(force_cpu) or bool(reuse_risk)
                     with contextlib.suppress(Exception):
                         rows_cpu = rows_cpu.clone()
                     if need_cpu_copy:
                         preds_cpu = preds.detach()
-                        if getattr(preds_cpu, "device", None) is not None and preds_cpu.device.type != "cpu":
+                        if (
+                            getattr(preds_cpu, "device", None) is not None
+                            and preds_cpu.device.type != "cpu"
+                        ):
                             preds_cpu = preds_cpu.to(device="cpu")
-                        if isinstance(preds_cpu, torch.Tensor) and (not preds_cpu.is_contiguous()):
+                        if isinstance(preds_cpu, torch.Tensor) and (
+                            not preds_cpu.is_contiguous()
+                        ):
                             preds_cpu = preds_cpu.contiguous()
                         with contextlib.suppress(Exception):
                             preds_cpu = preds_cpu.clone()
@@ -7017,9 +7954,7 @@ def infer(
                         if reuse_risk and getattr(preds.device, "type", None) == "cuda":
                             preds = preds.clone()
                         writer.append(rows_cpu, preds)
-                    appended_rows_total += int(
-                        getattr(preds, "shape", (0,))[0]
-                    )
+                    appended_rows_total += int(getattr(preds, "shape", (0,))[0])
                     del Xi, Xi_pad, rows_i, out, preds, rows_cpu
                     start = end
                 if torch_prof is not None:
@@ -7050,9 +7985,7 @@ def infer(
                     raise RuntimeError(
                         f"infer: prediction writer encountered an error: {type(err).__name__}: {err}"
                     ) from err
-                raise RuntimeError(
-                    "infer: prediction writer encountered an error"
-                )
+                raise RuntimeError("infer: prediction writer encountered an error")
         if status_bar is not None:
             status_bar.close()
         if exc_type is None:
@@ -7162,6 +8095,7 @@ def process(*args: Any, **kwargs: Any) -> object:
                 registered_signals.append(sig)
         except Exception:
             pass
+
     def _cleanup_on_success() -> None:
         for sig in registered_signals:
             with contextlib.suppress(Exception):
@@ -7271,11 +8205,19 @@ def process(*args: Any, **kwargs: Any) -> object:
         default=env_bool("ENN_SANITIZE_NAN_STRICT", default=False),
     )
     try:
-        cm_hint = os.environ.get("ENN_SERVE_COMPILE_MODE") or ops.cfg_dict.get("compile_mode") or "disabled"
+        cm_hint = (
+            os.environ.get("ENN_SERVE_COMPILE_MODE")
+            or ops.cfg_dict.get("compile_mode")
+            or "disabled"
+        )
         cm_hint = str(cm_hint).strip().lower()
-        if ops.mode != "train" and cm_hint not in ("disabled", "eager", "aot-eager") and env_bool(
-            ("ENN_PRED_UNIQUE_INDUCTOR_CACHE", "ENN_UNIQUE_INDUCTOR_CACHE"),
-            default=True,
+        if (
+            ops.mode != "train"
+            and cm_hint not in ("disabled", "eager", "aot-eager")
+            and env_bool(
+                ("ENN_PRED_UNIQUE_INDUCTOR_CACHE", "ENN_UNIQUE_INDUCTOR_CACHE"),
+                default=True,
+            )
         ):
             root = os.environ.get("TORCHINDUCTOR_CACHE_DIR")
             if not root:
@@ -7314,9 +8256,7 @@ def process(*args: Any, **kwargs: Any) -> object:
         backend = ProcessBroker.get_backend_type(device)
         ProcessBroker.configure_backend_env(backend, device)
         enable_tf32 = bool(getattr(ops, "enable_tf32", True))
-        ProcessBroker.init_process_group(
-            backend, device, local_rank=int(local_rank)
-        )
+        ProcessBroker.init_process_group(backend, device, local_rank=int(local_rank))
         cfg = coerce_model_config(
             ops.cfg_dict if isinstance(ops.cfg_dict, dict) else ops.cfg_dict
         )
@@ -7416,7 +8356,9 @@ def process(*args: Any, **kwargs: Any) -> object:
             autocast_dtype=precision.amp_float or param_dtype,
             enable_tf32=enable_tf32,
         )
-        fp8_quantize = env_bool(("ENN_MODEL_ENABLE_FP8_QUANTIZE", "ENN_ENABLE_FP8_QUANTIZE"), default=False)
+        fp8_quantize = env_bool(
+            ("ENN_MODEL_ENABLE_FP8_QUANTIZE", "ENN_ENABLE_FP8_QUANTIZE"), default=False
+        )
         fp8_enabled = False
         fp8_backend = None
         disable_note = None
@@ -7514,9 +8456,7 @@ def process(*args: Any, **kwargs: Any) -> object:
                     sync_module_states=True,
                 )
             except Exception as e:
-                _LOGGER.warning(
-                    f"HSDP2 wrapping fallback to root-only FSDP: {e}"
-                )
+                _LOGGER.warning(f"HSDP2 wrapping fallback to root-only FSDP: {e}")
                 model = to_hsdp_module(
                     model,
                     mesh=mesh,
@@ -7537,9 +8477,7 @@ def process(*args: Any, **kwargs: Any) -> object:
             and dist_policy.prefer_ddp
         )
         if dist_policy.sync_state:
-            distributed_sync(
-                _m_post, device=device, policy=dist_policy.collective
-            )
+            distributed_sync(_m_post, device=device, policy=dist_policy.collective)
         net_params = [p for p in model.parameters()]
         optimizer = AdamW.float(
             net_params,
@@ -7677,19 +8615,28 @@ def process(*args: Any, **kwargs: Any) -> object:
 
             calibration_loader = None
             try:
-                if raw_val_loader is not None and int(_get_batch_length(raw_val_loader)) > 0:
+                if (
+                    raw_val_loader is not None
+                    and int(_get_batch_length(raw_val_loader)) > 0
+                ):
                     calibration_loader = raw_val_loader
             except Exception:
                 calibration_loader = None
             if calibration_loader is None:
                 try:
-                    if raw_train_loader is not None and int(_get_batch_length(raw_train_loader)) > 0:
+                    if (
+                        raw_train_loader is not None
+                        and int(_get_batch_length(raw_train_loader)) > 0
+                    ):
                         calibration_loader = raw_train_loader
                 except Exception:
                     calibration_loader = None
             if calibration_loader is None:
                 try:
-                    if val_loader is not None and int(_get_batch_length(val_loader)) > 0:
+                    if (
+                        val_loader is not None
+                        and int(_get_batch_length(val_loader)) > 0
+                    ):
                         calibration_loader = val_loader
                 except Exception:
                     calibration_loader = None
@@ -7718,13 +8665,9 @@ def process(*args: Any, **kwargs: Any) -> object:
                 main_steps=main_steps,
                 emin=emin,
             )
-            sched = torch.optim.lr_scheduler.LambdaLR(
-                optimizer, lr_lambda=lr_lambda
-            )
+            sched = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
             scheduler_step_per_batch = True
-            tracked_module = (
-                model.module if hasattr(model, "module") else model
-            )
+            tracked_module = model.module if hasattr(model, "module") else model
             ema_helper = None
             swa_helper = None
             swa_start_epoch = int(total_epochs)
@@ -7738,9 +8681,7 @@ def process(*args: Any, **kwargs: Any) -> object:
                     _swa_env = os.environ.get("ENN_SWA_START_EPOCH")
                     if _swa_env is not None and str(_swa_env).strip() != "":
                         try:
-                            swa_start_epoch = max(
-                                0, int(str(_swa_env).strip())
-                            )
+                            swa_start_epoch = max(0, int(str(_swa_env).strip()))
                         except Exception:
                             swa_start_epoch = 0
                     swa_helper = StochasticWeightAverage(
@@ -7753,9 +8694,7 @@ def process(*args: Any, **kwargs: Any) -> object:
             amp_dtype = getattr(precision, "amp_float", None)
             compute_dtype = amp_dtype or param_dtype
             scaler = torch.amp.GradScaler(
-                enabled=bool(
-                    device.type == "cuda" and compute_dtype == torch.float16
-                )
+                enabled=bool(device.type == "cuda" and compute_dtype == torch.float16)
             )
             checkpointer: Checkpointer | None = None
             checkpoint_enabled = bool(getattr(ops, "checkpoint", True))
@@ -7853,9 +8792,7 @@ def process(*args: Any, **kwargs: Any) -> object:
         with contextlib.suppress(Exception):
             if int(local_rank) == 0 and getattr(ops, "ckpt_dir", None):
                 target = model.module if hasattr(model, "module") else model
-                _force_final_avg_update(
-                    ema_helper, swa_helper, target, optimizer
-                )
+                _force_final_avg_update(ema_helper, swa_helper, target, optimizer)
                 if (
                     swa_helper is not None
                     and has_bn
@@ -7865,20 +8802,14 @@ def process(*args: Any, **kwargs: Any) -> object:
                         dev = None
                         try:
                             p0 = next(
-                                (
-                                    p
-                                    for p in target.parameters()
-                                    if torch.is_tensor(p)
-                                ),
+                                (p for p in target.parameters() if torch.is_tensor(p)),
                                 None,
                             )
                             if torch.is_tensor(p0):
                                 dev = p0.device
                         except Exception:
                             dev = None
-                        fn = getattr(
-                            swa_helper, "apply_and_update_batch_norm", None
-                        )
+                        fn = getattr(swa_helper, "apply_and_update_batch_norm", None)
                         if callable(fn):
                             fn(train_loader, model=target, device=dev)
                     except Exception:
@@ -8026,15 +8957,19 @@ def process(*args: Any, **kwargs: Any) -> object:
                 autocast_dtype=precision.amp_float or param_dtype,
                 enable_tf32=enable_tf32,
             )
-        fp8_quantize = env_bool(("ENN_MODEL_ENABLE_FP8_QUANTIZE", "ENN_ENABLE_FP8_QUANTIZE"), default=False)
+        fp8_quantize = env_bool(
+            ("ENN_MODEL_ENABLE_FP8_QUANTIZE", "ENN_ENABLE_FP8_QUANTIZE"), default=False
+        )
         fp8_enabled = False
         fp8_backend = None
         disable_note = None
         if fp8_quantize:
             fp8_infer_ok, fp8_infer_reason = Dataset.is_float8_supported(device)
             if fp8_infer_ok:
-                model, fp8_enabled, fp8_backend = ModelPolicy.quantize_for_float8_prediction(
-                    model, metadata=metadata, logger=_float8_log
+                model, fp8_enabled, fp8_backend = (
+                    ModelPolicy.quantize_for_float8_prediction(
+                        model, metadata=metadata, logger=_float8_log
+                    )
                 )
                 if not fp8_enabled:
                     disable_note = fp8_backend or fp8_infer_reason
@@ -8071,9 +9006,7 @@ def process(*args: Any, **kwargs: Any) -> object:
         ).open()
         data_loader = session.training_loader
         chunk_dir = (
-            os.path.join(ops.ckpt_dir, "pred_chunks")
-            if ops.ckpt_dir or ""
-            else None
+            os.path.join(ops.ckpt_dir, "pred_chunks") if ops.ckpt_dir or "" else None
         )
         if chunk_dir and torch.distributed.get_rank() == 0:
             with contextlib.suppress(Exception):

@@ -34,7 +34,13 @@ from typing import (
 
 import torch
 from . import collate
-from ..core.concurrency import Disposable, Mutex, new_affinity, is_free_threading_build, is_gil_enabled
+from ..core.concurrency import (
+    Disposable,
+    Mutex,
+    is_free_threading_build,
+    is_gil_enabled,
+    new_affinity,
+)
 from ..core.datatypes import (
     PathLike,
     default_underflow_action,
@@ -233,7 +239,7 @@ def _is_lazy_tensor(x: Any) -> bool:
 def _feature_size_hint(obj: Any) -> Optional[int]:
     if isinstance(obj, torch.Tensor):
         return int(obj.numel()) if obj.ndim > 0 else 1
-    if isinstance(obj, (tuple, list)):
+    elif isinstance(obj, (tuple, list)):
         return len(obj)
     return None
 
@@ -755,9 +761,9 @@ def _set_batch_interval(
 def _is_source(obj: Any) -> bool:
     if not isinstance(obj, Mapping):
         return False
-    if "path" not in obj:
+    elif "path" not in obj:
         return False
-    if "format" not in obj and "kind" not in obj:
+    elif "format" not in obj and "kind" not in obj:
         return False
     p = obj.get("path")
     try:
@@ -810,7 +816,7 @@ def _fetch_auto_batch_size(
     worker_policy: WorkerPolicy,
     fallback: int,
 ) -> int:
-    candidates: List[int] = []
+    candidates: list[int] = []
     for ds in datasets.values():
         b_i, _ = _fetch_stream_batch(
             ds,
@@ -1210,7 +1216,7 @@ def fetch(
     )
     allocated = Disposable()
     scale_ctl = sampler_scale if sampler_scale is not None else Governor()
-    train_epochables: List[Any] = []
+    train_epochables: list[Any] = []
     specs = _fetch_normalize_sources(sources)
     spec_keys = list(specs.keys())
 
@@ -1356,7 +1362,7 @@ def preload_memmap(
     features_only: bool = False,
     default_label_shape: Tuple[int, ...] | None = None,
 ) -> None:
-    del args
+    _ = args
     if not isinstance(data, Mapping):
         raise TypeError(
             "preload_memmap expects a Mapping with at least 'features'"

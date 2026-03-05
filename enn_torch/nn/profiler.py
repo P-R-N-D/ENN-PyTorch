@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import contextlib
 import contextvars
+from collections import deque
 import logging
 import math
 import os
@@ -12,8 +13,9 @@ from types import TracebackType
 from typing import Any, Callable, Dict, List, Optional, Self, Sequence, Tuple
 
 import torch
-from ..core.datatypes import env_bool, env_int
 from torch import nn
+
+from ..core.datatypes import env_bool, env_int
 try:
     from torch.utils._python_dispatch import TorchDispatchMode
 except Exception:
@@ -47,6 +49,17 @@ _ACT_COEFF: Dict[type, float] = {
 }
 _ACT_CLASSES: Tuple[type, ...] = tuple(_ACT_COEFF.keys())
 _LOGGER = logging.getLogger(__name__)
+_ATEN_OVERLOAD_NAMES: Tuple[str, ...] = (
+    "Tensor",
+    "Scalar",
+    "default",
+    "self",
+    "ScalarSelf",
+    "ScalarOther",
+    "Tensor_out",
+    "Scalar_out",
+    "self_out",
+)
 
 
 def get_torch_profiler(
@@ -74,17 +87,18 @@ def get_torch_profiler(
     except Exception:
         dev = torch.device("cpu")
     activities = [tp.ProfilerActivity.CPU]
-    if dev.type == "cuda":
-        with contextlib.suppress(Exception):
-            activities.append(tp.ProfilerActivity.CUDA)
-    elif dev.type == "xpu":
-        with contextlib.suppress(Exception):
-            activities.append(getattr(tp.ProfilerActivity, "XPU"))
-    elif dev.type == "mps":
-        with contextlib.suppress(Exception):
-            mps_act = getattr(tp.ProfilerActivity, "MPS", None)
-            if mps_act is not None:
-                activities.append(mps_act)
+    match dev.type:
+        case "cuda":
+            with contextlib.suppress(Exception):
+                activities.append(tp.ProfilerActivity.CUDA)
+        case "xpu":
+            with contextlib.suppress(Exception):
+                activities.append(getattr(tp.ProfilerActivity, "XPU"))
+        case "mps":
+            with contextlib.suppress(Exception):
+                mps_act = getattr(tp.ProfilerActivity, "MPS", None)
+                if mps_act is not None:
+                    activities.append(mps_act)
 
     wait = max(0, int(env_int("ENN_TORCH_PROFILE_WAIT", 0)))
     warmup = max(0, int(env_int("ENN_TORCH_PROFILE_WARMUP", 2)))
@@ -183,14 +197,14 @@ def log_profiler_summary(
 def _float_safe(x: Any, default: float = 0.0) -> float:
     try:
         return v if (v := float(x)) == v else default
-    except:
+    except (TypeError, ValueError):
         return default
 
 
 def _int_safe(x: Any, default: int = 0) -> int:
     try:
         return int(x)
-    except:
+    except (TypeError, ValueError):
         return default
 
 
@@ -224,13 +238,14 @@ def _coerce_tensor_sequence(
     args: Tuple[Any, ...], max_n: int = 4
 ) -> List[torch.Tensor]:
     out: List[torch.Tensor] = []
-    for a in args:
-        if isinstance(a, torch.Tensor):
-            out.append(a)
-        elif isinstance(a, (tuple, list)):
-            out.extend(v for v in a if isinstance(v, torch.Tensor))
-        if len(out) >= max_n:
-            return out[:max_n]
+    queue: deque[Any] = deque(args)
+    while queue and len(out) < max_n:
+        cur = queue.popleft()
+        if isinstance(cur, torch.Tensor):
+            out.append(cur)
+            continue
+        if isinstance(cur, (tuple, list)):
+            queue.extendleft(reversed(cur))
     return out
 
 
@@ -254,16 +269,17 @@ def _infer_bhsd_shape(shape: Tuple[int, ...]) -> Tuple[int, int, int, int]:
 
 def _te_layernormmlp_name_score(name: str, for_w2: bool) -> int:
     s = name.lower()
-    if for_w2:
-        if "fc2" in s or "w2" in s or "linear2" in s or "dense_4h_to_h" in s:
-            return 3
-        if "out" in s or "proj" in s:
-            return 2
-    else:
-        if "fc1" in s or "w1" in s or "linear1" in s or "dense_h_to_4h" in s:
-            return 3
-        if "in" in s or "qkv" in s:
-            return 2
+    match for_w2:
+        case True:
+            if "fc2" in s or "w2" in s or "linear2" in s or "dense_4h_to_h" in s:
+                return 3
+            if "out" in s or "proj" in s:
+                return 2
+        case False:
+            if "fc1" in s or "w1" in s or "linear1" in s or "dense_h_to_4h" in s:
+                return 3
+            if "in" in s or "qkv" in s:
+                return 2
     return 1
 
 
@@ -276,25 +292,13 @@ def _register_op_handler(
 
 def _aten_ops_from(aten: Any, base: str) -> List[Any]:
     ops: List[Any] = []
-    obj = getattr(aten, base, None)
-    obj_ = getattr(aten, base + "_", None)
-    for pobj in (obj, obj_):
-        if pobj is None:
+    for packet in (getattr(aten, base, None), getattr(aten, base + "_", None)):
+        if packet is None:
             continue
-        for o in (
-            "Tensor",
-            "Scalar",
-            "default",
-            "self",
-            "ScalarSelf",
-            "ScalarOther",
-            "Tensor_out",
-            "Scalar_out",
-            "self_out",
-        ):
-            f = getattr(pobj, o, None)
-            if f is not None:
-                ops.append(f)
+        for overload in _ATEN_OVERLOAD_NAMES:
+            op = getattr(packet, overload, None)
+            if op is not None:
+                ops.append(op)
     return ops
 
 
@@ -1090,7 +1094,7 @@ def _meta_shape(meta: Any) -> Optional[Tuple[int, ...]]:
             if meta is not None and getattr(meta, "shape", None)
             else None
         )
-    except:
+    except (TypeError, ValueError, AttributeError):
         return None
 
 

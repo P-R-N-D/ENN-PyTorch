@@ -124,6 +124,50 @@ def _embedding_from_meta(
     return Embedding.from_spec(spec, in_dim=int(in_dim))
 
 
+def new_embedding(
+    in_dim: int,
+    *args: Any,
+    embedding: Embedding | Mapping[str, Any] | None = None,
+    meta: Mapping[str, Any] | None = None,
+    **kwargs: Any,
+) -> Embedding | None:
+    _ = (args, kwargs)
+    if isinstance(embedding, Embedding):
+        return embedding
+    if isinstance(embedding, Mapping):
+        return Embedding.from_spec(dict(embedding), in_dim=int(in_dim))
+    return _embedding_from_meta(meta, in_dim=int(in_dim))
+
+
+def load_embedding(
+    in_dim: int,
+    *args: Any,
+    meta: Mapping[str, Any] | None = None,
+    side_meta: Mapping[str, Any] | None = None,
+    **kwargs: Any,
+) -> Embedding | None:
+    _ = (args, kwargs)
+    emb = _embedding_from_meta(meta, in_dim=int(in_dim))
+    if emb is not None:
+        return emb
+    return _embedding_from_meta(side_meta, in_dim=int(in_dim))
+
+
+def save_embedding(
+    model: torch.nn.Module,
+    *args: Any,
+    extra: Mapping[str, object] | None = None,
+    **kwargs: Any,
+) -> dict[str, Any]:
+    _ = (args, kwargs)
+    merged: dict[str, Any] = dict(extra or {})
+    base = model.module if isinstance(getattr(model, "module", None), torch.nn.Module) else model
+    emb_spec = _embedding_to_spec(getattr(base, "embedding", None))
+    if emb_spec is not None:
+        merged["embedding"] = emb_spec
+    return merged
+
+
 def _rewrite_state_dict_key(k: str) -> str:
     if k.startswith("module."):
         return k[len("module.") :]
@@ -502,24 +546,27 @@ def _coerce_scaler_buffers_to_shape(
     def _make_new_1d_like(src: torch.Tensor, n: int) -> torch.Tensor:
         return src.detach().reshape(-1).new_empty((int(n),))
 
-    def _fill_tail(dst: torch.Tensor, src_flat: torch.Tensor, start: int, mode: str) -> None:
+    def _fill_tail(
+        dst: torch.Tensor, src_flat: torch.Tensor, start: int, mode: str
+    ) -> None:
         if start >= dst.numel():
-            return
-        if mode == "zero":
-            dst[start:] = 0
             return
         if src_flat.numel() <= 0:
             dst[start:] = 0
             return
-        if mode == "mean":
-            dst[start:] = src_flat.mean()
-            return
-        if mode == "tile":
-            reps = int((dst.numel() + src_flat.numel() - 1) // src_flat.numel())
-            tiled = src_flat.repeat(reps)[: dst.numel()]
-            dst[start:] = tiled[start:]
-            return
-        dst[start:] = src_flat[-1]
+        match mode:
+            case "zero":
+                dst[start:] = 0
+            case "mean":
+                dst[start:] = src_flat.mean()
+            case "tile":
+                reps = int(
+                    (dst.numel() + src_flat.numel() - 1) // src_flat.numel()
+                )
+                tiled = src_flat.repeat(reps)[: dst.numel()]
+                dst[start:] = tiled[start:]
+            case _:
+                dst[start:] = src_flat[-1]
 
     def _coerce_one(
         module: Scaler,
@@ -1379,9 +1426,7 @@ def _write_model_meta_json(model: torch.nn.Module, out_dir: PathLike) -> None:
     if callable(ts_fn):
         with contextlib.suppress(Exception):
             meta_payload["tasks"] = ts_fn()
-    emb_spec = _embedding_to_spec(getattr(base, "embedding", None))
-    if emb_spec is not None:
-        meta_payload["embedding"] = emb_spec
+    meta_payload = save_embedding(base, extra=meta_payload)
     collate.write_json(os.path.join(out_dir, "model.meta.json"), meta_payload, indent=2)
     collate.write_json(os.path.join(out_dir, "meta.json"), meta_payload, indent=2)
 
@@ -1824,15 +1869,17 @@ def _to_torch_dtype(dt: object) -> Optional[torch.dtype]:
         if dt is None:
             return None
         ndt = numpy.dtype(dt)
-        if ndt == numpy.float64:
-            return torch.float64
-        if ndt == numpy.float32:
-            return torch.float32
-        if ndt == numpy.float16:
-            return torch.float16
+        match ndt:
+            case numpy.float64:
+                return torch.float64
+            case numpy.float32:
+                return torch.float32
+            case numpy.float16:
+                return torch.float16
+            case _:
+                return None
     except Exception:
         return None
-    return None
 
 
 def _get_float_precision(obj: object) -> torch.dtype:
@@ -1891,15 +1938,23 @@ def new_model(
     in_dim: int,
     out_shape: Sequence[int],
     config: ModelConfig | Mapping[str, object] | None,
-    *,
-    embedding: Embedding | None = None,
+    *args: Any,
+    embedding: Embedding | Mapping[str, Any] | None = None,
+    meta: Mapping[str, Any] | None = None,
+    **kwargs: Any,
 ) -> Model:
+    _ = (args, kwargs)
     cfg = coerce_model_config(config)
+    resolved_embedding = new_embedding(
+        int(in_dim),
+        embedding=embedding,
+        meta=meta,
+    )
     core = Model(
         in_dim,
         tuple((int(x) for x in out_shape)),
         config=cfg,
-        embedding=embedding,
+        embedding=resolved_embedding,
     )
     return core
 
@@ -2006,12 +2061,13 @@ def load_weights(
             "pip install 'enn-torch[safetensors]'  # or: pip install safetensors",
         )
         from safetensors.torch import load_file as load_tensors
-        if map_location is None:
-            dev = "cpu"
-        elif isinstance(map_location, torch.device):
-            dev = str(map_location)
-        else:
-            dev = str(map_location)
+        match map_location:
+            case None:
+                dev = "cpu"
+            case torch.device():
+                dev = str(map_location)
+            case _:
+                dev = str(map_location)
         sd = load_tensors(str(p), device=dev)
         sd = _coerce_state_dict(sd)
         sd = _drop_runtime_only_state_keys(sd)
@@ -2422,7 +2478,7 @@ def load_model(
             raise ValueError(
                 "Loading from a checkpoint directory requires in_dim and out_shape, or a valid meta.json inside the directory."
             )
-        use_embedding = _embedding_from_meta(meta, in_dim=use_in_dim)
+        use_embedding = load_embedding(use_in_dim, meta=meta)
         model = new_model(use_in_dim, use_out_shape, use_config, embedding=use_embedding)
         if _model_has_meta_or_fake_tensors(model):
             _materialize_module_to_device(model, load_dev)
@@ -2514,7 +2570,7 @@ def load_model(
             raise RuntimeError(
                 f"Invalid in_dim/out_shape metadata in {str(meta_path)!r}: in_dim={use_in_dim}, out_shape={use_out_shape}"
             )
-        use_embedding = _embedding_from_meta(meta, in_dim=use_in_dim)
+        use_embedding = load_embedding(use_in_dim, meta=meta)
         model = new_model(use_in_dim, use_out_shape, use_config, embedding=use_embedding)
         with contextlib.suppress(Exception):
             tasks = meta.get("tasks") if isinstance(meta, dict) else None
@@ -2527,12 +2583,13 @@ def load_model(
         from safetensors.torch import load_file as load_tensors
 
         dev = None
-        if map_location is None:
-            dev = "cpu"
-        elif isinstance(map_location, torch.device):
-            dev = str(map_location)
-        else:
-            dev = str(map_location)
+        match map_location:
+            case None:
+                dev = "cpu"
+            case torch.device():
+                dev = str(map_location)
+            case _:
+                dev = str(map_location)
         sd = load_tensors(str(p), device=dev)
         sd = _coerce_state_dict(sd)
         resize_scaler_buffer(model, sd)
@@ -2607,9 +2664,11 @@ def load_model(
         raise RuntimeError(
             f"Invalid or missing in_dim/out_shape when loading checkpoint {str(p)!r}: in_dim={use_in_dim}, out_shape={use_out_shape}"
         )
-    use_embedding = _embedding_from_meta(obj if isinstance(obj, Mapping) else None, in_dim=use_in_dim)
-    if use_embedding is None:
-        use_embedding = _embedding_from_meta(side_meta, in_dim=use_in_dim)
+    use_embedding = load_embedding(
+        use_in_dim,
+        meta=obj if isinstance(obj, Mapping) else None,
+        side_meta=side_meta,
+    )
     model = new_model(use_in_dim, use_out_shape, use_config, embedding=use_embedding)
     with contextlib.suppress(Exception):
         tasks = obj.get("tasks") if isinstance(obj, dict) else None
@@ -2649,7 +2708,7 @@ def save_model(
             raise TypeError(
                 "Positional args are only supported for export converters; use keyword arguments for TorchIO.save()."
             )
-        merged_extra = dict(extra or {})
+        merged_extra = save_embedding(model, extra=extra)
         if ema_averager is not None and hasattr(ema_averager, "state_dict"):
             with contextlib.suppress(Exception):
                 merged_extra["ema_averager_state"] = ema_averager.state_dict()
@@ -3189,7 +3248,7 @@ def predict(
                 os.fspath(out_path), out_shape=out_shape
             )
             return PersistentTensorDict(filename=out_path, mode="r")
-        if overwrite_mode == "error":
+        elif overwrite_mode == "error":
             raise FileExistsError(
                 f"predict: destination already exists: {out_path!r}"
             )

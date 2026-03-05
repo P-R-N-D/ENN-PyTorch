@@ -11,6 +11,7 @@ from typing import Any, Iterator, TypeVar
 
 import torch
 from .system import is_pin_supported
+
 try:
     import torch._dynamo as _dynamo
 except Exception:
@@ -174,9 +175,11 @@ def enable_meta_monitor(model: object) -> None:
 
 
 def validate_no_fake_dtensor(
-    root: object, *args: object, **kwargs: object
+    root: object,
+    *args: Any,
+    **kwargs: Any,
 ) -> None:
-    del args, kwargs
+    _ = args, kwargs
     try:
         import torch.nn as nn
     except Exception:
@@ -208,6 +211,7 @@ def coerce_tensor(
     materialize_meta: bool = True,
     make_contiguous: bool = True,
 ) -> object:
+    _ = args
     if isinstance(value, torch.Tensor):
         t = value.to_local() if hasattr(value, "to_local") else value
         if materialize_meta and is_meta_or_fake_tensor(t):
@@ -415,11 +419,11 @@ def to_device_recursive(obj: object, dev: object) -> object:
             return obj.to(device=dev, non_blocking=non_blocking)
         except TypeError:
             return obj.to(device=dev)
-    if isinstance(obj, TensorDictBase):
+    elif isinstance(obj, TensorDictBase):
         return obj.to(device=dev)
-    if isinstance(obj, Mapping):
+    elif isinstance(obj, Mapping):
         return {k: to_device_recursive(v, dev) for k, v in obj.items()}
-    if isinstance(obj, (list, tuple)):
+    elif isinstance(obj, (list, tuple)):
         seq = [to_device_recursive(v, dev) for v in obj]
         return type(obj)(seq)
     return obj
@@ -429,18 +433,17 @@ def touch_tensors(obj: object) -> None:
     if isinstance(obj, torch.Tensor):
         _ = obj.sum()
         return
-    if isinstance(obj, TensorDictBase):
-        for v in obj.values():
-            touch_tensors(v)
+    elif isinstance(obj, TensorDictBase):
+        for value in obj.values():
+            touch_tensors(value)
         return
-    if isinstance(obj, Mapping):
-        for v in obj.values():
-            touch_tensors(v)
+    elif isinstance(obj, Mapping):
+        for value in obj.values():
+            touch_tensors(value)
         return
-    if isinstance(obj, (list, tuple)):
-        for v in obj:
-            touch_tensors(v)
-        return
+    elif isinstance(obj, (list, tuple)):
+        for value in obj:
+            touch_tensors(value)
 
 
 def compute_batch_bytes_per_sample(obj: object) -> tuple[int | None, int]:
@@ -462,11 +465,11 @@ def compute_batch_bytes_per_sample(obj: object) -> tuple[int | None, int]:
                 one = o.reshape(1, -1)
             bytes_per_sample += int(one.nelement()) * int(one.element_size())
         elif isinstance(o, TensorDictBase):
-            stack.extend(list(o.values()))
+            stack.extend(o.values())
         elif isinstance(o, Mapping):
-            stack.extend(list(o.values()))
+            stack.extend(o.values())
         elif isinstance(o, (list, tuple)):
-            stack.extend(list(o))
+            stack.extend(o)
 
     if bytes_per_sample <= 0:
         return (None, 0)

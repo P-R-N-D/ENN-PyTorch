@@ -159,31 +159,35 @@ class WorkerPolicy:
     def _device_count_for_type(dev_type: str) -> int:
         dt = str(dev_type or "cpu").strip().lower()
         try:
-            if dt == "cuda":
-                if torch.cuda.is_available():
-                    return int(torch.cuda.device_count())
-                return 0
-            if dt == "xpu":
-                xpu = getattr(torch, "xpu", None)
-                if (
-                    xpu is not None
-                    and callable(getattr(xpu, "is_available", None))
-                    and xpu.is_available()
-                ):
-                    return int(getattr(xpu, "device_count", lambda: 1)())
-                return 0
-            if dt == "mps":
-                mps_backend = getattr(torch.backends, "mps", None)
-                if (
-                    mps_backend is not None
-                    and callable(getattr(mps_backend, "is_available", None))
-                    and mps_backend.is_available()
-                ):
-                    return 1
-                return 0
+            match dt:
+                case "cuda":
+                    return (
+                        int(torch.cuda.device_count())
+                        if torch.cuda.is_available()
+                        else 0
+                    )
+                case "xpu":
+                    xpu = getattr(torch, "xpu", None)
+                    if (
+                        xpu is not None
+                        and callable(getattr(xpu, "is_available", None))
+                        and xpu.is_available()
+                    ):
+                        return int(getattr(xpu, "device_count", lambda: 1)())
+                    return 0
+                case "mps":
+                    mps_backend = getattr(torch.backends, "mps", None)
+                    if (
+                        mps_backend is not None
+                        and callable(getattr(mps_backend, "is_available", None))
+                        and mps_backend.is_available()
+                    ):
+                        return 1
+                    return 0
+                case _:
+                    return 0
         except Exception:
             return 0
-        return 0
 
     @classmethod
     def optimize(
@@ -379,25 +383,27 @@ class WorkerPolicy:
             )
         soft_inflight = max(1, min(int(soft_inflight), int(thread_cap)))
         if is_accel:
-            if eff_cores <= 4:
-                model_ratio = 1.00
-            elif eff_cores <= 8:
-                model_ratio = 0.90
-            elif eff_cores <= 16:
-                model_ratio = 0.80
-            elif eff_cores <= 32:
-                model_ratio = 0.70
-            else:
-                model_ratio = 0.60
+            match eff_cores:
+                case cores if cores <= 4:
+                    model_ratio = 1.00
+                case cores if cores <= 8:
+                    model_ratio = 0.90
+                case cores if cores <= 16:
+                    model_ratio = 0.80
+                case cores if cores <= 32:
+                    model_ratio = 0.70
+                case _:
+                    model_ratio = 0.60
         else:
-            if eff_cores <= 4:
-                model_ratio = 1.00
-            elif eff_cores <= 8:
-                model_ratio = 0.95
-            elif eff_cores <= 16:
-                model_ratio = 0.90
-            else:
-                model_ratio = 0.85
+            match eff_cores:
+                case cores if cores <= 4:
+                    model_ratio = 1.00
+                case cores if cores <= 8:
+                    model_ratio = 0.95
+                case cores if cores <= 16:
+                    model_ratio = 0.90
+                case _:
+                    model_ratio = 0.85
         with contextlib.suppress(Exception):
             env_key = (
                 "ENN_MODEL_CORE_RATIO_ACCEL"
@@ -703,6 +709,7 @@ class BatchPolicy:
         budget_min_bytes: int,
         budget_max_bytes: Optional[int],
     ) -> int:
+        _ = args
         total = int(total_bytes) if total_bytes is not None else 0
         ratio = float(budget_ratio or 0.0)
         base = int(float(total) * ratio) if total > 0 and ratio > 0.0 else 0

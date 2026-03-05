@@ -2,8 +2,8 @@
 from __future__ import annotations
 
 import contextlib
-import math
 import logging
+import math
 import os
 import uuid
 import warnings
@@ -27,7 +27,6 @@ from ..core.compat import StochasticDepth
 from ..core.concurrency import Mutex
 from ..core.datatypes import env_bool, env_float, env_int
 from ..core.policies import ATTENTION_POLICY, AttentionBackend
-from .activations import GeGLU
 from .graph import (
     is_checkpoint,
     is_compiling,
@@ -131,11 +130,9 @@ def _tensor_stats(
 
 
 def resize_scaler_buffer(model: nn.Module, state: Mapping[str, Any]) -> None:
-    scaler: Optional[Scaler] = None
-    for module in model.modules():
-        if isinstance(module, Scaler):
-            scaler = module
-            break
+    scaler = next(
+        (module for module in model.modules() if isinstance(module, Scaler)), None
+    )
     if scaler is None:
         return
     view: Mapping[str, Any]
@@ -385,22 +382,33 @@ def _coerce_attn_bias_to_bk(
     attn_bias: torch.Tensor, *, B: int, K: int, like: torch.Tensor
 ) -> torch.Tensor:
     t = attn_bias
-    if t.dim() == 4:
-        if int(t.shape[-1]) != int(K):
-            raise RuntimeError(f"attn_bias K mismatch: {tuple(t.shape)} vs K={int(K)}")
-        b0 = int(t.shape[0])
-        if b0 not in (1, int(B)):
-            raise RuntimeError(f"attn_bias B mismatch: {tuple(t.shape)} vs B={int(B)}")
-        t = t.reshape(b0, int(K))
-    elif t.dim() == 2:
-        if int(t.shape[1]) != int(K) or int(t.shape[0]) not in (1, int(B)):
-            raise RuntimeError(f"attn_bias shape mismatch: {tuple(t.shape)} vs (1|B,K)=({int(B)},{int(K)})")
-    elif t.dim() == 1:
-        if int(t.numel()) != int(K):
-            raise RuntimeError(f"attn_bias len mismatch: {int(t.numel())} vs K={int(K)}")
-        t = t.view(1, int(K))
-    else:
-        raise RuntimeError(f"Unsupported attn_bias rank {int(t.dim())}: {tuple(t.shape)}")
+    match t.dim():
+        case 4:
+            if int(t.shape[-1]) != int(K):
+                raise RuntimeError(
+                    f"attn_bias K mismatch: {tuple(t.shape)} vs K={int(K)}"
+                )
+            b0 = int(t.shape[0])
+            if b0 not in (1, int(B)):
+                raise RuntimeError(
+                    f"attn_bias B mismatch: {tuple(t.shape)} vs B={int(B)}"
+                )
+            t = t.reshape(b0, int(K))
+        case 2:
+            if int(t.shape[1]) != int(K) or int(t.shape[0]) not in (1, int(B)):
+                raise RuntimeError(
+                    f"attn_bias shape mismatch: {tuple(t.shape)} vs (1|B,K)=({int(B)},{int(K)})"
+                )
+        case 1:
+            if int(t.numel()) != int(K):
+                raise RuntimeError(
+                    f"attn_bias len mismatch: {int(t.numel())} vs K={int(K)}"
+                )
+            t = t.view(1, int(K))
+        case _:
+            raise RuntimeError(
+                f"Unsupported attn_bias rank {int(t.dim())}: {tuple(t.shape)}"
+            )
 
     return t.to(device=like.device, dtype=like.dtype, non_blocking=True).contiguous()
 
@@ -426,14 +434,15 @@ def _coerce_attn_bias_to_b11k(
             .contiguous()
         )
 
-    if t.dim() == 2:
-        t2 = t
-    elif t.dim() == 1:
-        t2 = t.reshape(1, t.shape[0])
-    else:
-        raise RuntimeError(
-            f"Unsupported attn_bias rank {int(t.dim())}: {tuple(t.shape)}"
-        )
+    match t.dim():
+        case 2:
+            t2 = t
+        case 1:
+            t2 = t.reshape(1, t.shape[0])
+        case _:
+            raise RuntimeError(
+                f"Unsupported attn_bias rank {int(t.dim())}: {tuple(t.shape)}"
+            )
 
     if not exporting:
         if int(t2.shape[1]) != int(K) or int(t2.shape[0]) not in (1, int(B)):
@@ -457,7 +466,7 @@ class Retention(nn.Module):
         **kwargs: Any,
     ) -> None:
         super().__init__()
-        del args, kwargs
+        _ = (args, kwargs)
         self.msr = MultiScaleRetention(d_model, nhead)
         self.mode = str(mode or "temporal").strip().lower()
 
@@ -466,20 +475,22 @@ class Retention(nn.Module):
         if mode is None:
             return "temporal"
         m = str(mode).strip().lower()
-        if m in ("t", "temporal", "time", "causal"):
-            return "temporal"
-        if m in (
-            "s",
-            "spatial",
-            "space",
-            "bi",
-            "bidir",
-            "bidirectional",
-            "noncausal",
-            "non-causal",
-        ):
-            return "spatial"
-        return m
+        match m:
+            case "t" | "temporal" | "time" | "causal":
+                return "temporal"
+            case (
+                "s"
+                | "spatial"
+                | "space"
+                | "bi"
+                | "bidir"
+                | "bidirectional"
+                | "noncausal"
+                | "non-causal"
+            ):
+                return "spatial"
+            case _:
+                return m
 
     def _forward_bidirectional(
         self: Self, x: torch.Tensor, attn_mask: Optional[torch.Tensor] = None
@@ -616,14 +627,15 @@ class DilatedAttention(nn.Module):
         if mlp_ratio is not None:
             ffn_ratio = mlp_ratio
         hidden = int(self.embed_dim * float(ffn_ratio))
-        if activation.lower() == "gelu":
-            act = nn.GELU()
-        elif activation.lower() == "silu":
-            act = nn.SiLU()
-        elif activation.lower() == "relu":
-            act = nn.ReLU()
-        else:
-            raise ValueError(f"Unsupported activation: {activation}")
+        match activation.lower():
+            case "gelu":
+                act = nn.GELU()
+            case "silu":
+                act = nn.SiLU()
+            case "relu":
+                act = nn.ReLU()
+            case _:
+                raise ValueError(f"Unsupported activation: {activation}")
         self.ffn = nn.Sequential(
             nn.Linear(self.embed_dim, hidden, bias=bias),
             act,
@@ -1051,7 +1063,7 @@ class CrossAttention(nn.Module):
         **kwargs: Any,
     ) -> None:
         super().__init__()
-        del args, kwargs
+        _ = (args, kwargs)
         self.d_model = int(d_model)
         self.nhead = int(nhead)
         if self.d_model % max(1, self.nhead) != 0:
@@ -1576,7 +1588,7 @@ class LatentAttention(nn.Module):
         **kwargs: Any,
     ) -> None:
         super().__init__()
-        del args, kwargs
+        _ = (args, kwargs)
         if d_model % nhead != 0:
             raise ValueError(
                 f"d_model ({d_model}) must be divisible by nhead ({nhead})"

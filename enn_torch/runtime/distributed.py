@@ -1,9 +1,7 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
-import tempfile
 import contextlib
-import sys
 import ctypes
 import dataclasses
 import gc
@@ -18,18 +16,27 @@ import random
 import re
 import shutil
 import socket
+import sys
+import tempfile
 import threading
 import time
 import warnings
 from collections import deque
 from contextlib import AbstractContextManager
 from pathlib import Path
-from typing import Any, Callable, Iterable, Mapping
+from typing import Any, Callable, Iterable, Mapping, Optional
 
 import torch
 import torch.distributed as dist
 from ..core.concurrency import Mutex, is_gil_enabled
-from ..core.datatypes import PathLike, env_bool, env_int, sanitize_single_line, save_temp, write_json
+from ..core.datatypes import (
+    PathLike,
+    env_bool,
+    env_int,
+    sanitize_single_line,
+    save_temp,
+    write_json,
+)
 from ..core.system import (
     CPU,
     Memory,
@@ -420,41 +427,46 @@ if env_bool("ENN_SUPPRESS_TYPEDSTORAGE_WARNING", default=True):
         os.environ["PYTHONWARNINGS"] = f"{_w},{_rule}"
 
 
-def _atomic_create_json(path, payload: dict) -> bool:
+def _atomic_create_json(
+    path: str | os.PathLike[str], payload: Mapping[str, Any]
+) -> bool:
+    path_obj = Path(path)
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
+        path_obj.parent.mkdir(parents=True, exist_ok=True)
     except Exception:
         pass
     try:
-        with open(path, "x", encoding="utf-8") as f:
+        with open(path_obj, "x", encoding="utf-8") as f:
             json.dump(payload, f)
         return True
     except FileExistsError:
         return False
     except Exception:
         with contextlib.suppress(Exception):
-            if path.exists():
-                path.unlink()
+            if path_obj.exists():
+                path_obj.unlink()
         return False
 
 
-def _safe_rmtree(path) -> None:
-    shutil.rmtree(path, ignore_errors=True)
+def _safe_rmtree(path: str | os.PathLike[str]) -> None:
+    path_obj = Path(path)
+    shutil.rmtree(path_obj, ignore_errors=True)
     try:
-        if not path.exists():
+        if not path_obj.exists():
             return
     except Exception:
         return
     ts = int(time.time())
-    dp = path.with_name(f"{path.name}.delete_pending.{ts}")
+    dp = path_obj.with_name(f"{path_obj.name}.delete_pending.{ts}")
     with contextlib.suppress(Exception):
-        path.rename(dp)
+        path_obj.rename(dp)
     shutil.rmtree(dp, ignore_errors=True)
 
 
-def _cleanup_delete_pending(root) -> None:
+def _cleanup_delete_pending(root: str | os.PathLike[str]) -> None:
+    root_path = Path(root)
     with contextlib.suppress(Exception):
-        for p in root.glob("*.delete_pending.*"):
+        for p in root_path.glob("*.delete_pending.*"):
             _safe_rmtree(p)
 
 
@@ -591,7 +603,7 @@ def _from_hsdp_module(module: torch.nn.Module) -> None:
             wait := getattr(handle, "wait", None)
         ):
             wait()
-    except:
+    except Exception:
         pass
 
 
@@ -608,7 +620,7 @@ def _is_ip_addr(value: str) -> bool:
     try:
         ipaddress.ip_address(_coerce_ip_addr(value))
         return True
-    except:
+    except Exception:
         return False
 
 
@@ -624,8 +636,13 @@ def _canonize_ip(
             ip.is_link_local and not link_local
         ):
             return None
-        return f"{ip.compressed}{'%' + value.partition('%')[2] if '%' in str(value) and ip.version == 6 else ''}"
-    except:
+        zone = (
+            "%" + value.partition("%")[2]
+            if "%" in str(value) and ip.version == 6
+            else ""
+        )
+        return f"{ip.compressed}{zone}"
+    except Exception:
         return None
 
 
@@ -641,7 +658,7 @@ def _format_endpoint(host: str, port: int) -> str:
             and ":" in h
             else h
         )
-    except:
+    except Exception:
         pass
     return f"{h}:{p}"
 
@@ -715,7 +732,7 @@ def _get_preferred_ip_cached(
                 continue
             try:
                 ip = ipaddress.ip_address(_coerce_ip_addr(canon))
-            except:
+            except Exception:
                 continue
             if ip.is_unspecified:
                 continue
@@ -760,13 +777,15 @@ def _hsdp_supported_params() -> set[str]:
 
 def _accel_backend_for_device(device: torch.device) -> str | None:
     dt = str(getattr(device, "type", "cpu") or "cpu").strip().lower()
-    if dt == "cuda":
-        return "nccl"
-    if dt == "xpu":
-        return "xccl"
-    if dt in {"hpu", "npu"}:
-        return "hccl"
-    return None
+    match dt:
+        case "cuda":
+            return "nccl"
+        case "xpu":
+            return "xccl"
+        case "hpu" | "npu":
+            return "hccl"
+        case _:
+            return None
 
 
 _CPU_GROUP: ProcessGroup | None = None

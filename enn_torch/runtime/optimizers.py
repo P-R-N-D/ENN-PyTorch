@@ -2,8 +2,8 @@
 from __future__ import annotations
 
 import contextlib
-import inspect
 import importlib.util
+import inspect
 import json
 import logging
 import math
@@ -65,9 +65,10 @@ def _log_optimizer(
     *args: Any,
     level: str = "info",
 ) -> None:
-    if logger is None and not _LOGGER.isEnabledFor(
-        logging.DEBUG if str(level).lower() == "debug" else logging.INFO
-    ):
+    _ = args
+    level_name = str(level).lower()
+    log_level = logging.DEBUG if level_name == "debug" else logging.INFO
+    if logger is None and not _LOGGER.isEnabledFor(log_level):
         return
     key = key or (
         "opt",
@@ -93,7 +94,7 @@ def _log_optimizer(
     if logger is not None:
         logger(msg)
         return
-    log_fn = getattr(_LOGGER, str(level).lower(), _LOGGER.info)
+    log_fn = getattr(_LOGGER, level_name, _LOGGER.info)
     log_fn(msg)
 
 
@@ -137,30 +138,33 @@ def _dataset_for_device(
     metadata: Optional["Dataset[Any]"] = None,
 ) -> Tuple[torch.device, "Dataset[Any]"]:
     ref_tensor: Optional[torch.Tensor] = None
-    if isinstance(model_or_params, nn.Module):
-        ref_tensor = ModelPolicy._peek_layer(model_or_params)
-    elif (
-        metadata is None
-        and isinstance(model_or_params, Sequence)
-        and model_or_params
-    ):
-        try:
-            first = model_or_params[0]
-            if isinstance(first, dict):
-                ref_tensor = next(
-                    (
-                        p
-                        for g in model_or_params
-                        if isinstance(g, dict)
-                        for p in g.get("params", [])
-                        if torch.is_tensor(p)
-                    ),
-                    None,
-                )
-            elif torch.is_tensor(first):
-                ref_tensor = first
-        except Exception:
-            ref_tensor = None
+    match model_or_params:
+        case nn.Module() as module:
+            ref_tensor = ModelPolicy._peek_layer(module)
+        case _ if (
+            metadata is None
+            and isinstance(model_or_params, Sequence)
+            and model_or_params
+        ):
+            try:
+                first = model_or_params[0]
+                if isinstance(first, dict):
+                    ref_tensor = next(
+                        (
+                            p
+                            for g in model_or_params
+                            if isinstance(g, dict)
+                            for p in g.get("params", [])
+                            if torch.is_tensor(p)
+                        ),
+                        None,
+                    )
+                elif torch.is_tensor(first):
+                    ref_tensor = first
+            except Exception:
+                ref_tensor = None
+        case _:
+            pass
     dev = (
         torch.device(metadata.device)
         if metadata
@@ -684,17 +688,18 @@ class AdamW:
                 safe_int8 = _scale_safe_int(meta, 8)
                 safe_int4 = _scale_safe_int(meta, 4)
                 target_bits: Optional[int] = None
-                if quant_bits == 8:
-                    if safe_int8:
-                        target_bits = 8
-                elif quant_bits == 4:
-                    if safe_int4:
-                        target_bits = 4
-                else:
-                    if Dataset.is_int8_supported(dev)[0] and safe_int8:
-                        target_bits = 8
-                    elif safe_int4:
-                        target_bits = 4
+                match quant_bits:
+                    case 8:
+                        if safe_int8:
+                            target_bits = 8
+                    case 4:
+                        if safe_int4:
+                            target_bits = 4
+                    case _:
+                        if Dataset.is_int8_supported(dev)[0] and safe_int8:
+                            target_bits = 8
+                        elif safe_int4:
+                            target_bits = 4
                 if target_bits is not None:
                     cls_name = f"AdamW{target_bits}bit"
                     for pkg in (
@@ -1232,12 +1237,15 @@ class StochasticWeightAverage(nn.Module):
 
     def _sync_device(self: Self, dev_type: str) -> None:
         try:
-            if dev_type == "cuda" and hasattr(torch, "cuda"):
-                torch.cuda.synchronize()
-            elif dev_type == "xpu" and hasattr(torch, "xpu"):
-                torch.xpu.synchronize()
-            elif dev_type == "mps" and hasattr(torch, "mps"):
-                torch.mps.synchronize()
+            match dev_type:
+                case "cuda" if hasattr(torch, "cuda"):
+                    torch.cuda.synchronize()
+                case "xpu" if hasattr(torch, "xpu"):
+                    torch.xpu.synchronize()
+                case "mps" if hasattr(torch, "mps"):
+                    torch.mps.synchronize()
+                case _:
+                    pass
         except Exception:
             pass
 

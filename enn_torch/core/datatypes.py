@@ -11,6 +11,7 @@ from typing import Any, TypeAlias
 
 import numpy
 import torch
+
 _CANONICAL_DTYPES: dict[str, dict[str, Any]] = {
     "float64": {
         "torch": torch.float64,
@@ -136,10 +137,14 @@ def sanitize_single_line(
 def normalize_windows_paste_path(value: PathLike) -> PathLike:
     if isinstance(value, str):
         text = sanitize_single_line(value, replacement="\n")
-        if "\n" in text:
-            lines = [line.strip() for line in text.split("\n") if line.strip()]
-            return lines[0] if lines else ""
-        return text
+        if "\n" not in text:
+            return text
+
+        first_line = next(
+            (line.strip() for line in text.split("\n") if line.strip()),
+            "",
+        )
+        return first_line
     return value
 
 
@@ -158,8 +163,18 @@ def _env_clean(value: object | None) -> str | None:
         return None
     if isinstance(value, (bytes, bytearray)):
         value = value.decode(errors="ignore")
-    s = str(value).replace("\\r\\n", "\n").replace("\\n", "\n").strip()
-    return s or None
+
+    text = sanitize_single_line(
+        value,
+        replacement="\n",
+        trim=True,
+        decode_escaped_newlines=True,
+    )
+    first_line = next(
+        (line.strip() for line in text.split("\n") if line.strip()),
+        "",
+    )
+    return first_line or None
 
 
 def _canonical_dtype(src: Any) -> str:
@@ -210,18 +225,18 @@ def _atomic_swap(path: PathLike) -> None:
 
 
 def parse_bool(value: object) -> bool | None:
-    if value is None:
+    state = _env_clean(value)
+    if state is None:
         return None
-    if isinstance(value, (bytes, bytearray)):
-        value = value.decode(errors="ignore")
-    s = str(value).replace("\\r\\n", "\n").replace("\\n", "\n").strip().lower()
-    if not s:
-        return None
-    if s in _TRUE:
-        return True
-    if s in _FALSE:
-        return False
-    return None
+
+    normalized = state.lower()
+    match normalized:
+        case candidate if candidate in _TRUE:
+            return True
+        case candidate if candidate in _FALSE:
+            return False
+        case _:
+            return None
 
 
 def env_str(name: str, default: str | None = None) -> str | None:
@@ -234,7 +249,7 @@ def env_bool(name: str | Sequence[str], default: bool = False) -> bool:
     if isinstance(name, Sequence) and not isinstance(
         name, (str, bytes, bytearray)
     ):
-        raw = env_first(list(name), default=None)
+        raw = env_first(name, default=None)
     else:
         raw = os.environ.get(str(name))
     v = parse_bool(raw)
@@ -303,9 +318,15 @@ def to_platform_dtype(src: Any, platform: str) -> Any:
     normalized = _PLATFORM_ALIASES.get(platform_key)
     if normalized is None:
         raise ValueError(f"unsupported platform: {platform!r}")
+
     canonical = _canonical_dtype(src)
-    if normalized == "name":
-        return canonical
+    match normalized:
+        case "name":
+            return canonical
+        case "torch" | "numpy" | "python":
+            pass
+        case _:
+            raise ValueError(f"unsupported platform: {platform!r}")
     mapping = _CANONICAL_DTYPES.get(canonical)
     if mapping is None:
         raise TypeError(
@@ -322,12 +343,11 @@ def to_platform_dtype(src: Any, platform: str) -> Any:
 def parse_torch_dtype(src: Any) -> torch.dtype | None:
     if src is None:
         return None
-    if isinstance(src, torch.dtype):
+    elif isinstance(src, torch.dtype):
         return src
-    try:
+
+    with contextlib.suppress(Exception):
         return to_platform_dtype(src, "torch")
-    except Exception:
-        pass
     try:
         key = str(src).strip()
     except Exception:
@@ -383,9 +403,14 @@ def write_json(
         json.dump(payload, f, indent=indent)
 
 
-def save_temp(path: PathLike, payload: Any, **opts: Any) -> None:
+def save_temp(
+    path: PathLike,
+    payload: Any,
+    *args: Any,
+    **kwargs: Any,
+) -> None:
     with _atomic_swap(path) as tmp:
-        torch.save(payload, tmp, **opts)
+        torch.save(payload, tmp, *args, **kwargs)
 
 
 def default_underflow_action() -> str:
@@ -404,10 +429,14 @@ def default_underflow_action() -> str:
 
 
 def normalize_underflow_action(
-    value: object, *args: Any, default: str = "warn"
+    value: object,
+    *args: Any,
+    default: str = "warn",
 ) -> str:
-    r = str(value if value is not None else default).strip().lower()
-    if r in _DEF_UNDERFLOW_ACTIONS:
-        return r
-    d = str(default).strip().lower()
-    return d if d in _DEF_UNDERFLOW_ACTIONS else "warn"
+    _ = args
+    requested = str(value if value is not None else default).strip().lower()
+    if requested in _DEF_UNDERFLOW_ACTIONS:
+        return requested
+
+    fallback = str(default).strip().lower()
+    return fallback if fallback in _DEF_UNDERFLOW_ACTIONS else "warn"

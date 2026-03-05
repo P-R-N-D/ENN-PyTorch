@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import itertools
 import json
 import os
 import re
@@ -13,7 +14,7 @@ import time
 import traceback
 import warnings
 from pathlib import Path
-from typing import Any, Dict, Iterator
+from typing import Any, Iterator
 
 import numpy as np
 import torch
@@ -21,9 +22,8 @@ from tensordict import TensorDict
 
 from enn_torch.core.config import ModelConfig, PatchConfig
 from enn_torch.core.tensor import extract_tensor, from_buffer
-from enn_torch.nn.layers import Embedding
 from enn_torch.runtime.io import Exporter
-from enn_torch.runtime.workflows import new_model, train
+from enn_torch.runtime.workflows import new_embedding, new_model, train
 
 from .lifecycle import build_dataset
 
@@ -31,22 +31,71 @@ _ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 _TL_LOG_RE = re.compile(r"(dedicated_log_torch_trace_[A-Za-z0-9_]+\.log)")
 
 
+_X_FEATURE_NAMES: tuple[str, ...] = ("month", "weekday_type", "direction")
+_EMBED_SPEC: dict[str, list[object]] = {
+    "continuous_idx": [],
+    "categorical": [
+        {
+            "name": "month",
+            "idx": 0,
+            "num_embeddings": 12,
+            "embedding_dim": 4,
+            "offset": -1,
+            "clamp": True,
+        },
+        {
+            "name": "weekday",
+            "idx": 1,
+            "num_embeddings": 7,
+            "embedding_dim": 3,
+            "clamp": True,
+        },
+        {
+            "name": "direction",
+            "idx": 2,
+            "num_embeddings": 2,
+            "embedding_dim": 2,
+            "clamp": True,
+        },
+    ],
+}
+
+
+def _normalize_pasted_text(value: object) -> str:
+    return (
+        str(value)
+        .replace("\r\n", "\n")
+        .replace("\r", "\n")
+        .replace("\\r\\n", "\n")
+        .replace("\\n", "\n")
+        .strip()
+    )
+
+
+def _env_truthy(name: str, default: bool = False) -> bool:
+    raw = _normalize_pasted_text(os.environ.get(name, ""))
+    if not raw:
+        return bool(default)
+    match raw.lower():
+        case "1" | "true" | "yes" | "y" | "on":
+            return True
+        case "0" | "false" | "no" | "n" | "off":
+            return False
+        case _:
+            return bool(default)
+
+
 def _as_path_list(out: Any, fallback: Path) -> list[str]:
-    if out is None:
-        return [str(fallback)]
-    if isinstance(out, (str, Path)):
-        return [str(out)]
-    if isinstance(out, (tuple, list)):
-        flat: list[str] = []
-        for item in out:
-            if item is None:
-                continue
-            if isinstance(item, (str, Path)):
-                flat.append(str(item))
-            else:
-                flat.append(str(item))
-        return flat if flat else [str(fallback)]
-    return [str(out)]
+    match out:
+        case None:
+            return [str(fallback)]
+        case str() | Path():
+            return [str(out)]
+        case tuple() | list():
+            flat = [str(item) for item in out if item is not None]
+            return flat if flat else [str(fallback)]
+        case _:
+            return [str(out)]
 
 
 def _stats_np(arr: np.ndarray) -> dict[str, float | list[int]]:
@@ -64,12 +113,11 @@ def _label_variation_by_x(td_train: TensorDict) -> dict[str, Any]:
     x = td_train["X"].detach().cpu().numpy()
     y = td_train["Y"].detach().cpu().numpy()
     y_flat = y.reshape(y.shape[0], -1)
-    names = ("month", "weekday_type", "direction")
     by_x: dict[str, dict[str, float]] = {}
-    for i, name in enumerate(names):
-        vals = sorted({int(v) for v in x[:, i]})
+    for i, name in enumerate(_X_FEATURE_NAMES):
+        vals = np.unique(x[:, i].astype(np.int64))
         stats: dict[str, float] = {}
-        for v in vals:
+        for v in vals.tolist():
             mask = x[:, i] == v
             yy = y_flat[mask]
             stats[f"{int(v)}_mean"] = float(np.mean(yy))
@@ -78,13 +126,14 @@ def _label_variation_by_x(td_train: TensorDict) -> dict[str, Any]:
         by_x[name] = stats
 
     pair_diffs: list[float] = []
-    n = int(y_flat.shape[0])
-    for i in range(n):
-        for j in range(i + 1, n):
-            diff_x = int(np.sum(x[i] != x[j]))
-            if diff_x == 1:
-                pair_diffs.append(float(np.mean(np.abs(y_flat[i] - y_flat[j]))))
-    out: dict[str, Any] = {"by_x": by_x, "pairs_diff_x_eq_1_count": int(len(pair_diffs))}
+    for i, j in itertools.combinations(range(int(y_flat.shape[0])), 2):
+        if int(np.count_nonzero(x[i] != x[j])) != 1:
+            continue
+        pair_diffs.append(float(np.mean(np.abs(y_flat[i] - y_flat[j]))))
+    out: dict[str, Any] = {
+        "by_x": by_x,
+        "pairs_diff_x_eq_1_count": int(len(pair_diffs)),
+    }
     if pair_diffs:
         arr = np.asarray(pair_diffs, dtype=np.float64)
         out["pairs_diff_x_eq_1_mean_abs_y_diff"] = float(arr.mean())
@@ -122,28 +171,14 @@ def _build_model_and_sample(
         preset="spatiotemporal",
         compile_mode="disabled",
     )
-    EMBED_SPEC = {
-        "continuous_idx": [],
-        "categorical": [
-            {"name": "month", "idx": 0, "num_embeddings": 12, "embedding_dim": 4, "offset": -1, "clamp": True},
-            {"name": "weekday", "idx": 1, "num_embeddings": 7, "embedding_dim": 3, "clamp": True},
-            {"name": "direction", "idx": 2, "num_embeddings": 2, "embedding_dim": 2, "clamp": True},
-        ],
-    }
-    embedding = Embedding.from_spec(EMBED_SPEC, in_dim=int(td_train["X"].shape[1]))
+    embedding = new_embedding(int(td_train["X"].shape[1]), embedding=_EMBED_SPEC)
     model = new_model(
         in_dim=td_train["X"].shape[1],
         out_shape=(S, T),
         config=cfg,
         embedding=embedding,
     ).to(device)
-    if os.environ.get("ENN_DEPLOYMENT_DEBUG_EXTRA", "0").strip().lower() in (
-        "1",
-        "true",
-        "yes",
-        "y",
-        "on",
-    ):
+    if _env_truthy("ENN_DEPLOYMENT_DEBUG_EXTRA", default=False):
         with contextlib.suppress(Exception):
             model.add_task("debug_extra", mode="spatial", weight=0.25)
     print("[debug] nodes:", model.get_subtree())
@@ -154,6 +189,9 @@ def _build_model_and_sample(
 def _run_isolated_export(
     fmt_name: str, out_path: str, state_path: str
 ) -> dict[str, Any]:
+    fmt_name = _normalize_pasted_text(fmt_name).strip()
+    out_path = _normalize_pasted_text(out_path).strip()
+    state_path = _normalize_pasted_text(state_path).strip()
     cmd = [
         sys.executable,
         "-m",
@@ -175,15 +213,16 @@ def _run_isolated_export(
     env.setdefault("ENN_EXPORT_FAULTHANDLER", "1")
     env.setdefault("ENN_EXPORT_TRACEBACK_AFTER_SEC", "30")
     timeout_s = 120
-    if str(fmt_name).strip().lower() in ("onnx", "ort"):
-        timeout_s = 600
-        env.setdefault("ENN_ONNX_PREFER_DYNAMO", "auto")
-        env.setdefault("ENN_ONNX_TRY_DYNAMO", "1")
+    match fmt_name.lower():
+        case "onnx" | "ort":
+            timeout_s = 600
+            env.setdefault("ENN_ONNX_PREFER_DYNAMO", "auto")
+            env.setdefault("ENN_ONNX_TRY_DYNAMO", "1")
+        case _:
+            pass
     with contextlib.suppress(Exception):
         timeout_s = int(
-            os.environ.get(
-                "ENN_EXPORT_SUBPROCESS_TIMEOUT", str(timeout_s)
-            ).strip()
+            os.environ.get("ENN_EXPORT_SUBPROCESS_TIMEOUT", str(timeout_s)).strip()
             or str(timeout_s)
         )
 
@@ -275,9 +314,7 @@ def _ensure_state_shapes_for_scaler(
         fallback_mod: torch.nn.Module,
     ) -> torch.Tensor:
         if torch.is_tensor(existing):
-            return torch.empty(
-                shape, device=existing.device, dtype=existing.dtype
-            )
+            return torch.empty(shape, device=existing.device, dtype=existing.dtype)
         return torch.empty(
             shape, device=_model_device(fallback_mod), dtype=torch.float32
         )
@@ -315,9 +352,7 @@ def _ensure_state_shapes_for_scaler(
                 )
                 setattr(mod, name, mod._buffers[name])
             continue
-        if hasattr(mod, "_parameters") and name in getattr(
-            mod, "_parameters", {}
-        ):
+        if hasattr(mod, "_parameters") and name in getattr(mod, "_parameters", {}):
             prm = mod._parameters.get(name)
             if (
                 prm is not None
@@ -445,8 +480,8 @@ def _draft_export_diagnostics(
                                 info["tlparse_log"] = tl
                                 ex = _read_log_excerpt(tl)
                                 if ex:
-                                    info["tlparse_log_excerpt_tail"] = (
-                                        _truncate(ex, 12000)
+                                    info["tlparse_log_excerpt_tail"] = _truncate(
+                                        ex, 12000
                                     )
                         if wrec:
                             info["warnings"] = [
@@ -460,9 +495,9 @@ def _draft_export_diagnostics(
                                         info["tlparse_log"] = tl
                                         ex = _read_log_excerpt(tl)
                                         if ex:
-                                            info[
-                                                "tlparse_log_excerpt_tail"
-                                            ] = _truncate(ex, 12000)
+                                            info["tlparse_log_excerpt_tail"] = (
+                                                _truncate(ex, 12000)
+                                            )
                                         break
                         for attr in (
                             "errors",
@@ -472,9 +507,7 @@ def _draft_export_diagnostics(
                         ):
                             if hasattr(res, attr):
                                 try:
-                                    info[attr] = _truncate(
-                                        repr(getattr(res, attr))
-                                    )
+                                    info[attr] = _truncate(repr(getattr(res, attr)))
                                 except Exception:
                                     pass
                         return info
@@ -514,9 +547,7 @@ def _export_only_main(fmt_name: str, out_path: str, state_path: str) -> int:
             after_s = 30
             with contextlib.suppress(Exception):
                 after_s = int(
-                    os.environ.get(
-                        "ENN_EXPORT_TRACEBACK_AFTER_SEC", "30"
-                    ).strip()
+                    os.environ.get("ENN_EXPORT_TRACEBACK_AFTER_SEC", "30").strip()
                     or "30"
                 )
             faulthandler.dump_traceback_later(after_s, repeat=True)
@@ -538,27 +569,28 @@ def _export_only_main(fmt_name: str, out_path: str, state_path: str) -> int:
         Path(out_path).suffix if Path(out_path).suffix else out_path
     )
     if fmt is None:
-        print(
-            json.dumps({"status": "error", "error": "no exporter registered"})
-        )
+        print(json.dumps({"status": "error", "error": "no exporter registered"}))
         return 1
     try:
         print(f"[export-only] format={fmt_name} out={out_path}", flush=True)
         save_kw = {"sample_input": sample, "dynamic_batch": True}
-        if str(fmt_name).strip().lower() in {
+        if fmt_name.strip().lower() in {
             "onnx",
             "ort",
             "tensorrt",
             "tensorflow",
             "litert",
         }:
-            pref = str(os.environ.get("ENN_ONNX_PREFER_DYNAMO", "auto") or "auto").strip().lower()
-            if pref in ("1", "true", "yes", "y", "on"):
-                save_kw["prefer_dynamo"] = True
-            elif pref in ("0", "false", "no", "n", "off"):
-                save_kw["prefer_dynamo"] = False
-            else:
-                save_kw["prefer_dynamo"] = bool(save_kw.get("dynamic_batch", False))
+            pref = _normalize_pasted_text(
+                os.environ.get("ENN_ONNX_PREFER_DYNAMO", "auto") or "auto"
+            ).lower()
+            match pref:
+                case "1" | "true" | "yes" | "y" | "on":
+                    save_kw["prefer_dynamo"] = True
+                case "0" | "false" | "no" | "n" | "off":
+                    save_kw["prefer_dynamo"] = False
+                case _:
+                    save_kw["prefer_dynamo"] = bool(save_kw.get("dynamic_batch", False))
         t0 = time.time()
         fmt.save(model, out_path, **save_kw)
         dt = time.time() - t0
@@ -578,7 +610,7 @@ def export_and_validate(
     sample: torch.Tensor,
     td_train: TensorDict,
     out_dir: Path,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     out_dir.mkdir(parents=True, exist_ok=True)
     warnings.filterwarnings(
         "ignore",
@@ -595,7 +627,7 @@ def export_and_validate(
         "coreml": out_dir / "model.mlmodel",
         "tensorrt": out_dir / "model.engine",
     }
-    results: Dict[str, Any] = {}
+    results: dict[str, Any] = {}
     state_path = out_dir / "model.state_dict.pt"
     task_spec_path = out_dir / "task_specs.json"
     try:
@@ -620,9 +652,7 @@ def export_and_validate(
         }
         for name, path in targets.items():
             if state_path is not None and name.strip().lower() in isolate:
-                results[name] = _run_isolated_export(
-                    name, str(path), str(state_path)
-                )
+                results[name] = _run_isolated_export(name, str(path), str(state_path))
                 if results[name].get("status") == "ok":
                     results[name] = {"status": "ok", "paths": [str(path)]}
                 elif results[name].get("status") == "skipped":
@@ -632,13 +662,11 @@ def export_and_validate(
                         "error": results[name].get("error", "skipped"),
                     }
                 continue
-            fmt = Exporter.for_export(
-                path.suffix if path.suffix else str(path)
-            )
+            fmt = Exporter.for_export(path.suffix if path.suffix else str(path))
             try:
                 if fmt is None:
                     raise RuntimeError("no exporter registered")
-                save_kwargs: Dict[str, Any] = {
+                save_kwargs: dict[str, Any] = {
                     "sample_input": sample,
                     "dynamic_batch": True,
                 }
@@ -659,7 +687,7 @@ def export_and_validate(
             except Exception as exc:
                 err_s = repr(exc)
                 results[name] = {"status": "error", "error": err_s}
-    validation: Dict[str, Any] = {}
+    validation: dict[str, Any] = {}
     try:
         y = td_train["Y"].detach().cpu().numpy()
         validation["label_stats"] = _stats_np(y)
@@ -708,9 +736,7 @@ def export_and_validate(
                 try:
                     pt2_np = _to_numpy_materialized(pt2_out)
                     torch_np = _to_numpy_materialized(torch_out)
-                    validation["pt2_mae"] = float(
-                        np.mean(np.abs(pt2_np - torch_np))
-                    )
+                    validation["pt2_mae"] = float(np.mean(np.abs(pt2_np - torch_np)))
                     validation["pt2_out_stats"] = _stats_np(pt2_np)
                 except Exception as conv_exc:
                     validation["pt2_error"] = repr(conv_exc)
@@ -718,10 +744,7 @@ def export_and_validate(
             except Exception as exc:
                 validation["pt2_error"] = repr(exc)
 
-        def _truthy(v: str) -> bool:
-            return v.strip().lower() in ("1", "true", "yes", "y", "on")
-
-        do_alt = _truthy(os.environ.get("ENN_VALIDATE_ALT_BATCH", "0"))
+        do_alt = _env_truthy("ENN_VALIDATE_ALT_BATCH", default=False)
         if (
             "pt2_error" not in validation
             and do_alt
@@ -770,12 +793,7 @@ def export_and_validate(
                     inp_name = sess.get_inputs()[0].name
                     out = sess.run(
                         None,
-                        {
-                            inp_name: sample.detach()
-                            .cpu()
-                            .numpy()
-                            .astype(np.float32)
-                        },
+                        {inp_name: sample.detach().cpu().numpy().astype(np.float32)},
                     )[0]
                     validation[f"{name}_out_stats"] = _stats_np(out)
                 except Exception as exc:
@@ -788,16 +806,15 @@ def main() -> None:
     ap.add_argument("--export-only", default=None)
     ap.add_argument("--out", default=None)
     ap.add_argument("--state", default=None)
-    args, _ = ap.parse_known_args()
+    args, _unused_args = ap.parse_known_args()
     if args.export_only:
-        raise SystemExit(
-            _export_only_main(args.export_only, args.out, args.state)
-        )
+        export_only = _normalize_pasted_text(args.export_only)
+        export_out = _normalize_pasted_text(args.out or "") or None
+        export_state = _normalize_pasted_text(args.state or "") or None
+        raise SystemExit(_export_only_main(export_only, export_out, export_state))
     os.environ.setdefault("ENN_PREBATCH", "1")
     os.environ.setdefault("ENN_PREFETCH_FACTOR", "1")
-    data, td_train, model, sample = _build_model_and_sample(
-        torch.device("cpu")
-    )
+    data, td_train, model, sample = _build_model_and_sample(torch.device("cpu"))
     S = data["S"]
     T = data["T"]
     print(f"[export] dataset groups={data['B']} grid={S}x{T}")
@@ -812,9 +829,7 @@ def main() -> None:
         max_nodes=1,
     )
     model.eval()
-    stats = export_and_validate(
-        model, sample, td_train, Path("export_artifacts")
-    )
+    stats = export_and_validate(model, sample, td_train, Path("export_artifacts"))
 
     def _json_default(o: object) -> object:
         if isinstance(o, bytes):
@@ -831,9 +846,7 @@ def main() -> None:
             pass
         return repr(o)
 
-    print(
-        json.dumps(stats, indent=2, ensure_ascii=False, default=_json_default)
-    )
+    print(json.dumps(stats, indent=2, ensure_ascii=False, default=_json_default))
 
 
 if __name__ == "__main__":
