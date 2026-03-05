@@ -21,7 +21,7 @@ from tensordict import TensorDict
 
 from enn_torch.core.config import ModelConfig, PatchConfig
 from enn_torch.core.tensor import extract_tensor, from_buffer
-from enn_torch.nn.layers import Embedder
+from enn_torch.nn.layers import Embedding
 from enn_torch.runtime.io import Exporter
 from enn_torch.runtime.workflows import new_model, train
 
@@ -130,12 +130,12 @@ def _build_model_and_sample(
             {"name": "direction", "idx": 2, "num_embeddings": 2, "embedding_dim": 2, "clamp": True},
         ],
     }
-    embedder = Embedder.from_spec(EMBED_SPEC, in_dim=int(td_train["X"].shape[1]))
+    embedding = Embedding.from_spec(EMBED_SPEC, in_dim=int(td_train["X"].shape[1]))
     model = new_model(
         in_dim=td_train["X"].shape[1],
         out_shape=(S, T),
         config=cfg,
-        embedder=embedder,
+        embedding=embedding,
     ).to(device)
     if os.environ.get("ENN_DEPLOYMENT_DEBUG_EXTRA", "0").strip().lower() in (
         "1",

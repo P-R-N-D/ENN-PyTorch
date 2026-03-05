@@ -51,7 +51,7 @@ from ..core.config import (
     coerce_model_config,
     runtime_config,
 )
-from ..core.datatypes import env_bool, read_json
+from ..core.datatypes import env_bool, normalize_windows_paste_path, read_json
 from ..core.policies import WorkerPolicy
 from ..core.system import _start_context, new_dir, optimal_start_method
 from ..core.tensor import coerce_tensor, is_meta_or_fake_tensor
@@ -65,7 +65,7 @@ from ..data.pipeline import (
     preload_memmap,
 )
 from ..nn.graph import inference_mode
-from ..nn.layers import Embedder, Recorder, Scaler, resize_scaler_buffer
+from ..nn.layers import Embedding, Recorder, Scaler, resize_scaler_buffer
 from ..nn.wrappers import Model
 from .distributed import (
     ProcessBroker,
@@ -87,30 +87,30 @@ except Exception:
 logger = logging.getLogger(__name__)
 
 
-def _embedder_to_spec(embedder: object | None) -> Mapping[str, Any] | None:
-    if not isinstance(embedder, Embedder):
+def _embedding_to_spec(embedding: object | None) -> Mapping[str, Any] | None:
+    if not isinstance(embedding, Embedding):
         return None
-    cats_raw = getattr(embedder, "_cats", ())
+    cats_raw = getattr(embedding, "_cats", ())
     cats: list[dict[str, Any]] = []
     for c in cats_raw if isinstance(cats_raw, Sequence) else ():
         if isinstance(c, Mapping):
             cats.append(dict(c))
     return {
-        "in_dim": int(getattr(embedder, "in_dim", 0)),
-        "out_dim": int(getattr(embedder, "out_dim", 0)),
-        "continuous_idx": [int(i) for i in tuple(getattr(embedder, "continuous_idx", ()) or ())],
+        "in_dim": int(getattr(embedding, "in_dim", 0)),
+        "out_dim": int(getattr(embedding, "out_dim", 0)),
+        "continuous_idx": [int(i) for i in tuple(getattr(embedding, "continuous_idx", ()) or ())],
         "categorical": cats,
     }
 
 
-def _embedder_from_meta(
+def _embedding_from_meta(
     meta: Mapping[str, Any] | None,
     *,
     in_dim: int,
-) -> Embedder | None:
+) -> Embedding | None:
     if not isinstance(meta, Mapping):
         return None
-    raw = meta.get("embedder")
+    raw = meta.get("embedding")
     if not isinstance(raw, Mapping):
         return None
     spec = dict(raw)
@@ -119,9 +119,9 @@ def _embedder_from_meta(
         with contextlib.suppress(Exception):
             if int(spec_in_dim) != int(in_dim):
                 raise RuntimeError(
-                    f"embedder spec in_dim mismatch: spec={int(spec_in_dim)} model={int(in_dim)}"
+                    f"embedding spec in_dim mismatch: spec={int(spec_in_dim)} model={int(in_dim)}"
                 )
-    return Embedder.from_spec(spec, in_dim=int(in_dim))
+    return Embedding.from_spec(spec, in_dim=int(in_dim))
 
 
 def _rewrite_state_dict_key(k: str) -> str:
@@ -133,6 +133,8 @@ def _rewrite_state_dict_key(k: str) -> str:
         parts = k.split(".")
         if len(parts) >= 4 and parts[1].isdigit() and parts[2] == "module":
             return ".".join(parts[3:])
+    if k.startswith("embedder."):
+        return "embedding." + k[len("embedder.") :]
     return k
 
 
@@ -192,22 +194,6 @@ def _drop_runtime_only_state_keys(sd: Mapping[str, Any]) -> Mapping[str, Any]:
     return out
 
 
-def _normalize_windows_paste(value: PathLike) -> PathLike:
-    if isinstance(value, str):
-        value = (
-            value.replace("\\r\\n", "\n")
-            .replace("\\n", "\n")
-            .replace("\\r", "\n")
-        )
-        value = value.replace("\r\n", "\n").replace("\r", "\n")
-        value = value.strip()
-        if "\n" in value:
-            lines = [
-                line.strip() for line in value.split("\n") if line.strip()
-            ]
-            value = lines[0] if lines else ""
-    return value
-
 
 def _read_safetensors_embedded_meta(p: Path) -> Mapping[str, Any] | None:
     is_required(
@@ -248,7 +234,7 @@ def export_safetensors_single(
     )
     from safetensors.torch import save_file as save_tensors
 
-    p = Path(_normalize_windows_paste(path))
+    p = Path(normalize_windows_paste_path(path))
     if not p.suffix:
         p = p.with_suffix(".safetensors")
     p.parent.mkdir(parents=True, exist_ok=True)
@@ -1393,9 +1379,9 @@ def _write_model_meta_json(model: torch.nn.Module, out_dir: PathLike) -> None:
     if callable(ts_fn):
         with contextlib.suppress(Exception):
             meta_payload["tasks"] = ts_fn()
-    emb_spec = _embedder_to_spec(getattr(base, "embedder", None))
+    emb_spec = _embedding_to_spec(getattr(base, "embedding", None))
     if emb_spec is not None:
-        meta_payload["embedder"] = emb_spec
+        meta_payload["embedding"] = emb_spec
     collate.write_json(os.path.join(out_dir, "model.meta.json"), meta_payload, indent=2)
     collate.write_json(os.path.join(out_dir, "meta.json"), meta_payload, indent=2)
 
@@ -1906,14 +1892,14 @@ def new_model(
     out_shape: Sequence[int],
     config: ModelConfig | Mapping[str, object] | None,
     *,
-    embedder: Embedder | None = None,
+    embedding: Embedding | None = None,
 ) -> Model:
     cfg = coerce_model_config(config)
     core = Model(
         in_dim,
         tuple((int(x) for x in out_shape)),
         config=cfg,
-        embedder=embedder,
+        embedding=embedding,
     )
     return core
 
@@ -1927,7 +1913,7 @@ def load_weights(
     mmap: bool | None = True,
     rebuild_tasks: bool = False,
 ) -> Mapping[str, Any] | None:
-    p = Path(_normalize_windows_paste(checkpoint_path))
+    p = Path(normalize_windows_paste_path(checkpoint_path))
 
     side_meta: Mapping[str, Any] | None = None
     with contextlib.suppress(Exception):
@@ -2404,7 +2390,7 @@ def load_model(
         if strict:
             raise RuntimeError(f"[ENN] load_model: non-finite parameters detected ({where}): {first_bad}")
 
-    p = Path(_normalize_windows_paste(checkpoint_path))
+    p = Path(normalize_windows_paste_path(checkpoint_path))
     side_meta: Mapping[str, Any] | None = None
     with contextlib.suppress(Exception):
         if p.is_file() and p.suffix.lower() in (".pt", ".pth"):
@@ -2436,8 +2422,8 @@ def load_model(
             raise ValueError(
                 "Loading from a checkpoint directory requires in_dim and out_shape, or a valid meta.json inside the directory."
             )
-        use_embedder = _embedder_from_meta(meta, in_dim=use_in_dim)
-        model = new_model(use_in_dim, use_out_shape, use_config, embedder=use_embedder)
+        use_embedding = _embedding_from_meta(meta, in_dim=use_in_dim)
+        model = new_model(use_in_dim, use_out_shape, use_config, embedding=use_embedding)
         if _model_has_meta_or_fake_tensors(model):
             _materialize_module_to_device(model, load_dev)
         with contextlib.suppress(Exception):
@@ -2528,8 +2514,8 @@ def load_model(
             raise RuntimeError(
                 f"Invalid in_dim/out_shape metadata in {str(meta_path)!r}: in_dim={use_in_dim}, out_shape={use_out_shape}"
             )
-        use_embedder = _embedder_from_meta(meta, in_dim=use_in_dim)
-        model = new_model(use_in_dim, use_out_shape, use_config, embedder=use_embedder)
+        use_embedding = _embedding_from_meta(meta, in_dim=use_in_dim)
+        model = new_model(use_in_dim, use_out_shape, use_config, embedding=use_embedding)
         with contextlib.suppress(Exception):
             tasks = meta.get("tasks") if isinstance(meta, dict) else None
             if tasks:
@@ -2621,10 +2607,10 @@ def load_model(
         raise RuntimeError(
             f"Invalid or missing in_dim/out_shape when loading checkpoint {str(p)!r}: in_dim={use_in_dim}, out_shape={use_out_shape}"
         )
-    use_embedder = _embedder_from_meta(obj if isinstance(obj, Mapping) else None, in_dim=use_in_dim)
-    if use_embedder is None:
-        use_embedder = _embedder_from_meta(side_meta, in_dim=use_in_dim)
-    model = new_model(use_in_dim, use_out_shape, use_config, embedder=use_embedder)
+    use_embedding = _embedding_from_meta(obj if isinstance(obj, Mapping) else None, in_dim=use_in_dim)
+    if use_embedding is None:
+        use_embedding = _embedding_from_meta(side_meta, in_dim=use_in_dim)
+    model = new_model(use_in_dim, use_out_shape, use_config, embedding=use_embedding)
     with contextlib.suppress(Exception):
         tasks = obj.get("tasks") if isinstance(obj, dict) else None
         if (not tasks) and isinstance(side_meta, Mapping):
@@ -2657,7 +2643,7 @@ def save_model(
     from .io import Builder
     from .io import Exporter
 
-    p = Path(_normalize_windows_paste(path))
+    p = Path(normalize_windows_paste_path(path))
     if Builder.is_target_native(p):
         if args:
             raise TypeError(

@@ -114,6 +114,35 @@ JsonValue: TypeAlias = (
 PathLike: TypeAlias = str | os.PathLike[str] | Path
 
 
+def sanitize_single_line(
+    value: object,
+    *,
+    replacement: str = "",
+    trim: bool = True,
+    decode_escaped_newlines: bool = True,
+) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, (bytes, bytearray)):
+        value = value.decode(errors="ignore")
+    s = str(value)
+    if decode_escaped_newlines:
+        s = s.replace("\\r\\n", "\n").replace("\\n", "\n").replace("\\r", "\n")
+    s = s.replace("\r\n", "\n").replace("\r", "\n")
+    s = s.replace("\n", replacement)
+    return s.strip() if trim else s
+
+
+def normalize_windows_paste_path(value: PathLike) -> PathLike:
+    if isinstance(value, str):
+        text = sanitize_single_line(value, replacement="\n")
+        if "\n" in text:
+            lines = [line.strip() for line in text.split("\n") if line.strip()]
+            return lines[0] if lines else ""
+        return text
+    return value
+
+
 def _env_cast(name: str, cast: Callable[[str], Any], default: Any) -> Any:
     s = env_str(name)
     if s is None:

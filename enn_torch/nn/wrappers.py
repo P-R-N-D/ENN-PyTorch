@@ -26,7 +26,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from ..core.concurrency import Mutex, is_gil_enabled
 from ..core.config import ModelConfig
-from ..core.datatypes import env_bool, env_first_int, env_int, env_str, env_float
+from ..core.datatypes import env_bool, env_first_int, env_int, env_str, env_float, sanitize_single_line
 from ..runtime.autobatch import diag_emit
 from ..core.policies import LossWeightPolicy, PrecisionPolicy
 from ..core.precision import AutocastState, StatefulAutocast, StatelessAutocast
@@ -68,7 +68,7 @@ from .graph import (
     torch_compiler_disable,
     torch_compiler_supported,
 )
-from .layers import Embedder, Recorder, Scaler, SigmoidGate
+from .layers import Embedding, Recorder, Scaler, SigmoidGate
 from tensordict import TensorDictBase
 _LOGGER = logging.getLogger(__name__)
 _ENN_DIAG_AUTOMICROBATCH_LOGGED = False
@@ -743,7 +743,7 @@ class Template(nn.Module):
     @staticmethod
     def _coerce_key_name(name: object) -> str:
         s = "" if name is None else str(name)
-        s = s.replace("\r", "").replace("\n", "").strip()
+        s = sanitize_single_line(s)
         if "." in s:
             s = s.replace(".", "_")
         return s
@@ -1643,7 +1643,7 @@ class Fuser(nn.Module):
 
     def _normalize_task_name(self: Self, value: object) -> str:
         s = "" if value is None else str(value)
-        s = s.replace("\r", "").replace("\n", "").strip()
+        s = sanitize_single_line(s)
         if "." in s:
             s = s.replace(".", "_")
         return s
@@ -3999,12 +3999,12 @@ class Model(nn.Module):
         out_shape: Sequence[int],
         config: ModelConfig,
         *,
-        embedder: Embedder | None = None,
+        embedding: Embedding | None = None,
     ) -> None:
         super().__init__()
         self.in_dim = int(in_dim)
-        self.embedder: Embedder | None = embedder
-        self.model_in_dim = int(getattr(embedder, "out_dim", self.in_dim))
+        self.embedding: Embedding | None = embedding
+        self.model_in_dim = int(getattr(embedding, "out_dim", self.in_dim))
         self.out_shape = tuple((int(x) for x in out_shape))
         self.out_dim = int(math.prod(self.out_shape))
         if config.device is not None:
@@ -4021,8 +4021,8 @@ class Model(nn.Module):
                     )
         else:
             self._device = get_device()
-        if self.embedder is not None:
-            self.embedder = self.embedder.to(self._device)
+        if self.embedding is not None:
+            self.embedding = self.embedding.to(self._device)
         self.scaler = Scaler().to(self._device)
         with torch.no_grad():
             if self.scaler.x_mean.numel() != self.in_dim:
@@ -5181,18 +5181,18 @@ class Model(nn.Module):
             features, device or self._device, base_dtype or features.dtype
         )
         x_norm: torch.Tensor | None = None
-        if self.embedder is None:
+        if self.embedding is None:
             x = self.scaler.normalize_x(x_raw)
         else:
-            if bool(getattr(self.embedder, "uses_x_norm", False)):
+            if bool(getattr(self.embedding, "uses_x_norm", False)):
                 x_norm = self.scaler.normalize_x(x_raw)
-            x = self.embedder(x_raw, x_norm=x_norm)
+            x = self.embedding(x_raw, x_norm=x_norm)
 
         if x.dim() == 1:
             x = x.view(1, -1)
         if x.dim() != 2 or int(x.shape[1]) != int(self.model_in_dim):
             raise ValueError(
-                f"model input dim mismatch: expected [B,{int(self.model_in_dim)}] after embedder, got {tuple(x.shape)}"
+                f"model input dim mismatch: expected [B,{int(self.model_in_dim)}] after embedding, got {tuple(x.shape)}"
             )
 
         if base_dtype is not None and x.dtype != base_dtype:
@@ -5828,12 +5828,12 @@ class Model(nn.Module):
         if isinstance(x_raw, torch.Tensor) and x_raw.device != device:
             x_raw = x_raw.to(device=device, non_blocking=True)
         x_norm: torch.Tensor | None = None
-        if self.embedder is None:
+        if self.embedding is None:
             x_scaled = self.scaler.normalize_x(x_raw)
         else:
-            if bool(getattr(self.embedder, "uses_x_norm", False)):
+            if bool(getattr(self.embedding, "uses_x_norm", False)):
                 x_norm = self.scaler.normalize_x(x_raw)
-            x_scaled = self.embedder(x_raw, x_norm=x_norm)
+            x_scaled = self.embedding(x_raw, x_norm=x_norm)
         graph_break()
         meta = None
         try:
