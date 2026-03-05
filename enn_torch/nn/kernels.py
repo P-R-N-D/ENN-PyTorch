@@ -1667,6 +1667,7 @@ class _MultiHeadAttentionNvidia(nn.Module):
     ) -> None:
         super().__init__()
         self.batch_first = batch_first
+        self.embed_dim = int(embed_dim)
         self.num_heads = int(num_heads)
         self._fallback = _MultiHeadAttentionCompat(
             embed_dim,
@@ -1860,7 +1861,7 @@ class _MultiHeadAttentionNvidia(nn.Module):
             query,
             key,
             num_heads=self.num_heads,
-            embed_dim=embed_dim,
+            embed_dim=self.embed_dim,
             batch_first=self.batch_first,
             include_projections=True,
         )

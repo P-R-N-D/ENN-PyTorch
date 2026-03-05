@@ -2720,7 +2720,7 @@ class Unsharder:
         if self.cache is not None:
             self.cache.submit(rows, path=rows_path)
         else:
-            atomic_torch_save(rows_path, rows)
+            save_temp(rows_path, rows)
 
         wait_evt = None
         release_cb = None
@@ -2755,7 +2755,7 @@ class Unsharder:
                 and preds_cpu.device.type != "cpu"
             ):
                 preds_cpu = preds_cpu.to(device="cpu")
-            atomic_torch_save(pred_path, preds_cpu)
+            save_temp(pred_path, preds_cpu)
             if release_cb is not None:
                 with contextlib.suppress(Exception):
                     release_cb()
