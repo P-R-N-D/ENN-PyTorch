@@ -160,7 +160,7 @@ def _cuda_fp32_precision_api_choice_from_env() -> str:
 
 def _clear_fp32_precision_api_cache() -> None:
     with contextlib.suppress(Exception):
-        _cuda_fp32_precision_api_choice.cache_clear()  # type: ignore[attr-defined]
+        _cuda_fp32_precision_api_choice.cache_clear()
 
 
 def __getattr__(name: str) -> Any:
@@ -1350,13 +1350,13 @@ def is_float8_supported(device: Optional[Union[torch.device, str]] = None) -> Tu
 
         def _has_torchao() -> bool:
             with contextlib.suppress(Exception):
-                import torchao.float8 # type: ignore
+                import torchao.float8
                 return True
             return False
 
         def _has_te() -> bool:
             with contextlib.suppress(Exception):
-                import transformer_engine.pytorch as te # type: ignore
+                import transformer_engine.pytorch as te
                 return callable(getattr(te, "autocast", None))
             return False
 
