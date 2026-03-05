@@ -87,6 +87,43 @@ except Exception:
 logger = logging.getLogger(__name__)
 
 
+def _embedder_to_spec(embedder: object | None) -> Mapping[str, Any] | None:
+    if not isinstance(embedder, Embedder):
+        return None
+    cats_raw = getattr(embedder, "_cats", ())
+    cats: list[dict[str, Any]] = []
+    for c in cats_raw if isinstance(cats_raw, Sequence) else ():
+        if isinstance(c, Mapping):
+            cats.append(dict(c))
+    return {
+        "in_dim": int(getattr(embedder, "in_dim", 0)),
+        "out_dim": int(getattr(embedder, "out_dim", 0)),
+        "continuous_idx": [int(i) for i in tuple(getattr(embedder, "continuous_idx", ()) or ())],
+        "categorical": cats,
+    }
+
+
+def _embedder_from_meta(
+    meta: Mapping[str, Any] | None,
+    *,
+    in_dim: int,
+) -> Embedder | None:
+    if not isinstance(meta, Mapping):
+        return None
+    raw = meta.get("embedder")
+    if not isinstance(raw, Mapping):
+        return None
+    spec = dict(raw)
+    spec_in_dim = spec.get("in_dim")
+    if spec_in_dim is not None:
+        with contextlib.suppress(Exception):
+            if int(spec_in_dim) != int(in_dim):
+                raise RuntimeError(
+                    f"embedder spec in_dim mismatch: spec={int(spec_in_dim)} model={int(in_dim)}"
+                )
+    return Embedder.from_spec(spec, in_dim=int(in_dim))
+
+
 def _rewrite_state_dict_key(k: str) -> str:
     if k.startswith("module."):
         return k[len("module.") :]
@@ -1351,6 +1388,9 @@ def _save_model_checkpoint(
             if callable(ts_fn):
                 with contextlib.suppress(Exception):
                     meta_payload["tasks"] = ts_fn()
+            emb_spec = _embedder_to_spec(getattr(base, "embedder", None))
+            if emb_spec is not None:
+                meta_payload["embedder"] = emb_spec
             collate.write_json(
                 os.path.join(out_dir, "model.meta.json"),
                 meta_payload,
@@ -2395,7 +2435,8 @@ def load_model(
             raise ValueError(
                 "Loading from a checkpoint directory requires in_dim and out_shape, or a valid meta.json inside the directory."
             )
-        model = new_model(use_in_dim, use_out_shape, use_config)
+        use_embedder = _embedder_from_meta(meta, in_dim=use_in_dim)
+        model = new_model(use_in_dim, use_out_shape, use_config, embedder=use_embedder)
         if _model_has_meta_or_fake_tensors(model):
             _materialize_module_to_device(model, load_dev)
         with contextlib.suppress(Exception):
@@ -2486,7 +2527,8 @@ def load_model(
             raise RuntimeError(
                 f"Invalid in_dim/out_shape metadata in {str(meta_path)!r}: in_dim={use_in_dim}, out_shape={use_out_shape}"
             )
-        model = new_model(use_in_dim, use_out_shape, use_config)
+        use_embedder = _embedder_from_meta(meta, in_dim=use_in_dim)
+        model = new_model(use_in_dim, use_out_shape, use_config, embedder=use_embedder)
         with contextlib.suppress(Exception):
             tasks = meta.get("tasks") if isinstance(meta, dict) else None
             if tasks:
@@ -2578,7 +2620,10 @@ def load_model(
         raise RuntimeError(
             f"Invalid or missing in_dim/out_shape when loading checkpoint {str(p)!r}: in_dim={use_in_dim}, out_shape={use_out_shape}"
         )
-    model = new_model(use_in_dim, use_out_shape, use_config)
+    use_embedder = _embedder_from_meta(obj if isinstance(obj, Mapping) else None, in_dim=use_in_dim)
+    if use_embedder is None:
+        use_embedder = _embedder_from_meta(side_meta, in_dim=use_in_dim)
+    model = new_model(use_in_dim, use_out_shape, use_config, embedder=use_embedder)
     with contextlib.suppress(Exception):
         tasks = obj.get("tasks") if isinstance(obj, dict) else None
         if (not tasks) and isinstance(side_meta, Mapping):
