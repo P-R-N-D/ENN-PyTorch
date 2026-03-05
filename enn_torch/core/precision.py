@@ -492,7 +492,7 @@ def unify_model_dtype(model: nn.Module, prefer: torch.dtype | None = None) -> to
 
 def _is_compiling() -> bool:
     with contextlib.suppress(Exception):
-        import torch._dynamo  # type: ignore
+        import torch._dynamo
         if bool(getattr(torch._dynamo, "is_compiling", lambda: False)()):
             return True
             
@@ -527,7 +527,7 @@ def _cast_tree_to_dtype(x: Any, dtype: torch.dtype) -> Any:
         case list():
             return [_cast_tree_to_dtype(v, dtype) for v in x]
         case Mapping():
-            return {k: _cast_tree_to_dtype(v, dtype) for k, v in x.items()} # type: ignore
+            return {k: _cast_tree_to_dtype(v, dtype) for k, v in x.items()}
         case _:
             return x
 
