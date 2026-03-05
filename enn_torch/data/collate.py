@@ -205,28 +205,39 @@ def _coerce_path(path: PathLike) -> Optional[str]:
     return os.path.abspath(os.path.expanduser(p))
 
 
+def _coerce_str_choice(
+    value: object,
+    aliases: dict[str, set[str]],
+    default: str,
+) -> str:
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        for canonical, candidates in aliases.items():
+            if normalized in candidates:
+                return canonical
+    return default
+
+
 def _coerce_prediction_output(output: object) -> str:
-    if isinstance(output, str) and output.strip().lower() in {
-        "file",
-        "disk",
-        "lazy",
-        "h5",
-        "hdf5",
-    }:
-        return "file"
-    return "memory"
+    return _coerce_str_choice(
+        output,
+        aliases={
+            "file": {"file", "disk", "lazy", "h5", "hdf5"},
+        },
+        default="memory",
+    )
 
 
 def _coerce_prediction_overwrite(overwrite: object) -> str:
-    if isinstance(overwrite, str):
-        ow = overwrite.strip().lower()
-        if ow == "resume":
-            return "resume"
-        if ow in {"replace", "overwrite", "force"}:
-            return "replace"
-        if ow in {"ignore", "skip"}:
-            return "ignore"
-    return "error"
+    return _coerce_str_choice(
+        overwrite,
+        aliases={
+            "resume": {"resume"},
+            "replace": {"replace", "overwrite", "force"},
+            "ignore": {"ignore", "skip"},
+        },
+        default="error",
+    )
 
 
 def _coerce_prediction_path(
