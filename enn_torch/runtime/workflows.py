@@ -1365,39 +1365,39 @@ def _save_model_checkpoint(
                         f"save_pt: {bad_k}"
                     )
         torch.save(pt_state, os.path.join(out_dir, "model.pt"))
-        with contextlib.suppress(Exception):
-            base = model
-            wrapped = getattr(model, "module", None)
-            if isinstance(wrapped, torch.nn.Module):
-                base = wrapped
-            meta_payload: dict[str, Any] = {
-                "format": "enn-model-meta-v1",
-                "created_time": float(time.time()),
-            }
-            in_dim0 = getattr(base, "in_dim", None)
-            out_shape0 = getattr(base, "out_shape", None)
-            if in_dim0 is not None:
-                with contextlib.suppress(Exception):
-                    meta_payload["in_dim"] = int(in_dim0)
-            if out_shape0 is not None:
-                with contextlib.suppress(Exception):
-                    meta_payload["out_shape"] = [int(x) for x in tuple(out_shape0)]
-            cfg0 = _extract_model_config_dict(base)
-            if isinstance(cfg0, dict) and cfg0:
-                meta_payload["config"] = cfg0
-            ts_fn = getattr(base, "task_specs", None)
-            if callable(ts_fn):
-                with contextlib.suppress(Exception):
-                    meta_payload["tasks"] = ts_fn()
-            emb_spec = _embedder_to_spec(getattr(base, "embedder", None))
-            if emb_spec is not None:
-                meta_payload["embedder"] = emb_spec
-            collate.write_json(
-                os.path.join(out_dir, "model.meta.json"),
-                meta_payload,
-                indent=2,
-            )
+    with contextlib.suppress(Exception):
+        _write_model_meta_json(model, out_dir)
     return m_sd
+
+def _write_model_meta_json(model: torch.nn.Module, out_dir: PathLike) -> None:
+    base = model
+    wrapped = getattr(model, "module", None)
+    if isinstance(wrapped, torch.nn.Module):
+        base = wrapped
+    meta_payload: dict[str, Any] = {
+        "format": "enn-model-meta-v1",
+        "created_time": float(time.time()),
+    }
+    in_dim0 = getattr(base, "in_dim", None)
+    out_shape0 = getattr(base, "out_shape", None)
+    if in_dim0 is not None:
+        with contextlib.suppress(Exception):
+            meta_payload["in_dim"] = int(in_dim0)
+    if out_shape0 is not None:
+        with contextlib.suppress(Exception):
+            meta_payload["out_shape"] = [int(x) for x in tuple(out_shape0)]
+    cfg0 = _extract_model_config_dict(base)
+    if isinstance(cfg0, dict) and cfg0:
+        meta_payload["config"] = cfg0
+    ts_fn = getattr(base, "task_specs", None)
+    if callable(ts_fn):
+        with contextlib.suppress(Exception):
+            meta_payload["tasks"] = ts_fn()
+    emb_spec = _embedder_to_spec(getattr(base, "embedder", None))
+    if emb_spec is not None:
+        meta_payload["embedder"] = emb_spec
+    collate.write_json(os.path.join(out_dir, "model.meta.json"), meta_payload, indent=2)
+    collate.write_json(os.path.join(out_dir, "meta.json"), meta_payload, indent=2)
 
 
 def _is_wrapped_or_distributed_model(model: torch.nn.Module) -> bool:
@@ -3238,8 +3238,6 @@ def predict(
                 else:
                     save_dcp = False
             elif strict and env_bool("ENN_PRED_SAVE_PT_ALSO_IF_STRICT", default=False):
-                save_pt = True
-            if getattr(model, "embedder", None) is not None:
                 save_pt = True
             dcp_dir = os.path.join(ckpt_dir, "dcp")
             if not (save_dcp or save_pt):
