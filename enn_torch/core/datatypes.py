@@ -104,7 +104,7 @@ def _canonical_dtype(src: Any) -> str:
             key = src.name
         case _:
             try:
-                key = numpy.dtype(src).name  # type: ignore
+                key = numpy.dtype(src).name
             except Exception:
                 key = str(src)
                 
@@ -318,9 +318,9 @@ def coerce_json(obj: object) -> JsonValue:
                 "device": str(obj.device),
             }
         case dict():
-            return {str(k): coerce_json(v) for k, v in obj.items()} # type: ignore
+            return {str(k): coerce_json(v) for k, v in obj.items()}
         case list() | tuple() | set():
-            return [coerce_json(v) for v in obj] # type: ignore
+            return [coerce_json(v) for v in obj]
         case _:
             return str(obj)
 
