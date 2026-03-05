@@ -7,7 +7,6 @@ import logging
 import os
 import shutil
 import tempfile
-import time
 from contextlib import suppress
 from functools import partial
 from pathlib import Path
@@ -39,7 +38,7 @@ from ..core.datatypes import (
     save_temp,
     write_json,
 )
-from ..core.system import Memory, is_accelerator_available
+from ..core.system import Memory
 from tensordict import (
     MemoryMappedTensor,
     PersistentTensorDict,
@@ -316,11 +315,6 @@ def _remove_safe(path: str) -> None:
         os.remove(path)
 
 
-def _node_state_key(node: Any, attr: str, fallback: str) -> str:
-    k = getattr(node, attr, None) or getattr(type(node), attr, None)
-    return k if isinstance(k, str) else fallback
-
-
 def _expand_multinode_sources(spec: Any) -> tuple[Any, bool]:
     if not (isinstance(spec, dict) and "path" in spec and "kind" in spec):
         return spec, False
@@ -340,94 +334,6 @@ def _expand_multinode_sources(spec: Any) -> tuple[Any, bool]:
             for v in payload
         ], True
     return spec, False
-
-
-def _is_accelerator_available() -> bool:
-    return any(is_accelerator_available(a) for a in ("cuda", "xpu", "mps"))
-
-
-def _device_guard_ok(device: torch.device, guard_bytes: int) -> bool:
-    if guard_bytes <= 0:
-        return True
-    try:
-        return (
-            free_b := Memory.mem_get_info(device)[0]
-        ) is None or free_b >= guard_bytes
-    except Exception:
-        return True
-
-
-def _host_guard_ok(guard_bytes: int) -> bool:
-    return (
-        guard_bytes <= 0
-        or getattr(Memory, "available", lambda: guard_bytes)() >= guard_bytes
-    )
-
-
-def _accel_event_poll_params() -> tuple[float, float, float]:
-    start_us = int(
-        env_first_int(
-            (
-                "ENN_ACCEL_EVENT_POLL_START_US",
-                "ENN_CUDA_EVENT_POLL_START_US",
-            ),
-            default=500,
-        )
-        or 500
-    )
-    max_ms = int(
-        env_first_int(
-            ("ENN_ACCEL_EVENT_POLL_MAX_MS", "ENN_CUDA_EVENT_POLL_MAX_MS"),
-            default=50,
-        )
-        or 50
-    )
-    stop_min_ms = int(
-        env_first_int(
-            (
-                "ENN_ACCEL_EVENT_POLL_STOP_MIN_MS",
-                "ENN_CUDA_EVENT_POLL_STOP_MIN_MS",
-            ),
-            default=5,
-        )
-        or 5
-    )
-    base_s = max(0.0, float(start_us) / 1_000_000.0)
-    max_s = max(base_s, float(max_ms) / 1000.0)
-    stop_min_s = max(0.0, float(stop_min_ms) / 1000.0)
-    return base_s, max_s, stop_min_s
-
-
-def _wait_accel_event_done(
-    ev: Any,
-    *args: Any,
-    stopped: Callable[[], bool] | None = None,
-    base_sleep_s: float | None = None,
-    max_sleep_s: float | None = None,
-    stop_min_sleep_s: float | None = None,
-) -> None:
-    stop_fn = stopped if stopped is not None else (lambda: False)
-    d_base, d_max, d_stop_min = _accel_event_poll_params()
-    base_sleep_s = base_sleep_s if base_sleep_s is not None else d_base
-    max_sleep_s = max_sleep_s if max_sleep_s is not None else d_max
-    stop_min_sleep_s = (
-        stop_min_sleep_s if stop_min_sleep_s is not None else d_stop_min
-    )
-    sleep_s = max(0.0, float(base_sleep_s))
-    max_s = max(sleep_s, float(max_sleep_s))
-    stop_min_s = max(0.0, float(stop_min_sleep_s))
-    while True:
-        try:
-            if ev.query():
-                return
-        except Exception:
-            with suppress(Exception):
-                ev.synchronize()
-            return
-        if stop_fn():
-            sleep_s = max(float(sleep_s), stop_min_s)
-        time.sleep(sleep_s)
-        sleep_s = min(float(sleep_s) * 2.0, max_s)
 
 
 def _preload_slice_any(
@@ -458,35 +364,6 @@ def _preload_gather_any_preconverted(
         return obj[idx_np if idx_np is not None else idx_cpu.numpy()]
     except Exception:
         return [obj[int(i)] for i in idx_cpu.tolist()]
-
-
-def _normalize_device_spec(
-    device: torch.device | str | Sequence[torch.device | str],
-) -> torch.device | list[torch.device]:
-    if isinstance(device, torch.device):
-        return device
-    if isinstance(device, str):
-        return torch.device(device)
-    if isinstance(device, Sequence) and not isinstance(
-        device, (str, bytes, bytearray)
-    ):
-        devs: list[torch.device] = []
-        for d in device:
-            devs.append(
-                d if isinstance(d, torch.device) else torch.device(str(d))
-            )
-        return devs if devs else torch.device("cpu")
-    return torch.device(device)
-
-
-def _primary_device(
-    device_spec: torch.device | list[torch.device],
-) -> torch.device:
-    return (
-        device_spec[0]
-        if isinstance(device_spec, list) and device_spec
-        else device_spec
-    )
 
 
 def _resolve_memmap_store_float(*args: Any, negotiable: bool) -> torch.dtype:
