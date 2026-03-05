@@ -4,7 +4,6 @@ from __future__ import annotations
 import importlib
 from types import ModuleType
 from typing import Any, TYPE_CHECKING
-
 if TYPE_CHECKING:
     from tensordict import TensorDictBase
 
