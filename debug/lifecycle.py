@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import contextlib
 import importlib
-import itertools
 import os
 import re
 import sys
@@ -295,6 +294,34 @@ def monitor_run(fn: Callable[[], T]) -> tuple[T, dict[str, object]]:
     }
 
 
+
+def _collect_single_feature_pair_dists(
+    x_np: np.ndarray, y_flat: np.ndarray
+) -> list[tuple[tuple[int, int], float]]:
+    key_to_idx: dict[tuple[int, ...], int] = {
+        tuple(map(int, row)): idx for idx, row in enumerate(x_np.astype(np.int64))
+    }
+    feature_values: list[list[int]] = [
+        sorted(np.unique(x_np[:, i].astype(np.int64)).tolist())
+        for i in range(x_np.shape[1])
+    ]
+    pair_dists: list[tuple[tuple[int, int], float]] = []
+    for i, row in enumerate(x_np.astype(np.int64)):
+        base_key = tuple(map(int, row))
+        for feat_idx, candidates in enumerate(feature_values):
+            cur_val = base_key[feat_idx]
+            for cand in candidates:
+                if cand == cur_val:
+                    continue
+                alt_key = list(base_key)
+                alt_key[feat_idx] = cand
+                j = key_to_idx.get(tuple(alt_key))
+                if j is None or i >= j:
+                    continue
+                dist = float(np.mean(np.abs(y_flat[i] - y_flat[j])))
+                pair_dists.append(((i, j), dist))
+    return pair_dists
+
 def summarize_x_y_distribution(
     td_train: TensorDict,
     group_keys: list[tuple[int, int, int]],
@@ -337,12 +364,7 @@ def summarize_x_y_distribution(
                 )
             )
 
-    pair_dists: list[tuple[tuple[int, int], float]] = []
-    for i, j in itertools.combinations(range(y_flat.shape[0]), 2):
-        if int(np.count_nonzero(x_np[i] != x_np[j])) != 1:
-            continue
-        dist = float(np.mean(np.abs(y_flat[i] - y_flat[j])))
-        pair_dists.append(((i, j), dist))
+    pair_dists = _collect_single_feature_pair_dists(x_np, y_flat)
 
     if pair_dists:
         pair_dists.sort(key=lambda x: x[1], reverse=True)
@@ -360,6 +382,70 @@ def summarize_x_y_distribution(
                     dist,
                 )
             )
+
+
+def summarize_inference_distribution(
+    y_true: torch.Tensor,
+    y_pred: torch.Tensor,
+    x: torch.Tensor,
+    s_orig: int,
+    t_orig: int,
+) -> None:
+    y_true_np = y_true.detach().cpu().numpy()[:, :s_orig, :t_orig]
+    y_pred_np = y_pred.detach().cpu().numpy()[:, :s_orig, :t_orig]
+    x_np = x.detach().cpu().numpy()
+
+    y_true_flat = y_true_np.reshape(y_true_np.shape[0], -1)
+    y_pred_flat = y_pred_np.reshape(y_pred_np.shape[0], -1)
+    mae_per_group = np.mean(np.abs(y_pred_flat - y_true_flat), axis=1)
+
+    print("[inference-analysis] Y(label) distribution on inference batches")
+    print(
+        "  true: mean=%.4f std=%.4f min=%.4f median=%.4f max=%.4f"
+        % (
+            float(np.mean(y_true_flat)),
+            float(np.std(y_true_flat)),
+            float(np.min(y_true_flat)),
+            float(np.median(y_true_flat)),
+            float(np.max(y_true_flat)),
+        )
+    )
+    print(
+        "  pred: mean=%.4f std=%.4f min=%.4f median=%.4f max=%.4f"
+        % (
+            float(np.mean(y_pred_flat)),
+            float(np.std(y_pred_flat)),
+            float(np.min(y_pred_flat)),
+            float(np.median(y_pred_flat)),
+            float(np.max(y_pred_flat)),
+        )
+    )
+
+    for i, name in enumerate(X_FEATURE_NAMES):
+        values = np.unique(x_np[:, i].astype(np.int64))
+        print(f"[inference-analysis] Y(label) by X.{name}")
+        grp_means: list[float] = []
+        for v in values.tolist():
+            mask = x_np[:, i] == v
+            y_grp = y_true_flat[mask]
+            grp_mean = float(np.mean(y_grp))
+            grp_means.append(grp_mean)
+            print(
+                "  X.%s=%d -> n=%d, true_mean=%.4f, true_std=%.4f, pred_mae=%.4f"
+                % (
+                    name,
+                    v,
+                    int(mask.sum()),
+                    grp_mean,
+                    float(np.std(y_grp)),
+                    float(np.mean(mae_per_group[mask])),
+                )
+            )
+        spread = max(grp_means) - min(grp_means) if grp_means else 0.0
+        print(
+            "  => X.%s group mean spread=%.4f (spread>0 이면 X에 따라 Y가 다름)"
+            % (name, spread)
+        )
 
 
 def main() -> None:
@@ -380,7 +466,9 @@ def main() -> None:
         f"Dataset built: B={B} groups, S_orig={S_orig}, T_orig={T_orig}, padded_grid={S}x{T}"
     )
     print(
-        f"td_train batch_size={td_train.batch_size}, X shape={tuple(td_train['X'].shape)}, Y shape={tuple(td_train['Y'].shape)}"
+        f"td_train batch_size={td_train.batch_size}, "
+        f"X shape={tuple(td_train['X'].shape)}, "
+        f"Y shape={tuple(td_train['Y'].shape)}"
     )
     summarize_x_y_distribution(td_train, info["group_keys"], S_orig, T_orig)
     device = get_device()
@@ -492,6 +580,13 @@ def main() -> None:
             float(Y_pred_t.mean().item()),
             float(Y_pred_t.std().item()),
         )
+    )
+    summarize_inference_distribution(
+        y_true=td_train["Y"],
+        y_pred=Y_pred_t,
+        x=td_train["X"],
+        s_orig=S_orig,
+        t_orig=T_orig,
     )
     if hasattr(pred_result, "close"):
         pred_result.close()
