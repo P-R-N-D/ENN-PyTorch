@@ -4413,7 +4413,7 @@ def infer(
                 )
             )
             partial_broadcast_match_default = (
-                0.98 if bool(_nogil_pred) else 0.90
+                0.95 if bool(_nogil_pred) else 0.90
             )
             partial_broadcast_match_frac = float(
                 env_float(
