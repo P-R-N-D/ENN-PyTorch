@@ -4280,7 +4280,8 @@ def infer(
                 or ""
             )
     _pred_compile_mode = str(_pred_compile_mode).strip().lower()
-    _td_cg_default = True
+    _nogil_pred = bool(CPU.is_no_gil_enforced())
+    _td_cg_default = not bool(_nogil_pred)
     if "no-cudagraph" in _pred_compile_mode:
         _td_cg_default = False
     td_cg_candidate = bool(
@@ -4397,23 +4398,33 @@ def infer(
             broadcast_probe_k = max(
                 2, int(env_int("ENN_PRED_BROADCAST_PROBE_K", 4) or 4)
             )
-            _dbg_diag_enabled = bool(env_bool("ENN_PRED_COLLAPSE_DIAG", default=False))
+            _dbg_diag_enabled = bool(
+                env_bool("ENN_PRED_COLLAPSE_DIAG", default=True)
+            )
             _dbg_raw_fallback = bool(
-                env_bool("ENN_PRED_COLLAPSE_FALLBACK_RAW", default=False)
+                env_bool("ENN_PRED_COLLAPSE_FALLBACK_RAW", default=True)
             )
             detect_partial_broadcast = bool(
                 env_bool(
                     "ENN_PRED_DETECT_PARTIAL_BROADCAST",
-                    default=bool(_dbg_diag_enabled or _dbg_raw_fallback),
+                    default=bool(
+                        _dbg_diag_enabled or _dbg_raw_fallback or _nogil_pred
+                    ),
                 )
             )
+            partial_broadcast_match_default = (
+                0.98 if bool(_nogil_pred) else 0.90
+            )
             partial_broadcast_match_frac = float(
-                env_float("ENN_PRED_PARTIAL_BROADCAST_MATCH_FRAC", 0.90)
+                env_float(
+                    "ENN_PRED_PARTIAL_BROADCAST_MATCH_FRAC",
+                    partial_broadcast_match_default,
+                )
             )
             partial_broadcast_force_single = bool(
                 env_bool(
                     "ENN_PRED_PARTIAL_BROADCAST_FORCE_SINGLE",
-                    default=bool(_dbg_raw_fallback),
+                    default=bool(_dbg_raw_fallback or _nogil_pred),
                 )
             )
             partial_broadcast_after_fix_match_frac = float(
@@ -4422,19 +4433,19 @@ def infer(
             partial_broadcast_force_uncompiled = bool(
                 env_bool(
                     "ENN_PRED_PARTIAL_BROADCAST_FORCE_UNCOMPILED",
-                    default=bool(_dbg_raw_fallback),
+                    default=bool(_dbg_raw_fallback or _nogil_pred),
                 )
             )
             partial_broadcast_force_eager = bool(
                 env_bool(
                     "ENN_PRED_PARTIAL_BROADCAST_FORCE_EAGER",
-                    default=bool(_dbg_raw_fallback),
+                    default=bool(_nogil_pred),
                 )
             )
             partial_broadcast_fp32_retry = bool(
                 env_bool(
                     "ENN_PRED_PARTIAL_BROADCAST_FP32_RETRY",
-                    default=bool(_dbg_raw_fallback),
+                    default=bool(_dbg_raw_fallback or _nogil_pred),
                 )
             )
             partial_broadcast_fp32_min_gain = float(
@@ -6562,6 +6573,7 @@ def infer(
                                     extra={
                                         "probe_kind": "always",
                                         "use_td_cg": bool(use_td_cg),
+                                        "nogil_active": bool(_nogil_pred),
                                         "mb": int(mb),
                                         "bs": int(bs),
                                     },

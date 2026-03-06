@@ -1573,7 +1573,27 @@ class Stream(BufferQueue):
                 hasattr(t, "is_pinned") and t.is_pinned()
             ):
                 return t
-            buf, tok = pool.get_like(t, return_handle=True, block=False)
+            pin_wait_ms = max(
+                0,
+                int(
+                    env_first_int(
+                        ("ENN_PREFETCH_PIN_POOL_WAIT_MS", "ENN_PIN_POOL_WAIT_MS"),
+                        default=(2 if CPU.is_optimized_for_no_gil() else 0),
+                    )
+                    or 0
+                ),
+            )
+            pin_wait_s = (
+                max(0.0, float(pin_wait_ms) / 1000.0)
+                if int(pin_wait_ms) > 0
+                else None
+            )
+            buf, tok = pool.get_like(
+                t,
+                return_handle=True,
+                block=bool(int(pin_wait_ms) > 0),
+                timeout=pin_wait_s,
+            )
             buf.copy_(t, non_blocking=False)
             tokens.append(tok)
             return buf
