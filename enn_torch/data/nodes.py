@@ -1621,6 +1621,34 @@ class Stream(BufferQueue):
         tokens: list[Optional[TensorPagePool.Token]] = []
         return self._stage_with_pool(x, pool, tokens), tokens
 
+    def _release_pool_tokens(
+        self: Self,
+        tokens: list[Optional[TensorPagePool.Token]],
+        wait_event: object | None = None,
+    ) -> None:
+        pool = self._host_pool
+        if pool is None or not tokens:
+            return
+        if wait_event is not None:
+            for tok in tokens:
+                with suppress(Exception):
+                    pool.release_after(tok, wait_event)
+        else:
+            for tok in tokens:
+                with suppress(Exception):
+                    pool.release(tok)
+
+    def _recycle_producer_event(
+        self: Self,
+        ev: object | None,
+        pool: queue.SimpleQueue | None,
+    ) -> None:
+        if ev is None or pool is None:
+            return
+        _wait_accel_event_done(ev, stopped=self.is_stopped)
+        with suppress(Exception):
+            pool.put(ev)
+
     def _producer_loop(
         self: Self,
         iterable: Any,
@@ -1675,6 +1703,9 @@ class Stream(BufferQueue):
                     if self.is_stopped():
                         break
                 batch, pool_tokens = self._pin_batch(batch)
+                if self.is_stopped():
+                    self._release_pool_tokens(pool_tokens)
+                    break
                 if use_device:
                     if use_accel_stream and self._accel_stream is not None:
                         ev = None
@@ -1685,6 +1716,10 @@ class Stream(BufferQueue):
                                     ev = pool.get(timeout=0.05)
                                 except queue.Empty:
                                     continue
+                        if self.is_stopped():
+                            self._release_pool_tokens(pool_tokens)
+                            self._recycle_producer_event(ev, pool)
+                            break
                         if ev is not None:
                             _wait_accel_event_done(ev, stopped=self.is_stopped)
                         try:
@@ -1697,39 +1732,26 @@ class Stream(BufferQueue):
                                         ev.record(self._accel_stream)
                                     except TypeError:
                                         ev.record()
-                            if self._host_pool is not None and pool_tokens:
-                                if ev is not None:
-                                    for tok in pool_tokens:
-                                        self._host_pool.release_after(tok, ev)
-                                else:
-                                    for tok in pool_tokens:
-                                        self._host_pool.release(tok)
+                            self._release_pool_tokens(pool_tokens, ev)
                             if not self.put((batch_dev, ev), timeout=None):
-                                if ev is not None and pool is not None:
-                                    _wait_accel_event_done(
-                                        ev, stopped=self.is_stopped
-                                    )
-                                    with suppress(Exception):
-                                        pool.put(ev)
+                                self._recycle_producer_event(ev, pool)
                                 break
                         except BaseException:
-                            if self._host_pool is not None and pool_tokens:
-                                for tok in pool_tokens:
-                                    with suppress(Exception):
-                                        self._host_pool.release(tok)
-                            if ev is not None and pool is not None:
-                                _wait_accel_event_done(
-                                    ev, stopped=self.is_stopped
-                                )
-                                with suppress(Exception):
-                                    pool.put(ev)
+                            self._release_pool_tokens(pool_tokens)
+                            self._recycle_producer_event(ev, pool)
                             raise
                     else:
-                        batch_dev = self._to_device(batch, device)
+                        try:
+                            batch_dev = self._to_device(batch, device)
+                        except BaseException:
+                            self._release_pool_tokens(pool_tokens)
+                            raise
+                        self._release_pool_tokens(pool_tokens)
                         if not self.put((batch_dev, None), timeout=None):
                             break
                 else:
                     if not self.put((batch, None), timeout=None):
+                        self._release_pool_tokens(pool_tokens)
                         break
         except BaseException as exc:
             with suppress(Exception):
@@ -1810,6 +1832,16 @@ class Stream(BufferQueue):
                 self._accel_event_pool = None
                 self._accel_stream = None
 
+        def _drain_thread_queue() -> None:
+            while True:
+                try:
+                    item = self.get(block=False)
+                except queue.Empty:
+                    break
+                if isinstance(item, tuple) and len(item) == 2:
+                    _batch, ev = item
+                    self._recycle_producer_event(ev, self._accel_event_pool)
+
         def _wait_guards() -> None:
             nonlocal last_check_t, last_guards_ok
             if not self._backpressure:
@@ -1881,7 +1913,14 @@ class Stream(BufferQueue):
                             self._host_pool.release(tok)
                 return batch_dev, None
 
-        if bool(getattr(self, "_prefetch_thread", False)):
+        threaded_prefetch = bool(
+            getattr(self, "_prefetch_thread", False)
+            and use_device
+            and use_accel_stream
+            and self._accel_stream is not None
+        )
+
+        if threaded_prefetch:
             sentinel = object()
             prod_fn = new_thread(
                 lambda: self._producer_loop(
@@ -1926,12 +1965,14 @@ class Stream(BufferQueue):
                     yield batch
             finally:
                 self.stop()
+                _drain_thread_queue()
                 with suppress(Exception):
                     producer.join(
                         timeout=float(
                             getattr(self, "_join_timeout_s", 0.5) or 0.5
                         )
                     )
+                _drain_thread_queue()
                 _drain_accel_pool()
             return
 
