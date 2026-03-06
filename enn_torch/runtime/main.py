@@ -86,6 +86,7 @@ from ..data import collate
 from ..data.collate import Unsharder, warmup_scaler_stats as _warmup_scaler_stats
 from ..data.pipeline import Dataset, get_batch_length as _get_batch_length
 from ..nn.graph import (
+    _is_compiled_for_inference,
     canonicalize_compile_mode,
     compile_distributed_safe,
     compile_safe,
@@ -4246,11 +4247,35 @@ def infer(
             cur = next_m
         return cur
 
+    def _has_explicit_uncompiled_shadow(m: torch.nn.Module) -> bool:
+        cur = m
+        seen: set[int] = set()
+        for _ in range(16):
+            cur_id = id(cur)
+            if cur_id in seen:
+                break
+            seen.add(cur_id)
+            for attr in ("_orig_mod", "_original_module", "_uncompiled_module"):
+                cand = getattr(cur, attr, None)
+                if isinstance(cand, torch.nn.Module) and cand is not cur:
+                    return True
+            child = getattr(cur, "module", None)
+            if not isinstance(child, torch.nn.Module) or child is cur:
+                break
+            cur = child
+        return False
+
+    _pred_has_compiled_shadow = bool(_has_explicit_uncompiled_shadow(run_model))
     run_model_uncompiled_base = _unwrap_uncompiled_model_handle(run_model)
     run_model_uncompiled = (
         to_submodule(run_model_uncompiled_base) or run_model_uncompiled_base
     )
-    if run_model_uncompiled is not run_model:
+    pred_uncompiled_available = bool(
+        _pred_has_compiled_shadow
+        and isinstance(run_model_uncompiled, torch.nn.Module)
+        and (run_model_uncompiled is not run_model)
+    )
+    if pred_uncompiled_available:
         with contextlib.suppress(Exception):
             run_model_uncompiled.eval()
 
@@ -4279,8 +4304,44 @@ def infer(
                 or getattr(model, "_enn_compile_requested_mode", "")
                 or ""
             )
-    _pred_compile_mode = str(_pred_compile_mode).strip().lower()
+    _pred_compile_mode = canonicalize_compile_mode(
+        str(_pred_compile_mode).strip().lower()
+    )
+    _pred_compile_enabled = bool(
+        _pred_compile_mode not in ("disabled", "eager", "aot-eager")
+    )
+    _pred_model_compiled = False
+    with contextlib.suppress(Exception):
+        _pred_model_compiled = bool(_is_compiled_for_inference(run_model))
     _nogil_pred = bool(CPU.is_no_gil_enforced())
+    _nogil_compiled_pred = bool(
+        _nogil_pred
+        and (
+            bool(_pred_has_compiled_shadow)
+            or bool(_pred_model_compiled)
+            or bool(cg_enabled)
+        )
+    )
+    pred_nogil_safe_mode = bool(
+        env_bool(
+            "ENN_PRED_NOGIL_SAFE_MODE",
+            default=bool(_nogil_compiled_pred),
+        )
+    )
+    if bool(pred_nogil_safe_mode) and bool(_nogil_compiled_pred):
+        prev_force_eager = bool(force_eager)
+        prev_force_uncompiled = bool(force_uncompiled)
+        force_eager = True
+        if bool(pred_uncompiled_available):
+            force_uncompiled = True
+        if (not prev_force_eager) or (bool(force_uncompiled) != bool(prev_force_uncompiled)):
+            _LOGGER.warning(
+                "[infer] no-GIL prediction safe mode enabled; forcing eager%s for correctness. "
+                "Set ENN_PRED_NOGIL_SAFE_MODE=0 to opt back into compiled prediction.",
+                "+uncompiled"
+                if bool(pred_uncompiled_available)
+                else "",
+            )
     _td_cg_default = not bool(_nogil_pred)
     if "no-cudagraph" in _pred_compile_mode:
         _td_cg_default = False
@@ -5906,11 +5967,7 @@ def infer(
                     except Exception as e:
                         diag["Y_raw_error"] = f"{type(e).__name__}: {e}"
                     try:
-                        if (
-                            bool(force_uncompiled)
-                            and (run_model_uncompiled is not None)
-                            and (run_model_uncompiled is not run_model)
-                        ):
+                        if bool(force_uncompiled) and bool(pred_uncompiled_available):
                             out_uc = run_model_uncompiled(
                                 Xi2, calibrate_output=True, return_loss=False
                             )
@@ -5993,15 +6050,8 @@ def infer(
                     if callable(cand) and getattr(cand, "__name__", "") == "disable":
                         _pred_disable_decorator = cand
 
-            def _run_model_predict(x: torch.Tensor):
-                return run_model(
-                    x,
-                    calibrate_output=bool(calibrate_pred_output),
-                    return_loss=False,
-                )
-
             def _select_pred_model(use_uncompiled: bool) -> torch.nn.Module:
-                if bool(use_uncompiled) and (run_model_uncompiled is not run_model):
+                if bool(use_uncompiled) and bool(pred_uncompiled_available):
                     return run_model_uncompiled
                 return run_model
 
@@ -6015,15 +6065,10 @@ def infer(
                 nonlocal force_uncompiled, force_eager
 
                 def _invoke_predict(mm: torch.nn.Module):
-                    ctx = (
-                        eager_ctx_factory()
-                        if (force_eager and callable(eager_ctx_factory))
-                        else contextlib.nullcontext()
-                    )
-                    with ctx:
+                    def _call_model(xx: torch.Tensor):
                         if bool(force_fp32) or bool(collapse_fp32_active):
                             with StatelessAutocast.suspend(device):
-                                x_fp32 = x
+                                x_fp32 = xx
                                 if (
                                     torch.is_tensor(x_fp32)
                                     and x_fp32.dtype != torch.float32
@@ -6035,10 +6080,22 @@ def infer(
                                     return_loss=False,
                                 )
                         return mm(
-                            x,
+                            xx,
                             calibrate_output=bool(calibrate_output),
                             return_loss=False,
                         )
+
+                    ctx = (
+                        eager_ctx_factory()
+                        if (force_eager and callable(eager_ctx_factory))
+                        else contextlib.nullcontext()
+                    )
+                    with ctx:
+                        if force_eager and callable(_pred_disable_decorator):
+                            wrapped = _pred_disable_decorator(_call_model)
+                            if callable(wrapped):
+                                return wrapped(x)
+                        return _call_model(x)
 
                 m = _select_pred_model(bool(use_uncompiled))
                 try:
@@ -6111,10 +6168,7 @@ def infer(
                         force_eager = True
                         mm_fb = (
                             run_model_uncompiled
-                            if (
-                                run_model_uncompiled is not None
-                                and run_model_uncompiled is not run_model
-                            )
+                            if bool(pred_uncompiled_available)
                             else m
                         )
                         return _invoke_predict(mm_fb)
@@ -6144,10 +6198,7 @@ def infer(
                         force_eager = True
                         mm_fb = (
                             run_model_uncompiled
-                            if (
-                                run_model_uncompiled is not None
-                                and run_model_uncompiled is not run_model
-                            )
+                            if bool(pred_uncompiled_available)
                             else m
                         )
                         return _invoke_predict(mm_fb)
@@ -6168,7 +6219,7 @@ def infer(
                         continue
                     if (
                         (cand is run_model)
-                        and (run_model_uncompiled is not run_model)
+                        and bool(pred_uncompiled_available)
                         and (not bool(cast_compiled))
                     ):
                         continue
@@ -6194,13 +6245,6 @@ def infer(
                         return False
                     raise
 
-            _run_model_predict_disabled = None
-            if callable(_pred_disable_decorator):
-                with contextlib.suppress(Exception):
-                    wrapped = _pred_disable_decorator(_run_model_predict)
-                    if callable(wrapped):
-                        _run_model_predict_disabled = wrapped
-
             def _td_predict(
                 x: torch.Tensor,
                 *,
@@ -6208,38 +6252,21 @@ def infer(
                 use_uncompiled: bool | None = None,
                 force_fp32: bool = False,
             ) -> torch.Tensor:
-                ctx = (
-                    eager_ctx_factory()
-                    if (force_eager and callable(eager_ctx_factory))
-                    else contextlib.nullcontext()
-                )
                 uc = (
                     bool(force_uncompiled)
                     if use_uncompiled is None
                     else bool(use_uncompiled)
                 )
-                with ctx:
-                    if (
-                        force_eager
-                        and callable(_run_model_predict_disabled)
-                        and calibrate_output is None
-                        and use_uncompiled is None
-                        and (not force_fp32)
-                    ):
-                        out = _run_model_predict_disabled(x)
-                    elif calibrate_output is not None:
-                        out = _run_model_predict_with_calibration(
-                            x,
-                            calibrate_output=bool(calibrate_output),
-                            use_uncompiled=uc,
-                            force_fp32=bool(force_fp32),
-                        )
-                    else:
-                        out = _run_model_predict_with_calibration(
-                            x,
-                            calibrate_output=bool(calibrate_pred_output),
-                            use_uncompiled=uc,
-                        )
+                out = _run_model_predict_with_calibration(
+                    x,
+                    calibrate_output=(
+                        bool(calibrate_pred_output)
+                        if calibrate_output is None
+                        else bool(calibrate_output)
+                    ),
+                    use_uncompiled=uc,
+                    force_fp32=bool(force_fp32),
+                )
                 if isinstance(out, tuple):
                     out = out[0]
                 if not isinstance(out, torch.Tensor):
@@ -6574,6 +6601,15 @@ def infer(
                                         "probe_kind": "always",
                                         "use_td_cg": bool(use_td_cg),
                                         "nogil_active": bool(_nogil_pred),
+                                        "pred_nogil_safe_mode": bool(pred_nogil_safe_mode),
+                                        "pred_compile_mode": str(_pred_compile_mode),
+                                        "pred_compile_enabled": bool(_pred_compile_enabled),
+                                        "pred_model_compiled": bool(_pred_model_compiled),
+                                        "pred_has_compiled_shadow": bool(_pred_has_compiled_shadow),
+                                        "pred_uncompiled_available": bool(pred_uncompiled_available),
+                                        "nogil_compiled_pred": bool(_nogil_compiled_pred),
+                                        "force_eager": bool(force_eager),
+                                        "force_uncompiled": bool(force_uncompiled),
                                         "mb": int(mb),
                                         "bs": int(bs),
                                     },
@@ -7716,10 +7752,7 @@ def infer(
                                                     (not collapse_switched_uncompiled)
                                                     and bool(collapse_force_uncompiled)
                                                     and (not bool(force_uncompiled))
-                                                    and (
-                                                        run_model_uncompiled
-                                                        is not run_model
-                                                    )
+                                                    and bool(pred_uncompiled_available)
                                                 ):
                                                     collapse_switched_uncompiled = True
                                                     _LOGGER.warning(
