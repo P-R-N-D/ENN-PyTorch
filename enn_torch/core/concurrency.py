@@ -1425,8 +1425,27 @@ def pool_tensor(
             return tensor, None, True
 
     if cpu_pool is not None and bool(pinned_ok):
+        pin_wait_ms = max(
+            0,
+            int(
+                env_first_int(
+                    ("ENN_RUNTIME_PIN_POOL_WAIT_MS", "ENN_PIN_POOL_WAIT_MS"),
+                    default=(2 if CPU.is_optimized_for_no_gil() else 0),
+                )
+                or 0
+            ),
+        )
+        pin_wait_s = (
+            max(0.0, float(pin_wait_ms) / 1000.0)
+            if int(pin_wait_ms) > 0
+            else None
+        )
         buf, token = cpu_pool.get(
-            tuple(tensor.shape), dtype, return_handle=True
+            tuple(tensor.shape),
+            dtype,
+            return_handle=True,
+            block=bool(int(pin_wait_ms) > 0),
+            timeout=pin_wait_s,
         )
         buf.copy_(tensor, non_blocking=False)
         pinned = False
