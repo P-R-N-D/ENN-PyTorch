@@ -810,22 +810,22 @@ def export_and_validate(
                     torch_np = _to_numpy_materialized(torch_out)
                     validation["pt2_mae"] = float(np.mean(np.abs(pt2_np - torch_np)))
                     validation["pt2_out_stats"] = _stats_np(pt2_np)
-                    with torch.no_grad():
-                        full_x = td_train["X"].to(sample.device)
-                        pt2_full = (
-                            extract_tensor(ep.module()(full_x))
-                            .detach()
-                            .cpu()
-                            .numpy()
+                    try:
+                        with torch.no_grad():
+                            full_x = td_train["X"].to(sample.device)
+                            pt2_full = _to_numpy_materialized(ep.module()(full_x))
+                        y_true = td_train["Y"].detach().cpu().numpy()
+                        if s_orig is not None and t_orig is not None:
+                            y_true = y_true[:, :s_orig, :t_orig]
+                            pt2_full = pt2_full[:, :s_orig, :t_orig]
+                        x_full = td_train["X"].detach().cpu().numpy()
+                        validation["pt2_inference_label_distribution"] = (
+                            _inference_label_distribution_by_x(x_full, y_true, pt2_full)
                         )
-                    y_true = td_train["Y"].detach().cpu().numpy()
-                    if s_orig is not None and t_orig is not None:
-                        y_true = y_true[:, :s_orig, :t_orig]
-                        pt2_full = pt2_full[:, :s_orig, :t_orig]
-                    x_full = td_train["X"].detach().cpu().numpy()
-                    validation["pt2_inference_label_distribution"] = (
-                        _inference_label_distribution_by_x(x_full, y_true, pt2_full)
-                    )
+                    except Exception as dist_exc:
+                        validation["pt2_inference_label_distribution_error"] = repr(
+                            dist_exc
+                        )
                 except Exception as conv_exc:
                     validation["pt2_error"] = repr(conv_exc)
                     validation["pt2_out_repr"] = repr(pt2_out)
