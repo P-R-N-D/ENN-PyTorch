@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import argparse
 import contextlib
-import itertools
 import json
 import os
 import re
@@ -105,6 +104,81 @@ def _stats_np(arr: np.ndarray) -> dict[str, float | list[int]]:
     }
 
 
+def _distribution_summary(arr: np.ndarray) -> dict[str, float | list[int]]:
+    arr = np.asarray(arr)
+    return {
+        "shape": list(arr.shape),
+        "min": float(arr.min()),
+        "max": float(arr.max()),
+        "mean": float(arr.mean()),
+        "std": float(arr.std()),
+        "median": float(np.median(arr)),
+    }
+
+
+def _inference_label_distribution_by_x(
+    x_np: np.ndarray,
+    y_true_np: np.ndarray,
+    y_pred_np: np.ndarray,
+) -> dict[str, Any]:
+    y_true_flat = y_true_np.reshape(y_true_np.shape[0], -1)
+    y_pred_flat = y_pred_np.reshape(y_pred_np.shape[0], -1)
+    mae = np.mean(np.abs(y_pred_flat - y_true_flat), axis=1)
+    out: dict[str, Any] = {
+        "true_global": _distribution_summary(y_true_flat),
+        "pred_global": _distribution_summary(y_pred_flat),
+        "features": {},
+    }
+    features: dict[str, Any] = {}
+    for i, name in enumerate(_X_FEATURE_NAMES):
+        vals = np.unique(x_np[:, i].astype(np.int64))
+        groups: dict[str, Any] = {}
+        means: list[float] = []
+        for v in vals.tolist():
+            mask = x_np[:, i] == v
+            yy = y_true_flat[mask]
+            means.append(float(np.mean(yy)))
+            groups[str(int(v))] = {
+                "n": int(mask.sum()),
+                "true_mean": float(np.mean(yy)),
+                "true_std": float(np.std(yy)),
+                "pred_mae": float(np.mean(mae[mask])),
+            }
+        spread = float(max(means) - min(means)) if means else 0.0
+        features[name] = {
+            "groups": groups,
+            "group_mean_spread": spread,
+            "y_differs_by_x": bool(spread > 0.0),
+        }
+    out["features"] = features
+    return out
+
+
+
+def _single_feature_pair_diffs(x_np: np.ndarray, y_flat: np.ndarray) -> np.ndarray:
+    key_to_idx: dict[tuple[int, ...], int] = {
+        tuple(map(int, row)): idx for idx, row in enumerate(x_np.astype(np.int64))
+    }
+    feature_values: list[list[int]] = [
+        sorted(np.unique(x_np[:, i].astype(np.int64)).tolist())
+        for i in range(x_np.shape[1])
+    ]
+    diffs: list[float] = []
+    for i, row in enumerate(x_np.astype(np.int64)):
+        base_key = tuple(map(int, row))
+        for feat_idx, candidates in enumerate(feature_values):
+            cur_val = base_key[feat_idx]
+            for cand in candidates:
+                if cand == cur_val:
+                    continue
+                alt_key = list(base_key)
+                alt_key[feat_idx] = cand
+                j = key_to_idx.get(tuple(alt_key))
+                if j is None or i >= j:
+                    continue
+                diffs.append(float(np.mean(np.abs(y_flat[i] - y_flat[j]))))
+    return np.asarray(diffs, dtype=np.float64)
+
 def _label_variation_by_x(td_train: TensorDict) -> dict[str, Any]:
     x = td_train["X"].detach().cpu().numpy()
     y = td_train["Y"].detach().cpu().numpy()
@@ -121,20 +195,15 @@ def _label_variation_by_x(td_train: TensorDict) -> dict[str, Any]:
             stats[f"{int(v)}_n"] = float(int(mask.sum()))
         by_x[name] = stats
 
-    pair_diffs: list[float] = []
-    for i, j in itertools.combinations(range(int(y_flat.shape[0])), 2):
-        if int(np.count_nonzero(x[i] != x[j])) != 1:
-            continue
-        pair_diffs.append(float(np.mean(np.abs(y_flat[i] - y_flat[j]))))
+    pair_diffs = _single_feature_pair_diffs(x, y_flat)
     out: dict[str, Any] = {
         "by_x": by_x,
-        "pairs_diff_x_eq_1_count": int(len(pair_diffs)),
+        "pairs_diff_x_eq_1_count": int(pair_diffs.size),
     }
-    if pair_diffs:
-        arr = np.asarray(pair_diffs, dtype=np.float64)
-        out["pairs_diff_x_eq_1_mean_abs_y_diff"] = float(arr.mean())
-        out["pairs_diff_x_eq_1_p90_abs_y_diff"] = float(np.percentile(arr, 90))
-        out["pairs_diff_x_eq_1_max_abs_y_diff"] = float(arr.max())
+    if pair_diffs.size > 0:
+        out["pairs_diff_x_eq_1_mean_abs_y_diff"] = float(pair_diffs.mean())
+        out["pairs_diff_x_eq_1_p90_abs_y_diff"] = float(np.percentile(pair_diffs, 90))
+        out["pairs_diff_x_eq_1_max_abs_y_diff"] = float(pair_diffs.max())
     return out
 
 
@@ -610,6 +679,9 @@ def export_and_validate(
     sample: torch.Tensor,
     td_train: TensorDict,
     out_dir: Path,
+    *,
+    s_orig: int | None = None,
+    t_orig: int | None = None,
 ) -> dict[str, Any]:
     out_dir.mkdir(parents=True, exist_ok=True)
     warnings.filterwarnings(
@@ -738,6 +810,22 @@ def export_and_validate(
                     torch_np = _to_numpy_materialized(torch_out)
                     validation["pt2_mae"] = float(np.mean(np.abs(pt2_np - torch_np)))
                     validation["pt2_out_stats"] = _stats_np(pt2_np)
+                    with torch.no_grad():
+                        full_x = td_train["X"].to(sample.device)
+                        pt2_full = (
+                            extract_tensor(ep.module()(full_x))
+                            .detach()
+                            .cpu()
+                            .numpy()
+                        )
+                    y_true = td_train["Y"].detach().cpu().numpy()
+                    if s_orig is not None and t_orig is not None:
+                        y_true = y_true[:, :s_orig, :t_orig]
+                        pt2_full = pt2_full[:, :s_orig, :t_orig]
+                    x_full = td_train["X"].detach().cpu().numpy()
+                    validation["pt2_inference_label_distribution"] = (
+                        _inference_label_distribution_by_x(x_full, y_true, pt2_full)
+                    )
                 except Exception as conv_exc:
                     validation["pt2_error"] = repr(conv_exc)
                     validation["pt2_out_repr"] = repr(pt2_out)
@@ -775,11 +863,13 @@ def export_and_validate(
     onnx_res = results.get("onnx", {})
     if isinstance(onnx_res, dict) and onnx_res.get("status") == "error":
         err = str(onnx_res.get("error", ""))
-        if _should_run_draft(err):
-            if os.environ.get("ENN_ONNX_DRAFT_EXPORT", "1") != "0":
-                validation["onnx_draft_export"] = _draft_export_diagnostics(
-                    model, sample
-                )
+        if (
+            _should_run_draft(err)
+            and os.environ.get("ENN_ONNX_DRAFT_EXPORT", "1") != "0"
+        ):
+            validation["onnx_draft_export"] = _draft_export_diagnostics(
+                model, sample
+            )
     for name in ("onnx", "ort"):
         path = targets[name]
         if path.exists():
@@ -796,6 +886,20 @@ def export_and_validate(
                         {inp_name: sample.detach().cpu().numpy().astype(np.float32)},
                     )[0]
                     validation[f"{name}_out_stats"] = _stats_np(out)
+
+                    full_x_np = td_train["X"].detach().cpu().numpy().astype(np.float32)
+                    full_out = sess.run(None, {inp_name: full_x_np})[0]
+                    y_true = td_train["Y"].detach().cpu().numpy()
+                    if s_orig is not None and t_orig is not None:
+                        y_true = y_true[:, :s_orig, :t_orig]
+                        full_out = full_out[:, :s_orig, :t_orig]
+                    validation[f"{name}_inference_label_distribution"] = (
+                        _inference_label_distribution_by_x(
+                            td_train["X"].detach().cpu().numpy(),
+                            y_true,
+                            full_out,
+                        )
+                    )
                 except Exception as exc:
                     validation[f"{name}_error"] = repr(exc)
     return {"exports": results, "validation": validation}
@@ -835,7 +939,14 @@ def main() -> None:
         max_nodes=1,
     )
     model.eval()
-    stats = export_and_validate(model, sample, td_train, Path("export_artifacts"))
+    stats = export_and_validate(
+        model,
+        sample,
+        td_train,
+        Path("export_artifacts"),
+        s_orig=data.get("S_orig"),
+        t_orig=data.get("T_orig"),
+    )
 
     def _json_default(o: object) -> object:
         if isinstance(o, bytes):
