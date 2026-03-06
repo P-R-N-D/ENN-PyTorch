@@ -1478,6 +1478,16 @@ class Stream(BufferQueue):
                 or 500
             )
             self._join_timeout_s = max(0.0, float(jt_ms) / 1000.0)
+        self._prefetch_thread = bool(
+            env_bool(
+                "ENN_PREFETCH_THREAD",
+                default=bool(
+                    use_accel
+                    and self._non_blocking
+                    and CPU.is_optimized_for_no_gil()
+                ),
+            )
+        )
 
     def _spawn_session(self: Self) -> "Stream":
         return Stream(
@@ -1775,6 +1785,35 @@ class Stream(BufferQueue):
         last_check_t = 0.0
         last_guards_ok = True
 
+        def _recycle_event(ev: object | None) -> None:
+            if not (use_accel_stream and ev is not None):
+                return
+            cs = current_accelerator_stream(device)
+            if cs is not None:
+                with suppress(Exception):
+                    cs.wait_event(ev)
+                with suppress(Exception):
+                    try:
+                        ev.record(cs)
+                    except TypeError:
+                        ev.record()
+            pool = self._accel_event_pool
+            if pool is not None:
+                with suppress(Exception):
+                    pool.put(ev)
+
+        def _drain_accel_pool() -> None:
+            pool = self._accel_event_pool
+            if use_accel_stream and pool is not None:
+                while True:
+                    try:
+                        ev = pool.get_nowait()
+                    except queue.Empty:
+                        break
+                    _wait_accel_event_done(ev, stopped=self.is_stopped)
+                self._accel_event_pool = None
+                self._accel_stream = None
+
         def _wait_guards() -> None:
             nonlocal last_check_t, last_guards_ok
             if not self._backpressure:
@@ -1846,6 +1885,60 @@ class Stream(BufferQueue):
                             self._host_pool.release(tok)
                 return batch_dev, None
 
+        if bool(getattr(self, "_prefetch_thread", False)):
+            sentinel = object()
+            prod_fn = new_thread(
+                lambda: self._producer_loop(
+                    iterable,
+                    sentinel,
+                    device=device,
+                    use_device=use_device,
+                    use_accel_stream=use_accel_stream,
+                    gpu_guard_bytes=gpu_guard_bytes,
+                    host_guard_bytes=host_guard_bytes,
+                ),
+                io_workers=max(1, int(getattr(self, "_depth", 2) or 2)),
+            )
+            producer = threading.Thread(
+                target=prod_fn,
+                name="ENNStreamProducer",
+                daemon=True,
+            )
+            producer.start()
+            try:
+                while True:
+                    try:
+                        item = self.get(timeout=0.05)
+                    except queue.Empty:
+                        if (not producer.is_alive()) and self.empty():
+                            break
+                        continue
+                    if item is sentinel:
+                        break
+                    if isinstance(item, ProducerError):
+                        tb = str(getattr(item, "tb", "") or "")
+                        exc = getattr(
+                            item,
+                            "exc",
+                            RuntimeError("Stream producer failed"),
+                        )
+                        if tb:
+                            _LOGGER.error("Stream producer failed:\n%s", tb)
+                        raise exc
+                    batch, ev = item
+                    _recycle_event(ev)
+                    yield batch
+            finally:
+                self.stop()
+                with suppress(Exception):
+                    producer.join(
+                        timeout=float(
+                            getattr(self, "_join_timeout_s", 0.5) or 0.5
+                        )
+                    )
+                _drain_accel_pool()
+            return
+
         buf = collections.deque()
 
         src_it = iter(iterable)
@@ -1868,22 +1961,7 @@ class Stream(BufferQueue):
             while buf:
                 batch, ev = buf.popleft()
 
-                if use_accel_stream and ev is not None:
-                    cs = current_accelerator_stream(device)
-                    if cs is not None:
-                        with suppress(Exception):
-                            cs.wait_event(ev)
-
-                        with suppress(Exception):
-                            try:
-                                ev.record(cs)
-                            except TypeError:
-                                ev.record()
-                    pool = self._accel_event_pool
-                    if pool is not None:
-                        with suppress(Exception):
-                            pool.put(ev)
-
+                _recycle_event(ev)
                 yield batch
 
                 try:
@@ -1895,13 +1973,4 @@ class Stream(BufferQueue):
             self.stop()
             with suppress(Exception):
                 close(src_it)
-            pool = self._accel_event_pool
-            if use_accel_stream and pool is not None:
-                while True:
-                    try:
-                        ev = pool.get_nowait()
-                    except queue.Empty:
-                        break
-                    _wait_accel_event_done(ev, stopped=self.is_stopped)
-                self._accel_event_pool = None
-                self._accel_stream = None
+            _drain_accel_pool()
