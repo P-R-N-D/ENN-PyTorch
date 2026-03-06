@@ -105,7 +105,7 @@ def _embedding_to_spec(embedding: object | None) -> Mapping[str, Any] | None:
 
 def _embedding_from_meta(
     meta: Mapping[str, Any] | None,
-    *,
+    *args: Any,
     in_dim: int,
 ) -> Embedding | None:
     if not isinstance(meta, Mapping):
