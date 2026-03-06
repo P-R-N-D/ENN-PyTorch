@@ -1659,7 +1659,6 @@ class Stream(BufferQueue):
                     break
                 if self.is_stopped():
                     break
-                batch, pool_tokens = self._pin_batch(batch)
                 if self._backpressure:
                     sleep_s = 0.001
                     while not self.is_stopped():
@@ -1674,11 +1673,8 @@ class Stream(BufferQueue):
                         time.sleep(sleep_s)
                         sleep_s = min(float(sleep_s) * 2.0, 0.05)
                     if self.is_stopped():
-                        if self._host_pool is not None and pool_tokens:
-                            for tok in pool_tokens:
-                                with suppress(Exception):
-                                    self._host_pool.release(tok)
                         break
+                batch, pool_tokens = self._pin_batch(batch)
                 if use_device:
                     if use_accel_stream and self._accel_stream is not None:
                         ev = None
