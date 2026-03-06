@@ -908,9 +908,10 @@ class _PoolEntry:
     gen: int = 0
 
 
+@dataclass(slots=True)
 class ProducerError:
     exc: BaseException
-    tb: str
+    tb: str = ""
 
 
 class Affinity:
