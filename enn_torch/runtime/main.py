@@ -4279,13 +4279,18 @@ def infer(
                 or getattr(model, "_enn_compile_requested_mode", "")
                 or ""
             )
-    _pred_compile_mode = str(_pred_compile_mode).strip().lower()
+    _pred_compile_mode = canonicalize_compile_mode(
+        str(_pred_compile_mode).strip().lower()
+    )
+    _pred_compile_enabled = bool(
+        _pred_compile_mode not in ("disabled", "eager", "aot-eager")
+    )
     _nogil_pred = bool(CPU.is_no_gil_enforced())
     _nogil_compiled_pred = bool(
         _nogil_pred
         and (
             (run_model_uncompiled is not run_model)
-            or bool(_pred_compile_mode)
+            or bool(_pred_compile_enabled)
             or bool(cg_enabled)
         )
     )
