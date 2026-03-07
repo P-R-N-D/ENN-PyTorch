@@ -13,6 +13,7 @@ import threading
 import time
 import traceback
 from contextlib import suppress
+from dataclasses import dataclass
 from typing import (
     Any,
     Callable,
@@ -61,6 +62,18 @@ from torchdata.nodes import (
     SamplerWrapper,
 )
 _LOGGER = logging.getLogger(__name__)
+
+
+@dataclass(slots=True)
+class _PinnedBatchItem:
+    batch: Any
+    pool_tokens: tuple[Optional[TensorPagePool.Token], ...]
+
+
+@dataclass(slots=True)
+class _DeviceBatchItem:
+    batch: Any
+    ev: object | None
 
 
 def _node_state_key(node: Any, attr: str, fallback: str) -> str:
@@ -1488,6 +1501,38 @@ class Stream(BufferQueue):
                 ),
             )
         )
+        raw_thread_mode = str(
+            os.getenv(
+                "ENN_PREFETCH_THREAD_MODE",
+                "host" if CPU.is_optimized_for_no_gil() else "device",
+            )
+            or ""
+        ).strip().lower()
+        if raw_thread_mode in {"gpu", "cuda"}:
+            raw_thread_mode = "device"
+        if raw_thread_mode not in {"host", "device"}:
+            raw_thread_mode = (
+                "host" if CPU.is_optimized_for_no_gil() else "device"
+            )
+        self._prefetch_thread_mode = str(raw_thread_mode)
+        device_q_default = (
+            1 if CPU.is_optimized_for_no_gil() else max(1, int(self._depth))
+        )
+        self._prefetch_thread_device_max_batches = max(
+            1,
+            int(
+                env_first_int(
+                    ("ENN_PREFETCH_THREAD_DEVICE_MAX_BATCHES",),
+                    default=device_q_default,
+                )
+                or device_q_default
+            ),
+        )
+        if bool(self._prefetch_thread) and str(self._prefetch_thread_mode) == "device":
+            self.max_batches = min(
+                int(self.max_batches),
+                int(self._prefetch_thread_device_max_batches),
+            )
         self._host_pool_max_capacity = 0
         if self._host_pool is not None:
             max_cap_default = max(
@@ -1694,6 +1739,52 @@ class Stream(BufferQueue):
                 with suppress(Exception):
                     pool.release(tok)
 
+
+    def _move_batch_to_device(
+        self: Self,
+        batch: Any,
+        pool_tokens: list[Optional[TensorPagePool.Token]],
+        *,
+        device: torch.device,
+        use_accel_stream: bool,
+    ) -> tuple[Any, object | None]:
+        if use_accel_stream and self._accel_stream is not None:
+            ev = None
+            pool = self._accel_event_pool
+            if pool is not None:
+                while ev is None and not self.is_stopped():
+                    try:
+                        ev = pool.get(timeout=0.05)
+                    except queue.Empty:
+                        continue
+            if self.is_stopped():
+                self._release_pool_tokens(pool_tokens)
+                self._recycle_producer_event(ev, pool)
+                raise StopIteration
+            if ev is not None:
+                _wait_accel_event_done(ev, stopped=self.is_stopped)
+            try:
+                with accelerator_stream(self._accel_stream, device.type):
+                    batch_dev = self._to_device(batch, device)
+                    if ev is not None:
+                        try:
+                            ev.record(self._accel_stream)
+                        except TypeError:
+                            ev.record()
+                self._release_pool_tokens(pool_tokens, ev)
+                return batch_dev, ev
+            except BaseException:
+                self._release_pool_tokens(pool_tokens)
+                self._recycle_producer_event(ev, pool)
+                raise
+        try:
+            batch_dev = self._to_device(batch, device)
+        except BaseException:
+            self._release_pool_tokens(pool_tokens)
+            raise
+        self._release_pool_tokens(pool_tokens)
+        return batch_dev, None
+
     def _recycle_producer_event(
         self: Self,
         ev: object | None,
@@ -1715,6 +1806,7 @@ class Stream(BufferQueue):
         use_accel_stream: bool,
         gpu_guard_bytes: int,
         host_guard_bytes: int,
+        thread_mode: str,
     ) -> None:
         last_check_t = 0.0
         last_guards_ok = True
@@ -1762,51 +1854,32 @@ class Stream(BufferQueue):
                 if self.is_stopped():
                     self._release_pool_tokens(pool_tokens)
                     break
-                if use_device:
-                    if use_accel_stream and self._accel_stream is not None:
-                        ev = None
-                        pool = self._accel_event_pool
-                        if pool is not None:
-                            while ev is None and not self.is_stopped():
-                                try:
-                                    ev = pool.get(timeout=0.05)
-                                except queue.Empty:
-                                    continue
-                        if self.is_stopped():
-                            self._release_pool_tokens(pool_tokens)
-                            self._recycle_producer_event(ev, pool)
-                            break
-                        if ev is not None:
-                            _wait_accel_event_done(ev, stopped=self.is_stopped)
-                        try:
-                            with accelerator_stream(
-                                self._accel_stream, device.type
-                            ):
-                                batch_dev = self._to_device(batch, device)
-                                if ev is not None:
-                                    try:
-                                        ev.record(self._accel_stream)
-                                    except TypeError:
-                                        ev.record()
-                            self._release_pool_tokens(pool_tokens, ev)
-                            if not self.put((batch_dev, ev), timeout=None):
-                                self._recycle_producer_event(ev, pool)
-                                break
-                        except BaseException:
-                            self._release_pool_tokens(pool_tokens)
-                            self._recycle_producer_event(ev, pool)
-                            raise
-                    else:
-                        try:
-                            batch_dev = self._to_device(batch, device)
-                        except BaseException:
-                            self._release_pool_tokens(pool_tokens)
-                            raise
+                if str(thread_mode) == "host":
+                    if not self.put(
+                        _PinnedBatchItem(
+                            batch=batch,
+                            pool_tokens=tuple(pool_tokens),
+                        ),
+                        timeout=None,
+                    ):
                         self._release_pool_tokens(pool_tokens)
-                        if not self.put((batch_dev, None), timeout=None):
-                            break
+                        break
+                    continue
+                if use_device:
+                    try:
+                        batch_dev, ev = self._move_batch_to_device(
+                            batch,
+                            pool_tokens,
+                            device=device,
+                            use_accel_stream=bool(use_accel_stream),
+                        )
+                    except StopIteration:
+                        break
+                    if not self.put(_DeviceBatchItem(batch=batch_dev, ev=ev), timeout=None):
+                        self._recycle_producer_event(ev, self._accel_event_pool)
+                        break
                 else:
-                    if not self.put((batch, None), timeout=None):
+                    if not self.put(_DeviceBatchItem(batch=batch, ev=None), timeout=None):
                         self._release_pool_tokens(pool_tokens)
                         break
         except BaseException as exc:
@@ -1894,9 +1967,10 @@ class Stream(BufferQueue):
                     item = self.get(block=False)
                 except queue.Empty:
                     break
-                if isinstance(item, tuple) and len(item) == 2:
-                    _batch, ev = item
-                    self._recycle_producer_event(ev, self._accel_event_pool)
+                if isinstance(item, _DeviceBatchItem):
+                    self._recycle_producer_event(item.ev, self._accel_event_pool)
+                elif isinstance(item, _PinnedBatchItem):
+                    self._release_pool_tokens(list(item.pool_tokens))
 
         def _wait_guards() -> None:
             nonlocal last_check_t, last_guards_ok
@@ -1969,11 +2043,16 @@ class Stream(BufferQueue):
                             self._host_pool.release(tok)
                 return batch_dev, None
 
+        thread_mode = str(getattr(self, "_prefetch_thread_mode", "device") or "device").strip().lower()
+        if thread_mode not in {"host", "device"}:
+            thread_mode = "device"
         threaded_prefetch = bool(
             getattr(self, "_prefetch_thread", False)
             and use_device
-            and use_accel_stream
-            and self._accel_stream is not None
+            and (
+                (thread_mode == "host")
+                or (use_accel_stream and self._accel_stream is not None)
+            )
         )
 
         if threaded_prefetch:
@@ -1987,6 +2066,7 @@ class Stream(BufferQueue):
                     use_accel_stream=use_accel_stream,
                     gpu_guard_bytes=gpu_guard_bytes,
                     host_guard_bytes=host_guard_bytes,
+                    thread_mode=str(thread_mode),
                 ),
                 io_workers=max(1, int(getattr(self, "_depth", 2) or 2)),
             )
@@ -2016,7 +2096,21 @@ class Stream(BufferQueue):
                         if tb:
                             _LOGGER.error("Stream producer failed:\n%s", tb)
                         raise exc
-                    batch, ev = item
+                    if isinstance(item, _PinnedBatchItem):
+                        _wait_guards()
+                        try:
+                            batch, ev = self._move_batch_to_device(
+                                item.batch,
+                                list(item.pool_tokens),
+                                device=device,
+                                use_accel_stream=bool(use_accel_stream),
+                            )
+                        except StopIteration:
+                            break
+                    elif isinstance(item, _DeviceBatchItem):
+                        batch, ev = item.batch, item.ev
+                    else:
+                        continue
                     _recycle_event(ev)
                     yield batch
             finally:
