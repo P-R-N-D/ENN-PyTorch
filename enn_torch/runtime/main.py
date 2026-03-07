@@ -6429,6 +6429,21 @@ def infer(
                 out_st["pair_i"] = float(pair_i)
                 return bool(is_like), int(pair_i), out_st
 
+            def _selected_pair_view(
+                t: torch.Tensor,
+                *,
+                preferred_i: int | None,
+            ) -> tuple[torch.Tensor, int]:
+                if not isinstance(t, torch.Tensor):
+                    raise TypeError("infer: selected-pair view requires a tensor")
+                n_now = int(getattr(t, "shape", (0,))[0])
+                if n_now < 2:
+                    return t[: min(2, n_now)].detach(), 0
+                pair_i = int(1 if preferred_i is None else preferred_i)
+                if pair_i < 1 or pair_i >= n_now:
+                    pair_i = 1
+                return t[[0, pair_i]].detach(), int(pair_i)
+
             def _td_predict(
                 x: torch.Tensor,
                 *,
@@ -7796,14 +7811,14 @@ def infer(
                                                         )
                                                         >= 2
                                                     ):
-                                                        _, st_fp32_once = (
-                                                            _broadcast_like(
-                                                                preds_fix_fp32_once[0],
-                                                                preds_fix_fp32_once[1],
-                                                                atol=float(
-                                                                    broadcast_atol
-                                                                ),
-                                                            )
+                                                        (
+                                                            is_like_fp32_once,
+                                                            pair_i_fp32_once,
+                                                            st_fp32_once,
+                                                        ) = _broadcast_like_selected_pair(
+                                                            preds_fix_fp32_once,
+                                                            preferred_i=int(pair_i2),
+                                                            atol=float(broadcast_atol),
                                                         )
                                                         mf_fp32 = float(
                                                             st_fp32_once.get(
@@ -7817,9 +7832,10 @@ def infer(
                                                             )
                                                         )
                                                         _LOGGER.warning(
-                                                            "[infer] fp32 retry sanity (this batch): match_frac=%.5f (was %.5f) max|Y0-Y1|=%.6g (was %.6g)",
+                                                            "[infer] fp32 retry sanity (this batch): match_frac=%.5f (was %.5f) max|Y0-Y%d|=%.6g (was %.6g)",
                                                             float(mf_fp32),
                                                             float(mf2),
+                                                            int(pair_i_fp32_once),
                                                             float(yd_fp32),
                                                             float(ydiff2),
                                                         )
@@ -7834,8 +7850,31 @@ def infer(
                                                                 )
                                                             )
                                                         )
+                                                        partial_like_fp32_once = bool(
+                                                            detect_partial_broadcast
+                                                            and math.isfinite(mf_fp32)
+                                                            and (
+                                                                mf_fp32
+                                                                >= float(
+                                                                    partial_broadcast_after_fix_match_frac
+                                                                )
+                                                            )
+                                                            and ("x_diff" in locals())
+                                                            and (float(x_diff.item()) > 0.0)
+                                                            and (str(dev_type) == "cuda")
+                                                        )
                                                         if bool(improved):
                                                             preds = preds_fix_fp32_once
+                                                            is_broadcast_like2 = bool(
+                                                                is_like_fp32_once
+                                                            )
+                                                            pair_i2 = int(pair_i_fp32_once)
+                                                            bstats2 = dict(st_fp32_once)
+                                                            ydiff2 = float(yd_fp32)
+                                                            mf2 = float(mf_fp32)
+                                                            partial_like2 = bool(
+                                                                partial_like_fp32_once
+                                                            )
                                                             if bool(
                                                                 partial_broadcast_fp32_persist
                                                             ):
@@ -7845,11 +7884,17 @@ def infer(
                                                             with contextlib.suppress(
                                                                 Exception
                                                             ):
+                                                                Xi_pair, _ = _selected_pair_view(
+                                                                    Xi,
+                                                                    preferred_i=int(pair_i2),
+                                                                )
+                                                                preds_pair, _ = _selected_pair_view(
+                                                                    preds,
+                                                                    preferred_i=int(pair_i2),
+                                                                )
                                                                 _diag_collapse_once(
-                                                                    Xi2=Xi[:2].detach(),
-                                                                    preds2=preds[
-                                                                        :2
-                                                                    ].detach(),
+                                                                    Xi2=Xi_pair,
+                                                                    preds2=preds_pair,
                                                                     x_diff=float(
                                                                         x_diff.item()
                                                                     )
@@ -7868,11 +7913,22 @@ def infer(
                                                         )
                                                     else:
                                                         raise
-                                            if bool(is_broadcast_like2):
+                                            collapse_like2 = bool(
+                                                is_broadcast_like2 or partial_like2
+                                            )
+                                            if bool(collapse_like2):
                                                 with contextlib.suppress(Exception):
+                                                    Xi_pair, _ = _selected_pair_view(
+                                                        Xi,
+                                                        preferred_i=int(pair_i2),
+                                                    )
+                                                    preds_pair, _ = _selected_pair_view(
+                                                        preds,
+                                                        preferred_i=int(pair_i2),
+                                                    )
                                                     _diag_collapse_once(
-                                                        Xi2=Xi[:2].detach(),
-                                                        preds2=preds[:2].detach(),
+                                                        Xi2=Xi_pair,
+                                                        preds2=preds_pair,
                                                         x_diff=float(x_diff.item())
                                                         if "x_diff" in locals()
                                                         else float("nan"),
@@ -7880,11 +7936,17 @@ def infer(
                                                         where="after_per_sample_fix",
                                                     )
                                                 _LOGGER.warning(
-                                                    "[infer] outputs remain batch-broadcasted even after per-sample fallback; this indicates a model/preprocess collapse (not just cudagraph batching)."
+                                                    "[infer] outputs remain %s after per-sample fallback; this indicates a model/preprocess collapse (not just cudagraph batching).",
+                                                    "batch-broadcasted"
+                                                    if bool(is_broadcast_like2)
+                                                    else "partial-broadcast-like",
+                                                )
+                                                Xi_diag, _ = _selected_pair_view(
+                                                    Xi, preferred_i=int(pair_i2)
                                                 )
                                                 _dump_collapse_stage_diag(
                                                     where="broadcast_trigger",
-                                                    Xi2=Xi[:2].detach(),
+                                                    Xi2=Xi_diag,
                                                     seen_batches=int(seen_batches),
                                                     x_diff=float(x_diff.item()),
                                                     y_diff_cal=float(ydiff2),
@@ -7945,14 +8007,14 @@ def infer(
                                                         and int(preds_fix_fp32.shape[0])
                                                         >= 2
                                                     ):
-                                                        is_like_fp32, st_fp32 = (
-                                                            _broadcast_like(
-                                                                preds_fix_fp32[0],
-                                                                preds_fix_fp32[1],
-                                                                atol=float(
-                                                                    broadcast_atol
-                                                                ),
-                                                            )
+                                                        (
+                                                            is_like_fp32,
+                                                            pair_i_fp32,
+                                                            st_fp32,
+                                                        ) = _broadcast_like_selected_pair(
+                                                            preds_fix_fp32,
+                                                            preferred_i=int(pair_i2),
+                                                            atol=float(broadcast_atol),
                                                         )
                                                         dy_fp32 = float(
                                                             st_fp32.get(
@@ -7960,7 +8022,8 @@ def infer(
                                                             )
                                                         )
                                                         _LOGGER.warning(
-                                                            "[infer] fp32 fallback sanity (this batch): max|Y0-Y1|=%.6g match_frac=%.5f rel_mean=%.3e",
+                                                            "[infer] fp32 fallback sanity (this batch): max|Y0-Y%d|=%.6g match_frac=%.5f rel_mean=%.3e",
+                                                            int(pair_i_fp32),
                                                             float(dy_fp32),
                                                             float(
                                                                 st_fp32.get(
@@ -8064,14 +8127,16 @@ def infer(
                                                             Exception
                                                         ):
                                                             if int(preds.shape[0]) >= 2:
-                                                                is_like_uc, st_uc = (
-                                                                    _broadcast_like(
-                                                                        preds[0],
-                                                                        preds[1],
-                                                                        atol=float(
-                                                                            broadcast_atol
-                                                                        ),
-                                                                    )
+                                                                (
+                                                                    is_like_uc,
+                                                                    pair_i_uc,
+                                                                    st_uc,
+                                                                ) = _broadcast_like_selected_pair(
+                                                                    preds,
+                                                                    preferred_i=int(pair_i2),
+                                                                    atol=float(
+                                                                        broadcast_atol
+                                                                    ),
                                                                 )
                                                                 dy_uc = float(
                                                                     st_uc.get(
@@ -8081,7 +8146,8 @@ def infer(
                                                                 )
                                                                 if not bool(is_like_uc):
                                                                     _LOGGER.warning(
-                                                                        "[infer] uncompiled per-sample resolved collapse for this batch; keeping force_eager=1 and force_uncompiled=1."
+                                                                        "[infer] uncompiled per-sample resolved collapse for this batch on pair (0,%d); keeping force_eager=1 and force_uncompiled=1.",
+                                                                        int(pair_i_uc),
                                                                     )
                                                                     force_eager = True
                                                                 else:
