@@ -6294,11 +6294,21 @@ def infer(
                         "infer: scaler.calibrate/denormalize_y unavailable for posthoc calibration"
                     )
                 x_raw = pred_raw.detach()
-                if bool(prefer_cpu) and getattr(x_raw.device, "type", None) != "cpu":
-                    x_raw = x_raw.to(device="cpu")
+                if x_raw.ndim == 0:
+                    raise RuntimeError(
+                        "infer: posthoc calibration requires batched predictions"
+                    )
+                raw_shape = tuple(x_raw.shape)
+                x_cal = (
+                    x_raw.reshape(raw_shape[0], 1)
+                    if x_raw.ndim == 1
+                    else x_raw.reshape(raw_shape[0], -1)
+                )
+                if bool(prefer_cpu) and getattr(x_cal.device, "type", None) != "cpu":
+                    x_cal = x_cal.to(device="cpu")
                 with torch.inference_mode():
                     with StatelessAutocast.suspend(device):
-                        z_cal = cal(x_raw)
+                        z_cal = cal(x_cal)
                         y_out = denorm(z_cal)
                 if isinstance(y_out, tuple):
                     y_out = y_out[0]
@@ -6306,6 +6316,18 @@ def infer(
                     raise RuntimeError(
                         "infer: unexpected posthoc calibration output type"
                     )
+                if y_out.ndim != 2 or int(y_out.shape[0]) != int(raw_shape[0]):
+                    raise RuntimeError(
+                        "infer: unexpected calibrated output shape"
+                    )
+                expected_features = (
+                    1 if len(raw_shape) == 1 else int(math.prod(raw_shape[1:]))
+                )
+                if int(y_out.shape[1]) != expected_features:
+                    raise RuntimeError(
+                        "infer: calibrated output width mismatch"
+                    )
+                y_out = y_out.reshape(raw_shape)
                 return y_out.detach()
 
             def _td_predict(
