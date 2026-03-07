@@ -6330,6 +6330,33 @@ def infer(
                 y_out = y_out.reshape(raw_shape)
                 return y_out.detach()
 
+            def _broadcast_like_selected_pair(
+                preds_now: torch.Tensor,
+                *,
+                preferred_i: int | None,
+                atol: float,
+            ) -> tuple[bool, int, dict[str, float]]:
+                n_now = int(getattr(preds_now, "shape", (0,))[0])
+                if n_now < 2:
+                    return False, 0, {
+                        "pair_i": 0.0,
+                        "y_max": float("nan"),
+                        "y_match_frac": float("nan"),
+                        "y_rel_mean": float("nan"),
+                        "sample_n": float("nan"),
+                    }
+                pair_i = int(1 if preferred_i is None else preferred_i)
+                if pair_i < 1 or pair_i >= n_now:
+                    pair_i = 1
+                is_like, st = _broadcast_like(
+                    preds_now[0],
+                    preds_now[pair_i],
+                    atol=float(atol),
+                )
+                out_st = dict(st)
+                out_st["pair_i"] = float(pair_i)
+                return bool(is_like), int(pair_i), out_st
+
             def _td_predict(
                 x: torch.Tensor,
                 *,
@@ -7455,12 +7482,21 @@ def infer(
                                         y_diff_cal=float(y_diff),
                                     )
                                     with contextlib.suppress(Exception):
+                                        idx2 = torch.tensor(
+                                            [0, int(sel_i)],
+                                            device=Xi.device,
+                                            dtype=torch.long,
+                                        )
                                         _diag_collapse_once(
-                                            Xi2=Xi[:2].detach(),
-                                            preds2=preds[:2].detach(),
+                                            Xi2=Xi.index_select(0, idx2).detach(),
+                                            preds2=preds.index_select(0, idx2).detach(),
                                             x_diff=float(x_diff.item()),
                                             y_diff=float(y_diff),
                                             where="broadcast_trigger",
+                                            extra={
+                                                "probe_kind": str(sel_kind or "broadcast_trigger"),
+                                                "probe_selected_i": int(sel_i),
+                                            },
                                         )
                                     _LOGGER.warning(
                                         "[infer] detected batch-broadcasted predictions (inputs differ but outputs are ~equal). "
@@ -7581,11 +7617,11 @@ def infer(
                                     )
                                     with contextlib.suppress(Exception):
                                         if int(preds.shape[0]) >= 2:
-                                            y0b = preds[0].detach()
-                                            y1b = preds[1].detach()
-                                            is_broadcast_like2, bstats2 = (
-                                                _broadcast_like(
-                                                    y0b, y1b, atol=float(broadcast_atol)
+                                            is_broadcast_like2, pair_i2, bstats2 = (
+                                                _broadcast_like_selected_pair(
+                                                    preds,
+                                                    preferred_i=int(sel_i),
+                                                    atol=float(broadcast_atol),
                                                 )
                                             )
                                             ydiff2 = float(
@@ -8033,10 +8069,10 @@ def infer(
                                                         and int(preds_fix2.shape[0])
                                                         >= 2
                                                     ):
-                                                        is_like_raw, st_raw = (
-                                                            _broadcast_like(
-                                                                preds_fix2[0],
-                                                                preds_fix2[1],
+                                                        is_like_raw, pair_i_raw, st_raw = (
+                                                            _broadcast_like_selected_pair(
+                                                                preds_fix2,
+                                                                preferred_i=int(sel_i),
                                                                 atol=float(
                                                                     broadcast_atol
                                                                 ),
@@ -8048,7 +8084,8 @@ def infer(
                                                             )
                                                         )
                                                         _LOGGER.warning(
-                                                            "[infer] calibrate_output=False sanity (this batch only): max|Y0-Y1|=%.6g match_frac=%.5f rel_mean=%.3e",
+                                                            "[infer] calibrate_output=False sanity (this batch only): max|Y0-Y%d|=%.6g match_frac=%.5f rel_mean=%.3e",
+                                                            int(pair_i_raw),
                                                             float(dy2),
                                                             float(
                                                                 st_raw.get(
@@ -8112,14 +8149,10 @@ def infer(
                                                                 )
                                                                 >= 2
                                                             ):
-                                                                is_like_post, st_post = (
-                                                                    _broadcast_like(
-                                                                        preds_fix2_post[
-                                                                            0
-                                                                        ],
-                                                                        preds_fix2_post[
-                                                                            1
-                                                                        ],
+                                                                is_like_post, pair_i_post, st_post = (
+                                                                    _broadcast_like_selected_pair(
+                                                                        preds_fix2_post,
+                                                                        preferred_i=int(sel_i),
                                                                         atol=float(
                                                                             broadcast_atol
                                                                         ),
@@ -8132,7 +8165,8 @@ def infer(
                                                                     )
                                                                 )
                                                                 _LOGGER.warning(
-                                                                    "[infer] posthoc-calibrated sanity (this batch only): max|Y0-Y1|=%.6g match_frac=%.5f rel_mean=%.3e",
+                                                                    "[infer] posthoc-calibrated sanity (this batch only): max|Y0-Y%d|=%.6g match_frac=%.5f rel_mean=%.3e",
+                                                                    int(pair_i_post),
                                                                     float(dy_post),
                                                                     float(
                                                                         st_post.get(
