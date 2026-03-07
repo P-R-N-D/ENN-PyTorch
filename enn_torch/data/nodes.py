@@ -1528,11 +1528,32 @@ class Stream(BufferQueue):
                 or device_q_default
             ),
         )
-        if bool(self._prefetch_thread) and str(self._prefetch_thread_mode) == "device":
-            self.max_batches = min(
-                int(self.max_batches),
-                int(self._prefetch_thread_device_max_batches),
-            )
+        host_q_default = (
+            1
+            if CPU.is_optimized_for_no_gil()
+            else max(1, min(2, int(self._depth)))
+        )
+        self._prefetch_thread_host_max_batches = max(
+            1,
+            int(
+                env_first_int(
+                    ("ENN_PREFETCH_THREAD_HOST_MAX_BATCHES",),
+                    default=host_q_default,
+                )
+                or host_q_default
+            ),
+        )
+        if bool(self._prefetch_thread):
+            if str(self._prefetch_thread_mode) == "device":
+                self.max_batches = min(
+                    int(self.max_batches),
+                    int(self._prefetch_thread_device_max_batches),
+                )
+            elif str(self._prefetch_thread_mode) == "host":
+                self.max_batches = min(
+                    int(self.max_batches),
+                    int(self._prefetch_thread_host_max_batches),
+                )
         self._host_pool_max_capacity = 0
         if self._host_pool is not None:
             max_cap_default = max(
@@ -1664,7 +1685,13 @@ class Stream(BufferQueue):
             return
         inflight_batches = max(1, int(self._depth))
         if bool(getattr(self, "_prefetch_thread", False)):
-            inflight_batches = max(inflight_batches + 1, int(self._depth) + 1)
+            inflight_batches = (
+                max(
+                    1,
+                    int(getattr(self, "max_batches", self._depth) or self._depth),
+                )
+                + 1
+            )
         target_cap = max(cur_cap, int(tensors_per_batch) * int(inflight_batches))
         if max_cap > 0:
             target_cap = min(target_cap, max_cap)
@@ -1811,6 +1838,13 @@ class Stream(BufferQueue):
         last_check_t = 0.0
         last_guards_ok = True
         ttl_s = float(getattr(self, "_guard_ttl_s", 0.0) or 0.0)
+        wait_device_guard = bool(
+            str(thread_mode) != "host"
+            or env_bool(
+                "ENN_PREFETCH_THREAD_HOST_WAIT_DEVICE_GUARD",
+                default=False,
+            )
+        )
         it: Iterator[Any] | None = None
         try:
             it = iter(iterable)
@@ -1842,7 +1876,11 @@ class Stream(BufferQueue):
                         if ttl_s <= 0.0 or (now - last_check_t) >= ttl_s:
                             last_check_t = now
                             host_ok = _host_guard_ok(host_guard_bytes)
-                            dev_ok = _device_guard_ok(device, gpu_guard_bytes)
+                            dev_ok = (
+                                _device_guard_ok(device, gpu_guard_bytes)
+                                if bool(wait_device_guard)
+                                else True
+                            )
                             last_guards_ok = bool(host_ok and dev_ok)
                         if bool(last_guards_ok):
                             break
@@ -1929,8 +1967,8 @@ class Stream(BufferQueue):
             self._accel_event_pool = None
 
         ttl_s = float(getattr(self, "_guard_ttl_s", 0.0) or 0.0)
-        last_check_t = 0.0
-        last_guards_ok = True
+        last_check_t_by_mode = {True: 0.0, False: 0.0}
+        last_guards_ok_by_mode = {True: True, False: True}
 
         def _recycle_event(ev: object | None) -> None:
             if not (use_accel_stream and ev is not None):
@@ -1973,20 +2011,25 @@ class Stream(BufferQueue):
                     self._release_pool_tokens(list(item.pool_tokens))
 
         def _wait_guards(*, wait_host: bool = True) -> None:
-            nonlocal last_check_t, last_guards_ok
             if not self._backpressure:
                 return
+            mode_key = bool(wait_host)
             sleep_s = 0.001
             while True:
                 if self.is_stopped():
                     raise StopIteration
                 now = time.monotonic()
+                last_check_t = float(
+                    last_check_t_by_mode.get(mode_key, 0.0) or 0.0
+                )
                 if ttl_s <= 0.0 or (now - last_check_t) >= ttl_s:
-                    last_check_t = now
-                    host_ok = _host_guard_ok(host_guard_bytes) if bool(wait_host) else True
+                    last_check_t_by_mode[mode_key] = now
+                    host_ok = (
+                        _host_guard_ok(host_guard_bytes) if mode_key else True
+                    )
                     dev_ok = _device_guard_ok(device, gpu_guard_bytes)
-                    last_guards_ok = bool(host_ok and dev_ok)
-                if bool(last_guards_ok):
+                    last_guards_ok_by_mode[mode_key] = bool(host_ok and dev_ok)
+                if bool(last_guards_ok_by_mode.get(mode_key, True)):
                     return
                 time.sleep(sleep_s)
                 sleep_s = min(float(sleep_s) * 2.0, 0.05)
