@@ -6028,6 +6028,20 @@ def infer(
                 pass
 
             collapse_switched_raw = False
+            pred_posthoc_calibrate_enabled = bool(
+                env_bool("ENN_PRED_COLLAPSE_POSTHOC_CALIBRATE", default=True)
+            )
+            pred_posthoc_prefer_cpu = bool(
+                env_bool(
+                    "ENN_PRED_COLLAPSE_POSTHOC_CPU",
+                    default=bool(_nogil_pred),
+                )
+            )
+            pred_persist_raw_mode = bool(
+                env_bool("ENN_PRED_COLLAPSE_PERSIST_RAW_MODE", default=True)
+            )
+            pred_posthoc_calibrate_active = False
+            pred_force_raw_output = False
             pred_cg_strict_sync = bool(
                 env_bool(
                     "ENN_PRED_CUDAGRAPH_STRICT_SYNC",
@@ -6245,6 +6259,55 @@ def infer(
                         return False
                     raise
 
+            def _get_pred_scaler() -> object | None:
+                seen_ids: set[int] = set()
+                cands: list[object] = []
+                for owner in (
+                    model_for_scaler,
+                    module_eval,
+                    run_model_uncompiled if bool(pred_uncompiled_available) else None,
+                    run_model,
+                ):
+                    if owner is None:
+                        continue
+                    with contextlib.suppress(Exception):
+                        sc = getattr(owner, "scaler", None)
+                        if sc is not None and id(sc) not in seen_ids:
+                            seen_ids.add(id(sc))
+                            cands.append(sc)
+                return cands[0] if cands else None
+
+            def _posthoc_calibrate_prediction(
+                pred_raw: torch.Tensor,
+                *,
+                prefer_cpu: bool,
+            ) -> torch.Tensor:
+                if not isinstance(pred_raw, torch.Tensor):
+                    raise TypeError("infer: posthoc calibration requires a tensor")
+                sc = _get_pred_scaler()
+                cal = getattr(sc, "calibrate", None) if sc is not None else None
+                denorm = (
+                    getattr(sc, "denormalize_y", None) if sc is not None else None
+                )
+                if not callable(cal) or not callable(denorm):
+                    raise RuntimeError(
+                        "infer: scaler.calibrate/denormalize_y unavailable for posthoc calibration"
+                    )
+                x_raw = pred_raw.detach()
+                if bool(prefer_cpu) and getattr(x_raw.device, "type", None) != "cpu":
+                    x_raw = x_raw.to(device="cpu")
+                with torch.inference_mode():
+                    with StatelessAutocast.suspend(device):
+                        z_cal = cal(x_raw)
+                        y_out = denorm(z_cal)
+                if isinstance(y_out, tuple):
+                    y_out = y_out[0]
+                if not isinstance(y_out, torch.Tensor):
+                    raise RuntimeError(
+                        "infer: unexpected posthoc calibration output type"
+                    )
+                return y_out.detach()
+
             def _td_predict(
                 x: torch.Tensor,
                 *,
@@ -6252,18 +6315,55 @@ def infer(
                 use_uncompiled: bool | None = None,
                 force_fp32: bool = False,
             ) -> torch.Tensor:
+                nonlocal pred_posthoc_calibrate_active, pred_force_raw_output
                 uc = (
                     bool(force_uncompiled)
                     if use_uncompiled is None
                     else bool(use_uncompiled)
                 )
+                want_calibrate = (
+                    bool(calibrate_pred_output)
+                    if calibrate_output is None
+                    else bool(calibrate_output)
+                )
+                if bool(pred_force_raw_output):
+                    want_calibrate = False
+                if bool(pred_posthoc_calibrate_active) and bool(want_calibrate):
+                    out_raw = _run_model_predict_with_calibration(
+                        x,
+                        calibrate_output=False,
+                        use_uncompiled=uc,
+                        force_fp32=bool(force_fp32),
+                    )
+                    if isinstance(out_raw, tuple):
+                        out_raw = out_raw[0]
+                    if not isinstance(out_raw, torch.Tensor):
+                        raise RuntimeError("infer: unexpected model output type")
+                    try:
+                        out_post = _posthoc_calibrate_prediction(
+                            out_raw,
+                            prefer_cpu=bool(pred_posthoc_prefer_cpu),
+                        )
+                        if isinstance(out_post, torch.Tensor) and (
+                            not out_post.is_contiguous()
+                        ):
+                            with contextlib.suppress(Exception):
+                                out_post = out_post.contiguous()
+                        return out_post.detach()
+                    except Exception as e:
+                        if bool(pred_persist_raw_mode):
+                            pred_posthoc_calibrate_active = False
+                            pred_force_raw_output = True
+                            _LOGGER.warning(
+                                "[infer] posthoc calibration failed during prediction (%s: %s); switching remaining outputs to raw mode for consistency.",
+                                type(e).__name__,
+                                str(e),
+                            )
+                            return out_raw.detach()
+                        raise
                 out = _run_model_predict_with_calibration(
                     x,
-                    calibrate_output=(
-                        bool(calibrate_pred_output)
-                        if calibrate_output is None
-                        else bool(calibrate_output)
-                    ),
+                    calibrate_output=bool(want_calibrate),
                     use_uncompiled=uc,
                     force_fp32=bool(force_fp32),
                 )
@@ -6610,6 +6710,8 @@ def infer(
                                         "nogil_compiled_pred": bool(_nogil_compiled_pred),
                                         "force_eager": bool(force_eager),
                                         "force_uncompiled": bool(force_uncompiled),
+                                        "pred_posthoc_calibrate_active": bool(pred_posthoc_calibrate_active),
+                                        "pred_force_raw_output": bool(pred_force_raw_output),
                                         "mb": int(mb),
                                         "bs": int(bs),
                                     },
@@ -7901,22 +8003,9 @@ def infer(
                                                         preds_fix2[j : j + 1].copy_(
                                                             pj2_cpu[:1]
                                                         )
-                                                    if preds_fix2 is not None:
-                                                        preds = preds_fix2
-                                                        with contextlib.suppress(
-                                                            Exception
-                                                        ):
-                                                            if isinstance(
-                                                                preds, torch.Tensor
-                                                            ) and (
-                                                                not preds.is_contiguous()
-                                                            ):
-                                                                preds = (
-                                                                    preds.contiguous()
-                                                                )
-                                                        _LOGGER.warning(
-                                                            "[infer] using calibrate_output=False per-sample predictions for output of this batch."
-                                                        )
+                                                    preds_fix2_raw_ok = False
+                                                    preds_fix2_post_ok = False
+                                                    preds_fix2_post: torch.Tensor | None = None
                                                     if (
                                                         preds_fix2 is not None
                                                         and int(preds_fix2.shape[0])
@@ -7952,6 +8041,9 @@ def infer(
                                                                 )
                                                             ),
                                                         )
+                                                        preds_fix2_raw_ok = not bool(
+                                                            is_like_raw
+                                                        )
                                                         if bool(is_like_raw) and bool(
                                                             collapse_abort
                                                         ):
@@ -7960,6 +8052,136 @@ def infer(
                                                                 "this indicates a true model/preprocess collapse. "
                                                                 "Set ENN_PRED_COLLAPSE_ABORT=0 to ignore and write outputs anyway."
                                                             )
+                                                    if (
+                                                        preds_fix2 is not None
+                                                        and bool(preds_fix2_raw_ok)
+                                                        and bool(pred_posthoc_calibrate_enabled)
+                                                    ):
+                                                        try:
+                                                            preds_fix2_post = (
+                                                                _posthoc_calibrate_prediction(
+                                                                    preds_fix2,
+                                                                    prefer_cpu=bool(
+                                                                        pred_posthoc_prefer_cpu
+                                                                    ),
+                                                                )
+                                                            )
+                                                            with contextlib.suppress(
+                                                                Exception
+                                                            ):
+                                                                if isinstance(
+                                                                    preds_fix2_post,
+                                                                    torch.Tensor,
+                                                                ) and (
+                                                                    not preds_fix2_post.is_contiguous()
+                                                                ):
+                                                                    preds_fix2_post = (
+                                                                        preds_fix2_post.contiguous()
+                                                                    )
+                                                            if (
+                                                                isinstance(
+                                                                    preds_fix2_post,
+                                                                    torch.Tensor,
+                                                                )
+                                                                and int(
+                                                                    preds_fix2_post.shape[
+                                                                        0
+                                                                    ]
+                                                                )
+                                                                >= 2
+                                                            ):
+                                                                is_like_post, st_post = (
+                                                                    _broadcast_like(
+                                                                        preds_fix2_post[
+                                                                            0
+                                                                        ],
+                                                                        preds_fix2_post[
+                                                                            1
+                                                                        ],
+                                                                        atol=float(
+                                                                            broadcast_atol
+                                                                        ),
+                                                                    )
+                                                                )
+                                                                dy_post = float(
+                                                                    st_post.get(
+                                                                        "y_max",
+                                                                        float("nan"),
+                                                                    )
+                                                                )
+                                                                _LOGGER.warning(
+                                                                    "[infer] posthoc-calibrated sanity (this batch only): max|Y0-Y1|=%.6g match_frac=%.5f rel_mean=%.3e",
+                                                                    float(dy_post),
+                                                                    float(
+                                                                        st_post.get(
+                                                                            "y_match_frac",
+                                                                            float(
+                                                                                "nan"
+                                                                            ),
+                                                                        )
+                                                                    ),
+                                                                    float(
+                                                                        st_post.get(
+                                                                            "y_rel_mean",
+                                                                            float(
+                                                                                "nan"
+                                                                            ),
+                                                                        )
+                                                                    ),
+                                                                )
+                                                                preds_fix2_post_ok = (
+                                                                    not bool(is_like_post)
+                                                                )
+                                                        except Exception as e:
+                                                            _LOGGER.warning(
+                                                                "[infer] posthoc calibration after raw-collapse fallback failed (%s: %s); keeping raw predictions for this batch.",
+                                                                type(e).__name__,
+                                                                str(e),
+                                                            )
+                                                            preds_fix2_post = None
+                                                            preds_fix2_post_ok = False
+                                                    if preds_fix2_post_ok and isinstance(
+                                                        preds_fix2_post, torch.Tensor
+                                                    ):
+                                                        preds = preds_fix2_post
+                                                        pred_posthoc_calibrate_active = (
+                                                            True
+                                                        )
+                                                        pred_force_raw_output = False
+                                                        _LOGGER.warning(
+                                                            "[infer] using per-sample raw predictions with posthoc output calibration for this batch; keeping posthoc calibration for remaining prediction microbatches."
+                                                        )
+                                                    elif preds_fix2 is not None:
+                                                        preds = preds_fix2
+                                                        if bool(pred_persist_raw_mode):
+                                                            pred_posthoc_calibrate_active = (
+                                                                False
+                                                            )
+                                                            pred_force_raw_output = True
+                                                            _LOGGER.warning(
+                                                                "[infer] keeping raw-output mode for remaining prediction microbatches to avoid mixed-scale outputs."
+                                                            )
+                                                        _LOGGER.warning(
+                                                            "[infer] using calibrate_output=False per-sample predictions for output of this batch."
+                                                        )
+                                                    if preds_fix2_post is not None and (
+                                                        not bool(preds_fix2_post_ok)
+                                                    ):
+                                                        _LOGGER.warning(
+                                                            "[infer] posthoc calibration reintroduced broadcast-like outputs; current batch keeps raw predictions."
+                                                        )
+                                                    if preds_fix2 is not None:
+                                                        with contextlib.suppress(
+                                                            Exception
+                                                        ):
+                                                            if isinstance(
+                                                                preds, torch.Tensor
+                                                            ) and (
+                                                                not preds.is_contiguous()
+                                                            ):
+                                                                preds = (
+                                                                    preds.contiguous()
+                                                                )
                         except Exception as exc:
                             if isinstance(exc, _InferCollapseAbort):
                                 raise
