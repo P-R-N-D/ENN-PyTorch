@@ -6365,6 +6365,8 @@ def infer(
                         target_device = scaler_device
                     elif scaler_device is not None:
                         target_device = scaler_device
+                    else:
+                        target_device = torch.device("cpu")
                 elif scaler_device is not None:
                     target_device = scaler_device
                 if str(getattr(x_cal, "device", "")) != str(target_device):
