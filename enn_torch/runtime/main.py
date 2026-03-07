@@ -4279,6 +4279,25 @@ def infer(
         with contextlib.suppress(Exception):
             run_model_uncompiled.eval()
 
+    _pred_scaler_owners: list[object] = []
+    _pred_scaler_owner_ids: set[int] = set()
+
+    def _add_pred_scaler_owner(owner: object | None) -> None:
+        if owner is None:
+            return
+        oid = id(owner)
+        if oid in _pred_scaler_owner_ids:
+            return
+        _pred_scaler_owner_ids.add(oid)
+        _pred_scaler_owners.append(owner)
+
+    _add_pred_scaler_owner(module_eval)
+    _add_pred_scaler_owner(run_model_uncompiled if bool(pred_uncompiled_available) else None)
+    _add_pred_scaler_owner(run_model)
+    with contextlib.suppress(Exception):
+        _add_pred_scaler_owner(getattr(model, "module", None))
+    _add_pred_scaler_owner(model)
+
     eager_ctx_factory = getattr(module_eval, "eager_for_export", None)
     force_eager = bool(env_bool("ENN_PRED_FORCE_EAGER", False))
     eager_on_broadcast = bool(env_bool("ENN_PRED_EAGER_ON_BROADCAST", True))
@@ -6259,23 +6278,55 @@ def infer(
                         return False
                     raise
 
+            _pred_scaler_cache_miss = object()
+            _pred_scaler_cache: object = _pred_scaler_cache_miss
+
             def _get_pred_scaler() -> object | None:
+                nonlocal _pred_scaler_cache
+                if _pred_scaler_cache is not _pred_scaler_cache_miss:
+                    return None if _pred_scaler_cache is False else _pred_scaler_cache
                 seen_ids: set[int] = set()
-                cands: list[object] = []
-                for owner in (
-                    model_for_scaler,
-                    module_eval,
-                    run_model_uncompiled if bool(pred_uncompiled_available) else None,
-                    run_model,
-                ):
+                for owner in tuple(_pred_scaler_owners):
                     if owner is None:
                         continue
                     with contextlib.suppress(Exception):
                         sc = getattr(owner, "scaler", None)
-                        if sc is not None and id(sc) not in seen_ids:
-                            seen_ids.add(id(sc))
-                            cands.append(sc)
-                return cands[0] if cands else None
+                        if sc is None or id(sc) in seen_ids:
+                            continue
+                        seen_ids.add(id(sc))
+                        cal = getattr(sc, "calibrate", None)
+                        denorm = getattr(sc, "denormalize_y", None)
+                        if callable(cal) and callable(denorm):
+                            _pred_scaler_cache = sc
+                            return sc
+                _pred_scaler_cache = False
+                return None
+
+            def _get_pred_scaler_device(sc: object | None) -> torch.device | None:
+                if sc is None:
+                    return None
+                for attr in (
+                    "y_mean",
+                    "x_mean",
+                    "affine_a",
+                    "affine_b",
+                    "pw_x",
+                    "pw_y",
+                ):
+                    with contextlib.suppress(Exception):
+                        t = getattr(sc, attr, None)
+                        if torch.is_tensor(t):
+                            return t.device
+                if isinstance(sc, torch.nn.Module):
+                    with contextlib.suppress(Exception):
+                        for t in sc.buffers(recurse=True):
+                            if torch.is_tensor(t):
+                                return t.device
+                    with contextlib.suppress(Exception):
+                        for t in sc.parameters(recurse=True):
+                            if torch.is_tensor(t):
+                                return t.device
+                return None
 
             def _posthoc_calibrate_prediction(
                 pred_raw: torch.Tensor,
@@ -6299,15 +6350,34 @@ def infer(
                         "infer: posthoc calibration requires batched predictions"
                     )
                 raw_shape = tuple(x_raw.shape)
+                raw_device = x_raw.device
                 x_cal = (
                     x_raw.reshape(raw_shape[0], 1)
                     if x_raw.ndim == 1
                     else x_raw.reshape(raw_shape[0], -1)
                 )
-                if bool(prefer_cpu) and getattr(x_cal.device, "type", None) != "cpu":
-                    x_cal = x_cal.to(device="cpu")
+                scaler_device = _get_pred_scaler_device(sc)
+                target_device = raw_device
+                if bool(prefer_cpu):
+                    if getattr(raw_device, "type", None) == "cpu":
+                        target_device = raw_device
+                    elif scaler_device is not None and getattr(scaler_device, "type", None) == "cpu":
+                        target_device = scaler_device
+                    elif scaler_device is not None:
+                        target_device = scaler_device
+                    else:
+                        target_device = torch.device("cpu")
+                elif scaler_device is not None:
+                    target_device = scaler_device
+                if str(getattr(x_cal, "device", "")) != str(target_device):
+                    x_cal = x_cal.to(device=target_device, non_blocking=False)
+                suspend_dev = (
+                    target_device
+                    if isinstance(target_device, torch.device)
+                    else device
+                )
                 with torch.inference_mode():
-                    with StatelessAutocast.suspend(device):
+                    with StatelessAutocast.suspend(suspend_dev):
                         z_cal = cal(x_cal)
                         y_out = denorm(z_cal)
                 if isinstance(y_out, tuple):
@@ -6328,6 +6398,8 @@ def infer(
                         "infer: calibrated output width mismatch"
                     )
                 y_out = y_out.reshape(raw_shape)
+                if str(getattr(y_out, "device", "")) != str(raw_device):
+                    y_out = y_out.to(device=raw_device, non_blocking=False)
                 return y_out.detach()
 
             def _broadcast_like_selected_pair(
@@ -7517,19 +7589,29 @@ def infer(
                                             default=True,
                                         )
                                     ) and (not bool(force_uncompiled)):
-                                        force_uncompiled = True
-                                        _LOGGER.warning(
-                                            "[infer] broadcast-like: forcing uncompiled model for correctness (ENN_PRED_BROADCAST_FORCE_UNCOMPILED=1)."
-                                        )
+                                        if bool(pred_uncompiled_available):
+                                            force_uncompiled = True
+                                            _LOGGER.warning(
+                                                "[infer] broadcast-like: forcing uncompiled model for correctness (ENN_PRED_BROADCAST_FORCE_UNCOMPILED=1)."
+                                            )
+                                        else:
+                                            _LOGGER.warning(
+                                                "[infer] broadcast-like: uncompiled shadow unavailable; keeping eager path for correctness."
+                                            )
 
                                     if str(sel_kind) == "partial_like":
                                         if bool(
                                             partial_broadcast_force_uncompiled
                                         ) and (not bool(force_uncompiled)):
-                                            force_uncompiled = True
-                                            _LOGGER.warning(
-                                                "[infer] partial-broadcast: forcing uncompiled model for correctness (ENN_PRED_PARTIAL_BROADCAST_FORCE_UNCOMPILED=1)."
-                                            )
+                                            if bool(pred_uncompiled_available):
+                                                force_uncompiled = True
+                                                _LOGGER.warning(
+                                                    "[infer] partial-broadcast: forcing uncompiled model for correctness (ENN_PRED_PARTIAL_BROADCAST_FORCE_UNCOMPILED=1)."
+                                                )
+                                            else:
+                                                _LOGGER.warning(
+                                                    "[infer] partial-broadcast: uncompiled shadow unavailable; keeping eager path for correctness."
+                                                )
                                         if bool(partial_broadcast_force_eager) and (
                                             not bool(force_eager)
                                         ):

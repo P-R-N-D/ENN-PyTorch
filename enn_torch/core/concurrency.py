@@ -1220,6 +1220,14 @@ class TensorPagePool:
     def capacity(self: Self) -> int:
         return int(self._cap)
 
+    def ensure_capacity(self: Self, capacity: int) -> int:
+        want = max(1, int(capacity))
+        with self._cv:
+            if want > self._cap:
+                self._cap = int(want)
+                self._cv.notify_all()
+            return int(self._cap)
+
     def get(
         self: Self,
         shape: Tuple[int, ...],

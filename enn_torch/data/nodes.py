@@ -1488,6 +1488,21 @@ class Stream(BufferQueue):
                 ),
             )
         )
+        self._host_pool_max_capacity = 0
+        if self._host_pool is not None:
+            max_cap_default = max(
+                int(getattr(self._host_pool, "capacity", 0) or 0),
+                16 if bool(self._prefetch_thread) else 8,
+                int(self._depth)
+                * (6 if bool(self._prefetch_thread) and CPU.is_optimized_for_no_gil() else 4),
+            )
+            self._host_pool_max_capacity = int(
+                env_first_int(
+                    ("ENN_PREFETCH_PIN_POOL_MAX_CAPACITY",),
+                    default=max_cap_default,
+                )
+                or max_cap_default
+            )
 
     def _spawn_session(self: Self) -> "Stream":
         return Stream(
@@ -1572,6 +1587,46 @@ class Stream(BufferQueue):
 
         return self._apply_structure(x, _f)
 
+    def _count_stageable_tensors(self: Self, obj: Any) -> int:
+        count = 0
+
+        def _f(t: object) -> object:
+            nonlocal count
+            if (
+                torch.is_tensor(t)
+                and t.device.type == "cpu"
+                and not (hasattr(t, "is_pinned") and t.is_pinned())
+            ):
+                count += 1
+            return t
+
+        with suppress(Exception):
+            self._apply_structure(obj, _f)
+        return int(count)
+
+    def _maybe_grow_host_pool_for_batch(self: Self, obj: Any) -> None:
+        pool = self._host_pool
+        if pool is None or not bool(getattr(self, "_pin_pool", False)):
+            return
+        if not bool(env_bool("ENN_PREFETCH_PIN_POOL_AUTO_GROW", default=True)):
+            return
+        cur_cap = int(getattr(pool, "capacity", 0) or 0)
+        max_cap = int(getattr(self, "_host_pool_max_capacity", 0) or 0)
+        if max_cap > 0 and cur_cap >= max_cap:
+            return
+        tensors_per_batch = int(self._count_stageable_tensors(obj))
+        if tensors_per_batch <= 0:
+            return
+        inflight_batches = max(1, int(self._depth))
+        if bool(getattr(self, "_prefetch_thread", False)):
+            inflight_batches = max(inflight_batches + 1, int(self._depth) + 1)
+        target_cap = max(cur_cap, int(tensors_per_batch) * int(inflight_batches))
+        if max_cap > 0:
+            target_cap = min(target_cap, max_cap)
+        if target_cap > cur_cap:
+            with suppress(Exception):
+                pool.ensure_capacity(int(target_cap))
+
     def _stage_with_pool(
         self: Self,
         obj: Any,
@@ -1618,6 +1673,7 @@ class Stream(BufferQueue):
         pool = self._host_pool
         if pool is None:
             return self._pin_memory(x), []
+        self._maybe_grow_host_pool_for_batch(x)
         tokens: list[Optional[TensorPagePool.Token]] = []
         return self._stage_with_pool(x, pool, tokens), tokens
 
