@@ -1972,7 +1972,7 @@ class Stream(BufferQueue):
                 elif isinstance(item, _PinnedBatchItem):
                     self._release_pool_tokens(list(item.pool_tokens))
 
-        def _wait_guards() -> None:
+        def _wait_guards(*, wait_host: bool = True) -> None:
             nonlocal last_check_t, last_guards_ok
             if not self._backpressure:
                 return
@@ -1983,7 +1983,7 @@ class Stream(BufferQueue):
                 now = time.monotonic()
                 if ttl_s <= 0.0 or (now - last_check_t) >= ttl_s:
                     last_check_t = now
-                    host_ok = _host_guard_ok(host_guard_bytes)
+                    host_ok = _host_guard_ok(host_guard_bytes) if bool(wait_host) else True
                     dev_ok = _device_guard_ok(device, gpu_guard_bytes)
                     last_guards_ok = bool(host_ok and dev_ok)
                 if bool(last_guards_ok):
@@ -2097,7 +2097,7 @@ class Stream(BufferQueue):
                             _LOGGER.error("Stream producer failed:\n%s", tb)
                         raise exc
                     if isinstance(item, _PinnedBatchItem):
-                        _wait_guards()
+                        _wait_guards(wait_host=False)
                         try:
                             batch, ev = self._move_batch_to_device(
                                 item.batch,
