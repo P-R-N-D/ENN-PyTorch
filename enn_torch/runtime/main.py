@@ -7796,8 +7796,10 @@ def infer(
                                             _LOGGER.warning(
                                                 "[infer] partial-broadcast: forcing eager mode for correctness (ENN_PRED_PARTIAL_BROADCAST_FORCE_EAGER=1)."
                                             )
-                                        if bool(str(sel_kind) == "low_diversity") and bool(low_diversity_persist_fp32):
-                                            collapse_fp32_active = True
+                                    if bool(str(sel_kind) == "low_diversity") and bool(
+                                        low_diversity_persist_fp32
+                                    ):
+                                        collapse_fp32_active = True
 
                                     force_single = True
                                     td_cg_active = False
