@@ -6109,6 +6109,33 @@ def infer(
                     default=bool(_nogil_pred),
                 )
             )
+            pred_posthoc_input_space = str(
+                os.getenv("ENN_PRED_COLLAPSE_POSTHOC_INPUT_SPACE", "auto")
+                or "auto"
+            ).strip().lower()
+            if pred_posthoc_input_space in {"", "default"}:
+                pred_posthoc_input_space = "auto"
+            elif pred_posthoc_input_space in {
+                "y-space",
+                "yspace",
+                "yhat",
+                "denorm",
+                "denormalized",
+                "output",
+                "outputs",
+            }:
+                pred_posthoc_input_space = "y"
+            elif pred_posthoc_input_space in {
+                "z-space",
+                "zspace",
+                "raw-z",
+                "zraw",
+                "latent",
+                "normalized",
+            }:
+                pred_posthoc_input_space = "z"
+            elif pred_posthoc_input_space not in {"auto", "y", "z"}:
+                pred_posthoc_input_space = "auto"
             pred_persist_raw_mode = bool(
                 env_bool("ENN_PRED_COLLAPSE_PERSIST_RAW_MODE", default=True)
             )
@@ -6393,6 +6420,7 @@ def infer(
                 denorm = (
                     getattr(sc, "denormalize_y", None) if sc is not None else None
                 )
+                norm = getattr(sc, "normalize_y", None) if sc is not None else None
                 if not callable(cal) or not callable(denorm):
                     raise RuntimeError(
                         "infer: scaler.calibrate/denormalize_y unavailable for posthoc calibration"
@@ -6404,10 +6432,14 @@ def infer(
                     )
                 raw_shape = tuple(x_raw.shape)
                 raw_device = x_raw.device
-                x_cal = (
-                    x_raw.reshape(raw_shape[0], 1)
+                batch_n = int(raw_shape[0])
+                expected_features = (
+                    1 if len(raw_shape) == 1 else int(math.prod(raw_shape[1:]))
+                )
+                x_flat = (
+                    x_raw.reshape(batch_n, 1)
                     if x_raw.ndim == 1
-                    else x_raw.reshape(raw_shape[0], -1)
+                    else x_raw.reshape(batch_n, -1)
                 )
                 scaler_device = _get_pred_scaler_device(sc)
                 target_device = raw_device
@@ -6422,38 +6454,76 @@ def infer(
                         target_device = torch.device("cpu")
                 elif scaler_device is not None:
                     target_device = scaler_device
-                if str(getattr(x_cal, "device", "")) != str(target_device):
-                    x_cal = x_cal.to(device=target_device, non_blocking=False)
                 suspend_dev = (
                     target_device
                     if isinstance(target_device, torch.device)
                     else device
                 )
-                with torch.inference_mode():
-                    with StatelessAutocast.suspend(suspend_dev):
-                        z_cal = cal(x_cal)
-                        y_out = denorm(z_cal)
-                if isinstance(y_out, tuple):
-                    y_out = y_out[0]
-                if not isinstance(y_out, torch.Tensor):
-                    raise RuntimeError(
-                        "infer: unexpected posthoc calibration output type"
-                    )
-                if y_out.ndim != 2 or int(y_out.shape[0]) != int(raw_shape[0]):
-                    raise RuntimeError(
-                        "infer: unexpected calibrated output shape"
-                    )
-                expected_features = (
-                    1 if len(raw_shape) == 1 else int(math.prod(raw_shape[1:]))
+
+                def _ensure_2d_features(t: object, *, name: str) -> torch.Tensor:
+                    if isinstance(t, tuple):
+                        t = t[0]
+                    if not isinstance(t, torch.Tensor):
+                        raise RuntimeError(
+                            f"infer: unexpected {name} output type"
+                        )
+                    if t.ndim == 0:
+                        raise RuntimeError(
+                            f"infer: unexpected scalar {name} output"
+                        )
+                    if t.ndim == 1:
+                        t2 = t.reshape(batch_n, 1)
+                    else:
+                        t2 = t.reshape(int(t.shape[0]), -1)
+                    if int(t2.shape[0]) != int(batch_n):
+                        raise RuntimeError(
+                            f"infer: unexpected {name} batch size"
+                        )
+                    if int(t2.shape[1]) != int(expected_features):
+                        raise RuntimeError(
+                            f"infer: unexpected {name} feature width"
+                        )
+                    return t2
+
+                input_space_mode = str(pred_posthoc_input_space or "auto")
+                if input_space_mode == "y":
+                    space_order = ("y",)
+                elif input_space_mode == "z":
+                    space_order = ("z",)
+                else:
+                    space_order = ("y", "z")
+                last_exc: Exception | None = None
+                for space in space_order:
+                    if str(space) == "y" and not callable(norm):
+                        last_exc = RuntimeError(
+                            "infer: scaler.normalize_y unavailable for Y-space posthoc calibration"
+                        )
+                        continue
+                    try:
+                        x_work = x_flat
+                        if str(getattr(x_work, "device", "")) != str(target_device):
+                            x_work = x_work.to(device=target_device, non_blocking=False)
+                        with torch.inference_mode():
+                            with StatelessAutocast.suspend(suspend_dev):
+                                z_in = x_work
+                                if str(space) == "y":
+                                    z_in = norm(x_work)
+                                z_in = _ensure_2d_features(z_in, name="posthoc input")
+                                z_cal = cal(z_in)
+                                y_out = denorm(z_cal)
+                        y_out = _ensure_2d_features(y_out, name="calibrated")
+                        y_out = y_out.reshape(raw_shape)
+                        if str(getattr(y_out, "device", "")) != str(raw_device):
+                            y_out = y_out.to(device=raw_device, non_blocking=False)
+                        return y_out.detach()
+                    except Exception as e:
+                        last_exc = e
+                        continue
+                if last_exc is not None:
+                    raise last_exc
+                raise RuntimeError(
+                    "infer: posthoc calibration had no viable input space"
                 )
-                if int(y_out.shape[1]) != expected_features:
-                    raise RuntimeError(
-                        "infer: calibrated output width mismatch"
-                    )
-                y_out = y_out.reshape(raw_shape)
-                if str(getattr(y_out, "device", "")) != str(raw_device):
-                    y_out = y_out.to(device=raw_device, non_blocking=False)
-                return y_out.detach()
 
             def _broadcast_like_selected_pair(
                 preds_now: torch.Tensor,
@@ -6970,6 +7040,8 @@ def infer(
                                         "nogil_compiled_pred": bool(_nogil_compiled_pred),
                                         "force_eager": bool(force_eager),
                                         "force_uncompiled": bool(force_uncompiled),
+                                        "pred_posthoc_prefer_cpu": bool(pred_posthoc_prefer_cpu),
+                                        "pred_posthoc_input_space": str(pred_posthoc_input_space),
                                         "pred_posthoc_calibrate_active": bool(pred_posthoc_calibrate_active),
                                         "pred_force_raw_output": bool(pred_force_raw_output),
                                         "pred_detect_low_diversity": bool(detect_low_diversity),
