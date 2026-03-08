@@ -4493,6 +4493,7 @@ def infer(
                 or cg_enabled
                 or td_cg_candidate
             )
+            _low_diversity_default = bool(_pred_collapse_risk_default)
             detect_partial_broadcast = bool(
                 env_bool(
                     "ENN_PRED_DETECT_PARTIAL_BROADCAST",
@@ -4544,7 +4545,7 @@ def infer(
             detect_low_diversity = bool(
                 env_bool(
                     "ENN_PRED_DETECT_LOW_DIVERSITY",
-                    default=bool(_pred_collapse_risk_default),
+                    default=bool(_low_diversity_default),
                 )
             )
             low_diversity_probe_k = max(
@@ -4579,19 +4580,19 @@ def infer(
             low_diversity_force_single = bool(
                 env_bool(
                     "ENN_PRED_LOW_DIVERSITY_FORCE_SINGLE",
-                    default=bool(_pred_collapse_risk_default),
+                    default=bool(_low_diversity_default),
                 )
             )
             low_diversity_force_fp32 = bool(
                 env_bool(
                     "ENN_PRED_LOW_DIVERSITY_FORCE_FP32",
-                    default=bool(_pred_collapse_risk_default),
+                    default=bool(_low_diversity_default),
                 )
             )
             low_diversity_persist_fp32 = bool(
                 env_bool(
                     "ENN_PRED_LOW_DIVERSITY_PERSIST_FP32",
-                    default=bool(_pred_collapse_risk_default),
+                    default=bool(_low_diversity_default),
                 )
             )
 
@@ -7211,7 +7212,10 @@ def infer(
                                         "pred_posthoc_reject_low_diversity": bool(pred_posthoc_reject_low_diversity),
                                         "pred_posthoc_reject_partial_like": bool(pred_posthoc_reject_partial_like),
                                         "pred_detect_low_diversity": bool(detect_low_diversity),
+                                        "pred_low_diversity_default": bool(_low_diversity_default),
+                                        "pred_low_diversity_force_single": bool(low_diversity_force_single),
                                         "pred_low_diversity_force_fp32": bool(low_diversity_force_fp32),
+                                        "pred_low_diversity_persist_fp32": bool(low_diversity_persist_fp32),
                                         "pred_collapse_risk_default": bool(_pred_collapse_risk_default),
                                         "mb": int(mb),
                                         "bs": int(bs),
