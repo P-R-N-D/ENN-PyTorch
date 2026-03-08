@@ -4579,7 +4579,7 @@ def infer(
             low_diversity_force_single = bool(
                 env_bool(
                     "ENN_PRED_LOW_DIVERSITY_FORCE_SINGLE",
-                    default=bool(low_diversity_default),
+                    default=bool(_pred_collapse_risk_default),
                 )
             )
             low_diversity_force_fp32 = bool(
