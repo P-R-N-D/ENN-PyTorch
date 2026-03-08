@@ -1472,7 +1472,7 @@ class Stream(BufferQueue):
             cap_default = max(
                 8,
                 max(2, int(self._depth) * 2),
-                16 if bool(_nogil_fast) else 8,
+                24 if bool(_nogil_fast) else 8,
             )
             cap = env_first_int(
                 ("ENN_PREFETCH_PIN_POOL_CAPACITY",), default=cap_default
@@ -1572,14 +1572,14 @@ class Stream(BufferQueue):
                 int(
                     env_first_int(
                         ("ENN_PREFETCH_SYNC_DEPTH_NOGIL_BOOST",),
-                        default=2,
+                        default=4,
                     )
-                    or 2
+                    or 4
                 ),
             )
             sync_depth_default = max(
                 int(sync_depth_default),
-                min(6, int(sync_depth_default) + int(sync_boost_default)),
+                min(8, int(sync_depth_default) + int(sync_boost_default)),
             )
         self._sync_prefetch_depth = max(
             1,
@@ -1598,12 +1598,12 @@ class Stream(BufferQueue):
                 int(getattr(self._host_pool, "capacity", 0) or 0),
                 16
                 if bool(self._prefetch_thread)
-                else (32 if bool(nogil_sync_nonthread) else (24 if CPU.is_optimized_for_no_gil() else 8)),
+                else (48 if bool(nogil_sync_nonthread) else (24 if CPU.is_optimized_for_no_gil() else 8)),
                 int(self._depth)
                 * (6 if bool(self._prefetch_thread) and CPU.is_optimized_for_no_gil() else 4),
                 int(sync_depth_eff)
                 * (
-                    10
+                    12
                     if bool(nogil_sync_nonthread)
                     else (8 if CPU.is_optimized_for_no_gil() else 4)
                 ),

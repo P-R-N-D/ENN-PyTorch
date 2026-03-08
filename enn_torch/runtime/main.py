@@ -4484,16 +4484,24 @@ def infer(
             _dbg_raw_fallback = bool(
                 env_bool("ENN_PRED_COLLAPSE_FALLBACK_RAW", default=True)
             )
+            _pred_collapse_risk_default = bool(
+                _dbg_diag_enabled
+                or _dbg_raw_fallback
+                or _nogil_pred
+                or _pred_compile_enabled
+                or _pred_model_compiled
+                or cg_enabled
+                or td_cg_candidate
+            )
+            _low_diversity_default = bool(_pred_collapse_risk_default)
             detect_partial_broadcast = bool(
                 env_bool(
                     "ENN_PRED_DETECT_PARTIAL_BROADCAST",
-                    default=bool(
-                        _dbg_diag_enabled or _dbg_raw_fallback or _nogil_pred
-                    ),
+                    default=bool(_pred_collapse_risk_default),
                 )
             )
             partial_broadcast_match_default = (
-                0.95 if bool(_nogil_pred) else 0.90
+                0.95 if bool(_pred_collapse_risk_default) else 0.90
             )
             partial_broadcast_match_frac = float(
                 env_float(
@@ -4504,7 +4512,7 @@ def infer(
             partial_broadcast_force_single = bool(
                 env_bool(
                     "ENN_PRED_PARTIAL_BROADCAST_FORCE_SINGLE",
-                    default=bool(_dbg_raw_fallback or _nogil_pred),
+                    default=bool(_pred_collapse_risk_default),
                 )
             )
             partial_broadcast_after_fix_match_frac = float(
@@ -4513,19 +4521,19 @@ def infer(
             partial_broadcast_force_uncompiled = bool(
                 env_bool(
                     "ENN_PRED_PARTIAL_BROADCAST_FORCE_UNCOMPILED",
-                    default=bool(_dbg_raw_fallback or _nogil_pred),
+                    default=bool(_pred_collapse_risk_default),
                 )
             )
             partial_broadcast_force_eager = bool(
                 env_bool(
                     "ENN_PRED_PARTIAL_BROADCAST_FORCE_EAGER",
-                    default=bool(_nogil_pred),
+                    default=bool(_pred_collapse_risk_default),
                 )
             )
             partial_broadcast_fp32_retry = bool(
                 env_bool(
                     "ENN_PRED_PARTIAL_BROADCAST_FP32_RETRY",
-                    default=bool(_dbg_raw_fallback or _nogil_pred),
+                    default=bool(_pred_collapse_risk_default),
                 )
             )
             partial_broadcast_fp32_min_gain = float(
@@ -4537,7 +4545,7 @@ def infer(
             detect_low_diversity = bool(
                 env_bool(
                     "ENN_PRED_DETECT_LOW_DIVERSITY",
-                    default=bool(_nogil_pred),
+                    default=bool(_low_diversity_default),
                 )
             )
             low_diversity_probe_k = max(
@@ -4572,19 +4580,19 @@ def infer(
             low_diversity_force_single = bool(
                 env_bool(
                     "ENN_PRED_LOW_DIVERSITY_FORCE_SINGLE",
-                    default=bool(_nogil_pred),
+                    default=bool(_low_diversity_default),
                 )
             )
             low_diversity_force_fp32 = bool(
                 env_bool(
                     "ENN_PRED_LOW_DIVERSITY_FORCE_FP32",
-                    default=bool(_nogil_pred),
+                    default=bool(_low_diversity_default),
                 )
             )
             low_diversity_persist_fp32 = bool(
                 env_bool(
                     "ENN_PRED_LOW_DIVERSITY_PERSIST_FP32",
-                    default=bool(_nogil_pred),
+                    default=bool(_low_diversity_default),
                 )
             )
 
@@ -6106,7 +6114,7 @@ def infer(
             pred_posthoc_prefer_cpu = bool(
                 env_bool(
                     "ENN_PRED_COLLAPSE_POSTHOC_CPU",
-                    default=bool(_nogil_pred),
+                    default=bool(_pred_collapse_risk_default),
                 )
             )
             pred_posthoc_input_space = str(
@@ -6142,10 +6150,29 @@ def infer(
                     default=False,
                 )
             )
+            pred_posthoc_denorm_only_enabled = bool(
+                env_bool(
+                    "ENN_PRED_COLLAPSE_POSTHOC_DENORM_ONLY",
+                    default=True,
+                )
+            )
+            pred_posthoc_reject_low_diversity = bool(
+                env_bool(
+                    "ENN_PRED_COLLAPSE_POSTHOC_REJECT_LOW_DIVERSITY",
+                    default=True,
+                )
+            )
+            pred_posthoc_reject_partial_like = bool(
+                env_bool(
+                    "ENN_PRED_COLLAPSE_POSTHOC_REJECT_PARTIAL",
+                    default=True,
+                )
+            )
             pred_persist_raw_mode = bool(
                 env_bool("ENN_PRED_COLLAPSE_PERSIST_RAW_MODE", default=True)
             )
             pred_posthoc_calibrate_active = False
+            pred_posthoc_denorm_only_active = False
             pred_force_raw_output = False
             pred_cg_strict_sync = bool(
                 env_bool(
@@ -6544,6 +6571,88 @@ def infer(
                     "infer: posthoc calibration had no viable input space"
                 )
 
+            def _posthoc_denormalize_prediction(
+                pred_raw: torch.Tensor,
+                *,
+                prefer_cpu: bool,
+            ) -> torch.Tensor:
+                if not isinstance(pred_raw, torch.Tensor):
+                    raise TypeError("infer: posthoc denormalization requires a tensor")
+                sc = _get_pred_scaler()
+                denorm = (
+                    getattr(sc, "denormalize_y", None) if sc is not None else None
+                )
+                if not callable(denorm):
+                    raise RuntimeError(
+                        "infer: scaler.denormalize_y unavailable for posthoc denormalization"
+                    )
+                x_raw = pred_raw.detach()
+                if x_raw.ndim == 0:
+                    raise RuntimeError(
+                        "infer: posthoc denormalization requires batched predictions"
+                    )
+                raw_shape = tuple(x_raw.shape)
+                raw_device = x_raw.device
+                batch_n = int(raw_shape[0])
+                expected_features = (
+                    1 if len(raw_shape) == 1 else int(math.prod(raw_shape[1:]))
+                )
+                x_flat = (
+                    x_raw.reshape(batch_n, 1)
+                    if x_raw.ndim == 1
+                    else x_raw.reshape(batch_n, -1)
+                )
+                scaler_device = _get_pred_scaler_device(sc)
+                target_device = raw_device
+                if bool(prefer_cpu):
+                    if getattr(raw_device, "type", None) == "cpu":
+                        target_device = raw_device
+                    elif scaler_device is not None and getattr(scaler_device, "type", None) == "cpu":
+                        target_device = scaler_device
+                    elif scaler_device is not None:
+                        target_device = scaler_device
+                    else:
+                        target_device = torch.device("cpu")
+                elif scaler_device is not None:
+                    target_device = scaler_device
+                suspend_dev = (
+                    target_device
+                    if isinstance(target_device, torch.device)
+                    else device
+                )
+                x_work = x_flat
+                if str(getattr(x_work, "device", "")) != str(target_device):
+                    x_work = x_work.to(device=target_device, non_blocking=False)
+                with torch.inference_mode():
+                    with StatelessAutocast.suspend(suspend_dev):
+                        y_out = denorm(x_work)
+                if isinstance(y_out, tuple):
+                    y_out = y_out[0]
+                if not isinstance(y_out, torch.Tensor):
+                    raise RuntimeError(
+                        "infer: unexpected denormalized output type"
+                    )
+                if y_out.ndim == 0:
+                    raise RuntimeError(
+                        "infer: unexpected scalar denormalized output"
+                    )
+                if y_out.ndim == 1:
+                    y2 = y_out.reshape(batch_n, 1)
+                else:
+                    y2 = y_out.reshape(int(y_out.shape[0]), -1)
+                if int(y2.shape[0]) != int(batch_n):
+                    raise RuntimeError(
+                        "infer: unexpected denormalized batch size"
+                    )
+                if int(y2.shape[1]) != int(expected_features):
+                    raise RuntimeError(
+                        "infer: unexpected denormalized feature width"
+                    )
+                y_out = y2.reshape(raw_shape)
+                if str(getattr(y_out, "device", "")) != str(raw_device):
+                    y_out = y_out.to(device=raw_device, non_blocking=False)
+                return y_out.detach()
+
             def _broadcast_like_selected_pair(
                 preds_now: torch.Tensor,
                 *,
@@ -6664,7 +6773,7 @@ def infer(
                 use_uncompiled: bool | None = None,
                 force_fp32: bool = False,
             ) -> torch.Tensor:
-                nonlocal pred_posthoc_calibrate_active, pred_force_raw_output
+                nonlocal pred_posthoc_calibrate_active, pred_posthoc_denorm_only_active, pred_force_raw_output
                 uc = (
                     bool(force_uncompiled)
                     if use_uncompiled is None
@@ -6677,6 +6786,39 @@ def infer(
                 )
                 if bool(pred_force_raw_output):
                     want_calibrate = False
+                if bool(pred_posthoc_denorm_only_active) and bool(want_calibrate):
+                    out_raw = _run_model_predict_with_calibration(
+                        x,
+                        calibrate_output=False,
+                        use_uncompiled=uc,
+                        force_fp32=bool(force_fp32),
+                    )
+                    if isinstance(out_raw, tuple):
+                        out_raw = out_raw[0]
+                    if not isinstance(out_raw, torch.Tensor):
+                        raise RuntimeError("infer: unexpected model output type")
+                    try:
+                        out_post = _posthoc_denormalize_prediction(
+                            out_raw,
+                            prefer_cpu=bool(pred_posthoc_prefer_cpu),
+                        )
+                        if isinstance(out_post, torch.Tensor) and (
+                            not out_post.is_contiguous()
+                        ):
+                            with contextlib.suppress(Exception):
+                                out_post = out_post.contiguous()
+                        return out_post.detach()
+                    except Exception as e:
+                        if bool(pred_persist_raw_mode):
+                            pred_posthoc_denorm_only_active = False
+                            pred_force_raw_output = True
+                            _LOGGER.warning(
+                                "[infer] posthoc denormalization failed during prediction (%s: %s); switching remaining outputs to raw mode for consistency.",
+                                type(e).__name__,
+                                str(e),
+                            )
+                            return out_raw.detach()
+                        raise
                 if bool(pred_posthoc_calibrate_active) and bool(want_calibrate):
                     out_raw = _run_model_predict_with_calibration(
                         x,
@@ -6703,6 +6845,7 @@ def infer(
                     except Exception as e:
                         if bool(pred_persist_raw_mode):
                             pred_posthoc_calibrate_active = False
+                            pred_posthoc_denorm_only_active = False
                             pred_force_raw_output = True
                             _LOGGER.warning(
                                 "[infer] posthoc calibration failed during prediction (%s: %s); switching remaining outputs to raw mode for consistency.",
@@ -7064,9 +7207,16 @@ def infer(
                                         "pred_posthoc_input_space": str(pred_posthoc_input_space),
                                         "pred_posthoc_allow_cross_space_fallback": bool(pred_posthoc_allow_cross_space_fallback),
                                         "pred_posthoc_calibrate_active": bool(pred_posthoc_calibrate_active),
+                                        "pred_posthoc_denorm_only_active": bool(pred_posthoc_denorm_only_active),
                                         "pred_force_raw_output": bool(pred_force_raw_output),
+                                        "pred_posthoc_reject_low_diversity": bool(pred_posthoc_reject_low_diversity),
+                                        "pred_posthoc_reject_partial_like": bool(pred_posthoc_reject_partial_like),
                                         "pred_detect_low_diversity": bool(detect_low_diversity),
+                                        "pred_low_diversity_default": bool(_low_diversity_default),
+                                        "pred_low_diversity_force_single": bool(low_diversity_force_single),
                                         "pred_low_diversity_force_fp32": bool(low_diversity_force_fp32),
+                                        "pred_low_diversity_persist_fp32": bool(low_diversity_persist_fp32),
+                                        "pred_collapse_risk_default": bool(_pred_collapse_risk_default),
                                         "mb": int(mb),
                                         "bs": int(bs),
                                     },
@@ -8487,7 +8637,9 @@ def infer(
                                                         )
                                                     preds_fix2_raw_ok = False
                                                     preds_fix2_post_ok = False
+                                                    preds_fix2_denorm_ok = False
                                                     preds_fix2_post: torch.Tensor | None = None
+                                                    preds_fix2_denorm: torch.Tensor | None = None
                                                     if (
                                                         preds_fix2 is not None
                                                         and int(preds_fix2.shape[0])
@@ -8550,94 +8702,167 @@ def infer(
                                                                     input_space_hint="z",
                                                                 )
                                                             )
-                                                            with contextlib.suppress(
-                                                                Exception
-                                                            ):
-                                                                if isinstance(
-                                                                    preds_fix2_post,
-                                                                    torch.Tensor,
-                                                                ) and (
+                                                            with contextlib.suppress(Exception):
+                                                                if isinstance(preds_fix2_post, torch.Tensor) and (
                                                                     not preds_fix2_post.is_contiguous()
                                                                 ):
-                                                                    preds_fix2_post = (
-                                                                        preds_fix2_post.contiguous()
-                                                                    )
+                                                                    preds_fix2_post = preds_fix2_post.contiguous()
                                                             if (
-                                                                isinstance(
-                                                                    preds_fix2_post,
-                                                                    torch.Tensor,
-                                                                )
-                                                                and int(
-                                                                    preds_fix2_post.shape[
-                                                                        0
-                                                                    ]
-                                                                )
-                                                                >= 2
+                                                                isinstance(preds_fix2_post, torch.Tensor)
+                                                                and int(preds_fix2_post.shape[0]) >= 2
                                                             ):
                                                                 is_like_post, pair_i_post, st_post = (
                                                                     _broadcast_like_selected_pair(
                                                                         preds_fix2_post,
                                                                         preferred_i=int(sel_i),
-                                                                        atol=float(
-                                                                            broadcast_atol
-                                                                        ),
+                                                                        atol=float(broadcast_atol),
                                                                     )
                                                                 )
-                                                                dy_post = float(
-                                                                    st_post.get(
-                                                                        "y_max",
-                                                                        float("nan"),
+                                                                dy_post = float(st_post.get("y_max", float("nan")))
+                                                                mf_post = float(st_post.get("y_match_frac", float("nan")))
+                                                                partial_like_post = bool(
+                                                                    detect_partial_broadcast
+                                                                    and math.isfinite(mf_post)
+                                                                    and (
+                                                                        mf_post
+                                                                        >= float(partial_broadcast_after_fix_match_frac)
                                                                     )
+                                                                    and ("x_diff" in locals())
+                                                                    and (float(x_diff.item()) > 0.0)
+                                                                    and (str(dev_type) == "cuda")
                                                                 )
+                                                                lowdiv_like_post = False
+                                                                lowdiv_stats_post: dict[str, float] | None = None
+                                                                with contextlib.suppress(Exception):
+                                                                    if bool(detect_low_diversity):
+                                                                        lowdiv_stats_post = _low_diversity_probe_stats(
+                                                                            preds_fix2_post,
+                                                                            probe_k=int(min(int(low_diversity_probe_k), int(getattr(preds_fix2_post, "shape", (0,))[0] or 0))),
+                                                                            atol=float(broadcast_atol),
+                                                                            sample_max=int(low_diversity_sample_max),
+                                                                        )
+                                                                        lowdiv_like_post = bool(_is_low_diversity_stats(lowdiv_stats_post))
                                                                 _LOGGER.warning(
                                                                     "[infer] posthoc-calibrated sanity (this batch only): max|Y0-Y%d|=%.6g match_frac=%.5f rel_mean=%.3e",
                                                                     int(pair_i_post),
                                                                     float(dy_post),
-                                                                    float(
-                                                                        st_post.get(
-                                                                            "y_match_frac",
-                                                                            float(
-                                                                                "nan"
-                                                                            ),
-                                                                        )
-                                                                    ),
-                                                                    float(
-                                                                        st_post.get(
-                                                                            "y_rel_mean",
-                                                                            float(
-                                                                                "nan"
-                                                                            ),
-                                                                        )
-                                                                    ),
+                                                                    float(mf_post),
+                                                                    float(st_post.get("y_rel_mean", float("nan"))),
                                                                 )
-                                                                preds_fix2_post_ok = (
-                                                                    not bool(is_like_post)
-                                                                )
+                                                                preds_fix2_post_ok = (not bool(is_like_post))
+                                                                if bool(pred_posthoc_reject_partial_like) and bool(partial_like_post):
+                                                                    preds_fix2_post_ok = False
+                                                                if bool(pred_posthoc_reject_low_diversity) and bool(lowdiv_like_post):
+                                                                    preds_fix2_post_ok = False
+                                                                if bool(partial_like_post):
+                                                                    _LOGGER.warning(
+                                                                        "[infer] posthoc calibration remained partial-broadcast-like; trying denorm-only fallback before using raw outputs."
+                                                                    )
+                                                                if bool(lowdiv_like_post):
+                                                                    _LOGGER.warning(
+                                                                        "[infer] posthoc calibration remained low-diversity (uniq<=2 frac=%.5f, uniq<=3 frac=%.5f, std_p50=%.6g); trying denorm-only fallback before using raw outputs.",
+                                                                        float((lowdiv_stats_post or {}).get("uniq_le2_frac", float("nan"))),
+                                                                        float((lowdiv_stats_post or {}).get("uniq_le3_frac", float("nan"))),
+                                                                        float((lowdiv_stats_post or {}).get("std_p50", float("nan"))),
+                                                                    )
                                                         except Exception as e:
                                                             _LOGGER.warning(
-                                                                "[infer] posthoc calibration after raw-collapse fallback failed (%s: %s); keeping raw predictions for this batch.",
+                                                                "[infer] posthoc calibration after raw-collapse fallback failed (%s: %s); trying denorm-only fallback before raw outputs.",
                                                                 type(e).__name__,
                                                                 str(e),
                                                             )
                                                             preds_fix2_post = None
                                                             preds_fix2_post_ok = False
-                                                    if preds_fix2_post_ok and isinstance(
-                                                        preds_fix2_post, torch.Tensor
+                                                    if (
+                                                        preds_fix2 is not None
+                                                        and bool(preds_fix2_raw_ok)
+                                                        and (not bool(preds_fix2_post_ok))
+                                                        and bool(pred_posthoc_denorm_only_enabled)
                                                     ):
+                                                        try:
+                                                            preds_fix2_denorm = _posthoc_denormalize_prediction(
+                                                                preds_fix2,
+                                                                prefer_cpu=bool(pred_posthoc_prefer_cpu),
+                                                            )
+                                                            with contextlib.suppress(Exception):
+                                                                if isinstance(preds_fix2_denorm, torch.Tensor) and (
+                                                                    not preds_fix2_denorm.is_contiguous()
+                                                                ):
+                                                                    preds_fix2_denorm = preds_fix2_denorm.contiguous()
+                                                            if (
+                                                                isinstance(preds_fix2_denorm, torch.Tensor)
+                                                                and int(preds_fix2_denorm.shape[0]) >= 2
+                                                            ):
+                                                                is_like_den, pair_i_den, st_den = _broadcast_like_selected_pair(
+                                                                    preds_fix2_denorm,
+                                                                    preferred_i=int(sel_i),
+                                                                    atol=float(broadcast_atol),
+                                                                )
+                                                                dy_den = float(st_den.get("y_max", float("nan")))
+                                                                mf_den = float(st_den.get("y_match_frac", float("nan")))
+                                                                partial_like_den = bool(
+                                                                    detect_partial_broadcast
+                                                                    and math.isfinite(mf_den)
+                                                                    and (
+                                                                        mf_den
+                                                                        >= float(partial_broadcast_after_fix_match_frac)
+                                                                    )
+                                                                    and ("x_diff" in locals())
+                                                                    and (float(x_diff.item()) > 0.0)
+                                                                    and (str(dev_type) == "cuda")
+                                                                )
+                                                                lowdiv_like_den = False
+                                                                lowdiv_stats_den: dict[str, float] | None = None
+                                                                with contextlib.suppress(Exception):
+                                                                    if bool(detect_low_diversity):
+                                                                        lowdiv_stats_den = _low_diversity_probe_stats(
+                                                                            preds_fix2_denorm,
+                                                                            probe_k=int(min(int(low_diversity_probe_k), int(getattr(preds_fix2_denorm, "shape", (0,))[0] or 0))),
+                                                                            atol=float(broadcast_atol),
+                                                                            sample_max=int(low_diversity_sample_max),
+                                                                        )
+                                                                        lowdiv_like_den = bool(_is_low_diversity_stats(lowdiv_stats_den))
+                                                                _LOGGER.warning(
+                                                                    "[infer] denorm-only sanity (this batch only): max|Y0-Y%d|=%.6g match_frac=%.5f rel_mean=%.3e",
+                                                                    int(pair_i_den),
+                                                                    float(dy_den),
+                                                                    float(mf_den),
+                                                                    float(st_den.get("y_rel_mean", float("nan"))),
+                                                                )
+                                                                preds_fix2_denorm_ok = (not bool(is_like_den))
+                                                                if bool(pred_posthoc_reject_partial_like) and bool(partial_like_den):
+                                                                    preds_fix2_denorm_ok = False
+                                                                if bool(pred_posthoc_reject_low_diversity) and bool(lowdiv_like_den):
+                                                                    preds_fix2_denorm_ok = False
+                                                        except Exception as e:
+                                                            _LOGGER.warning(
+                                                                "[infer] denorm-only fallback after raw-collapse fallback failed (%s: %s); keeping raw predictions for this batch.",
+                                                                type(e).__name__,
+                                                                str(e),
+                                                            )
+                                                            preds_fix2_denorm = None
+                                                            preds_fix2_denorm_ok = False
+                                                    if preds_fix2_post_ok and isinstance(preds_fix2_post, torch.Tensor):
                                                         preds = preds_fix2_post
-                                                        pred_posthoc_calibrate_active = (
-                                                            True
-                                                        )
+                                                        pred_posthoc_calibrate_active = True
+                                                        pred_posthoc_denorm_only_active = False
                                                         pred_force_raw_output = False
                                                         _LOGGER.warning(
                                                             "[infer] using per-sample raw predictions with posthoc output calibration for this batch; keeping posthoc calibration for remaining prediction microbatches."
                                                         )
+                                                    elif preds_fix2_denorm_ok and isinstance(preds_fix2_denorm, torch.Tensor):
+                                                        preds = preds_fix2_denorm
+                                                        pred_posthoc_calibrate_active = False
+                                                        pred_posthoc_denorm_only_active = True
+                                                        pred_force_raw_output = False
+                                                        _LOGGER.warning(
+                                                            "[infer] using per-sample raw predictions with denorm-only output scaling for this batch; keeping denorm-only scaling for remaining prediction microbatches."
+                                                        )
                                                     elif preds_fix2 is not None:
                                                         preds = preds_fix2
                                                         if bool(pred_persist_raw_mode):
-                                                            pred_posthoc_calibrate_active = (
-                                                                False
-                                                            )
+                                                            pred_posthoc_calibrate_active = False
+                                                            pred_posthoc_denorm_only_active = False
                                                             pred_force_raw_output = True
                                                             _LOGGER.warning(
                                                                 "[infer] keeping raw-output mode for remaining prediction microbatches to avoid mixed-scale outputs."
@@ -8645,11 +8870,9 @@ def infer(
                                                         _LOGGER.warning(
                                                             "[infer] using calibrate_output=False per-sample predictions for output of this batch."
                                                         )
-                                                    if preds_fix2_post is not None and (
-                                                        not bool(preds_fix2_post_ok)
-                                                    ):
+                                                    if preds_fix2_post is not None and (not bool(preds_fix2_post_ok)):
                                                         _LOGGER.warning(
-                                                            "[infer] posthoc calibration reintroduced broadcast-like outputs; current batch keeps raw predictions."
+                                                            "[infer] posthoc calibration was rejected after sanity checks; current batch did not keep that calibrated output."
                                                         )
                                                     if preds_fix2 is not None:
                                                         with contextlib.suppress(
