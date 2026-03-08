@@ -6491,7 +6491,9 @@ def infer(
                 elif input_space_mode == "z":
                     space_order = ("z",)
                 else:
-                    space_order = ("y", "z")
+                    # Model forward outputs are in normalized Z-space by default,
+                    # so auto mode should try Z first and only fall back to Y.
+                    space_order = ("z", "y")
                 last_exc: Exception | None = None
                 for space in space_order:
                     if str(space) == "y" and not callable(norm):
