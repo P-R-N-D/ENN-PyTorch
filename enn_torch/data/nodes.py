@@ -1468,7 +1468,12 @@ class Stream(BufferQueue):
             and is_stream_supported(self._device.type)
         ):
             use_pool = env_bool("ENN_PREFETCH_PIN_POOL", default=True)
-            cap_default = max(8, max(2, int(self._depth) * 2))
+            _nogil_fast = bool(CPU.is_optimized_for_no_gil())
+            cap_default = max(
+                8,
+                max(2, int(self._depth) * 2),
+                16 if bool(_nogil_fast) else 8,
+            )
             cap = env_first_int(
                 ("ENN_PREFETCH_PIN_POOL_CAPACITY",), default=cap_default
             )
@@ -1554,13 +1559,28 @@ class Stream(BufferQueue):
                     int(self.max_batches),
                     int(self._prefetch_thread_host_max_batches),
                 )
+        sync_depth_default = int(self._depth)
+        if bool(CPU.is_optimized_for_no_gil()) and bool(use_accel) and bool(self._non_blocking) and (not bool(self._prefetch_thread)):
+            sync_depth_default = max(int(sync_depth_default), min(4, int(sync_depth_default) + 1))
+        self._sync_prefetch_depth = max(
+            1,
+            int(
+                env_first_int(
+                    ("ENN_PREFETCH_SYNC_DEPTH",),
+                    default=sync_depth_default,
+                )
+                or sync_depth_default
+            ),
+        )
         self._host_pool_max_capacity = 0
         if self._host_pool is not None:
+            sync_depth_eff = int(getattr(self, "_sync_prefetch_depth", self._depth) or self._depth)
             max_cap_default = max(
                 int(getattr(self._host_pool, "capacity", 0) or 0),
-                16 if bool(self._prefetch_thread) else 8,
+                16 if bool(self._prefetch_thread) else (24 if CPU.is_optimized_for_no_gil() else 8),
                 int(self._depth)
                 * (6 if bool(self._prefetch_thread) and CPU.is_optimized_for_no_gil() else 4),
+                int(sync_depth_eff) * (8 if CPU.is_optimized_for_no_gil() else 4),
             )
             self._host_pool_max_capacity = int(
                 env_first_int(
@@ -1683,7 +1703,10 @@ class Stream(BufferQueue):
         tensors_per_batch = int(self._count_stageable_tensors(obj))
         if tensors_per_batch <= 0:
             return
-        inflight_batches = max(1, int(self._depth))
+        inflight_batches = max(
+            1,
+            int(getattr(self, "_sync_prefetch_depth", self._depth) or self._depth),
+        )
         if bool(getattr(self, "_prefetch_thread", False)):
             inflight_batches = (
                 max(
@@ -1944,6 +1967,10 @@ class Stream(BufferQueue):
         iterable = getattr(self, "_iterable", self._src)
         gpu_guard_bytes = int(getattr(self, "_gpu_guard_bytes", 0) or 0)
         host_guard_bytes = int(getattr(self, "_host_guard_bytes", 0) or 0)
+        sync_depth_eff = max(
+            1,
+            int(getattr(self, "_sync_prefetch_depth", self._depth) or self._depth),
+        )
 
         if use_accel_stream and self._accel_stream is None:
             self._accel_stream = new_accelerator_stream(device)
@@ -1953,7 +1980,7 @@ class Stream(BufferQueue):
         if use_accel_stream:
             pool: queue.SimpleQueue = queue.SimpleQueue()
             created = 0
-            for _ in range(max(1, int(getattr(self, "_depth", 2) or 2))):
+            for _ in range(int(sync_depth_eff)):
                 ev = new_accelerator_event(device, enable_timing=False)
                 if ev is not None:
                     pool.put(ev)
@@ -2174,7 +2201,7 @@ class Stream(BufferQueue):
         src_it = iter(iterable)
 
         try:
-            for _ in range(max(1, int(getattr(self, "_depth", 2) or 2))):
+            for _ in range(int(sync_depth_eff)):
                 try:
                     raw = next(src_it)
                 except StopIteration:

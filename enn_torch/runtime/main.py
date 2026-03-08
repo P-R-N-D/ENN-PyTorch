@@ -4534,6 +4534,59 @@ def infer(
             partial_broadcast_fp32_persist = bool(
                 env_bool("ENN_PRED_PARTIAL_BROADCAST_FP32_PERSIST", default=False)
             )
+            detect_low_diversity = bool(
+                env_bool(
+                    "ENN_PRED_DETECT_LOW_DIVERSITY",
+                    default=bool(_nogil_pred),
+                )
+            )
+            low_diversity_probe_k = max(
+                2,
+                int(
+                    env_int(
+                        "ENN_PRED_LOW_DIVERSITY_PROBE_K",
+                        int(max(2, int(broadcast_probe_k))),
+                    )
+                    or int(max(2, int(broadcast_probe_k)))
+                ),
+            )
+            low_diversity_sample_max = max(
+                0,
+                int(
+                    env_int(
+                        "ENN_PRED_LOW_DIVERSITY_SAMPLE_MAX",
+                        int(max(0, int(broadcast_sample_max))),
+                    )
+                    or int(max(0, int(broadcast_sample_max)))
+                ),
+            )
+            low_diversity_frac_le2 = float(
+                env_float("ENN_PRED_LOW_DIVERSITY_FRAC_LE2", 0.90)
+            )
+            low_diversity_frac_le3 = float(
+                env_float("ENN_PRED_LOW_DIVERSITY_FRAC_LE3", 0.60)
+            )
+            low_diversity_std_p50_max = float(
+                env_float("ENN_PRED_LOW_DIVERSITY_STD_P50_MAX", 1e-3)
+            )
+            low_diversity_force_single = bool(
+                env_bool(
+                    "ENN_PRED_LOW_DIVERSITY_FORCE_SINGLE",
+                    default=bool(_nogil_pred),
+                )
+            )
+            low_diversity_force_fp32 = bool(
+                env_bool(
+                    "ENN_PRED_LOW_DIVERSITY_FORCE_FP32",
+                    default=bool(_nogil_pred),
+                )
+            )
+            low_diversity_persist_fp32 = bool(
+                env_bool(
+                    "ENN_PRED_LOW_DIVERSITY_PERSIST_FP32",
+                    default=bool(_nogil_pred),
+                )
+            )
 
             def _broadcast_like(
                 y0: torch.Tensor,
@@ -6444,6 +6497,77 @@ def infer(
                     pair_i = 1
                 return t[[0, pair_i]].detach(), int(pair_i)
 
+            def _low_diversity_probe_stats(
+                preds_now: torch.Tensor,
+                *,
+                probe_k: int,
+                atol: float,
+                sample_max: int,
+            ) -> dict[str, float]:
+                if not isinstance(preds_now, torch.Tensor):
+                    return {}
+                n_now = int(getattr(preds_now, "shape", (0,))[0] or 0)
+                k_now = int(max(0, min(int(probe_k), int(n_now))))
+                if k_now < 2:
+                    return {}
+                work = preds_now[:k_now].detach()
+                if work.ndim <= 1:
+                    work = work.reshape(k_now, 1)
+                else:
+                    work = work.reshape(k_now, -1)
+                cols = int(getattr(work, "shape", (0, 0))[1] or 0)
+                if cols <= 0:
+                    return {}
+                if int(sample_max) > 0 and cols > int(sample_max):
+                    idx = torch.arange(
+                        int(sample_max), device=work.device, dtype=torch.long
+                    )
+                    idx = (idx * max(0, cols - 1)) // max(1, int(sample_max) - 1)
+                    work = work.index_select(1, idx)
+                    cols = int(getattr(work, "shape", (0, 0))[1] or 0)
+                if work.dtype in (torch.float16, torch.bfloat16):
+                    work = work.to(dtype=torch.float32)
+                elif not work.is_floating_point():
+                    work = work.to(dtype=torch.float32)
+                with contextlib.suppress(Exception):
+                    work = torch.where(torch.isfinite(work), work, torch.zeros_like(work))
+                sorted_vals, _ = torch.sort(work, dim=0)
+                if int(k_now) <= 1:
+                    distinct = torch.ones((cols,), device=work.device, dtype=torch.int32)
+                else:
+                    gaps = (sorted_vals[1:] - sorted_vals[:-1]).abs() > float(atol)
+                    distinct = 1 + gaps.to(dtype=torch.int32).sum(dim=0)
+                distinct_f = distinct.to(dtype=torch.float32)
+                std = work.std(dim=0, unbiased=False)
+                return {
+                    "probe_k": float(k_now),
+                    "sample_n": float(cols),
+                    "uniq_le1_frac": float((distinct_f <= 1).to(dtype=torch.float32).mean().item()),
+                    "uniq_le2_frac": float((distinct_f <= 2).to(dtype=torch.float32).mean().item()),
+                    "uniq_le3_frac": float((distinct_f <= 3).to(dtype=torch.float32).mean().item()),
+                    "std_p50": float(torch.quantile(std, 0.50).item()) if int(std.numel()) > 0 else float("nan"),
+                    "std_p90": float(torch.quantile(std, 0.90).item()) if int(std.numel()) > 0 else float("nan"),
+                    "std_p99": float(torch.quantile(std, 0.99).item()) if int(std.numel()) > 0 else float("nan"),
+                    "std_max": float(std.max().item()) if int(std.numel()) > 0 else float("nan"),
+                }
+
+            def _is_low_diversity_stats(stats: dict[str, float] | None) -> bool:
+                if not isinstance(stats, dict) or not stats:
+                    return False
+                frac_le2 = float(stats.get("uniq_le2_frac", float("nan")))
+                frac_le3 = float(stats.get("uniq_le3_frac", float("nan")))
+                std_p50 = float(stats.get("std_p50", float("nan")))
+                if math.isfinite(frac_le2) and frac_le2 >= float(low_diversity_frac_le2):
+                    return True
+                if (
+                    math.isfinite(frac_le3)
+                    and math.isfinite(std_p50)
+                    and frac_le3 >= float(low_diversity_frac_le3)
+                    and std_p50 <= float(low_diversity_std_p50_max)
+                ):
+                    return True
+                return False
+
             def _td_predict(
                 x: torch.Tensor,
                 *,
@@ -6848,6 +6972,8 @@ def infer(
                                         "force_uncompiled": bool(force_uncompiled),
                                         "pred_posthoc_calibrate_active": bool(pred_posthoc_calibrate_active),
                                         "pred_force_raw_output": bool(pred_force_raw_output),
+                                        "pred_detect_low_diversity": bool(detect_low_diversity),
+                                        "pred_low_diversity_force_fp32": bool(low_diversity_force_fp32),
                                         "mb": int(mb),
                                         "bs": int(bs),
                                     },
@@ -7448,6 +7574,8 @@ def infer(
                             sel_i = 1
                             sel_kind = ""
                             sel_bstats: dict[str, float] | None = None
+                            lowdiv_stats: dict[str, float] | None = None
+                            lowdiv_like = False
 
                             for pi in range(1, int(probe_k)):
                                 xi = Xi[pi].detach()
@@ -7503,6 +7631,20 @@ def infer(
                                     sel_kind = "partial_like"
                                     sel_bstats = best_bstats
 
+                            if bool(detect_low_diversity) and int(probe_k) >= 2:
+                                with contextlib.suppress(Exception):
+                                    lowdiv_stats = _low_diversity_probe_stats(
+                                        preds,
+                                        probe_k=int(min(int(low_diversity_probe_k), int(probe_k))),
+                                        atol=float(broadcast_atol),
+                                        sample_max=int(low_diversity_sample_max),
+                                    )
+                                    lowdiv_like = bool(_is_low_diversity_stats(lowdiv_stats))
+                                    if bool(lowdiv_like) and (not str(sel_kind)):
+                                        sel_i = int(best_i) if int(best_i) > 0 else 1
+                                        sel_kind = "low_diversity"
+                                        sel_bstats = dict(best_bstats or {})
+
                             if (
                                 bool(collapse_diag)
                                 and bool(collapse_diag_save)
@@ -7543,6 +7685,8 @@ def infer(
                                             "probe_selected_rel_mean": float(
                                                 st_s.get("y_rel_mean", float("nan"))
                                             ),
+                                            "probe_low_diversity": bool(lowdiv_like),
+                                            "probe_low_diversity_stats": dict(lowdiv_stats or {}),
                                         },
                                     )
 
@@ -7560,8 +7704,13 @@ def infer(
                                 trigger_fallback = bool(is_broadcast_like) or (
                                     (str(sel_kind) == "partial_like")
                                     and bool(partial_broadcast_force_single)
+                                ) or (
+                                    (str(sel_kind) == "low_diversity")
+                                    and bool(low_diversity_force_single)
                                 )
                                 if bool(trigger_fallback):
+                                    if bool(str(sel_kind) == "low_diversity") and bool(low_diversity_force_fp32):
+                                        collapse_fp32_active = True
                                     _dump_collapse_stage_diag_from_model(
                                         Xi,
                                         where="broadcast_trigger",
@@ -7585,16 +7734,29 @@ def infer(
                                                 "probe_selected_i": int(sel_i),
                                             },
                                         )
-                                    _LOGGER.warning(
-                                        "[infer] detected batch-broadcasted predictions (inputs differ but outputs are ~equal). "
-                                        "max|Y0-Y1|=%.6g match_frac=%.5f rel_mean=%.3e (atol=%.3e, sample_n=%.0f). "
-                                        "Falling back to per-sample inference (microbatch=1) for correctness.",
-                                        float(y_diff),
-                                        float(bstats.get("y_match_frac", float("nan"))),
-                                        float(bstats.get("y_rel_mean", float("nan"))),
-                                        float(broadcast_atol),
-                                        float(bstats.get("sample_n", float("nan"))),
-                                    )
+                                    if str(sel_kind) == "low_diversity":
+                                        _LOGGER.warning(
+                                            "[infer] detected low-diversity predictions on the first probe batch (uniq<=2 frac=%.5f, uniq<=3 frac=%.5f, std_p50=%.6g, probe_k=%.0f, sample_n=%.0f). "
+                                            "Falling back to per-sample inference (microbatch=1)%s for correctness.",
+                                            float((lowdiv_stats or {}).get("uniq_le2_frac", float("nan"))),
+                                            float((lowdiv_stats or {}).get("uniq_le3_frac", float("nan"))),
+                                            float((lowdiv_stats or {}).get("std_p50", float("nan"))),
+                                            float((lowdiv_stats or {}).get("probe_k", float("nan"))),
+                                            float((lowdiv_stats or {}).get("sample_n", float("nan"))),
+                                            " with fp32" if bool(low_diversity_force_fp32) else "",
+                                        )
+                                    else:
+                                        _LOGGER.warning(
+                                            "[infer] detected batch-broadcasted predictions (inputs differ but outputs are ~equal). "
+                                            "max|Y0-Y%d|=%.6g match_frac=%.5f rel_mean=%.3e (atol=%.3e, sample_n=%.0f). "
+                                            "Falling back to per-sample inference (microbatch=1) for correctness.",
+                                            int(sel_i),
+                                            float(y_diff),
+                                            float(bstats.get("y_match_frac", float("nan"))),
+                                            float(bstats.get("y_rel_mean", float("nan"))),
+                                            float(broadcast_atol),
+                                            float(bstats.get("sample_n", float("nan"))),
+                                        )
                                     if eager_on_broadcast:
                                         force_eager = True
 
@@ -7634,6 +7796,10 @@ def infer(
                                             _LOGGER.warning(
                                                 "[infer] partial-broadcast: forcing eager mode for correctness (ENN_PRED_PARTIAL_BROADCAST_FORCE_EAGER=1)."
                                             )
+                                    if bool(str(sel_kind) == "low_diversity") and bool(
+                                        low_diversity_persist_fp32
+                                    ):
+                                        collapse_fp32_active = True
 
                                     force_single = True
                                     td_cg_active = False
@@ -7913,8 +8079,19 @@ def infer(
                                                         )
                                                     else:
                                                         raise
+                                            lowdiv_like2 = False
+                                            lowdiv_stats2: dict[str, float] | None = None
+                                            with contextlib.suppress(Exception):
+                                                if bool(detect_low_diversity):
+                                                    lowdiv_stats2 = _low_diversity_probe_stats(
+                                                        preds,
+                                                        probe_k=int(min(int(low_diversity_probe_k), int(getattr(preds, "shape", (0,))[0] or 0))),
+                                                        atol=float(broadcast_atol),
+                                                        sample_max=int(low_diversity_sample_max),
+                                                    )
+                                                    lowdiv_like2 = bool(_is_low_diversity_stats(lowdiv_stats2))
                                             collapse_like2 = bool(
-                                                is_broadcast_like2 or partial_like2
+                                                is_broadcast_like2 or partial_like2 or lowdiv_like2
                                             )
                                             if bool(collapse_like2):
                                                 with contextlib.suppress(Exception):
@@ -7937,9 +8114,15 @@ def infer(
                                                     )
                                                 _LOGGER.warning(
                                                     "[infer] outputs remain %s after per-sample fallback; this indicates a model/preprocess collapse (not just cudagraph batching).",
-                                                    "batch-broadcasted"
-                                                    if bool(is_broadcast_like2)
-                                                    else "partial-broadcast-like",
+                                                    (
+                                                        "batch-broadcasted"
+                                                        if bool(is_broadcast_like2)
+                                                        else (
+                                                            "partial-broadcast-like"
+                                                            if bool(partial_like2)
+                                                            else "low-diversity"
+                                                        )
+                                                    ),
                                                 )
                                                 Xi_diag, _ = _selected_pair_view(
                                                     Xi, preferred_i=int(pair_i2)
