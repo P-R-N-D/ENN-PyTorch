@@ -6136,6 +6136,12 @@ def infer(
                 pred_posthoc_input_space = "z"
             elif pred_posthoc_input_space not in {"auto", "y", "z"}:
                 pred_posthoc_input_space = "auto"
+            pred_posthoc_allow_cross_space_fallback = bool(
+                env_bool(
+                    "ENN_PRED_COLLAPSE_POSTHOC_ALLOW_CROSS_SPACE_FALLBACK",
+                    default=False,
+                )
+            )
             pred_persist_raw_mode = bool(
                 env_bool("ENN_PRED_COLLAPSE_PERSIST_RAW_MODE", default=True)
             )
@@ -6412,6 +6418,8 @@ def infer(
                 pred_raw: torch.Tensor,
                 *,
                 prefer_cpu: bool,
+                input_space_hint: str | None = None,
+                allow_cross_space_fallback: bool | None = None,
             ) -> torch.Tensor:
                 if not isinstance(pred_raw, torch.Tensor):
                     raise TypeError("infer: posthoc calibration requires a tensor")
@@ -6486,14 +6494,23 @@ def infer(
                     return t2
 
                 input_space_mode = str(pred_posthoc_input_space or "auto")
+                input_space_hint = str(input_space_hint or "").strip().lower()
+                if input_space_hint not in {"y", "z"}:
+                    input_space_hint = "z"
+                allow_cross_space_fallback_eff = bool(
+                    pred_posthoc_allow_cross_space_fallback
+                    if allow_cross_space_fallback is None
+                    else allow_cross_space_fallback
+                )
                 if input_space_mode == "y":
                     space_order = ("y",)
                 elif input_space_mode == "z":
                     space_order = ("z",)
                 else:
-                    # Model forward outputs are in normalized Z-space by default,
-                    # so auto mode should try Z first and only fall back to Y.
-                    space_order = ("z", "y")
+                    space_order = (input_space_hint,)
+                    if bool(allow_cross_space_fallback_eff):
+                        alt_space = "y" if str(input_space_hint) == "z" else "z"
+                        space_order = (input_space_hint, alt_space)
                 last_exc: Exception | None = None
                 for space in space_order:
                     if str(space) == "y" and not callable(norm):
@@ -6675,6 +6692,7 @@ def infer(
                         out_post = _posthoc_calibrate_prediction(
                             out_raw,
                             prefer_cpu=bool(pred_posthoc_prefer_cpu),
+                            input_space_hint="z",
                         )
                         if isinstance(out_post, torch.Tensor) and (
                             not out_post.is_contiguous()
@@ -7044,6 +7062,7 @@ def infer(
                                         "force_uncompiled": bool(force_uncompiled),
                                         "pred_posthoc_prefer_cpu": bool(pred_posthoc_prefer_cpu),
                                         "pred_posthoc_input_space": str(pred_posthoc_input_space),
+                                        "pred_posthoc_allow_cross_space_fallback": bool(pred_posthoc_allow_cross_space_fallback),
                                         "pred_posthoc_calibrate_active": bool(pred_posthoc_calibrate_active),
                                         "pred_force_raw_output": bool(pred_force_raw_output),
                                         "pred_detect_low_diversity": bool(detect_low_diversity),
@@ -8528,6 +8547,7 @@ def infer(
                                                                     prefer_cpu=bool(
                                                                         pred_posthoc_prefer_cpu
                                                                     ),
+                                                                    input_space_hint="z",
                                                                 )
                                                             )
                                                             with contextlib.suppress(
