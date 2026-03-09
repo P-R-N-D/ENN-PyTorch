@@ -6494,17 +6494,17 @@ def infer(
                         )
                         if not callable(denorm):
                             continue
-                        cls = owner.__class__
-                        mod = str(getattr(cls, "__module__", "") or "")
-                        if mod.startswith("enn_torch.nn.wrappers"):
-                            _pred_raw_output_space_cache = "y"
-                            return "y"
-                        fwd = getattr(owner, "forward", None)
-                        if callable(fwd):
-                            sig = inspect.signature(fwd)
-                            if "calibrate_output" in sig.parameters:
-                                _pred_raw_output_space_cache = "y"
-                                return "y"
+                        for attr_name in (
+                            "pred_raw_output_space",
+                            "raw_output_space",
+                            "output_space",
+                        ):
+                            explicit_space = str(
+                                getattr(owner, attr_name, "") or ""
+                            ).strip().lower()
+                            if explicit_space in {"y", "z"}:
+                                _pred_raw_output_space_cache = explicit_space
+                                return explicit_space
                 _pred_raw_output_space_cache = "z"
                 return "z"
 
