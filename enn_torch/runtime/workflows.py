@@ -4,6 +4,7 @@ from __future__ import annotations
 import contextlib
 import collections
 import gc
+import hashlib
 import inspect
 import json
 import logging
@@ -87,6 +88,15 @@ except Exception:
 logger = logging.getLogger(__name__)
 
 
+def _normalize_pasted_path(value: str | os.PathLike[str]) -> str | os.PathLike[str]:
+    normalized = normalize_windows_paste_path(value)
+    if isinstance(normalized, str):
+        text = normalized.replace("\\r\\n", "\n").replace("\\n", "\n")
+        first_line = next((line.strip() for line in text.split("\n") if line.strip()), "")
+        return first_line or normalized.strip()
+    return normalized
+
+
 def _embedding_to_spec(embedding: object | None) -> Mapping[str, Any] | None:
     if not isinstance(embedding, Embedding):
         return None
@@ -96,6 +106,7 @@ def _embedding_to_spec(embedding: object | None) -> Mapping[str, Any] | None:
         if isinstance(c, Mapping):
             cats.append(dict(c))
     return {
+        "__enn_embedding_spec__": 1,
         "in_dim": int(getattr(embedding, "in_dim", 0)),
         "out_dim": int(getattr(embedding, "out_dim", 0)),
         "continuous_idx": [int(i) for i in tuple(getattr(embedding, "continuous_idx", ()) or ())],
@@ -103,25 +114,97 @@ def _embedding_to_spec(embedding: object | None) -> Mapping[str, Any] | None:
     }
 
 
+def _looks_like_embedding_spec(raw: object | None) -> bool:
+    if not isinstance(raw, Mapping):
+        return False
+    flag = raw.get("__enn_embedding_spec__")
+    if isinstance(flag, str):
+        if flag.strip().lower() in {"1", "true", "yes", "y"}:
+            return True
+    elif bool(flag):
+        return True
+    keys = {str(k) for k in raw.keys()}
+    if bool({"categorical", "cats", "continuous_idx", "continuous"} & keys):
+        return True
+    if ("in_dim" in keys) and ("out_dim" in keys):
+        return True
+    return False
+
+
+def _extract_embedding_spec_mapping(
+    source: object | None,
+) -> Mapping[str, Any] | None:
+    raw = source
+    if isinstance(raw, Embedding):
+        raw = _embedding_to_spec(raw)
+    if not isinstance(raw, Mapping):
+        return None
+    direct: list[tuple[str, Mapping[str, Any]]] = []
+    if _looks_like_embedding_spec(raw):
+        direct.append(("self", cast(Mapping[str, Any], raw)))
+    for name, path in (
+        ("embedding", ("embedding",)),
+        ("extra.embedding", ("extra", "embedding")),
+        ("meta.embedding", ("meta", "embedding")),
+        ("meta.extra.embedding", ("meta", "extra", "embedding")),
+    ):
+        cur: object = raw
+        ok = True
+        for part in path:
+            if not isinstance(cur, Mapping):
+                ok = False
+                break
+            cur = cur.get(part)
+        if ok and _looks_like_embedding_spec(cur):
+            direct.append((name, cast(Mapping[str, Any], cur)))
+    if not direct:
+        return None
+    chosen_name, chosen = direct[0]
+    for other_name, other in direct[1:]:
+        if dict(other) != dict(chosen):
+            logger.warning(
+                "embedding spec mismatch across payload paths (%s vs %s); using %s",
+                chosen_name,
+                other_name,
+                chosen_name,
+            )
+            break
+    return chosen
+
+
+def _apply_embedding_spec_in_dim(
+    spec: Mapping[str, Any],
+    *,
+    in_dim: int | None,
+    label: str,
+) -> dict[str, Any]:
+    out = dict(spec)
+    if in_dim is None:
+        return out
+    spec_in_dim = out.get("in_dim")
+    if spec_in_dim is not None:
+        try:
+            spec_in_dim_i = int(spec_in_dim)
+        except Exception:
+            spec_in_dim_i = None
+        if spec_in_dim_i is not None and int(spec_in_dim_i) != int(in_dim):
+            raise RuntimeError(
+                f"embedding spec in_dim mismatch: spec={int(spec_in_dim_i)} {label}={int(in_dim)}"
+            )
+    out["in_dim"] = int(in_dim)
+    return out
+
+
 def _embedding_from_meta(
     meta: Mapping[str, Any] | None,
     *args: Any,
     in_dim: int,
 ) -> Embedding | None:
-    if not isinstance(meta, Mapping):
+    _ = args
+    spec = _coerce_embedding_spec(meta, in_dim=int(in_dim))
+    if spec is None:
         return None
-    raw = meta.get("embedding")
-    if not isinstance(raw, Mapping):
-        return None
-    spec = dict(raw)
-    spec_in_dim = spec.get("in_dim")
-    if spec_in_dim is not None:
-        with contextlib.suppress(Exception):
-            if int(spec_in_dim) != int(in_dim):
-                raise RuntimeError(
-                    f"embedding spec in_dim mismatch: spec={int(spec_in_dim)} model={int(in_dim)}"
-                )
-    return Embedding.from_spec(spec, in_dim=int(in_dim))
+    return Embedding.from_spec(dict(spec), in_dim=int(in_dim))
 
 
 def new_embedding(
@@ -135,7 +218,12 @@ def new_embedding(
     if isinstance(embedding, Embedding):
         return embedding
     if isinstance(embedding, Mapping):
-        return Embedding.from_spec(dict(embedding), in_dim=int(in_dim))
+        spec = _coerce_embedding_spec(embedding, in_dim=int(in_dim))
+        if spec is None:
+            raise ValueError(
+                "new_embedding: mapping did not contain an embedding spec"
+            )
+        return Embedding.from_spec(dict(spec), in_dim=int(in_dim))
     return _embedding_from_meta(meta, in_dim=int(in_dim))
 
 
@@ -173,36 +261,14 @@ def _coerce_embedding_spec(
     *,
     in_dim: int | None = None,
 ) -> Mapping[str, Any] | None:
-    raw = source
-    if isinstance(raw, Embedding):
-        raw = _embedding_to_spec(raw)
-    if isinstance(raw, Mapping):
-        if isinstance(raw.get("embedding"), Mapping):
-            raw = cast(Mapping[str, Any], raw.get("embedding"))
-        elif isinstance(raw.get("extra"), Mapping) and isinstance(
-            cast(Mapping[str, Any], raw.get("extra")).get("embedding"), Mapping
-        ):
-            raw = cast(
-                Mapping[str, Any],
-                cast(Mapping[str, Any], raw.get("extra")).get("embedding"),
-            )
-    if not isinstance(raw, Mapping):
+    raw = _extract_embedding_spec_mapping(source)
+    if raw is None:
         return None
-    spec = dict(raw)
-    spec_in_dim = spec.get("in_dim")
-    if in_dim is not None:
-        if spec_in_dim is not None:
-            with contextlib.suppress(Exception):
-                if int(spec_in_dim) != int(in_dim):
-                    raise RuntimeError(
-                        f"embedding spec in_dim mismatch: spec={int(spec_in_dim)} requested={int(in_dim)}"
-                    )
-        spec["in_dim"] = int(in_dim)
-    return spec
+    return _apply_embedding_spec_in_dim(raw, in_dim=in_dim, label="requested")
 
 
 def _read_embedding_payload(path: str | os.PathLike[str]) -> Mapping[str, Any]:
-    p = Path(normalize_windows_paste_path(path))
+    p = Path(_normalize_pasted_path(path))
     if p.is_dir():
         for name in (
             "embedding.json",
@@ -297,12 +363,14 @@ def save_embedding(
         spec = _coerce_embedding_spec(getattr(base, "embedding", None))
     merged: dict[str, Any] = dict(extra or {})
     if spec is not None:
-        merged["embedding"] = dict(spec)
+        spec_out = dict(spec)
+        spec_out.setdefault("__enn_embedding_spec__", 1)
+        merged["embedding"] = spec_out
     if path is None:
         return merged
     if spec is None:
         raise ValueError("save_embedding: source does not expose an embedding spec")
-    p = Path(normalize_windows_paste_path(path))
+    p = Path(_normalize_pasted_path(path))
     if not str(p.suffix):
         if p.exists() and p.is_dir():
             p = p / "embedding.json"
@@ -346,9 +414,37 @@ def _nextafter_repeat(value: object, steps: int, *, dtype: numpy.dtype) -> objec
     return cur.item()
 
 
+def _find_potential_exact_tie_features_cpu(y_cpu: torch.Tensor) -> list[int]:
+    if not torch.is_tensor(y_cpu):
+        return []
+    if int(getattr(y_cpu, "shape", (0,))[0] or 0) <= 1:
+        return []
+    y_np = y_cpu.detach().to(device="cpu").numpy()
+    flat = y_np.reshape(int(y_np.shape[0]), -1)
+    feats: list[int] = []
+    for feat in range(int(flat.shape[1])):
+        col = flat[:, feat]
+        seen: set[bytes] = set()
+        dup = False
+        for i in range(int(col.shape[0])):
+            v = col[i]
+            if not bool(numpy.isfinite(v)):
+                continue
+            key = numpy.asarray(v, dtype=col.dtype).tobytes()
+            if key in seen:
+                dup = True
+                break
+            seen.add(key)
+        if dup:
+            feats.append(int(feat))
+    return feats
+
+
 def _break_prediction_exact_ties_cpu_inplace(
     x_cpu: torch.Tensor,
     y_cpu: torch.Tensor,
+    *,
+    feature_indices: Sequence[int] | None = None,
 ) -> dict[str, int]:
     if (not torch.is_tensor(x_cpu)) or (not torch.is_tensor(y_cpu)):
         return {"changed_elements": 0, "changed_cells": 0, "changed_groups": 0}
@@ -358,11 +454,21 @@ def _break_prediction_exact_ties_cpu_inplace(
     y_np = y_cpu.detach().to(device="cpu").numpy()
     flat = y_np.reshape(int(y_np.shape[0]), -1)
     x_view = x_np.reshape(int(x_np.shape[0]), -1)
+    row_key_cache: list[bytes | None] = [None] * int(x_view.shape[0])
+    feat_iter: Sequence[int]
+    if feature_indices is None:
+        feat_iter = tuple(range(int(flat.shape[1])))
+    else:
+        feat_iter = tuple(
+            int(feat)
+            for feat in feature_indices
+            if 0 <= int(feat) < int(flat.shape[1])
+        )
     changed_elements = 0
     changed_cells = 0
     changed_groups = 0
-    for feat in range(int(flat.shape[1])):
-        col = flat[:, feat]
+    for feat in feat_iter:
+        col = flat[:, int(feat)]
         by_value: dict[bytes, list[int]] = {}
         for i in range(int(col.shape[0])):
             v = col[i]
@@ -376,12 +482,20 @@ def _break_prediction_exact_ties_cpu_inplace(
                 continue
             by_x: dict[bytes, list[int]] = {}
             for row_idx in idxs:
-                x_key = x_view[int(row_idx)].tobytes()
-                by_x.setdefault(x_key, []).append(int(row_idx))
+                r = int(row_idx)
+                x_key = row_key_cache[r]
+                if x_key is None:
+                    x_key = hashlib.blake2b(
+                        x_view[r].tobytes(), digest_size=16
+                    ).digest()
+                    row_key_cache[r] = x_key
+                by_x.setdefault(x_key, []).append(r)
             if len(by_x) <= 1:
                 continue
             base = col[idxs[0]].item()
-            for rank, (_, rows) in enumerate(sorted(by_x.items(), key=lambda kv: kv[0])):
+            for rank, (_, rows) in enumerate(
+                sorted(by_x.items(), key=lambda kv: kv[0])
+            ):
                 if rank <= 0:
                     continue
                 new_v = _nextafter_repeat(base, rank, dtype=col.dtype)
@@ -443,9 +557,20 @@ def _maybe_break_prediction_exact_ties(
         )
         return {"changed_elements": 0, "changed_cells": 0, "changed_groups": 0}
     try:
-        x_cpu = collate.copy_mmt_to_cpu_tensor(x_src, count=int(count), chunk_size=int(chunk_size))
-        y_cpu = collate.copy_mmt_to_cpu_tensor(y_src, count=int(count), chunk_size=int(chunk_size))
-        stats = _break_prediction_exact_ties_cpu_inplace(x_cpu, y_cpu)
+        y_cpu = collate.copy_mmt_to_cpu_tensor(
+            y_src, count=int(count), chunk_size=int(chunk_size)
+        )
+        candidate_features = _find_potential_exact_tie_features_cpu(y_cpu)
+        if len(candidate_features) <= 0:
+            return {"changed_elements": 0, "changed_cells": 0, "changed_groups": 0}
+        x_cpu = collate.copy_mmt_to_cpu_tensor(
+            x_src, count=int(count), chunk_size=int(chunk_size)
+        )
+        stats = _break_prediction_exact_ties_cpu_inplace(
+            x_cpu,
+            y_cpu,
+            feature_indices=candidate_features,
+        )
         if int(stats.get("changed_elements", 0) or 0) > 0:
             step = max(1, int(chunk_size))
             target_dtype = getattr(y_src, "dtype", y_cpu.dtype)
