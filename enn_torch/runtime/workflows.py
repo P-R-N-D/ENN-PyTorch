@@ -176,8 +176,16 @@ def _coerce_embedding_spec(
     raw = source
     if isinstance(raw, Embedding):
         raw = _embedding_to_spec(raw)
-    if isinstance(raw, Mapping) and isinstance(raw.get("embedding"), Mapping):
-        raw = cast(Mapping[str, Any], raw.get("embedding"))
+    if isinstance(raw, Mapping):
+        if isinstance(raw.get("embedding"), Mapping):
+            raw = cast(Mapping[str, Any], raw.get("embedding"))
+        elif isinstance(raw.get("extra"), Mapping) and isinstance(
+            cast(Mapping[str, Any], raw.get("extra")).get("embedding"), Mapping
+        ):
+            raw = cast(
+                Mapping[str, Any],
+                cast(Mapping[str, Any], raw.get("extra")).get("embedding"),
+            )
     if not isinstance(raw, Mapping):
         return None
     spec = dict(raw)
@@ -349,7 +357,7 @@ def _break_prediction_exact_ties_cpu_inplace(
     x_np = x_cpu.detach().to(device="cpu").numpy()
     y_np = y_cpu.detach().to(device="cpu").numpy()
     flat = y_np.reshape(int(y_np.shape[0]), -1)
-    x_keys = [tuple(numpy.asarray(x_np[i]).tolist()) for i in range(int(x_np.shape[0]))]
+    x_view = x_np.reshape(int(x_np.shape[0]), -1)
     changed_elements = 0
     changed_cells = 0
     changed_groups = 0
@@ -366,9 +374,10 @@ def _break_prediction_exact_ties_cpu_inplace(
         for idxs in by_value.values():
             if len(idxs) <= 1:
                 continue
-            by_x: dict[tuple[object, ...], list[int]] = {}
+            by_x: dict[bytes, list[int]] = {}
             for row_idx in idxs:
-                by_x.setdefault(x_keys[row_idx], []).append(int(row_idx))
+                x_key = x_view[int(row_idx)].tobytes()
+                by_x.setdefault(x_key, []).append(int(row_idx))
             if len(by_x) <= 1:
                 continue
             base = col[idxs[0]].item()
@@ -416,6 +425,21 @@ def _maybe_break_prediction_exact_ties(
             "predict: skipping exact-tie breaker because total_elems=%d exceeds max=%d",
             int(total_elems),
             int(max_elems),
+        )
+        return {"changed_elements": 0, "changed_cells": 0, "changed_groups": 0}
+    x_shape = tuple(int(x) for x in getattr(x_src, "shape", ()) or ())
+    x_feature_elems = 1
+    for dim in x_shape[1:]:
+        x_feature_elems *= max(1, int(dim))
+    x_total_elems = int(count) * int(x_feature_elems)
+    max_x_elems = int(
+        env_int("ENN_PRED_BREAK_EXACT_TIES_MAX_X_ELEMS", 2_000_000) or 2_000_000
+    )
+    if x_total_elems > int(max_x_elems):
+        logger.info(
+            "predict: skipping exact-tie breaker because x_total_elems=%d exceeds max=%d",
+            int(x_total_elems),
+            int(max_x_elems),
         )
         return {"changed_elements": 0, "changed_cells": 0, "changed_groups": 0}
     try:
