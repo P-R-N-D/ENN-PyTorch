@@ -6634,10 +6634,54 @@ class Model(nn.Module):
             )
             if infer_mode and calibrate_output and (not is_cls_loss):
                 sc = self.scaler
+                prefer_quantile_bounds = bool(
+                    env_bool(
+                        "ENN_OUTPUT_AB_SUSPICIOUS_Y_BOUNDS_USE_QUANTILE",
+                        default=True,
+                    )
+                )
+                clip_quantile_bounds = bool(
+                    env_bool(
+                        "ENN_OUTPUT_AB_SUSPICIOUS_Y_BOUNDS_CLIP_TO_MINMAX",
+                        default=True,
+                    )
+                )
                 use_suspicious_y_bounds_fallback = bool(
                     env_bool("ENN_OUTPUT_AB_SUSPICIOUS_USE_Y_BOUNDS", default=True)
                     and bool(getattr(sc, "_output_ab_clip_only", False))
                 )
+                if bool(use_suspicious_y_bounds_fallback):
+                    bounds_resolver = getattr(sc, "_resolve_y_bounds_for_output", None)
+                    y_bounds_available = False
+                    if callable(bounds_resolver):
+                        lo, hi = bounds_resolver(
+                            y_hat,
+                            prefer_quantile=prefer_quantile_bounds,
+                            clip_quant_to_minmax=clip_quantile_bounds,
+                        )
+                        y_bounds_available = bool(lo is not None and hi is not None)
+                    use_suspicious_y_bounds_fallback = bool(y_bounds_available)
+                    if (
+                        not bool(use_suspicious_y_bounds_fallback)
+                        and env_bool("ENN_OUTPUT_AB_SUSPICIOUS_LOG", default=True)
+                        and (
+                            not bool(
+                                getattr(
+                                    self,
+                                    "_pred_output_ab_suspicious_unbounded_warned",
+                                    False,
+                                )
+                            )
+                        )
+                    ):
+                        setattr(
+                            self,
+                            "_pred_output_ab_suspicious_unbounded_warned",
+                            True,
+                        )
+                        _LOGGER.warning(
+                            "[ENN][predict] suspicious output_ab clip-only active; Y-bounds unavailable/non-finite, using default calibrate path."
+                        )
                 if bool(use_suspicious_y_bounds_fallback):
                     try:
                         z_cal = sc.calibrate(y_hat, apply_output_ab=False)
@@ -6648,18 +6692,8 @@ class Model(nn.Module):
                         if callable(clamp_y):
                             pred = clamp_y(
                                 pred,
-                                prefer_quantile=bool(
-                                    env_bool(
-                                        "ENN_OUTPUT_AB_SUSPICIOUS_Y_BOUNDS_USE_QUANTILE",
-                                        default=True,
-                                    )
-                                ),
-                                clip_quant_to_minmax=bool(
-                                    env_bool(
-                                        "ENN_OUTPUT_AB_SUSPICIOUS_Y_BOUNDS_CLIP_TO_MINMAX",
-                                        default=True,
-                                    )
-                                ),
+                                prefer_quantile=prefer_quantile_bounds,
+                                clip_quant_to_minmax=clip_quantile_bounds,
                             )
                         if env_bool("ENN_OUTPUT_AB_SUSPICIOUS_LOG", default=True) and (
                             not bool(getattr(self, "_pred_output_ab_suspicious_warned", False))
