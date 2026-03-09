@@ -4479,7 +4479,7 @@ def infer(
                 2, int(env_int("ENN_PRED_BROADCAST_PROBE_K", 4) or 4)
             )
             _dbg_diag_enabled = bool(
-                env_bool("ENN_PRED_COLLAPSE_DIAG", default=True)
+                env_bool("ENN_PRED_COLLAPSE_DIAG", default=False)
             )
             _dbg_raw_fallback = bool(
                 env_bool("ENN_PRED_COLLAPSE_FALLBACK_RAW", default=True)
@@ -5605,8 +5605,8 @@ def infer(
                 env_bool("ENN_PRED_COLLAPSE_FORCE_FP32_PERSIST", default=False)
             )
             collapse_fp32_active = False
-            collapse_diag = bool(env_bool("ENN_PRED_COLLAPSE_DIAG", True))
-            collapse_diag_save = bool(env_bool("ENN_PRED_COLLAPSE_DIAG_SAVE", True))
+            collapse_diag = bool(env_bool("ENN_PRED_COLLAPSE_DIAG", False))
+            collapse_diag_save = bool(env_bool("ENN_PRED_COLLAPSE_DIAG_SAVE", False))
             collapse_diag_max_elems = int(
                 env_int("ENN_PRED_COLLAPSE_DIAG_MAX_ELEMS", 64) or 64
             )

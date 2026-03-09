@@ -51,7 +51,7 @@ from ..core.config import (
     coerce_model_config,
     runtime_config,
 )
-from ..core.datatypes import env_bool, normalize_windows_paste_path, read_json
+from ..core.datatypes import env_bool, env_int, normalize_windows_paste_path, read_json
 from ..core.policies import WorkerPolicy
 from ..core.system import _start_context, new_dir, optimal_start_method
 from ..core.tensor import coerce_tensor, is_meta_or_fake_tensor
@@ -139,7 +139,7 @@ def new_embedding(
     return _embedding_from_meta(meta, in_dim=int(in_dim))
 
 
-def load_embedding(
+def _load_embedding_from_meta(
     in_dim: int,
     *args: Any,
     meta: Mapping[str, Any] | None = None,
@@ -153,7 +153,7 @@ def load_embedding(
     return _embedding_from_meta(side_meta, in_dim=int(in_dim))
 
 
-def save_embedding(
+def _merge_embedding_meta(
     model: torch.nn.Module,
     *args: Any,
     extra: Mapping[str, object] | None = None,
@@ -166,6 +166,286 @@ def save_embedding(
     if emb_spec is not None:
         merged["embedding"] = emb_spec
     return merged
+
+
+def _coerce_embedding_spec(
+    source: object | None,
+    *,
+    in_dim: int | None = None,
+) -> Mapping[str, Any] | None:
+    raw = source
+    if isinstance(raw, Embedding):
+        raw = _embedding_to_spec(raw)
+    if isinstance(raw, Mapping) and isinstance(raw.get("embedding"), Mapping):
+        raw = cast(Mapping[str, Any], raw.get("embedding"))
+    if not isinstance(raw, Mapping):
+        return None
+    spec = dict(raw)
+    spec_in_dim = spec.get("in_dim")
+    if in_dim is not None:
+        if spec_in_dim is not None:
+            with contextlib.suppress(Exception):
+                if int(spec_in_dim) != int(in_dim):
+                    raise RuntimeError(
+                        f"embedding spec in_dim mismatch: spec={int(spec_in_dim)} requested={int(in_dim)}"
+                    )
+        spec["in_dim"] = int(in_dim)
+    return spec
+
+
+def _read_embedding_payload(path: str | os.PathLike[str]) -> Mapping[str, Any]:
+    p = Path(normalize_windows_paste_path(path))
+    if p.is_dir():
+        for name in (
+            "embedding.json",
+            "embedding.pt",
+            "embedding.pth",
+            "meta.json",
+            "model.meta.json",
+        ):
+            cand = p / name
+            if cand.exists():
+                return _read_embedding_payload(cand)
+        raise FileNotFoundError(
+            f"No embedding payload found under directory: {str(p)!r}"
+        )
+    if not p.exists():
+        raise FileNotFoundError(f"Embedding payload not found: {str(p)!r}")
+    suffix = str(p.suffix or "").lower()
+    if suffix == ".json":
+        payload = read_json(os.fspath(p))
+    elif suffix in {".pt", ".pth"}:
+        payload = _torch_load_checkpoint(
+            p,
+            map_location="cpu",
+            weights_only=False,
+            mmap=None,
+        )
+    else:
+        raise ValueError(
+            f"Unsupported embedding payload extension {suffix!r}. Use .json/.pt/.pth or a directory."
+        )
+    if not isinstance(payload, Mapping):
+        raise RuntimeError(
+            f"Embedding payload must be a mapping, got {type(payload).__name__}"
+        )
+    return cast(Mapping[str, Any], payload)
+
+
+def load_embedding(
+    source: int | str | os.PathLike[str] | Mapping[str, Any] | Embedding,
+    *args: Any,
+    in_dim: int | None = None,
+    meta: Mapping[str, Any] | None = None,
+    side_meta: Mapping[str, Any] | None = None,
+    **kwargs: Any,
+) -> Embedding | None:
+    _ = (args, kwargs)
+    if isinstance(source, int):
+        use_in_dim = int(in_dim if in_dim is not None else source)
+        return _load_embedding_from_meta(
+            use_in_dim,
+            meta=meta,
+            side_meta=side_meta,
+        )
+    if isinstance(source, Embedding):
+        return source
+    if isinstance(source, Mapping):
+        spec = _coerce_embedding_spec(source, in_dim=in_dim)
+        if spec is None:
+            raise ValueError("load_embedding: mapping did not contain an embedding spec")
+    else:
+        payload = _read_embedding_payload(cast(str | os.PathLike[str], source))
+        spec = _coerce_embedding_spec(payload, in_dim=in_dim)
+        if spec is None:
+            raise RuntimeError(
+                "load_embedding: payload did not contain an embedding spec"
+            )
+    spec_in_dim = spec.get("in_dim")
+    if spec_in_dim is None and in_dim is None:
+        raise ValueError(
+            "load_embedding: embedding spec is missing in_dim; pass in_dim explicitly"
+        )
+    use_in_dim = int(in_dim if in_dim is not None else spec_in_dim)
+    return Embedding.from_spec(dict(spec), in_dim=use_in_dim)
+
+
+def save_embedding(
+    source: Embedding | torch.nn.Module | Mapping[str, Any],
+    path: str | os.PathLike[str] | None = None,
+    *args: Any,
+    extra: Mapping[str, object] | None = None,
+    indent: int = 2,
+    **kwargs: Any,
+) -> dict[str, Any]:
+    _ = (args, kwargs)
+    spec = _coerce_embedding_spec(source)
+    if spec is None and isinstance(source, torch.nn.Module):
+        base = (
+            source.module
+            if isinstance(getattr(source, "module", None), torch.nn.Module)
+            else source
+        )
+        spec = _coerce_embedding_spec(getattr(base, "embedding", None))
+    merged: dict[str, Any] = dict(extra or {})
+    if spec is not None:
+        merged["embedding"] = dict(spec)
+    if path is None:
+        return merged
+    if spec is None:
+        raise ValueError("save_embedding: source does not expose an embedding spec")
+    p = Path(normalize_windows_paste_path(path))
+    if not str(p.suffix):
+        if p.exists() and p.is_dir():
+            p = p / "embedding.json"
+        else:
+            p = p.with_suffix(".json")
+    p.parent.mkdir(parents=True, exist_ok=True)
+    suffix = str(p.suffix or "").lower()
+    if suffix == ".json":
+        collate.write_json(os.fspath(p), merged, indent=int(indent))
+    elif suffix in {".pt", ".pth"}:
+        torch.save(merged, os.fspath(p))
+    else:
+        raise ValueError(
+            f"Unsupported embedding payload extension {suffix!r}. Use .json/.pt/.pth."
+        )
+    out = dict(merged)
+    out["path"] = str(p)
+    return out
+
+
+def _nextafter_repeat(value: object, steps: int, *, dtype: numpy.dtype) -> object:
+    cur = numpy.asarray(value, dtype=dtype)
+    if int(steps) <= 0:
+        return cur.item()
+    pos_inf = numpy.asarray(numpy.inf, dtype=dtype)
+    neg_inf = numpy.asarray(-numpy.inf, dtype=dtype)
+    for _ in range(int(steps)):
+        nxt = numpy.nextafter(cur, pos_inf, dtype=dtype)
+        if (not numpy.isfinite(nxt)) or bool(nxt == cur):
+            nxt = numpy.nextafter(cur, neg_inf, dtype=dtype)
+        if (not numpy.isfinite(nxt)) or bool(nxt == cur):
+            scale = max(1.0, abs(float(cur)))
+            try:
+                eps = float(numpy.finfo(dtype).eps)
+            except Exception:
+                eps = float(numpy.finfo(numpy.float32).eps)
+            nxt = numpy.asarray(float(cur) + (scale * eps), dtype=dtype)
+        if bool(nxt == cur):
+            nxt = numpy.asarray(float(cur) + 1e-6, dtype=dtype)
+        cur = nxt
+    return cur.item()
+
+
+def _break_prediction_exact_ties_cpu_inplace(
+    x_cpu: torch.Tensor,
+    y_cpu: torch.Tensor,
+) -> dict[str, int]:
+    if (not torch.is_tensor(x_cpu)) or (not torch.is_tensor(y_cpu)):
+        return {"changed_elements": 0, "changed_cells": 0, "changed_groups": 0}
+    if int(getattr(y_cpu, "shape", (0,))[0] or 0) <= 1:
+        return {"changed_elements": 0, "changed_cells": 0, "changed_groups": 0}
+    x_np = x_cpu.detach().to(device="cpu").numpy()
+    y_np = y_cpu.detach().to(device="cpu").numpy()
+    flat = y_np.reshape(int(y_np.shape[0]), -1)
+    x_keys = [tuple(numpy.asarray(x_np[i]).tolist()) for i in range(int(x_np.shape[0]))]
+    changed_elements = 0
+    changed_cells = 0
+    changed_groups = 0
+    for feat in range(int(flat.shape[1])):
+        col = flat[:, feat]
+        by_value: dict[bytes, list[int]] = {}
+        for i in range(int(col.shape[0])):
+            v = col[i]
+            if not bool(numpy.isfinite(v)):
+                continue
+            key = numpy.asarray(v, dtype=col.dtype).tobytes()
+            by_value.setdefault(key, []).append(i)
+        cell_changed = False
+        for idxs in by_value.values():
+            if len(idxs) <= 1:
+                continue
+            by_x: dict[tuple[object, ...], list[int]] = {}
+            for row_idx in idxs:
+                by_x.setdefault(x_keys[row_idx], []).append(int(row_idx))
+            if len(by_x) <= 1:
+                continue
+            base = col[idxs[0]].item()
+            for rank, (_, rows) in enumerate(sorted(by_x.items(), key=lambda kv: kv[0])):
+                if rank <= 0:
+                    continue
+                new_v = _nextafter_repeat(base, rank, dtype=col.dtype)
+                for row_idx in rows:
+                    if bool(col[row_idx] == new_v):
+                        continue
+                    col[row_idx] = new_v
+                    changed_elements += 1
+                    cell_changed = True
+            changed_groups += 1
+        if cell_changed:
+            changed_cells += 1
+    return {
+        "changed_elements": int(changed_elements),
+        "changed_cells": int(changed_cells),
+        "changed_groups": int(changed_groups),
+    }
+
+
+def _maybe_break_prediction_exact_ties(
+    x_src: object,
+    y_src: object,
+    *,
+    count: int,
+    chunk_size: int,
+) -> dict[str, int]:
+    if not bool(env_bool("ENN_PRED_BREAK_EXACT_TIES", default=True)):
+        return {"changed_elements": 0, "changed_cells": 0, "changed_groups": 0}
+    y_shape = tuple(int(x) for x in getattr(y_src, "shape", ()) or ())
+    if (not y_shape) or int(count) <= 1:
+        return {"changed_elements": 0, "changed_cells": 0, "changed_groups": 0}
+    feature_elems = 1
+    for dim in y_shape[1:]:
+        feature_elems *= max(1, int(dim))
+    total_elems = int(count) * int(feature_elems)
+    max_elems = int(
+        env_int("ENN_PRED_BREAK_EXACT_TIES_MAX_ELEMS", 8_000_000) or 8_000_000
+    )
+    if total_elems > int(max_elems):
+        logger.info(
+            "predict: skipping exact-tie breaker because total_elems=%d exceeds max=%d",
+            int(total_elems),
+            int(max_elems),
+        )
+        return {"changed_elements": 0, "changed_cells": 0, "changed_groups": 0}
+    try:
+        x_cpu = collate.copy_mmt_to_cpu_tensor(x_src, count=int(count), chunk_size=int(chunk_size))
+        y_cpu = collate.copy_mmt_to_cpu_tensor(y_src, count=int(count), chunk_size=int(chunk_size))
+        stats = _break_prediction_exact_ties_cpu_inplace(x_cpu, y_cpu)
+        if int(stats.get("changed_elements", 0) or 0) > 0:
+            step = max(1, int(chunk_size))
+            target_dtype = getattr(y_src, "dtype", y_cpu.dtype)
+            for s in range(0, int(count), step):
+                e = min(int(count), s + step)
+                y_src[s:e] = y_cpu[s:e].to(device="cpu", dtype=target_dtype)
+            logger.warning(
+                "predict: exact-tie breaker adjusted %d element(s) across %d output cell(s) and %d tie-group(s)",
+                int(stats.get("changed_elements", 0) or 0),
+                int(stats.get("changed_cells", 0) or 0),
+                int(stats.get("changed_groups", 0) or 0),
+            )
+        return {
+            "changed_elements": int(stats.get("changed_elements", 0) or 0),
+            "changed_cells": int(stats.get("changed_cells", 0) or 0),
+            "changed_groups": int(stats.get("changed_groups", 0) or 0),
+        }
+    except Exception as e:
+        logger.warning(
+            "predict: exact-tie breaker skipped after failure (%s: %s)",
+            type(e).__name__,
+            e,
+        )
+        return {"changed_elements": 0, "changed_cells": 0, "changed_groups": 0}
 
 
 def _rewrite_state_dict_key(k: str) -> str:
@@ -1426,7 +1706,7 @@ def _write_model_meta_json(model: torch.nn.Module, out_dir: PathLike) -> None:
     if callable(ts_fn):
         with contextlib.suppress(Exception):
             meta_payload["tasks"] = ts_fn()
-    meta_payload = save_embedding(base, extra=meta_payload)
+    meta_payload = _merge_embedding_meta(base, extra=meta_payload)
     collate.write_json(os.path.join(out_dir, "model.meta.json"), meta_payload, indent=2)
     collate.write_json(os.path.join(out_dir, "meta.json"), meta_payload, indent=2)
 
@@ -2478,7 +2758,7 @@ def load_model(
             raise ValueError(
                 "Loading from a checkpoint directory requires in_dim and out_shape, or a valid meta.json inside the directory."
             )
-        use_embedding = load_embedding(use_in_dim, meta=meta)
+        use_embedding = _load_embedding_from_meta(use_in_dim, meta=meta)
         model = new_model(use_in_dim, use_out_shape, use_config, embedding=use_embedding)
         if _model_has_meta_or_fake_tensors(model):
             _materialize_module_to_device(model, load_dev)
@@ -2570,7 +2850,7 @@ def load_model(
             raise RuntimeError(
                 f"Invalid in_dim/out_shape metadata in {str(meta_path)!r}: in_dim={use_in_dim}, out_shape={use_out_shape}"
             )
-        use_embedding = load_embedding(use_in_dim, meta=meta)
+        use_embedding = _load_embedding_from_meta(use_in_dim, meta=meta)
         model = new_model(use_in_dim, use_out_shape, use_config, embedding=use_embedding)
         with contextlib.suppress(Exception):
             tasks = meta.get("tasks") if isinstance(meta, dict) else None
@@ -2664,7 +2944,7 @@ def load_model(
         raise RuntimeError(
             f"Invalid or missing in_dim/out_shape when loading checkpoint {str(p)!r}: in_dim={use_in_dim}, out_shape={use_out_shape}"
         )
-    use_embedding = load_embedding(
+    use_embedding = _load_embedding_from_meta(
         use_in_dim,
         meta=obj if isinstance(obj, Mapping) else None,
         side_meta=side_meta,
@@ -2708,7 +2988,7 @@ def save_model(
             raise TypeError(
                 "Positional args are only supported for export converters; use keyword arguments for TorchIO.save()."
             )
-        merged_extra = save_embedding(model, extra=extra)
+        merged_extra = _merge_embedding_meta(model, extra=extra)
         if ema_averager is not None and hasattr(ema_averager, "state_dict"):
             with contextlib.suppress(Exception):
                 merged_extra["ema_averager_state"] = ema_averager.state_dict()
@@ -3373,6 +3653,12 @@ def predict(
                 raise RuntimeError(
                     "predict: failed to open assembled pred.mmt"
                 )
+            _maybe_break_prediction_exact_ties(
+                X_mmt,
+                Y_mmt,
+                count=int(count),
+                chunk_size=int(chunk_size or 8192),
+            )
             if out_path is not None:
                 out_td = collate.write_predictions_h5_atomic(
                     os.fspath(out_path),
