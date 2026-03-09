@@ -6633,10 +6633,60 @@ class Model(nn.Module):
                 edge_reg_high,
             )
             if infer_mode and calibrate_output and (not is_cls_loss):
-                z_cal = self.scaler.calibrate(y_hat)
-                pred = self.scaler.denormalize_y(z_cal).reshape(
-                    b, *self.out_shape
+                sc = self.scaler
+                use_suspicious_y_bounds_fallback = bool(
+                    env_bool("ENN_OUTPUT_AB_SUSPICIOUS_USE_Y_BOUNDS", default=True)
+                    and bool(getattr(sc, "_output_ab_clip_only", False))
                 )
+                if bool(use_suspicious_y_bounds_fallback):
+                    try:
+                        z_cal = sc.calibrate(y_hat, apply_output_ab=False)
+                        pred = sc.denormalize_y(z_cal).reshape(
+                            b, *self.out_shape
+                        )
+                        clamp_y = getattr(sc, "clamp_y_bounds", None)
+                        if callable(clamp_y):
+                            pred = clamp_y(
+                                pred,
+                                prefer_quantile=bool(
+                                    env_bool(
+                                        "ENN_OUTPUT_AB_SUSPICIOUS_Y_BOUNDS_USE_QUANTILE",
+                                        default=True,
+                                    )
+                                ),
+                                clip_quant_to_minmax=bool(
+                                    env_bool(
+                                        "ENN_OUTPUT_AB_SUSPICIOUS_Y_BOUNDS_CLIP_TO_MINMAX",
+                                        default=True,
+                                    )
+                                ),
+                            )
+                        if env_bool("ENN_OUTPUT_AB_SUSPICIOUS_LOG", default=True) and (
+                            not bool(getattr(self, "_pred_output_ab_suspicious_warned", False))
+                        ):
+                            setattr(self, "_pred_output_ab_suspicious_warned", True)
+                            _LOGGER.warning(
+                                "[ENN][predict] suspicious output_ab clip-only active; using calibrate(apply_output_ab=False)+Y-bounds clamp for inference."
+                            )
+                    except Exception as e:
+                        if env_bool("ENN_OUTPUT_AB_SUSPICIOUS_LOG", default=True) and (
+                            not bool(getattr(self, "_pred_output_ab_suspicious_fallback_warned", False))
+                        ):
+                            setattr(self, "_pred_output_ab_suspicious_fallback_warned", True)
+                            _LOGGER.warning(
+                                "[ENN][predict] suspicious output_ab Y-bounds fallback failed (%s: %s); using default calibrate path.",
+                                type(e).__name__,
+                                str(e),
+                            )
+                        z_cal = sc.calibrate(y_hat)
+                        pred = sc.denormalize_y(z_cal).reshape(
+                            b, *self.out_shape
+                        )
+                else:
+                    z_cal = sc.calibrate(y_hat)
+                    pred = sc.denormalize_y(z_cal).reshape(
+                        b, *self.out_shape
+                    )
             if td_input is not None:
                 if hasattr(td_input, "copy"):
                     out_td = td_input.copy()

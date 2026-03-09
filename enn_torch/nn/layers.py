@@ -3628,7 +3628,96 @@ class Scaler(nn.Module):
         )
         return y.view(-1) if z.dim() == 1 else y.view(orig_shape)
 
-    def calibrate(self: Self, z_raw: torch.Tensor) -> torch.Tensor:
+    def _resolve_y_bounds_for_output(
+        self: Self,
+        y: torch.Tensor,
+        *,
+        prefer_quantile: bool = True,
+        clip_quant_to_minmax: bool = True,
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+        if y.numel() == 0:
+            return None, None
+        orig_shape = tuple(y.shape)
+        feature_dim = (
+            int(orig_shape[0]) if y.dim() == 1 else int(math.prod(orig_shape[1:]))
+        )
+        master_dtype = self._resolve_master_dtype_for_io(y)
+        if master_dtype is torch.int64:
+            master_dtype = torch.float64
+
+        def _prepare(v: object) -> torch.Tensor | None:
+            if not isinstance(v, torch.Tensor) or int(v.numel()) <= 0:
+                return None
+            out = v.detach().reshape(-1).to(device=y.device, dtype=master_dtype)
+            if int(out.numel()) == 1 and int(feature_dim) != 1:
+                out = out.expand((int(feature_dim),))
+            if int(out.numel()) != int(feature_dim):
+                return None
+            if not bool(torch.isfinite(out).all().item()):
+                return None
+            return out
+
+        ylo = _prepare(getattr(self, "y_min", None))
+        yhi = _prepare(getattr(self, "y_max", None))
+        qlo = _prepare(getattr(self, "y_q_low", None))
+        qhi = _prepare(getattr(self, "y_q_high", None))
+
+        lo = ylo
+        hi = yhi
+        if bool(prefer_quantile) and qlo is not None and qhi is not None:
+            lo = qlo
+            hi = qhi
+            if bool(clip_quant_to_minmax) and ylo is not None and yhi is not None:
+                lo = torch.maximum(lo, ylo)
+                hi = torch.minimum(hi, yhi)
+        if lo is None or hi is None:
+            return None, None
+        lo0 = torch.minimum(lo, hi)
+        hi0 = torch.maximum(lo, hi)
+        return lo0, hi0
+
+    def clamp_y_bounds(
+        self: Self,
+        y: torch.Tensor,
+        *,
+        prefer_quantile: bool = True,
+        clip_quant_to_minmax: bool = True,
+    ) -> torch.Tensor:
+        if y.numel() == 0:
+            return y
+        lo, hi = self._resolve_y_bounds_for_output(
+            y,
+            prefer_quantile=bool(prefer_quantile),
+            clip_quant_to_minmax=bool(clip_quant_to_minmax),
+        )
+        if lo is None or hi is None:
+            return y
+        input_dtype = y.dtype
+        master_dtype = self._resolve_master_dtype_for_io(y)
+        if master_dtype is torch.int64:
+            master_dtype = torch.float64
+        orig_shape = tuple(y.shape)
+        y2 = (
+            y.reshape(1, -1)
+            if y.dim() == 1
+            else y.reshape(int(y.shape[0]), -1)
+        ).to(dtype=master_dtype)
+        out2 = torch.minimum(torch.maximum(y2, lo), hi)
+        out = out2.reshape(orig_shape) if y.dim() != 1 else out2.reshape(-1)
+        if (
+            y.is_floating_point()
+            and out.dtype != input_dtype
+            and self._should_restore_input_dtype(input_dtype)
+        ):
+            out = out.to(dtype=input_dtype)
+        return out
+
+    def calibrate(
+        self: Self,
+        z_raw: torch.Tensor,
+        *,
+        apply_output_ab: bool = True,
+    ) -> torch.Tensor:
         disable_pw = env_bool(
             (
                 "ENN_DISABLE_PIECEWISE_CALIB",
@@ -3636,25 +3725,28 @@ class Scaler(nn.Module):
             ),
             default=False,
         )
+        def _finish(z: torch.Tensor) -> torch.Tensor:
+            return self._apply_output_ab(z) if bool(apply_output_ab) else z
+
         if disable_pw or is_symbolic() or is_meta_or_fake_tensor(z_raw):
             if self.calib_mode in ("piecewise", "affine"):
-                return self.affine(z_raw)
-            return z_raw
+                return _finish(self.affine(z_raw))
+            return _finish(z_raw)
         match self.calib_mode:
             case "piecewise":
                 if self.pw_x.numel() >= 2 and self.pw_y.numel() >= 2:
                     z = self._piecewise(z_raw)
                 else:
                     z = z_raw
-                return self._apply_output_ab(z)
+                return _finish(z)
             case "affine":
-                return self._apply_output_ab(self.affine(z_raw))
+                return _finish(self.affine(z_raw))
             case "ab":
-                return self._apply_output_ab(self._piecewise(z_raw))
+                return _finish(self._piecewise(z_raw))
             case "none":
-                return self._apply_output_ab(z_raw)
+                return _finish(z_raw)
             case _:
-                return self._apply_output_ab(z_raw)
+                return _finish(z_raw)
 
     def _apply_output_ab(self: Self, z: torch.Tensor) -> torch.Tensor:
         if z.numel() == 0:
