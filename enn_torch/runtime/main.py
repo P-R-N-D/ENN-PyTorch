@@ -6471,9 +6471,68 @@ def infer(
                 return None
 
             _pred_raw_output_space_cache: str | None = None
+            _pred_raw_output_space_source_cache: str = "default:z"
+
+            def _get_explicit_pred_raw_output_space(owner: object | None) -> tuple[str, str] | None:
+                if owner is None:
+                    return None
+                owner_name = type(owner).__name__
+                owner_attr_names = (
+                    "pred_raw_output_space_calibrate_false",
+                    "pred_raw_output_space",
+                    "calibrate_output_false_space",
+                    "raw_output_space",
+                )
+                method_attr_names = (
+                    "pred_raw_output_space_calibrate_false",
+                    "pred_raw_output_space",
+                    "calibrate_output_false_space",
+                    "raw_output_space",
+                )
+                scaler_attr_names = (
+                    "pred_raw_output_space_calibrate_false",
+                    "pred_raw_output_space",
+                    "calibrate_output_false_space",
+                    "raw_output_space",
+                )
+                for attr_name in owner_attr_names:
+                    with contextlib.suppress(Exception):
+                        explicit_space = str(
+                            getattr(owner, attr_name, "") or ""
+                        ).strip().lower()
+                        if explicit_space in {"y", "z"}:
+                            return explicit_space, f"owner:{owner_name}.{attr_name}"
+                with contextlib.suppress(Exception):
+                    fwd = getattr(owner, "forward", None)
+                    if callable(fwd):
+                        for attr_name in method_attr_names:
+                            explicit_space = str(
+                                getattr(fwd, attr_name, "") or ""
+                            ).strip().lower()
+                            if explicit_space in {"y", "z"}:
+                                return explicit_space, f"forward:{owner_name}.{attr_name}"
+                with contextlib.suppress(Exception):
+                    sc = getattr(owner, "scaler", None)
+                    denorm = (
+                        getattr(sc, "denormalize_y", None)
+                        if sc is not None
+                        else None
+                    )
+                    if callable(denorm):
+                        for attr_name in scaler_attr_names:
+                            explicit_space = str(
+                                getattr(sc, attr_name, "") or ""
+                            ).strip().lower()
+                            if explicit_space in {"y", "z"}:
+                                return explicit_space, f"scaler:{owner_name}.{attr_name}"
+                return None
+
+            def _get_pred_raw_output_space_source() -> str:
+                _get_pred_raw_output_space()
+                return str(_pred_raw_output_space_source_cache or "default:z")
 
             def _get_pred_raw_output_space() -> str:
-                nonlocal _pred_raw_output_space_cache
+                nonlocal _pred_raw_output_space_cache, _pred_raw_output_space_source_cache
                 if isinstance(_pred_raw_output_space_cache, str) and (
                     _pred_raw_output_space_cache in {"y", "z"}
                 ):
@@ -6481,31 +6540,34 @@ def infer(
                 mode = str(pred_raw_output_space or "auto").strip().lower()
                 if mode in {"y", "z"}:
                     _pred_raw_output_space_cache = mode
+                    _pred_raw_output_space_source_cache = f"env:{mode}"
                     return mode
+                found: list[tuple[str, str]] = []
+                seen_sources: set[tuple[str, str]] = set()
                 for owner in tuple(_pred_scaler_owners):
-                    if owner is None:
+                    explicit = _get_explicit_pred_raw_output_space(owner)
+                    if explicit is None:
                         continue
-                    with contextlib.suppress(Exception):
-                        sc = getattr(owner, "scaler", None)
-                        denorm = (
-                            getattr(sc, "denormalize_y", None)
-                            if sc is not None
-                            else None
-                        )
-                        if not callable(denorm):
-                            continue
-                        for attr_name in (
-                            "pred_raw_output_space",
-                            "raw_output_space",
-                            "output_space",
-                        ):
-                            explicit_space = str(
-                                getattr(owner, attr_name, "") or ""
-                            ).strip().lower()
-                            if explicit_space in {"y", "z"}:
-                                _pred_raw_output_space_cache = explicit_space
-                                return explicit_space
+                    if explicit not in seen_sources:
+                        seen_sources.add(explicit)
+                        found.append(explicit)
+                explicit_spaces = {space for space, _ in found}
+                if len(explicit_spaces) == 1 and found:
+                    space, source = found[0]
+                    _pred_raw_output_space_cache = space
+                    _pred_raw_output_space_source_cache = source
+                    return space
+                if len(explicit_spaces) > 1:
+                    joined = ", ".join(f"{src}={space}" for space, src in found)
+                    _LOGGER.warning(
+                        "[infer] conflicting explicit raw-output-space metadata detected (%s); defaulting to Z-space for calibrate_output=False prediction.",
+                        joined,
+                    )
+                    _pred_raw_output_space_cache = "z"
+                    _pred_raw_output_space_source_cache = "conflict:z"
+                    return "z"
                 _pred_raw_output_space_cache = "z"
+                _pred_raw_output_space_source_cache = "default:z"
                 return "z"
 
             def _posthoc_calibrate_prediction(
@@ -7281,6 +7343,7 @@ def infer(
                                         "pred_posthoc_prefer_cpu": bool(pred_posthoc_prefer_cpu),
                                         "pred_posthoc_input_space": str(pred_posthoc_input_space),
                                         "pred_raw_output_space": str(_get_pred_raw_output_space() or "z"),
+                                        "pred_raw_output_space_source": str(_get_pred_raw_output_space_source() or "default:z"),
                                         "pred_posthoc_allow_cross_space_fallback": bool(pred_posthoc_allow_cross_space_fallback),
                                         "pred_posthoc_denorm_only_effective": bool(
                                             pred_posthoc_denorm_only_enabled
