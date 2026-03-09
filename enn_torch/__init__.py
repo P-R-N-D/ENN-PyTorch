@@ -10,7 +10,7 @@ if TYPE_CHECKING:
 
     from .core.config import ModelConfig
     from .core.config import RuntimeConfig
-    from .nn.embedding import Embedding
+    from .nn.layers import Embedding
     from .nn.wrappers import Model
 
 __all__ = [
@@ -44,7 +44,7 @@ def new_model(*args: Any, **kwargs: Any) -> Model:
     return workflows.new_model(*args, **kwargs)
 
 
-def new_embedding(*args: Any, **kwargs: Any) -> Embedding:
+def new_embedding(*args: Any, **kwargs: Any) -> Embedding | None:
     from .runtime import workflows
 
     return workflows.new_embedding(*args, **kwargs)
@@ -62,7 +62,7 @@ def load_weights(*args: Any, **kwargs: Any) -> object:
     return workflows.load_weights(*args, **kwargs)
 
 
-def load_embedding(*args: Any, **kwargs: Any) -> Embedding:
+def load_embedding(*args: Any, **kwargs: Any) -> Embedding | None:
     from .runtime import workflows
 
     return workflows.load_embedding(*args, **kwargs)
