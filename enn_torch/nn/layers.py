@@ -3682,21 +3682,45 @@ class Scaler(nn.Module):
         *,
         prefer_quantile: bool = True,
         clip_quant_to_minmax: bool = True,
+        resolved_bounds: tuple[torch.Tensor | None, torch.Tensor | None] | None = None,
     ) -> torch.Tensor:
         if y.numel() == 0:
-            return y
-        lo, hi = self._resolve_y_bounds_for_output(
-            y,
-            prefer_quantile=bool(prefer_quantile),
-            clip_quant_to_minmax=bool(clip_quant_to_minmax),
-        )
-        if lo is None or hi is None:
             return y
         input_dtype = y.dtype
         master_dtype = self._resolve_master_dtype_for_io(y)
         if master_dtype is torch.int64:
             master_dtype = torch.float64
         orig_shape = tuple(y.shape)
+        feature_dim = (
+            int(orig_shape[0])
+            if y.dim() == 1
+            else int(math.prod(orig_shape[1:]))
+        )
+
+        def _prepare_bound(v: object) -> torch.Tensor | None:
+            if not isinstance(v, torch.Tensor) or int(v.numel()) <= 0:
+                return None
+            out = v.detach().reshape(-1).to(device=y.device, dtype=master_dtype)
+            if int(out.numel()) == 1 and int(feature_dim) != 1:
+                out = out.expand((int(feature_dim),))
+            if int(out.numel()) != int(feature_dim):
+                return None
+            if not bool(torch.isfinite(out).all().item()):
+                return None
+            return out
+
+        if resolved_bounds is None:
+            lo, hi = self._resolve_y_bounds_for_output(
+                y,
+                prefer_quantile=bool(prefer_quantile),
+                clip_quant_to_minmax=bool(clip_quant_to_minmax),
+            )
+        else:
+            lo_raw, hi_raw = resolved_bounds
+            lo = _prepare_bound(lo_raw)
+            hi = _prepare_bound(hi_raw)
+        if lo is None or hi is None:
+            return y
         y2 = (
             y.reshape(1, -1)
             if y.dim() == 1
