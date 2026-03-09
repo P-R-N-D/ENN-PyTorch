@@ -6633,10 +6633,128 @@ class Model(nn.Module):
                 edge_reg_high,
             )
             if infer_mode and calibrate_output and (not is_cls_loss):
-                z_cal = self.scaler.calibrate(y_hat)
-                pred = self.scaler.denormalize_y(z_cal).reshape(
-                    b, *self.out_shape
+                sc = self.scaler
+                prefer_quantile_bounds = bool(
+                    env_bool(
+                        "ENN_OUTPUT_AB_SUSPICIOUS_Y_BOUNDS_USE_QUANTILE",
+                        default=True,
+                    )
                 )
+                clip_quantile_bounds = bool(
+                    env_bool(
+                        "ENN_OUTPUT_AB_SUSPICIOUS_Y_BOUNDS_CLIP_TO_MINMAX",
+                        default=True,
+                    )
+                )
+                clamp_y = getattr(sc, "clamp_y_bounds", None)
+                use_suspicious_y_bounds_fallback = bool(
+                    env_bool("ENN_OUTPUT_AB_SUSPICIOUS_USE_Y_BOUNDS", default=True)
+                    and bool(getattr(sc, "_output_ab_clip_only", False))
+                    and callable(clamp_y)
+                )
+                resolved_y_bounds: tuple[torch.Tensor | None, torch.Tensor | None] | None = None
+                if bool(use_suspicious_y_bounds_fallback):
+                    bounds_resolver = getattr(sc, "_resolve_y_bounds_for_output", None)
+                    y_bounds_available = False
+                    if callable(bounds_resolver):
+                        lo, hi = bounds_resolver(
+                            y_hat,
+                            prefer_quantile=prefer_quantile_bounds,
+                            clip_quant_to_minmax=clip_quantile_bounds,
+                        )
+                        y_bounds_available = bool(lo is not None and hi is not None)
+                        if bool(y_bounds_available):
+                            resolved_y_bounds = (lo, hi)
+                    use_suspicious_y_bounds_fallback = bool(y_bounds_available)
+                    if (
+                        not bool(use_suspicious_y_bounds_fallback)
+                        and env_bool("ENN_OUTPUT_AB_SUSPICIOUS_LOG", default=True)
+                        and (
+                            not bool(
+                                getattr(
+                                    self,
+                                    "_pred_output_ab_suspicious_unbounded_warned",
+                                    False,
+                                )
+                            )
+                        )
+                    ):
+                        setattr(
+                            self,
+                            "_pred_output_ab_suspicious_unbounded_warned",
+                            True,
+                        )
+                        _LOGGER.warning(
+                            "[ENN][predict] suspicious output_ab clip-only active; Y-bounds unavailable/non-finite, using default calibrate path."
+                        )
+                if bool(use_suspicious_y_bounds_fallback):
+                    try:
+                        z_cal = sc.calibrate(y_hat, apply_output_ab=False)
+                        pred = sc.denormalize_y(z_cal).reshape(
+                            b, *self.out_shape
+                        )
+                        pred = clamp_y(
+                            pred,
+                            prefer_quantile=prefer_quantile_bounds,
+                            clip_quant_to_minmax=clip_quantile_bounds,
+                            resolved_bounds=resolved_y_bounds,
+                        )
+                        if not bool(torch.isfinite(pred).all().item()):
+                            raise RuntimeError(
+                                "non-finite output after Y-bounds clamp"
+                            )
+                        if resolved_y_bounds is not None:
+                            lo_chk, hi_chk = resolved_y_bounds
+                            pred_chk = pred.reshape(int(pred.shape[0]), -1).to(
+                                device=lo_chk.device,
+                                dtype=lo_chk.dtype,
+                            )
+                            lo_chk2 = lo_chk.reshape(1, -1)
+                            hi_chk2 = hi_chk.reshape(1, -1)
+                            clamp_atol = float(
+                                env_float(
+                                    "ENN_OUTPUT_AB_SUSPICIOUS_Y_BOUNDS_ATOL",
+                                    0.0,
+                                )
+                            )
+                            if clamp_atol > 0.0:
+                                outside = (pred_chk < (lo_chk2 - clamp_atol)) | (
+                                    pred_chk > (hi_chk2 + clamp_atol)
+                                )
+                            else:
+                                outside = (pred_chk < lo_chk2) | (
+                                    pred_chk > hi_chk2
+                                )
+                            if bool(outside.any().item()):
+                                raise RuntimeError(
+                                    "Y-bounds fallback output escaped resolved bounds"
+                                )
+                        if env_bool("ENN_OUTPUT_AB_SUSPICIOUS_LOG", default=True) and (
+                            not bool(getattr(self, "_pred_output_ab_suspicious_warned", False))
+                        ):
+                            setattr(self, "_pred_output_ab_suspicious_warned", True)
+                            _LOGGER.warning(
+                                "[ENN][predict] suspicious output_ab clip-only active; using calibrate(apply_output_ab=False)+Y-bounds clamp for inference."
+                            )
+                    except Exception as e:
+                        if env_bool("ENN_OUTPUT_AB_SUSPICIOUS_LOG", default=True) and (
+                            not bool(getattr(self, "_pred_output_ab_suspicious_fallback_warned", False))
+                        ):
+                            setattr(self, "_pred_output_ab_suspicious_fallback_warned", True)
+                            _LOGGER.warning(
+                                "[ENN][predict] suspicious output_ab Y-bounds fallback failed (%s: %s); using default calibrate path.",
+                                type(e).__name__,
+                                str(e),
+                            )
+                        z_cal = sc.calibrate(y_hat)
+                        pred = sc.denormalize_y(z_cal).reshape(
+                            b, *self.out_shape
+                        )
+                else:
+                    z_cal = sc.calibrate(y_hat)
+                    pred = sc.denormalize_y(z_cal).reshape(
+                        b, *self.out_shape
+                    )
             if td_input is not None:
                 if hasattr(td_input, "copy"):
                     out_td = td_input.copy()
