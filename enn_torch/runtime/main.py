@@ -6144,6 +6144,35 @@ def infer(
                 pred_posthoc_input_space = "z"
             elif pred_posthoc_input_space not in {"auto", "y", "z"}:
                 pred_posthoc_input_space = "auto"
+            pred_raw_output_space = str(
+                os.getenv("ENN_PRED_COLLAPSE_RAW_OUTPUT_SPACE", "auto")
+                or "auto"
+            ).strip().lower()
+            if pred_raw_output_space in {"", "default"}:
+                pred_raw_output_space = "auto"
+            elif pred_raw_output_space in {
+                "y-space",
+                "yspace",
+                "yhat",
+                "denorm",
+                "denormalized",
+                "output",
+                "outputs",
+                "raw-y",
+                "yraw",
+            }:
+                pred_raw_output_space = "y"
+            elif pred_raw_output_space in {
+                "z-space",
+                "zspace",
+                "raw-z",
+                "zraw",
+                "latent",
+                "normalized",
+            }:
+                pred_raw_output_space = "z"
+            elif pred_raw_output_space not in {"auto", "y", "z"}:
+                pred_raw_output_space = "auto"
             pred_posthoc_allow_cross_space_fallback = bool(
                 env_bool(
                     "ENN_PRED_COLLAPSE_POSTHOC_ALLOW_CROSS_SPACE_FALLBACK",
@@ -6440,6 +6469,106 @@ def infer(
                             if torch.is_tensor(t):
                                 return t.device
                 return None
+
+            _pred_raw_output_space_cache: str | None = None
+            _pred_raw_output_space_source_cache: str = "default:z"
+
+            def _get_explicit_pred_raw_output_space(owner: object | None) -> tuple[str, str] | None:
+                if owner is None:
+                    return None
+                owner_name = type(owner).__name__
+                owner_attr_names = (
+                    "pred_raw_output_space_calibrate_false",
+                    "pred_raw_output_space",
+                    "calibrate_output_false_space",
+                    "raw_output_space",
+                )
+                method_attr_names = (
+                    "pred_raw_output_space_calibrate_false",
+                    "pred_raw_output_space",
+                    "calibrate_output_false_space",
+                    "raw_output_space",
+                )
+                scaler_attr_names = (
+                    "pred_raw_output_space_calibrate_false",
+                    "pred_raw_output_space",
+                    "calibrate_output_false_space",
+                    "raw_output_space",
+                )
+                for attr_name in owner_attr_names:
+                    with contextlib.suppress(Exception):
+                        explicit_space = str(
+                            getattr(owner, attr_name, "") or ""
+                        ).strip().lower()
+                        if explicit_space in {"y", "z"}:
+                            return explicit_space, f"owner:{owner_name}.{attr_name}"
+                with contextlib.suppress(Exception):
+                    fwd = getattr(owner, "forward", None)
+                    if callable(fwd):
+                        for attr_name in method_attr_names:
+                            explicit_space = str(
+                                getattr(fwd, attr_name, "") or ""
+                            ).strip().lower()
+                            if explicit_space in {"y", "z"}:
+                                return explicit_space, f"forward:{owner_name}.{attr_name}"
+                with contextlib.suppress(Exception):
+                    sc = getattr(owner, "scaler", None)
+                    denorm = (
+                        getattr(sc, "denormalize_y", None)
+                        if sc is not None
+                        else None
+                    )
+                    if callable(denorm):
+                        for attr_name in scaler_attr_names:
+                            explicit_space = str(
+                                getattr(sc, attr_name, "") or ""
+                            ).strip().lower()
+                            if explicit_space in {"y", "z"}:
+                                return explicit_space, f"scaler:{owner_name}.{attr_name}"
+                return None
+
+            def _get_pred_raw_output_space_source() -> str:
+                _get_pred_raw_output_space()
+                return str(_pred_raw_output_space_source_cache or "default:z")
+
+            def _get_pred_raw_output_space() -> str:
+                nonlocal _pred_raw_output_space_cache, _pred_raw_output_space_source_cache
+                if isinstance(_pred_raw_output_space_cache, str) and (
+                    _pred_raw_output_space_cache in {"y", "z"}
+                ):
+                    return _pred_raw_output_space_cache
+                mode = str(pred_raw_output_space or "auto").strip().lower()
+                if mode in {"y", "z"}:
+                    _pred_raw_output_space_cache = mode
+                    _pred_raw_output_space_source_cache = f"env:{mode}"
+                    return mode
+                found: list[tuple[str, str]] = []
+                seen_sources: set[tuple[str, str]] = set()
+                for owner in tuple(_pred_scaler_owners):
+                    explicit = _get_explicit_pred_raw_output_space(owner)
+                    if explicit is None:
+                        continue
+                    if explicit not in seen_sources:
+                        seen_sources.add(explicit)
+                        found.append(explicit)
+                explicit_spaces = {space for space, _ in found}
+                if len(explicit_spaces) == 1 and found:
+                    space, source = found[0]
+                    _pred_raw_output_space_cache = space
+                    _pred_raw_output_space_source_cache = source
+                    return space
+                if len(explicit_spaces) > 1:
+                    joined = ", ".join(f"{src}={space}" for space, src in found)
+                    _LOGGER.warning(
+                        "[infer] conflicting explicit raw-output-space metadata detected (%s); defaulting to Z-space for calibrate_output=False prediction.",
+                        joined,
+                    )
+                    _pred_raw_output_space_cache = "z"
+                    _pred_raw_output_space_source_cache = "conflict:z"
+                    return "z"
+                _pred_raw_output_space_cache = "z"
+                _pred_raw_output_space_source_cache = "default:z"
+                return "z"
 
             def _posthoc_calibrate_prediction(
                 pred_raw: torch.Tensor,
@@ -6784,6 +6913,14 @@ def infer(
                     if calibrate_output is None
                     else bool(calibrate_output)
                 )
+                raw_output_space = str(_get_pred_raw_output_space() or "z")
+                if bool(pred_posthoc_denorm_only_active) and str(raw_output_space) != "z":
+                    pred_posthoc_denorm_only_active = False
+                    if bool(pred_persist_raw_mode):
+                        pred_force_raw_output = True
+                        _LOGGER.warning(
+                            "[infer] disabling denorm-only persistence because calibrate_output=False outputs already appear to be in Y-space; keeping raw Y-space outputs instead."
+                        )
                 if bool(pred_force_raw_output):
                     want_calibrate = False
                 if bool(pred_posthoc_denorm_only_active) and bool(want_calibrate):
@@ -6834,7 +6971,7 @@ def infer(
                         out_post = _posthoc_calibrate_prediction(
                             out_raw,
                             prefer_cpu=bool(pred_posthoc_prefer_cpu),
-                            input_space_hint="z",
+                            input_space_hint=str(raw_output_space),
                         )
                         if isinstance(out_post, torch.Tensor) and (
                             not out_post.is_contiguous()
@@ -7205,7 +7342,13 @@ def infer(
                                         "force_uncompiled": bool(force_uncompiled),
                                         "pred_posthoc_prefer_cpu": bool(pred_posthoc_prefer_cpu),
                                         "pred_posthoc_input_space": str(pred_posthoc_input_space),
+                                        "pred_raw_output_space": str(_get_pred_raw_output_space() or "z"),
+                                        "pred_raw_output_space_source": str(_get_pred_raw_output_space_source() or "default:z"),
                                         "pred_posthoc_allow_cross_space_fallback": bool(pred_posthoc_allow_cross_space_fallback),
+                                        "pred_posthoc_denorm_only_effective": bool(
+                                            pred_posthoc_denorm_only_enabled
+                                            and str(_get_pred_raw_output_space() or "z") == "z"
+                                        ),
                                         "pred_posthoc_calibrate_active": bool(pred_posthoc_calibrate_active),
                                         "pred_posthoc_denorm_only_active": bool(pred_posthoc_denorm_only_active),
                                         "pred_force_raw_output": bool(pred_force_raw_output),
@@ -8699,7 +8842,7 @@ def infer(
                                                                     prefer_cpu=bool(
                                                                         pred_posthoc_prefer_cpu
                                                                     ),
-                                                                    input_space_hint="z",
+                                                                    input_space_hint=str(_get_pred_raw_output_space() or "z"),
                                                                 )
                                                             )
                                                             with contextlib.suppress(Exception):
@@ -8778,6 +8921,7 @@ def infer(
                                                         and bool(preds_fix2_raw_ok)
                                                         and (not bool(preds_fix2_post_ok))
                                                         and bool(pred_posthoc_denorm_only_enabled)
+                                                        and str(_get_pred_raw_output_space() or "z") == "z"
                                                     ):
                                                         try:
                                                             preds_fix2_denorm = _posthoc_denormalize_prediction(
@@ -8842,6 +8986,16 @@ def infer(
                                                             )
                                                             preds_fix2_denorm = None
                                                             preds_fix2_denorm_ok = False
+                                                    if (
+                                                        preds_fix2 is not None
+                                                        and bool(preds_fix2_raw_ok)
+                                                        and (not bool(preds_fix2_post_ok))
+                                                        and bool(pred_posthoc_denorm_only_enabled)
+                                                        and str(_get_pred_raw_output_space() or "z") != "z"
+                                                    ):
+                                                        _LOGGER.warning(
+                                                            "[infer] skipping denorm-only fallback because calibrate_output=False outputs already appear to be in Y-space; using raw per-sample outputs instead."
+                                                        )
                                                     if preds_fix2_post_ok and isinstance(preds_fix2_post, torch.Tensor):
                                                         preds = preds_fix2_post
                                                         pred_posthoc_calibrate_active = True
@@ -8864,9 +9018,14 @@ def infer(
                                                             pred_posthoc_calibrate_active = False
                                                             pred_posthoc_denorm_only_active = False
                                                             pred_force_raw_output = True
-                                                            _LOGGER.warning(
-                                                                "[infer] keeping raw-output mode for remaining prediction microbatches to avoid mixed-scale outputs."
-                                                            )
+                                                            if str(_get_pred_raw_output_space() or "z") == "y":
+                                                                _LOGGER.warning(
+                                                                    "[infer] keeping calibrate_output=False Y-space outputs for remaining prediction microbatches to preserve scale and diversity."
+                                                                )
+                                                            else:
+                                                                _LOGGER.warning(
+                                                                    "[infer] keeping raw-output mode for remaining prediction microbatches to avoid mixed-scale outputs."
+                                                                )
                                                         _LOGGER.warning(
                                                             "[infer] using calibrate_output=False per-sample predictions for output of this batch."
                                                         )

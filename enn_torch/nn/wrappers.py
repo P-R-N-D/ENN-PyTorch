@@ -3996,6 +3996,7 @@ class Fuser(nn.Module):
 
 
 class Model(nn.Module):
+    pred_raw_output_space_calibrate_false = "z"
     @staticmethod
     def _get_cfg(
         cfg: object,
