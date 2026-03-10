@@ -7502,6 +7502,10 @@ def infer(
                     and bool(pred_raw_z_last_resort_denorm)
                     and bool(pred_force_raw_output)
                     and str(raw_output_space) == "z"
+                    and (
+                        (not bool(pred_raw_z_last_resort_require_non_broadcast))
+                        or (not bool(pred_posthoc_denorm_only_active))
+                    )
                 )
                 if bool(force_raw_z_last_resort_denorm):
                     out_raw = _run_model_predict_with_calibration(
@@ -7524,6 +7528,16 @@ def infer(
                         ):
                             with contextlib.suppress(Exception):
                                 out_post = out_post.contiguous()
+                        if bool(pred_raw_z_last_resort_require_non_broadcast) and int(
+                            getattr(out_post, "shape", (0,))[0] or 0
+                        ) >= 2:
+                            is_like_last_resort, _, _ = _broadcast_like_selected_pair(
+                                out_post,
+                                preferred_i=None,
+                                atol=float(broadcast_atol),
+                            )
+                            if bool(is_like_last_resort):
+                                return out_raw.detach()
                         if not bool(pred_raw_z_last_resort_denorm_warned):
                             pred_raw_z_last_resort_denorm_warned = True
                             _LOGGER.warning(
