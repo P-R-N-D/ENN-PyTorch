@@ -6263,6 +6263,9 @@ def infer(
                     default=True,
                 )
             )
+            pred_raw_z_last_resort_denorm_runtime_enabled = bool(
+                pred_raw_z_last_resort_denorm
+            )
             pred_raw_z_last_resort_require_non_broadcast = bool(
                 env_bool(
                     "ENN_PRED_COLLAPSE_RAW_Z_LAST_RESORT_REQUIRE_NON_BROADCAST",
@@ -7477,7 +7480,7 @@ def infer(
                 use_uncompiled: bool | None = None,
                 force_fp32: bool = False,
             ) -> torch.Tensor:
-                nonlocal pred_posthoc_calibrate_active, pred_posthoc_denorm_only_active, pred_posthoc_denorm_anchor_active, pred_posthoc_denorm_anchor_runtime_enabled, pred_posthoc_denorm_anchor_warned, pred_posthoc_denorm_anchor_skip_warned, pred_force_raw_output, pred_raw_z_last_resort_denorm_warned, pred_raw_z_last_resort_denorm_failed_warned
+                nonlocal pred_posthoc_calibrate_active, pred_posthoc_denorm_only_active, pred_posthoc_denorm_anchor_active, pred_posthoc_denorm_anchor_runtime_enabled, pred_posthoc_denorm_anchor_warned, pred_posthoc_denorm_anchor_skip_warned, pred_force_raw_output, pred_raw_z_last_resort_denorm_runtime_enabled, pred_raw_z_last_resort_denorm_warned, pred_raw_z_last_resort_denorm_failed_warned
                 uc = (
                     bool(force_uncompiled)
                     if use_uncompiled is None
@@ -7499,7 +7502,7 @@ def infer(
                         )
                 force_raw_z_last_resort_denorm = bool(
                     want_calibrate
-                    and bool(pred_raw_z_last_resort_denorm)
+                    and bool(pred_raw_z_last_resort_denorm_runtime_enabled)
                     and bool(pred_force_raw_output)
                     and str(raw_output_space) == "z"
                     and (
@@ -7537,6 +7540,10 @@ def infer(
                                 atol=float(broadcast_atol),
                             )
                             if bool(is_like_last_resort):
+                                pred_raw_z_last_resort_denorm_runtime_enabled = False
+                                _LOGGER.warning(
+                                    "[infer] raw-output persistence would keep Z-space outputs, but last-resort denorm-only output still looked broadcast-like; disabling future last-resort denorm-only attempts and keeping raw outputs."
+                                )
                                 return out_raw.detach()
                         if not bool(pred_raw_z_last_resort_denorm_warned):
                             pred_raw_z_last_resort_denorm_warned = True
@@ -7545,10 +7552,11 @@ def infer(
                             )
                         return out_post.detach()
                     except Exception as e:
+                        pred_raw_z_last_resort_denorm_runtime_enabled = False
                         if not bool(pred_raw_z_last_resort_denorm_failed_warned):
                             pred_raw_z_last_resort_denorm_failed_warned = True
                             _LOGGER.warning(
-                                "[infer] raw-output persistence would keep Z-space outputs; last-resort denorm-only scaling failed (%s: %s); keeping raw outputs.",
+                                "[infer] raw-output persistence would keep Z-space outputs; last-resort denorm-only scaling failed (%s: %s); disabling future last-resort denorm-only attempts and keeping raw outputs.",
                                 type(e).__name__,
                                 str(e),
                             )
@@ -7608,8 +7616,9 @@ def infer(
                             pred_posthoc_denorm_only_active = False
                             pred_posthoc_denorm_anchor_active = False
                             pred_force_raw_output = True
+                            pred_raw_z_last_resort_denorm_runtime_enabled = False
                             _LOGGER.warning(
-                                "[infer] posthoc denormalization failed during prediction (%s: %s); switching remaining outputs to raw mode for consistency.",
+                                "[infer] posthoc denormalization failed during prediction (%s: %s); disabling future last-resort denorm-only attempts and switching remaining outputs to raw mode for consistency.",
                                 type(e).__name__,
                                 str(e),
                             )
@@ -8015,6 +8024,7 @@ def infer(
                                         "pred_posthoc_denorm_anchor_runtime_enabled": bool(pred_posthoc_denorm_anchor_runtime_enabled),
                                         "pred_force_raw_output": bool(pred_force_raw_output),
                                         "pred_raw_z_last_resort_denorm": bool(pred_raw_z_last_resort_denorm),
+                                        "pred_raw_z_last_resort_denorm_runtime_enabled": bool(pred_raw_z_last_resort_denorm_runtime_enabled),
                                         "pred_raw_z_last_resort_require_non_broadcast": bool(pred_raw_z_last_resort_require_non_broadcast),
                                         "pred_posthoc_reject_low_diversity": bool(pred_posthoc_reject_low_diversity),
                                         "pred_posthoc_reject_partial_like": bool(pred_posthoc_reject_partial_like),
@@ -9746,8 +9756,9 @@ def infer(
                                                                         float((coarse_stats_den or {}).get("std_p50", float("nan"))),
                                                                     )
                                                         except Exception as e:
+                                                            pred_raw_z_last_resort_denorm_runtime_enabled = False
                                                             _LOGGER.warning(
-                                                                "[infer] denorm-only fallback after raw-collapse fallback failed (%s: %s); keeping raw predictions for this batch.",
+                                                                "[infer] denorm-only fallback after raw-collapse fallback failed (%s: %s); disabling future last-resort denorm-only attempts and keeping raw predictions for this batch.",
                                                                 type(e).__name__,
                                                                 str(e),
                                                             )
@@ -9811,7 +9822,7 @@ def infer(
                                                                 "[infer] using per-sample raw predictions with denorm-only output scaling for this batch; keeping denorm-only scaling for remaining prediction microbatches."
                                                             )
                                                     elif (
-                                                        bool(pred_raw_z_last_resort_denorm)
+                                                        bool(pred_raw_z_last_resort_denorm_runtime_enabled)
                                                         and isinstance(preds_fix2_denorm, torch.Tensor)
                                                         and (not bool(preds_fix2_post_ok))
                                                         and str(_get_pred_raw_output_space() or "z") == "z"
@@ -9840,6 +9851,16 @@ def infer(
                                                             pred_posthoc_denorm_only_active = False
                                                             pred_posthoc_denorm_anchor_active = False
                                                             pred_force_raw_output = True
+                                                            if (
+                                                                bool(pred_raw_z_last_resort_denorm_runtime_enabled)
+                                                                and bool(pred_raw_z_last_resort_require_non_broadcast)
+                                                                and str(_get_pred_raw_output_space() or "z") == "z"
+                                                                and bool(is_like_den)
+                                                            ):
+                                                                pred_raw_z_last_resort_denorm_runtime_enabled = False
+                                                                _LOGGER.warning(
+                                                                    "[infer] denorm-only fallback stayed broadcast-like for this batch; disabling future last-resort denorm-only attempts and keeping raw-output mode for consistency."
+                                                                )
                                                             if str(_get_pred_raw_output_space() or "z") == "y":
                                                                 _LOGGER.warning(
                                                                     "[infer] keeping calibrate_output=False Y-space outputs for remaining prediction microbatches to preserve scale and diversity."
