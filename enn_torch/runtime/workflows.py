@@ -14,6 +14,7 @@ import os
 import shutil
 import tempfile
 import time
+import traceback
 from functools import partial, update_wrapper
 from pathlib import Path
 from typing import (
@@ -94,13 +95,74 @@ def _is_nonfatal_base_exception(exc: BaseException) -> bool:
     return not isinstance(exc, (KeyboardInterrupt, SystemExit, GeneratorExit))
 
 
+def _iter_exception_chain(exc: BaseException) -> Iterable[BaseException]:
+    seen: set[int] = set()
+    cur: BaseException | None = exc
+    while cur is not None:
+        cur_id = id(cur)
+        if cur_id in seen:
+            break
+        seen.add(cur_id)
+        yield cur
+        nxt = getattr(cur, "__cause__", None)
+        if nxt is None:
+            nxt = getattr(cur, "__context__", None)
+        cur = nxt if isinstance(nxt, BaseException) else None
+
+
+def _traceback_has_forkserver_bootstrap(tb: Any) -> bool:
+    cur = tb
+    while cur is not None:
+        try:
+            frame = cur.tb_frame
+            code = frame.f_code
+            fname = os.path.normcase(str(getattr(code, "co_filename", "") or ""))
+            func = str(getattr(code, "co_name", "") or "")
+        except Exception:
+            fname, func = "", ""
+        if (
+            fname.endswith(os.path.normcase(os.path.join("multiprocessing", "forkserver.py")))
+            and func == "connect_to_new_process"
+        ) or (
+            fname.endswith(os.path.normcase(os.path.join("multiprocessing", "popen_forkserver.py")))
+            and func in {"_launch", "__init__"}
+        ):
+            return True
+        cur = getattr(cur, "tb_next", None)
+    return False
+
+
 def _looks_like_forkserver_start_failure(exc: BaseException) -> bool:
-    if isinstance(exc, FileNotFoundError):
-        return True
-    if isinstance(exc, OSError) and getattr(exc, "errno", None) == errno.ENOENT:
-        return True
-    text = f"{type(exc).__name__}: {exc}".lower()
-    return ("forkserver" in text) or ("connect_to_new_process" in text)
+    for part in _iter_exception_chain(exc):
+        is_enoent = isinstance(part, FileNotFoundError) or (
+            isinstance(part, OSError)
+            and getattr(part, "errno", None) == errno.ENOENT
+        )
+        if not bool(is_enoent):
+            continue
+        if _traceback_has_forkserver_bootstrap(getattr(part, "__traceback__", None)):
+            return True
+        text = f"{type(part).__name__}: {part}".lower()
+        if (
+            "forkserver" in text
+            and (
+                "connect_to_new_process" in text
+                or "_forkserver_address" in text
+                or "popen_forkserver" in text
+            )
+        ):
+            return True
+        with contextlib.suppress(Exception):
+            tb_text = "\n".join(traceback.format_tb(getattr(part, "__traceback__", None))).lower()
+            if (
+                "multiprocessing/forkserver.py" in tb_text
+                and "connect_to_new_process" in tb_text
+            ) or (
+                "multiprocessing/popen_forkserver.py" in tb_text
+                and "_launch" in tb_text
+            ):
+                return True
+    return False
 
 
 def _elastic_launch_with_start_method_retry(
