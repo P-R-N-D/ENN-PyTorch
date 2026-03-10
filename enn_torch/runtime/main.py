@@ -6257,6 +6257,18 @@ def infer(
             pred_persist_raw_mode = bool(
                 env_bool("ENN_PRED_COLLAPSE_PERSIST_RAW_MODE", default=True)
             )
+            pred_raw_z_last_resort_denorm = bool(
+                env_bool(
+                    "ENN_PRED_COLLAPSE_RAW_Z_LAST_RESORT_DENORM",
+                    default=True,
+                )
+            )
+            pred_raw_z_last_resort_require_non_broadcast = bool(
+                env_bool(
+                    "ENN_PRED_COLLAPSE_RAW_Z_LAST_RESORT_REQUIRE_NON_BROADCAST",
+                    default=True,
+                )
+            )
             pred_posthoc_calibrate_active = False
             pred_posthoc_denorm_only_active = False
             pred_posthoc_denorm_anchor_active = False
@@ -6266,6 +6278,8 @@ def infer(
             pred_posthoc_denorm_anchor_warned = False
             pred_posthoc_denorm_anchor_skip_warned = False
             pred_force_raw_output = False
+            pred_raw_z_last_resort_denorm_warned = False
+            pred_raw_z_last_resort_denorm_failed_warned = False
             pred_cg_strict_sync = bool(
                 env_bool(
                     "ENN_PRED_CUDAGRAPH_STRICT_SYNC",
@@ -7463,7 +7477,7 @@ def infer(
                 use_uncompiled: bool | None = None,
                 force_fp32: bool = False,
             ) -> torch.Tensor:
-                nonlocal pred_posthoc_calibrate_active, pred_posthoc_denorm_only_active, pred_posthoc_denorm_anchor_active, pred_posthoc_denorm_anchor_runtime_enabled, pred_posthoc_denorm_anchor_warned, pred_posthoc_denorm_anchor_skip_warned, pred_force_raw_output
+                nonlocal pred_posthoc_calibrate_active, pred_posthoc_denorm_only_active, pred_posthoc_denorm_anchor_active, pred_posthoc_denorm_anchor_runtime_enabled, pred_posthoc_denorm_anchor_warned, pred_posthoc_denorm_anchor_skip_warned, pred_force_raw_output, pred_raw_z_last_resort_denorm_warned, pred_raw_z_last_resort_denorm_failed_warned
                 uc = (
                     bool(force_uncompiled)
                     if use_uncompiled is None
@@ -7483,6 +7497,48 @@ def infer(
                         _LOGGER.warning(
                             "[infer] disabling denorm-only persistence because calibrate_output=False outputs already appear to be in Y-space; keeping raw Y-space outputs instead."
                         )
+                force_raw_z_last_resort_denorm = bool(
+                    want_calibrate
+                    and bool(pred_raw_z_last_resort_denorm)
+                    and bool(pred_force_raw_output)
+                    and str(raw_output_space) == "z"
+                )
+                if bool(force_raw_z_last_resort_denorm):
+                    out_raw = _run_model_predict_with_calibration(
+                        x,
+                        calibrate_output=False,
+                        use_uncompiled=uc,
+                        force_fp32=bool(force_fp32),
+                    )
+                    if isinstance(out_raw, tuple):
+                        out_raw = out_raw[0]
+                    if not isinstance(out_raw, torch.Tensor):
+                        raise RuntimeError("infer: unexpected model output type")
+                    try:
+                        out_post = _posthoc_denormalize_prediction(
+                            out_raw,
+                            prefer_cpu=bool(pred_posthoc_prefer_cpu),
+                        )
+                        if isinstance(out_post, torch.Tensor) and (
+                            not out_post.is_contiguous()
+                        ):
+                            with contextlib.suppress(Exception):
+                                out_post = out_post.contiguous()
+                        if not bool(pred_raw_z_last_resort_denorm_warned):
+                            pred_raw_z_last_resort_denorm_warned = True
+                            _LOGGER.warning(
+                                "[infer] raw-output persistence would keep Z-space outputs; using denorm-only output scaling as last-resort for remaining prediction microbatches."
+                            )
+                        return out_post.detach()
+                    except Exception as e:
+                        if not bool(pred_raw_z_last_resort_denorm_failed_warned):
+                            pred_raw_z_last_resort_denorm_failed_warned = True
+                            _LOGGER.warning(
+                                "[infer] raw-output persistence would keep Z-space outputs; last-resort denorm-only scaling failed (%s: %s); keeping raw outputs.",
+                                type(e).__name__,
+                                str(e),
+                            )
+                        return out_raw.detach()
                 if bool(pred_force_raw_output):
                     want_calibrate = False
                 if bool(pred_posthoc_denorm_only_active) and bool(want_calibrate):
@@ -7944,6 +8000,8 @@ def infer(
                                         "pred_posthoc_denorm_anchor_posthoc": bool(pred_posthoc_denorm_anchor_posthoc),
                                         "pred_posthoc_denorm_anchor_runtime_enabled": bool(pred_posthoc_denorm_anchor_runtime_enabled),
                                         "pred_force_raw_output": bool(pred_force_raw_output),
+                                        "pred_raw_z_last_resort_denorm": bool(pred_raw_z_last_resort_denorm),
+                                        "pred_raw_z_last_resort_require_non_broadcast": bool(pred_raw_z_last_resort_require_non_broadcast),
                                         "pred_posthoc_reject_low_diversity": bool(pred_posthoc_reject_low_diversity),
                                         "pred_posthoc_reject_partial_like": bool(pred_posthoc_reject_partial_like),
                                         "pred_posthoc_detect_coarse_low_diversity": bool(
@@ -9585,6 +9643,10 @@ def infer(
                                                             )
                                                             preds_fix2_post = None
                                                             preds_fix2_post_ok = False
+                                                    is_like_den = False
+                                                    partial_like_den = False
+                                                    lowdiv_like_den = False
+                                                    coarse_lowdiv_den = False
                                                     if (
                                                         preds_fix2 is not None
                                                         and bool(preds_fix2_raw_ok)
@@ -9733,6 +9795,29 @@ def infer(
                                                         else:
                                                             _LOGGER.warning(
                                                                 "[infer] using per-sample raw predictions with denorm-only output scaling for this batch; keeping denorm-only scaling for remaining prediction microbatches."
+                                                            )
+                                                    elif (
+                                                        bool(pred_raw_z_last_resort_denorm)
+                                                        and isinstance(preds_fix2_denorm, torch.Tensor)
+                                                        and (not bool(preds_fix2_post_ok))
+                                                        and str(_get_pred_raw_output_space() or "z") == "z"
+                                                        and (not bool(partial_like_den))
+                                                        and (
+                                                            (not bool(pred_raw_z_last_resort_require_non_broadcast))
+                                                            or (not bool(is_like_den))
+                                                        )
+                                                    ):
+                                                        preds = preds_fix2_denorm
+                                                        pred_posthoc_calibrate_active = False
+                                                        pred_posthoc_denorm_only_active = True
+                                                        pred_force_raw_output = False
+                                                        if bool(pred_posthoc_denorm_anchor_active):
+                                                            _LOGGER.warning(
+                                                                "[infer] raw fallback would keep Z-space outputs; using denorm-only output scaling anchored to posthoc-calibrated center as last-resort for this batch and remaining prediction microbatches."
+                                                            )
+                                                        else:
+                                                            _LOGGER.warning(
+                                                                "[infer] raw fallback would keep Z-space outputs; using denorm-only output scaling as last-resort for this batch and remaining prediction microbatches even though low-diversity checks rejected it."
                                                             )
                                                     elif preds_fix2 is not None:
                                                         preds = preds_fix2
