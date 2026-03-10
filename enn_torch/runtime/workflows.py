@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import contextlib
 import collections
+import dataclasses
+import errno
 import gc
 import hashlib
 import inspect
@@ -12,6 +14,7 @@ import os
 import shutil
 import tempfile
 import time
+import traceback
 from functools import partial, update_wrapper
 from pathlib import Path
 from typing import (
@@ -86,6 +89,120 @@ except Exception:
     pass
 
 logger = logging.getLogger(__name__)
+
+
+def _is_nonfatal_base_exception(exc: BaseException) -> bool:
+    return not isinstance(exc, (KeyboardInterrupt, SystemExit, GeneratorExit))
+
+
+def _iter_exception_chain(exc: BaseException) -> Iterable[BaseException]:
+    seen: set[int] = set()
+    cur: BaseException | None = exc
+    while cur is not None:
+        cur_id = id(cur)
+        if cur_id in seen:
+            break
+        seen.add(cur_id)
+        yield cur
+        nxt = getattr(cur, "__cause__", None)
+        if nxt is None:
+            nxt = getattr(cur, "__context__", None)
+        cur = nxt if isinstance(nxt, BaseException) else None
+
+
+def _traceback_has_forkserver_bootstrap(tb: Any) -> bool:
+    cur = tb
+    while cur is not None:
+        try:
+            frame = cur.tb_frame
+            code = frame.f_code
+            fname = os.path.normcase(str(getattr(code, "co_filename", "") or ""))
+            func = str(getattr(code, "co_name", "") or "")
+        except Exception:
+            fname, func = "", ""
+        if (
+            fname.endswith(os.path.normcase(os.path.join("multiprocessing", "forkserver.py")))
+            and func == "connect_to_new_process"
+        ) or (
+            fname.endswith(os.path.normcase(os.path.join("multiprocessing", "popen_forkserver.py")))
+            and func in {"_launch", "__init__"}
+        ):
+            return True
+        cur = getattr(cur, "tb_next", None)
+    return False
+
+
+def _looks_like_forkserver_start_failure(exc: BaseException) -> bool:
+    for part in _iter_exception_chain(exc):
+        is_enoent = isinstance(part, FileNotFoundError) or (
+            isinstance(part, OSError)
+            and getattr(part, "errno", None) == errno.ENOENT
+        )
+        if not bool(is_enoent):
+            continue
+        if _traceback_has_forkserver_bootstrap(getattr(part, "__traceback__", None)):
+            return True
+        text = f"{type(part).__name__}: {part}".lower()
+        if (
+            "forkserver" in text
+            and (
+                "connect_to_new_process" in text
+                or "_forkserver_address" in text
+                or "popen_forkserver" in text
+            )
+        ):
+            return True
+        with contextlib.suppress(Exception):
+            tb_text = "\n".join(traceback.format_tb(getattr(part, "__traceback__", None))).lower()
+            if (
+                "multiprocessing/forkserver.py" in tb_text
+                and "connect_to_new_process" in tb_text
+            ) or (
+                "multiprocessing/popen_forkserver.py" in tb_text
+                and "_launch" in tb_text
+            ):
+                return True
+    return False
+
+
+def _elastic_launch_with_start_method_retry(
+    lc: LaunchConfig,
+    ops: Mapping[str, Any],
+) -> None:
+    def _run(cfg: LaunchConfig) -> None:
+        with _start_context():
+            elastic_launch(cfg, process)(ops)
+
+    try:
+        _run(lc)
+        return
+    except BaseException as exc:
+        if (
+            not _is_nonfatal_base_exception(exc)
+            or (
+                str(getattr(lc, "start_method", "") or "")
+                .strip()
+                .lower()
+                != "forkserver"
+            )
+            or (
+                not bool(
+                    env_bool(
+                        "ENN_ELASTIC_RETRY_SPAWN_ON_FORKSERVER_FAILURE",
+                        default=True,
+                    )
+                )
+            )
+            or (not _looks_like_forkserver_start_failure(exc))
+        ):
+            raise
+        logger.warning(
+            "elastic launch via forkserver failed (%s: %s); retrying once with spawn.",
+            type(exc).__name__,
+            str(exc),
+        )
+        spawn_lc = dataclasses.replace(lc, start_method="spawn")
+        _run(spawn_lc)
 
 
 def _normalize_pasted_path(value: str | os.PathLike[str]) -> str | os.PathLike[str]:
@@ -2442,7 +2559,9 @@ def load_weights(
                 if not strict:
                     _raise_if_empty_dcp_model_state(m_sd, checkpoint_path=p)
                 _dcp_load_model_state(reader=reader, model_state=m_sd, planner=planner)
-            except Exception:
+            except BaseException as exc:
+                if not _is_nonfatal_base_exception(exc):
+                    raise
                 if (not strict) and _try_load_dir_checkpoint_fallback_pt(
                     model,
                     pt_path=(p / "model.pt"),
@@ -2940,7 +3059,9 @@ def load_model(
                 if not strict:
                     _raise_if_empty_dcp_model_state(m_sd, checkpoint_path=p)
                 _dcp_load_model_state(reader=reader, model_state=m_sd, planner=planner)
-            except Exception:
+            except BaseException as exc:
+                if not _is_nonfatal_base_exception(exc):
+                    raise
                 if (not strict) and _try_load_dir_checkpoint_fallback_pt(
                     model,
                     pt_path=(p / "model.pt"),
@@ -3355,8 +3476,7 @@ def train(
                 m.to("cpu")
 
         _clear_device_caches()
-        with _start_context():
-            elastic_launch(lc, process)(ops)
+        _elastic_launch_with_start_method_retry(lc, ops)
         fallback: str | None = None
         ret_dir = os.environ.get("ENN_RETURN_DIR") or ""
         for fname in ("model.pt",):
@@ -3449,25 +3569,43 @@ def train(
                     ),
                 )
             )
-            state_meta = getattr(meta, "state_dict_metadata", None)
-            if isinstance(state_meta, Mapping) and state_meta:
-                allowed_keys: set[str] = set()
-                for key in state_meta.keys():
-                    if key.startswith("model."):
-                        allowed_keys.add(key[len("model.") :])
-                    else:
-                        allowed_keys.add(key)
-                if allowed_keys:
-                    m_sd = {k: v for k, v in m_sd.items() if k in allowed_keys}
-            with ensure_dcp_process_group(torch.device("cpu")):
-                load(
-                    state_dict={"model": m_sd},
-                    storage_reader=reader,
+            strict = _dcp_strict_load_enabled()
+            allowed_keys, shapes = _dcp_allowed_keys_and_shapes(meta)
+            if allowed_keys:
+                m_sd = _dcp_filter_model_state_dict(
+                    m_sd,
+                    allowed_keys=allowed_keys,
+                    shapes=(None if strict else shapes),
                 )
-            resize_scaler_buffer(model, m_sd)
-            set_model_state_dict(
-                model, m_sd, options=StateDictOptions(full_state_dict=False, strict=False)
-            )
+            planner = _make_dcp_load_planner(allow_partial_load=not strict)
+            try:
+                if not strict:
+                    _raise_if_empty_dcp_model_state(
+                        m_sd, checkpoint_path=Path(os.fspath(dcp_dir))
+                    )
+                _dcp_load_model_state(
+                    reader=reader, model_state=m_sd, planner=planner
+                )
+            except BaseException as exc:
+                if not _is_nonfatal_base_exception(exc):
+                    raise
+                if (not strict) and _try_load_dir_checkpoint_fallback_pt(
+                    model,
+                    pt_path=(Path(os.fspath(dcp_dir)) / "model.pt"),
+                    map_location="cpu",
+                    mmap=True,
+                    rebuild_tasks=True,
+                ):
+                    pass
+                else:
+                    raise
+            else:
+                resize_scaler_buffer(model, m_sd)
+                set_model_state_dict(
+                    model,
+                    m_sd,
+                    options=StateDictOptions(full_state_dict=False, strict=False),
+                )
             with contextlib.suppress(Exception):
                 _coerce_scaler_buffers_to_shape(model, first_in_dim, label_shape)
         _update_history(model, ckpt_dir, epochs, val_frac, num_samples_dataset)
@@ -3518,8 +3656,15 @@ def train(
                         weights_only=True,
                         rebuild_tasks=True,
                     )
-            except Exception:
-                pass
+            except BaseException as exc:
+                if not _is_nonfatal_base_exception(exc):
+                    raise
+                logger.warning(
+                    "train cleanup: restore from %r skipped after failure (%s: %s)",
+                    str(restore_path),
+                    type(exc).__name__,
+                    str(exc),
+                )
         do_async = (
             str(os.environ.get("ENN_ASYNC_CLEANUP", "1") or "1")
             .strip()
@@ -3780,8 +3925,7 @@ def predict(
             with contextlib.suppress(Exception):
                 model.to("cpu")
             _clear_device_caches()
-            with _start_context():
-                elastic_launch(lc, process)(ops)
+            _elastic_launch_with_start_method_retry(lc, ops)
             chunks_dir = os.path.join(ckpt_dir, "pred_chunks")
             if not os.path.isdir(chunks_dir):
                 raise RuntimeError(
