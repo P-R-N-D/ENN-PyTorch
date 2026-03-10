@@ -6236,13 +6236,35 @@ def infer(
                     float("inf"),
                 )
             )
+            pred_posthoc_denorm_anchor_require_y_bounds = bool(
+                env_bool(
+                    "ENN_PRED_COLLAPSE_DENORM_ANCHOR_REQUIRE_Y_BOUNDS",
+                    default=True,
+                )
+            )
+            pred_posthoc_denorm_anchor_require_reference_in_bounds = bool(
+                env_bool(
+                    "ENN_PRED_COLLAPSE_DENORM_ANCHOR_REQUIRE_REFERENCE_IN_BOUNDS",
+                    default=True,
+                )
+            )
+            pred_posthoc_denorm_anchor_max_bounds_frac = float(
+                env_float(
+                    "ENN_PRED_COLLAPSE_DENORM_ANCHOR_MAX_BOUNDS_FRAC",
+                    0.25,
+                )
+            )
             pred_persist_raw_mode = bool(
                 env_bool("ENN_PRED_COLLAPSE_PERSIST_RAW_MODE", default=True)
             )
             pred_posthoc_calibrate_active = False
             pred_posthoc_denorm_only_active = False
             pred_posthoc_denorm_anchor_active = False
+            pred_posthoc_denorm_anchor_runtime_enabled = bool(
+                pred_posthoc_denorm_anchor_posthoc
+            )
             pred_posthoc_denorm_anchor_warned = False
+            pred_posthoc_denorm_anchor_skip_warned = False
             pred_force_raw_output = False
             pred_cg_strict_sync = bool(
                 env_bool(
@@ -7130,15 +7152,98 @@ def infer(
                     raise RuntimeError(
                         "infer: anchored denorm fallback feature width mismatch"
                     )
-                shift = post2.mean(dim=0, keepdim=True) - den2.mean(
-                    dim=0, keepdim=True
+                prefer_quantile_bounds = bool(
+                    env_bool(
+                        "ENN_OUTPUT_AB_SUSPICIOUS_Y_BOUNDS_USE_QUANTILE",
+                        default=True,
+                    )
                 )
+                clip_quantile_bounds = bool(
+                    env_bool(
+                        "ENN_OUTPUT_AB_SUSPICIOUS_Y_BOUNDS_CLIP_TO_MINMAX",
+                        default=True,
+                    )
+                )
+                sc = _get_pred_scaler()
+                clamp_y = getattr(sc, "clamp_y_bounds", None) if sc is not None else None
+                bounds_resolver = (
+                    getattr(sc, "_resolve_y_bounds_for_output", None)
+                    if sc is not None
+                    else None
+                )
+                resolved_y_bounds: tuple[torch.Tensor | None, torch.Tensor | None] | None = None
+                if callable(bounds_resolver):
+                    lo, hi = bounds_resolver(
+                        y_den.reshape(batch_n, -1).detach().to(
+                            device=raw_device,
+                            dtype=y_den.dtype,
+                        ),
+                        prefer_quantile=prefer_quantile_bounds,
+                        clip_quant_to_minmax=clip_quantile_bounds,
+                    )
+                    if lo is not None and hi is not None:
+                        resolved_y_bounds = (lo, hi)
+                if bool(pred_posthoc_denorm_anchor_require_y_bounds) and (
+                    resolved_y_bounds is None
+                ):
+                    raise RuntimeError(
+                        "infer: anchored denorm fallback requires finite Y-bounds"
+                    )
+                lo2_cpu = hi2_cpu = None
+                if resolved_y_bounds is not None:
+                    lo2, hi2 = resolved_y_bounds
+                    if lo2 is None or hi2 is None:
+                        resolved_y_bounds = None
+                    else:
+                        lo2_cpu = lo2.reshape(1, -1).to(device="cpu", dtype=torch.float32)
+                        hi2_cpu = hi2.reshape(1, -1).to(device="cpu", dtype=torch.float32)
+                post_center = post2.mean(dim=0, keepdim=True)
+                den_center = den2.mean(dim=0, keepdim=True)
+                if not bool(torch.isfinite(post_center).all().item()):
+                    raise RuntimeError(
+                        "infer: anchored denorm fallback got non-finite posthoc center"
+                    )
+                if (
+                    bool(pred_posthoc_denorm_anchor_require_reference_in_bounds)
+                    and lo2_cpu is not None
+                    and hi2_cpu is not None
+                ):
+                    clamp_atol = float(
+                        env_float(
+                            "ENN_OUTPUT_AB_SUSPICIOUS_Y_BOUNDS_ATOL",
+                            0.0,
+                        )
+                    )
+                    if clamp_atol > 0.0:
+                        outside_center = (post_center < (lo2_cpu - clamp_atol)) | (
+                            post_center > (hi2_cpu + clamp_atol)
+                        )
+                    else:
+                        outside_center = (post_center < lo2_cpu) | (post_center > hi2_cpu)
+                    if bool(outside_center.any().item()):
+                        raise RuntimeError(
+                            "infer: anchored denorm fallback rejected because posthoc center escapes Y-bounds"
+                        )
+                shift = post_center - den_center
                 max_shift = float(pred_posthoc_denorm_anchor_max_abs_shift)
                 if math.isfinite(max_shift):
                     if max_shift <= 0.0:
                         shift = torch.zeros_like(shift)
                     else:
                         shift = torch.clamp(shift, min=-max_shift, max=max_shift)
+                max_frac = float(pred_posthoc_denorm_anchor_max_bounds_frac)
+                if (
+                    resolved_y_bounds is not None
+                    and lo2_cpu is not None
+                    and hi2_cpu is not None
+                    and math.isfinite(max_frac)
+                ):
+                    if max_frac <= 0.0:
+                        shift = torch.zeros_like(shift)
+                    else:
+                        width = torch.clamp(hi2_cpu - lo2_cpu, min=0.0)
+                        frac_cap = width * max_frac
+                        shift = torch.maximum(torch.minimum(shift, frac_cap), -frac_cap)
                 y2 = den2 + shift
                 y_out = y2.to(device=raw_device, dtype=y_den.dtype).reshape(raw_shape)
                 if bool(
@@ -7147,21 +7252,7 @@ def infer(
                         default=True,
                     )
                 ):
-                    sc = _get_pred_scaler()
-                    (
-                        use_y_bounds_fallback,
-                        clamp_y,
-                        resolved_y_bounds,
-                        prefer_quantile_bounds,
-                        clip_quantile_bounds,
-                    ) = _resolve_posthoc_y_bounds_fallback(
-                        sc,
-                        pred_posthoc.reshape(batch_n, -1).detach().to(
-                            device=raw_device,
-                            dtype=y_den.dtype,
-                        ),
-                    )
-                    if bool(use_y_bounds_fallback) and callable(clamp_y):
+                    if resolved_y_bounds is not None and callable(clamp_y):
                         y_out = clamp_y(
                             y_out,
                             prefer_quantile=prefer_quantile_bounds,
@@ -7345,6 +7436,26 @@ def infer(
                     "std_max": float(std.max().item()) if int(std.numel()) > 0 else float("nan"),
                 }
 
+            def _disable_posthoc_denorm_anchor(
+                err: BaseException | None = None,
+                *,
+                log_message: str,
+            ) -> None:
+                nonlocal pred_posthoc_denorm_anchor_active, pred_posthoc_denorm_anchor_runtime_enabled, pred_posthoc_denorm_anchor_skip_warned
+                pred_posthoc_denorm_anchor_active = False
+                pred_posthoc_denorm_anchor_runtime_enabled = False
+                if not bool(pred_posthoc_denorm_anchor_skip_warned):
+                    pred_posthoc_denorm_anchor_skip_warned = True
+                    if err is None:
+                        _LOGGER.warning("%s", log_message)
+                    else:
+                        _LOGGER.warning(
+                            "%s (%s: %s).",
+                            log_message,
+                            type(err).__name__,
+                            str(err),
+                        )
+
             def _td_predict(
                 x: torch.Tensor,
                 *,
@@ -7352,7 +7463,7 @@ def infer(
                 use_uncompiled: bool | None = None,
                 force_fp32: bool = False,
             ) -> torch.Tensor:
-                nonlocal pred_posthoc_calibrate_active, pred_posthoc_denorm_only_active, pred_posthoc_denorm_anchor_active, pred_posthoc_denorm_anchor_warned, pred_force_raw_output
+                nonlocal pred_posthoc_calibrate_active, pred_posthoc_denorm_only_active, pred_posthoc_denorm_anchor_active, pred_posthoc_denorm_anchor_runtime_enabled, pred_posthoc_denorm_anchor_warned, pred_posthoc_denorm_anchor_skip_warned, pred_force_raw_output
                 uc = (
                     bool(force_uncompiled)
                     if use_uncompiled is None
@@ -7395,8 +7506,8 @@ def infer(
                         ):
                             with contextlib.suppress(Exception):
                                 out_post = out_post.contiguous()
-                        if bool(pred_posthoc_denorm_anchor_posthoc) and str(raw_output_space) == "z":
-                            with contextlib.suppress(Exception):
+                        if bool(pred_posthoc_denorm_anchor_runtime_enabled) and str(raw_output_space) == "z":
+                            try:
                                 out_cal = _posthoc_calibrate_prediction(
                                     out_raw,
                                     prefer_cpu=bool(pred_posthoc_prefer_cpu),
@@ -7414,6 +7525,11 @@ def infer(
                                         _LOGGER.warning(
                                             "[infer] using denorm-only output scaling anchored to posthoc-calibrated center for remaining prediction microbatches."
                                         )
+                            except Exception as e_anchor:
+                                _disable_posthoc_denorm_anchor(
+                                    e_anchor,
+                                    log_message="[infer] skipping anchored denorm-only persistence and keeping plain denorm-only scaling; disabling future anchor attempts",
+                                )
                         else:
                             pred_posthoc_denorm_anchor_active = False
                         return out_post.detach()
@@ -7826,6 +7942,7 @@ def infer(
                                         "pred_posthoc_denorm_only_active": bool(pred_posthoc_denorm_only_active),
                                         "pred_posthoc_denorm_anchor_active": bool(pred_posthoc_denorm_anchor_active),
                                         "pred_posthoc_denorm_anchor_posthoc": bool(pred_posthoc_denorm_anchor_posthoc),
+                                        "pred_posthoc_denorm_anchor_runtime_enabled": bool(pred_posthoc_denorm_anchor_runtime_enabled),
                                         "pred_force_raw_output": bool(pred_force_raw_output),
                                         "pred_posthoc_reject_low_diversity": bool(pred_posthoc_reject_low_diversity),
                                         "pred_posthoc_reject_partial_like": bool(pred_posthoc_reject_partial_like),
@@ -9563,7 +9680,7 @@ def infer(
                                                     if (
                                                         isinstance(preds_fix2_denorm, torch.Tensor)
                                                         and bool(preds_fix2_denorm_ok)
-                                                        and bool(pred_posthoc_denorm_anchor_posthoc)
+                                                        and bool(pred_posthoc_denorm_anchor_runtime_enabled)
                                                         and isinstance(preds_fix2_post, torch.Tensor)
                                                         and str(_get_pred_raw_output_space() or "z") == "z"
                                                         and (
@@ -9579,11 +9696,9 @@ def infer(
                                                             )
                                                             pred_posthoc_denorm_anchor_active = True
                                                         except Exception as e:
-                                                            pred_posthoc_denorm_anchor_active = False
-                                                            _LOGGER.warning(
-                                                                "[infer] anchored denorm-only fallback failed (%s: %s); keeping plain denorm-only scaling for this batch.",
-                                                                type(e).__name__,
-                                                                str(e),
+                                                            _disable_posthoc_denorm_anchor(
+                                                                e,
+                                                                log_message="[infer] anchored denorm-only fallback failed; keeping plain denorm-only scaling for this batch and disabling future anchor attempts",
                                                             )
                                                     else:
                                                         pred_posthoc_denorm_anchor_active = False
