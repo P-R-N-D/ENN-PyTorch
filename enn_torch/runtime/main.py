@@ -5742,10 +5742,15 @@ def infer(
                 details: dict[str, object] = {}
                 if not isinstance(diag, dict):
                     return "unknown", details
-                atol = max(
-                    _collapse_triage_safe_float(diag.get("atol", 1e-6)),
-                    1e-6,
-                )
+                atol_raw = diag.get("atol", None)
+                if atol_raw is None:
+                    atol_raw = diag.get("broadcast_atol", 1e-6)
+                atol = _collapse_triage_safe_float(atol_raw)
+                if (not math.isfinite(atol)) or (float(atol) <= 0.0):
+                    atol = _collapse_triage_safe_float(
+                        diag.get("broadcast_atol", diag.get("atol", 1e-6))
+                    )
+                atol = max(float(atol), 1e-6)
                 x_diff = abs(_collapse_triage_safe_float(diag.get("x_diff", float("nan"))))
                 y_cal = abs(
                     _collapse_triage_safe_float(
