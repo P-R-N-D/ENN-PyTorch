@@ -6283,6 +6283,20 @@ def infer(
             pred_force_raw_output = False
             pred_raw_z_last_resort_denorm_warned = False
             pred_raw_z_last_resort_denorm_failed_warned = False
+            pred_concise_log = bool(env_bool("ENN_PRED_CONCISE_LOG", default=True))
+            pred_concise_log_summary = bool(
+                env_bool("ENN_PRED_CONCISE_LOG_SUMMARY", default=True)
+            )
+            pred_concise_log_keep_first = max(
+                0, int(env_int("ENN_PRED_CONCISE_LOG_KEEP_FIRST", 0) or 0)
+            )
+            pred_concise_log_sanity = bool(
+                env_bool("ENN_PRED_CONCISE_LOG_SANITY", default=False)
+            )
+            pred_concise_log_counts: dict[str, int] = {}
+            pred_concise_log_labels: dict[str, str] = {}
+            pred_concise_log_order: list[str] = []
+            pred_concise_log_shown: dict[str, int] = {}
             pred_cg_strict_sync = bool(
                 env_bool(
                     "ENN_PRED_CUDAGRAPH_STRICT_SYNC",
@@ -6304,6 +6318,63 @@ def infer(
                     cand = getattr(torch_dynamo, "disable", None)
                     if callable(cand) and getattr(cand, "__name__", "") == "disable":
                         _pred_disable_decorator = cand
+
+            def _pred_log_warning(
+                key: str,
+                label: str,
+                msg: str,
+                *args: object,
+                suppress_in_concise: bool = False,
+                include_in_summary: bool = True,
+            ) -> None:
+                if bool(include_in_summary):
+                    if key not in pred_concise_log_counts:
+                        pred_concise_log_order.append(key)
+                    pred_concise_log_counts[key] = int(
+                        pred_concise_log_counts.get(key, 0) or 0
+                    ) + 1
+                    pred_concise_log_labels[key] = str(label or key)
+                shown = int(pred_concise_log_shown.get(key, 0) or 0)
+                if bool(pred_concise_log) and bool(suppress_in_concise) and shown >= int(
+                    pred_concise_log_keep_first
+                ):
+                    return
+                _LOGGER.warning(msg, *args)
+                pred_concise_log_shown[key] = shown + 1
+
+            def _infer_pred_mode_label() -> str:
+                if bool(pred_posthoc_calibrate_active):
+                    return "posthoc_persisted"
+                if bool(pred_posthoc_denorm_only_active):
+                    if bool(pred_posthoc_denorm_anchor_active):
+                        return "denorm_anchor_persisted"
+                    return "denorm_only_persisted"
+                if bool(pred_force_raw_output):
+                    return f"raw_{str(_get_pred_raw_output_space() or 'z')}_persisted"
+                return "direct"
+
+            def _emit_pred_concise_summary() -> None:
+                if (not bool(pred_concise_log)) or (not bool(pred_concise_log_summary)):
+                    return
+                items: list[str] = []
+                for key in pred_concise_log_order:
+                    count = int(pred_concise_log_counts.get(key, 0) or 0)
+                    if count <= 0:
+                        continue
+                    label = str(pred_concise_log_labels.get(key, key) or key)
+                    items.append(f"{label}={count}")
+                if not items:
+                    return
+                shown_items = items[:10]
+                extra = max(0, len(items) - len(shown_items))
+                msg_summary = ", ".join(shown_items)
+                if extra > 0:
+                    msg_summary = f"{msg_summary}, +{extra} more"
+                _LOGGER.warning(
+                    "[infer] concise summary: final_mode=%s, %s",
+                    _infer_pred_mode_label(),
+                    msg_summary,
+                )
 
             def _select_pred_model(use_uncompiled: bool) -> torch.nn.Module:
                 if bool(use_uncompiled) and bool(pred_uncompiled_available):
@@ -7464,13 +7535,22 @@ def infer(
                 if not bool(pred_posthoc_denorm_anchor_skip_warned):
                     pred_posthoc_denorm_anchor_skip_warned = True
                     if err is None:
-                        _LOGGER.warning("%s", log_message)
+                        _pred_log_warning(
+                            "denorm_anchor_disabled",
+                            "denorm_anchor_disabled",
+                            "%s",
+                            log_message,
+                            suppress_in_concise=True,
+                        )
                     else:
-                        _LOGGER.warning(
+                        _pred_log_warning(
+                            "denorm_anchor_disabled",
+                            "denorm_anchor_disabled",
                             "%s (%s: %s).",
                             log_message,
                             type(err).__name__,
                             str(err),
+                            suppress_in_concise=True,
                         )
 
             def _td_predict(
@@ -9482,7 +9562,9 @@ def infer(
                                                                 "y_max", float("nan")
                                                             )
                                                         )
-                                                        _LOGGER.warning(
+                                                        _pred_log_warning(
+                                                            "sanity_raw_output",
+                                                            "sanity_raw_output",
                                                             "[infer] calibrate_output=False sanity (this batch only): max|Y0-Y%d|=%.6g match_frac=%.5f rel_mean=%.3e",
                                                             int(pair_i_raw),
                                                             float(dy2),
@@ -9498,6 +9580,8 @@ def infer(
                                                                     float("nan"),
                                                                 )
                                                             ),
+                                                            suppress_in_concise=True,
+                                                            include_in_summary=bool(pred_concise_log_sanity),
                                                         )
                                                         preds_fix2_raw_ok = not bool(
                                                             is_like_raw
@@ -9576,12 +9660,16 @@ def infer(
                                                                             quantum=float(pred_posthoc_coarse_quantum),
                                                                         )
                                                                         coarse_lowdiv_post = bool(_is_low_diversity_stats(coarse_stats_post))
-                                                                _LOGGER.warning(
+                                                                _pred_log_warning(
+                                                                    "sanity_posthoc_calibrated",
+                                                                    "sanity_posthoc_calibrated",
                                                                     "[infer] posthoc-calibrated sanity (this batch only): max|Y0-Y%d|=%.6g match_frac=%.5f rel_mean=%.3e",
                                                                     int(pair_i_post),
                                                                     float(dy_post),
                                                                     float(mf_post),
                                                                     float(st_post.get("y_rel_mean", float("nan"))),
+                                                                    suppress_in_concise=True,
+                                                                    include_in_summary=bool(pred_concise_log_sanity),
                                                                 )
                                                                 preds_fix2_post_ok = (not bool(is_like_post))
                                                                 if bool(pred_posthoc_reject_partial_like) and bool(partial_like_post):
@@ -9591,23 +9679,32 @@ def infer(
                                                                 ):
                                                                     preds_fix2_post_ok = False
                                                                 if bool(partial_like_post):
-                                                                    _LOGGER.warning(
-                                                                        "[infer] posthoc calibration remained partial-broadcast-like; trying denorm-only fallback before using raw outputs."
+                                                                    _pred_log_warning(
+                                                                        "posthoc_partial_broadcast",
+                                                                        "posthoc_partial_broadcast",
+                                                                        "[infer] posthoc calibration remained partial-broadcast-like; trying denorm-only fallback before using raw outputs.",
+                                                                        suppress_in_concise=True,
                                                                     )
                                                                 if bool(lowdiv_like_post):
-                                                                    _LOGGER.warning(
+                                                                    _pred_log_warning(
+                                                                        "posthoc_low_diversity",
+                                                                        "posthoc_low_diversity",
                                                                         "[infer] posthoc calibration remained low-diversity (uniq<=2 frac=%.5f, uniq<=3 frac=%.5f, std_p50=%.6g); trying denorm-only fallback before using raw outputs.",
                                                                         float((lowdiv_stats_post or {}).get("uniq_le2_frac", float("nan"))),
                                                                         float((lowdiv_stats_post or {}).get("uniq_le3_frac", float("nan"))),
                                                                         float((lowdiv_stats_post or {}).get("std_p50", float("nan"))),
+                                                                        suppress_in_concise=True,
                                                                     )
                                                                 if bool(coarse_lowdiv_post):
-                                                                    _LOGGER.warning(
+                                                                    _pred_log_warning(
+                                                                        "posthoc_coarse_low_diversity",
+                                                                        "posthoc_coarse_low_diversity",
                                                                         "[infer] posthoc calibration remained coarse low-diversity at quantum=%.6g (uniq<=2 frac=%.5f, uniq<=3 frac=%.5f, std_p50=%.6g); trying denorm-only fallback before using raw outputs.",
                                                                         float((coarse_stats_post or {}).get("quantum", float(pred_posthoc_coarse_quantum))),
                                                                         float((coarse_stats_post or {}).get("uniq_le2_frac", float("nan"))),
                                                                         float((coarse_stats_post or {}).get("uniq_le3_frac", float("nan"))),
                                                                         float((coarse_stats_post or {}).get("std_p50", float("nan"))),
+                                                                        suppress_in_concise=True,
                                                                     )
                                                                 posthoc_reactivity_compressed = False
                                                                 if bool(pred_posthoc_reject_reactivity_compression):
@@ -9647,23 +9744,32 @@ def infer(
                                                                             ):
                                                                                 preds_fix2_post_ok = False
                                                                                 posthoc_reactivity_compressed = True
-                                                                                _LOGGER.warning(
+                                                                                _pred_log_warning(
+                                                                                    "posthoc_reactivity_compression",
+                                                                                    "posthoc_reactivity_compression",
                                                                                     "[infer] posthoc calibration remained overly compressed vs raw-denorm signal (reactivity ratio p50=%.5f, p10=%.5f, frac<0.25=%.5f); trying denorm-only fallback before using raw outputs.",
                                                                                     float((react_stats_post or {}).get("ratio_p50", float("nan"))),
                                                                                     float((react_stats_post or {}).get("ratio_p10", float("nan"))),
                                                                                     float((react_stats_post or {}).get("ratio_lt_0.25_frac", float("nan"))),
+                                                                                    suppress_in_concise=True,
                                                                                 )
                                                                     except Exception as e:
-                                                                        _LOGGER.warning(
+                                                                        _pred_log_warning(
+                                                                            "posthoc_reactivity_probe_failed",
+                                                                            "posthoc_reactivity_probe_failed",
                                                                             "[infer] posthoc reactivity-compression probe failed (%s: %s); ignoring that check for this batch.",
                                                                             type(e).__name__,
                                                                             str(e),
+                                                                            suppress_in_concise=True,
                                                                         )
                                                         except Exception as e:
-                                                            _LOGGER.warning(
+                                                            _pred_log_warning(
+                                                                "posthoc_fallback_failed",
+                                                                "posthoc_fallback_failed",
                                                                 "[infer] posthoc calibration after raw-collapse fallback failed (%s: %s); trying denorm-only fallback before raw outputs.",
                                                                 type(e).__name__,
                                                                 str(e),
+                                                                suppress_in_concise=True,
                                                             )
                                                             preds_fix2_post = None
                                                             preds_fix2_post_ok = False
@@ -9733,12 +9839,16 @@ def infer(
                                                                             quantum=float(pred_posthoc_coarse_quantum),
                                                                         )
                                                                         coarse_lowdiv_den = bool(_is_low_diversity_stats(coarse_stats_den))
-                                                                _LOGGER.warning(
+                                                                _pred_log_warning(
+                                                                    "sanity_denorm_only",
+                                                                    "sanity_denorm_only",
                                                                     "[infer] denorm-only sanity (this batch only): max|Y0-Y%d|=%.6g match_frac=%.5f rel_mean=%.3e",
                                                                     int(pair_i_den),
                                                                     float(dy_den),
                                                                     float(mf_den),
                                                                     float(st_den.get("y_rel_mean", float("nan"))),
+                                                                    suppress_in_concise=True,
+                                                                    include_in_summary=bool(pred_concise_log_sanity),
                                                                 )
                                                                 preds_fix2_denorm_ok = (not bool(is_like_den))
                                                                 if bool(pred_posthoc_reject_partial_like) and bool(partial_like_den):
@@ -9748,12 +9858,15 @@ def infer(
                                                                 ):
                                                                     preds_fix2_denorm_ok = False
                                                                 if bool(coarse_lowdiv_den):
-                                                                    _LOGGER.warning(
+                                                                    _pred_log_warning(
+                                                                        "denorm_coarse_low_diversity",
+                                                                        "denorm_coarse_low_diversity",
                                                                         "[infer] denorm-only fallback remained coarse low-diversity at quantum=%.6g (uniq<=2 frac=%.5f, uniq<=3 frac=%.5f, std_p50=%.6g); using raw outputs instead.",
                                                                         float((coarse_stats_den or {}).get("quantum", float(pred_posthoc_coarse_quantum))),
                                                                         float((coarse_stats_den or {}).get("uniq_le2_frac", float("nan"))),
                                                                         float((coarse_stats_den or {}).get("uniq_le3_frac", float("nan"))),
                                                                         float((coarse_stats_den or {}).get("std_p50", float("nan"))),
+                                                                        suppress_in_concise=True,
                                                                     )
                                                         except Exception as e:
                                                             pred_raw_z_last_resort_denorm_runtime_enabled = False
@@ -9873,8 +9986,11 @@ def infer(
                                                             "[infer] using calibrate_output=False per-sample predictions for output of this batch."
                                                         )
                                                     if preds_fix2_post is not None and (not bool(preds_fix2_post_ok)):
-                                                        _LOGGER.warning(
-                                                            "[infer] posthoc calibration was rejected after sanity checks; current batch did not keep that calibrated output."
+                                                        _pred_log_warning(
+                                                            "posthoc_rejected",
+                                                            "posthoc_rejected",
+                                                            "[infer] posthoc calibration was rejected after sanity checks; current batch did not keep that calibrated output.",
+                                                            suppress_in_concise=True,
                                                         )
                                                     if preds_fix2 is not None:
                                                         with contextlib.suppress(
@@ -9961,6 +10077,8 @@ def infer(
                 raise RuntimeError("infer: prediction writer encountered an error")
         if status_bar is not None:
             status_bar.close()
+        with contextlib.suppress(Exception):
+            _emit_pred_concise_summary()
         if exc_type is None:
             with contextlib.suppress(Exception):
                 done_path = os.path.join(str(chunk_dir), f".rankdone.{int(rank):06d}")
