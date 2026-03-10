@@ -6197,6 +6197,33 @@ def infer(
                     default=True,
                 )
             )
+            pred_posthoc_coarse_quantum = float(
+                env_float("ENN_PRED_COLLAPSE_POSTHOC_COARSE_QUANTUM", 1e-2)
+            )
+            pred_posthoc_detect_coarse_low_diversity = bool(
+                env_bool(
+                    "ENN_PRED_COLLAPSE_POSTHOC_DETECT_COARSE_LOW_DIVERSITY",
+                    default=bool(detect_low_diversity),
+                )
+            )
+            pred_posthoc_use_suspicious_y_bounds = bool(
+                env_bool(
+                    "ENN_PRED_COLLAPSE_POSTHOC_USE_SUSPICIOUS_Y_BOUNDS",
+                    default=True,
+                )
+            )
+            pred_posthoc_reject_reactivity_compression = bool(
+                env_bool(
+                    "ENN_PRED_COLLAPSE_POSTHOC_REJECT_REACTIVITY_COMPRESSION",
+                    default=True,
+                )
+            )
+            pred_posthoc_min_reactivity_ratio = float(
+                env_float(
+                    "ENN_PRED_COLLAPSE_POSTHOC_MIN_REACTIVITY_RATIO",
+                    0.15,
+                )
+            )
             pred_persist_raw_mode = bool(
                 env_bool("ENN_PRED_COLLAPSE_PERSIST_RAW_MODE", default=True)
             )
@@ -6570,6 +6597,155 @@ def infer(
                 _pred_raw_output_space_source_cache = "default:z"
                 return "z"
 
+            def _resolve_posthoc_y_bounds_fallback(
+                sc: object,
+                ref_tensor: torch.Tensor,
+            ) -> tuple[
+                bool,
+                object | None,
+                tuple[torch.Tensor | None, torch.Tensor | None] | None,
+                bool,
+                bool,
+            ]:
+                prefer_quantile_bounds = bool(
+                    env_bool(
+                        "ENN_OUTPUT_AB_SUSPICIOUS_Y_BOUNDS_USE_QUANTILE",
+                        default=True,
+                    )
+                )
+                clip_quantile_bounds = bool(
+                    env_bool(
+                        "ENN_OUTPUT_AB_SUSPICIOUS_Y_BOUNDS_CLIP_TO_MINMAX",
+                        default=True,
+                    )
+                )
+                clamp_y = getattr(sc, "clamp_y_bounds", None) if sc is not None else None
+                use_fallback = bool(
+                    bool(pred_posthoc_use_suspicious_y_bounds)
+                    and env_bool("ENN_OUTPUT_AB_SUSPICIOUS_USE_Y_BOUNDS", default=True)
+                    and bool(getattr(sc, "_output_ab_clip_only", False))
+                    and callable(clamp_y)
+                )
+                resolved_y_bounds: tuple[
+                    torch.Tensor | None, torch.Tensor | None
+                ] | None = None
+                if bool(use_fallback):
+                    bounds_resolver = (
+                        getattr(sc, "_resolve_y_bounds_for_output", None)
+                        if sc is not None
+                        else None
+                    )
+                    if callable(bounds_resolver):
+                        lo, hi = bounds_resolver(
+                            ref_tensor,
+                            prefer_quantile=prefer_quantile_bounds,
+                            clip_quant_to_minmax=clip_quantile_bounds,
+                        )
+                        if lo is not None and hi is not None:
+                            resolved_y_bounds = (lo, hi)
+                        else:
+                            use_fallback = False
+                    else:
+                        use_fallback = False
+                return (
+                    bool(use_fallback),
+                    clamp_y,
+                    resolved_y_bounds,
+                    prefer_quantile_bounds,
+                    clip_quantile_bounds,
+                )
+
+            def _validate_posthoc_y_bounds_output(
+                y_out: torch.Tensor,
+                resolved_bounds: tuple[torch.Tensor | None, torch.Tensor | None] | None,
+            ) -> None:
+                if not isinstance(y_out, torch.Tensor):
+                    raise RuntimeError(
+                        "infer: expected tensor output for Y-bounds validation"
+                    )
+                if not bool(torch.isfinite(y_out).all().item()):
+                    raise RuntimeError("non-finite output after Y-bounds clamp")
+                if resolved_bounds is None:
+                    return
+                lo_chk, hi_chk = resolved_bounds
+                if lo_chk is None or hi_chk is None:
+                    return
+                pred_chk = y_out.reshape(int(y_out.shape[0]), -1).to(
+                    device=lo_chk.device,
+                    dtype=lo_chk.dtype,
+                )
+                lo_chk2 = lo_chk.reshape(1, -1)
+                hi_chk2 = hi_chk.reshape(1, -1)
+                clamp_atol = float(
+                    env_float(
+                        "ENN_OUTPUT_AB_SUSPICIOUS_Y_BOUNDS_ATOL",
+                        0.0,
+                    )
+                )
+                if clamp_atol > 0.0:
+                    outside = (pred_chk < (lo_chk2 - clamp_atol)) | (
+                        pred_chk > (hi_chk2 + clamp_atol)
+                    )
+                else:
+                    outside = (pred_chk < lo_chk2) | (pred_chk > hi_chk2)
+                if bool(outside.any().item()):
+                    raise RuntimeError(
+                        "Y-bounds fallback output escaped resolved bounds"
+                    )
+
+            def _reactivity_ratio_probe_stats(
+                candidate_y: torch.Tensor,
+                reference_y: torch.Tensor,
+                *,
+                sample_max: int,
+            ) -> dict[str, float]:
+                if (not isinstance(candidate_y, torch.Tensor)) or (
+                    not isinstance(reference_y, torch.Tensor)
+                ):
+                    return {}
+                n = int(
+                    min(
+                        int(getattr(candidate_y, "shape", (0,))[0] or 0),
+                        int(getattr(reference_y, "shape", (0,))[0] or 0),
+                    )
+                )
+                if n <= 1:
+                    return {}
+                if int(sample_max) > 0:
+                    n = min(n, int(sample_max))
+                if n <= 1:
+                    return {}
+                cand = candidate_y[:n].detach().reshape(n, -1).to(
+                    device="cpu",
+                    dtype=torch.float32,
+                )
+                ref = reference_y[:n].detach().reshape(n, -1).to(
+                    device="cpu",
+                    dtype=torch.float32,
+                )
+                cstd = cand.std(dim=0, unbiased=False)
+                rstd = ref.std(dim=0, unbiased=False)
+                mask = torch.isfinite(cstd) & torch.isfinite(rstd) & (
+                    rstd > float(broadcast_atol)
+                )
+                if not bool(mask.any().item()):
+                    return {}
+                ratios = (cstd[mask] / rstd[mask]).detach().cpu()
+                if int(ratios.numel()) <= 0:
+                    return {}
+                return {
+                    "ratio_p10": float(torch.quantile(ratios, 0.10).item()),
+                    "ratio_p50": float(torch.quantile(ratios, 0.50).item()),
+                    "ratio_p90": float(torch.quantile(ratios, 0.90).item()),
+                    "ratio_lt_0.10_frac": float(
+                        (ratios < 0.10).to(dtype=torch.float32).mean().item()
+                    ),
+                    "ratio_lt_0.25_frac": float(
+                        (ratios < 0.25).to(dtype=torch.float32).mean().item()
+                    ),
+                    "feature_n": float(int(ratios.numel())),
+                }
+
             def _posthoc_calibrate_prediction(
                 pred_raw: torch.Tensor,
                 *,
@@ -6684,8 +6860,94 @@ def infer(
                                 if str(space) == "y":
                                     z_in = norm(x_work)
                                 z_in = _ensure_2d_features(z_in, name="posthoc input")
-                                z_cal = cal(z_in)
-                                y_out = denorm(z_cal)
+                                (
+                                    use_y_bounds_fallback,
+                                    clamp_y,
+                                    resolved_y_bounds,
+                                    prefer_quantile_bounds,
+                                    clip_quantile_bounds,
+                                ) = _resolve_posthoc_y_bounds_fallback(sc, z_in)
+                                if bool(use_y_bounds_fallback):
+                                    try:
+                                        z_cal = cal(z_in, apply_output_ab=False)
+                                        y_out = denorm(z_cal)
+                                        y_out = _ensure_2d_features(y_out, name="calibrated")
+                                        y_out = y_out.reshape(raw_shape)
+                                        if callable(clamp_y):
+                                            y_out = clamp_y(
+                                                y_out,
+                                                prefer_quantile=prefer_quantile_bounds,
+                                                clip_quant_to_minmax=clip_quantile_bounds,
+                                                resolved_bounds=resolved_y_bounds,
+                                            )
+                                        _validate_posthoc_y_bounds_output(
+                                            y_out,
+                                            resolved_y_bounds,
+                                        )
+                                        if env_bool("ENN_OUTPUT_AB_SUSPICIOUS_LOG", default=True) and (
+                                            not bool(
+                                                getattr(
+                                                    sc,
+                                                    "_pred_posthoc_output_ab_suspicious_warned",
+                                                    False,
+                                                )
+                                            )
+                                        ):
+                                            setattr(
+                                                sc,
+                                                "_pred_posthoc_output_ab_suspicious_warned",
+                                                True,
+                                            )
+                                            _LOGGER.warning(
+                                                "[infer] posthoc calibration detected suspicious output_ab clip-only; using calibrate(apply_output_ab=False)+Y-bounds clamp."
+                                            )
+                                    except Exception as e_yb:
+                                        if env_bool("ENN_OUTPUT_AB_SUSPICIOUS_LOG", default=True) and (
+                                            not bool(
+                                                getattr(
+                                                    sc,
+                                                    "_pred_posthoc_output_ab_suspicious_fallback_warned",
+                                                    False,
+                                                )
+                                            )
+                                        ):
+                                            setattr(
+                                                sc,
+                                                "_pred_posthoc_output_ab_suspicious_fallback_warned",
+                                                True,
+                                            )
+                                            _LOGGER.warning(
+                                                "[infer] posthoc calibration Y-bounds fallback failed (%s: %s); using default calibrate path.",
+                                                type(e_yb).__name__,
+                                                str(e_yb),
+                                            )
+                                        z_cal = cal(z_in)
+                                        y_out = denorm(z_cal)
+                                else:
+                                    if bool(pred_posthoc_use_suspicious_y_bounds) and bool(
+                                        getattr(sc, "_output_ab_clip_only", False)
+                                    ) and env_bool(
+                                        "ENN_OUTPUT_AB_SUSPICIOUS_LOG",
+                                        default=True,
+                                    ) and (
+                                        not bool(
+                                            getattr(
+                                                sc,
+                                                "_pred_posthoc_output_ab_suspicious_unbounded_warned",
+                                                False,
+                                            )
+                                        )
+                                    ):
+                                        setattr(
+                                            sc,
+                                            "_pred_posthoc_output_ab_suspicious_unbounded_warned",
+                                            True,
+                                        )
+                                        _LOGGER.warning(
+                                            "[infer] posthoc calibration sees suspicious output_ab clip-only but Y-bounds are unavailable/non-finite; using default calibrate path."
+                                        )
+                                    z_cal = cal(z_in)
+                                    y_out = denorm(z_cal)
                         y_out = _ensure_2d_features(y_out, name="calibrated")
                         y_out = y_out.reshape(raw_shape)
                         if str(getattr(y_out, "device", "")) != str(raw_device):
@@ -6778,6 +7040,30 @@ def infer(
                         "infer: unexpected denormalized feature width"
                     )
                 y_out = y2.reshape(raw_shape)
+                if bool(
+                    env_bool(
+                        "ENN_PRED_COLLAPSE_DENORM_ONLY_CLAMP_Y_BOUNDS",
+                        default=True,
+                    )
+                ):
+                    (
+                        use_y_bounds_fallback,
+                        clamp_y,
+                        resolved_y_bounds,
+                        prefer_quantile_bounds,
+                        clip_quantile_bounds,
+                    ) = _resolve_posthoc_y_bounds_fallback(sc, x_work)
+                    if bool(use_y_bounds_fallback) and callable(clamp_y):
+                        y_out = clamp_y(
+                            y_out,
+                            prefer_quantile=prefer_quantile_bounds,
+                            clip_quant_to_minmax=clip_quantile_bounds,
+                            resolved_bounds=resolved_y_bounds,
+                        )
+                        _validate_posthoc_y_bounds_output(
+                            y_out,
+                            resolved_y_bounds,
+                        )
                 if str(getattr(y_out, "device", "")) != str(raw_device):
                     y_out = y_out.to(device=raw_device, non_blocking=False)
                 return y_out.detach()
@@ -6894,6 +7180,64 @@ def infer(
                 ):
                     return True
                 return False
+
+            def _quantized_low_diversity_probe_stats(
+                preds_now: torch.Tensor,
+                *,
+                probe_k: int,
+                sample_max: int,
+                quantum: float,
+            ) -> dict[str, float]:
+                q = float(quantum)
+                if (not isinstance(preds_now, torch.Tensor)) or (not math.isfinite(q)) or q <= 0.0:
+                    return {}
+                n_now = int(getattr(preds_now, "shape", (0,))[0] or 0)
+                k_now = int(max(0, min(int(probe_k), int(n_now))))
+                if k_now < 2:
+                    return {}
+                work = preds_now[:k_now].detach()
+                if work.ndim <= 1:
+                    work = work.reshape(k_now, 1)
+                else:
+                    work = work.reshape(k_now, -1)
+                cols = int(getattr(work, "shape", (0, 0))[1] or 0)
+                if cols <= 0:
+                    return {}
+                if int(sample_max) > 0 and cols > int(sample_max):
+                    idx = torch.arange(
+                        int(sample_max), device=work.device, dtype=torch.long
+                    )
+                    idx = (idx * max(0, cols - 1)) // max(1, int(sample_max) - 1)
+                    work = work.index_select(1, idx)
+                    cols = int(getattr(work, "shape", (0, 0))[1] or 0)
+                if work.dtype in (torch.float16, torch.bfloat16):
+                    work = work.to(dtype=torch.float32)
+                elif not work.is_floating_point():
+                    work = work.to(dtype=torch.float32)
+                with contextlib.suppress(Exception):
+                    work = torch.where(torch.isfinite(work), work, torch.zeros_like(work))
+                q_t = work.new_tensor(float(q))
+                work_q = torch.round(work / q_t)
+                sorted_vals, _ = torch.sort(work_q, dim=0)
+                if int(k_now) <= 1:
+                    distinct = torch.ones((cols,), device=work.device, dtype=torch.int32)
+                else:
+                    gaps = sorted_vals[1:] != sorted_vals[:-1]
+                    distinct = 1 + gaps.to(dtype=torch.int32).sum(dim=0)
+                distinct_f = distinct.to(dtype=torch.float32)
+                std = work.std(dim=0, unbiased=False)
+                return {
+                    "probe_k": float(k_now),
+                    "sample_n": float(cols),
+                    "quantum": float(q),
+                    "uniq_le1_frac": float((distinct_f <= 1).to(dtype=torch.float32).mean().item()),
+                    "uniq_le2_frac": float((distinct_f <= 2).to(dtype=torch.float32).mean().item()),
+                    "uniq_le3_frac": float((distinct_f <= 3).to(dtype=torch.float32).mean().item()),
+                    "std_p50": float(torch.quantile(std, 0.50).item()) if int(std.numel()) > 0 else float("nan"),
+                    "std_p90": float(torch.quantile(std, 0.90).item()) if int(std.numel()) > 0 else float("nan"),
+                    "std_p99": float(torch.quantile(std, 0.99).item()) if int(std.numel()) > 0 else float("nan"),
+                    "std_max": float(std.max().item()) if int(std.numel()) > 0 else float("nan"),
+                }
 
             def _td_predict(
                 x: torch.Tensor,
@@ -7354,6 +7698,12 @@ def infer(
                                         "pred_force_raw_output": bool(pred_force_raw_output),
                                         "pred_posthoc_reject_low_diversity": bool(pred_posthoc_reject_low_diversity),
                                         "pred_posthoc_reject_partial_like": bool(pred_posthoc_reject_partial_like),
+                                        "pred_posthoc_detect_coarse_low_diversity": bool(
+                                            pred_posthoc_detect_coarse_low_diversity
+                                        ),
+                                        "pred_posthoc_coarse_quantum": float(
+                                            pred_posthoc_coarse_quantum
+                                        ),
                                         "pred_detect_low_diversity": bool(detect_low_diversity),
                                         "pred_low_diversity_default": bool(_low_diversity_default),
                                         "pred_low_diversity_force_single": bool(low_diversity_force_single),
@@ -8876,6 +9226,8 @@ def infer(
                                                                 )
                                                                 lowdiv_like_post = False
                                                                 lowdiv_stats_post: dict[str, float] | None = None
+                                                                coarse_lowdiv_post = False
+                                                                coarse_stats_post: dict[str, float] | None = None
                                                                 with contextlib.suppress(Exception):
                                                                     if bool(detect_low_diversity):
                                                                         lowdiv_stats_post = _low_diversity_probe_stats(
@@ -8885,6 +9237,15 @@ def infer(
                                                                             sample_max=int(low_diversity_sample_max),
                                                                         )
                                                                         lowdiv_like_post = bool(_is_low_diversity_stats(lowdiv_stats_post))
+                                                                with contextlib.suppress(Exception):
+                                                                    if bool(pred_posthoc_detect_coarse_low_diversity) and float(pred_posthoc_coarse_quantum) > 0.0:
+                                                                        coarse_stats_post = _quantized_low_diversity_probe_stats(
+                                                                            preds_fix2_post,
+                                                                            probe_k=int(min(int(low_diversity_probe_k), int(getattr(preds_fix2_post, "shape", (0,))[0] or 0))),
+                                                                            sample_max=int(low_diversity_sample_max),
+                                                                            quantum=float(pred_posthoc_coarse_quantum),
+                                                                        )
+                                                                        coarse_lowdiv_post = bool(_is_low_diversity_stats(coarse_stats_post))
                                                                 _LOGGER.warning(
                                                                     "[infer] posthoc-calibrated sanity (this batch only): max|Y0-Y%d|=%.6g match_frac=%.5f rel_mean=%.3e",
                                                                     int(pair_i_post),
@@ -8895,7 +9256,9 @@ def infer(
                                                                 preds_fix2_post_ok = (not bool(is_like_post))
                                                                 if bool(pred_posthoc_reject_partial_like) and bool(partial_like_post):
                                                                     preds_fix2_post_ok = False
-                                                                if bool(pred_posthoc_reject_low_diversity) and bool(lowdiv_like_post):
+                                                                if bool(pred_posthoc_reject_low_diversity) and (
+                                                                    bool(lowdiv_like_post) or bool(coarse_lowdiv_post)
+                                                                ):
                                                                     preds_fix2_post_ok = False
                                                                 if bool(partial_like_post):
                                                                     _LOGGER.warning(
@@ -8908,6 +9271,62 @@ def infer(
                                                                         float((lowdiv_stats_post or {}).get("uniq_le3_frac", float("nan"))),
                                                                         float((lowdiv_stats_post or {}).get("std_p50", float("nan"))),
                                                                     )
+                                                                if bool(coarse_lowdiv_post):
+                                                                    _LOGGER.warning(
+                                                                        "[infer] posthoc calibration remained coarse low-diversity at quantum=%.6g (uniq<=2 frac=%.5f, uniq<=3 frac=%.5f, std_p50=%.6g); trying denorm-only fallback before using raw outputs.",
+                                                                        float((coarse_stats_post or {}).get("quantum", float(pred_posthoc_coarse_quantum))),
+                                                                        float((coarse_stats_post or {}).get("uniq_le2_frac", float("nan"))),
+                                                                        float((coarse_stats_post or {}).get("uniq_le3_frac", float("nan"))),
+                                                                        float((coarse_stats_post or {}).get("std_p50", float("nan"))),
+                                                                    )
+                                                                if bool(pred_posthoc_reject_reactivity_compression):
+                                                                    try:
+                                                                        reactivity_ref_post: torch.Tensor | None = None
+                                                                        raw_output_space_now = str(_get_pred_raw_output_space() or "z")
+                                                                        if str(raw_output_space_now) == "z":
+                                                                            if preds_fix2_denorm is None:
+                                                                                preds_fix2_denorm = _posthoc_denormalize_prediction(
+                                                                                    preds_fix2,
+                                                                                    prefer_cpu=bool(pred_posthoc_prefer_cpu),
+                                                                                )
+                                                                                with contextlib.suppress(Exception):
+                                                                                    if isinstance(preds_fix2_denorm, torch.Tensor) and (
+                                                                                        not preds_fix2_denorm.is_contiguous()
+                                                                                    ):
+                                                                                        preds_fix2_denorm = preds_fix2_denorm.contiguous()
+                                                                            if isinstance(preds_fix2_denorm, torch.Tensor):
+                                                                                reactivity_ref_post = preds_fix2_denorm
+                                                                        elif str(raw_output_space_now) == "y" and isinstance(preds_fix2, torch.Tensor):
+                                                                            reactivity_ref_post = preds_fix2
+                                                                        if isinstance(reactivity_ref_post, torch.Tensor):
+                                                                            react_stats_post = _reactivity_ratio_probe_stats(
+                                                                                preds_fix2_post,
+                                                                                reactivity_ref_post,
+                                                                                sample_max=int(low_diversity_sample_max),
+                                                                            )
+                                                                            ratio_p50_post = float(
+                                                                                (react_stats_post or {}).get(
+                                                                                    "ratio_p50",
+                                                                                    float("nan"),
+                                                                                )
+                                                                            )
+                                                                            if math.isfinite(ratio_p50_post) and (
+                                                                                ratio_p50_post
+                                                                                < float(pred_posthoc_min_reactivity_ratio)
+                                                                            ):
+                                                                                preds_fix2_post_ok = False
+                                                                                _LOGGER.warning(
+                                                                                    "[infer] posthoc calibration remained overly compressed vs raw-denorm signal (reactivity ratio p50=%.5f, p10=%.5f, frac<0.25=%.5f); trying denorm-only fallback before using raw outputs.",
+                                                                                    float((react_stats_post or {}).get("ratio_p50", float("nan"))),
+                                                                                    float((react_stats_post or {}).get("ratio_p10", float("nan"))),
+                                                                                    float((react_stats_post or {}).get("ratio_lt_0.25_frac", float("nan"))),
+                                                                                )
+                                                                    except Exception as e:
+                                                                        _LOGGER.warning(
+                                                                            "[infer] posthoc reactivity-compression probe failed (%s: %s); ignoring that check for this batch.",
+                                                                            type(e).__name__,
+                                                                            str(e),
+                                                                        )
                                                         except Exception as e:
                                                             _LOGGER.warning(
                                                                 "[infer] posthoc calibration after raw-collapse fallback failed (%s: %s); trying denorm-only fallback before raw outputs.",
@@ -8924,15 +9343,16 @@ def infer(
                                                         and str(_get_pred_raw_output_space() or "z") == "z"
                                                     ):
                                                         try:
-                                                            preds_fix2_denorm = _posthoc_denormalize_prediction(
-                                                                preds_fix2,
-                                                                prefer_cpu=bool(pred_posthoc_prefer_cpu),
-                                                            )
-                                                            with contextlib.suppress(Exception):
-                                                                if isinstance(preds_fix2_denorm, torch.Tensor) and (
-                                                                    not preds_fix2_denorm.is_contiguous()
-                                                                ):
-                                                                    preds_fix2_denorm = preds_fix2_denorm.contiguous()
+                                                            if preds_fix2_denorm is None:
+                                                                preds_fix2_denorm = _posthoc_denormalize_prediction(
+                                                                    preds_fix2,
+                                                                    prefer_cpu=bool(pred_posthoc_prefer_cpu),
+                                                                )
+                                                                with contextlib.suppress(Exception):
+                                                                    if isinstance(preds_fix2_denorm, torch.Tensor) and (
+                                                                        not preds_fix2_denorm.is_contiguous()
+                                                                    ):
+                                                                        preds_fix2_denorm = preds_fix2_denorm.contiguous()
                                                             if (
                                                                 isinstance(preds_fix2_denorm, torch.Tensor)
                                                                 and int(preds_fix2_denorm.shape[0]) >= 2
@@ -8957,6 +9377,8 @@ def infer(
                                                                 )
                                                                 lowdiv_like_den = False
                                                                 lowdiv_stats_den: dict[str, float] | None = None
+                                                                coarse_lowdiv_den = False
+                                                                coarse_stats_den: dict[str, float] | None = None
                                                                 with contextlib.suppress(Exception):
                                                                     if bool(detect_low_diversity):
                                                                         lowdiv_stats_den = _low_diversity_probe_stats(
@@ -8966,6 +9388,15 @@ def infer(
                                                                             sample_max=int(low_diversity_sample_max),
                                                                         )
                                                                         lowdiv_like_den = bool(_is_low_diversity_stats(lowdiv_stats_den))
+                                                                with contextlib.suppress(Exception):
+                                                                    if bool(pred_posthoc_detect_coarse_low_diversity) and float(pred_posthoc_coarse_quantum) > 0.0:
+                                                                        coarse_stats_den = _quantized_low_diversity_probe_stats(
+                                                                            preds_fix2_denorm,
+                                                                            probe_k=int(min(int(low_diversity_probe_k), int(getattr(preds_fix2_denorm, "shape", (0,))[0] or 0))),
+                                                                            sample_max=int(low_diversity_sample_max),
+                                                                            quantum=float(pred_posthoc_coarse_quantum),
+                                                                        )
+                                                                        coarse_lowdiv_den = bool(_is_low_diversity_stats(coarse_stats_den))
                                                                 _LOGGER.warning(
                                                                     "[infer] denorm-only sanity (this batch only): max|Y0-Y%d|=%.6g match_frac=%.5f rel_mean=%.3e",
                                                                     int(pair_i_den),
@@ -8976,8 +9407,18 @@ def infer(
                                                                 preds_fix2_denorm_ok = (not bool(is_like_den))
                                                                 if bool(pred_posthoc_reject_partial_like) and bool(partial_like_den):
                                                                     preds_fix2_denorm_ok = False
-                                                                if bool(pred_posthoc_reject_low_diversity) and bool(lowdiv_like_den):
+                                                                if bool(pred_posthoc_reject_low_diversity) and (
+                                                                    bool(lowdiv_like_den) or bool(coarse_lowdiv_den)
+                                                                ):
                                                                     preds_fix2_denorm_ok = False
+                                                                if bool(coarse_lowdiv_den):
+                                                                    _LOGGER.warning(
+                                                                        "[infer] denorm-only fallback remained coarse low-diversity at quantum=%.6g (uniq<=2 frac=%.5f, uniq<=3 frac=%.5f, std_p50=%.6g); using raw outputs instead.",
+                                                                        float((coarse_stats_den or {}).get("quantum", float(pred_posthoc_coarse_quantum))),
+                                                                        float((coarse_stats_den or {}).get("uniq_le2_frac", float("nan"))),
+                                                                        float((coarse_stats_den or {}).get("uniq_le3_frac", float("nan"))),
+                                                                        float((coarse_stats_den or {}).get("std_p50", float("nan"))),
+                                                                    )
                                                         except Exception as e:
                                                             _LOGGER.warning(
                                                                 "[infer] denorm-only fallback after raw-collapse fallback failed (%s: %s); keeping raw predictions for this batch.",
