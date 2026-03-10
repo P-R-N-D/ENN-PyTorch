@@ -5355,6 +5355,7 @@ def infer(
                         float(diag["diff_pred_denorm_uncal"]),
                         str(out_path),
                     )
+                    _emit_collapse_triage(diag, diag_filename=str(fname))
                     _collapse_stage_diag_done = True
                 except Exception:
                     return
@@ -5594,6 +5595,10 @@ def infer(
                         str(out_path),
                         str(_collapse_diag_out_dir),
                     )
+                    _emit_collapse_triage(
+                        diag,
+                        diag_filename=f"collapse_stage_diag.rank{int(rank)}.batch{int(seen_batches):06d}.json",
+                    )
                     _collapse_stage_diag_done = True
                 except Exception:
                     return
@@ -5716,6 +5721,159 @@ def infer(
                     return float(d.max().item())
                 except Exception:
                     return float("nan")
+
+            def _pred_output_ab_clip_only_active() -> bool:
+                try:
+                    sc = getattr(module_eval, "scaler", None)
+                    return bool(getattr(sc, "_output_ab_clip_only", False))
+                except Exception:
+                    return False
+
+            def _collapse_triage_safe_float(v: object) -> float:
+                try:
+                    out = float(v)
+                    return out if math.isfinite(out) else float("nan")
+                except Exception:
+                    return float("nan")
+
+            def _classify_collapse_triage(
+                diag: dict[str, object] | None,
+            ) -> tuple[str, dict[str, object]]:
+                details: dict[str, object] = {}
+                if not isinstance(diag, dict):
+                    return "unknown", details
+                atol_raw = diag.get("atol", None)
+                if atol_raw is None:
+                    atol_raw = diag.get("broadcast_atol", 1e-6)
+                atol = _collapse_triage_safe_float(atol_raw)
+                if (not math.isfinite(atol)) or (float(atol) <= 0.0):
+                    atol = _collapse_triage_safe_float(
+                        diag.get("broadcast_atol", diag.get("atol", 1e-6))
+                    )
+                atol = max(float(atol), 1e-6)
+                x_diff = abs(_collapse_triage_safe_float(diag.get("x_diff", float("nan"))))
+                y_cal = abs(
+                    _collapse_triage_safe_float(
+                        diag.get(
+                            "y_diff_calibrated",
+                            diag.get(
+                                "diff_pred_runtime",
+                                diag.get("diff_pred_final", float("nan")),
+                            ),
+                        )
+                    )
+                )
+                pred_denorm_uncal = abs(
+                    _collapse_triage_safe_float(diag.get("diff_pred_denorm_uncal", float("nan")))
+                )
+                pred_final = abs(
+                    _collapse_triage_safe_float(
+                        diag.get(
+                            "diff_pred_final",
+                            diag.get("diff_pred_runtime", float("nan")),
+                        )
+                    )
+                )
+                y_hat_z = abs(
+                    _collapse_triage_safe_float(diag.get("diff_y_hat_z", float("nan")))
+                )
+                refined = abs(
+                    _collapse_triage_safe_float(diag.get("diff_refined", float("nan")))
+                )
+                assembled = abs(
+                    _collapse_triage_safe_float(
+                        diag.get("diff_assembled_z", diag.get("diff_context_z", float("nan")))
+                    )
+                )
+                tokens = abs(
+                    _collapse_triage_safe_float(diag.get("diff_tokens", float("nan")))
+                )
+                clip_only = bool(_pred_output_ab_clip_only_active())
+                eps_tiny = max(64.0 * float(atol), 1e-4)
+                eps_small = max(256.0 * float(atol), 1e-3)
+                eps_mid = max(1024.0 * float(atol), 1e-2)
+                label = "mixed_or_unclear"
+                if math.isfinite(x_diff) and x_diff > 0.0:
+                    if math.isfinite(y_cal) and y_cal <= eps_tiny and (
+                        (math.isfinite(pred_denorm_uncal) and pred_denorm_uncal > max(10.0 * eps_mid, 1.0))
+                        or (math.isfinite(y_hat_z) and y_hat_z > eps_mid)
+                    ):
+                        label = (
+                            "posthoc_output_scaler_collapse"
+                            if bool(clip_only)
+                            else "downstream_output_collapse"
+                        )
+                    elif math.isfinite(tokens) and tokens <= eps_tiny:
+                        label = "tokenize_or_fuser_collapse"
+                    elif math.isfinite(y_hat_z) and y_hat_z <= eps_small:
+                        if math.isfinite(tokens) and tokens > eps_tiny:
+                            label = "head_or_projection_low_reactivity"
+                        else:
+                            label = "model_low_diversity"
+                    elif (
+                        math.isfinite(pred_denorm_uncal)
+                        and pred_denorm_uncal <= eps_mid
+                        and math.isfinite(y_hat_z)
+                        and y_hat_z > eps_small
+                    ):
+                        label = "denorm_or_final_mapping_collapse"
+                details = {
+                    "likely_root": str(label),
+                    "output_ab_clip_only": bool(clip_only),
+                    "x_pair_max": float(x_diff) if math.isfinite(x_diff) else None,
+                    "calibrated_pair_max": float(y_cal) if math.isfinite(y_cal) else None,
+                    "pred_final_pair_max": float(pred_final) if math.isfinite(pred_final) else None,
+                    "pred_denorm_uncal_pair_max": float(pred_denorm_uncal)
+                    if math.isfinite(pred_denorm_uncal)
+                    else None,
+                    "y_hat_z_pair_max": float(y_hat_z) if math.isfinite(y_hat_z) else None,
+                    "refined_pair_max": float(refined) if math.isfinite(refined) else None,
+                    "assembled_pair_max": float(assembled) if math.isfinite(assembled) else None,
+                    "tokens_pair_max": float(tokens) if math.isfinite(tokens) else None,
+                    "atol": float(atol),
+                }
+                return str(label), details
+
+            def _emit_collapse_triage(
+                diag: dict[str, object] | None,
+                *,
+                diag_filename: str | None = None,
+            ) -> None:
+                nonlocal pred_collapse_triage_label, pred_collapse_triage_payload
+                if (not bool(pred_collapse_triage)) or (not isinstance(diag, dict)):
+                    return
+                label, details = _classify_collapse_triage(diag)
+                pred_collapse_triage_label = str(label)
+                payload: dict[str, object] = dict(details)
+                payload["where"] = str(diag.get("where", ""))
+                payload["rank"] = int(rank)
+                payload["seen_batches"] = int(seen_batches)
+                pred_collapse_triage_payload = payload
+                _LOGGER.warning(
+                    "[infer][triage] likely=%s calibrated_pair=%.6g denorm_uncal_pair=%.6g y_hat_z_pair=%.6g tokens_pair=%.6g output_ab_clip_only=%d",
+                    str(label),
+                    float(details.get("calibrated_pair_max") or 0.0),
+                    float(details.get("pred_denorm_uncal_pair_max") or 0.0),
+                    float(details.get("y_hat_z_pair_max") or 0.0),
+                    float(details.get("tokens_pair_max") or 0.0),
+                    1 if bool(details.get("output_ab_clip_only", False)) else 0,
+                )
+                if bool(pred_collapse_triage_save):
+                    try:
+                        base = str(diag_filename or "").strip()
+                        if not base:
+                            base = f"collapse_triage.rank{int(rank)}.batch{int(seen_batches):06d}.json"
+                        else:
+                            base = os.path.basename(base)
+                            if base.startswith("collapse_stage_diag"):
+                                base = base.replace("collapse_stage_diag", "collapse_triage", 1)
+                            elif base.endswith(".json"):
+                                base = base[:-5] + ".triage.json"
+                            else:
+                                base = base + ".triage.json"
+                        _maybe_write_diag_copy(base, payload)
+                    except Exception:
+                        pass
 
             def _try_normalize_x(x_in: torch.Tensor) -> torch.Tensor | None:
                 try:
@@ -6283,6 +6441,12 @@ def infer(
             pred_force_raw_output = False
             pred_raw_z_last_resort_denorm_warned = False
             pred_raw_z_last_resort_denorm_failed_warned = False
+            pred_collapse_triage = bool(
+                env_bool("ENN_PRED_COLLAPSE_TRIAGE", default=True)
+            )
+            pred_collapse_triage_save = bool(
+                env_bool("ENN_PRED_COLLAPSE_TRIAGE_SAVE", default=True)
+            )
             pred_concise_log = bool(env_bool("ENN_PRED_CONCISE_LOG", default=True))
             pred_concise_log_summary = bool(
                 env_bool("ENN_PRED_CONCISE_LOG_SUMMARY", default=True)
@@ -6297,6 +6461,8 @@ def infer(
             pred_concise_log_labels: dict[str, str] = {}
             pred_concise_log_order: list[str] = []
             pred_concise_log_shown: dict[str, int] = {}
+            pred_collapse_triage_label: str | None = None
+            pred_collapse_triage_payload: dict[str, object] | None = None
             pred_cg_strict_sync = bool(
                 env_bool(
                     "ENN_PRED_CUDAGRAPH_STRICT_SYNC",
@@ -6363,6 +6529,10 @@ def infer(
                         continue
                     label = str(pred_concise_log_labels.get(key, key) or key)
                     items.append(f"{label}={count}")
+                if isinstance(pred_collapse_triage_label, str) and str(
+                    pred_collapse_triage_label or ""
+                ).strip():
+                    items.insert(0, f"triage={str(pred_collapse_triage_label).strip()}")
                 if not items:
                     return
                 shown_items = items[:10]
@@ -9258,18 +9428,32 @@ def infer(
                                                         y_diff=float(ydiff2),
                                                         where="after_per_sample_fix",
                                                     )
-                                                _LOGGER.warning(
-                                                    "[infer] outputs remain %s after per-sample fallback; this indicates a model/preprocess collapse (not just cudagraph batching).",
-                                                    (
-                                                        "batch-broadcasted"
-                                                        if bool(is_broadcast_like2)
-                                                        else (
-                                                            "partial-broadcast-like"
-                                                            if bool(partial_like2)
-                                                            else "low-diversity"
-                                                        )
-                                                    ),
-                                                )
+                                                if bool(_pred_output_ab_clip_only_active()):
+                                                    _LOGGER.warning(
+                                                        "[infer] outputs remain %s after per-sample fallback; this rules out cudagraph batching. Current run also has suspicious output_ab clip-only active, so downstream calibration/output-scaling collapse remains a likely cause.",
+                                                        (
+                                                            "batch-broadcasted"
+                                                            if bool(is_broadcast_like2)
+                                                            else (
+                                                                "partial-broadcast-like"
+                                                                if bool(partial_like2)
+                                                                else "low-diversity"
+                                                            )
+                                                        ),
+                                                    )
+                                                else:
+                                                    _LOGGER.warning(
+                                                        "[infer] outputs remain %s after per-sample fallback; this rules out cudagraph batching. Likely causes are model/preprocess low-reactivity or downstream calibration/output-scaling collapse.",
+                                                        (
+                                                            "batch-broadcasted"
+                                                            if bool(is_broadcast_like2)
+                                                            else (
+                                                                "partial-broadcast-like"
+                                                                if bool(partial_like2)
+                                                                else "low-diversity"
+                                                            )
+                                                        ),
+                                                    )
                                                 Xi_diag, _ = _selected_pair_view(
                                                     Xi, preferred_i=int(pair_i2)
                                                 )
@@ -9958,6 +10142,36 @@ def infer(
                                                                 "[infer] raw fallback would keep Z-space outputs; using denorm-only output scaling as last-resort for this batch and remaining prediction microbatches even though low-diversity checks rejected it."
                                                             )
                                                     elif preds_fix2 is not None:
+                                                        raw_lowdiv_like = False
+                                                        raw_lowdiv_stats: dict[str, float] | None = None
+                                                        with contextlib.suppress(Exception):
+                                                            if bool(detect_low_diversity) and int(
+                                                                getattr(preds_fix2, "shape", (0,))[0] or 0
+                                                            ) >= 2:
+                                                                raw_lowdiv_stats = _low_diversity_probe_stats(
+                                                                    preds_fix2,
+                                                                    probe_k=int(
+                                                                        min(
+                                                                            int(low_diversity_probe_k),
+                                                                            int(getattr(preds_fix2, "shape", (0,))[0] or 0),
+                                                                        )
+                                                                    ),
+                                                                    atol=float(broadcast_atol),
+                                                                    sample_max=int(low_diversity_sample_max),
+                                                                )
+                                                                raw_lowdiv_like = bool(
+                                                                    _is_low_diversity_stats(raw_lowdiv_stats)
+                                                                )
+                                                        if bool(raw_lowdiv_like):
+                                                            _pred_log_warning(
+                                                                "raw_low_diversity",
+                                                                "raw_low_diversity",
+                                                                "[infer] raw per-sample outputs still show low cross-sample diversity (uniq<=2 frac=%.5f, uniq<=3 frac=%.5f, std_p50=%.6g); this points to model/preprocess low-reactivity beyond posthoc/output-scaling issues.",
+                                                                float((raw_lowdiv_stats or {}).get("uniq_le2_frac", float("nan"))),
+                                                                float((raw_lowdiv_stats or {}).get("uniq_le3_frac", float("nan"))),
+                                                                float((raw_lowdiv_stats or {}).get("std_p50", float("nan"))),
+                                                                suppress_in_concise=True,
+                                                            )
                                                         preds = preds_fix2
                                                         if bool(pred_persist_raw_mode):
                                                             pred_posthoc_calibrate_active = False
