@@ -7134,8 +7134,11 @@ def infer(
                     dim=0, keepdim=True
                 )
                 max_shift = float(pred_posthoc_denorm_anchor_max_abs_shift)
-                if math.isfinite(max_shift) and max_shift > 0.0:
-                    shift = torch.clamp(shift, min=-max_shift, max=max_shift)
+                if math.isfinite(max_shift):
+                    if max_shift <= 0.0:
+                        shift = torch.zeros_like(shift)
+                    else:
+                        shift = torch.clamp(shift, min=-max_shift, max=max_shift)
                 y2 = den2 + shift
                 y_out = y2.to(device=raw_device, dtype=y_den.dtype).reshape(raw_shape)
                 if bool(
