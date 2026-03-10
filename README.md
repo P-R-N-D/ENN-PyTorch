@@ -1,365 +1,194 @@
 # ENN-PyTorch
-> ENN (Elastic Neural Networks) — fabric model for High-Performance Computing (HPC), which supports a pluggable submodel interface, integrated with automated workflows for training, inference, and deployment export
 
-ENN-PyTorch standardizes the end-to-end pipeline—configuration, data/I/O, elastic distributed execution, checkpointing,
-and export to deployment artifacts (ONNX/ORT/torch.export). The workflow layer automates training, inference, and artifact
-saving, so you can iterate on modeling without rebuilding the surrounding runtime.
+> A PyTorch-based Elastic Neural Networks framework for training, inference, export, and runtime-aware AI deployment workflows.
 
-The repository includes an optional reference ENN model stack built from RetNet-based blocks for spatio-temporal modeling:
-here, *temporal* refers to order-sensitive sequence dependencies (permutation-like), while *spatial* refers to combination-style
-interactions across fields/entities/positions (not literal geometric coordinates).
-It provides templated tasks and Perceiver-style fusion with conservative defaults. For domain-specific needs, you can attach custom
-`torch.nn.Module` components via BYOM (Bring Your Own Model) and compose task templates into a DAG-structured task graph
-(Directed Acyclic Graph), while keeping the same integrated train/infer/export interface. BYOM components are intentionally kept out
-of checkpoints, so training weights remain portable across iterative model-side changes.
+## Overview
 
-This repository also includes a worked example notebook (`notebook.ipynb`) and a sample data (`raw_data.xlsx`) demonstrating a tabular‑to‑grid regression workflow.
+ENN-PyTorch is a research-to-deployment deep learning framework designed to keep model development, execution control, and artifact export inside one consistent workflow.
 
-## License
+The project focuses on a practical engineering problem: a model is only useful when it can be trained, evaluated, executed repeatedly, and exported in a way that remains stable under real runtime conditions. ENN-PyTorch addresses that problem by combining configurable model composition, data pipelines, distributed execution, runtime safeguards, and deployment-oriented export support.
 
-**Source code** is licensed under the **PolyForm Noncommercial License 1.0.0** (see `LICENSE`).  
-**Weights, datasets, and other artifacts** may be licensed separately.
+## Core Goals
 
-For commercial use, please contact the **copyright holder** to obtain a separate **commercial license**.
+- unify training, inference, checkpointing, and export in one workflow
+- support repeatable execution under changing runtime conditions
+- reduce friction between model iteration and deployment preparation
+- improve resilience under memory pressure and unstable kernel behavior
+- keep export and runtime control as first-class parts of development
 
-## Requirements
+## Core Capabilities
 
-### Mandatory
-- **python**: >= 3.12
-- **torch**: >= 2.9.1
-- **torchvision**: >= 0.24.1
-- **torchao**: >= 0.15.0
-- **torchdata**: >= 0.11.0 (`torchdata.nodes`-based pipeline)
-- **tensordict**: >= 0.10.0
-- **triton**: >= 3.5.1 (core JIT backend; typically installed alongside PyTorch)
-- **numpy**: >= 2.4.1
-- **onnx**: >= 1.20.1
-- **onnxruntime**: >= 1.23.2
-- **onnxscript**: >= 0.5.7
-- **onnx_ir**: >= 0.1.14
-- **ml_dtypes**: >= 0.5.4
-- **psutil**: >= 7.2.1
-- **py-cpuinfo**: >= 9.0.0
-- **tqdm**: >= 4.67.1
-- **h5py**: >= 3.15.1 (required for persisted prediction outputs)
+### Unified Workflow
+ENN-PyTorch provides one integrated path for:
 
-### Recommended
-- **python**: >= 3.13t (free-threading / no-GIL build)
-  - The data pipeline uses thread-parallel execution via `torchdata.nodes` and is designed to reduce GIL contention on standard CPython.
-  - Free-threaded Python can further improve throughput by removing the GIL, but it is not necessary.
-- DataFrame integrations (pandas, pandas-on-Spark, polars) are optional. install the corresponding extra (e.g., `pip install -e .[pandas]`) when needed.
+- model construction
+- training
+- prediction
+- checkpointing
+- artifact export
 
-## Features
-- **APIs** (`enn_torch.runtime.workflows`): build/load models, elastic train/predict entrypoints (uses `torch.distributed.elastic`), and checkpoint/export helpers.
-- **Templated configurations** (`enn_torch.core.config`): dataclass configs with coercion/validation and string canonicalizers for preset, normalization, and compile options.
-- **Neural network stacks** (`enn_torch.nn`): spatio-temporal Fuser/Collector blocks (Template tasks + Perceiver resampler), attention variants, scaler + recorder modules, AMP negotiation guard band (`ModelConfig.safety_margin_pow2`).
-- **Data pipeline** (`enn_torch.data`): `torchdata.nodes`-driven memmap pipeline with TensorDict support, prefetch/pin/pool options, and scale-aware dataset metadata.
-- **Runnable tasks** (`enn_torch.runtime`): thread/NUMA tuning, free-threaded/no-GIL optimizations, mixed-precision helpers, history recorder, and OOM recovery hooks (see `enn_torch.runtime.autobatch`). ONNX/ORT/onnxscript/onnx_ir/torch.export (PT2) out of the box; optional platform-dependent backends (TensorRT/CoreML/ExecuTorch/onnx-tf) via extras. elastic launch wiring and group setup for multi-process CPU/GPU runs.
-- **Losses/optimizers/profiling** (`enn_torch.core`): Student’s t losses, SWA helpers, FLOP/IO timing.
+This makes it easier to move from experimentation to validation and deployment without rebuilding the surrounding runtime every time.
 
-## Model layout (current)
+### Elastic and Distributed Execution
+The framework supports elastic and distributed execution patterns for larger-scale environments, including multi-process and hardware-aware runtime behavior.
 
-High-level flow used by `enn_torch.nn.wrappers.Model`:
+### Configurable Model Composition
+ENN-PyTorch is designed for flexible model construction rather than a single fixed architecture. It supports:
 
-```
-Input features (B x C_in)
-  → Scaler (feature normalization)
-  → Fuser
-      → Template tasks (one or more)
-          → Tokenizer (Linear: C_in → tokens × d_model)
-          → RetNet stack (mode = spatial | temporal)
-          → (optional) user submodel hook (BYOM; not checkpointed)
-      → Perceiver fusion (Resampler cross-attn + latent self-attn)
-      → Aggregation + MLP head → output vector
-  → Collector (temporal controller head)
-  → Optional linear branch (configurable)
-```
+- task-based model composition
+- BYOM-style extension
+- DAG-oriented workflow structure
+- spatio-temporal modeling blocks
 
-Key building blocks:
-- **Scaler**: input feature normalization, with an optional linear branch when `use_linear_branch` is enabled.
-- **Template**: a single *task* = tokenizer + RetNet stack. Each task has:
-  - a unique **name** (this is the key used inside the model / `ModuleDict` and the primary external identifier)
-  - optional metadata: `description`, `tags`
-  - Task names are normalized (`strip()` and `.` → `_`) to stay `state_dict`-safe.
-  - If you pass `None` / blank / duplicate names to `add_task(...)`, a UUID-based name is generated and returned (with a collision check).
-  - `update_task(...)` / `remove_task(...)` accept a task name. When loading older checkpoints, legacy `task_id` values are accepted as aliases and remapped on load.
-- **Fuser**: runs all selected tasks, fuses their token-sets in an orderless way via a Perceiver-style latent array, then decodes to the output vector.
-  - Per-task `weight` is applied as an attention log-bias (token-count-normalized) to reflect view importance without imposing any ordering.
-  - `forward_stream` supports a single temporal stream state (`Tensor` for `stream_task_name`) or a dict mapping `task_name -> state` for multiple temporal tasks.
-- **Collector**: the temporal controller head for the model instance.
+### Data Pipeline Support
+The data layer is built for practical workloads, including:
+
+- TensorDict-aware processing
+- memory-mapped data handling
+- `torchdata.nodes`-based pipelines
+- structured prediction output handling
+
+### Deployment-Oriented Export
+ENN-PyTorch supports export workflows for:
+
+- ONNX
+- ONNX Runtime
+- `torch.export`
+- optional deployment targets through extras
+
+The framework is built so that export is part of the normal workflow, not a separate afterthought.
+
+### Runtime Resilience
+A major focus of the project is runtime stability. ENN-PyTorch includes mechanisms for:
+
+- memory-aware batch scaling
+- OOM retry and recovery
+- gradient accumulation adjustment under pressure
+- kernel fallback handling
+- output validation and sanitization
+- precision-aware execution control
+
+This makes the repository relevant not only as a model project, but also as a runtime engineering project.
+
+## Engineering Principles
+
+ENN-PyTorch is built around the following principles:
+
+- **Reproducibility**  
+  The same project should support repeated training, inference, and export without ad hoc rewrites.
+
+- **Operational Stability**  
+  Runtime behavior matters. A model that runs once is not enough.
+
+- **Deployment Readiness**  
+  Export and downstream integration should be part of the design.
+
+- **Extensibility**  
+  New model blocks and workflows should be added without rebuilding the runtime layer.
+
+## Technology Stack
+
+- Python 3.12+
+- PyTorch
+- Triton
+- TensorDict
+- torchdata
+- ONNX
+- ONNX Runtime
+- `torch.export`
+- optional dataframe integrations such as pandas and polars
 
 ## Installation
-1. Install the appropriate **PyTorch** build for your accelerator first (CUDA/ROCm/XPU/CPU).
-2. Install ENN-PyTorch (editable for development is recommended):
-   ```bash
-   pip install --upgrade pip
-   # Example (CUDA users should pick the right index-url/wheel for their CUDA version)
-   # pip install --index-url https://download.pytorch.org/whl/cu121 'torch>=2.9.1'
-   pip install -e .
-   ```
 
-3. `cloudpickle>=3.1.2` is a mandatory dependency and is installed automatically from package metadata.
+Install the appropriate PyTorch build for your hardware first, then install the project:
 
-Optional extras:
 ```bash
-# Broader export stack (platform/python constraints; some wheels may be unavailable on py3.13/py3.14t)
-# Includes onnx-tf/onnx2tf (py<3.13; requires tf-keras), CoreML (macOS), TensorRT (Linux/CUDA), ExecuTorch (Linux, py<3.12)
-pip install -e .[deployment_full]
-
-# Dataframe integrations
-pip install -e .[pandas]      # or: .[polars]
-
-# Pandas on Spark (with pandas-on-Spark)
-pip install -e .[pandas_on_spark]
-
-# NVIDIA TE / Intel IPEX (hardware-specific)
-pip install -e .[nvidia_te_cu12]   # or .[nvidia_te_cu13]
-pip install -e .[intel_ai]
-
-# Telemetry (NVIDIA GPU info)
-pip install -e .[telemetry]
-
-# NUFFT losses (CUDA, optional)
-pip install -e .[nufft]
-
-# Dev tooling (lint/test)
-pip install -e .[dev]
+pip install --upgrade pip
+pip install -e .
 ```
 
-> **Note**: Triton >= 3.5.1 is required, but a matching build is normally installed alongside PyTorch—avoid overriding it with a mismatched wheel.
+Optional extras can be installed depending on the workflow, such as dataframe integrations or broader deployment backends.
 
-> **Checkpoint formats**:
-> - `.safetensors` checkpoints require the `safetensors` extra: `pip install -e .[safetensors]`
->   (or `pip install 'enn-torch[safetensors]'` when installed from PyPI).
-
-> **Platform note**: many `deployment_full` backends are OS/driver/python dependent (e.g., CoreML on macOS, TensorRT on Linux/CUDA, ExecuTorch often lacks wheels for Python ≥3.12). If you only need ONNX export, the mandatory `onnx`/`onnxruntime`/`onnxscript`/`onnx_ir` set is sufficient.
-
-## Distributed training & inference (HSDP)
-
-ENN uses **FSDP2 (composable `fully_shard`)** for both training and inference on GPU/XPU.
-When running multi-node, ENN will prefer an **HSDP-style 2D DeviceMesh**:
-
-- **Shard** within a node (across local GPUs)
-- **Replicate** across nodes (no cross-node parameter sharding)
-
-### Asymmetric nodes (different GPU counts)
-
-HSDP requires a rectangular 2D mesh (i.e., the same number of local ranks/GPUs per node). When nodes have different GPU counts, ENN will **automatically fall back to a 1D FSDP2 mesh** across all ranks. This keeps the run working (no hang/crash), but it does mean **parameters can be sharded across nodes** in the fallback mode.
-
-### Mesh selection
-
-- Default: **implicit mesh** via `torch.distributed.device_mesh.init_device_mesh`.
-- If your rank ordering is not node-contiguous, you can force explicit mesh construction:
-  - `ENN_HSDP_EXPLICIT_MESH=1`
-- If your launcher does not set `LOCAL_WORLD_SIZE`, you can override the assumed per-node size:
-  - `ENN_HSDP_SHARD_SIZE=<int>`
-
-## Export / serving notes
-
-- ONNX export defaults to **opset 18**.
-- Some graphs contain batch-dependent control flow; the export utilities avoid common `batch==1` specialization pitfalls by using safe defaults (and disabling dynamic batching when the current `torch.export.Dim` implementation cannot express constraints).
-
-## Quickstart
-
-Minimal forward/backward loop:
+## Minimal Example
 
 ```python
 import torch
-
 import enn_torch
 
 from enn_torch.core.config import ModelConfig
 from enn_torch.runtime.losses import StudentsTLoss
-from enn_torch.core.policies import optimize_threads
 
-# 1) Build a config and model
 cfg = ModelConfig(
     d_model=128,
     heads=4,
     device="cuda" if torch.cuda.is_available() else "cpu",
-    # AMP dtype negotiation guard band: safety_margin = 2**n (default n=3 -> margin=8)
-    safety_margin_pow2=3,
 )
+
 model = enn_torch.new_model(in_dim=16, out_shape=(1,), config=cfg)
 
-# 2) Synthetic batch (B x C_in) -> (B x *out_shape)
-device = next(model.parameters()).device
-x = torch.randn(32, 16, device=device)
-y = torch.randn(32, 1, device=device)
-labels_flat = y.reshape(y.shape[0], -1)
+x = torch.randn(32, 16, device=next(model.parameters()).device)
+y = torch.randn(32, 1, device=next(model.parameters()).device)
 
-# 3) Loss & optimizer
-net_loss = StudentsTLoss()
+loss_fn = StudentsTLoss()
 opt = torch.optim.AdamW(model.parameters(), lr=1e-3)
 
-# 4) Optional: autotune thread settings for this machine
-optimize_threads()
-
 model.train()
-for step in range(200):
-    pred, loss = model(x, labels_flat=labels_flat, net_loss=net_loss)
+for _ in range(10):
+    pred, loss = model(
+        x,
+        labels_flat=y.reshape(y.shape[0], -1),
+        net_loss=loss_fn,
+    )
     loss.backward()
     opt.step()
     opt.zero_grad(set_to_none=True)
 
-# Inference
 model.eval()
 with torch.no_grad():
     pred = model(x, return_loss=False)
-    # or: pred = model.predict(x)
 ```
 
-Checkpointing:
-```python
-from enn_torch import load_model, load_weights, save_model
+## Included Examples
 
-save_model(model, "ckpt.pth")
-model2 = load_model("ckpt.pth", map_location="cuda")
+- `notebook.ipynb` — worked example workflow
+- `raw_data.xlsx` — sample input data for the notebook flow
 
-# Continuous lifecycle: keep the same model object (BYOM hooks stay attached)
-load_weights(model, "ckpt.pth", map_location="cpu")
+## Repository Layout
 
-# Directory checkpoints (torch.distributed.checkpoint + meta.json)
-from pathlib import Path
-Path("ckpt_dir").mkdir(exist_ok=True)
-save_model(model, "ckpt_dir")
-model3 = load_model("ckpt_dir", map_location="cpu")
-```
-
-Prediction outputs:
-```python
-import enn_torch
-
-# In-memory (default): returns a CPU TensorDict with keys {"X", "Y"}.
-# NOTE: output='eager' is accepted as an alias of output='memory'.
-td = enn_torch.predict(model, my_data, output="memory", path=None)
-print(td[0]["X"], td[0]["Y"])
-
-# Persistent: writes an HDF5 file and returns a PersistentTensorDict.
-# NOTE: output='lazy' is accepted as an alias of output='file'.
-td_persistent = enn_torch.predict(
-    model,
-    my_data,
-    output="file",
-    path="predictions.h5",
-    overwrite="replace",
-)
-print(td_persistent[0]["X"], td_persistent[0]["Y"])
-
-# IMPORTANT: PersistentTensorDict does not auto-close. Close it when you're done.
-td_persistent.close()
-```
-
-Notebook demo:
-- Open `notebook.ipynb` for an end-to-end workflow using `raw_data.xlsx`.
-
-> API names above reflect the current package layout. If you have local changes, adjust imports accordingly.
-
-## Project layout
-
-```
+```text
 enn_torch/
-  __init__.py
   core/
-    __init__.py
-    config.py
-    compat.py             # accelerator/memory helpers, meta/fake tensor guards
-    concurrency.py        # threading/affinity helpers
-    datatypes.py          # env parsing + small type utilities
-  runtime/
-    workflows.py          # build/load models, elastic train/predict entrypoints
-    policies.py           # thread/data policy heuristics
-    precision.py          # dtype/precision helpers
-    system.py             # thread/NUMA tuning, device detection, temp dirs
-    tensor.py             # tensor helpers + from_buffer context manager
   data/
-    __init__.py
-    nodes.py              # torchdata nodes, Sampler/Loader, memmap writer/reader
-    pipeline.py           # dataset fetch, collate, session orchestration
-    collate.py            # dataset storage helpers + feature/label key utilities
-  runtime/
-    __init__.py
-    distributed.py        # elastic launch + process group utilities
-    io.py                 # exporters (ONNX/ORT/torch.export (PT2)/etc.), checkpoint save/load
-    main.py               # training loop, predict path, elastic worker entrypoint
-    losses.py             # Student’s t, regression losses, mask utils
-    optimizers.py         # SGD/AdamW wrappers, SWA helper
   nn/
-    __init__.py
-    activations.py
-    wrappers.py
-    blocks.py
-    graph.py              # torch.compile helpers, graph break utilities, activation checkpoint helpers
-    kernels.py
-    layers.py
-    profiler.py           # lightweight FLOP/IO timers
+  runtime/
+README.md
+pyproject.toml
+notebook.ipynb
+raw_data.xlsx
 ```
 
-## Configuration notes
+## Example Use Cases
 
-### ModelConfig string options
+ENN-PyTorch is a strong fit for:
 
-`enn_torch.core.config.coerce_model_config()` normalizes common separator variants in a few string fields
-to reduce "almost-right" config bugs:
+- PyTorch model development with export requirements
+- distributed or elastic training workflows
+- tabular or spatio-temporal learning pipelines
+- runtime-aware experimentation on CPU/GPU systems
+- deployment-oriented model validation
 
-- `preset`: canonical values `{spatial, temporal, spatiotemporal}` (or `None` to start with no tasks).
-  - Examples accepted: `ss`, `tt`, `st`, `spatial`, `temporal`, `spatiotemporal`, `spatio-temporal`, `spatio_temporal`, `temporal-spatial`, …
-- `normalization_method`: canonical values `layernorm`, `batchnorm`, `rmsnorm`.
-  - Examples accepted: `ln`, `layer_norm`, `layer-norm`, `bn`, `batch_norm`, `rms_norm`, …
-- `compile_mode`: canonical values `disabled` (default), `reduce-overhead` (alias: `stable`),
-  `max-autotune`, `max-autotune-no-cudagraphs`, `aot-eager` (alias: `debug`).
-  - Examples accepted (case-insensitive; `-`/`_` treated the same): `max_autotune`, `max-autotune`,
-    `stable`, `reduce_overhead`, `debug`, `aot_eager`, …
-  - Any other value is treated as `disabled`.
+## Why This Repository Matters
 
-### RuntimeConfig string options (training)
+ENN-PyTorch is more than a model implementation repository. It is a runtime and deployment engineering project that combines:
 
-- `loss_mask_mode`: must be one of `none`, `finite`, or `neq`.
-  - Examples accepted: `isfinite`, `not_equal`, `!=`, …
+- model construction
+- data pipeline design
+- execution control
+- exportability
+- resilience under unstable runtime conditions
 
+This makes it relevant for AI engineering, MLOps, systems-oriented deep learning, and deployment-aware model development.
 
-## Environment variables
+## License
 
-- `ENN_META_MONITOR` (alias: `ENN_META_HOOK`): set to `1` to fail fast on meta-tensor inputs during model wiring/forward; set to `warn` to log only.
-- `ENN_DISABLE_MKLDNN`: set to `1` to disable oneDNN (MKLDNN) before model construction if it causes issues for your CPU build.
-
-- **Free-threading / no-GIL**
-  - `ENN_NOGIL_OPT` (aliases: `ENN_NO_GIL_OPT`, `ENN_FREE_THREADING_OPT`): enable/disable no-GIL-specific tuning. Default: auto-detect (enabled only when running on a free-threaded build *and* the GIL is disabled).
-  - `ENN_MEMMAP_THREAD_LOCAL`: use per-thread `MemoryMappedTensor` handles (`1`/`0`). Default: auto-enabled when no-GIL optimizations are enabled.
-  - `ENN_TLB_FLUSH_EVERY`, `ENN_TLB_SAMPLE_EVERY`: reduce thread-local telemetry overhead in high-throughput thread pipelines (defaults are higher when no-GIL optimizations are enabled).
-
-- **NVML telemetry** (optional extra: `.[telemetry]`)
-  - `ENN_NVML_DISABLE=1`: disable NVML telemetry unconditionally.
-  - `ENN_NVML_MIN_INTERVAL_S` (alias: `ENN_NVML_MIN_INTERVAL`): throttle NVML utilization queries (seconds).
-
-- **TorchInductor compilation**
-  - `ENN_INDUCTOR_COMPILE_THREADS` (alias: `ENN_COMPILE_THREADS`): cap Inductor compile threads per process to avoid oversubscription on multi-rank nodes.
-
-- **Prediction assembly (predict)**
-  - `ENN_PRED_ASSEMBLE_MAX_SEGMENTS`: threshold for the "segment slice-copy" fast path when assembling chunked predictions.
-    - Default: `64`.
-    - If `<= 0`, the segment fast path is disabled (always uses index-based writes).
-  - `ENN_PRED_ASSEMBLE_TUNE`: enable best-effort tuning logs for prediction assembly.
-    - Default: `1`.
-    - When enabled, assembly reports how often the segment-copy path was applicable and may suggest a better `ENN_PRED_ASSEMBLE_MAX_SEGMENTS`.
-  - `ENN_PRED_ASSEMBLE_TUNE_LOG_ONCE`: log tuning guidance at most once per process.
-    - Default: `1`.
-  - `ENN_PRED_ASSEMBLE_TUNE_MIN_PARTS`: minimum number of manifest parts required before emitting tuning logs.
-    - Default: `4`.
-
-- **Prefetch (CUDA event polling)**
-  - `ENN_CUDA_EVENT_POLL_START_US`: initial sleep (microseconds) for CUDA event completion polling.
-    - Default: `500` (0.5 ms).
-  - `ENN_CUDA_EVENT_POLL_MAX_MS`: max sleep (milliseconds) for CUDA event polling backoff.
-    - Default: `50`.
-  - `ENN_CUDA_EVENT_POLL_STOP_MIN_MS`: minimum sleep (milliseconds) once shutdown/stop is requested.
-    - Default: `5`.
-
-## Version & compatibility notes
-
-- `python` ≥ 3.12 is mandatory among GIL-enabled builds (or `abi3`-complicants), while `python` ≥ 3.13t is reqiured among free-threading builds (or `abi3t`-complicants).
-- `torch` ≥ 2.9.1 is mandatory.
-- `torchdata` ≥ 0.11.0 is mandatory bacause `torchdata.nodes` is required.
-- `tensordict` provides TensorDict integration and memory-mapped tensor utilities.
-- `triton` ≥ 3.5.1 is necessary.
-- Export backends (TensorRT/CoreML/ExecuTorch/ORT) have additional system requirements; install only what you need.
+Source code is licensed under the PolyForm Noncommercial License 1.0.0. Please review the repository license file for full details.
