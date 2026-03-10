@@ -6224,11 +6224,25 @@ def infer(
                     0.15,
                 )
             )
+            pred_posthoc_denorm_anchor_posthoc = bool(
+                env_bool(
+                    "ENN_PRED_COLLAPSE_DENORM_ONLY_ANCHOR_POSTHOC",
+                    default=True,
+                )
+            )
+            pred_posthoc_denorm_anchor_max_abs_shift = float(
+                env_float(
+                    "ENN_PRED_COLLAPSE_DENORM_ANCHOR_MAX_ABS_SHIFT",
+                    float("inf"),
+                )
+            )
             pred_persist_raw_mode = bool(
                 env_bool("ENN_PRED_COLLAPSE_PERSIST_RAW_MODE", default=True)
             )
             pred_posthoc_calibrate_active = False
             pred_posthoc_denorm_only_active = False
+            pred_posthoc_denorm_anchor_active = False
+            pred_posthoc_denorm_anchor_warned = False
             pred_force_raw_output = False
             pred_cg_strict_sync = bool(
                 env_bool(
@@ -7068,6 +7082,95 @@ def infer(
                     y_out = y_out.to(device=raw_device, non_blocking=False)
                 return y_out.detach()
 
+            def _anchor_denorm_to_posthoc_center(
+                pred_denorm: torch.Tensor,
+                pred_posthoc: torch.Tensor,
+            ) -> torch.Tensor:
+                if (not isinstance(pred_denorm, torch.Tensor)) or (
+                    not isinstance(pred_posthoc, torch.Tensor)
+                ):
+                    raise TypeError(
+                        "infer: anchored denorm fallback requires tensor inputs"
+                    )
+                if tuple(pred_denorm.shape) != tuple(pred_posthoc.shape):
+                    raise RuntimeError(
+                        "infer: anchored denorm fallback shape mismatch"
+                    )
+                y_den = pred_denorm.detach()
+                y_post = pred_posthoc.detach()
+                if y_den.ndim == 0:
+                    raise RuntimeError(
+                        "infer: anchored denorm fallback requires batched predictions"
+                    )
+                raw_shape = tuple(y_den.shape)
+                raw_device = y_den.device
+                batch_n = int(raw_shape[0])
+                expected_features = (
+                    1 if len(raw_shape) == 1 else int(math.prod(raw_shape[1:]))
+                )
+                den2 = (
+                    y_den.reshape(batch_n, 1)
+                    if y_den.ndim == 1
+                    else y_den.reshape(batch_n, -1)
+                ).to(device="cpu", dtype=torch.float32)
+                post2 = (
+                    y_post.reshape(batch_n, 1)
+                    if y_post.ndim == 1
+                    else y_post.reshape(batch_n, -1)
+                ).to(device="cpu", dtype=torch.float32)
+                if int(den2.shape[0]) != int(batch_n) or int(post2.shape[0]) != int(
+                    batch_n
+                ):
+                    raise RuntimeError(
+                        "infer: anchored denorm fallback batch size mismatch"
+                    )
+                if int(den2.shape[1]) != int(expected_features) or int(
+                    post2.shape[1]
+                ) != int(expected_features):
+                    raise RuntimeError(
+                        "infer: anchored denorm fallback feature width mismatch"
+                    )
+                shift = post2.mean(dim=0, keepdim=True) - den2.mean(
+                    dim=0, keepdim=True
+                )
+                max_shift = float(pred_posthoc_denorm_anchor_max_abs_shift)
+                if math.isfinite(max_shift) and max_shift > 0.0:
+                    shift = torch.clamp(shift, min=-max_shift, max=max_shift)
+                y2 = den2 + shift
+                y_out = y2.to(device=raw_device, dtype=y_den.dtype).reshape(raw_shape)
+                if bool(
+                    env_bool(
+                        "ENN_PRED_COLLAPSE_DENORM_ONLY_CLAMP_Y_BOUNDS",
+                        default=True,
+                    )
+                ):
+                    sc = _get_pred_scaler()
+                    (
+                        use_y_bounds_fallback,
+                        clamp_y,
+                        resolved_y_bounds,
+                        prefer_quantile_bounds,
+                        clip_quantile_bounds,
+                    ) = _resolve_posthoc_y_bounds_fallback(
+                        sc,
+                        pred_posthoc.reshape(batch_n, -1).detach().to(
+                            device=raw_device,
+                            dtype=y_den.dtype,
+                        ),
+                    )
+                    if bool(use_y_bounds_fallback) and callable(clamp_y):
+                        y_out = clamp_y(
+                            y_out,
+                            prefer_quantile=prefer_quantile_bounds,
+                            clip_quant_to_minmax=clip_quantile_bounds,
+                            resolved_bounds=resolved_y_bounds,
+                        )
+                        _validate_posthoc_y_bounds_output(
+                            y_out,
+                            resolved_y_bounds,
+                        )
+                return y_out.detach()
+
             def _broadcast_like_selected_pair(
                 preds_now: torch.Tensor,
                 *,
@@ -7246,7 +7349,7 @@ def infer(
                 use_uncompiled: bool | None = None,
                 force_fp32: bool = False,
             ) -> torch.Tensor:
-                nonlocal pred_posthoc_calibrate_active, pred_posthoc_denorm_only_active, pred_force_raw_output
+                nonlocal pred_posthoc_calibrate_active, pred_posthoc_denorm_only_active, pred_posthoc_denorm_anchor_active, pred_posthoc_denorm_anchor_warned, pred_force_raw_output
                 uc = (
                     bool(force_uncompiled)
                     if use_uncompiled is None
@@ -7260,6 +7363,7 @@ def infer(
                 raw_output_space = str(_get_pred_raw_output_space() or "z")
                 if bool(pred_posthoc_denorm_only_active) and str(raw_output_space) != "z":
                     pred_posthoc_denorm_only_active = False
+                    pred_posthoc_denorm_anchor_active = False
                     if bool(pred_persist_raw_mode):
                         pred_force_raw_output = True
                         _LOGGER.warning(
@@ -7288,10 +7392,32 @@ def infer(
                         ):
                             with contextlib.suppress(Exception):
                                 out_post = out_post.contiguous()
+                        if bool(pred_posthoc_denorm_anchor_posthoc) and str(raw_output_space) == "z":
+                            with contextlib.suppress(Exception):
+                                out_cal = _posthoc_calibrate_prediction(
+                                    out_raw,
+                                    prefer_cpu=bool(pred_posthoc_prefer_cpu),
+                                    input_space_hint="z",
+                                    allow_cross_space_fallback=False,
+                                )
+                                if isinstance(out_cal, torch.Tensor):
+                                    out_post = _anchor_denorm_to_posthoc_center(
+                                        out_post,
+                                        out_cal,
+                                    )
+                                    pred_posthoc_denorm_anchor_active = True
+                                    if not bool(pred_posthoc_denorm_anchor_warned):
+                                        pred_posthoc_denorm_anchor_warned = True
+                                        _LOGGER.warning(
+                                            "[infer] using denorm-only output scaling anchored to posthoc-calibrated center for remaining prediction microbatches."
+                                        )
+                        else:
+                            pred_posthoc_denorm_anchor_active = False
                         return out_post.detach()
                     except Exception as e:
                         if bool(pred_persist_raw_mode):
                             pred_posthoc_denorm_only_active = False
+                            pred_posthoc_denorm_anchor_active = False
                             pred_force_raw_output = True
                             _LOGGER.warning(
                                 "[infer] posthoc denormalization failed during prediction (%s: %s); switching remaining outputs to raw mode for consistency.",
@@ -7695,6 +7821,8 @@ def infer(
                                         ),
                                         "pred_posthoc_calibrate_active": bool(pred_posthoc_calibrate_active),
                                         "pred_posthoc_denorm_only_active": bool(pred_posthoc_denorm_only_active),
+                                        "pred_posthoc_denorm_anchor_active": bool(pred_posthoc_denorm_anchor_active),
+                                        "pred_posthoc_denorm_anchor_posthoc": bool(pred_posthoc_denorm_anchor_posthoc),
                                         "pred_force_raw_output": bool(pred_force_raw_output),
                                         "pred_posthoc_reject_low_diversity": bool(pred_posthoc_reject_low_diversity),
                                         "pred_posthoc_reject_partial_like": bool(pred_posthoc_reject_partial_like),
@@ -9279,6 +9407,7 @@ def infer(
                                                                         float((coarse_stats_post or {}).get("uniq_le3_frac", float("nan"))),
                                                                         float((coarse_stats_post or {}).get("std_p50", float("nan"))),
                                                                     )
+                                                                posthoc_reactivity_compressed = False
                                                                 if bool(pred_posthoc_reject_reactivity_compression):
                                                                     try:
                                                                         reactivity_ref_post: torch.Tensor | None = None
@@ -9315,6 +9444,7 @@ def infer(
                                                                                 < float(pred_posthoc_min_reactivity_ratio)
                                                                             ):
                                                                                 preds_fix2_post_ok = False
+                                                                                posthoc_reactivity_compressed = True
                                                                                 _LOGGER.warning(
                                                                                     "[infer] posthoc calibration remained overly compressed vs raw-denorm signal (reactivity ratio p50=%.5f, p10=%.5f, frac<0.25=%.5f); trying denorm-only fallback before using raw outputs.",
                                                                                     float((react_stats_post or {}).get("ratio_p50", float("nan"))),
@@ -9428,6 +9558,33 @@ def infer(
                                                             preds_fix2_denorm = None
                                                             preds_fix2_denorm_ok = False
                                                     if (
+                                                        isinstance(preds_fix2_denorm, torch.Tensor)
+                                                        and bool(preds_fix2_denorm_ok)
+                                                        and bool(pred_posthoc_denorm_anchor_posthoc)
+                                                        and isinstance(preds_fix2_post, torch.Tensor)
+                                                        and str(_get_pred_raw_output_space() or "z") == "z"
+                                                        and (
+                                                            bool(posthoc_reactivity_compressed)
+                                                            or bool(lowdiv_like_post)
+                                                            or bool(coarse_lowdiv_post)
+                                                        )
+                                                    ):
+                                                        try:
+                                                            preds_fix2_denorm = _anchor_denorm_to_posthoc_center(
+                                                                preds_fix2_denorm,
+                                                                preds_fix2_post,
+                                                            )
+                                                            pred_posthoc_denorm_anchor_active = True
+                                                        except Exception as e:
+                                                            pred_posthoc_denorm_anchor_active = False
+                                                            _LOGGER.warning(
+                                                                "[infer] anchored denorm-only fallback failed (%s: %s); keeping plain denorm-only scaling for this batch.",
+                                                                type(e).__name__,
+                                                                str(e),
+                                                            )
+                                                    else:
+                                                        pred_posthoc_denorm_anchor_active = False
+                                                    if (
                                                         preds_fix2 is not None
                                                         and bool(preds_fix2_raw_ok)
                                                         and (not bool(preds_fix2_post_ok))
@@ -9441,6 +9598,7 @@ def infer(
                                                         preds = preds_fix2_post
                                                         pred_posthoc_calibrate_active = True
                                                         pred_posthoc_denorm_only_active = False
+                                                        pred_posthoc_denorm_anchor_active = False
                                                         pred_force_raw_output = False
                                                         _LOGGER.warning(
                                                             "[infer] using per-sample raw predictions with posthoc output calibration for this batch; keeping posthoc calibration for remaining prediction microbatches."
@@ -9450,14 +9608,20 @@ def infer(
                                                         pred_posthoc_calibrate_active = False
                                                         pred_posthoc_denorm_only_active = True
                                                         pred_force_raw_output = False
-                                                        _LOGGER.warning(
-                                                            "[infer] using per-sample raw predictions with denorm-only output scaling for this batch; keeping denorm-only scaling for remaining prediction microbatches."
-                                                        )
+                                                        if bool(pred_posthoc_denorm_anchor_active):
+                                                            _LOGGER.warning(
+                                                                "[infer] using per-sample raw predictions with denorm-only output scaling anchored to posthoc-calibrated center for this batch; keeping anchored denorm-only scaling for remaining prediction microbatches."
+                                                            )
+                                                        else:
+                                                            _LOGGER.warning(
+                                                                "[infer] using per-sample raw predictions with denorm-only output scaling for this batch; keeping denorm-only scaling for remaining prediction microbatches."
+                                                            )
                                                     elif preds_fix2 is not None:
                                                         preds = preds_fix2
                                                         if bool(pred_persist_raw_mode):
                                                             pred_posthoc_calibrate_active = False
                                                             pred_posthoc_denorm_only_active = False
+                                                            pred_posthoc_denorm_anchor_active = False
                                                             pred_force_raw_output = True
                                                             if str(_get_pred_raw_output_space() or "z") == "y":
                                                                 _LOGGER.warning(
