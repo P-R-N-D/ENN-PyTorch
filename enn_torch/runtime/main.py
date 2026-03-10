@@ -6260,6 +6260,9 @@ def infer(
             pred_posthoc_calibrate_active = False
             pred_posthoc_denorm_only_active = False
             pred_posthoc_denorm_anchor_active = False
+            pred_posthoc_denorm_anchor_runtime_enabled = bool(
+                pred_posthoc_denorm_anchor_posthoc
+            )
             pred_posthoc_denorm_anchor_warned = False
             pred_posthoc_denorm_anchor_skip_warned = False
             pred_force_raw_output = False
@@ -7433,6 +7436,26 @@ def infer(
                     "std_max": float(std.max().item()) if int(std.numel()) > 0 else float("nan"),
                 }
 
+            def _disable_posthoc_denorm_anchor(
+                err: BaseException | None = None,
+                *,
+                log_message: str,
+            ) -> None:
+                nonlocal pred_posthoc_denorm_anchor_active, pred_posthoc_denorm_anchor_runtime_enabled, pred_posthoc_denorm_anchor_skip_warned
+                pred_posthoc_denorm_anchor_active = False
+                pred_posthoc_denorm_anchor_runtime_enabled = False
+                if not bool(pred_posthoc_denorm_anchor_skip_warned):
+                    pred_posthoc_denorm_anchor_skip_warned = True
+                    if err is None:
+                        _LOGGER.warning("%s", log_message)
+                    else:
+                        _LOGGER.warning(
+                            "%s (%s: %s).",
+                            log_message,
+                            type(err).__name__,
+                            str(err),
+                        )
+
             def _td_predict(
                 x: torch.Tensor,
                 *,
@@ -7440,7 +7463,7 @@ def infer(
                 use_uncompiled: bool | None = None,
                 force_fp32: bool = False,
             ) -> torch.Tensor:
-                nonlocal pred_posthoc_calibrate_active, pred_posthoc_denorm_only_active, pred_posthoc_denorm_anchor_active, pred_posthoc_denorm_anchor_warned, pred_posthoc_denorm_anchor_skip_warned, pred_force_raw_output
+                nonlocal pred_posthoc_calibrate_active, pred_posthoc_denorm_only_active, pred_posthoc_denorm_anchor_active, pred_posthoc_denorm_anchor_runtime_enabled, pred_posthoc_denorm_anchor_warned, pred_posthoc_denorm_anchor_skip_warned, pred_force_raw_output
                 uc = (
                     bool(force_uncompiled)
                     if use_uncompiled is None
@@ -7483,7 +7506,7 @@ def infer(
                         ):
                             with contextlib.suppress(Exception):
                                 out_post = out_post.contiguous()
-                        if bool(pred_posthoc_denorm_anchor_posthoc) and str(raw_output_space) == "z":
+                        if bool(pred_posthoc_denorm_anchor_runtime_enabled) and str(raw_output_space) == "z":
                             try:
                                 out_cal = _posthoc_calibrate_prediction(
                                     out_raw,
@@ -7503,14 +7526,10 @@ def infer(
                                             "[infer] using denorm-only output scaling anchored to posthoc-calibrated center for remaining prediction microbatches."
                                         )
                             except Exception as e_anchor:
-                                pred_posthoc_denorm_anchor_active = False
-                                if not bool(pred_posthoc_denorm_anchor_skip_warned):
-                                    pred_posthoc_denorm_anchor_skip_warned = True
-                                    _LOGGER.warning(
-                                        "[infer] skipping anchored denorm-only persistence and keeping plain denorm-only scaling (%s: %s).",
-                                        type(e_anchor).__name__,
-                                        str(e_anchor),
-                                    )
+                                _disable_posthoc_denorm_anchor(
+                                    e_anchor,
+                                    log_message="[infer] skipping anchored denorm-only persistence and keeping plain denorm-only scaling; disabling future anchor attempts",
+                                )
                         else:
                             pred_posthoc_denorm_anchor_active = False
                         return out_post.detach()
@@ -7923,6 +7942,7 @@ def infer(
                                         "pred_posthoc_denorm_only_active": bool(pred_posthoc_denorm_only_active),
                                         "pred_posthoc_denorm_anchor_active": bool(pred_posthoc_denorm_anchor_active),
                                         "pred_posthoc_denorm_anchor_posthoc": bool(pred_posthoc_denorm_anchor_posthoc),
+                                        "pred_posthoc_denorm_anchor_runtime_enabled": bool(pred_posthoc_denorm_anchor_runtime_enabled),
                                         "pred_force_raw_output": bool(pred_force_raw_output),
                                         "pred_posthoc_reject_low_diversity": bool(pred_posthoc_reject_low_diversity),
                                         "pred_posthoc_reject_partial_like": bool(pred_posthoc_reject_partial_like),
@@ -9660,7 +9680,7 @@ def infer(
                                                     if (
                                                         isinstance(preds_fix2_denorm, torch.Tensor)
                                                         and bool(preds_fix2_denorm_ok)
-                                                        and bool(pred_posthoc_denorm_anchor_posthoc)
+                                                        and bool(pred_posthoc_denorm_anchor_runtime_enabled)
                                                         and isinstance(preds_fix2_post, torch.Tensor)
                                                         and str(_get_pred_raw_output_space() or "z") == "z"
                                                         and (
@@ -9676,11 +9696,9 @@ def infer(
                                                             )
                                                             pred_posthoc_denorm_anchor_active = True
                                                         except Exception as e:
-                                                            pred_posthoc_denorm_anchor_active = False
-                                                            _LOGGER.warning(
-                                                                "[infer] anchored denorm-only fallback failed (%s: %s); keeping plain denorm-only scaling for this batch.",
-                                                                type(e).__name__,
-                                                                str(e),
+                                                            _disable_posthoc_denorm_anchor(
+                                                                e,
+                                                                log_message="[infer] anchored denorm-only fallback failed; keeping plain denorm-only scaling for this batch and disabling future anchor attempts",
                                                             )
                                                     else:
                                                         pred_posthoc_denorm_anchor_active = False
