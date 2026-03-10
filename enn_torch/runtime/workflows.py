@@ -694,12 +694,19 @@ def _maybe_break_prediction_exact_ties(
             for s in range(0, int(count), step):
                 e = min(int(count), s + step)
                 y_src[s:e] = y_cpu[s:e].to(device="cpu", dtype=target_dtype)
-            logger.warning(
-                "predict: exact-tie breaker adjusted %d element(s) across %d output cell(s) and %d tie-group(s)",
-                int(stats.get("changed_elements", 0) or 0),
-                int(stats.get("changed_cells", 0) or 0),
-                int(stats.get("changed_groups", 0) or 0),
+            tie_log_enabled = bool(
+                env_bool(
+                    "ENN_PRED_LOG_EXACT_TIE_BREAKER",
+                    default=(not bool(env_bool("ENN_PRED_CONCISE_LOG", default=True))),
+                )
             )
+            if bool(tie_log_enabled):
+                logger.warning(
+                    "predict: exact-tie breaker adjusted %d element(s) across %d output cell(s) and %d tie-group(s)",
+                    int(stats.get("changed_elements", 0) or 0),
+                    int(stats.get("changed_cells", 0) or 0),
+                    int(stats.get("changed_groups", 0) or 0),
+                )
         return {
             "changed_elements": int(stats.get("changed_elements", 0) or 0),
             "changed_cells": int(stats.get("changed_cells", 0) or 0),
