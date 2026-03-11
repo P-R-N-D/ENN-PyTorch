@@ -5382,6 +5382,12 @@ def infer(
                         "y_diff_calibrated": float(y_diff_cal),
                         "atol": float(broadcast_atol),
                         "calibrate_pred_output": bool(calibrate_pred_output),
+                        "pred_compare_force_requested_candidate": bool(
+                            pred_compare_force_requested_candidate
+                        ),
+                        "pred_compare_force_requested_candidate_source": str(
+                            pred_compare_force_requested_candidate_source
+                        ),
                         "pred_tail_force_fp32_requested": getattr(
                             m0, "_pred_tail_force_fp32_requested", None
                         ),
@@ -5570,6 +5576,12 @@ def infer(
                         "y_diff_calibrated": float(y_diff_cal),
                         "calibrate_pred_output": bool(calibrate_pred_output),
                         "broadcast_atol": float(broadcast_atol),
+                        "pred_compare_force_requested_candidate": bool(
+                            pred_compare_force_requested_candidate
+                        ),
+                        "pred_compare_force_requested_candidate_source": str(
+                            pred_compare_force_requested_candidate_source
+                        ),
                         "X": _tensor_diag(Xi2),
                         "tokens": _tensor_diag(tokens),
                         "context_z": _tensor_diag(assembled),
@@ -6007,6 +6019,13 @@ def infer(
                     "assembled_absmax": float(assembled_absmax) if math.isfinite(assembled_absmax) else None,
                     "y_hat_z_absmax": float(y_hat_z_absmax) if math.isfinite(y_hat_z_absmax) else None,
                     "bf16_tail_quantization_risk": bool(bf16_tail_quantization_risk),
+                    "pred_compare_force_requested_candidate": bool(
+                        diag.get("pred_compare_force_requested_candidate", False)
+                    ),
+                    "pred_compare_force_requested_candidate_source": str(
+                        diag.get("pred_compare_force_requested_candidate_source", "")
+                        or ""
+                    ),
                     "pred_tail_force_fp32_requested": bool(tail_fp32_requested),
                     "pred_tail_force_fp32_effective": bool(tail_fp32_effective),
                     "pred_tail_force_fp32_skip_reason": str(tail_fp32_skip_reason),
@@ -6597,12 +6616,28 @@ def infer(
                     0.25,
                 )
             )
-            pred_compare_force_requested_candidate = bool(
-                env_bool(
-                    "ENN_PRED_COMPARE_FORCE_REQUESTED_CANDIDATE",
-                    default=False,
-                )
+            pred_compare_force_requested_candidate_source = "env"
+            pred_compare_force_requested_candidate_cfg = getattr(
+                ops,
+                "compare_force_requested_candidate",
+                None,
             )
+            if pred_compare_force_requested_candidate_cfg is None:
+                pred_compare_force_requested_candidate = bool(
+                    env_bool(
+                        "ENN_PRED_COMPARE_FORCE_REQUESTED_CANDIDATE",
+                        default=False,
+                    )
+                )
+                if not bool(pred_compare_force_requested_candidate):
+                    pred_compare_force_requested_candidate_source = "off"
+            else:
+                pred_compare_force_requested_candidate = bool(
+                    pred_compare_force_requested_candidate_cfg
+                )
+                pred_compare_force_requested_candidate_source = (
+                    "ops" if bool(pred_compare_force_requested_candidate) else "ops_off"
+                )
             pred_compare_force_requested_warned = False
             pred_compare_force_requested_fallback_warned = False
             pred_persist_raw_mode = bool(
@@ -6739,7 +6774,13 @@ def infer(
                     items.insert(insert_at, f"tail_fp32={tail_status}")
                 if bool(pred_compare_force_requested_candidate):
                     insert_at = 1 if items else 0
-                    items.insert(insert_at, "compare=requested_candidate")
+                    comp_label = "compare=requested_candidate"
+                    comp_source = str(
+                        pred_compare_force_requested_candidate_source or ""
+                    ).strip()
+                    if comp_source:
+                        comp_label = f"{comp_label}@{comp_source}"
+                    items.insert(insert_at, comp_label)
                 if bool(pred_auto_safe_mode_active):
                     safe_label = "+".join(pred_auto_safe_mode_reasons[:2]).strip()
                     if safe_label:

@@ -860,6 +860,7 @@ class RuntimeConfig:
     model_ckpt_dir: Optional[str] = None
     keys: Optional[Sequence[Any]] = None
     loss_skew: bool = True
+    compare_force_requested_candidate: Optional[bool] = None
     _COMMON_KEYS: ClassVar[frozenset[str]] = frozenset(
         {"in_dim", "out_shape", "cfg_dict"}
     )
@@ -902,6 +903,7 @@ class RuntimeConfig:
             "loss_skew",
             "train_weights",
             "val_weights",
+            "compare_force_requested_candidate",
         }
     )
     TRAIN_POS_ORDER: ClassVar[Tuple[str, ...]] = (
@@ -1106,6 +1108,17 @@ class RuntimeConfig:
             shuffle=_coerce_bool(data.get("shuffle", False), name="shuffle"),
             loss_skew=_coerce_bool(
                 data.get("loss_skew", True), name="loss_skew"
+            ),
+            compare_force_requested_candidate=(
+                _coerce_bool(
+                    data.get("compare_force_requested_candidate"),
+                    name="compare_force_requested_candidate",
+                )
+                if (
+                    "compare_force_requested_candidate" in data
+                    and data.get("compare_force_requested_candidate") is not None
+                )
+                else None
             ),
             train_weights=(
                 _coerce_weights_spec(
