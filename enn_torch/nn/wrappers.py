@@ -6013,6 +6013,139 @@ class Model(nn.Module):
             isinstance(amp_dtype, torch.dtype)
             and amp_dtype is not torch.float64
         )
+        def _pred_tail_force_fp32_param_status() -> tuple[bool, tuple[str, ...]]:
+            cache_enabled = bool(
+                env_bool("ENN_PRED_TAIL_FORCE_FP32_PARAM_CACHE", default=True)
+            )
+            sentinel_key = ("", "", -1)
+            with contextlib.suppress(Exception):
+                for _param in self.parameters():
+                    if (
+                        isinstance(_param, torch.Tensor)
+                        and _param.is_floating_point()
+                    ):
+                        sentinel_key = (
+                            str(_param.dtype),
+                            str(_param.device),
+                            int(getattr(_param, "_version", -1)),
+                        )
+                        break
+            if cache_enabled:
+                cache = getattr(
+                    self, "_pred_tail_force_fp32_param_status_cache", None
+                )
+                if isinstance(cache, dict) and tuple(
+                    cache.get("sentinel_key", ())
+                ) == tuple(sentinel_key):
+                    return (
+                        bool(cache.get("has_bf16_params", False)),
+                        tuple(
+                            str(v)
+                            for v in tuple(cache.get("float_param_dtypes", ()))
+                        ),
+                    )
+            has_bf16_params = False
+            float_param_dtypes: set[str] = set()
+            with contextlib.suppress(Exception):
+                for _param in self.parameters():
+                    if (
+                        isinstance(_param, torch.Tensor)
+                        and _param.is_floating_point()
+                    ):
+                        dtype_s = str(_param.dtype)
+                        float_param_dtypes.add(dtype_s)
+                        if _param.dtype == torch.bfloat16:
+                            has_bf16_params = True
+            dtype_tuple = tuple(sorted(float_param_dtypes))
+            if cache_enabled:
+                setattr(
+                    self,
+                    "_pred_tail_force_fp32_param_status_cache",
+                    {
+                        "sentinel_key": tuple(sentinel_key),
+                        "has_bf16_params": bool(has_bf16_params),
+                        "float_param_dtypes": dtype_tuple,
+                    },
+                )
+            return bool(has_bf16_params), dtype_tuple
+
+        pred_tail_force_fp32_requested = bool(
+            infer_mode
+            and (not self.training)
+            and (getattr(device, "type", None) == "cuda")
+            and env_bool(
+                "ENN_PRED_TAIL_FORCE_FP32",
+                default=bool(
+                    env_bool("ENN_PRED_TAIL_FORCE_FP32_AUTO", default=True)
+                    and isinstance(amp_dtype, torch.dtype)
+                    and amp_dtype == torch.bfloat16
+                ),
+            )
+        )
+        pred_tail_force_fp32 = bool(pred_tail_force_fp32_requested)
+        pred_tail_force_fp32_has_bf16_params = False
+        pred_tail_force_fp32_skip_reason = ""
+        pred_tail_force_fp32_float_param_dtypes: tuple[str, ...] = tuple()
+        if bool(pred_tail_force_fp32_requested):
+            (
+                pred_tail_force_fp32_has_bf16_params,
+                pred_tail_force_fp32_float_param_dtypes,
+            ) = _pred_tail_force_fp32_param_status()
+            if bool(pred_tail_force_fp32_has_bf16_params):
+                pred_tail_force_fp32 = False
+                pred_tail_force_fp32_skip_reason = "bf16_params"
+                if env_bool("ENN_PRED_TAIL_FORCE_FP32_LOG", default=True) and (
+                    not bool(
+                        getattr(
+                            self,
+                            "_pred_tail_force_fp32_bf16_params_warned",
+                            False,
+                        )
+                    )
+                ):
+                    setattr(
+                        self,
+                        "_pred_tail_force_fp32_bf16_params_warned",
+                        True,
+                    )
+                    _LOGGER.warning(
+                        "[ENN][predict] skipping fp32 encoder/decoder tail because model parameters are bf16; keeping autocast path to avoid dtype mismatches (floating dtypes=%s).",
+                        ",".join(pred_tail_force_fp32_float_param_dtypes)
+                        if pred_tail_force_fp32_float_param_dtypes
+                        else "unknown",
+                    )
+        setattr(
+            self,
+            "_pred_tail_force_fp32_requested",
+            bool(pred_tail_force_fp32_requested),
+        )
+        setattr(
+            self,
+            "_pred_tail_force_fp32_effective",
+            bool(pred_tail_force_fp32),
+        )
+        setattr(
+            self,
+            "_pred_tail_force_fp32_has_bf16_params",
+            bool(pred_tail_force_fp32_has_bf16_params),
+        )
+        setattr(
+            self,
+            "_pred_tail_force_fp32_skip_reason",
+            str(pred_tail_force_fp32_skip_reason),
+        )
+        setattr(
+            self,
+            "_pred_tail_force_fp32_float_param_dtypes",
+            tuple(str(v) for v in pred_tail_force_fp32_float_param_dtypes),
+        )
+        if bool(pred_tail_force_fp32) and env_bool(
+            "ENN_PRED_TAIL_FORCE_FP32_LOG", default=True
+        ) and (not bool(getattr(self, "_pred_tail_force_fp32_warned", False))):
+            setattr(self, "_pred_tail_force_fp32_warned", True)
+            _LOGGER.warning(
+                "[ENN][predict] enabling fp32 encoder/decoder tail for inference to reduce bf16 output quantization that can flatten low-reactivity predictions."
+            )
         is_cls_loss = (
             isinstance(net_loss, (nn.CrossEntropyLoss, nn.NLLLoss))
             if net_loss is not None
@@ -6053,6 +6186,8 @@ class Model(nn.Module):
                     base_dtype = next(self.parameters()).dtype
                 except Exception:
                     base_dtype = master_dtype
+            if bool(pred_tail_force_fp32):
+                base_dtype = torch.float32
             if (
                 isinstance(x_scaled, torch.Tensor)
                 and x_scaled.device != device
@@ -6099,9 +6234,13 @@ class Model(nn.Module):
                 inp: torch.Tensor,
             ) -> Tuple[torch.Tensor, Any]:
                 with (
-                    StatelessAutocast.float(device, metadata=meta)
-                    if amp_enabled
-                    else StatelessAutocast.suspend(device)
+                    StatelessAutocast.suspend(device)
+                    if bool(pred_tail_force_fp32)
+                    else (
+                        StatelessAutocast.float(device, metadata=meta)
+                        if amp_enabled
+                        else StatelessAutocast.suspend(device)
+                    )
                 ):
                     return self.fuser(inp)
 
@@ -6164,6 +6303,11 @@ class Model(nn.Module):
             context = _coerce_tensor(
                 context, enabled=sanitize_enabled, inplace=sanitize_inplace
             )
+            if bool(pred_tail_force_fp32):
+                if isinstance(tokens, torch.Tensor) and tokens.is_floating_point() and tokens.dtype != torch.float32:
+                    tokens = tokens.to(dtype=torch.float32)
+                if isinstance(context, torch.Tensor) and context.is_floating_point() and context.dtype != torch.float32:
+                    context = context.to(dtype=torch.float32)
             if exporting:
                 assembled = context.reshape(context.shape[0], -1)
             else:
@@ -6206,6 +6350,8 @@ class Model(nn.Module):
                 enabled=sanitize_enabled,
                 inplace=sanitize_inplace,
             )
+            if bool(pred_tail_force_fp32) and isinstance(refined_tokens, torch.Tensor) and refined_tokens.is_floating_point() and refined_tokens.dtype != torch.float32:
+                refined_tokens = refined_tokens.to(dtype=torch.float32)
             ctrl_mb = max(
                 1,
                 min(
@@ -6223,19 +6369,28 @@ class Model(nn.Module):
                 dc = getattr(self, "_decode_compiled", None)
 
                 def _run_decode_chunk(chunk: torch.Tensor) -> torch.Tensor:
+                    chunk_in = chunk
+                    if bool(pred_tail_force_fp32) and isinstance(chunk_in, torch.Tensor) and chunk_in.is_floating_point() and chunk_in.dtype != torch.float32:
+                        chunk_in = chunk_in.to(dtype=torch.float32)
                     with (
-                        StatelessAutocast.float(device, metadata=meta)
-                        if amp_enabled
-                        else StatelessAutocast.suspend(device)
+                        StatelessAutocast.suspend(device)
+                        if bool(pred_tail_force_fp32)
+                        else (
+                            StatelessAutocast.float(device, metadata=meta)
+                            if amp_enabled
+                            else StatelessAutocast.suspend(device)
+                        )
                     ):
+                        if bool(pred_tail_force_fp32):
+                            return self.fuser.decode(chunk_in, apply_norm=True)
                         if dc is not None:
                             if cg_ok and (getattr(device, "type", None) == "cuda"):
                                 cudagraph_mark_step_begin()
-                                out = cast(torch.Tensor, dc(chunk))
+                                out = cast(torch.Tensor, dc(chunk_in))
                                 cudagraph_mark_step_end()
                                 return out
-                            return cast(torch.Tensor, dc(chunk))
-                        return self.fuser.decode(chunk, apply_norm=True)
+                            return cast(torch.Tensor, dc(chunk_in))
+                        return self.fuser.decode(chunk_in, apply_norm=True)
 
                 dec_static_in: torch.Tensor | None = None
                 if (
@@ -6289,6 +6444,8 @@ class Model(nn.Module):
                 enabled=sanitize_enabled,
                 inplace=sanitize_inplace,
             )
+            if bool(pred_tail_force_fp32) and isinstance(residual_context, torch.Tensor) and residual_context.is_floating_point() and residual_context.dtype != torch.float32:
+                residual_context = residual_context.to(dtype=torch.float32)
             enhanced = residual_context.reshape(b, -1)
             if enhanced.dtype != assembled.dtype:
                 enhanced = enhanced.to(dtype=assembled.dtype)

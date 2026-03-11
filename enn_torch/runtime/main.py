@@ -5289,6 +5289,15 @@ def infer(
                                                 }
                     except Exception:
                         pass
+                    pred_tail_force_fp32_float_param_dtypes = getattr(
+                        m0, "_pred_tail_force_fp32_float_param_dtypes", None
+                    )
+                    if isinstance(pred_tail_force_fp32_float_param_dtypes, tuple):
+                        pred_tail_force_fp32_float_param_dtypes = list(
+                            pred_tail_force_fp32_float_param_dtypes
+                        )
+                    if not isinstance(pred_tail_force_fp32_float_param_dtypes, list):
+                        pred_tail_force_fp32_float_param_dtypes = []
                     diag: dict[str, object] = {
                         "where": str(where),
                         "nonfinite_pre_sanitize": nonfinite_pre_sanitize,
@@ -5300,6 +5309,23 @@ def infer(
                         "y_diff_calibrated": float(y_diff_cal),
                         "atol": float(broadcast_atol),
                         "calibrate_pred_output": bool(calibrate_pred_output),
+                        "pred_tail_force_fp32_requested": getattr(
+                            m0, "_pred_tail_force_fp32_requested", None
+                        ),
+                        "pred_tail_force_fp32_effective": getattr(
+                            m0, "_pred_tail_force_fp32_effective", None
+                        ),
+                        "pred_tail_force_fp32_has_bf16_params": getattr(
+                            m0, "_pred_tail_force_fp32_has_bf16_params", None
+                        ),
+                        "pred_tail_force_fp32_skip_reason": str(
+                            getattr(m0, "_pred_tail_force_fp32_skip_reason", "")
+                            or ""
+                        ),
+                        "pred_tail_force_fp32_float_param_dtypes": [
+                            str(v)
+                            for v in pred_tail_force_fp32_float_param_dtypes
+                        ],
                         "diff_tokens": float(_pair_diff_max(tokens) or 0.0),
                         "diff_assembled_z": float(_pair_diff_max(assembled) or 0.0),
                         "diff_refined": float(_pair_diff_max(refined) or 0.0),
@@ -5788,6 +5814,46 @@ def infer(
                 tokens = abs(
                     _collapse_triage_safe_float(diag.get("diff_tokens", float("nan")))
                 )
+                def _triage_tensor_meta(name: str) -> tuple[str, float]:
+                    node = diag.get(name, None)
+                    if not isinstance(node, dict):
+                        return "", float("nan")
+                    dtype_s = str(node.get("dtype", "") or "")
+                    abs_max_v = abs(
+                        _collapse_triage_safe_float(node.get("abs_max", float("nan")))
+                    )
+                    return dtype_s, abs_max_v
+                assembled_dtype, assembled_absmax = _triage_tensor_meta("assembled_z")
+                y_hat_z_dtype, y_hat_z_absmax = _triage_tensor_meta("y_hat_z")
+                tail_fp32_requested_raw = diag.get("pred_tail_force_fp32_requested", None)
+                tail_fp32_effective_raw = diag.get("pred_tail_force_fp32_effective", None)
+                tail_fp32_skip_reason = str(
+                    diag.get("pred_tail_force_fp32_skip_reason", "") or ""
+                )
+                tail_fp32_param_dtypes = diag.get(
+                    "pred_tail_force_fp32_float_param_dtypes", []
+                )
+                if isinstance(tail_fp32_param_dtypes, tuple):
+                    tail_fp32_param_dtypes = list(tail_fp32_param_dtypes)
+                if not isinstance(tail_fp32_param_dtypes, list):
+                    tail_fp32_param_dtypes = []
+                tail_fp32_requested = (
+                    bool(tail_fp32_requested_raw)
+                    if isinstance(tail_fp32_requested_raw, (bool, int, float))
+                    else False
+                )
+                tail_fp32_effective = (
+                    bool(tail_fp32_effective_raw)
+                    if isinstance(tail_fp32_effective_raw, (bool, int, float))
+                    else False
+                )
+                tail_fp32_status = "off"
+                if bool(tail_fp32_effective):
+                    tail_fp32_status = "enabled"
+                elif bool(tail_fp32_requested) and str(tail_fp32_skip_reason) == "bf16_params":
+                    tail_fp32_status = "skipped_bf16_params"
+                elif bool(tail_fp32_requested):
+                    tail_fp32_status = "requested_but_disabled"
                 clip_only = bool(_pred_output_ab_clip_only_active())
                 eps_tiny = max(64.0 * float(atol), 1e-4)
                 eps_small = max(256.0 * float(atol), 1e-3)
@@ -5817,6 +5883,28 @@ def infer(
                         and y_hat_z > eps_small
                     ):
                         label = "denorm_or_final_mapping_collapse"
+                bf16_tail_quantization_risk = bool(
+                    str(assembled_dtype).lower() in {"torch.bfloat16", "bfloat16"}
+                    or str(y_hat_z_dtype).lower() in {"torch.bfloat16", "bfloat16"}
+                ) and bool(
+                    (math.isfinite(assembled_absmax) and assembled_absmax >= 64.0)
+                    or (math.isfinite(y_hat_z_absmax) and y_hat_z_absmax >= 64.0)
+                ) and bool(
+                    (math.isfinite(tokens) and tokens > eps_tiny)
+                    or (math.isfinite(refined) and refined > eps_tiny)
+                ) and bool(
+                    math.isfinite(y_hat_z)
+                    and y_hat_z <= max(1.5, 64.0 * eps_mid)
+                )
+                if str(label) == "mixed_or_unclear" and bool(bf16_tail_quantization_risk):
+                    label = "bf16_tail_quantization_risk"
+                if (
+                    str(label) == "bf16_tail_quantization_risk"
+                    and bool(tail_fp32_requested)
+                    and (not bool(tail_fp32_effective))
+                    and str(tail_fp32_skip_reason) == "bf16_params"
+                ):
+                    label = "bf16_tail_quantization_risk_guarded_off"
                 details = {
                     "likely_root": str(label),
                     "output_ab_clip_only": bool(clip_only),
@@ -5830,6 +5918,18 @@ def infer(
                     "refined_pair_max": float(refined) if math.isfinite(refined) else None,
                     "assembled_pair_max": float(assembled) if math.isfinite(assembled) else None,
                     "tokens_pair_max": float(tokens) if math.isfinite(tokens) else None,
+                    "assembled_dtype": str(assembled_dtype),
+                    "y_hat_z_dtype": str(y_hat_z_dtype),
+                    "assembled_absmax": float(assembled_absmax) if math.isfinite(assembled_absmax) else None,
+                    "y_hat_z_absmax": float(y_hat_z_absmax) if math.isfinite(y_hat_z_absmax) else None,
+                    "bf16_tail_quantization_risk": bool(bf16_tail_quantization_risk),
+                    "pred_tail_force_fp32_requested": bool(tail_fp32_requested),
+                    "pred_tail_force_fp32_effective": bool(tail_fp32_effective),
+                    "pred_tail_force_fp32_skip_reason": str(tail_fp32_skip_reason),
+                    "pred_tail_force_fp32_status": str(tail_fp32_status),
+                    "pred_tail_force_fp32_float_param_dtypes": [
+                        str(v) for v in tail_fp32_param_dtypes
+                    ],
                     "atol": float(atol),
                 }
                 return str(label), details
@@ -6533,6 +6633,16 @@ def infer(
                     pred_collapse_triage_label or ""
                 ).strip():
                     items.insert(0, f"triage={str(pred_collapse_triage_label).strip()}")
+                if isinstance(pred_collapse_triage_payload, dict):
+                    tail_status = str(
+                        pred_collapse_triage_payload.get(
+                            "pred_tail_force_fp32_status", ""
+                        )
+                        or ""
+                    ).strip()
+                    if tail_status:
+                        insert_at = 1 if items else 0
+                        items.insert(insert_at, f"tail_fp32={tail_status}")
                 if not items:
                     return
                 shown_items = items[:10]
