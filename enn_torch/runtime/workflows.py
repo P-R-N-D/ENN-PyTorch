@@ -3897,6 +3897,8 @@ def predict(
                 ),
             )
         return out_multi
+    if "calibrate_output" in kwargs and "predict_calibrate_output" not in kwargs:
+        kwargs["predict_calibrate_output"] = kwargs.pop("calibrate_output")
     underflow_action = kwargs.pop(
         "underflow_action", default_underflow_action()
     )
