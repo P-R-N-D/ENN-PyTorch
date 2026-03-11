@@ -92,7 +92,26 @@ logger = logging.getLogger(__name__)
 
 
 
-def _emit_reactivity_aux_audit(model: torch.nn.Module) -> None:
+def _read_reactivity_aux_audit_payload(audit_path: str | None) -> dict[str, Any] | None:
+    path = str(audit_path or "").strip()
+    if not path or (not os.path.isfile(path)):
+        return None
+    try:
+        payload = read_json(path)
+    except Exception:
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                payload = json.load(f)
+        except Exception:
+            return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _emit_reactivity_aux_audit(
+    model: torch.nn.Module,
+    *,
+    audit_path: str | None = None,
+) -> None:
     if not env_bool("ENN_REACTIVITY_AUX_AUDIT", default=True):
         return
     try:
@@ -100,6 +119,22 @@ def _emit_reactivity_aux_audit(model: torch.nn.Module) -> None:
         applied_steps = int(getattr(model, "_reactivity_aux_audit_applied_steps", 0) or 0)
         last = getattr(model, "_reactivity_aux_audit_last", None)
         ema = getattr(model, "_reactivity_aux_audit_ema", None)
+        if (steps <= 0) and (not isinstance(last, dict)) and (not isinstance(ema, dict)):
+            payload = _read_reactivity_aux_audit_payload(audit_path)
+            if isinstance(payload, dict):
+                steps = int(payload.get("steps", 0) or 0)
+                applied_steps = int(payload.get("applied_steps", 0) or 0)
+                last_payload = payload.get("last")
+                ema_payload = payload.get("ema")
+                last = last_payload if isinstance(last_payload, dict) else None
+                ema = ema_payload if isinstance(ema_payload, dict) else None
+                with contextlib.suppress(Exception):
+                    setattr(model, "_reactivity_aux_audit_steps", steps)
+                    setattr(model, "_reactivity_aux_audit_applied_steps", applied_steps)
+                    if isinstance(last, dict):
+                        setattr(model, "_reactivity_aux_audit_last", last)
+                    if isinstance(ema, dict):
+                        setattr(model, "_reactivity_aux_audit_ema", ema)
         if (steps <= 0) and (not isinstance(last, dict)) and (not isinstance(ema, dict)):
             return
         parts: list[str] = [
@@ -3555,10 +3590,15 @@ def train(
             if isinstance(model, torch.nn.Module) and _has_meta_tensors(model):
                 with contextlib.suppress(Exception):
                     _materialize_to_cpu(model)
+            audit_path = os.path.join(
+                os.path.dirname(fallback),
+                "reactivity_aux_audit.json",
+            )
             try:
                 load_weights(
                     model, fallback, map_location="cpu", rebuild_tasks=True
                 )
+                _emit_reactivity_aux_audit(model, audit_path=audit_path)
             finally:
                 with contextlib.suppress(Exception):
                     os.remove(fallback)
@@ -3569,9 +3609,12 @@ def train(
                     if os.path.isfile(meta_path):
                         os.remove(meta_path)
                 with contextlib.suppress(Exception):
+                    if os.path.isfile(audit_path):
+                        os.remove(audit_path)
+                with contextlib.suppress(Exception):
                     d = os.path.dirname(fallback)
                     for name in os.listdir(d):
-                        if name.endswith(".tmp") and "model.pt" in name:
+                        if name.endswith(".tmp") and ("model.pt" in name or "reactivity_aux_audit.json" in name):
                             with contextlib.suppress(Exception):
                                 os.remove(os.path.join(d, name))
             _update_history(model, ckpt_dir, epochs, val_frac, num_samples_dataset)
@@ -3608,7 +3651,6 @@ def train(
                 if os.path.isfile(marker):
                     with contextlib.suppress(Exception):
                         shutil.rmtree(cand, ignore_errors=True)
-            _emit_reactivity_aux_audit(model)
             gc.collect()
             return model
         else:
@@ -3692,7 +3734,10 @@ def train(
                 meta=export_meta,
                 overwrite=bool(export_overwrite),
             )
-        _emit_reactivity_aux_audit(model)
+        _emit_reactivity_aux_audit(
+            model,
+            audit_path=os.path.join(str(ckpt_dir), "reactivity_aux_audit.json"),
+        )
         return model
     finally:
         restore_path: str | None = None

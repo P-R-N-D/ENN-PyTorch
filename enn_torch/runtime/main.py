@@ -373,6 +373,45 @@ def _schedule(
     )
 
 
+def _collect_reactivity_aux_audit_payload(model: Any) -> dict[str, object] | None:
+    if not env_bool("ENN_REACTIVITY_AUX_AUDIT", default=True):
+        return None
+    try:
+        steps = int(getattr(model, "_reactivity_aux_audit_steps", 0) or 0)
+        applied_steps = int(getattr(model, "_reactivity_aux_audit_applied_steps", 0) or 0)
+        last = getattr(model, "_reactivity_aux_audit_last", None)
+        ema = getattr(model, "_reactivity_aux_audit_ema", None)
+        if (steps <= 0) and (not isinstance(last, dict)) and (not isinstance(ema, dict)):
+            return None
+        payload: dict[str, object] = {
+            "steps": int(steps),
+            "applied_steps": int(applied_steps),
+        }
+        if isinstance(last, dict):
+            payload["last"] = last
+        if isinstance(ema, dict):
+            payload["ema"] = ema
+        return payload
+    except Exception:
+        return None
+
+
+def _write_reactivity_aux_audit_file(model: Any, out_dir: str) -> None:
+    payload = _collect_reactivity_aux_audit_payload(model)
+    if not isinstance(payload, dict) or not payload:
+        return
+    path = os.path.join(str(out_dir), "reactivity_aux_audit.json")
+    tmp = f"{path}.tmp.{os.getpid()}.{os.urandom(4).hex()}"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, path)
+    except Exception:
+        with contextlib.suppress(Exception):
+            if os.path.isfile(tmp):
+                os.remove(tmp)
+
+
 def _export_return_model_pt(
     model: Any,
     ckpt_dir: str,
@@ -504,6 +543,7 @@ def _export_return_model_pt(
 
         out_path = os.path.join(out_dir, "model.pt")
         _atomic_torch_save(sd_out, out_path)
+        _write_reactivity_aux_audit_file(model, out_dir)
 
         sd.clear()
         sd_out.clear()
