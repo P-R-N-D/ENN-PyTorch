@@ -6597,9 +6597,17 @@ def infer(
                     0.25,
                 )
             )
+            pred_compare_force_requested_candidate = bool(
+                env_bool(
+                    "ENN_PRED_COMPARE_FORCE_REQUESTED_CANDIDATE",
+                    default=False,
+                )
+            )
+            pred_compare_force_requested_warned = False
+            pred_compare_force_requested_fallback_warned = False
             pred_persist_raw_mode = bool(
                 env_bool("ENN_PRED_COLLAPSE_PERSIST_RAW_MODE", default=True)
-            )
+            ) and (not bool(pred_compare_force_requested_candidate))
             pred_raw_z_last_resort_denorm = bool(
                 env_bool(
                     "ENN_PRED_COLLAPSE_RAW_Z_LAST_RESORT_DENORM",
@@ -6729,6 +6737,9 @@ def infer(
                 if tail_status:
                     insert_at = 1 if items else 0
                     items.insert(insert_at, f"tail_fp32={tail_status}")
+                if bool(pred_compare_force_requested_candidate):
+                    insert_at = 1 if items else 0
+                    items.insert(insert_at, "compare=requested_candidate")
                 if bool(pred_auto_safe_mode_active):
                     safe_label = "+".join(pred_auto_safe_mode_reasons[:2]).strip()
                     if safe_label:
@@ -7931,7 +7942,7 @@ def infer(
                 use_uncompiled: bool | None = None,
                 force_fp32: bool = False,
             ) -> torch.Tensor:
-                nonlocal pred_posthoc_calibrate_active, pred_posthoc_denorm_only_active, pred_posthoc_denorm_anchor_active, pred_posthoc_denorm_anchor_runtime_enabled, pred_posthoc_denorm_anchor_warned, pred_posthoc_denorm_anchor_skip_warned, pred_force_raw_output, pred_raw_z_last_resort_denorm_runtime_enabled, pred_raw_z_last_resort_denorm_warned, pred_raw_z_last_resort_denorm_failed_warned
+                nonlocal pred_posthoc_calibrate_active, pred_posthoc_denorm_only_active, pred_posthoc_denorm_anchor_active, pred_posthoc_denorm_anchor_runtime_enabled, pred_posthoc_denorm_anchor_warned, pred_posthoc_denorm_anchor_skip_warned, pred_force_raw_output, pred_raw_z_last_resort_denorm_runtime_enabled, pred_raw_z_last_resort_denorm_warned, pred_raw_z_last_resort_denorm_failed_warned, pred_compare_force_requested_warned
                 uc = (
                     bool(force_uncompiled)
                     if use_uncompiled is None
@@ -7942,6 +7953,23 @@ def infer(
                     if calibrate_output is None
                     else bool(calibrate_output)
                 )
+                if bool(pred_compare_force_requested_candidate):
+                    out_direct = _run_model_predict_with_calibration(
+                        x,
+                        calibrate_output=bool(want_calibrate),
+                        use_uncompiled=uc,
+                        force_fp32=bool(force_fp32),
+                    )
+                    if isinstance(out_direct, tuple):
+                        out_direct = out_direct[0]
+                    if not isinstance(out_direct, torch.Tensor):
+                        raise RuntimeError("infer: unexpected model output type")
+                    if not bool(pred_compare_force_requested_warned):
+                        pred_compare_force_requested_warned = True
+                        _LOGGER.warning(
+                            "[infer] compare mode active; requested candidate path enabled and collapse persistence rewrites are bypassed."
+                        )
+                    return out_direct.detach()
                 raw_output_space = str(_get_pred_raw_output_space() or "z")
                 if bool(pred_posthoc_denorm_only_active) and str(raw_output_space) != "z":
                     pred_posthoc_denorm_only_active = False
@@ -9874,6 +9902,20 @@ def infer(
                                                                     force_uncompiled = bool(
                                                                         prev_force_uncompiled
                                                                     )
+                                                if (
+                                                    (not collapse_switched_raw)
+                                                    and bool(collapse_fallback_raw)
+                                                    and bool(calibrate_pred_output)
+                                                    and bool(pred_compare_force_requested_candidate)
+                                                ):
+                                                    collapse_switched_raw = True
+                                                    if not bool(
+                                                        pred_compare_force_requested_fallback_warned
+                                                    ):
+                                                        pred_compare_force_requested_fallback_warned = True
+                                                        _LOGGER.warning(
+                                                            "[infer] compare mode active; requested calibrated candidate kept, skipping raw-collapse fallback."
+                                                        )
                                                 if (
                                                     (not collapse_switched_raw)
                                                     and bool(collapse_fallback_raw)
