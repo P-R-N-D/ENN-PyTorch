@@ -6923,14 +6923,17 @@ class Model(nn.Module):
                         aux_eps_t = pred_flat.new_tensor(max(aux_eps, 1e-8))
                         pred_center = pred_flat - pred_flat.mean(dim=0, keepdim=True)
                         true_center = true_flat - true_flat.mean(dim=0, keepdim=True)
-                        pred_std = torch.sqrt(
-                            torch.mean(pred_center.square(), dim=0) + aux_eps_t
+                        pred_var_raw = torch.mean(pred_center.square(), dim=0)
+                        true_var_raw = torch.mean(true_center.square(), dim=0)
+                        pred_std = torch.sqrt(pred_var_raw + aux_eps_t)
+                        true_std = torch.sqrt(true_var_raw + aux_eps_t)
+                        valid = (
+                            torch.isfinite(pred_var_raw)
+                            & torch.isfinite(true_var_raw)
+                            & torch.isfinite(pred_std)
+                            & torch.isfinite(true_std)
                         )
-                        true_std = torch.sqrt(
-                            torch.mean(true_center.square(), dim=0) + aux_eps_t
-                        )
-                        valid = torch.isfinite(pred_std) & torch.isfinite(true_std)
-                        valid = valid & (true_std > aux_eps_t)
+                        valid = valid & (true_var_raw > aux_eps_t)
                         if bool(valid.any().item()):
                             pred_std_v = pred_std[valid]
                             true_std_v = true_std[valid]
