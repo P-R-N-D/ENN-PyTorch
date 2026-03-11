@@ -6100,35 +6100,11 @@ class Model(nn.Module):
             cache_enabled = bool(
                 env_bool("ENN_PRED_TAIL_FORCE_FP32_PARAM_CACHE", default=True)
             )
-            sentinel_key = ("", "", -1)
-            with contextlib.suppress(Exception):
-                for _param in self.parameters():
-                    if (
-                        isinstance(_param, torch.Tensor)
-                        and _param.is_floating_point()
-                    ):
-                        sentinel_key = (
-                            str(_param.dtype),
-                            str(_param.device),
-                            int(getattr(_param, "_version", -1)),
-                        )
-                        break
-            if cache_enabled:
-                cache = getattr(
-                    self, "_pred_tail_force_fp32_param_status_cache", None
-                )
-                if isinstance(cache, dict) and tuple(
-                    cache.get("sentinel_key", ())
-                ) == tuple(sentinel_key):
-                    return (
-                        bool(cache.get("has_bf16_params", False)),
-                        tuple(
-                            str(v)
-                            for v in tuple(cache.get("float_param_dtypes", ()))
-                        ),
-                    )
             has_bf16_params = False
             float_param_dtypes: set[str] = set()
+            float_param_signature: list[
+                tuple[str, str, tuple[int, ...], int]
+            ] = []
             with contextlib.suppress(Exception):
                 for _param in self.parameters():
                     if (
@@ -6137,15 +6113,66 @@ class Model(nn.Module):
                     ):
                         dtype_s = str(_param.dtype)
                         float_param_dtypes.add(dtype_s)
+                        float_param_signature.append(
+                            (
+                                dtype_s,
+                                str(_param.device),
+                                tuple(
+                                    int(v)
+                                    for v in tuple(
+                                        getattr(_param, "shape", ())
+                                    )
+                                ),
+                                int(getattr(_param, "_version", -1)),
+                            )
+                        )
                         if _param.dtype == torch.bfloat16:
                             has_bf16_params = True
             dtype_tuple = tuple(sorted(float_param_dtypes))
+            signature_tuple = tuple(float_param_signature)
             if cache_enabled:
+                cache = getattr(
+                    self, "_pred_tail_force_fp32_param_status_cache", None
+                )
+                cached_signature = tuple(cache.get("signature", ())) if isinstance(
+                    cache, dict
+                ) else tuple()
+                if isinstance(cache, dict) and cached_signature == signature_tuple:
+                    return (
+                        bool(cache.get("has_bf16_params", False)),
+                        tuple(
+                            str(v)
+                            for v in tuple(cache.get("float_param_dtypes", ()))
+                        ),
+                    )
+                if (
+                    isinstance(cache, dict)
+                    and bool(cached_signature)
+                    and cached_signature != signature_tuple
+                    and env_bool("ENN_PRED_TAIL_FORCE_FP32_LOG", default=True)
+                    and (
+                        not bool(
+                            getattr(
+                                self,
+                                "_pred_tail_force_fp32_param_cache_refresh_warned",
+                                False,
+                            )
+                        )
+                    )
+                ):
+                    setattr(
+                        self,
+                        "_pred_tail_force_fp32_param_cache_refresh_warned",
+                        True,
+                    )
+                    _LOGGER.warning(
+                        "[ENN][predict] refreshing fp32-tail param cache because floating parameter dtype/device state changed; re-evaluating bf16 guard from current parameters."
+                    )
                 setattr(
                     self,
                     "_pred_tail_force_fp32_param_status_cache",
                     {
-                        "sentinel_key": tuple(sentinel_key),
+                        "signature": signature_tuple,
                         "has_bf16_params": bool(has_bf16_params),
                         "float_param_dtypes": dtype_tuple,
                     },
