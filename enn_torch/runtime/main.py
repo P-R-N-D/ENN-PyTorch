@@ -5788,6 +5788,17 @@ def infer(
                 tokens = abs(
                     _collapse_triage_safe_float(diag.get("diff_tokens", float("nan")))
                 )
+                def _triage_tensor_meta(name: str) -> tuple[str, float]:
+                    node = diag.get(name, None)
+                    if not isinstance(node, dict):
+                        return "", float("nan")
+                    dtype_s = str(node.get("dtype", "") or "")
+                    abs_max_v = abs(
+                        _collapse_triage_safe_float(node.get("abs_max", float("nan")))
+                    )
+                    return dtype_s, abs_max_v
+                assembled_dtype, assembled_absmax = _triage_tensor_meta("assembled_z")
+                y_hat_z_dtype, y_hat_z_absmax = _triage_tensor_meta("y_hat_z")
                 clip_only = bool(_pred_output_ab_clip_only_active())
                 eps_tiny = max(64.0 * float(atol), 1e-4)
                 eps_small = max(256.0 * float(atol), 1e-3)
@@ -5817,6 +5828,21 @@ def infer(
                         and y_hat_z > eps_small
                     ):
                         label = "denorm_or_final_mapping_collapse"
+                bf16_tail_quantization_risk = bool(
+                    str(assembled_dtype).lower() in {"torch.bfloat16", "bfloat16"}
+                    or str(y_hat_z_dtype).lower() in {"torch.bfloat16", "bfloat16"}
+                ) and bool(
+                    (math.isfinite(assembled_absmax) and assembled_absmax >= 64.0)
+                    or (math.isfinite(y_hat_z_absmax) and y_hat_z_absmax >= 64.0)
+                ) and bool(
+                    (math.isfinite(tokens) and tokens > eps_tiny)
+                    or (math.isfinite(refined) and refined > eps_tiny)
+                ) and bool(
+                    math.isfinite(y_hat_z)
+                    and y_hat_z <= max(1.5, 64.0 * eps_mid)
+                )
+                if str(label) == "mixed_or_unclear" and bool(bf16_tail_quantization_risk):
+                    label = "bf16_tail_quantization_risk"
                 details = {
                     "likely_root": str(label),
                     "output_ab_clip_only": bool(clip_only),
@@ -5830,6 +5856,11 @@ def infer(
                     "refined_pair_max": float(refined) if math.isfinite(refined) else None,
                     "assembled_pair_max": float(assembled) if math.isfinite(assembled) else None,
                     "tokens_pair_max": float(tokens) if math.isfinite(tokens) else None,
+                    "assembled_dtype": str(assembled_dtype),
+                    "y_hat_z_dtype": str(y_hat_z_dtype),
+                    "assembled_absmax": float(assembled_absmax) if math.isfinite(assembled_absmax) else None,
+                    "y_hat_z_absmax": float(y_hat_z_absmax) if math.isfinite(y_hat_z_absmax) else None,
+                    "bf16_tail_quantization_risk": bool(bf16_tail_quantization_risk),
                     "atol": float(atol),
                 }
                 return str(label), details
