@@ -9914,8 +9914,120 @@ def infer(
                                                     ):
                                                         pred_compare_force_requested_fallback_warned = True
                                                         _LOGGER.warning(
-                                                            "[infer] compare mode active; requested calibrated candidate kept, skipping raw-collapse fallback."
+                                                            "[infer] compare mode active; keeping the requested calibrated candidate for this diagnostic run, but still probing calibrate_output=False fallback to honor persistent-collapse abort checks."
                                                         )
+                                                    if bool(collapse_abort):
+                                                        preds_fix2_abort: torch.Tensor | None = None
+                                                        for j in range(int(n_i)):
+                                                            x1_buf.copy_(Xi[j : j + 1])
+                                                            if dev_type == "cuda":
+                                                                cudagraph_mark_step_begin()
+                                                            pj2_abort = _td_predict(
+                                                                x1_buf,
+                                                                calibrate_output=False,
+                                                            )
+                                                            if dev_type == "cuda":
+                                                                cudagraph_mark_step_end()
+                                                            pj2_abort_cpu = pj2_abort.detach()
+                                                            if (
+                                                                getattr(
+                                                                    pj2_abort_cpu.device,
+                                                                    "type",
+                                                                    None,
+                                                                )
+                                                                != "cpu"
+                                                            ):
+                                                                pj2_abort_cpu = pj2_abort_cpu.to(
+                                                                    device="cpu"
+                                                                )
+                                                            with contextlib.suppress(
+                                                                Exception
+                                                            ):
+                                                                pj2_abort_cpu = (
+                                                                    pj2_abort_cpu.contiguous()
+                                                                )
+                                                            pj2_abort_cpu = (
+                                                                pj2_abort_cpu.clone()
+                                                            )
+                                                            if preds_fix2_abort is None:
+                                                                preds_fix2_abort = (
+                                                                    pj2_abort_cpu.new_empty(
+                                                                        (int(n_i),)
+                                                                        + tuple(
+                                                                            pj2_abort_cpu.shape[
+                                                                                1:
+                                                                            ]
+                                                                        )
+                                                                    )
+                                                                )
+                                                            preds_fix2_abort[
+                                                                j : j + 1
+                                                            ].copy_(
+                                                                pj2_abort_cpu[:1]
+                                                            )
+                                                        if (
+                                                            preds_fix2_abort is not None
+                                                            and int(
+                                                                preds_fix2_abort.shape[
+                                                                    0
+                                                                ]
+                                                            )
+                                                            >= 2
+                                                        ):
+                                                            (
+                                                                is_like_raw_abort,
+                                                                pair_i_raw_abort,
+                                                                st_raw_abort,
+                                                            ) = _broadcast_like_selected_pair(
+                                                                preds_fix2_abort,
+                                                                preferred_i=int(sel_i),
+                                                                atol=float(
+                                                                    broadcast_atol
+                                                                ),
+                                                            )
+                                                            dy_abort = float(
+                                                                st_raw_abort.get(
+                                                                    "y_max",
+                                                                    float("nan"),
+                                                                )
+                                                            )
+                                                            _pred_log_warning(
+                                                                "sanity_raw_output_compare_abort",
+                                                                "sanity_raw_output_compare_abort",
+                                                                "[infer] compare-mode raw-fallback sanity (abort probe only): max|Y0-Y%d|=%.6g match_frac=%.5f rel_mean=%.3e",
+                                                                int(
+                                                                    pair_i_raw_abort
+                                                                ),
+                                                                float(dy_abort),
+                                                                float(
+                                                                    st_raw_abort.get(
+                                                                        "y_match_frac",
+                                                                        float(
+                                                                            "nan"
+                                                                        ),
+                                                                    )
+                                                                ),
+                                                                float(
+                                                                    st_raw_abort.get(
+                                                                        "y_rel_mean",
+                                                                        float(
+                                                                            "nan"
+                                                                        ),
+                                                                    )
+                                                                ),
+                                                                suppress_in_concise=True,
+                                                                include_in_summary=bool(
+                                                                    pred_concise_log_sanity
+                                                                ),
+                                                            )
+                                                            if bool(
+                                                                is_like_raw_abort
+                                                            ):
+                                                                raise _InferCollapseAbort(
+                                                                    "infer: collapse persisted even in calibrate_output=False path; "
+                                                                    "this indicates a true model/preprocess collapse. "
+                                                                    "Set ENN_PRED_COLLAPSE_ABORT=0 to ignore and write outputs anyway."
+                                                                )
                                                 if (
                                                     (not collapse_switched_raw)
                                                     and bool(collapse_fallback_raw)
