@@ -6640,6 +6640,24 @@ def infer(
                 )
             pred_compare_force_requested_warned = False
             pred_compare_force_requested_fallback_warned = False
+            pred_collapse_prefer_validated_requested_candidate = bool(
+                env_bool(
+                    "ENN_PRED_COLLAPSE_PREFER_VALIDATED_REQUESTED_CANDIDATE",
+                    default=True,
+                )
+            ) and (not bool(pred_compare_force_requested_candidate))
+            pred_collapse_prefer_validated_requested_require_clip_only = bool(
+                env_bool(
+                    "ENN_PRED_COLLAPSE_PREFER_VALIDATED_REQUESTED_REQUIRE_CLIP_ONLY",
+                    default=True,
+                )
+            )
+            pred_collapse_prefer_validated_requested_require_y_bounds = bool(
+                env_bool(
+                    "ENN_PRED_COLLAPSE_PREFER_VALIDATED_REQUESTED_REQUIRE_Y_BOUNDS",
+                    default=True,
+                )
+            )
             pred_persist_raw_mode = bool(
                 env_bool("ENN_PRED_COLLAPSE_PERSIST_RAW_MODE", default=True)
             ) and (not bool(pred_compare_force_requested_candidate))
@@ -6667,6 +6685,7 @@ def infer(
             pred_posthoc_denorm_anchor_warned = False
             pred_posthoc_denorm_anchor_skip_warned = False
             pred_force_raw_output = False
+            pred_validated_requested_candidate_active = False
             pred_raw_z_last_resort_denorm_warned = False
             pred_raw_z_last_resort_denorm_failed_warned = False
             pred_collapse_triage = bool(
@@ -6736,6 +6755,14 @@ def infer(
                 _LOGGER.warning(msg, *args)
                 pred_concise_log_shown[key] = shown + 1
 
+            def _clear_pred_validated_requested_candidate_active() -> None:
+                nonlocal pred_validated_requested_candidate_active
+                pred_validated_requested_candidate_active = False
+
+            def _set_pred_validated_requested_candidate_active(active: bool) -> None:
+                nonlocal pred_validated_requested_candidate_active
+                pred_validated_requested_candidate_active = bool(active)
+
             def _infer_pred_mode_label() -> str:
                 if bool(pred_posthoc_calibrate_active):
                     return "posthoc_persisted"
@@ -6745,6 +6772,8 @@ def infer(
                     return "denorm_only_persisted"
                 if bool(pred_force_raw_output):
                     return f"raw_{str(_get_pred_raw_output_space() or 'z')}_persisted"
+                if bool(pred_validated_requested_candidate_active):
+                    return "validated_calibrated_persisted"
                 return "direct"
 
             def _emit_pred_concise_summary() -> None:
@@ -7239,6 +7268,75 @@ def infer(
                     raise RuntimeError(
                         "Y-bounds fallback output escaped resolved bounds"
                     )
+
+            def _requested_calibrated_candidate_guard(
+                y_candidate: torch.Tensor,
+            ) -> tuple[bool, dict[str, object]]:
+                meta: dict[str, object] = {
+                    "clip_only": False,
+                    "has_y_bounds": False,
+                    "negative_frac": float("nan"),
+                }
+                if not isinstance(y_candidate, torch.Tensor):
+                    return False, meta
+                if y_candidate.ndim == 0:
+                    return False, meta
+                if not bool(torch.isfinite(y_candidate).all().item()):
+                    return False, meta
+                sc = _get_pred_scaler()
+                clip_only = bool(getattr(sc, "_output_ab_clip_only", False))
+                meta["clip_only"] = clip_only
+                if bool(pred_collapse_prefer_validated_requested_require_clip_only) and (
+                    not bool(clip_only)
+                ):
+                    return False, meta
+                y_det = y_candidate.detach()
+                if bool(y_det.is_floating_point()) and int(y_det.numel()) > 0:
+                    with contextlib.suppress(Exception):
+                        meta["negative_frac"] = float(
+                            ((y_det < 0).to(dtype=torch.float32).mean().item())
+                        )
+                bounds_resolver = (
+                    getattr(sc, "_resolve_y_bounds_for_output", None)
+                    if sc is not None
+                    else None
+                )
+                resolved_bounds: tuple[
+                    torch.Tensor | None, torch.Tensor | None
+                ] | None = None
+                if callable(bounds_resolver):
+                    lo_chk, hi_chk = bounds_resolver(
+                        y_det,
+                        prefer_quantile=bool(
+                            env_bool(
+                                "ENN_OUTPUT_AB_SUSPICIOUS_Y_BOUNDS_USE_QUANTILE",
+                                default=True,
+                            )
+                        ),
+                        clip_quant_to_minmax=bool(
+                            env_bool(
+                                "ENN_OUTPUT_AB_SUSPICIOUS_Y_BOUNDS_CLIP_TO_MINMAX",
+                                default=True,
+                            )
+                        ),
+                    )
+                    if lo_chk is not None and hi_chk is not None:
+                        resolved_bounds = (lo_chk, hi_chk)
+                        meta["has_y_bounds"] = True
+                if resolved_bounds is None:
+                    return (
+                        (
+                            not bool(
+                                pred_collapse_prefer_validated_requested_require_y_bounds
+                            )
+                        ),
+                        meta,
+                    )
+                _validate_posthoc_y_bounds_output(
+                    y_det,
+                    resolved_bounds,
+                )
+                return True, meta
 
             def _reactivity_ratio_probe_stats(
                 candidate_y: torch.Tensor,
@@ -8005,6 +8103,7 @@ def infer(
                         out_direct = out_direct[0]
                     if not isinstance(out_direct, torch.Tensor):
                         raise RuntimeError("infer: unexpected model output type")
+                    _clear_pred_validated_requested_candidate_active()
                     if not bool(pred_compare_force_requested_warned):
                         pred_compare_force_requested_warned = True
                         _LOGGER.warning(
@@ -8015,6 +8114,7 @@ def infer(
                 if bool(pred_posthoc_denorm_only_active) and str(raw_output_space) != "z":
                     pred_posthoc_denorm_only_active = False
                     pred_posthoc_denorm_anchor_active = False
+                    _clear_pred_validated_requested_candidate_active()
                     if bool(pred_persist_raw_mode):
                         pred_force_raw_output = True
                         _LOGGER.warning(
@@ -8061,10 +8161,12 @@ def infer(
                             )
                             if bool(is_like_last_resort):
                                 pred_raw_z_last_resort_denorm_runtime_enabled = False
+                                _clear_pred_validated_requested_candidate_active()
                                 _LOGGER.warning(
                                     "[infer] raw-output persistence would keep Z-space outputs, but last-resort denorm-only output still looked broadcast-like; disabling future last-resort denorm-only attempts and keeping raw outputs."
                                 )
                                 return out_raw.detach()
+                        _clear_pred_validated_requested_candidate_active()
                         if not bool(pred_raw_z_last_resort_denorm_warned):
                             pred_raw_z_last_resort_denorm_warned = True
                             _LOGGER.warning(
@@ -8073,6 +8175,7 @@ def infer(
                         return out_post.detach()
                     except Exception as e:
                         pred_raw_z_last_resort_denorm_runtime_enabled = False
+                        _clear_pred_validated_requested_candidate_active()
                         if not bool(pred_raw_z_last_resort_denorm_failed_warned):
                             pred_raw_z_last_resort_denorm_failed_warned = True
                             _LOGGER.warning(
@@ -8130,12 +8233,14 @@ def infer(
                                 )
                         else:
                             pred_posthoc_denorm_anchor_active = False
+                        _clear_pred_validated_requested_candidate_active()
                         return out_post.detach()
                     except Exception as e:
                         if bool(pred_persist_raw_mode):
                             pred_posthoc_denorm_only_active = False
                             pred_posthoc_denorm_anchor_active = False
                             pred_force_raw_output = True
+                            _clear_pred_validated_requested_candidate_active()
                             pred_raw_z_last_resort_denorm_runtime_enabled = False
                             _LOGGER.warning(
                                 "[infer] posthoc denormalization failed during prediction (%s: %s); disabling future last-resort denorm-only attempts and switching remaining outputs to raw mode for consistency.",
@@ -8166,12 +8271,14 @@ def infer(
                         ):
                             with contextlib.suppress(Exception):
                                 out_post = out_post.contiguous()
+                        _clear_pred_validated_requested_candidate_active()
                         return out_post.detach()
                     except Exception as e:
                         if bool(pred_persist_raw_mode):
                             pred_posthoc_calibrate_active = False
                             pred_posthoc_denorm_only_active = False
                             pred_force_raw_output = True
+                            _clear_pred_validated_requested_candidate_active()
                             _LOGGER.warning(
                                 "[infer] posthoc calibration failed during prediction (%s: %s); switching remaining outputs to raw mode for consistency.",
                                 type(e).__name__,
@@ -8189,6 +8296,12 @@ def infer(
                     out = out[0]
                 if not isinstance(out, torch.Tensor):
                     raise RuntimeError("infer: unexpected model output type")
+                if (
+                    (not bool(pred_posthoc_calibrate_active))
+                    and (not bool(pred_posthoc_denorm_only_active))
+                    and (not bool(pred_force_raw_output))
+                ):
+                    _clear_pred_validated_requested_candidate_active()
                 return out.detach()
 
             def _pred_reuse_active(cur_fn: object) -> bool:
@@ -10074,6 +10187,35 @@ def infer(
                                                     and bool(collapse_fallback_raw)
                                                     and bool(calibrate_pred_output)
                                                 ):
+                                                    requested_calibrated_candidate: torch.Tensor | None = None
+                                                    requested_calibrated_candidate_ok = False
+                                                    requested_calibrated_candidate_meta: dict[str, object] | None = None
+                                                    if (
+                                                        bool(pred_collapse_prefer_validated_requested_candidate)
+                                                        and (not bool(pred_compare_force_requested_candidate))
+                                                        and bool(calibrate_pred_output)
+                                                        and isinstance(preds, torch.Tensor)
+                                                        and str(_get_pred_raw_output_space() or "z") == "z"
+                                                    ):
+                                                        try:
+                                                            requested_calibrated_candidate = preds.detach()
+                                                            with contextlib.suppress(Exception):
+                                                                if isinstance(requested_calibrated_candidate, torch.Tensor) and (
+                                                                    not requested_calibrated_candidate.is_contiguous()
+                                                                ):
+                                                                    requested_calibrated_candidate = requested_calibrated_candidate.contiguous()
+                                                            if isinstance(requested_calibrated_candidate, torch.Tensor):
+                                                                requested_calibrated_candidate = requested_calibrated_candidate.clone()
+                                                                (
+                                                                    requested_calibrated_candidate_ok,
+                                                                    requested_calibrated_candidate_meta,
+                                                                ) = _requested_calibrated_candidate_guard(
+                                                                    requested_calibrated_candidate
+                                                                )
+                                                        except Exception:
+                                                            requested_calibrated_candidate = None
+                                                            requested_calibrated_candidate_ok = False
+                                                            requested_calibrated_candidate_meta = None
                                                     collapse_switched_raw = True
                                                     _LOGGER.warning(
                                                         "[infer] collapse persisted; retrying this batch per-sample with calibrate_output=False (ENN_PRED_COLLAPSE_FALLBACK_RAW=1)."
@@ -10504,6 +10646,7 @@ def infer(
                                                         pred_posthoc_denorm_only_active = False
                                                         pred_posthoc_denorm_anchor_active = False
                                                         pred_force_raw_output = False
+                                                        _clear_pred_validated_requested_candidate_active()
                                                         _LOGGER.warning(
                                                             "[infer] using per-sample raw predictions with posthoc output calibration for this batch; keeping posthoc calibration for remaining prediction microbatches."
                                                         )
@@ -10512,6 +10655,7 @@ def infer(
                                                         pred_posthoc_calibrate_active = False
                                                         pred_posthoc_denorm_only_active = True
                                                         pred_force_raw_output = False
+                                                        _clear_pred_validated_requested_candidate_active()
                                                         if bool(pred_posthoc_denorm_anchor_active):
                                                             _LOGGER.warning(
                                                                 "[infer] using per-sample raw predictions with denorm-only output scaling anchored to posthoc-calibrated center for this batch; keeping anchored denorm-only scaling for remaining prediction microbatches."
@@ -10535,6 +10679,7 @@ def infer(
                                                         pred_posthoc_calibrate_active = False
                                                         pred_posthoc_denorm_only_active = True
                                                         pred_force_raw_output = False
+                                                        _clear_pred_validated_requested_candidate_active()
                                                         if bool(pred_posthoc_denorm_anchor_active):
                                                             _LOGGER.warning(
                                                                 "[infer] raw fallback would keep Z-space outputs; using denorm-only output scaling anchored to posthoc-calibrated center as last-resort for this batch and remaining prediction microbatches."
@@ -10543,6 +10688,27 @@ def infer(
                                                             _LOGGER.warning(
                                                                 "[infer] raw fallback would keep Z-space outputs; using denorm-only output scaling as last-resort for this batch and remaining prediction microbatches even though low-diversity checks rejected it."
                                                             )
+                                                    elif (
+                                                        bool(requested_calibrated_candidate_ok)
+                                                        and isinstance(requested_calibrated_candidate, torch.Tensor)
+                                                    ):
+                                                        preds = requested_calibrated_candidate
+                                                        pred_posthoc_calibrate_active = False
+                                                        pred_posthoc_denorm_only_active = False
+                                                        pred_posthoc_denorm_anchor_active = False
+                                                        pred_force_raw_output = False
+                                                        _set_pred_validated_requested_candidate_active(True)
+                                                        rescue_detail = "finite and within learned Y-bounds"
+                                                        if isinstance(requested_calibrated_candidate_meta, dict):
+                                                            if not bool(requested_calibrated_candidate_meta.get("has_y_bounds", False)):
+                                                                rescue_detail = "finite"
+                                                        _pred_log_warning(
+                                                            "validated_requested_calibrated",
+                                                            "validated_requested_calibrated",
+                                                            "[infer] raw-collapse fallback would keep Z-space outputs, but the requested calibrated candidate is %s; keeping that validated calibrated output for this batch and remaining prediction microbatches.",
+                                                            str(rescue_detail),
+                                                            suppress_in_concise=False,
+                                                        )
                                                     elif preds_fix2 is not None:
                                                         raw_lowdiv_like = False
                                                         raw_lowdiv_stats: dict[str, float] | None = None
@@ -10580,6 +10746,7 @@ def infer(
                                                             pred_posthoc_denorm_only_active = False
                                                             pred_posthoc_denorm_anchor_active = False
                                                             pred_force_raw_output = True
+                                                            _clear_pred_validated_requested_candidate_active()
                                                             if (
                                                                 bool(pred_raw_z_last_resort_denorm_runtime_enabled)
                                                                 and bool(pred_raw_z_last_resort_require_non_broadcast)
