@@ -6026,6 +6026,36 @@ class Model(nn.Module):
                 ),
             )
         )
+        if bool(pred_tail_force_fp32):
+            has_bf16_params = False
+            with contextlib.suppress(Exception):
+                for _param in self.parameters():
+                    if (
+                        isinstance(_param, torch.Tensor)
+                        and _param.is_floating_point()
+                        and _param.dtype == torch.bfloat16
+                    ):
+                        has_bf16_params = True
+                        break
+            if has_bf16_params:
+                pred_tail_force_fp32 = False
+                if env_bool("ENN_PRED_TAIL_FORCE_FP32_LOG", default=True) and (
+                    not bool(
+                        getattr(
+                            self,
+                            "_pred_tail_force_fp32_bf16_params_warned",
+                            False,
+                        )
+                    )
+                ):
+                    setattr(
+                        self,
+                        "_pred_tail_force_fp32_bf16_params_warned",
+                        True,
+                    )
+                    _LOGGER.warning(
+                        "[ENN][predict] skipping fp32 encoder/decoder tail because model parameters are bf16; keeping autocast path to avoid dtype mismatches."
+                    )
         if bool(pred_tail_force_fp32) and env_bool(
             "ENN_PRED_TAIL_FORCE_FP32_LOG", default=True
         ) and (not bool(getattr(self, "_pred_tail_force_fp32_warned", False))):
