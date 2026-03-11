@@ -5847,8 +5847,14 @@ def infer(
                     if isinstance(tail_fp32_effective_raw, (bool, int, float))
                     else False
                 )
+                tail_fp32_z_dtype_mismatch = bool(tail_fp32_effective) and bool(
+                    str(assembled_dtype).lower() in {"torch.bfloat16", "bfloat16"}
+                    or str(y_hat_z_dtype).lower() in {"torch.bfloat16", "bfloat16"}
+                )
                 tail_fp32_status = "off"
-                if bool(tail_fp32_effective):
+                if bool(tail_fp32_z_dtype_mismatch):
+                    tail_fp32_status = "enabled_but_z_bf16"
+                elif bool(tail_fp32_effective):
                     tail_fp32_status = "enabled"
                 elif bool(tail_fp32_requested) and str(tail_fp32_skip_reason) == "bf16_params":
                     tail_fp32_status = "skipped_bf16_params"
@@ -5900,6 +5906,11 @@ def infer(
                     label = "bf16_tail_quantization_risk"
                 if (
                     str(label) == "bf16_tail_quantization_risk"
+                    and bool(tail_fp32_z_dtype_mismatch)
+                ):
+                    label = "bf16_tail_quantization_risk_tail_fp32_ineffective"
+                if (
+                    str(label) in {"bf16_tail_quantization_risk", "bf16_tail_quantization_risk_tail_fp32_ineffective"}
                     and bool(tail_fp32_requested)
                     and (not bool(tail_fp32_effective))
                     and str(tail_fp32_skip_reason) == "bf16_params"
@@ -5927,6 +5938,7 @@ def infer(
                     "pred_tail_force_fp32_effective": bool(tail_fp32_effective),
                     "pred_tail_force_fp32_skip_reason": str(tail_fp32_skip_reason),
                     "pred_tail_force_fp32_status": str(tail_fp32_status),
+                    "pred_tail_force_fp32_z_dtype_mismatch": bool(tail_fp32_z_dtype_mismatch),
                     "pred_tail_force_fp32_float_param_dtypes": [
                         str(v) for v in tail_fp32_param_dtypes
                     ],

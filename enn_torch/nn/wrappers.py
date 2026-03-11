@@ -5190,8 +5190,68 @@ class Model(nn.Module):
                         f"[ENN] nonfinite detected before sanitize in {tag}: nonfinite={nonfinite} absmax={absmax} dtype={dtype} shape={shape}"
                     )
 
+        core_device = device or self._device
+
+        def _pred_tail_force_fp32_param_status_core() -> tuple[bool, tuple[str, ...]]:
+            cached = getattr(self, "_pred_tail_force_fp32_param_status_cache", None)
+            if isinstance(cached, tuple) and len(cached) == 2:
+                try:
+                    return bool(cached[0]), tuple(str(v) for v in cached[1])
+                except Exception:
+                    pass
+            has_bf16 = False
+            float_param_dtypes: set[str] = set()
+            with contextlib.suppress(Exception):
+                for _param in self.parameters():
+                    if isinstance(_param, torch.Tensor) and _param.is_floating_point():
+                        float_param_dtypes.add(str(_param.dtype))
+                        if _param.dtype == torch.bfloat16:
+                            has_bf16 = True
+                status = (bool(has_bf16), tuple(sorted(float_param_dtypes)))
+                setattr(self, "_pred_tail_force_fp32_param_status_cache", status)
+                return status
+            return False, tuple()
+
+        pred_tail_force_fp32_requested = bool(
+            (not export)
+            and (not self.training)
+            and (not torch.is_grad_enabled())
+            and (getattr(core_device, "type", None) == "cuda")
+            and (
+                bool(getattr(self, "_pred_tail_force_fp32_requested", False))
+                or bool(getattr(self, "_pred_tail_force_fp32_effective", False))
+                or env_bool(
+                    "ENN_PRED_TAIL_FORCE_FP32",
+                    default=bool(
+                        env_bool("ENN_PRED_TAIL_FORCE_FP32_AUTO", default=True)
+                        and isinstance(base_dtype, torch.dtype)
+                        and base_dtype == torch.bfloat16
+                    ),
+                )
+            )
+        )
+        pred_tail_force_fp32 = bool(pred_tail_force_fp32_requested)
+        pred_tail_force_fp32_skip_reason = ""
+        pred_tail_force_fp32_float_param_dtypes: tuple[str, ...] = tuple()
+        if bool(pred_tail_force_fp32_requested):
+            has_bf16_params, pred_tail_force_fp32_float_param_dtypes = (
+                _pred_tail_force_fp32_param_status_core()
+            )
+            if bool(has_bf16_params):
+                pred_tail_force_fp32 = False
+                pred_tail_force_fp32_skip_reason = "bf16_params"
+        setattr(self, "_pred_tail_force_fp32_requested", bool(pred_tail_force_fp32_requested))
+        setattr(self, "_pred_tail_force_fp32_effective", bool(pred_tail_force_fp32))
+        setattr(self, "_pred_tail_force_fp32_skip_reason", str(pred_tail_force_fp32_skip_reason))
+        setattr(
+            self,
+            "_pred_tail_force_fp32_float_param_dtypes",
+            tuple(str(v) for v in pred_tail_force_fp32_float_param_dtypes),
+        )
+        core_base_dtype = torch.float32 if bool(pred_tail_force_fp32) else (base_dtype or features.dtype)
+
         x_raw = self._cast_graph_safe(
-            features, device or self._device, base_dtype or features.dtype
+            features, core_device, core_base_dtype
         )
         x_norm: torch.Tensor | None = None
         if self.embedding is None:
@@ -5208,25 +5268,37 @@ class Model(nn.Module):
                 f"model input dim mismatch: expected [B,{int(self.model_in_dim)}] after embedding, got {tuple(x.shape)}"
             )
 
-        if base_dtype is not None and x.dtype != base_dtype:
-            x = self._cast_graph_safe(x, device or self._device, base_dtype)
+        if core_base_dtype is not None and x.dtype != core_base_dtype:
+            x = self._cast_graph_safe(x, core_device, core_base_dtype)
         b = x.size(0)
-        if export:
-            tokens, context = self.fuser.forward_export(x)
-            next_state = None
-        else:
-            tokens, context, next_state = self.fuser(
-                x,
-                temporal_state=temporal_state,
-                return_temporal_state=True,
-                causal_mask=causal_mask,
-            )
+        with (
+            StatelessAutocast.suspend(core_device)
+            if bool(pred_tail_force_fp32)
+            else contextlib.nullcontext()
+        ):
+            if export:
+                tokens, context = self.fuser.forward_export(x)
+                next_state = None
+            else:
+                tokens, context, next_state = self.fuser(
+                    x,
+                    temporal_state=temporal_state,
+                    return_temporal_state=True,
+                    causal_mask=causal_mask,
+                )
         if sanitize_nan:
             _diag_nonfinite("fuser.tokens", tokens)
             _diag_nonfinite("fuser.context", context)
             tokens = _coerce_tensor(tokens, enabled=True, inplace=not export)
             context = _coerce_tensor(context, enabled=True, inplace=not export)
+        if bool(pred_tail_force_fp32):
+            if isinstance(tokens, torch.Tensor) and tokens.is_floating_point() and tokens.dtype != torch.float32:
+                tokens = tokens.to(dtype=torch.float32)
+            if isinstance(context, torch.Tensor) and context.is_floating_point() and context.dtype != torch.float32:
+                context = context.to(dtype=torch.float32)
         assembled = context.reshape(b, -1)
+        if bool(pred_tail_force_fp32) and isinstance(assembled, torch.Tensor) and assembled.is_floating_point() and assembled.dtype != torch.float32:
+            assembled = assembled.to(dtype=torch.float32)
         if self.is_norm_linear and self.linear_branch is not None:
             assembled = assembled + self.linear_branch(
                 self._cast_graph_safe(x, self._device, assembled.dtype)
@@ -5249,12 +5321,21 @@ class Model(nn.Module):
         if sanitize_nan:
             _diag_nonfinite("collector.refined", refined)
             refined = _coerce_tensor(refined, enabled=True, inplace=not export)
-        residual = self.fuser.decode(refined, apply_norm=True)
+        if bool(pred_tail_force_fp32) and isinstance(refined, torch.Tensor) and refined.is_floating_point() and refined.dtype != torch.float32:
+            refined = refined.to(dtype=torch.float32)
+        with (
+            StatelessAutocast.suspend(core_device)
+            if bool(pred_tail_force_fp32)
+            else contextlib.nullcontext()
+        ):
+            residual = self.fuser.decode(refined, apply_norm=True)
         if sanitize_nan:
             _diag_nonfinite("fuser.residual", residual)
             residual = _coerce_tensor(
                 residual, enabled=True, inplace=not export
             )
+        if bool(pred_tail_force_fp32) and isinstance(residual, torch.Tensor) and residual.is_floating_point() and residual.dtype != torch.float32:
+            residual = residual.to(dtype=torch.float32)
         enhanced = residual.reshape(b, -1).to(dtype=assembled.dtype)
         delta = enhanced - assembled
         p = None
@@ -5298,6 +5379,8 @@ class Model(nn.Module):
             y_hat = assembled + delta * 0.5
         if sanitize_nan:
             y_hat = _coerce_tensor(y_hat, enabled=True, inplace=not export)
+        if bool(pred_tail_force_fp32) and isinstance(y_hat, torch.Tensor) and y_hat.is_floating_point() and y_hat.dtype != torch.float32:
+            y_hat = y_hat.to(dtype=torch.float32)
         if calibrate_output:
             y_hat = self.scaler.calibrate(y_hat)
         pred = self.scaler.denormalize_y(y_hat).reshape(b, *self.out_shape)
@@ -6017,35 +6100,11 @@ class Model(nn.Module):
             cache_enabled = bool(
                 env_bool("ENN_PRED_TAIL_FORCE_FP32_PARAM_CACHE", default=True)
             )
-            sentinel_key = ("", "", -1)
-            with contextlib.suppress(Exception):
-                for _param in self.parameters():
-                    if (
-                        isinstance(_param, torch.Tensor)
-                        and _param.is_floating_point()
-                    ):
-                        sentinel_key = (
-                            str(_param.dtype),
-                            str(_param.device),
-                            int(getattr(_param, "_version", -1)),
-                        )
-                        break
-            if cache_enabled:
-                cache = getattr(
-                    self, "_pred_tail_force_fp32_param_status_cache", None
-                )
-                if isinstance(cache, dict) and tuple(
-                    cache.get("sentinel_key", ())
-                ) == tuple(sentinel_key):
-                    return (
-                        bool(cache.get("has_bf16_params", False)),
-                        tuple(
-                            str(v)
-                            for v in tuple(cache.get("float_param_dtypes", ()))
-                        ),
-                    )
             has_bf16_params = False
             float_param_dtypes: set[str] = set()
+            float_param_signature: list[
+                tuple[str, str, tuple[int, ...], int]
+            ] = []
             with contextlib.suppress(Exception):
                 for _param in self.parameters():
                     if (
@@ -6054,15 +6113,66 @@ class Model(nn.Module):
                     ):
                         dtype_s = str(_param.dtype)
                         float_param_dtypes.add(dtype_s)
+                        float_param_signature.append(
+                            (
+                                dtype_s,
+                                str(_param.device),
+                                tuple(
+                                    int(v)
+                                    for v in tuple(
+                                        getattr(_param, "shape", ())
+                                    )
+                                ),
+                                int(getattr(_param, "_version", -1)),
+                            )
+                        )
                         if _param.dtype == torch.bfloat16:
                             has_bf16_params = True
             dtype_tuple = tuple(sorted(float_param_dtypes))
+            signature_tuple = tuple(float_param_signature)
             if cache_enabled:
+                cache = getattr(
+                    self, "_pred_tail_force_fp32_param_status_cache", None
+                )
+                cached_signature = tuple(cache.get("signature", ())) if isinstance(
+                    cache, dict
+                ) else tuple()
+                if isinstance(cache, dict) and cached_signature == signature_tuple:
+                    return (
+                        bool(cache.get("has_bf16_params", False)),
+                        tuple(
+                            str(v)
+                            for v in tuple(cache.get("float_param_dtypes", ()))
+                        ),
+                    )
+                if (
+                    isinstance(cache, dict)
+                    and bool(cached_signature)
+                    and cached_signature != signature_tuple
+                    and env_bool("ENN_PRED_TAIL_FORCE_FP32_LOG", default=True)
+                    and (
+                        not bool(
+                            getattr(
+                                self,
+                                "_pred_tail_force_fp32_param_cache_refresh_warned",
+                                False,
+                            )
+                        )
+                    )
+                ):
+                    setattr(
+                        self,
+                        "_pred_tail_force_fp32_param_cache_refresh_warned",
+                        True,
+                    )
+                    _LOGGER.warning(
+                        "[ENN][predict] refreshing fp32-tail param cache because floating parameter dtype/device state changed; re-evaluating bf16 guard from current parameters."
+                    )
                 setattr(
                     self,
                     "_pred_tail_force_fp32_param_status_cache",
                     {
-                        "sentinel_key": tuple(sentinel_key),
+                        "signature": signature_tuple,
                         "has_bf16_params": bool(has_bf16_params),
                         "float_param_dtypes": dtype_tuple,
                     },
