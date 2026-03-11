@@ -5576,6 +5576,12 @@ def infer(
                         "y_diff_calibrated": float(y_diff_cal),
                         "calibrate_pred_output": bool(calibrate_pred_output),
                         "broadcast_atol": float(broadcast_atol),
+                        "pred_compare_force_requested_candidate": bool(
+                            pred_compare_force_requested_candidate
+                        ),
+                        "pred_compare_force_requested_candidate_source": str(
+                            pred_compare_force_requested_candidate_source
+                        ),
                         "X": _tensor_diag(Xi2),
                         "tokens": _tensor_diag(tokens),
                         "context_z": _tensor_diag(assembled),
