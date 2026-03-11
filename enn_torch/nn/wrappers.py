@@ -6013,7 +6013,63 @@ class Model(nn.Module):
             isinstance(amp_dtype, torch.dtype)
             and amp_dtype is not torch.float64
         )
-        pred_tail_force_fp32 = bool(
+        def _pred_tail_force_fp32_param_status() -> tuple[bool, tuple[str, ...]]:
+            cache_enabled = bool(
+                env_bool("ENN_PRED_TAIL_FORCE_FP32_PARAM_CACHE", default=True)
+            )
+            sentinel_key = ("", "", -1)
+            with contextlib.suppress(Exception):
+                for _param in self.parameters():
+                    if (
+                        isinstance(_param, torch.Tensor)
+                        and _param.is_floating_point()
+                    ):
+                        sentinel_key = (
+                            str(_param.dtype),
+                            str(_param.device),
+                            int(getattr(_param, "_version", -1)),
+                        )
+                        break
+            if cache_enabled:
+                cache = getattr(
+                    self, "_pred_tail_force_fp32_param_status_cache", None
+                )
+                if isinstance(cache, dict) and tuple(
+                    cache.get("sentinel_key", ())
+                ) == tuple(sentinel_key):
+                    return (
+                        bool(cache.get("has_bf16_params", False)),
+                        tuple(
+                            str(v)
+                            for v in tuple(cache.get("float_param_dtypes", ()))
+                        ),
+                    )
+            has_bf16_params = False
+            float_param_dtypes: set[str] = set()
+            with contextlib.suppress(Exception):
+                for _param in self.parameters():
+                    if (
+                        isinstance(_param, torch.Tensor)
+                        and _param.is_floating_point()
+                    ):
+                        dtype_s = str(_param.dtype)
+                        float_param_dtypes.add(dtype_s)
+                        if _param.dtype == torch.bfloat16:
+                            has_bf16_params = True
+            dtype_tuple = tuple(sorted(float_param_dtypes))
+            if cache_enabled:
+                setattr(
+                    self,
+                    "_pred_tail_force_fp32_param_status_cache",
+                    {
+                        "sentinel_key": tuple(sentinel_key),
+                        "has_bf16_params": bool(has_bf16_params),
+                        "float_param_dtypes": dtype_tuple,
+                    },
+                )
+            return bool(has_bf16_params), dtype_tuple
+
+        pred_tail_force_fp32_requested = bool(
             infer_mode
             and (not self.training)
             and (getattr(device, "type", None) == "cuda")
@@ -6026,19 +6082,18 @@ class Model(nn.Module):
                 ),
             )
         )
-        if bool(pred_tail_force_fp32):
-            has_bf16_params = False
-            with contextlib.suppress(Exception):
-                for _param in self.parameters():
-                    if (
-                        isinstance(_param, torch.Tensor)
-                        and _param.is_floating_point()
-                        and _param.dtype == torch.bfloat16
-                    ):
-                        has_bf16_params = True
-                        break
-            if has_bf16_params:
+        pred_tail_force_fp32 = bool(pred_tail_force_fp32_requested)
+        pred_tail_force_fp32_has_bf16_params = False
+        pred_tail_force_fp32_skip_reason = ""
+        pred_tail_force_fp32_float_param_dtypes: tuple[str, ...] = tuple()
+        if bool(pred_tail_force_fp32_requested):
+            (
+                pred_tail_force_fp32_has_bf16_params,
+                pred_tail_force_fp32_float_param_dtypes,
+            ) = _pred_tail_force_fp32_param_status()
+            if bool(pred_tail_force_fp32_has_bf16_params):
                 pred_tail_force_fp32 = False
+                pred_tail_force_fp32_skip_reason = "bf16_params"
                 if env_bool("ENN_PRED_TAIL_FORCE_FP32_LOG", default=True) and (
                     not bool(
                         getattr(
@@ -6054,8 +6109,36 @@ class Model(nn.Module):
                         True,
                     )
                     _LOGGER.warning(
-                        "[ENN][predict] skipping fp32 encoder/decoder tail because model parameters are bf16; keeping autocast path to avoid dtype mismatches."
+                        "[ENN][predict] skipping fp32 encoder/decoder tail because model parameters are bf16; keeping autocast path to avoid dtype mismatches (floating dtypes=%s).",
+                        ",".join(pred_tail_force_fp32_float_param_dtypes)
+                        if pred_tail_force_fp32_float_param_dtypes
+                        else "unknown",
                     )
+        setattr(
+            self,
+            "_pred_tail_force_fp32_requested",
+            bool(pred_tail_force_fp32_requested),
+        )
+        setattr(
+            self,
+            "_pred_tail_force_fp32_effective",
+            bool(pred_tail_force_fp32),
+        )
+        setattr(
+            self,
+            "_pred_tail_force_fp32_has_bf16_params",
+            bool(pred_tail_force_fp32_has_bf16_params),
+        )
+        setattr(
+            self,
+            "_pred_tail_force_fp32_skip_reason",
+            str(pred_tail_force_fp32_skip_reason),
+        )
+        setattr(
+            self,
+            "_pred_tail_force_fp32_float_param_dtypes",
+            tuple(str(v) for v in pred_tail_force_fp32_float_param_dtypes),
+        )
         if bool(pred_tail_force_fp32) and env_bool(
             "ENN_PRED_TAIL_FORCE_FP32_LOG", default=True
         ) and (not bool(getattr(self, "_pred_tail_force_fp32_warned", False))):
