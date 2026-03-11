@@ -6899,6 +6899,86 @@ class Model(nn.Module):
                 edge_reg_low,
                 edge_reg_high,
             )
+            reactivity_aux_weight = float(
+                env_float("ENN_REACTIVITY_AUX_WEIGHT", 0.0)
+            )
+            if (
+                self.training
+                and grad_enabled
+                and (not is_cls_loss)
+                and (z_true is not None)
+                and math.isfinite(reactivity_aux_weight)
+                and (reactivity_aux_weight > 0.0)
+            ):
+                try:
+                    pred_flat = y_hat.reshape(int(y_hat.shape[0]), -1)
+                    true_flat = z_true.to(
+                        device=pred_flat.device,
+                        dtype=pred_flat.dtype,
+                    ).reshape(int(pred_flat.shape[0]), -1)
+                    if int(pred_flat.shape[0]) >= 2 and pred_flat.shape == true_flat.shape:
+                        aux_eps = float(
+                            env_float("ENN_REACTIVITY_AUX_EPS", 1e-6)
+                        )
+                        aux_eps_t = pred_flat.new_tensor(max(aux_eps, 1e-8))
+                        pred_center = pred_flat - pred_flat.mean(dim=0, keepdim=True)
+                        true_center = true_flat - true_flat.mean(dim=0, keepdim=True)
+                        pred_std = torch.sqrt(
+                            torch.mean(pred_center.square(), dim=0) + aux_eps_t
+                        )
+                        true_std = torch.sqrt(
+                            torch.mean(true_center.square(), dim=0) + aux_eps_t
+                        )
+                        valid = torch.isfinite(pred_std) & torch.isfinite(true_std)
+                        valid = valid & (true_std > aux_eps_t)
+                        if bool(valid.any().item()):
+                            pred_std_v = pred_std[valid]
+                            true_std_v = true_std[valid]
+                            min_std_ratio = float(
+                                env_float(
+                                    "ENN_REACTIVITY_AUX_MIN_STD_RATIO",
+                                    0.10,
+                                )
+                            )
+                            min_std_ratio_t = pred_flat.new_tensor(
+                                max(min_std_ratio, 0.0)
+                            )
+                            std_ratio = pred_std_v / true_std_v.clamp_min(aux_eps_t)
+                            loss_std = torch.relu(min_std_ratio_t - std_ratio).mean()
+                            corr_floor = float(
+                                env_float(
+                                    "ENN_REACTIVITY_AUX_CORR_FLOOR",
+                                    0.05,
+                                )
+                            )
+                            corr_floor_t = pred_flat.new_tensor(corr_floor)
+                            pred_center_v = pred_center[:, valid]
+                            true_center_v = true_center[:, valid]
+                            corr_num = torch.mean(
+                                pred_center_v * true_center_v,
+                                dim=0,
+                            )
+                            corr_den = pred_std_v * true_std_v + aux_eps_t
+                            corr = corr_num / corr_den
+                            corr = torch.nan_to_num(corr, nan=0.0, posinf=0.0, neginf=0.0)
+                            loss_corr = torch.relu(corr_floor_t - corr).mean()
+                            corr_weight = float(
+                                env_float(
+                                    "ENN_REACTIVITY_AUX_CORR_WEIGHT",
+                                    0.25,
+                                )
+                            )
+                            reactivity_aux = loss_std + (
+                                pred_flat.new_tensor(max(corr_weight, 0.0)) * loss_corr
+                            )
+                            if not isinstance(loss_val, torch.Tensor):
+                                loss_val = pred_flat.new_tensor(0.0)
+                            loss_val = loss_val + (
+                                pred_flat.new_tensor(reactivity_aux_weight)
+                                * reactivity_aux
+                            )
+                except Exception:
+                    pass
             if infer_mode and calibrate_output and (not is_cls_loss):
                 sc = self.scaler
                 prefer_quantile_bounds = bool(
