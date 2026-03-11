@@ -4305,6 +4305,15 @@ def infer(
     collapse_force_uncompiled = bool(
         env_bool("ENN_PRED_COLLAPSE_FORCE_UNCOMPILED", default=True)
     )
+    pred_auto_safe_mode = bool(
+        env_bool("ENN_PRED_AUTO_SAFE_MODE", default=True)
+    )
+    pred_force_uncompiled_env_explicit = bool(
+        "ENN_PRED_FORCE_UNCOMPILED" in os.environ
+    )
+    pred_td_cudagraph_env_explicit = bool(
+        "ENN_PRED_TD_CUDAGRAPH" in os.environ
+    )
 
     cg_enabled = bool(
         dev_type == "cuda" and getattr(module_eval, "_compile_cudagraphs", False)
@@ -4363,6 +4372,12 @@ def infer(
             )
     _td_cg_default = not bool(_nogil_pred)
     if "no-cudagraph" in _pred_compile_mode:
+        _td_cg_default = False
+    if (
+        bool(pred_auto_safe_mode)
+        and (not bool(pred_td_cudagraph_env_explicit))
+        and (not bool(_pred_compile_enabled))
+    ):
         _td_cg_default = False
     td_cg_candidate = bool(
         (not cg_enabled)
@@ -4465,7 +4480,65 @@ def infer(
             td_cg_target = None
             td_cg_x_inner_shape = None
             force_single = False
+            pred_auto_safe_mode_active = False
+            pred_auto_safe_mode_reasons: list[str] = []
+            pred_auto_safe_mode_warned = False
             broadcast_checked = False
+
+            def _enable_pred_auto_safe_mode(
+                reason: str,
+                *,
+                disable_td_cg: bool = True,
+                prefer_uncompiled: bool = True,
+            ) -> bool:
+                nonlocal force_uncompiled
+                nonlocal td_cg_active, td_cg_disabled, td_cg_mb, td_cg_mod
+                nonlocal td_cg_pad_buf, td_cg_seen, td_cg_max_bs
+                nonlocal td_cg_target, td_cg_x_inner_shape
+                nonlocal pred_auto_safe_mode_active
+                nonlocal pred_auto_safe_mode_reasons, pred_auto_safe_mode_warned
+                if not bool(pred_auto_safe_mode):
+                    return False
+                changed = False
+                reason_tag = str(reason or "").strip()
+                if (
+                    bool(prefer_uncompiled)
+                    and (not bool(force_uncompiled))
+                    and bool(pred_uncompiled_available)
+                    and (not bool(pred_force_uncompiled_env_explicit))
+                ):
+                    force_uncompiled = True
+                    changed = True
+                if (
+                    bool(disable_td_cg)
+                    and (not bool(td_cg_disabled))
+                    and (not bool(pred_td_cudagraph_env_explicit))
+                ):
+                    td_cg_disabled = True
+                    td_cg_active = False
+                    td_cg_mb = None
+                    td_cg_mod = None
+                    td_cg_pad_buf = None
+                    td_cg_seen = 0
+                    td_cg_max_bs = 0
+                    td_cg_target = None
+                    td_cg_x_inner_shape = None
+                    changed = True
+                if changed:
+                    pred_auto_safe_mode_active = True
+                if reason_tag and reason_tag not in pred_auto_safe_mode_reasons:
+                    pred_auto_safe_mode_reasons.append(reason_tag)
+                if changed and (not bool(pred_auto_safe_mode_warned)):
+                    pred_auto_safe_mode_warned = True
+                    reasons_joined = "+".join(pred_auto_safe_mode_reasons) or "unspecified"
+                    _LOGGER.warning(
+                        "[infer] enabling automatic prediction safe mode for remaining microbatches (%s): preferring uncompiled shadow and disabling TD cudagraph unless explicitly overridden.",
+                        reasons_joined,
+                    )
+                return changed
+
+            if bool(pred_auto_safe_mode) and (not bool(_pred_compile_enabled)):
+                _enable_pred_auto_safe_mode("compile_disabled")
             detect_broadcast = bool(env_bool("ENN_PRED_DETECT_BATCH_BROADCAST", True))
             broadcast_atol = float(env_float("ENN_PRED_BROADCAST_ATOL", 1e-6))
             broadcast_match_frac = float(
@@ -6645,6 +6718,7 @@ def infer(
                     pred_collapse_triage_label or ""
                 ).strip():
                     items.insert(0, f"triage={str(pred_collapse_triage_label).strip()}")
+                tail_status = ""
                 if isinstance(pred_collapse_triage_payload, dict):
                     tail_status = str(
                         pred_collapse_triage_payload.get(
@@ -6652,9 +6726,14 @@ def infer(
                         )
                         or ""
                     ).strip()
-                    if tail_status:
+                if tail_status:
+                    insert_at = 1 if items else 0
+                    items.insert(insert_at, f"tail_fp32={tail_status}")
+                if bool(pred_auto_safe_mode_active):
+                    safe_label = "+".join(pred_auto_safe_mode_reasons[:2]).strip()
+                    if safe_label:
                         insert_at = 1 if items else 0
-                        items.insert(insert_at, f"tail_fp32={tail_status}")
+                        items.insert(insert_at, f"auto_safe={safe_label}")
                 if not items:
                     return
                 shown_items = items[:10]
@@ -9563,6 +9642,9 @@ def infer(
                                                             )
                                                         ),
                                                     )
+                                                    _enable_pred_auto_safe_mode(
+                                                        "clip_only_collapse"
+                                                    )
                                                 else:
                                                     _LOGGER.warning(
                                                         "[infer] outputs remain %s after per-sample fallback; this rules out cudagraph batching. Likely causes are model/preprocess low-reactivity or downstream calibration/output-scaling collapse.",
@@ -9575,6 +9657,9 @@ def infer(
                                                                 else "low-diversity"
                                                             )
                                                         ),
+                                                    )
+                                                    _enable_pred_auto_safe_mode(
+                                                        "collapse_persisted"
                                                     )
                                                 Xi_diag, _ = _selected_pair_view(
                                                     Xi, preferred_i=int(pair_i2)
