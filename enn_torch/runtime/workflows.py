@@ -91,6 +91,62 @@ except Exception:
 logger = logging.getLogger(__name__)
 
 
+
+def _emit_reactivity_aux_audit(model: torch.nn.Module) -> None:
+    if not env_bool("ENN_REACTIVITY_AUX_AUDIT", default=True):
+        return
+    try:
+        steps = int(getattr(model, "_reactivity_aux_audit_steps", 0) or 0)
+        applied_steps = int(getattr(model, "_reactivity_aux_audit_applied_steps", 0) or 0)
+        last = getattr(model, "_reactivity_aux_audit_last", None)
+        ema = getattr(model, "_reactivity_aux_audit_ema", None)
+        if (steps <= 0) and (not isinstance(last, dict)) and (not isinstance(ema, dict)):
+            return
+        parts: list[str] = [
+            f"steps={steps}",
+            f"applied_steps={applied_steps}",
+        ]
+        if isinstance(ema, dict):
+            for key in (
+                "weight",
+                "corr_weight",
+                "valid_frac",
+                "std_ratio_mean",
+                "corr_mean",
+                "loss_std",
+                "loss_corr",
+                "reactivity_aux",
+            ):
+                if key in ema:
+                    try:
+                        parts.append(f"{key}={float(ema[key]):.6f}")
+                    except Exception:
+                        pass
+            if ema.get("last_reason") not in (None, "", "ok"):
+                parts.append(f"last_reason={ema.get('last_reason')}")
+        elif isinstance(last, dict):
+            for key in (
+                "weight",
+                "corr_weight",
+                "valid_frac",
+                "std_ratio_mean",
+                "corr_mean",
+                "loss_std",
+                "loss_corr",
+                "reactivity_aux",
+            ):
+                if key in last:
+                    try:
+                        parts.append(f"{key}={float(last[key]):.6f}")
+                    except Exception:
+                        pass
+            if last.get("reason") not in (None, "", "ok"):
+                parts.append(f"last_reason={last.get('reason')}")
+        logger.warning("[train][reactivity_aux] %s", ", ".join(parts))
+    except Exception:
+        pass
+
+
 def _is_nonfatal_base_exception(exc: BaseException) -> bool:
     return not isinstance(exc, (KeyboardInterrupt, SystemExit, GeneratorExit))
 
@@ -3552,6 +3608,7 @@ def train(
                 if os.path.isfile(marker):
                     with contextlib.suppress(Exception):
                         shutil.rmtree(cand, ignore_errors=True)
+            _emit_reactivity_aux_audit(model)
             gc.collect()
             return model
         else:
@@ -3635,6 +3692,7 @@ def train(
                 meta=export_meta,
                 overwrite=bool(export_overwrite),
             )
+        _emit_reactivity_aux_audit(model)
         return model
     finally:
         restore_path: str | None = None
