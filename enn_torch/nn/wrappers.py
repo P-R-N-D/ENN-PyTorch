@@ -6934,6 +6934,20 @@ class Model(nn.Module):
                             & torch.isfinite(true_std)
                         )
                         valid = valid & (true_var_raw > aux_eps_t)
+                        total_features = int(pred_flat.shape[1])
+                        valid_count = int(valid.sum().item()) if bool(valid.numel()) else 0
+                        audit_reason = "ok"
+                        loss_std = pred_flat.new_tensor(0.0)
+                        loss_corr = pred_flat.new_tensor(0.0)
+                        reactivity_aux = pred_flat.new_tensor(0.0)
+                        corr = pred_flat.new_zeros((0,))
+                        std_ratio = pred_flat.new_zeros((0,))
+                        corr_weight = float(
+                            env_float(
+                                "ENN_REACTIVITY_AUX_CORR_WEIGHT",
+                                0.25,
+                            )
+                        )
                         if bool(valid.any().item()):
                             pred_std_v = pred_std[valid]
                             true_std_v = true_std[valid]
@@ -6965,12 +6979,6 @@ class Model(nn.Module):
                             corr = corr_num / corr_den
                             corr = torch.nan_to_num(corr, nan=0.0, posinf=0.0, neginf=0.0)
                             loss_corr = torch.relu(corr_floor_t - corr).mean()
-                            corr_weight = float(
-                                env_float(
-                                    "ENN_REACTIVITY_AUX_CORR_WEIGHT",
-                                    0.25,
-                                )
-                            )
                             reactivity_aux = loss_std + (
                                 pred_flat.new_tensor(max(corr_weight, 0.0)) * loss_corr
                             )
@@ -6980,7 +6988,73 @@ class Model(nn.Module):
                                 pred_flat.new_tensor(reactivity_aux_weight)
                                 * reactivity_aux
                             )
+                        else:
+                            audit_reason = "no_valid_features"
+                        if env_bool("ENN_REACTIVITY_AUX_AUDIT", default=True):
+                            try:
+                                audit = {
+                                    "enabled": True,
+                                    "weight": float(reactivity_aux_weight),
+                                    "batch_size": int(pred_flat.shape[0]),
+                                    "total_features": int(total_features),
+                                    "valid_features": int(valid_count),
+                                    "valid_frac": float(valid_count / max(1, total_features)),
+                                    "std_ratio_mean": float(std_ratio.mean().item()) if bool(std_ratio.numel()) else 0.0,
+                                    "std_ratio_min": float(std_ratio.min().item()) if bool(std_ratio.numel()) else 0.0,
+                                    "corr_mean": float(corr.mean().item()) if bool(corr.numel()) else 0.0,
+                                    "corr_min": float(corr.min().item()) if bool(corr.numel()) else 0.0,
+                                    "loss_std": float(loss_std.item()),
+                                    "loss_corr": float(loss_corr.item()),
+                                    "corr_weight": float(max(corr_weight, 0.0)),
+                                    "reactivity_aux": float(reactivity_aux.item()),
+                                    "applied": bool(valid_count > 0),
+                                    "reason": str(audit_reason),
+                                }
+                                setattr(self, "_reactivity_aux_audit_last", audit)
+                                steps = int(getattr(self, "_reactivity_aux_audit_steps", 0)) + 1
+                                setattr(self, "_reactivity_aux_audit_steps", steps)
+                                if audit.get("applied", False):
+                                    applied_steps = int(getattr(self, "_reactivity_aux_audit_applied_steps", 0)) + 1
+                                    setattr(self, "_reactivity_aux_audit_applied_steps", applied_steps)
+                                ema = getattr(self, "_reactivity_aux_audit_ema", None)
+                                if not isinstance(ema, dict):
+                                    ema = {}
+                                decay = float(env_float("ENN_REACTIVITY_AUX_AUDIT_EMA_DECAY", 0.90))
+                                decay = min(max(decay, 0.0), 0.999)
+                                for key in (
+                                    "valid_frac",
+                                    "std_ratio_mean",
+                                    "std_ratio_min",
+                                    "corr_mean",
+                                    "corr_min",
+                                    "loss_std",
+                                    "loss_corr",
+                                    "reactivity_aux",
+                                ):
+                                    val = float(audit.get(key, 0.0))
+                                    prev = ema.get(key)
+                                    ema[key] = val if prev is None else (decay * float(prev) + (1.0 - decay) * val)
+                                ema["weight"] = float(reactivity_aux_weight)
+                                ema["corr_weight"] = float(max(corr_weight, 0.0))
+                                ema["last_reason"] = str(audit_reason)
+                                ema["steps"] = int(steps)
+                                ema["applied_steps"] = int(getattr(self, "_reactivity_aux_audit_applied_steps", 0))
+                                setattr(self, "_reactivity_aux_audit_ema", ema)
+                            except Exception:
+                                pass
                 except Exception:
+                    if env_bool("ENN_REACTIVITY_AUX_AUDIT", default=True):
+                        with contextlib.suppress(Exception):
+                            setattr(
+                                self,
+                                "_reactivity_aux_audit_last",
+                                {
+                                    "enabled": True,
+                                    "weight": float(reactivity_aux_weight),
+                                    "applied": False,
+                                    "reason": "exception",
+                                },
+                            )
                     pass
             if infer_mode and calibrate_output and (not is_cls_loss):
                 sc = self.scaler

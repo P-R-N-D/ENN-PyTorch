@@ -91,6 +91,97 @@ except Exception:
 logger = logging.getLogger(__name__)
 
 
+
+def _read_reactivity_aux_audit_payload(audit_path: str | None) -> dict[str, Any] | None:
+    path = str(audit_path or "").strip()
+    if not path or (not os.path.isfile(path)):
+        return None
+    try:
+        payload = read_json(path)
+    except Exception:
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                payload = json.load(f)
+        except Exception:
+            return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _emit_reactivity_aux_audit(
+    model: torch.nn.Module,
+    *,
+    audit_path: str | None = None,
+) -> None:
+    if not env_bool("ENN_REACTIVITY_AUX_AUDIT", default=True):
+        return
+    try:
+        steps = int(getattr(model, "_reactivity_aux_audit_steps", 0) or 0)
+        applied_steps = int(getattr(model, "_reactivity_aux_audit_applied_steps", 0) or 0)
+        last = getattr(model, "_reactivity_aux_audit_last", None)
+        ema = getattr(model, "_reactivity_aux_audit_ema", None)
+        if (steps <= 0) and (not isinstance(last, dict)) and (not isinstance(ema, dict)):
+            payload = _read_reactivity_aux_audit_payload(audit_path)
+            if isinstance(payload, dict):
+                steps = int(payload.get("steps", 0) or 0)
+                applied_steps = int(payload.get("applied_steps", 0) or 0)
+                last_payload = payload.get("last")
+                ema_payload = payload.get("ema")
+                last = last_payload if isinstance(last_payload, dict) else None
+                ema = ema_payload if isinstance(ema_payload, dict) else None
+                with contextlib.suppress(Exception):
+                    setattr(model, "_reactivity_aux_audit_steps", steps)
+                    setattr(model, "_reactivity_aux_audit_applied_steps", applied_steps)
+                    if isinstance(last, dict):
+                        setattr(model, "_reactivity_aux_audit_last", last)
+                    if isinstance(ema, dict):
+                        setattr(model, "_reactivity_aux_audit_ema", ema)
+        if (steps <= 0) and (not isinstance(last, dict)) and (not isinstance(ema, dict)):
+            return
+        parts: list[str] = [
+            f"steps={steps}",
+            f"applied_steps={applied_steps}",
+        ]
+        if isinstance(ema, dict):
+            for key in (
+                "weight",
+                "corr_weight",
+                "valid_frac",
+                "std_ratio_mean",
+                "corr_mean",
+                "loss_std",
+                "loss_corr",
+                "reactivity_aux",
+            ):
+                if key in ema:
+                    try:
+                        parts.append(f"{key}={float(ema[key]):.6f}")
+                    except Exception:
+                        pass
+            if ema.get("last_reason") not in (None, "", "ok"):
+                parts.append(f"last_reason={ema.get('last_reason')}")
+        elif isinstance(last, dict):
+            for key in (
+                "weight",
+                "corr_weight",
+                "valid_frac",
+                "std_ratio_mean",
+                "corr_mean",
+                "loss_std",
+                "loss_corr",
+                "reactivity_aux",
+            ):
+                if key in last:
+                    try:
+                        parts.append(f"{key}={float(last[key]):.6f}")
+                    except Exception:
+                        pass
+            if last.get("reason") not in (None, "", "ok"):
+                parts.append(f"last_reason={last.get('reason')}")
+        logger.warning("[train][reactivity_aux] %s", ", ".join(parts))
+    except Exception:
+        pass
+
+
 def _is_nonfatal_base_exception(exc: BaseException) -> bool:
     return not isinstance(exc, (KeyboardInterrupt, SystemExit, GeneratorExit))
 
@@ -3499,10 +3590,15 @@ def train(
             if isinstance(model, torch.nn.Module) and _has_meta_tensors(model):
                 with contextlib.suppress(Exception):
                     _materialize_to_cpu(model)
+            audit_path = os.path.join(
+                os.path.dirname(fallback),
+                "reactivity_aux_audit.json",
+            )
             try:
                 load_weights(
                     model, fallback, map_location="cpu", rebuild_tasks=True
                 )
+                _emit_reactivity_aux_audit(model, audit_path=audit_path)
             finally:
                 with contextlib.suppress(Exception):
                     os.remove(fallback)
@@ -3513,9 +3609,12 @@ def train(
                     if os.path.isfile(meta_path):
                         os.remove(meta_path)
                 with contextlib.suppress(Exception):
+                    if os.path.isfile(audit_path):
+                        os.remove(audit_path)
+                with contextlib.suppress(Exception):
                     d = os.path.dirname(fallback)
                     for name in os.listdir(d):
-                        if name.endswith(".tmp") and "model.pt" in name:
+                        if name.endswith(".tmp") and ("model.pt" in name or "reactivity_aux_audit.json" in name):
                             with contextlib.suppress(Exception):
                                 os.remove(os.path.join(d, name))
             _update_history(model, ckpt_dir, epochs, val_frac, num_samples_dataset)
@@ -3635,6 +3734,10 @@ def train(
                 meta=export_meta,
                 overwrite=bool(export_overwrite),
             )
+        _emit_reactivity_aux_audit(
+            model,
+            audit_path=os.path.join(str(ckpt_dir), "reactivity_aux_audit.json"),
+        )
         return model
     finally:
         restore_path: str | None = None
