@@ -861,6 +861,7 @@ class RuntimeConfig:
     keys: Optional[Sequence[Any]] = None
     loss_skew: bool = True
     compare_force_requested_candidate: Optional[bool] = None
+    predict_calibrate_output: Optional[bool] = None
     _COMMON_KEYS: ClassVar[frozenset[str]] = frozenset(
         {"in_dim", "out_shape", "cfg_dict"}
     )
@@ -904,6 +905,7 @@ class RuntimeConfig:
             "train_weights",
             "val_weights",
             "compare_force_requested_candidate",
+            "predict_calibrate_output",
         }
     )
     TRAIN_POS_ORDER: ClassVar[Tuple[str, ...]] = (
@@ -1117,6 +1119,17 @@ class RuntimeConfig:
                 if (
                     "compare_force_requested_candidate" in data
                     and data.get("compare_force_requested_candidate") is not None
+                )
+                else None
+            ),
+            predict_calibrate_output=(
+                _coerce_bool(
+                    data.get("predict_calibrate_output"),
+                    name="predict_calibrate_output",
+                )
+                if (
+                    "predict_calibrate_output" in data
+                    and data.get("predict_calibrate_output") is not None
                 )
                 else None
             ),

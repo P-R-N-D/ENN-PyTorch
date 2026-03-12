@@ -5422,6 +5422,10 @@ def infer(
                         "y_diff_calibrated": float(y_diff_cal),
                         "atol": float(broadcast_atol),
                         "calibrate_pred_output": bool(calibrate_pred_output),
+                        "pred_requested_calibrate_output": bool(calibrate_pred_output),
+                        "pred_requested_calibrate_output_source": str(
+                            pred_requested_calibrate_output_source
+                        ),
                         "pred_compare_force_requested_candidate": bool(
                             pred_compare_force_requested_candidate
                         ),
@@ -5615,6 +5619,10 @@ def infer(
                         "x_diff": float(x_diff),
                         "y_diff_calibrated": float(y_diff_cal),
                         "calibrate_pred_output": bool(calibrate_pred_output),
+                        "pred_requested_calibrate_output": bool(calibrate_pred_output),
+                        "pred_requested_calibrate_output_source": str(
+                            pred_requested_calibrate_output_source
+                        ),
                         "broadcast_atol": float(broadcast_atol),
                         "pred_compare_force_requested_candidate": bool(
                             pred_compare_force_requested_candidate
@@ -6066,6 +6074,12 @@ def infer(
                         diag.get("pred_compare_force_requested_candidate_source", "")
                         or ""
                     ),
+                    "pred_requested_calibrate_output": bool(
+                        diag.get("pred_requested_calibrate_output", diag.get("calibrate_pred_output", True))
+                    ),
+                    "pred_requested_calibrate_output_source": str(
+                        diag.get("pred_requested_calibrate_output_source", "") or ""
+                    ),
                     "pred_tail_force_fp32_requested": bool(tail_fp32_requested),
                     "pred_tail_force_fp32_effective": bool(tail_fp32_effective),
                     "pred_tail_force_fp32_skip_reason": str(tail_fp32_skip_reason),
@@ -6495,7 +6509,27 @@ def infer(
                             _maybe_write_diag_copy(fname, diag)
 
             collapse_switched_uncompiled = False
-            calibrate_pred_output = bool(env_bool("ENN_PRED_CALIBRATE_OUTPUT", True))
+            pred_requested_calibrate_output_source = "env"
+            pred_requested_calibrate_output_cfg = getattr(
+                ops,
+                "predict_calibrate_output",
+                None,
+            )
+            if pred_requested_calibrate_output_cfg is None:
+                calibrate_pred_output = bool(
+                    env_bool("ENN_PRED_CALIBRATE_OUTPUT", True)
+                )
+                if not bool(calibrate_pred_output):
+                    pred_requested_calibrate_output_source = "env_off"
+            else:
+                calibrate_pred_output = bool(
+                    pred_requested_calibrate_output_cfg
+                )
+                pred_requested_calibrate_output_source = (
+                    "ops"
+                    if bool(calibrate_pred_output)
+                    else "ops_off"
+                )
             collapse_fallback_raw = bool(
                 env_bool("ENN_PRED_COLLAPSE_FALLBACK_RAW", True)
             )
@@ -6830,6 +6864,12 @@ def infer(
                     pred_collapse_triage_label or ""
                 ).strip():
                     items.insert(0, f"triage={str(pred_collapse_triage_label).strip()}")
+                req_mode = "calibrated" if bool(calibrate_pred_output) else "raw"
+                req_src = str(pred_requested_calibrate_output_source or "")
+                if req_src:
+                    items.insert(0, f"requested={req_mode}@{req_src}")
+                else:
+                    items.insert(0, f"requested={req_mode}")
                 tail_status = ""
                 if isinstance(pred_collapse_triage_payload, dict):
                     tail_status = str(
