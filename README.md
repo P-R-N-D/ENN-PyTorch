@@ -88,7 +88,7 @@ ENN-PyTorch is built around the following principles:
 
 ## Technology Stack
 
-- Python 3.12+
+- Python 3.12+ (Python 3.14t, or later free-threading build is recommended)
 - PyTorch
 - Triton
 - TensorDict
