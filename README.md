@@ -30,7 +30,7 @@ ENN-PyTorch provides one integrated path for:
 This makes it easier to move from experimentation to validation and deployment without rebuilding the surrounding runtime every time.
 
 ### Elastic and Distributed Execution
-The framework supports elastic and distributed execution patterns for larger-scale environments, including multi-process and hardware-aware runtime behavior.
+The framework supports elastic and distributed execution patterns for larger-scale environments, including multi-threading and hardware-aware runtime behavior.
 
 ### Configurable Model Composition
 ENN-PyTorch is designed for flexible model construction rather than a single fixed architecture. It supports:
