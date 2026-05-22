@@ -440,3 +440,180 @@ class Reducer(nn.Module):
             f"cast={self.cast}, "
             f"output_dtype={self.output_dtype}"
         )
+
+
+class AutoConvND(nn.Module):
+    """
+    Channel-last Conv1d/Conv2d/Conv3d adapter for region-local tensors.
+
+    Expected input shape:
+        (B, R, *local_shape, D)
+
+    The layer inspects ``local_shape``:
+      - rank 1 -> depthwise-separable Conv1d
+      - rank 2 -> depthwise-separable Conv2d
+      - rank 3 -> depthwise-separable Conv3d
+      - rank 0 or rank > 3 -> identity fallback
+
+    This is intentionally an adapter over PyTorch's optimized 1D/2D/3D
+    convolution layers, not a custom arbitrary-rank convolution kernel.
+    """
+
+    SUPPORTED_LOCAL_DIMS = {1, 2, 3}
+
+    def __init__(
+        self,
+        dim: int,
+        *args: Any,
+        kernel_size: int = 3,
+        enabled: bool = True,
+        bias: bool = True,
+        activation: str = "gelu",
+        residual: bool = True,
+        residual_scale_init: float = 1.0,
+    ) -> None:
+        super().__init__()
+        _ = args
+        self.dim = int(dim)
+        self.kernel_size = int(kernel_size)
+        self.enabled = bool(enabled)
+        self.residual = bool(residual)
+
+        if self.dim <= 0:
+            raise ValueError(f"dim must be positive, got {dim}")
+        if self.kernel_size <= 0:
+            raise ValueError(
+                f"kernel_size must be positive, got {kernel_size}"
+            )
+        if self.kernel_size % 2 == 0:
+            raise ValueError(
+                "AutoConvND requires an odd kernel_size so the local shape "
+                f"can be preserved. Got kernel_size={kernel_size}."
+            )
+
+        self.conv1 = self._make_conv(1, bias=bias, activation=activation)
+        self.conv2 = self._make_conv(2, bias=bias, activation=activation)
+        self.conv3 = self._make_conv(3, bias=bias, activation=activation)
+
+        if self.residual:
+            self.residual_scale = nn.Parameter(
+                torch.tensor(float(residual_scale_init))
+            )
+        else:
+            self.register_parameter("residual_scale", None)
+
+    def forward(self, x: Tensor, *args: Any) -> Tensor:
+        _ = args
+        if not isinstance(x, Tensor):
+            raise TypeError(f"AutoConvND expects Tensor, got {type(x)!r}")
+
+        if not self.enabled:
+            return x
+
+        if x.ndim < 3:
+            return x
+
+        if x.shape[-1] != self.dim:
+            raise ValueError(
+                f"Expected last dim={self.dim}, got shape={tuple(x.shape)}"
+            )
+
+        if not x.is_floating_point():
+            return x
+
+        local_ndim = x.ndim - 3
+        match local_ndim:
+            case 1:
+                return self._forward_1d(x)
+            case 2:
+                return self._forward_2d(x)
+            case 3:
+                return self._forward_3d(x)
+            case _:
+                return x
+
+    def _forward_1d(self, x: Tensor) -> Tensor:
+        B, R, L, D = x.shape
+        h = x.reshape(B * R, L, D).transpose(1, 2).contiguous()
+        y = self.conv1(h)
+        y = y.transpose(1, 2).reshape(B, R, L, D)
+        return self._finish(x, y)
+
+    def _forward_2d(self, x: Tensor) -> Tensor:
+        B, R, H, W, D = x.shape
+        h = x.reshape(B * R, H, W, D).permute(0, 3, 1, 2).contiguous()
+        y = self.conv2(h)
+        y = y.permute(0, 2, 3, 1).reshape(B, R, H, W, D)
+        return self._finish(x, y)
+
+    def _forward_3d(self, x: Tensor) -> Tensor:
+        B, R, T, H, W, D = x.shape
+        h = (
+            x.reshape(B * R, T, H, W, D)
+            .permute(0, 4, 1, 2, 3)
+            .contiguous()
+        )
+        y = self.conv3(h)
+        y = y.permute(0, 2, 3, 4, 1).reshape(B, R, T, H, W, D)
+        return self._finish(x, y)
+
+    def _finish(self, x: Tensor, y: Tensor) -> Tensor:
+        if not self.residual:
+            return y
+        scale = self.residual_scale.to(device=y.device, dtype=y.dtype)
+        return x + scale * y
+
+    def _make_conv(
+        self,
+        ndim: int,
+        *args: Any,
+        bias: bool,
+        activation: str,
+    ) -> nn.Sequential:
+        _ = args
+        padding = self.kernel_size // 2
+        conv_cls: type[nn.Conv1d] | type[nn.Conv2d] | type[nn.Conv3d]
+        match ndim:
+            case 1:
+                conv_cls = nn.Conv1d
+            case 2:
+                conv_cls = nn.Conv2d
+            case 3:
+                conv_cls = nn.Conv3d
+            case _:
+                raise ValueError(f"Unsupported conv ndim: {ndim}")
+
+        return nn.Sequential(
+            conv_cls(
+                self.dim,
+                self.dim,
+                kernel_size=self.kernel_size,
+                padding=padding,
+                groups=self.dim,
+                bias=bias,
+            ),
+            self._make_activation(activation),
+            conv_cls(
+                self.dim,
+                self.dim,
+                kernel_size=1,
+                padding=0,
+                groups=1,
+                bias=bias,
+            ),
+        )
+
+    @staticmethod
+    def _make_activation(name: str) -> nn.Module:
+        normalized = str(name).lower().strip()
+        match normalized:
+            case "gelu":
+                return nn.GELU()
+            case "silu" | "swish":
+                return nn.SiLU()
+            case "relu":
+                return nn.ReLU()
+            case "identity" | "none" | "linear":
+                return nn.Identity()
+            case _:
+                raise ValueError(f"Unsupported activation: {name!r}")
