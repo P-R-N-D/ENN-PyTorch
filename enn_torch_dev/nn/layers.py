@@ -86,7 +86,7 @@ class Reducer(nn.Module):
         )
 
         if op in self.ORDERED_OPS:
-            self._require_ordered_compatible(dtype, op)
+            self._require_ordered_compatible(xs, op)
 
         with self._disabled_autocast_if_needed(xs[0], dtype):
             match op:
@@ -352,11 +352,11 @@ class Reducer(nn.Module):
                 raise TypeError(f"{op!r} does not support complex tensors.")
             return dtype
 
-        if op == "sum":
-            return torch.int64
-
         if op == "mean" or weights is not None:
             return torch.float32
+
+        if op == "sum":
+            return torch.int64
 
         return dtype
 
@@ -421,8 +421,8 @@ class Reducer(nn.Module):
         probe = torch.empty((), dtype=dtype)
         return probe.is_floating_point() or probe.is_complex()
 
-    def _require_ordered_compatible(self, dtype: torch.dtype, op: str) -> None:
-        if torch.empty((), dtype=dtype).is_complex():
+    def _require_ordered_compatible(self, xs: Sequence[Tensor], op: str) -> None:
+        if any(x.is_complex() for x in xs):
             raise TypeError(f"{op!r} does not support complex tensors.")
 
     def extra_repr(self) -> str:
