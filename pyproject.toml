@@ -57,7 +57,7 @@ dependencies = [
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["enn_torch*"]
-exclude = ["debug*", "tests*", "docs*", "examples*"]
+exclude = ["enn_torch/debug*", "tests*", "docs*", "examples*"]
 
 [project.urls]
 Repository = "https://github.com/P-R-N-D/ENN-PyTorch"
