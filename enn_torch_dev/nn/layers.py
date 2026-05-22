@@ -74,13 +74,13 @@ class Reducer(nn.Module):
     ) -> Tensor:
         op = self._normalize_op(op)
         xs = self._validate_tensors(tensors)
-        self._require_supported_input_types(xs)
+        self._assert_no_bool(xs)
 
         if op in self.ORDERED_OPS and weights is not None:
             raise ValueError(f"{op!r} does not support weights.")
 
-        dtype = self._resolve_compute_dtype(xs, op=op, weights=weights)
-        ws = self._make_weights(
+        dtype = self._infer_reduction_dtype(xs, op=op, weights=weights)
+        ws = self._norm_weight(
             weights,
             source_count=len(xs),
             ref=xs[0],
@@ -88,57 +88,57 @@ class Reducer(nn.Module):
         )
 
         if op in self.ORDERED_OPS:
-            self._require_ordered_compatible(xs, op)
+            self._assert_no_complex(xs, op)
 
-        with self._disabled_autocast_if_needed(xs[0], dtype):
+        with self._is_autocast_disabled(xs[0], dtype):
             match op:
                 case "sum":
-                    return self._reduce_sum(xs, weights=ws, dtype=dtype)
+                    return self._sum(xs, weights=ws, dtype=dtype)
 
                 case "mean":
-                    return self._reduce_mean(xs, weights=ws, dtype=dtype)
+                    return self._mean(xs, weights=ws, dtype=dtype)
 
                 case "min":
-                    return self._reduce_min(xs, dtype=dtype)
+                    return self._min(xs, dtype=dtype)
 
                 case "max":
-                    return self._reduce_max(xs, dtype=dtype)
+                    return self._max(xs, dtype=dtype)
 
                 case _:
                     raise AssertionError(f"Unreachable reducer op: {op}")
 
-    def _reduce_sum(
+    def _sum(
         self,
         xs: list[Tensor],
         *args: Any,
         weights: Tensor | None,
         dtype: torch.dtype,
     ) -> Tensor:
-        out = self._prepare_value(
+        out = self._scale(
             xs[0],
-            weight=self._weight_at(weights, 0),
+            weight=self._coeff(weights, 0),
             dtype=dtype,
         ).clone()
 
         for i, x in enumerate(xs[1:], start=1):
             out.add_(
-                self._prepare_value(
+                self._scale(
                     x,
-                    weight=self._weight_at(weights, i),
+                    weight=self._coeff(weights, i),
                     dtype=dtype,
                 )
             )
 
         return out
 
-    def _reduce_mean(
+    def _mean(
         self,
         xs: list[Tensor],
         *args: Any,
         weights: Tensor | None,
         dtype: torch.dtype,
     ) -> Tensor:
-        out = self._reduce_sum(xs, weights=weights, dtype=dtype)
+        out = self._sum(xs, weights=weights, dtype=dtype)
 
         if weights is None:
             return out / len(xs)
@@ -151,7 +151,7 @@ class Reducer(nn.Module):
 
         return out / denom
 
-    def _reduce_min(
+    def _min(
         self,
         xs: list[Tensor],
         *args: Any,
@@ -164,7 +164,7 @@ class Reducer(nn.Module):
 
         return out
 
-    def _reduce_max(
+    def _max(
         self,
         xs: list[Tensor],
         *args: Any,
@@ -177,7 +177,7 @@ class Reducer(nn.Module):
 
         return out
 
-    def _prepare_value(
+    def _scale(
         self,
         tensor: Tensor,
         *args: Any,
@@ -192,7 +192,7 @@ class Reducer(nn.Module):
         return value * weight.to(device=value.device, dtype=value.dtype)
 
     @staticmethod
-    def _weight_at(weights: Tensor | None, index: int) -> Tensor | None:
+    def _coeff(weights: Tensor | None, index: int) -> Tensor | None:
         if weights is None:
             return None
         return weights[index]
@@ -245,7 +245,7 @@ class Reducer(nn.Module):
 
         return xs
 
-    def _resolve_compute_dtype(
+    def _infer_reduction_dtype(
         self,
         xs: list[Tensor],
         *args: Any,
@@ -272,17 +272,17 @@ class Reducer(nn.Module):
             dtype = torch.promote_types(dtype, weights.dtype)
 
         if self.cast is False:
-            return self._required_dtype_without_auto_cast(dtype, op=op, weights=weights)
+            return self._dtype_without_autocast(dtype, op=op, weights=weights)
 
         if self.cast is True:
-            return self.cast_dtype or self._baseline_dtype(dtype, op=op, weights=weights)
+            return self.cast_dtype or self._default_dtype(dtype, op=op, weights=weights)
 
-        if self._should_auto_cast(dtype, op=op, weights=weights):
-            return self.cast_dtype or self._baseline_dtype(dtype, op=op, weights=weights)
+        if self._is_autocast_needed(dtype, op=op, weights=weights):
+            return self.cast_dtype or self._default_dtype(dtype, op=op, weights=weights)
 
-        return self._required_dtype_without_auto_cast(dtype, op=op, weights=weights)
+        return self._dtype_without_autocast(dtype, op=op, weights=weights)
 
-    def _required_dtype_without_auto_cast(
+    def _dtype_without_autocast(
         self,
         dtype: torch.dtype,
         *args: Any,
@@ -297,15 +297,15 @@ class Reducer(nn.Module):
                 raise TypeError(f"{op!r} does not support complex tensors.")
             return dtype
 
-        if op == "mean" and not self._is_float_dtype(dtype):
+        if op == "mean" and not self._is_float(dtype):
             return torch.get_default_dtype()
 
-        if weights is not None and not self._is_float_dtype(dtype):
+        if weights is not None and not self._is_float(dtype):
             return torch.get_default_dtype()
 
         return dtype
 
-    def _should_auto_cast(
+    def _is_autocast_needed(
         self,
         dtype: torch.dtype,
         *args: Any,
@@ -318,15 +318,15 @@ class Reducer(nn.Module):
         if dtype in {torch.float16, torch.bfloat16}:
             return op in {"sum", "mean"} or weights is not None
 
-        if dtype == self._complex32_dtype():
+        if dtype == self._has_torch_complex32():
             return True
 
-        if not self._is_float_or_complex_dtype(dtype):
+        if not self._is_float_or_complex(dtype):
             return op == "sum" or op == "mean" or weights is not None
 
         return False
 
-    def _baseline_dtype(
+    def _default_dtype(
         self,
         dtype: torch.dtype,
         *args: Any,
@@ -344,7 +344,7 @@ class Reducer(nn.Module):
         if dtype in {torch.float32, torch.float64}:
             return dtype
 
-        if dtype == self._complex32_dtype():
+        if dtype == self._has_torch_complex32():
             if op in self.ORDERED_OPS:
                 raise TypeError(f"{op!r} does not support complex tensors.")
             return torch.complex64
@@ -362,7 +362,7 @@ class Reducer(nn.Module):
 
         return dtype
 
-    def _make_weights(
+    def _norm_weight(
         self,
         weights: Sequence[float] | Tensor | None,
         *args: Any,
@@ -397,7 +397,7 @@ class Reducer(nn.Module):
 
         return w
 
-    def _disabled_autocast_if_needed(
+    def _is_autocast_disabled(
         self, ref: Tensor, dtype: torch.dtype
     ) -> AbstractContextManager[None]:
         if dtype == ref.dtype:
@@ -410,28 +410,28 @@ class Reducer(nn.Module):
         return torch.autocast(device_type=device_type, enabled=False)
 
     @staticmethod
-    def _complex32_dtype() -> torch.dtype | None:
+    def _has_torch_complex32() -> torch.dtype | None:
         value = getattr(torch, "complex32", None)
         return value if isinstance(value, torch.dtype) else None
 
     @staticmethod
-    def _is_float_dtype(dtype: torch.dtype) -> bool:
+    def _is_float(dtype: torch.dtype) -> bool:
         return torch.empty((), dtype=dtype).is_floating_point()
 
     @staticmethod
-    def _is_float_or_complex_dtype(dtype: torch.dtype) -> bool:
+    def _is_float_or_complex(dtype: torch.dtype) -> bool:
         probe = torch.empty((), dtype=dtype)
         return probe.is_floating_point() or probe.is_complex()
 
-    def _require_ordered_compatible(self, xs: Sequence[Tensor], op: str) -> None:
+    def _assert_no_complex(self, xs: Sequence[Tensor], op: str) -> None:
         if any(x.is_complex() for x in xs):
             raise TypeError(f"{op!r} does not support complex tensors.")
 
-    def _require_supported_input_types(self, xs: Sequence[Tensor]) -> None:
+    def _assert_no_bool(self, xs: Sequence[Tensor]) -> None:
         if any(x.dtype == torch.bool for x in xs):
             raise TypeError("Reducer does not support bool tensors.")
 
-    def extra_repr(self) -> str:
+    def get_repr(self) -> str:
         return (
             f"strict_shape={self.strict_shape}, "
             f"strict_dtype={self.strict_dtype}, "
