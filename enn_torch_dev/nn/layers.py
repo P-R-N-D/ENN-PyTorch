@@ -73,6 +73,7 @@ class Reducer(nn.Module):
     ) -> Tensor:
         op = self._normalize_op(op)
         xs = self._validate_tensors(tensors)
+        self._require_supported_input_types(xs)
 
         if op in self.ORDERED_OPS and weights is not None:
             raise ValueError(f"{op!r} does not support weights.")
@@ -380,7 +381,7 @@ class Reducer(nn.Module):
                 raise ValueError("Reducer weights must not require gradients.")
             w = weights.to(device=ref.device, dtype=dtype)
         else:
-            if any(isinstance(weight, complex) for weight in weights):
+            if any(torch.is_complex(torch.as_tensor(weight)) for weight in weights):
                 raise ValueError("Reducer does not support complex weights.")
             w = torch.tensor(weights, device=ref.device, dtype=dtype)
 
@@ -424,6 +425,10 @@ class Reducer(nn.Module):
     def _require_ordered_compatible(self, xs: Sequence[Tensor], op: str) -> None:
         if any(x.is_complex() for x in xs):
             raise TypeError(f"{op!r} does not support complex tensors.")
+
+    def _require_supported_input_types(self, xs: Sequence[Tensor]) -> None:
+        if any(x.dtype == torch.bool for x in xs):
+            raise TypeError("Reducer does not support bool tensors.")
 
     def extra_repr(self) -> str:
         return (
