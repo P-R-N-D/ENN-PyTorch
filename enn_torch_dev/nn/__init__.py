@@ -1,5 +1,10 @@
 from __future__ import annotations
 
-from .layers import Reducer
+from .blocks import RegionCompressor
+from .layers import AutoConvND, Reducer
 
-__all__ = ["Reducer"]
+__all__ = [
+    "AutoConvND",
+    "Reducer",
+    "RegionCompressor",
+]
