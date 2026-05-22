@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from typing import Any
 from collections.abc import Sequence
 from contextlib import AbstractContextManager, nullcontext
 
@@ -48,7 +49,7 @@ class Reducer(nn.Module):
 
     def __init__(
         self,
-        *,
+        *args: Any,
         strict_shape: bool = True,
         strict_dtype: bool = True,
         validate_device: bool = True,
@@ -67,7 +68,7 @@ class Reducer(nn.Module):
     def forward(
         self,
         tensors: Sequence[Tensor],
-        *,
+        *args: Any,
         op: str = "mean",
         weights: Sequence[float] | Tensor | None = None,
     ) -> Tensor:
@@ -109,7 +110,7 @@ class Reducer(nn.Module):
     def _reduce_sum(
         self,
         xs: list[Tensor],
-        *,
+        *args: Any,
         weights: Tensor | None,
         dtype: torch.dtype,
     ) -> Tensor:
@@ -133,7 +134,7 @@ class Reducer(nn.Module):
     def _reduce_mean(
         self,
         xs: list[Tensor],
-        *,
+        *args: Any,
         weights: Tensor | None,
         dtype: torch.dtype,
     ) -> Tensor:
@@ -153,7 +154,7 @@ class Reducer(nn.Module):
     def _reduce_min(
         self,
         xs: list[Tensor],
-        *,
+        *args: Any,
         dtype: torch.dtype,
     ) -> Tensor:
         out = xs[0].to(dtype=dtype).clone()
@@ -166,7 +167,7 @@ class Reducer(nn.Module):
     def _reduce_max(
         self,
         xs: list[Tensor],
-        *,
+        *args: Any,
         dtype: torch.dtype,
     ) -> Tensor:
         out = xs[0].to(dtype=dtype).clone()
@@ -179,7 +180,7 @@ class Reducer(nn.Module):
     def _prepare_value(
         self,
         tensor: Tensor,
-        *,
+        *args: Any,
         weight: Tensor | None,
         dtype: torch.dtype,
     ) -> Tensor:
@@ -247,7 +248,7 @@ class Reducer(nn.Module):
     def _resolve_compute_dtype(
         self,
         xs: list[Tensor],
-        *,
+        *args: Any,
         op: str,
         weights: Sequence[float] | Tensor | None,
     ) -> torch.dtype:
@@ -284,7 +285,7 @@ class Reducer(nn.Module):
     def _required_dtype_without_auto_cast(
         self,
         dtype: torch.dtype,
-        *,
+        *args: Any,
         op: str,
         weights: Sequence[float] | Tensor | None,
     ) -> torch.dtype:
@@ -307,7 +308,7 @@ class Reducer(nn.Module):
     def _should_auto_cast(
         self,
         dtype: torch.dtype,
-        *,
+        *args: Any,
         op: str,
         weights: Sequence[float] | Tensor | None,
     ) -> bool:
@@ -328,7 +329,7 @@ class Reducer(nn.Module):
     def _baseline_dtype(
         self,
         dtype: torch.dtype,
-        *,
+        *args: Any,
         op: str,
         weights: Sequence[float] | Tensor | None,
     ) -> torch.dtype:
@@ -364,7 +365,7 @@ class Reducer(nn.Module):
     def _make_weights(
         self,
         weights: Sequence[float] | Tensor | None,
-        *,
+        *args: Any,
         source_count: int,
         ref: Tensor,
         dtype: torch.dtype,
