@@ -261,10 +261,13 @@ def _run_isolated_export(
     state_path = _normalize_pasted_text(
         state_path, decode_escaped_newlines=False
     ).strip()
+    if not __package__:
+        raise RuntimeError("debug.deployment must be executed as a package module")
+    module_path = f"{__package__}.deployment"
     cmd = [
         sys.executable,
         "-m",
-        "debug.deployment",
+        module_path,
         "--export-only",
         fmt_name,
         "--out",

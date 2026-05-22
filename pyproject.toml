@@ -57,7 +57,7 @@ dependencies = [
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["enn_torch*"]
-exclude = ["debug*", "tests*", "docs*", "examples*"]
+exclude = ["enn_torch/debug*", "tests*", "docs*", "examples*"]
 
 [project.urls]
 Repository = "https://github.com/P-R-N-D/ENN-PyTorch"
@@ -101,7 +101,7 @@ export_litert = [
   "ai-edge-torch>=0.7.1",
 ]
 export_executorch = [
-  "executorch>=1.0.1; python_version < '3.13'",
+  "executorch>=1.0.1",
 ]
 export_coreml = [
   "coremltools>=9.0; platform_system == 'Darwin'",
@@ -119,7 +119,7 @@ deployment_full = [
   "tf-keras>=2.20.1",
   "tensorflow>=2.20.0",
   "ai-edge-torch>=0.7.1",
-  "executorch>=1.0.1; python_version < '3.13'",
+  "executorch>=1.0.1",
   "coremltools>=9.0; platform_system == 'Darwin'",
   "torch-tensorrt>=2.9.0; platform_system == 'Linux'",
   "onnx-graphsurgeon>=0.5.8; platform_system == 'Linux'",
