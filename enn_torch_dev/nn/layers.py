@@ -30,7 +30,7 @@ class Reducer(nn.Module):
       - True : always cast to the selected compute dtype
       - None : auto, cast only when the dtype/op combination needs it
 
-    cast_dtype:
+    output_dtype:
       - If None, a baseline compute dtype is selected from dtype/op/weights.
     """
 
@@ -55,7 +55,7 @@ class Reducer(nn.Module):
         validate_device: bool = True,
         eps: float = 1e-12,
         cast: bool | None = None,
-        cast_dtype: torch.dtype | None = None,
+        output_dtype: torch.dtype | None = None,
     ) -> None:
         super().__init__()
         self.strict_shape = strict_shape
@@ -63,7 +63,7 @@ class Reducer(nn.Module):
         self.validate_device = validate_device
         self.eps = float(eps)
         self.cast = cast
-        self.cast_dtype = cast_dtype
+        self.output_dtype = output_dtype
 
     def forward(
         self,
@@ -255,9 +255,9 @@ class Reducer(nn.Module):
         if self.cast not in {True, False, None}:
             raise TypeError(f"cast must be bool | None, got {type(self.cast)!r}")
 
-        if self.cast_dtype is not None and not isinstance(self.cast_dtype, torch.dtype):
+        if self.output_dtype is not None and not isinstance(self.output_dtype, torch.dtype):
             raise TypeError(
-                f"cast_dtype must be torch.dtype | None, got {type(self.cast_dtype)!r}"
+                f"output_dtype must be torch.dtype | None, got {type(self.output_dtype)!r}"
             )
 
         dtype = xs[0].dtype
@@ -275,10 +275,10 @@ class Reducer(nn.Module):
             return self._dtype_without_autocast(dtype, op=op, weights=weights)
 
         if self.cast is True:
-            return self.cast_dtype or self._default_dtype(dtype, op=op, weights=weights)
+            return self.output_dtype or self._default_dtype(dtype, op=op, weights=weights)
 
         if self._is_autocast_needed(dtype, op=op, weights=weights):
-            return self.cast_dtype or self._default_dtype(dtype, op=op, weights=weights)
+            return self.output_dtype or self._default_dtype(dtype, op=op, weights=weights)
 
         return self._dtype_without_autocast(dtype, op=op, weights=weights)
 
@@ -431,12 +431,12 @@ class Reducer(nn.Module):
         if any(x.dtype == torch.bool for x in xs):
             raise TypeError("Reducer does not support bool tensors.")
 
-    def get_repr(self) -> str:
+    def get_attr(self) -> str:
         return (
             f"strict_shape={self.strict_shape}, "
             f"strict_dtype={self.strict_dtype}, "
             f"validate_device={self.validate_device}, "
             f"eps={self.eps}, "
             f"cast={self.cast}, "
-            f"cast_dtype={self.cast_dtype}"
+            f"output_dtype={self.output_dtype}"
         )
