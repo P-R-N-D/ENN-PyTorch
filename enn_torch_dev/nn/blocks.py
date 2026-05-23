@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Any
 
 import torch
@@ -190,6 +191,365 @@ class RegionCompressor(nn.Module):
 
         denom = weights.sum(dim=2, keepdim=True).clamp_min(self.eps)
         return weights / denom
+
+    @staticmethod
+    def _make_activation(name: str) -> nn.Module:
+        normalized = str(name).lower().strip()
+        match normalized:
+            case "gelu":
+                return nn.GELU()
+            case "silu" | "swish":
+                return nn.SiLU()
+            case "relu":
+                return nn.ReLU()
+            case "identity" | "none" | "linear":
+                return nn.Identity()
+            case _:
+                raise ValueError(f"Unsupported activation: {name!r}")
+
+
+@dataclass(frozen=True)
+class GlobalContextComposition:
+    """
+    Packed coarse context produced by ``GlobalContextComposer``.
+
+    ``tokens`` is the dense sequence passed to global attention.
+    ``attn_bias`` is an optional key-side salience bias with shape
+    ``(B, 1, 1, T)``. Attention implementations may add it to attention
+    logits before softmax.
+    """
+
+    tokens: Tensor
+    token_mask: Tensor | None
+    attn_bias: Tensor | None
+    salience: Tensor | None
+    score: Tensor | None
+    original_shape: tuple[int, int, int, int]
+
+
+class GlobalContextComposer(nn.Module):
+    """
+    Recompose compressed regional context into a coarse global context.
+
+    Expected input shape:
+        (B, R, K, D)
+
+    Output:
+        ``GlobalContextComposition`` with ``tokens`` shaped ``(B, T, D)``,
+        where ``T = R * K``.
+
+    This block is intentionally placed between ``RegionCompressor`` and the
+    global attention layer. It owns coarse-context composition metadata and
+    optional TriAttention-like salience biasing:
+
+      - no hard routing by default;
+      - compressed tokens stay dense;
+      - soft top-k salience suppresses low-importance keys and highlights
+        high-importance keys through an attention-logit bias.
+
+    ``context_mask`` is optional and should have shape ``(B, R, K)`` with
+    True for valid compressed context slots. ``region_mask`` can be provided
+    instead when all slots in a region share the same validity.
+    """
+
+    SUPPORTED_SALIENCE_MODES = {"none", "score", "soft_topk"}
+
+    def __init__(
+        self,
+        dim: int,
+        *args: Any,
+        salience_mode: str = "none",
+        salience_topk: int | float | None = None,
+        salience_hidden_dim: int | None = None,
+        salience_temperature: float = 1.0,
+        salience_bias_scale: float = 1.0,
+        detach_topk_threshold: bool = True,
+        activation: str = "gelu",
+        dropout: float = 0.0,
+        eps: float = 1e-6,
+    ) -> None:
+        super().__init__()
+        _ = args
+
+        self.dim = int(dim)
+        self.salience_mode = self._normalize_salience_mode(salience_mode)
+        self.salience_topk = salience_topk
+        self.salience_temperature = float(salience_temperature)
+        self.salience_bias_scale = float(salience_bias_scale)
+        self.detach_topk_threshold = bool(detach_topk_threshold)
+        self.eps = float(eps)
+
+        if self.dim <= 0:
+            raise ValueError(f"dim must be positive, got {dim}")
+        if self.salience_temperature <= 0:
+            raise ValueError(
+                "salience_temperature must be positive, got "
+                f"{salience_temperature}"
+            )
+        if self.eps <= 0:
+            raise ValueError(f"eps must be positive, got {eps}")
+
+        hidden = (
+            self.dim
+            if salience_hidden_dim is None
+            else int(salience_hidden_dim)
+        )
+        if hidden <= 0:
+            raise ValueError(
+                "salience_hidden_dim must be positive, got "
+                f"{salience_hidden_dim}"
+            )
+
+        self.input_norm = nn.LayerNorm(self.dim)
+        self.salience_score = nn.Sequential(
+            nn.Linear(self.dim, hidden),
+            self._make_activation(activation),
+            nn.Dropout(float(dropout)),
+            nn.Linear(hidden, 1),
+        )
+
+    def forward(
+        self,
+        context: Tensor,
+        *args: Any,
+        context_mask: Tensor | None = None,
+        region_mask: Tensor | None = None,
+    ) -> GlobalContextComposition:
+        _ = args
+
+        if not isinstance(context, Tensor):
+            raise TypeError(
+                "GlobalContextComposer expects Tensor, got "
+                f"{type(context)!r}"
+            )
+        if context.ndim != 4:
+            raise ValueError(
+                "GlobalContextComposer expects shape (B, R, K, D). "
+                f"Got shape={tuple(context.shape)}."
+            )
+        if context.shape[-1] != self.dim:
+            raise ValueError(
+                f"Expected last dim={self.dim}, got shape={tuple(context.shape)}"
+            )
+        if not context.is_floating_point():
+            raise TypeError(
+                "GlobalContextComposer requires floating point input. "
+                f"Got dtype={context.dtype}."
+            )
+
+        B, R, K, D = context.shape
+        mask = self._validate_context_mask(
+            context,
+            context_mask=context_mask,
+            region_mask=region_mask,
+        )
+
+        tokens = context.reshape(B, R * K, D)
+        token_mask = mask.reshape(B, R * K) if mask is not None else None
+
+        score: Tensor | None = None
+        salience: Tensor | None = None
+        attn_bias: Tensor | None = None
+
+        if self.salience_mode != "none":
+            score = self.salience_score(self.input_norm(tokens)).squeeze(-1)
+            if token_mask is not None:
+                min_value = torch.finfo(score.dtype).min
+                score = score.masked_fill(~token_mask, min_value)
+
+            salience, attn_bias = self._salience_and_bias(
+                score,
+                token_mask=token_mask,
+            )
+
+        return GlobalContextComposition(
+            tokens=tokens,
+            token_mask=token_mask,
+            attn_bias=attn_bias,
+            salience=salience,
+            score=score,
+            original_shape=(B, R, K, D),
+        )
+
+    def restore(
+        self,
+        tokens: Tensor,
+        composition: GlobalContextComposition,
+        *args: Any,
+    ) -> Tensor:
+        _ = args
+
+        if not isinstance(tokens, Tensor):
+            raise TypeError(
+                f"restore expects Tensor, got {type(tokens)!r}"
+            )
+
+        B, R, K, D = composition.original_shape
+        expected = (B, R * K, D)
+        if tuple(tokens.shape) != expected:
+            raise ValueError(
+                f"Expected tokens.shape={expected}, got {tuple(tokens.shape)}"
+            )
+
+        restored = tokens.reshape(B, R, K, D)
+        if composition.token_mask is not None:
+            mask = composition.token_mask.reshape(B, R, K, 1)
+            restored = restored.masked_fill(~mask, 0)
+        return restored
+
+    def _validate_context_mask(
+        self,
+        context: Tensor,
+        *args: Any,
+        context_mask: Tensor | None,
+        region_mask: Tensor | None,
+    ) -> Tensor | None:
+        _ = args
+
+        if context_mask is not None and region_mask is not None:
+            raise ValueError(
+                "Provide either context_mask or region_mask, not both."
+            )
+
+        B, R, K, _ = context.shape
+
+        if context_mask is not None:
+            if not isinstance(context_mask, Tensor):
+                raise TypeError(
+                    "context_mask must be Tensor | None, got "
+                    f"{type(context_mask)!r}"
+                )
+            if tuple(context_mask.shape) != (B, R, K):
+                raise ValueError(
+                    "context_mask shape must be (B, R, K). "
+                    f"context_mask.shape={tuple(context_mask.shape)}, "
+                    f"expected={(B, R, K)}"
+                )
+            return context_mask.to(device=context.device, dtype=torch.bool)
+
+        if region_mask is not None:
+            if not isinstance(region_mask, Tensor):
+                raise TypeError(
+                    "region_mask must be Tensor | None, got "
+                    f"{type(region_mask)!r}"
+                )
+            if tuple(region_mask.shape) != (B, R):
+                raise ValueError(
+                    "region_mask shape must be (B, R). "
+                    f"region_mask.shape={tuple(region_mask.shape)}, "
+                    f"expected={(B, R)}"
+                )
+            return (
+                region_mask.to(device=context.device, dtype=torch.bool)
+                .unsqueeze(-1)
+                .expand(B, R, K)
+            )
+
+        return None
+
+    def _salience_and_bias(
+        self,
+        score: Tensor,
+        *args: Any,
+        token_mask: Tensor | None,
+    ) -> tuple[Tensor, Tensor]:
+        _ = args
+
+        if self.salience_mode == "score":
+            salience = torch.sigmoid(score)
+            if token_mask is not None:
+                salience = salience.masked_fill(~token_mask, 0)
+            return salience, self._bias_from_salience(
+                salience,
+                token_mask=token_mask,
+            )
+
+        if self.salience_mode == "soft_topk":
+            k = self._resolve_topk(score.shape[-1])
+            if k is None:
+                salience = torch.sigmoid(score)
+            else:
+                topk_value = torch.topk(score, k=k, dim=-1).values[..., -1:]
+                if self.detach_topk_threshold:
+                    topk_value = topk_value.detach()
+                centered = (score - topk_value) / self.salience_temperature
+                salience = torch.sigmoid(centered)
+
+            if token_mask is not None:
+                salience = salience.masked_fill(~token_mask, 0)
+
+            return salience, self._bias_from_salience(
+                salience,
+                token_mask=token_mask,
+            )
+
+        raise AssertionError(
+            f"Unreachable salience mode: {self.salience_mode}"
+        )
+
+    def _bias_from_salience(
+        self,
+        salience: Tensor,
+        *args: Any,
+        token_mask: Tensor | None,
+    ) -> Tensor:
+        _ = args
+
+        safe = salience.clamp_min(self.eps)
+        bias = self.salience_bias_scale * torch.log(safe)
+
+        if token_mask is not None:
+            min_value = torch.finfo(bias.dtype).min
+            bias = bias.masked_fill(~token_mask, min_value)
+
+        return bias[:, None, None, :]
+
+    def _resolve_topk(self, total_tokens: int) -> int | None:
+        if self.salience_topk is None:
+            return None
+
+        if isinstance(self.salience_topk, bool):
+            raise TypeError(
+                "salience_topk must be int | float | None, not bool"
+            )
+
+        if isinstance(self.salience_topk, int):
+            k = int(self.salience_topk)
+        elif isinstance(self.salience_topk, float):
+            ratio = float(self.salience_topk)
+            if not (0.0 < ratio <= 1.0):
+                raise ValueError(
+                    "float salience_topk must be in (0, 1]. "
+                    f"Got {self.salience_topk}"
+                )
+            k = int(torch.ceil(torch.tensor(total_tokens * ratio)).item())
+        else:
+            raise TypeError(
+                "salience_topk must be int | float | None, got "
+                f"{type(self.salience_topk)!r}"
+            )
+
+        if k <= 0:
+            raise ValueError(f"salience_topk must be positive, got {k}")
+
+        return min(k, int(total_tokens))
+
+    @classmethod
+    def _normalize_salience_mode(cls, mode: str) -> str:
+        normalized = str(mode).lower().strip()
+        match normalized:
+            case "none" | "off" | "disabled" | "identity":
+                return "none"
+            case "score" | "sigmoid" | "gate":
+                return "score"
+            case "soft_topk" | "soft-topk" | "topk" | "triattention":
+                return "soft_topk"
+            case _:
+                supported = ", ".join(sorted(cls.SUPPORTED_SALIENCE_MODES))
+                raise ValueError(
+                    f"Unsupported salience_mode: {mode!r}. "
+                    f"Supported modes: {supported}"
+                )
 
     @staticmethod
     def _make_activation(name: str) -> nn.Module:
