@@ -194,10 +194,13 @@ class Reducer(nn.Module):
 
     def _safe_weight_denom(self, weights: Tensor) -> Tensor:
         denom = weights.sum()
-        eps_val = torch.full_like(denom, self.eps)
+        real_dtype = denom.real.dtype if torch.is_complex(denom) else denom.dtype
+        eps_floor = torch.finfo(real_dtype).tiny
+        safe_eps = max(self.eps, eps_floor)
+        eps_val = torch.full_like(denom, safe_eps)
         denom_sign_ref = denom.real if torch.is_complex(denom) else denom
         denom_eps = torch.where(denom_sign_ref < 0, -eps_val, eps_val)
-        return torch.where(torch.abs(denom) < self.eps, denom_eps, denom)
+        return torch.where(torch.abs(denom) < safe_eps, denom_eps, denom)
 
     def _min(
         self,
@@ -407,6 +410,8 @@ class Reducer(nn.Module):
         if self.master_int_dtype == torch.bool:
             raise TypeError("master_int_dtype must be an integer dtype, not bool.")
         int_probe = torch.empty((), dtype=self.master_int_dtype)
+        if int_probe.is_quantized:
+            raise TypeError("master_int_dtype must not be a quantized dtype.")
         if int_probe.is_floating_point():
             raise TypeError("master_int_dtype must be an integer dtype.")
         elif int_probe.is_complex():
