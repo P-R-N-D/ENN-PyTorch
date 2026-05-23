@@ -140,17 +140,21 @@ class Reducer(nn.Module):
 
         for base in range(0, n, chunk_size):
             end = min(base + chunk_size, n)
-            chunk = torch.stack(
-                [x.to(dtype=dtype) for x in xs[base:end]],
-                dim=0,
-            )
+            reduced = self._scale(
+                xs[base],
+                weight=self._get_coeff(weights, base),
+                dtype=dtype,
+            ).clone()
 
-            if weights is not None:
-                view = (end - base,) + (1,) * xs[0].ndim
-                coeff = weights[base:end].to(device=chunk.device).reshape(view)
-                chunk.mul_(coeff)
+            for i in range(base + 1, end):
+                reduced.add_(
+                    self._scale(
+                        xs[i],
+                        weight=self._get_coeff(weights, i),
+                        dtype=dtype,
+                    )
+                )
 
-            reduced = chunk.sum(dim=0)
             if out is None:
                 out = reduced
             else:
@@ -238,11 +242,10 @@ class Reducer(nn.Module):
 
         for base in range(0, n, chunk_size):
             end = min(base + chunk_size, n)
-            chunk = torch.stack(
-                [x.to(dtype=dtype) for x in xs[base:end]],
-                dim=0,
-            )
-            reduced = chunk.amin(dim=0)
+            reduced = xs[base].to(dtype=dtype).clone()
+            for i in range(base + 1, end):
+                reduced = torch.minimum(reduced, xs[i].to(dtype=dtype))
+
             out = reduced if out is None else torch.minimum(out, reduced)
 
         if out is None:
@@ -272,11 +275,10 @@ class Reducer(nn.Module):
 
         for base in range(0, n, chunk_size):
             end = min(base + chunk_size, n)
-            chunk = torch.stack(
-                [x.to(dtype=dtype) for x in xs[base:end]],
-                dim=0,
-            )
-            reduced = chunk.amax(dim=0)
+            reduced = xs[base].to(dtype=dtype).clone()
+            for i in range(base + 1, end):
+                reduced = torch.maximum(reduced, xs[i].to(dtype=dtype))
+
             out = reduced if out is None else torch.maximum(out, reduced)
 
         if out is None:
