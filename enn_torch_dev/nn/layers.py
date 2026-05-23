@@ -61,6 +61,8 @@ class Reducer(nn.Module):
         op = self._norm_op_str(op)
         xs = self._norm_tensor(tensors)
         chunk_size = self._norm_chunk_size(chunk_size)
+        if chunk_size is not None and chunk_size >= len(xs):
+            chunk_size = None
 
         if op in self.ORDERED_OPS and weights is not None:
             raise ValueError(f"{op!r} does not support weights.")
@@ -111,16 +113,32 @@ class Reducer(nn.Module):
         weights: Tensor | None,
         dtype: torch.dtype,
     ) -> Tensor:
+        return self._sum_range(
+            xs,
+            weights=weights,
+            dtype=dtype,
+            start=0,
+            end=len(xs),
+        )
+
+    def _sum_range(
+        self,
+        xs: list[Tensor],
+        weights: Tensor | None,
+        dtype: torch.dtype,
+        start: int,
+        end: int,
+    ) -> Tensor:
         out = self._scale(
-            xs[0],
-            weight=self._get_coeff(weights, 0),
+            xs[start],
+            weight=self._get_coeff(weights, start),
             dtype=dtype,
         ).clone()
 
-        for i, x in enumerate(xs[1:], start=1):
+        for i in range(start + 1, end):
             out.add_(
                 self._scale(
-                    x,
+                    xs[i],
                     weight=self._get_coeff(weights, i),
                     dtype=dtype,
                 )
@@ -140,19 +158,30 @@ class Reducer(nn.Module):
 
         for base in range(0, n, chunk_size):
             end = min(base + chunk_size, n)
-            reduced = self._scale(
-                xs[base],
-                weight=self._get_coeff(weights, base),
-                dtype=dtype,
-            ).clone()
 
-            for i in range(base + 1, end):
-                reduced.add_(
-                    self._scale(
-                        xs[i],
-                        weight=self._get_coeff(weights, i),
-                        dtype=dtype,
+            if self._can_stack(xs, base, end):
+                chunk = torch.stack(
+                    [x.to(dtype=dtype) for x in xs[base:end]],
+                    dim=0,
+                )
+
+                if weights is not None:
+                    view = (end - base,) + (1,) * xs[base].ndim
+                    coeff = (
+                        weights[base:end]
+                        .to(device=chunk.device)
+                        .reshape(view)
                     )
+                    chunk.mul_(coeff)
+
+                reduced = chunk.sum(dim=0)
+            else:
+                reduced = self._sum_range(
+                    xs,
+                    weights=weights,
+                    dtype=dtype,
+                    start=base,
+                    end=end,
                 )
 
             if out is None:
@@ -224,10 +253,19 @@ class Reducer(nn.Module):
         xs: list[Tensor],
         dtype: torch.dtype,
     ) -> Tensor:
-        out = xs[0].to(dtype=dtype).clone()
+        return self._min_range(xs, dtype=dtype, start=0, end=len(xs))
 
-        for x in xs[1:]:
-            out = torch.minimum(out, x.to(dtype=dtype))
+    def _min_range(
+        self,
+        xs: list[Tensor],
+        dtype: torch.dtype,
+        start: int,
+        end: int,
+    ) -> Tensor:
+        out = xs[start].to(dtype=dtype).clone()
+
+        for i in range(start + 1, end):
+            out = torch.minimum(out, xs[i].to(dtype=dtype))
 
         return out
 
@@ -242,9 +280,15 @@ class Reducer(nn.Module):
 
         for base in range(0, n, chunk_size):
             end = min(base + chunk_size, n)
-            reduced = xs[base].to(dtype=dtype).clone()
-            for i in range(base + 1, end):
-                reduced = torch.minimum(reduced, xs[i].to(dtype=dtype))
+
+            if self._can_stack(xs, base, end):
+                chunk = torch.stack(
+                    [x.to(dtype=dtype) for x in xs[base:end]],
+                    dim=0,
+                )
+                reduced = chunk.amin(dim=0)
+            else:
+                reduced = self._min_range(xs, dtype=dtype, start=base, end=end)
 
             out = reduced if out is None else torch.minimum(out, reduced)
 
@@ -257,10 +301,19 @@ class Reducer(nn.Module):
         xs: list[Tensor],
         dtype: torch.dtype,
     ) -> Tensor:
-        out = xs[0].to(dtype=dtype).clone()
+        return self._max_range(xs, dtype=dtype, start=0, end=len(xs))
 
-        for x in xs[1:]:
-            out = torch.maximum(out, x.to(dtype=dtype))
+    def _max_range(
+        self,
+        xs: list[Tensor],
+        dtype: torch.dtype,
+        start: int,
+        end: int,
+    ) -> Tensor:
+        out = xs[start].to(dtype=dtype).clone()
+
+        for i in range(start + 1, end):
+            out = torch.maximum(out, xs[i].to(dtype=dtype))
 
         return out
 
@@ -275,9 +328,15 @@ class Reducer(nn.Module):
 
         for base in range(0, n, chunk_size):
             end = min(base + chunk_size, n)
-            reduced = xs[base].to(dtype=dtype).clone()
-            for i in range(base + 1, end):
-                reduced = torch.maximum(reduced, xs[i].to(dtype=dtype))
+
+            if self._can_stack(xs, base, end):
+                chunk = torch.stack(
+                    [x.to(dtype=dtype) for x in xs[base:end]],
+                    dim=0,
+                )
+                reduced = chunk.amax(dim=0)
+            else:
+                reduced = self._max_range(xs, dtype=dtype, start=base, end=end)
 
             out = reduced if out is None else torch.maximum(out, reduced)
 
@@ -303,6 +362,11 @@ class Reducer(nn.Module):
         if weights is None:
             return None
         return weights[index]
+
+    @staticmethod
+    def _can_stack(xs: Sequence[Tensor], start: int, end: int) -> bool:
+        shape = xs[start].shape
+        return all(x.shape == shape for x in xs[start + 1 : end])
 
     def _norm_op_str(self, op: str) -> str:
         if not isinstance(op, str):
@@ -459,12 +523,17 @@ class Reducer(nn.Module):
                 raise ValueError("Reducer does not support complex weights.")
             w = weights.to(device=ref.device, dtype=dtype)
         else:
-            values = list(weights)
-            for weight in values:
-                if isinstance(weight, complex):
+            values: list[float] = []
+            for weight in weights:
+                probe = torch.as_tensor(weight)
+                if probe.ndim != 0:
+                    raise ValueError("Reducer weights must be scalar values.")
+                if torch.is_complex(probe):
                     raise ValueError("Reducer does not support complex weights.")
-                if not math.isfinite(float(weight)):
+                value = float(probe)
+                if not math.isfinite(value):
                     raise ValueError("Reducer weights must be finite.")
+                values.append(value)
             w = torch.tensor(values, device=ref.device, dtype=dtype)
 
         if w.ndim != 1:
