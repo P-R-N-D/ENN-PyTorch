@@ -64,10 +64,9 @@ class Reducer(nn.Module):
         if chunk_size is not None and chunk_size >= len(xs):
             chunk_size = None
 
-        if op in self.ORDERED_OPS and weights is not None:
-            raise ValueError(f"{op!r} does not support weights.")
-
         if op in self.ORDERED_OPS:
+            if weights is not None:
+                raise ValueError(f"{op!r} does not support weights.")
             self._verify_no_complex(xs, op)
 
         dtype = self._infer_reduction_dtype(xs, op=op, weights=weights)
