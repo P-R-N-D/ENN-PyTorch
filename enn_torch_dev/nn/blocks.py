@@ -6,10 +6,10 @@ from typing import Any
 import torch
 from torch import Tensor, nn
 
-from .layers import AutoConvND
+from .layers import ConvND
 
 
-class RegionCompressor(nn.Module):
+class Compressor(nn.Module):
     """
     Compress region-local channel-last features into a small number of
     context slots.
@@ -22,7 +22,7 @@ class RegionCompressor(nn.Module):
 
     The compressor is intentionally split into two stages:
 
-      1. Optional structured local mixing through ``AutoConvND``.
+      1. Optional structured local mixing through ``ConvND``.
          Conv1d/Conv2d/Conv3d is selected from the rank of
          ``local_shape``. Unsupported local ranks fall back to identity.
 
@@ -73,7 +73,7 @@ class RegionCompressor(nn.Module):
             )
 
         self.input_norm = nn.LayerNorm(self.dim)
-        self.conv = AutoConvND(
+        self.conv = ConvND(
             self.dim,
             kernel_size=conv_kernel_size,
             enabled=use_conv,
@@ -86,7 +86,7 @@ class RegionCompressor(nn.Module):
         self.score_norm = nn.LayerNorm(self.dim)
         self.score = nn.Sequential(
             nn.Linear(self.dim, score_hidden),
-            self._make_activation(activation),
+            self._get_activation(activation),
             nn.Dropout(float(dropout)),
             nn.Linear(score_hidden, self.num_slots),
         )
@@ -107,11 +107,11 @@ class RegionCompressor(nn.Module):
 
         if not isinstance(x, Tensor):
             raise TypeError(
-                f"RegionCompressor expects Tensor, got {type(x)!r}"
+                f"Compressor expects Tensor, got {type(x)!r}"
             )
         if x.ndim < 3:
             raise ValueError(
-                "RegionCompressor expects shape (B, R, *local_shape, D). "
+                "Compressor expects shape (B, R, *local_shape, D). "
                 f"Got shape={tuple(x.shape)}."
             )
         if x.shape[-1] != self.dim:
@@ -120,11 +120,11 @@ class RegionCompressor(nn.Module):
             )
         if not x.is_floating_point():
             raise TypeError(
-                "RegionCompressor requires floating point input. "
+                "Compressor requires floating point input. "
                 f"Got dtype={x.dtype}."
             )
 
-        mask = self._validate_mask(local_mask, x)
+        mask = self._norm_mask(local_mask, x)
         h = self.input_norm(x)
 
         if mask is not None:
@@ -145,7 +145,7 @@ class RegionCompressor(nn.Module):
 
         score_in = self.score_norm(h_flat)
         score = self.score(score_in)
-        weights = self._slot_weights(score, mask_flat)
+        weights = self._get_weight(score, mask_flat)
 
         z = torch.einsum("brlk,brld->brkd", weights, h_flat)
         z = self.out(z)
@@ -158,7 +158,7 @@ class RegionCompressor(nn.Module):
             return z, weights
         return z
 
-    def _validate_mask(
+    def _norm_mask(
         self, local_mask: Tensor | None, x: Tensor
     ) -> Tensor | None:
         if local_mask is None:
@@ -176,7 +176,7 @@ class RegionCompressor(nn.Module):
             )
         return local_mask.to(device=x.device, dtype=torch.bool)
 
-    def _slot_weights(
+    def _get_weight(
         self, score: Tensor, mask: Tensor | None
     ) -> Tensor:
         if mask is None:
@@ -193,7 +193,7 @@ class RegionCompressor(nn.Module):
         return weights / denom
 
     @staticmethod
-    def _make_activation(name: str) -> nn.Module:
+    def _get_activation(name: str) -> nn.Module:
         normalized = str(name).lower().strip()
         match normalized:
             case "gelu":
@@ -209,9 +209,9 @@ class RegionCompressor(nn.Module):
 
 
 @dataclass(frozen=True)
-class GlobalContextComposition:
+class ContextSummary:
     """
-    Packed coarse context produced by ``GlobalContextComposer``.
+    Packed coarse context produced by ``Composer``.
 
     ``tokens`` is the dense sequence passed to global attention.
     ``attn_bias`` is an optional key-side salience bias with shape
@@ -227,7 +227,7 @@ class GlobalContextComposition:
     original_shape: tuple[int, int, int, int]
 
 
-class GlobalContextComposer(nn.Module):
+class Composer(nn.Module):
     """
     Recompose compressed regional context into a coarse global context.
 
@@ -235,10 +235,10 @@ class GlobalContextComposer(nn.Module):
         (B, R, K, D)
 
     Output:
-        ``GlobalContextComposition`` with ``tokens`` shaped ``(B, T, D)``,
+        ``ContextSummary`` with ``tokens`` shaped ``(B, T, D)``,
         where ``T = R * K``.
 
-    This block is intentionally placed between ``RegionCompressor`` and the
+    This block is intentionally placed between ``Compressor`` and the
     global attention layer. It owns coarse-context composition metadata and
     optional TriAttention-like salience biasing:
 
@@ -272,7 +272,7 @@ class GlobalContextComposer(nn.Module):
         _ = args
 
         self.dim = int(dim)
-        self.salience_mode = self._normalize_salience_mode(salience_mode)
+        self.salience_mode = self._norm_salience_str(salience_mode)
         self.salience_topk = salience_topk
         self.salience_temperature = float(salience_temperature)
         self.salience_bias_scale = float(salience_bias_scale)
@@ -303,7 +303,7 @@ class GlobalContextComposer(nn.Module):
         self.input_norm = nn.LayerNorm(self.dim)
         self.salience_score = nn.Sequential(
             nn.Linear(self.dim, hidden),
-            self._make_activation(activation),
+            self._get_activation(activation),
             nn.Dropout(float(dropout)),
             nn.Linear(hidden, 1),
         )
@@ -314,17 +314,17 @@ class GlobalContextComposer(nn.Module):
         *args: Any,
         context_mask: Tensor | None = None,
         region_mask: Tensor | None = None,
-    ) -> GlobalContextComposition:
+    ) -> ContextSummary:
         _ = args
 
         if not isinstance(context, Tensor):
             raise TypeError(
-                "GlobalContextComposer expects Tensor, got "
+                "Composer expects Tensor, got "
                 f"{type(context)!r}"
             )
         if context.ndim != 4:
             raise ValueError(
-                "GlobalContextComposer expects shape (B, R, K, D). "
+                "Composer expects shape (B, R, K, D). "
                 f"Got shape={tuple(context.shape)}."
             )
         if context.shape[-1] != self.dim:
@@ -333,12 +333,12 @@ class GlobalContextComposer(nn.Module):
             )
         if not context.is_floating_point():
             raise TypeError(
-                "GlobalContextComposer requires floating point input. "
+                "Composer requires floating point input. "
                 f"Got dtype={context.dtype}."
             )
 
         B, R, K, D = context.shape
-        mask = self._validate_context_mask(
+        mask = self._norm_mask(
             context,
             context_mask=context_mask,
             region_mask=region_mask,
@@ -357,12 +357,12 @@ class GlobalContextComposer(nn.Module):
                 min_value = torch.finfo(score.dtype).min
                 score = score.masked_fill(~token_mask, min_value)
 
-            salience, attn_bias = self._salience_and_bias(
+            salience, attn_bias = self._get_salience_and_bias(
                 score,
                 token_mask=token_mask,
             )
 
-        return GlobalContextComposition(
+        return ContextSummary(
             tokens=tokens,
             token_mask=token_mask,
             attn_bias=attn_bias,
@@ -374,7 +374,7 @@ class GlobalContextComposer(nn.Module):
     def restore(
         self,
         tokens: Tensor,
-        composition: GlobalContextComposition,
+        composition: ContextSummary,
         *args: Any,
     ) -> Tensor:
         _ = args
@@ -397,7 +397,7 @@ class GlobalContextComposer(nn.Module):
             restored = restored.masked_fill(~mask, 0)
         return restored
 
-    def _validate_context_mask(
+    def _norm_mask(
         self,
         context: Tensor,
         *args: Any,
@@ -447,7 +447,7 @@ class GlobalContextComposer(nn.Module):
 
         return None
 
-    def _salience_and_bias(
+    def _get_salience_and_bias(
         self,
         score: Tensor,
         *args: Any,
@@ -459,7 +459,7 @@ class GlobalContextComposer(nn.Module):
             salience = torch.sigmoid(score)
             if token_mask is not None:
                 salience = salience.masked_fill(~token_mask, 0)
-            return salience, self._bias_from_salience(
+            return salience, self._get_bias_from_salience(
                 salience,
                 token_mask=token_mask,
             )
@@ -478,7 +478,7 @@ class GlobalContextComposer(nn.Module):
             if token_mask is not None:
                 salience = salience.masked_fill(~token_mask, 0)
 
-            return salience, self._bias_from_salience(
+            return salience, self._get_bias_from_salience(
                 salience,
                 token_mask=token_mask,
             )
@@ -487,7 +487,7 @@ class GlobalContextComposer(nn.Module):
             f"Unreachable salience mode: {self.salience_mode}"
         )
 
-    def _bias_from_salience(
+    def _get_bias_from_salience(
         self,
         salience: Tensor,
         *args: Any,
@@ -535,7 +535,7 @@ class GlobalContextComposer(nn.Module):
         return min(k, int(total_tokens))
 
     @classmethod
-    def _normalize_salience_mode(cls, mode: str) -> str:
+    def _norm_salience_str(cls, mode: str) -> str:
         normalized = str(mode).lower().strip()
         match normalized:
             case "none" | "off" | "disabled" | "identity":
@@ -552,7 +552,7 @@ class GlobalContextComposer(nn.Module):
                 )
 
     @staticmethod
-    def _make_activation(name: str) -> nn.Module:
+    def _get_activation(name: str) -> nn.Module:
         normalized = str(name).lower().strip()
         match normalized:
             case "gelu":

@@ -52,7 +52,7 @@ class Reducer(nn.Module):
         *args: Any,
         strict_shape: bool = True,
         strict_dtype: bool = True,
-        validate_device: bool = True,
+        strict_device: bool = True,
         eps: float = 1e-12,
         cast: bool | None = None,
         output_dtype: torch.dtype | None = None,
@@ -60,7 +60,7 @@ class Reducer(nn.Module):
         super().__init__()
         self.strict_shape = strict_shape
         self.strict_dtype = strict_dtype
-        self.validate_device = validate_device
+        self.strict_device = strict_device
         self.eps = float(eps)
         self.cast = cast
         self.output_dtype = output_dtype
@@ -72,8 +72,8 @@ class Reducer(nn.Module):
         op: str = "mean",
         weights: Sequence[float] | Tensor | None = None,
     ) -> Tensor:
-        op = self._normalize_op(op)
-        xs = self._validate_tensors(tensors)
+        op = self._norm_op_str(op)
+        xs = self._norm_tensor(tensors)
         self._assert_no_bool(xs)
 
         if op in self.ORDERED_OPS and weights is not None:
@@ -90,7 +90,7 @@ class Reducer(nn.Module):
         if op in self.ORDERED_OPS:
             self._assert_no_complex(xs, op)
 
-        with self._is_autocast_disabled(xs[0], dtype):
+        with self._safe_reduction(xs[0], dtype):
             match op:
                 case "sum":
                     return self._sum(xs, weights=ws, dtype=dtype)
@@ -116,7 +116,7 @@ class Reducer(nn.Module):
     ) -> Tensor:
         out = self._scale(
             xs[0],
-            weight=self._coeff(weights, 0),
+            weight=self._get_coeff(weights, 0),
             dtype=dtype,
         ).clone()
 
@@ -124,7 +124,7 @@ class Reducer(nn.Module):
             out.add_(
                 self._scale(
                     x,
-                    weight=self._coeff(weights, i),
+                    weight=self._get_coeff(weights, i),
                     dtype=dtype,
                 )
             )
@@ -192,12 +192,12 @@ class Reducer(nn.Module):
         return value * weight.to(device=value.device, dtype=value.dtype)
 
     @staticmethod
-    def _coeff(weights: Tensor | None, index: int) -> Tensor | None:
+    def _get_coeff(weights: Tensor | None, index: int) -> Tensor | None:
         if weights is None:
             return None
         return weights[index]
 
-    def _normalize_op(self, op: str) -> str:
+    def _norm_op_str(self, op: str) -> str:
         if not isinstance(op, str):
             raise TypeError(f"op must be str, got {type(op)!r}")
 
@@ -210,7 +210,7 @@ class Reducer(nn.Module):
 
         return normalized
 
-    def _validate_tensors(self, tensors: Sequence[Tensor]) -> list[Tensor]:
+    def _norm_tensor(self, tensors: Sequence[Tensor]) -> list[Tensor]:
         xs = list(tensors)
 
         if not xs:
@@ -237,9 +237,9 @@ class Reducer(nn.Module):
                     f"tensors[0].dtype={first.dtype}, tensors[{i}].dtype={x.dtype}"
                 )
 
-            if self.validate_device and x.device != first.device:
+            if self.strict_device and x.device != first.device:
                 raise ValueError(
-                    "All tensors must be on the same device when validate_device=True. "
+                    "All tensors must be on the same device when strict_device=True. "
                     f"tensors[0].device={first.device}, tensors[{i}].device={x.device}"
                 )
 
@@ -272,17 +272,17 @@ class Reducer(nn.Module):
             dtype = torch.promote_types(dtype, weights.dtype)
 
         if self.cast is False:
-            return self._dtype_without_autocast(dtype, op=op, weights=weights)
+            return self._infer_safe_dtype(dtype, op=op, weights=weights)
 
         if self.cast is True:
-            return self.output_dtype or self._default_dtype(dtype, op=op, weights=weights)
+            return self.output_dtype or self._get_default_dtype(dtype, op=op, weights=weights)
 
-        if self._is_autocast_needed(dtype, op=op, weights=weights):
-            return self.output_dtype or self._default_dtype(dtype, op=op, weights=weights)
+        if self._is_cast_needed(dtype, op=op, weights=weights):
+            return self.output_dtype or self._get_default_dtype(dtype, op=op, weights=weights)
 
-        return self._dtype_without_autocast(dtype, op=op, weights=weights)
+        return self._infer_safe_dtype(dtype, op=op, weights=weights)
 
-    def _dtype_without_autocast(
+    def _infer_safe_dtype(
         self,
         dtype: torch.dtype,
         *args: Any,
@@ -305,7 +305,7 @@ class Reducer(nn.Module):
 
         return dtype
 
-    def _is_autocast_needed(
+    def _is_cast_needed(
         self,
         dtype: torch.dtype,
         *args: Any,
@@ -326,7 +326,7 @@ class Reducer(nn.Module):
 
         return False
 
-    def _default_dtype(
+    def _get_default_dtype(
         self,
         dtype: torch.dtype,
         *args: Any,
@@ -397,7 +397,7 @@ class Reducer(nn.Module):
 
         return w
 
-    def _is_autocast_disabled(
+    def _safe_reduction(
         self, ref: Tensor, dtype: torch.dtype
     ) -> AbstractContextManager[None]:
         if dtype == ref.dtype:
@@ -431,18 +431,18 @@ class Reducer(nn.Module):
         if any(x.dtype == torch.bool for x in xs):
             raise TypeError("Reducer does not support bool tensors.")
 
-    def get_attr(self) -> str:
+    def extra_repr(self) -> str:
         return (
             f"strict_shape={self.strict_shape}, "
             f"strict_dtype={self.strict_dtype}, "
-            f"validate_device={self.validate_device}, "
+            f"strict_device={self.strict_device}, "
             f"eps={self.eps}, "
             f"cast={self.cast}, "
             f"output_dtype={self.output_dtype}"
         )
 
 
-class AutoConvND(nn.Module):
+class ConvND(nn.Module):
     """
     Channel-last Conv1d/Conv2d/Conv3d adapter for region-local tensors.
 
@@ -487,13 +487,13 @@ class AutoConvND(nn.Module):
             )
         if self.kernel_size % 2 == 0:
             raise ValueError(
-                "AutoConvND requires an odd kernel_size so the local shape "
+                "ConvND requires an odd kernel_size so the local shape "
                 f"can be preserved. Got kernel_size={kernel_size}."
             )
 
-        self.conv1 = self._make_conv(1, bias=bias, activation=activation)
-        self.conv2 = self._make_conv(2, bias=bias, activation=activation)
-        self.conv3 = self._make_conv(3, bias=bias, activation=activation)
+        self.conv1 = self._get_conv(1, bias=bias, activation=activation)
+        self.conv2 = self._get_conv(2, bias=bias, activation=activation)
+        self.conv3 = self._get_conv(3, bias=bias, activation=activation)
 
         if self.residual:
             self.residual_scale = nn.Parameter(
@@ -505,7 +505,7 @@ class AutoConvND(nn.Module):
     def forward(self, x: Tensor, *args: Any) -> Tensor:
         _ = args
         if not isinstance(x, Tensor):
-            raise TypeError(f"AutoConvND expects Tensor, got {type(x)!r}")
+            raise TypeError(f"ConvND expects Tensor, got {type(x)!r}")
 
         if not self.enabled:
             return x
@@ -537,14 +537,14 @@ class AutoConvND(nn.Module):
         h = x.reshape(B * R, L, D).transpose(1, 2).contiguous()
         y = self.conv1(h)
         y = y.transpose(1, 2).reshape(B, R, L, D)
-        return self._finish(x, y)
+        return self._postprocess(x, y)
 
     def _forward_2d(self, x: Tensor) -> Tensor:
         B, R, H, W, D = x.shape
         h = x.reshape(B * R, H, W, D).permute(0, 3, 1, 2).contiguous()
         y = self.conv2(h)
         y = y.permute(0, 2, 3, 1).reshape(B, R, H, W, D)
-        return self._finish(x, y)
+        return self._postprocess(x, y)
 
     def _forward_3d(self, x: Tensor) -> Tensor:
         B, R, T, H, W, D = x.shape
@@ -555,15 +555,15 @@ class AutoConvND(nn.Module):
         )
         y = self.conv3(h)
         y = y.permute(0, 2, 3, 4, 1).reshape(B, R, T, H, W, D)
-        return self._finish(x, y)
+        return self._postprocess(x, y)
 
-    def _finish(self, x: Tensor, y: Tensor) -> Tensor:
+    def _postprocess(self, x: Tensor, y: Tensor) -> Tensor:
         if not self.residual:
             return y
         scale = self.residual_scale.to(device=y.device, dtype=y.dtype)
         return x + scale * y
 
-    def _make_conv(
+    def _get_conv(
         self,
         ndim: int,
         *args: Any,
@@ -592,7 +592,7 @@ class AutoConvND(nn.Module):
                 groups=self.dim,
                 bias=bias,
             ),
-            self._make_activation(activation),
+            self._get_activation(activation),
             conv_cls(
                 self.dim,
                 self.dim,
@@ -604,7 +604,7 @@ class AutoConvND(nn.Module):
         )
 
     @staticmethod
-    def _make_activation(name: str) -> nn.Module:
+    def _get_activation(name: str) -> nn.Module:
         normalized = str(name).lower().strip()
         match normalized:
             case "gelu":
