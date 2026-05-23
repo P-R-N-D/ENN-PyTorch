@@ -1,16 +1,16 @@
 from __future__ import annotations
 
 from .blocks import (
-    GlobalContextComposer,
-    GlobalContextComposition,
-    RegionCompressor,
+    Composer,
+    ContextSummary,
+    Compressor,
 )
-from .layers import AutoConvND, Reducer
+from .layers import ConvND, Reducer
 
 __all__ = [
-    "AutoConvND",
-    "GlobalContextComposer",
-    "GlobalContextComposition",
+    "ConvND",
+    "Composer",
+    "ContextSummary",
     "Reducer",
-    "RegionCompressor",
+    "Compressor",
 ]
