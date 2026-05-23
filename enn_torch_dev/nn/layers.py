@@ -153,14 +153,7 @@ class Reducer(nn.Module):
         if weights is None:
             return out / len(xs)
 
-        denom = weights.sum()
-        eps_val = torch.full_like(denom, self.eps)
-        denom_safe = torch.where(
-            torch.abs(denom) < self.eps,
-            torch.where(denom < 0, -eps_val, eps_val),
-            denom,
-        )
-        return out / denom_safe
+        return out / self._safe_weight_denom(weights)
 
     def _sum_chunked(
         self,
@@ -197,14 +190,14 @@ class Reducer(nn.Module):
         out = self._sum_chunked(xs, weights=weights, dtype=dtype, chunk_size=chunk_size)
         if weights is None:
             return out / len(xs)
+        return out / self._safe_weight_denom(weights)
+
+    def _safe_weight_denom(self, weights: Tensor) -> Tensor:
         denom = weights.sum()
         eps_val = torch.full_like(denom, self.eps)
-        denom_safe = torch.where(
-            torch.abs(denom) < self.eps,
-            torch.where(denom < 0, -eps_val, eps_val),
-            denom,
-        )
-        return out / denom_safe
+        denom_sign_ref = denom.real if torch.is_complex(denom) else denom
+        denom_eps = torch.where(denom_sign_ref < 0, -eps_val, eps_val)
+        return torch.where(torch.abs(denom) < self.eps, denom_eps, denom)
 
     def _min(
         self,
