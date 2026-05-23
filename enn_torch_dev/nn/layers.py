@@ -136,12 +136,13 @@ class Reducer(nn.Module):
         ).clone()
 
         for i in range(start + 1, end):
-            out.add_(
+            out = self._add_to_accum(
+                out,
                 self._scale(
                     xs[i],
                     weight=self._get_coeff(weights, i),
                     dtype=dtype,
-                )
+                ),
             )
 
         return out
@@ -187,7 +188,7 @@ class Reducer(nn.Module):
             if out is None:
                 out = reduced
             else:
-                out.add_(reduced)
+                out = self._add_to_accum(out, reduced)
 
         if out is None:
             raise AssertionError("Reducer requires at least one tensor.")
@@ -204,7 +205,7 @@ class Reducer(nn.Module):
             out = xs[0].to(dtype=dtype).clone()
             out.mul_(coeff)
             for x in xs[1:]:
-                out.add_(x.to(dtype=dtype), alpha=coeff)
+                out = self._add_to_accum(out, x.to(dtype=dtype), alpha=coeff)
             return out
 
         coeffs = self._mean_coeffs(weights)
@@ -367,6 +368,20 @@ class Reducer(nn.Module):
     def _can_stack(xs: Sequence[Tensor], start: int, end: int) -> bool:
         shape = xs[start].shape
         return all(x.shape == shape for x in xs[start + 1 : end])
+
+    @staticmethod
+    def _add_to_accum(out: Tensor, term: Tensor, alpha: float = 1.0) -> Tensor:
+        broadcast_shape = torch.broadcast_shapes(out.shape, term.shape)
+        if tuple(broadcast_shape) == tuple(out.shape):
+            if alpha == 1.0:
+                out.add_(term)
+            else:
+                out.add_(term, alpha=alpha)
+            return out
+
+        if alpha == 1.0:
+            return out + term
+        return torch.add(out, term, alpha=alpha)
 
     def _norm_op_str(self, op: str) -> str:
         if not isinstance(op, str):
