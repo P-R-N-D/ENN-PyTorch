@@ -11,6 +11,7 @@ recursive-exclude *.diff *.patch *.git
 # Exclude debug scripts
 recursive-include enn_torch *.py *.json *.yaml *.yml *.ini *.cfg *.md *.txt
 recursive-exclude enn_torch/debug *
+recursive-exclude enn_torch_dev/debug *
 
 # Exclude junk / build outputs
 # Note: Re-typed spaces to ensure no non-breaking space characters
