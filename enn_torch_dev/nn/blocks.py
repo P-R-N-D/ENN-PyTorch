@@ -41,7 +41,7 @@ class Compressor(nn.Module):
         num_slots: int = 4,
         input_dim: int | None = None,
         integral_mode: str = "cast",
-        complex_mode: str = "real_imag",
+        complex_mode: str | None = None,
         output_dtype: torch.dtype | None = None,
         use_conv: bool = True,
         conv_kernel_size: int = 3,
@@ -66,7 +66,10 @@ class Compressor(nn.Module):
         self.pool_chunk_size = self._norm_chunk_size(pool_chunk_size)
         self.input_dim = self.dim if input_dim is None else int(input_dim)
         self.integral_mode = self._norm_integral_mode(integral_mode)
-        self.complex_mode = self._norm_complex_mode(complex_mode)
+        (
+            self.complex_mode,
+            complex_projection_mode,
+        ) = self._norm_complex_mode(complex_mode)
         self.output_dtype = self._norm_optional_real_dtype(output_dtype)
 
         if self.dim <= 0:
@@ -98,12 +101,16 @@ class Compressor(nn.Module):
             if self.input_dim == self.dim
             else nn.Linear(self.input_dim, self.dim)
         )
-        if self.complex_mode == "real_imag":
-            complex_adapted_dim = self.input_dim * 2
-        elif self.complex_mode == "abs":
-            complex_adapted_dim = self.input_dim
-        else:
-            complex_adapted_dim = self.input_dim
+        match complex_projection_mode:
+            case "real_imag":
+                complex_adapted_dim = self.input_dim * 2
+            case "abs" | "reject":
+                complex_adapted_dim = self.input_dim
+            case _:
+                raise AssertionError(
+                    "Unreachable complex projection mode: "
+                    f"{complex_projection_mode}"
+                )
         self.complex_input_proj = (
             nn.Identity()
             if complex_adapted_dim == self.dim
@@ -371,24 +378,28 @@ class Compressor(nn.Module):
                     "Compressor received complex input, but complex_mode='reject'."
                 )
             self._check_input_dim(x)
-            if self.complex_mode == "real_imag":
-                x = torch.view_as_real(x).flatten(-2)
-            elif self.complex_mode == "abs":
-                x = x.abs()
-            else:
-                raise AssertionError(f"Unreachable complex_mode: {self.complex_mode}")
+            match self.complex_mode:
+                case "real_imag":
+                    x = torch.view_as_real(x).flatten(-2)
+                case "abs":
+                    x = x.abs()
+                case _:
+                    raise AssertionError(
+                        f"Unreachable complex_mode: {self.complex_mode}"
+                    )
             return self.complex_input_proj(x.to(dtype=target_dtype))
-        if x.is_floating_point():
+        elif x.is_floating_point():
             self._check_input_dim(x)
             return self.real_input_proj(x.to(dtype=target_dtype))
-        if x.dtype == torch.bool:
+        elif x.dtype == torch.bool:
             raise TypeError("Compressor does not accept bool tensors as numeric input.")
-        if self.integral_mode == "reject":
+        elif self.integral_mode == "reject":
             raise TypeError(
                 "Compressor received integral input, but integral_mode='reject'."
             )
-        self._check_input_dim(x)
-        return self.real_input_proj(x.to(dtype=target_dtype))
+        else:
+            self._check_input_dim(x)
+            return self.real_input_proj(x.to(dtype=target_dtype))
 
     def _check_input_dim(self, x: Tensor) -> None:
         if x.shape[-1] != self.input_dim:
@@ -429,22 +440,31 @@ class Compressor(nn.Module):
     @staticmethod
     def _norm_integral_mode(mode: str) -> str:
         normalized = str(mode).lower().strip()
-        if normalized in {"cast", "float", "to_float"}:
-            return "cast"
-        if normalized in {"reject", "error", "none"}:
-            return "reject"
-        raise ValueError("integral_mode must be one of 'cast' or 'reject'.")
+        match normalized:
+            case "cast" | "float" | "to_float":
+                return "cast"
+            case "reject" | "error" | "none":
+                return "reject"
+            case _:
+                raise ValueError("integral_mode must be one of 'cast' or 'reject'.")
 
     @staticmethod
-    def _norm_complex_mode(mode: str) -> str:
+    def _norm_complex_mode(mode: str | None) -> tuple[str, str]:
+        if mode is None:
+            return "reject", "real_imag"
+
         normalized = str(mode).lower().strip().replace("-", "_")
-        if normalized in {"real_imag", "cartesian", "ri"}:
-            return "real_imag"
-        if normalized in {"abs", "magnitude", "mag"}:
-            return "abs"
-        if normalized in {"reject", "error", "none"}:
-            return "reject"
-        raise ValueError("complex_mode must be one of 'real_imag', 'abs', or 'reject'.")
+        match normalized:
+            case "real_imag" | "cartesian" | "ri":
+                return "real_imag", "real_imag"
+            case "abs" | "magnitude" | "mag":
+                return "abs", "abs"
+            case "reject" | "error" | "none":
+                return "reject", "reject"
+            case _:
+                raise ValueError(
+                    "complex_mode must be one of 'real_imag', 'abs', or 'reject'."
+                )
 
     @staticmethod
     def _norm_chunk_size(chunk_size: int | None) -> int | None:

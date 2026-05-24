@@ -63,6 +63,7 @@ def test_compressor_chunked_pooling_matches_dense_pooling():
 
     assert torch.allclose(chunked_out, dense_out, atol=1e-5, rtol=1e-5)
 
+
 def test_compressor_chunked_pooling_handles_empty_local_dim():
     x = torch.randn(2, 3, 0, 4)
 
@@ -173,6 +174,55 @@ def test_compressor_rejects_integral_input_when_configured():
 
     with pytest.raises(TypeError, match="integral input"):
         module(x)
+
+
+def test_compressor_default_rejects_complex_but_loads_legacy_default_state_dict():
+    module = Compressor(4, num_slots=2, use_conv=False)
+    legacy = Compressor(
+        4, num_slots=2, use_conv=False, complex_mode="real_imag"
+    )
+    x = torch.randn(2, 3, 5, 4, dtype=torch.complex64)
+
+    assert isinstance(module.complex_input_proj, torch.nn.Linear)
+    assert "complex_input_proj.weight" in module.state_dict()
+
+    module.load_state_dict(legacy.state_dict(), strict=True)
+
+    with pytest.raises(TypeError, match="complex input"):
+        module(x)
+
+
+def test_compressor_explicit_reject_omits_complex_projection_when_dims_match():
+    module = Compressor(
+        4, num_slots=2, use_conv=False, complex_mode="reject"
+    )
+    x = torch.randn(2, 3, 5, 4, dtype=torch.complex64)
+
+    assert isinstance(module.complex_input_proj, torch.nn.Identity)
+    assert "complex_input_proj.weight" not in module.state_dict()
+
+    with pytest.raises(TypeError, match="complex input"):
+        module(x)
+
+
+def test_compressor_explicit_reject_preserves_projection_when_input_dim_differs():
+    legacy = Compressor(
+        8, input_dim=4, num_slots=2, use_conv=False, complex_mode="reject"
+    )
+    module = Compressor(
+        8, input_dim=4, num_slots=2, use_conv=False, complex_mode="reject"
+    )
+
+    assert isinstance(module.real_input_proj, torch.nn.Linear)
+    assert isinstance(module.complex_input_proj, torch.nn.Linear)
+    assert "real_input_proj.weight" in module.state_dict()
+    assert "complex_input_proj.weight" in module.state_dict()
+    assert module.complex_input_proj.weight.shape == (8, 4)
+
+    module.load_state_dict(legacy.state_dict(), strict=True)
+
+    with pytest.raises(TypeError, match="complex input"):
+        module(torch.randn(2, 3, 5, 4, dtype=torch.complex64))
 
 
 def test_compressor_accepts_complex_real_imag_input():
