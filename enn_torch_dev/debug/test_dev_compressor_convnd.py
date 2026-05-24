@@ -42,6 +42,18 @@ def test_convnd_rank0_and_rank_gt3_identity_fallback():
     assert layer(rank4) is rank4
 
 
+def test_convnd_disabled_omits_conv_parameters():
+    layer = ConvND(4, enabled=False)
+    x = torch.randn(2, 3, 5, 4)
+
+    assert layer(x) is x
+    assert not list(layer.parameters())
+    assert not any(
+        key.startswith(("conv1.", "conv2.", "conv3."))
+        for key in layer.state_dict()
+    )
+
+
 def test_compressor_masks_all_invalid_regions_without_nan():
     x = torch.randn(2, 3, 7, 4)
     mask = torch.ones(2, 3, 7, dtype=torch.bool)

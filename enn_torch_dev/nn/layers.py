@@ -763,6 +763,13 @@ class ConvND(nn.Module):
                 f"can be preserved. Got kernel_size={kernel_size}."
             )
 
+        if not self.enabled:
+            self.conv1 = nn.Identity()
+            self.conv2 = nn.Identity()
+            self.conv3 = nn.Identity()
+            self.register_parameter("residual_scale", None)
+            return
+
         self.conv1 = self._make_or_identity(1, bias=bias, activation=activation)
         self.conv2 = self._make_or_identity(2, bias=bias, activation=activation)
         self.conv3 = self._make_or_identity(3, bias=bias, activation=activation)
