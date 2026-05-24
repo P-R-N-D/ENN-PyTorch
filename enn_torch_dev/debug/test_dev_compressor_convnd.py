@@ -61,6 +61,15 @@ def test_convnd_disabled_loads_legacy_state_dict_strict():
     disabled.load_state_dict(legacy.state_dict(), strict=True)
 
 
+def test_convnd_disabled_rejects_non_legacy_unexpected_key_strict():
+    disabled = ConvND(4, enabled=False)
+    state = disabled.state_dict()
+    state["unexpected.weight"] = torch.randn(1)
+
+    with pytest.raises(RuntimeError, match="Unexpected key"):
+        disabled.load_state_dict(state, strict=True)
+
+
 def test_compressor_masks_all_invalid_regions_without_nan():
     x = torch.randn(2, 3, 7, 4)
     mask = torch.ones(2, 3, 7, dtype=torch.bool)
@@ -125,6 +134,15 @@ def test_compressor_use_conv_false_loads_legacy_conv_state_dict_strict():
     assert not any(key.startswith("conv.") for key in disabled.state_dict())
 
     disabled.load_state_dict(legacy_state, strict=True)
+
+
+def test_compressor_use_conv_false_rejects_non_legacy_unexpected_key_strict():
+    disabled = Compressor(4, num_slots=2, use_conv=False)
+    state = disabled.state_dict()
+    state["conv.extra.weight"] = torch.randn(1)
+
+    with pytest.raises(RuntimeError, match="Unexpected key"):
+        disabled.load_state_dict(state, strict=True)
 
 
 def test_compressor_score_hidden_dim_is_not_silently_clamped():
