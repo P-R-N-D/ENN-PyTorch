@@ -781,6 +781,37 @@ class ConvND(nn.Module):
         else:
             self.register_parameter("residual_scale", None)
 
+    def _load_from_state_dict(
+        self,
+        state_dict: dict[str, Tensor],
+        prefix: str,
+        local_metadata: dict[str, Any],
+        strict: bool,
+        missing_keys: list[str],
+        unexpected_keys: list[str],
+        error_msgs: list[str],
+    ) -> None:
+        if not self.enabled:
+            legacy_prefixes = ("conv1.", "conv2.", "conv3.")
+            drop_keys = [
+                key
+                for key in tuple(state_dict.keys())
+                if key == f"{prefix}residual_scale"
+                or key.startswith(tuple(f"{prefix}{p}" for p in legacy_prefixes))
+            ]
+            for key in drop_keys:
+                state_dict.pop(key, None)
+
+        super()._load_from_state_dict(
+            state_dict=state_dict,
+            prefix=prefix,
+            local_metadata=local_metadata,
+            strict=strict,
+            missing_keys=missing_keys,
+            unexpected_keys=unexpected_keys,
+            error_msgs=error_msgs,
+        )
+
     def forward(self, x: Tensor, *args: Any) -> Tensor:
         _ = args
         if not isinstance(x, Tensor):

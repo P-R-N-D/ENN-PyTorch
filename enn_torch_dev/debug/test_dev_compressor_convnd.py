@@ -54,6 +54,13 @@ def test_convnd_disabled_omits_conv_parameters():
     )
 
 
+def test_convnd_disabled_loads_legacy_state_dict_strict():
+    legacy = ConvND(4, enabled=True)
+    disabled = ConvND(4, enabled=False)
+
+    disabled.load_state_dict(legacy.state_dict(), strict=True)
+
+
 def test_compressor_masks_all_invalid_regions_without_nan():
     x = torch.randn(2, 3, 7, 4)
     mask = torch.ones(2, 3, 7, dtype=torch.bool)
