@@ -845,7 +845,6 @@ class ConvND(nn.Module):
         scale = self.residual_scale.to(device=y.device, dtype=y.dtype)
         return x + scale * y
 
-
     def _make_or_identity(
         self,
         ndim: int,
