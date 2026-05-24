@@ -41,7 +41,7 @@ class Compressor(nn.Module):
         num_slots: int = 4,
         input_dim: int | None = None,
         integral_mode: str = "cast",
-        complex_mode: str = "reject",
+        complex_mode: str | None = None,
         output_dtype: torch.dtype | None = None,
         use_conv: bool = True,
         conv_kernel_size: int = 3,
@@ -66,7 +66,10 @@ class Compressor(nn.Module):
         self.pool_chunk_size = self._norm_chunk_size(pool_chunk_size)
         self.input_dim = self.dim if input_dim is None else int(input_dim)
         self.integral_mode = self._norm_integral_mode(integral_mode)
-        self.complex_mode = self._norm_complex_mode(complex_mode)
+        (
+            self.complex_mode,
+            complex_projection_mode,
+        ) = self._norm_complex_mode(complex_mode)
         self.output_dtype = self._norm_optional_real_dtype(output_dtype)
 
         if self.dim <= 0:
@@ -98,18 +101,16 @@ class Compressor(nn.Module):
             if self.input_dim == self.dim
             else nn.Linear(self.input_dim, self.dim)
         )
-        if self.complex_mode == "real_imag":
+        if complex_projection_mode == "real_imag":
             complex_adapted_dim = self.input_dim * 2
-        elif self.complex_mode == "abs":
+        elif complex_projection_mode == "abs":
             complex_adapted_dim = self.input_dim
-        elif self.complex_mode == "reject":
-            # Keep legacy projection parameters registered for strict
-            # load_state_dict compatibility with checkpoints created when
-            # the default complex_mode was "real_imag".
-            complex_adapted_dim = self.input_dim * 2
+        elif complex_projection_mode == "reject":
+            complex_adapted_dim = self.input_dim
         else:
             raise AssertionError(
-                f"Unreachable complex_mode: {self.complex_mode}"
+                "Unreachable complex projection mode: "
+                f"{complex_projection_mode}"
             )
         self.complex_input_proj = (
             nn.Identity()
@@ -443,14 +444,17 @@ class Compressor(nn.Module):
         raise ValueError("integral_mode must be one of 'cast' or 'reject'.")
 
     @staticmethod
-    def _norm_complex_mode(mode: str) -> str:
+    def _norm_complex_mode(mode: str | None) -> tuple[str, str]:
+        if mode is None:
+            return "reject", "real_imag"
+
         normalized = str(mode).lower().strip().replace("-", "_")
         if normalized in {"real_imag", "cartesian", "ri"}:
-            return "real_imag"
+            return "real_imag", "real_imag"
         if normalized in {"abs", "magnitude", "mag"}:
-            return "abs"
+            return "abs", "abs"
         if normalized in {"reject", "error", "none"}:
-            return "reject"
+            return "reject", "reject"
         raise ValueError("complex_mode must be one of 'real_imag', 'abs', or 'reject'.")
 
     @staticmethod
