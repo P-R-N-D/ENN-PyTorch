@@ -763,6 +763,13 @@ class ConvND(nn.Module):
                 f"can be preserved. Got kernel_size={kernel_size}."
             )
 
+        if not self.enabled:
+            self.conv1 = nn.Identity()
+            self.conv2 = nn.Identity()
+            self.conv3 = nn.Identity()
+            self.register_parameter("residual_scale", None)
+            return
+
         self.conv1 = self._make_or_identity(1, bias=bias, activation=activation)
         self.conv2 = self._make_or_identity(2, bias=bias, activation=activation)
         self.conv3 = self._make_or_identity(3, bias=bias, activation=activation)
@@ -773,6 +780,37 @@ class ConvND(nn.Module):
             )
         else:
             self.register_parameter("residual_scale", None)
+
+    def _load_from_state_dict(
+        self,
+        state_dict: dict[str, Tensor],
+        prefix: str,
+        local_metadata: dict[str, Any],
+        strict: bool,
+        missing_keys: list[str],
+        unexpected_keys: list[str],
+        error_msgs: list[str],
+    ) -> None:
+        if not self.enabled:
+            legacy_prefixes = ("conv1.", "conv2.", "conv3.")
+            drop_keys = [
+                key
+                for key in tuple(state_dict.keys())
+                if key == f"{prefix}residual_scale"
+                or key.startswith(tuple(f"{prefix}{p}" for p in legacy_prefixes))
+            ]
+            for key in drop_keys:
+                state_dict.pop(key, None)
+
+        super()._load_from_state_dict(
+            state_dict=state_dict,
+            prefix=prefix,
+            local_metadata=local_metadata,
+            strict=strict,
+            missing_keys=missing_keys,
+            unexpected_keys=unexpected_keys,
+            error_msgs=error_msgs,
+        )
 
     def forward(self, x: Tensor, *args: Any) -> Tensor:
         _ = args

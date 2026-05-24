@@ -147,6 +147,41 @@ class Compressor(nn.Module):
             nn.Linear(self.dim, self.dim),
         )
 
+    def _load_from_state_dict(
+        self,
+        state_dict: dict[str, Tensor],
+        prefix: str,
+        local_metadata: dict[str, Any],
+        strict: bool,
+        missing_keys: list[str],
+        unexpected_keys: list[str],
+        error_msgs: list[str],
+    ) -> None:
+        if isinstance(self.conv, nn.Identity):
+            legacy_conv_prefixes = (
+                f"{prefix}conv.conv1.",
+                f"{prefix}conv.conv2.",
+                f"{prefix}conv.conv3.",
+            )
+            legacy_conv_keys = [
+                key
+                for key in tuple(state_dict.keys())
+                if key == f"{prefix}conv.residual_scale"
+                or key.startswith(legacy_conv_prefixes)
+            ]
+            for key in legacy_conv_keys:
+                state_dict.pop(key, None)
+
+        super()._load_from_state_dict(
+            state_dict=state_dict,
+            prefix=prefix,
+            local_metadata=local_metadata,
+            strict=strict,
+            missing_keys=missing_keys,
+            unexpected_keys=unexpected_keys,
+            error_msgs=error_msgs,
+        )
+
     def forward(
         self,
         x: Tensor,

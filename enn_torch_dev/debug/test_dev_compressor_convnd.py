@@ -42,6 +42,34 @@ def test_convnd_rank0_and_rank_gt3_identity_fallback():
     assert layer(rank4) is rank4
 
 
+def test_convnd_disabled_omits_conv_parameters():
+    layer = ConvND(4, enabled=False)
+    x = torch.randn(2, 3, 5, 4)
+
+    assert layer(x) is x
+    assert not list(layer.parameters())
+    assert not any(
+        key.startswith(("conv1.", "conv2.", "conv3."))
+        for key in layer.state_dict()
+    )
+
+
+def test_convnd_disabled_loads_legacy_state_dict_strict():
+    legacy = ConvND(4, enabled=True)
+    disabled = ConvND(4, enabled=False)
+
+    disabled.load_state_dict(legacy.state_dict(), strict=True)
+
+
+def test_convnd_disabled_rejects_non_legacy_unexpected_key_strict():
+    disabled = ConvND(4, enabled=False)
+    state = disabled.state_dict()
+    state["unexpected.weight"] = torch.randn(1)
+
+    with pytest.raises(RuntimeError, match="Unexpected key"):
+        disabled.load_state_dict(state, strict=True)
+
+
 def test_compressor_masks_all_invalid_regions_without_nan():
     x = torch.randn(2, 3, 7, 4)
     mask = torch.ones(2, 3, 7, dtype=torch.bool)
@@ -95,6 +123,26 @@ def test_compressor_use_conv_false_omits_conv_parameters():
 
     assert isinstance(module.conv, torch.nn.Identity)
     assert not any(key.startswith("conv.") for key in module.state_dict())
+
+
+def test_compressor_use_conv_false_loads_legacy_conv_state_dict_strict():
+    legacy = Compressor(4, num_slots=2, use_conv=True)
+    disabled = Compressor(4, num_slots=2, use_conv=False)
+
+    legacy_state = legacy.state_dict()
+    assert any(key.startswith("conv.") for key in legacy_state)
+    assert not any(key.startswith("conv.") for key in disabled.state_dict())
+
+    disabled.load_state_dict(legacy_state, strict=True)
+
+
+def test_compressor_use_conv_false_rejects_non_legacy_unexpected_key_strict():
+    disabled = Compressor(4, num_slots=2, use_conv=False)
+    state = disabled.state_dict()
+    state["conv.extra.weight"] = torch.randn(1)
+
+    with pytest.raises(RuntimeError, match="Unexpected key"):
+        disabled.load_state_dict(state, strict=True)
 
 
 def test_compressor_score_hidden_dim_is_not_silently_clamped():
