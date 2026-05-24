@@ -88,7 +88,7 @@ class Compressor(nn.Module):
         elif score_hidden_dim is None:
             score_hidden = self.dim
         else:
-            score_hidden = min(self.dim, int(score_hidden_dim))
+            score_hidden = int(score_hidden_dim)
 
         if score_hidden <= 0:
             raise ValueError(
@@ -118,15 +118,19 @@ class Compressor(nn.Module):
         )
 
         self.input_norm = nn.LayerNorm(self.dim)
-        self.conv = ConvND(
-            self.dim,
-            kernel_size=conv_kernel_size,
-            enabled=use_conv,
-            bias=conv_bias,
-            activation=conv_activation,
-            local_ndim=conv_local_ndim,
-            residual=conv_residual,
-            residual_scale_init=conv_residual_scale_init,
+        self.conv = (
+            ConvND(
+                self.dim,
+                kernel_size=conv_kernel_size,
+                enabled=True,
+                bias=conv_bias,
+                activation=conv_activation,
+                local_ndim=conv_local_ndim,
+                residual=conv_residual,
+                residual_scale_init=conv_residual_scale_init,
+            )
+            if use_conv
+            else nn.Identity()
         )
 
         self.value_norm = nn.LayerNorm(self.dim)
@@ -203,6 +207,14 @@ class Compressor(nn.Module):
         mask_flat = (
             mask.reshape(B, R, -1) if mask is not None else None
         )
+
+        if h_flat.shape[2] == 0:
+            z = h_flat.new_zeros((B, R, self.num_slots, D))
+            z = self._cast_output(z)
+            if return_weights:
+                weights = h_flat.new_zeros((B, R, 0, self.num_slots))
+                return z, weights
+            return z
 
         use_chunked = (
             self.pool_chunk_size is not None
@@ -283,8 +295,7 @@ class Compressor(nn.Module):
         B, R, L, D = h_flat.shape
         K = self.num_slots
         if L == 0:
-            z, _ = self._pool_dense(h_flat, mask)
-            return z
+            return h_flat.new_zeros((B, R, K, D))
 
         score_max: Tensor | None = None
         chunks: list[tuple[Tensor, Tensor, Tensor | None]] = []
