@@ -64,67 +64,97 @@ class Reducer(nn.Module):
         if chunk_size is not None and chunk_size >= len(xs):
             chunk_size = None
 
-        if op in self.ORDERED_OPS:
-            if weights is not None:
-                raise ValueError(f"{op!r} does not support weights.")
-            self._verify_no_complex(xs, op)
+        if op in self.ORDERED_OPS and weights is not None:
+            raise ValueError(f"{op!r} does not support weights.")
 
         dtype = self._infer_reduction_dtype(xs, op=op, weights=weights)
-        weight_dtype = self._weight_dtype(dtype=dtype, weights=weights)
-        ws = self._norm_weight(
-            weights,
-            source_count=len(xs),
-            ref=xs[0],
-            dtype=weight_dtype,
-        )
+        device = xs[0].device
+        ws: Tensor | None = None
+        if op not in self.ORDERED_OPS:
+            weight_dtype = self._weight_dtype(dtype=dtype, weights=weights)
+            ws = self._norm_weight(
+                weights,
+                source_count=len(xs),
+                ref=xs[0],
+                dtype=weight_dtype,
+            )
 
         match op:
             case "sum":
                 if chunk_size is None:
-                    return self._sum(xs, weights=ws, dtype=dtype)
+                    return self._sum_range(
+                        xs,
+                        weights=ws,
+                        dtype=dtype,
+                        device=device,
+                        start=0,
+                        end=len(xs),
+                    )
                 return self._sum_chunked(
-                    xs, weights=ws, dtype=dtype, chunk_size=chunk_size
+                    xs,
+                    weights=ws,
+                    dtype=dtype,
+                    device=device,
+                    chunk_size=chunk_size,
                 )
 
             case "mean":
                 if chunk_size is None:
-                    return self._mean(xs, weights=ws, dtype=dtype)
+                    return self._mean(
+                        xs,
+                        weights=ws,
+                        dtype=dtype,
+                        device=device,
+                    )
                 return self._mean_chunked(
-                    xs, weights=ws, dtype=dtype, chunk_size=chunk_size
+                    xs,
+                    weights=ws,
+                    dtype=dtype,
+                    device=device,
+                    chunk_size=chunk_size,
                 )
 
             case "min":
                 if chunk_size is None:
-                    return self._min(xs, dtype=dtype)
-                return self._min_chunked(xs, dtype=dtype, chunk_size=chunk_size)
+                    return self._min_range(
+                        xs,
+                        dtype=dtype,
+                        device=device,
+                        start=0,
+                        end=len(xs),
+                    )
+                return self._min_chunked(
+                    xs,
+                    dtype=dtype,
+                    device=device,
+                    chunk_size=chunk_size,
+                )
 
             case "max":
                 if chunk_size is None:
-                    return self._max(xs, dtype=dtype)
-                return self._max_chunked(xs, dtype=dtype, chunk_size=chunk_size)
+                    return self._max_range(
+                        xs,
+                        dtype=dtype,
+                        device=device,
+                        start=0,
+                        end=len(xs),
+                    )
+                return self._max_chunked(
+                    xs,
+                    dtype=dtype,
+                    device=device,
+                    chunk_size=chunk_size,
+                )
 
             case _:
                 raise AssertionError(f"Unreachable reducer op: {op}")
-
-    def _sum(
-        self,
-        xs: list[Tensor],
-        weights: Tensor | None,
-        dtype: torch.dtype,
-    ) -> Tensor:
-        return self._sum_range(
-            xs,
-            weights=weights,
-            dtype=dtype,
-            start=0,
-            end=len(xs),
-        )
 
     def _sum_range(
         self,
         xs: list[Tensor],
         weights: Tensor | None,
         dtype: torch.dtype,
+        device: torch.device,
         start: int,
         end: int,
     ) -> Tensor:
@@ -132,6 +162,7 @@ class Reducer(nn.Module):
             xs[start],
             weight=self._get_coeff(weights, start),
             dtype=dtype,
+            device=device,
         ).clone()
 
         for i in range(start + 1, end):
@@ -141,6 +172,7 @@ class Reducer(nn.Module):
                     xs[i],
                     weight=self._get_coeff(weights, i),
                     dtype=dtype,
+                    device=device,
                 ),
             )
 
@@ -151,6 +183,7 @@ class Reducer(nn.Module):
         xs: list[Tensor],
         weights: Tensor | None,
         dtype: torch.dtype,
+        device: torch.device,
         chunk_size: int,
     ) -> Tensor:
         out: Tensor | None = None
@@ -161,17 +194,20 @@ class Reducer(nn.Module):
 
             if self._can_stack(xs, base, end):
                 chunk = torch.stack(
-                    [x.to(dtype=dtype) for x in xs[base:end]],
+                    [
+                        self._to_reduction_tensor(
+                            x,
+                            dtype=dtype,
+                            device=device,
+                        )
+                        for x in xs[base:end]
+                    ],
                     dim=0,
                 )
 
                 if weights is not None:
                     view = (end - base,) + (1,) * xs[base].ndim
-                    coeff = (
-                        weights[base:end]
-                        .to(device=chunk.device)
-                        .reshape(view)
-                    )
+                    coeff = weights[base:end].to(device=device).reshape(view)
                     chunk.mul_(coeff)
 
                 reduced = chunk.sum(dim=0)
@@ -180,6 +216,7 @@ class Reducer(nn.Module):
                     xs,
                     weights=weights,
                     dtype=dtype,
+                    device=device,
                     start=base,
                     end=end,
                 )
@@ -198,30 +235,51 @@ class Reducer(nn.Module):
         xs: list[Tensor],
         weights: Tensor | None,
         dtype: torch.dtype,
+        device: torch.device,
     ) -> Tensor:
         if weights is None:
             coeff = 1.0 / len(xs)
-            out = xs[0].to(dtype=dtype).clone()
+            out = self._to_reduction_tensor(
+                xs[0],
+                dtype=dtype,
+                device=device,
+            ).clone()
             out.mul_(coeff)
             for x in xs[1:]:
-                out = self._add_to_accum(out, x.to(dtype=dtype), alpha=coeff)
+                out = self._add_to_accum(
+                    out,
+                    self._to_reduction_tensor(
+                        x,
+                        dtype=dtype,
+                        device=device,
+                    ),
+                    alpha=coeff,
+                )
             return out
 
         coeffs = self._mean_coeffs(weights)
-        return self._sum(xs, weights=coeffs, dtype=dtype)
+        return self._sum_range(
+            xs,
+            weights=coeffs,
+            dtype=dtype,
+            device=device,
+            start=0,
+            end=len(xs),
+        )
 
     def _mean_chunked(
         self,
         xs: list[Tensor],
         weights: Tensor | None,
         dtype: torch.dtype,
+        device: torch.device,
         chunk_size: int,
     ) -> Tensor:
         if weights is None:
             coeffs = torch.full(
                 (len(xs),),
                 1.0 / len(xs),
-                device=xs[0].device,
+                device=device,
                 dtype=self._weight_dtype(dtype=dtype, weights=None),
             )
         else:
@@ -231,6 +289,7 @@ class Reducer(nn.Module):
             xs,
             weights=coeffs,
             dtype=dtype,
+            device=device,
             chunk_size=chunk_size,
         )
 
@@ -238,34 +297,37 @@ class Reducer(nn.Module):
         scale_floor = torch.finfo(weights.dtype).tiny
         scale = weights.abs().amax().clamp_min(scale_floor)
         scaled = weights / scale
-        denom = self._safe_signed_denom(scaled)
+        denom = scaled.sum()
+        safe_eps = max(self.eps, torch.finfo(weights.dtype).tiny)
+        if torch.abs(denom).item() < safe_eps:
+            raise ValueError(
+                "Weighted mean requires weights with a non-zero sum."
+            )
         return scaled / denom
-
-    def _safe_signed_denom(self, values: Tensor) -> Tensor:
-        denom = values.sum()
-        safe_eps = max(self.eps, torch.finfo(values.dtype).tiny)
-        eps = torch.full_like(denom, safe_eps)
-        denom_eps = torch.where(denom < 0, -eps, eps)
-        return torch.where(torch.abs(denom) < safe_eps, denom_eps, denom)
-
-    def _min(
-        self,
-        xs: list[Tensor],
-        dtype: torch.dtype,
-    ) -> Tensor:
-        return self._min_range(xs, dtype=dtype, start=0, end=len(xs))
 
     def _min_range(
         self,
         xs: list[Tensor],
         dtype: torch.dtype,
+        device: torch.device,
         start: int,
         end: int,
     ) -> Tensor:
-        out = xs[start].to(dtype=dtype).clone()
+        out = self._to_reduction_tensor(
+            xs[start],
+            dtype=dtype,
+            device=device,
+        ).clone()
 
         for i in range(start + 1, end):
-            out = torch.minimum(out, xs[i].to(dtype=dtype))
+            out = torch.minimum(
+                out,
+                self._to_reduction_tensor(
+                    xs[i],
+                    dtype=dtype,
+                    device=device,
+                ),
+            )
 
         return out
 
@@ -273,6 +335,7 @@ class Reducer(nn.Module):
         self,
         xs: list[Tensor],
         dtype: torch.dtype,
+        device: torch.device,
         chunk_size: int,
     ) -> Tensor:
         out: Tensor | None = None
@@ -283,12 +346,25 @@ class Reducer(nn.Module):
 
             if self._can_stack(xs, base, end):
                 chunk = torch.stack(
-                    [x.to(dtype=dtype) for x in xs[base:end]],
+                    [
+                        self._to_reduction_tensor(
+                            x,
+                            dtype=dtype,
+                            device=device,
+                        )
+                        for x in xs[base:end]
+                    ],
                     dim=0,
                 )
                 reduced = chunk.amin(dim=0)
             else:
-                reduced = self._min_range(xs, dtype=dtype, start=base, end=end)
+                reduced = self._min_range(
+                    xs,
+                    dtype=dtype,
+                    device=device,
+                    start=base,
+                    end=end,
+                )
 
             out = reduced if out is None else torch.minimum(out, reduced)
 
@@ -296,24 +372,29 @@ class Reducer(nn.Module):
             raise AssertionError("Reducer requires at least one tensor.")
         return out
 
-    def _max(
-        self,
-        xs: list[Tensor],
-        dtype: torch.dtype,
-    ) -> Tensor:
-        return self._max_range(xs, dtype=dtype, start=0, end=len(xs))
-
     def _max_range(
         self,
         xs: list[Tensor],
         dtype: torch.dtype,
+        device: torch.device,
         start: int,
         end: int,
     ) -> Tensor:
-        out = xs[start].to(dtype=dtype).clone()
+        out = self._to_reduction_tensor(
+            xs[start],
+            dtype=dtype,
+            device=device,
+        ).clone()
 
         for i in range(start + 1, end):
-            out = torch.maximum(out, xs[i].to(dtype=dtype))
+            out = torch.maximum(
+                out,
+                self._to_reduction_tensor(
+                    xs[i],
+                    dtype=dtype,
+                    device=device,
+                ),
+            )
 
         return out
 
@@ -321,6 +402,7 @@ class Reducer(nn.Module):
         self,
         xs: list[Tensor],
         dtype: torch.dtype,
+        device: torch.device,
         chunk_size: int,
     ) -> Tensor:
         out: Tensor | None = None
@@ -331,12 +413,25 @@ class Reducer(nn.Module):
 
             if self._can_stack(xs, base, end):
                 chunk = torch.stack(
-                    [x.to(dtype=dtype) for x in xs[base:end]],
+                    [
+                        self._to_reduction_tensor(
+                            x,
+                            dtype=dtype,
+                            device=device,
+                        )
+                        for x in xs[base:end]
+                    ],
                     dim=0,
                 )
                 reduced = chunk.amax(dim=0)
             else:
-                reduced = self._max_range(xs, dtype=dtype, start=base, end=end)
+                reduced = self._max_range(
+                    xs,
+                    dtype=dtype,
+                    device=device,
+                    start=base,
+                    end=end,
+                )
 
             out = reduced if out is None else torch.maximum(out, reduced)
 
@@ -349,13 +444,27 @@ class Reducer(nn.Module):
         tensor: Tensor,
         weight: Tensor | None,
         dtype: torch.dtype,
+        device: torch.device,
     ) -> Tensor:
-        value = tensor.to(dtype=dtype)
+        value = self._to_reduction_tensor(
+            tensor,
+            dtype=dtype,
+            device=device,
+        )
 
         if weight is None:
             return value
 
-        return value * weight.to(device=value.device)
+        return value * weight.to(device=device)
+
+    @staticmethod
+    def _to_reduction_tensor(
+        tensor: Tensor,
+        *,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> Tensor:
+        return tensor.to(device=device, dtype=dtype)
 
     @staticmethod
     def _get_coeff(weights: Tensor | None, index: int) -> Tensor | None:
@@ -408,7 +517,17 @@ class Reducer(nn.Module):
         return chunk_size
 
     def _norm_tensor(self, tensors: Sequence[Tensor]) -> list[Tensor]:
-        xs = list(tensors)
+        if isinstance(tensors, Tensor):
+            raise TypeError(
+                "Reducer expects a Sequence[Tensor], not a single Tensor."
+            )
+
+        try:
+            xs = list(tensors)
+        except TypeError as exc:
+            raise TypeError(
+                f"Reducer expects a Sequence[Tensor], got {type(tensors)!r}"
+            ) from exc
 
         if not xs:
             raise ValueError("Reducer requires at least one tensor.")
@@ -553,6 +672,9 @@ class Reducer(nn.Module):
         if w.ndim != 1:
             raise ValueError(f"weights must be 1-D. Got shape={tuple(w.shape)}.")
 
+        if not torch.isfinite(w).all().item():
+            raise ValueError("Reducer weights must be finite.")
+
         if w.numel() != source_count:
             raise ValueError(
                 f"weights length must match tensor count. "
@@ -578,10 +700,6 @@ class Reducer(nn.Module):
     @staticmethod
     def _is_complex(dtype: torch.dtype) -> bool:
         return torch.empty((), dtype=dtype).is_complex()
-
-    def _verify_no_complex(self, xs: Sequence[Tensor], op: str) -> None:
-        if any(x.is_complex() for x in xs):
-            raise TypeError(f"{op!r} does not support complex tensors.")
 
     def extra_repr(self) -> str:
         return (
