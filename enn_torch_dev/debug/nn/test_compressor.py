@@ -5,6 +5,7 @@ import torch
 
 from enn_torch_dev.nn.blocks import Compressor
 
+
 def test_compressor_masks_all_invalid_regions_without_nan():
     x = torch.randn(2, 3, 7, 4)
     mask = torch.ones(2, 3, 7, dtype=torch.bool)
