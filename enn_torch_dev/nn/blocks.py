@@ -41,7 +41,7 @@ class Compressor(nn.Module):
         num_slots: int = 4,
         input_dim: int | None = None,
         integral_mode: str = "cast",
-        complex_mode: str = "real_imag",
+        complex_mode: str = "reject",
         output_dtype: torch.dtype | None = None,
         use_conv: bool = True,
         conv_kernel_size: int = 3,
@@ -98,17 +98,22 @@ class Compressor(nn.Module):
             if self.input_dim == self.dim
             else nn.Linear(self.input_dim, self.dim)
         )
-        if self.complex_mode == "real_imag":
-            complex_adapted_dim = self.input_dim * 2
-        elif self.complex_mode == "abs":
-            complex_adapted_dim = self.input_dim
+        if self.complex_mode == "reject":
+            self.complex_input_proj = nn.Identity()
         else:
-            complex_adapted_dim = self.input_dim
-        self.complex_input_proj = (
-            nn.Identity()
-            if complex_adapted_dim == self.dim
-            else nn.Linear(complex_adapted_dim, self.dim)
-        )
+            if self.complex_mode == "real_imag":
+                complex_adapted_dim = self.input_dim * 2
+            elif self.complex_mode == "abs":
+                complex_adapted_dim = self.input_dim
+            else:
+                raise AssertionError(
+                    f"Unreachable complex_mode: {self.complex_mode}"
+                )
+            self.complex_input_proj = (
+                nn.Identity()
+                if complex_adapted_dim == self.dim
+                else nn.Linear(complex_adapted_dim, self.dim)
+            )
 
         self.input_norm = nn.LayerNorm(self.dim)
         self.conv = ConvND(

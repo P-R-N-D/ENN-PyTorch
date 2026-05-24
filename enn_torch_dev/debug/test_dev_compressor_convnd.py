@@ -63,6 +63,7 @@ def test_compressor_chunked_pooling_matches_dense_pooling():
 
     assert torch.allclose(chunked_out, dense_out, atol=1e-5, rtol=1e-5)
 
+
 def test_compressor_chunked_pooling_handles_empty_local_dim():
     x = torch.randn(2, 3, 0, 4)
 
@@ -173,6 +174,26 @@ def test_compressor_rejects_integral_input_when_configured():
 
     with pytest.raises(TypeError, match="integral input"):
         module(x)
+
+
+def test_compressor_default_rejects_complex_without_projection_params():
+    module = Compressor(4, num_slots=2, use_conv=False)
+    x = torch.randn(2, 3, 5, 4, dtype=torch.complex64)
+
+    assert isinstance(module.complex_input_proj, torch.nn.Identity)
+    assert "complex_input_proj.weight" not in module.state_dict()
+
+    with pytest.raises(TypeError, match="complex input"):
+        module(x)
+
+
+def test_compressor_reject_mode_keeps_complex_projection_parameter_free_with_input_projection():
+    module = Compressor(8, input_dim=4, num_slots=2, use_conv=False)
+
+    assert isinstance(module.real_input_proj, torch.nn.Linear)
+    assert isinstance(module.complex_input_proj, torch.nn.Identity)
+    assert "real_input_proj.weight" in module.state_dict()
+    assert "complex_input_proj.weight" not in module.state_dict()
 
 
 def test_compressor_accepts_complex_real_imag_input():
