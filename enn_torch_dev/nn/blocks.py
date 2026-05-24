@@ -39,6 +39,10 @@ class Compressor(nn.Module):
         dim: int,
         *args: Any,
         num_slots: int = 4,
+        input_dim: int | None = None,
+        integral_mode: str = "cast",
+        complex_mode: str = "real_imag",
+        output_dtype: torch.dtype | None = None,
         use_conv: bool = True,
         conv_kernel_size: int = 3,
         conv_bias: bool = True,
@@ -60,6 +64,10 @@ class Compressor(nn.Module):
         self.num_slots = int(num_slots)
         self.eps = float(eps)
         self.pool_chunk_size = self._norm_chunk_size(pool_chunk_size)
+        self.input_dim = self.dim if input_dim is None else int(input_dim)
+        self.integral_mode = self._norm_integral_mode(integral_mode)
+        self.complex_mode = self._norm_complex_mode(complex_mode)
+        self.output_dtype = self._norm_optional_real_dtype(output_dtype)
 
         if self.dim <= 0:
             raise ValueError(f"dim must be positive, got {dim}")
@@ -69,6 +77,8 @@ class Compressor(nn.Module):
             )
         if self.eps <= 0:
             raise ValueError(f"eps must be positive, got {eps}")
+        if self.input_dim <= 0:
+            raise ValueError(f"input_dim must be positive, got {self.input_dim}")
 
         if hidden_dim is not None:
             score_hidden = int(hidden_dim)
@@ -82,6 +92,23 @@ class Compressor(nn.Module):
                 "score hidden dimension must be positive. "
                 f"hidden_dim={hidden_dim}, score_hidden_dim={score_hidden_dim}"
             )
+
+        self.real_input_proj = (
+            nn.Identity()
+            if self.input_dim == self.dim
+            else nn.Linear(self.input_dim, self.dim)
+        )
+        if self.complex_mode == "real_imag":
+            complex_adapted_dim = self.input_dim * 2
+        elif self.complex_mode == "abs":
+            complex_adapted_dim = self.input_dim
+        else:
+            complex_adapted_dim = self.input_dim
+        self.complex_input_proj = (
+            nn.Identity()
+            if complex_adapted_dim == self.dim
+            else nn.Linear(complex_adapted_dim, self.dim)
+        )
 
         self.input_norm = nn.LayerNorm(self.dim)
         self.conv = ConvND(
@@ -139,13 +166,14 @@ class Compressor(nn.Module):
                 "Compressor expects shape (B, R, *local_shape, D). "
                 f"Got shape={tuple(x.shape)}."
             )
+        x = self._adapt_input(x)
         if x.shape[-1] != self.dim:
             raise ValueError(
                 f"Expected last dim={self.dim}, got shape={tuple(x.shape)}"
             )
         if not x.is_floating_point():
             raise TypeError(
-                "Compressor requires floating point input. "
+                "Compressor core requires real floating point input. "
                 f"Got dtype={x.dtype}."
             )
 
@@ -180,6 +208,7 @@ class Compressor(nn.Module):
         if mask_flat is not None:
             valid_region = mask_flat.any(dim=2).view(B, R, 1, 1)
             z = torch.where(valid_region, z, torch.zeros_like(z))
+        z = self._cast_output(z)
 
         if return_weights:
             return z, weights
@@ -230,9 +259,13 @@ class Compressor(nn.Module):
         self, h_flat: Tensor, mask: Tensor | None
     ) -> tuple[Tensor, Tensor]:
         score = self.score(self.score_norm(h_flat))
+        work_dtype = self._work_dtype(h_flat.dtype)
         weights = self._get_weight(score, mask)
-        z = torch.matmul(weights.transpose(-1, -2), h_flat)
-        return z, weights
+        z = torch.matmul(
+            weights.to(dtype=work_dtype).transpose(-1, -2),
+            h_flat.to(dtype=work_dtype),
+        )
+        return z.to(dtype=h_flat.dtype), weights
 
     def _pool_chunked(self, h_flat: Tensor, mask: Tensor | None) -> Tensor:
         chunk_size = self.pool_chunk_size
@@ -252,7 +285,8 @@ class Compressor(nn.Module):
         for start in range(0, L, chunk_size):
             end = min(start + chunk_size, L)
             h_chunk = h_flat[:, :, start:end, :]
-            score = self.score(self.score_norm(h_chunk)).float()
+            work_dtype = self._work_dtype(h_flat.dtype)
+            score = self.score(self.score_norm(h_chunk)).to(dtype=work_dtype)
             if mask is not None:
                 mask_chunk_base = mask[:, :, start:end]
                 score = score.masked_fill(
@@ -275,8 +309,9 @@ class Compressor(nn.Module):
                 torch.zeros_like(score_max),
             )
 
-        numer = h_flat.new_zeros((B, R, K, D), dtype=torch.float32)
-        denom = h_flat.new_zeros((B, R, K), dtype=torch.float32)
+        work_dtype = self._work_dtype(h_flat.dtype)
+        numer = h_flat.new_zeros((B, R, K, D), dtype=work_dtype)
+        denom = h_flat.new_zeros((B, R, K), dtype=work_dtype)
 
         for h_chunk, score, mask_chunk_base in chunks:
             exp_score = torch.exp(score - score_max.unsqueeze(2))
@@ -284,7 +319,10 @@ class Compressor(nn.Module):
                 exp_score = exp_score.masked_fill(~mask_chunk_base.unsqueeze(-1), 0.0)
 
             denom = denom + exp_score.sum(dim=2)
-            numer = numer + torch.matmul(exp_score.transpose(-1, -2), h_chunk.float())
+            numer = numer + torch.matmul(
+                exp_score.transpose(-1, -2),
+                h_chunk.to(dtype=work_dtype),
+            )
 
         safe_eps = self._safe_eps(denom.dtype)
         z = numer / denom.clamp_min(safe_eps).unsqueeze(-1)
@@ -299,7 +337,7 @@ class Compressor(nn.Module):
         self, score: Tensor, mask: Tensor | None
     ) -> Tensor:
         out_dtype = score.dtype
-        score = score.float()
+        score = score.to(dtype=self._work_dtype(score.dtype))
 
         if mask is None:
             return torch.softmax(score, dim=2).to(dtype=out_dtype)
@@ -322,6 +360,91 @@ class Compressor(nn.Module):
 
     def _safe_eps(self, dtype: torch.dtype) -> float:
         return max(float(self.eps), float(torch.finfo(dtype).tiny))
+
+    def _adapt_input(self, x: Tensor) -> Tensor:
+        if x.is_quantized:
+            raise TypeError("Compressor does not accept quantized tensors directly.")
+        target_dtype = self._module_real_dtype()
+        if x.is_complex():
+            if self.complex_mode == "reject":
+                raise TypeError(
+                    "Compressor received complex input, but complex_mode='reject'."
+                )
+            self._check_input_dim(x)
+            if self.complex_mode == "real_imag":
+                x = torch.view_as_real(x).flatten(-2)
+            elif self.complex_mode == "abs":
+                x = x.abs()
+            else:
+                raise AssertionError(f"Unreachable complex_mode: {self.complex_mode}")
+            return self.complex_input_proj(x.to(dtype=target_dtype))
+        if x.is_floating_point():
+            self._check_input_dim(x)
+            return self.real_input_proj(x.to(dtype=target_dtype))
+        if x.dtype == torch.bool:
+            raise TypeError("Compressor does not accept bool tensors as numeric input.")
+        if self.integral_mode == "reject":
+            raise TypeError(
+                "Compressor received integral input, but integral_mode='reject'."
+            )
+        self._check_input_dim(x)
+        return self.real_input_proj(x.to(dtype=target_dtype))
+
+    def _check_input_dim(self, x: Tensor) -> None:
+        if x.shape[-1] != self.input_dim:
+            raise ValueError(
+                f"Expected input last dim={self.input_dim}, "
+                f"got shape={tuple(x.shape)}"
+            )
+
+    def _module_real_dtype(self) -> torch.dtype:
+        dtype = self.input_norm.weight.dtype
+        if not torch.empty((), dtype=dtype).is_floating_point():
+            raise TypeError(f"Compressor module dtype must be real floating, got {dtype}")
+        return dtype
+
+    def _cast_output(self, z: Tensor) -> Tensor:
+        if self.output_dtype is None:
+            return z
+        return z.to(dtype=self.output_dtype)
+
+    @staticmethod
+    def _work_dtype(dtype: torch.dtype) -> torch.dtype:
+        if dtype == torch.float64:
+            return torch.float64
+        if dtype in {torch.float16, torch.bfloat16, torch.float32}:
+            return torch.float32
+        raise TypeError(f"Unsupported Compressor core dtype: {dtype}")
+
+    @staticmethod
+    def _norm_optional_real_dtype(dtype: torch.dtype | None) -> torch.dtype | None:
+        if dtype is None:
+            return None
+        if not isinstance(dtype, torch.dtype):
+            raise TypeError(f"output_dtype must be torch.dtype | None, got {type(dtype)!r}")
+        if not torch.empty((), dtype=dtype).is_floating_point():
+            raise TypeError(f"output_dtype must be real floating, got {dtype}")
+        return dtype
+
+    @staticmethod
+    def _norm_integral_mode(mode: str) -> str:
+        normalized = str(mode).lower().strip()
+        if normalized in {"cast", "float", "to_float"}:
+            return "cast"
+        if normalized in {"reject", "error", "none"}:
+            return "reject"
+        raise ValueError("integral_mode must be one of 'cast' or 'reject'.")
+
+    @staticmethod
+    def _norm_complex_mode(mode: str) -> str:
+        normalized = str(mode).lower().strip().replace("-", "_")
+        if normalized in {"real_imag", "cartesian", "ri"}:
+            return "real_imag"
+        if normalized in {"abs", "magnitude", "mag"}:
+            return "abs"
+        if normalized in {"reject", "error", "none"}:
+            return "reject"
+        raise ValueError("complex_mode must be one of 'real_imag', 'abs', or 'reject'.")
 
     @staticmethod
     def _norm_chunk_size(chunk_size: int | None) -> int | None:

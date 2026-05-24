@@ -63,9 +63,6 @@ def test_compressor_chunked_pooling_matches_dense_pooling():
 
     assert torch.allclose(chunked_out, dense_out, atol=1e-5, rtol=1e-5)
 
-
-
-
 def test_compressor_chunked_pooling_handles_empty_local_dim():
     x = torch.randn(2, 3, 0, 4)
 
@@ -100,6 +97,8 @@ def test_compressor_chunked_pooling_scores_are_not_recomputed_between_passes():
         module.score.forward = orig_forward
 
     assert calls == 4
+
+
 def test_compressor_forward_export_has_stable_tensor_return():
     x = torch.randn(2, 3, 5, 4)
     mask = torch.ones(2, 3, 5, dtype=torch.bool)
@@ -124,3 +123,86 @@ def test_compressor_amp_friendly_dtypes_are_finite(dtype):
 
     assert out.dtype == dtype
     assert torch.isfinite(out.float()).all()
+
+
+def test_compressor_dense_preserves_float64_weights():
+    x = torch.randn(2, 3, 17, 4, dtype=torch.float64)
+    module = Compressor(4, num_slots=3, use_conv=False).to(dtype=torch.float64)
+
+    out, weights = module(x, return_weights=True)
+
+    assert out.dtype == torch.float64
+    assert weights.dtype == torch.float64
+    assert torch.isfinite(out).all()
+    assert torch.isfinite(weights).all()
+
+
+def test_compressor_chunked_pooling_matches_dense_float64():
+    x = torch.randn(2, 3, 17, 4, dtype=torch.float64)
+    mask = torch.rand(2, 3, 17) > 0.25
+    mask[0, 2] = False
+
+    dense = Compressor(
+        4, num_slots=3, use_conv=False, pool_chunk_size=None
+    ).to(dtype=torch.float64)
+    chunked = Compressor(
+        4, num_slots=3, use_conv=False, pool_chunk_size=5
+    ).to(dtype=torch.float64)
+    chunked.load_state_dict(dense.state_dict())
+
+    dense_out = dense(x, local_mask=mask)
+    chunked_out = chunked(x, local_mask=mask)
+
+    assert torch.allclose(chunked_out, dense_out, atol=1e-10, rtol=1e-10)
+
+
+def test_compressor_accepts_integral_numeric_input():
+    x = torch.randint(0, 10, (2, 3, 5, 4), dtype=torch.int64)
+    module = Compressor(4, num_slots=2, use_conv=False)
+
+    out = module(x)
+
+    assert out.is_floating_point()
+    assert out.dtype == torch.float32
+    assert out.shape == (2, 3, 2, 4)
+
+
+def test_compressor_rejects_integral_input_when_configured():
+    x = torch.randint(0, 10, (2, 3, 5, 4), dtype=torch.int64)
+    module = Compressor(4, num_slots=2, use_conv=False, integral_mode="reject")
+
+    with pytest.raises(TypeError, match="integral input"):
+        module(x)
+
+
+def test_compressor_accepts_complex_real_imag_input():
+    x = torch.randn(2, 3, 5, 4, dtype=torch.complex64)
+    module = Compressor(
+        dim=8,
+        input_dim=4,
+        num_slots=2,
+        use_conv=False,
+        complex_mode="real_imag",
+    )
+
+    out = module(x)
+
+    assert out.is_floating_point()
+    assert out.dtype == torch.float32
+    assert out.shape == (2, 3, 2, 8)
+
+
+def test_compressor_accepts_complex_abs_input():
+    x = torch.randn(2, 3, 5, 4, dtype=torch.complex64)
+    module = Compressor(
+        dim=4,
+        input_dim=4,
+        num_slots=2,
+        use_conv=False,
+        complex_mode="abs",
+    )
+
+    out = module(x)
+
+    assert out.is_floating_point()
+    assert out.shape == (2, 3, 2, 4)
