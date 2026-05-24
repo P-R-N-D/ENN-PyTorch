@@ -43,12 +43,15 @@ class Compressor(nn.Module):
         conv_kernel_size: int = 3,
         conv_bias: bool = True,
         conv_activation: str = "gelu",
+        conv_local_ndim: int | None = None,
         conv_residual: bool = True,
-        conv_residual_scale_init: float = 1.0,
+        conv_residual_scale_init: float = 0.0,
         hidden_dim: int | None = None,
+        score_hidden_dim: int | None = 128,
         activation: str = "gelu",
         dropout: float = 0.0,
-        eps: float = 1e-12,
+        pool_chunk_size: int | None = None,
+        eps: float = 1e-6,
     ) -> None:
         super().__init__()
         _ = args
@@ -56,6 +59,7 @@ class Compressor(nn.Module):
         self.dim = int(dim)
         self.num_slots = int(num_slots)
         self.eps = float(eps)
+        self.pool_chunk_size = self._norm_chunk_size(pool_chunk_size)
 
         if self.dim <= 0:
             raise ValueError(f"dim must be positive, got {dim}")
@@ -66,10 +70,17 @@ class Compressor(nn.Module):
         if self.eps <= 0:
             raise ValueError(f"eps must be positive, got {eps}")
 
-        score_hidden = self.dim if hidden_dim is None else int(hidden_dim)
+        if hidden_dim is not None:
+            score_hidden = int(hidden_dim)
+        elif score_hidden_dim is None:
+            score_hidden = self.dim
+        else:
+            score_hidden = min(self.dim, int(score_hidden_dim))
+
         if score_hidden <= 0:
             raise ValueError(
-                f"hidden_dim must be positive, got {hidden_dim}"
+                "score hidden dimension must be positive. "
+                f"hidden_dim={hidden_dim}, score_hidden_dim={score_hidden_dim}"
             )
 
         self.input_norm = nn.LayerNorm(self.dim)
@@ -79,10 +90,12 @@ class Compressor(nn.Module):
             enabled=use_conv,
             bias=conv_bias,
             activation=conv_activation,
+            local_ndim=conv_local_ndim,
             residual=conv_residual,
             residual_scale_init=conv_residual_scale_init,
         )
 
+        self.value_norm = nn.LayerNorm(self.dim)
         self.score_norm = nn.LayerNorm(self.dim)
         self.score = nn.Sequential(
             nn.Linear(self.dim, score_hidden),
@@ -102,6 +115,18 @@ class Compressor(nn.Module):
         *args: Any,
         local_mask: Tensor | None = None,
         return_weights: bool = False,
+    ) -> Tensor | tuple[Tensor, Tensor]:
+        return self._forward_impl(
+            x, local_mask=local_mask, return_weights=return_weights
+        )
+
+    def _forward_impl(
+        self,
+        x: Tensor,
+        *args: Any,
+        local_mask: Tensor | None,
+        return_weights: bool,
+        force_dense: bool = False,
     ) -> Tensor | tuple[Tensor, Tensor]:
         _ = args
 
@@ -131,6 +156,7 @@ class Compressor(nn.Module):
             h = h.masked_fill(~mask.unsqueeze(-1), 0)
 
         h = self.conv(h)
+        h = self.value_norm(h)
 
         if mask is not None:
             h = h.masked_fill(~mask.unsqueeze(-1), 0)
@@ -143,11 +169,12 @@ class Compressor(nn.Module):
             mask.reshape(B, R, -1) if mask is not None else None
         )
 
-        score_in = self.score_norm(h_flat)
-        score = self.score(score_in)
-        weights = self._get_weight(score, mask_flat)
-
-        z = torch.einsum("brlk,brld->brkd", weights, h_flat)
+        use_chunked = (
+            self.pool_chunk_size is not None
+            and not force_dense
+            and not return_weights
+        )
+        z, weights = self._pool(h_flat, mask_flat, chunked=use_chunked)
         z = self.out(z)
 
         if mask_flat is not None:
@@ -157,6 +184,18 @@ class Compressor(nn.Module):
         if return_weights:
             return z, weights
         return z
+
+    def forward_export(self, x: Tensor, local_mask: Tensor) -> Tensor:
+        out = self._forward_impl(
+            x, local_mask=local_mask, return_weights=False, force_dense=True
+        )
+        return out if isinstance(out, Tensor) else out[0]
+
+    def forward_export_nomask(self, x: Tensor) -> Tensor:
+        out = self._forward_impl(
+            x, local_mask=None, return_weights=False, force_dense=True
+        )
+        return out if isinstance(out, Tensor) else out[0]
 
     def _norm_mask(
         self, local_mask: Tensor | None, x: Tensor
@@ -176,21 +215,127 @@ class Compressor(nn.Module):
             )
         return local_mask.to(device=x.device, dtype=torch.bool)
 
+    def _pool(
+        self,
+        h_flat: Tensor,
+        mask: Tensor | None,
+        *,
+        chunked: bool,
+    ) -> tuple[Tensor, Tensor | None]:
+        if chunked:
+            return self._pool_chunked(h_flat, mask), None
+        return self._pool_dense(h_flat, mask)
+
+    def _pool_dense(
+        self, h_flat: Tensor, mask: Tensor | None
+    ) -> tuple[Tensor, Tensor]:
+        score = self.score(self.score_norm(h_flat))
+        weights = self._get_weight(score, mask)
+        z = torch.matmul(weights.transpose(-1, -2), h_flat)
+        return z, weights
+
+    def _pool_chunked(self, h_flat: Tensor, mask: Tensor | None) -> Tensor:
+        chunk_size = self.pool_chunk_size
+        if chunk_size is None:
+            z, _ = self._pool_dense(h_flat, mask)
+            return z
+
+        B, R, L, D = h_flat.shape
+        K = self.num_slots
+        score_max: Tensor | None = None
+
+        for start in range(0, L, chunk_size):
+            end = min(start + chunk_size, L)
+            h_chunk = h_flat[:, :, start:end, :]
+            score = self.score(self.score_norm(h_chunk)).float()
+            if mask is not None:
+                mask_chunk = mask[:, :, start:end].unsqueeze(-1)
+                score = score.masked_fill(~mask_chunk, torch.finfo(score.dtype).min)
+            chunk_max = score.amax(dim=2)
+            score_max = chunk_max if score_max is None else torch.maximum(score_max, chunk_max)
+
+        if score_max is None:
+            raise AssertionError("Compressor requires at least one local element.")
+
+        if mask is not None:
+            valid_region = mask.any(dim=2)
+            score_max = torch.where(
+                valid_region.unsqueeze(-1),
+                score_max,
+                torch.zeros_like(score_max),
+            )
+
+        numer = h_flat.new_zeros((B, R, K, D), dtype=torch.float32)
+        denom = h_flat.new_zeros((B, R, K), dtype=torch.float32)
+
+        for start in range(0, L, chunk_size):
+            end = min(start + chunk_size, L)
+            h_chunk = h_flat[:, :, start:end, :]
+            score = self.score(self.score_norm(h_chunk)).float()
+            if mask is not None:
+                mask_chunk_base = mask[:, :, start:end]
+                mask_chunk = mask_chunk_base.unsqueeze(-1)
+                score = score.masked_fill(~mask_chunk, torch.finfo(score.dtype).min)
+            else:
+                mask_chunk_base = None
+
+            exp_score = torch.exp(score - score_max.unsqueeze(2))
+            if mask_chunk_base is not None:
+                exp_score = exp_score.masked_fill(~mask_chunk_base.unsqueeze(-1), 0.0)
+
+            denom = denom + exp_score.sum(dim=2)
+            numer = numer + torch.matmul(
+                exp_score.transpose(-1, -2), h_chunk.float()
+            )
+
+        safe_eps = self._safe_eps(denom.dtype)
+        z = numer / denom.clamp_min(safe_eps).unsqueeze(-1)
+
+        if mask is not None:
+            valid_region = mask.any(dim=2).view(B, R, 1, 1)
+            z = torch.where(valid_region, z, torch.zeros_like(z))
+
+        return z.to(dtype=h_flat.dtype)
+
     def _get_weight(
         self, score: Tensor, mask: Tensor | None
     ) -> Tensor:
+        out_dtype = score.dtype
+        score = score.float()
+
         if mask is None:
-            return torch.softmax(score, dim=2)
+            return torch.softmax(score, dim=2).to(dtype=out_dtype)
 
         mask_expanded = mask.unsqueeze(-1)
         min_value = torch.finfo(score.dtype).min
         masked_score = score.masked_fill(~mask_expanded, min_value)
 
         weights = torch.softmax(masked_score, dim=2)
-        weights = weights.masked_fill(~mask_expanded, 0)
+        weights = weights.masked_fill(~mask_expanded, 0.0)
 
-        denom = weights.sum(dim=2, keepdim=True).clamp_min(self.eps)
-        return weights / denom
+        denom = weights.sum(dim=2, keepdim=True).clamp_min(
+            self._safe_eps(weights.dtype)
+        )
+        weights = weights / denom
+
+        valid = mask.any(dim=2, keepdim=True).unsqueeze(-1)
+        weights = torch.where(valid, weights, torch.zeros_like(weights))
+        return weights.to(dtype=out_dtype)
+
+    def _safe_eps(self, dtype: torch.dtype) -> float:
+        return max(float(self.eps), float(torch.finfo(dtype).tiny))
+
+    @staticmethod
+    def _norm_chunk_size(chunk_size: int | None) -> int | None:
+        if chunk_size is None:
+            return None
+        if isinstance(chunk_size, bool) or not isinstance(chunk_size, int):
+            raise TypeError(
+                f"pool_chunk_size must be int | None, got {type(chunk_size)!r}"
+            )
+        if chunk_size <= 0:
+            raise ValueError(f"pool_chunk_size must be positive, got {chunk_size}")
+        return int(chunk_size)
 
     @staticmethod
     def _get_activation(name: str) -> nn.Module:

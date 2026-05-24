@@ -718,14 +718,15 @@ class ConvND(nn.Module):
     Expected input shape:
         (B, R, *local_shape, D)
 
-    The layer inspects ``local_shape``:
+    The layer inspects ``local_shape`` unless ``local_ndim`` is fixed:
       - rank 1 -> depthwise-separable Conv1d
       - rank 2 -> depthwise-separable Conv2d
       - rank 3 -> depthwise-separable Conv3d
-      - rank 0 or rank > 3 -> identity fallback
+      - rank 0 or rank > 3 -> identity fallback when ``local_ndim`` is None
 
     This is intentionally an adapter over PyTorch's optimized 1D/2D/3D
-    convolution layers, not a custom arbitrary-rank convolution kernel.
+    convolution layers, not a custom arbitrary-rank convolution or pooling
+    kernel.
     """
 
     SUPPORTED_LOCAL_DIMS = {1, 2, 3}
@@ -740,6 +741,7 @@ class ConvND(nn.Module):
         activation: str = "gelu",
         residual: bool = True,
         residual_scale_init: float = 1.0,
+        local_ndim: int | None = None,
     ) -> None:
         super().__init__()
         _ = args
@@ -747,6 +749,7 @@ class ConvND(nn.Module):
         self.kernel_size = int(kernel_size)
         self.enabled = bool(enabled)
         self.residual = bool(residual)
+        self.local_ndim = self._norm_local_ndim(local_ndim)
 
         if self.dim <= 0:
             raise ValueError(f"dim must be positive, got {dim}")
@@ -760,9 +763,9 @@ class ConvND(nn.Module):
                 f"can be preserved. Got kernel_size={kernel_size}."
             )
 
-        self.conv1 = self._get_conv(1, bias=bias, activation=activation)
-        self.conv2 = self._get_conv(2, bias=bias, activation=activation)
-        self.conv3 = self._get_conv(3, bias=bias, activation=activation)
+        self.conv1 = self._make_or_identity(1, bias=bias, activation=activation)
+        self.conv2 = self._make_or_identity(2, bias=bias, activation=activation)
+        self.conv3 = self._make_or_identity(3, bias=bias, activation=activation)
 
         if self.residual:
             self.residual_scale = nn.Parameter(
@@ -791,7 +794,17 @@ class ConvND(nn.Module):
             return x
 
         local_ndim = x.ndim - 3
-        match local_ndim:
+        if self.local_ndim is not None:
+            if local_ndim != self.local_ndim:
+                raise ValueError(
+                    "ConvND fixed local_ndim does not match input rank. "
+                    f"local_ndim={self.local_ndim}, "
+                    f"input local rank={local_ndim}, "
+                    f"shape={tuple(x.shape)}"
+                )
+            local_ndim = self.local_ndim
+
+        match int(local_ndim):
             case 1:
                 return self._forward_1d(x)
             case 2:
@@ -831,6 +844,29 @@ class ConvND(nn.Module):
             return y
         scale = self.residual_scale.to(device=y.device, dtype=y.dtype)
         return x + scale * y
+
+
+    def _make_or_identity(
+        self,
+        ndim: int,
+        *,
+        bias: bool,
+        activation: str,
+    ) -> nn.Module:
+        if self.local_ndim is not None and self.local_ndim != int(ndim):
+            return nn.Identity()
+        return self._get_conv(ndim, bias=bias, activation=activation)
+
+    @classmethod
+    def _norm_local_ndim(cls, local_ndim: int | None) -> int | None:
+        if local_ndim is None:
+            return None
+        if isinstance(local_ndim, bool) or not isinstance(local_ndim, int):
+            raise TypeError(f"local_ndim must be int | None, got {type(local_ndim)!r}")
+        if local_ndim not in cls.SUPPORTED_LOCAL_DIMS:
+            supported = ", ".join(str(x) for x in sorted(cls.SUPPORTED_LOCAL_DIMS))
+            raise ValueError(f"local_ndim must be one of {{{supported}}} or None, got {local_ndim}")
+        return int(local_ndim)
 
     def _get_conv(
         self,
