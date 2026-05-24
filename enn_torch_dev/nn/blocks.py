@@ -242,15 +242,25 @@ class Compressor(nn.Module):
 
         B, R, L, D = h_flat.shape
         K = self.num_slots
+        if L == 0:
+            z, _ = self._pool_dense(h_flat, mask)
+            return z
+
         score_max: Tensor | None = None
+        chunks: list[tuple[Tensor, Tensor, Tensor | None]] = []
 
         for start in range(0, L, chunk_size):
             end = min(start + chunk_size, L)
             h_chunk = h_flat[:, :, start:end, :]
             score = self.score(self.score_norm(h_chunk)).float()
             if mask is not None:
-                mask_chunk = mask[:, :, start:end].unsqueeze(-1)
-                score = score.masked_fill(~mask_chunk, torch.finfo(score.dtype).min)
+                mask_chunk_base = mask[:, :, start:end]
+                score = score.masked_fill(
+                    ~mask_chunk_base.unsqueeze(-1), torch.finfo(score.dtype).min
+                )
+            else:
+                mask_chunk_base = None
+            chunks.append((h_chunk, score, mask_chunk_base))
             chunk_max = score.amax(dim=2)
             score_max = chunk_max if score_max is None else torch.maximum(score_max, chunk_max)
 
@@ -268,25 +278,13 @@ class Compressor(nn.Module):
         numer = h_flat.new_zeros((B, R, K, D), dtype=torch.float32)
         denom = h_flat.new_zeros((B, R, K), dtype=torch.float32)
 
-        for start in range(0, L, chunk_size):
-            end = min(start + chunk_size, L)
-            h_chunk = h_flat[:, :, start:end, :]
-            score = self.score(self.score_norm(h_chunk)).float()
-            if mask is not None:
-                mask_chunk_base = mask[:, :, start:end]
-                mask_chunk = mask_chunk_base.unsqueeze(-1)
-                score = score.masked_fill(~mask_chunk, torch.finfo(score.dtype).min)
-            else:
-                mask_chunk_base = None
-
+        for h_chunk, score, mask_chunk_base in chunks:
             exp_score = torch.exp(score - score_max.unsqueeze(2))
             if mask_chunk_base is not None:
                 exp_score = exp_score.masked_fill(~mask_chunk_base.unsqueeze(-1), 0.0)
 
             denom = denom + exp_score.sum(dim=2)
-            numer = numer + torch.matmul(
-                exp_score.transpose(-1, -2), h_chunk.float()
-            )
+            numer = numer + torch.matmul(exp_score.transpose(-1, -2), h_chunk.float())
 
         safe_eps = self._safe_eps(denom.dtype)
         z = numer / denom.clamp_min(safe_eps).unsqueeze(-1)

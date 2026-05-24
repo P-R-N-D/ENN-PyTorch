@@ -64,6 +64,42 @@ def test_compressor_chunked_pooling_matches_dense_pooling():
     assert torch.allclose(chunked_out, dense_out, atol=1e-5, rtol=1e-5)
 
 
+
+
+def test_compressor_chunked_pooling_handles_empty_local_dim():
+    x = torch.randn(2, 3, 0, 4)
+
+    dense = Compressor(4, num_slots=2, use_conv=False, pool_chunk_size=None)
+    chunked = Compressor(4, num_slots=2, use_conv=False, pool_chunk_size=4)
+    chunked.load_state_dict(dense.state_dict())
+
+    dense_out = dense(x)
+    chunked_out = chunked(x)
+
+    assert dense_out.shape == (2, 3, 2, 4)
+    assert torch.allclose(chunked_out, dense_out, atol=1e-6, rtol=1e-6)
+
+
+def test_compressor_chunked_pooling_scores_are_not_recomputed_between_passes():
+    x = torch.randn(2, 3, 17, 4)
+    module = Compressor(4, num_slots=3, use_conv=False, pool_chunk_size=5, dropout=0.5)
+    module.train()
+
+    calls = 0
+    orig_forward = module.score.forward
+
+    def counted_forward(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return orig_forward(*args, **kwargs)
+
+    module.score.forward = counted_forward
+    try:
+        _ = module(x)
+    finally:
+        module.score.forward = orig_forward
+
+    assert calls == 4
 def test_compressor_forward_export_has_stable_tensor_return():
     x = torch.randn(2, 3, 5, 4)
     mask = torch.ones(2, 3, 5, dtype=torch.bool)
