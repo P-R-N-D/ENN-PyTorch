@@ -13,12 +13,25 @@ def _sample_tensors(dtype=torch.float32, device=None):
     ]
 
 
+def _broadcastable_tensors():
+    return [
+        torch.tensor([[1.0, 2.0], [3.0, 4.0]]),
+        torch.tensor([10.0, 20.0]),
+        torch.tensor([[0.5], [1.5]]),
+    ]
+
+
 def test_basic_ops_match_torch():
     xs = _sample_tensors()
     reducer = Reducer()
 
     assert torch.allclose(reducer(xs, op="sum"), torch.stack(xs, dim=0).sum(dim=0))
-    assert torch.allclose(reducer(xs, op="mean"), torch.stack(xs, dim=0).mean(dim=0), atol=1e-7, rtol=1e-6)
+    assert torch.allclose(
+        reducer(xs, op="mean"),
+        torch.stack(xs, dim=0).mean(dim=0),
+        atol=1e-7,
+        rtol=1e-6,
+    )
     assert torch.allclose(reducer(xs, op="min"), torch.stack(xs, dim=0).amin(dim=0))
     assert torch.allclose(reducer(xs, op="max"), torch.stack(xs, dim=0).amax(dim=0))
 
@@ -27,6 +40,15 @@ def test_basic_ops_match_torch():
 def test_chunked_matches_non_chunked(op):
     xs = _sample_tensors()
     reducer = Reducer()
+    non_chunked = reducer(xs, op=op)
+    chunked = reducer(xs, op=op, chunk_size=2)
+    assert torch.allclose(chunked, non_chunked, atol=1e-7, rtol=1e-6)
+
+
+@pytest.mark.parametrize("op", ["sum", "mean", "min", "max"])
+def test_chunked_broadcast_fallback_matches_non_chunked(op):
+    xs = _broadcastable_tensors()
+    reducer = Reducer(strict_shape=False)
     non_chunked = reducer(xs, op=op)
     chunked = reducer(xs, op=op, chunk_size=2)
     assert torch.allclose(chunked, non_chunked, atol=1e-7, rtol=1e-6)
@@ -44,12 +66,12 @@ def test_weighted_sum_matches_manual():
 
 def test_weighted_mean_matches_manual_formula():
     xs = _sample_tensors()
-    weights = torch.tensor([0.2, 0.3, 0.5], dtype=torch.float32)
+    weights = torch.tensor([2.0, 3.0, 5.0], dtype=torch.float32)
     reducer = Reducer()
 
     got = reducer(xs, op="mean", weights=weights)
     expected = sum(x * w for x, w in zip(xs, weights)) / weights.sum()
-    assert torch.allclose(got, expected)
+    assert torch.allclose(got, expected, atol=1e-7, rtol=1e-6)
 
 
 def test_single_tensor_input_rejected():
@@ -59,7 +81,13 @@ def test_single_tensor_input_rejected():
         reducer(x)
 
 
-@pytest.mark.parametrize("bad", [torch.tensor([1.0, float("nan")]), torch.tensor([1.0, float("inf")])])
+@pytest.mark.parametrize(
+    "bad",
+    [
+        torch.tensor([1.0, float("nan")]),
+        torch.tensor([1.0, float("inf")]),
+    ],
+)
 def test_tensor_weights_nan_or_inf_rejected(bad):
     xs = _sample_tensors()[:2]
     reducer = Reducer()
@@ -75,7 +103,14 @@ def test_sequence_weights_nan_or_inf_rejected(bad):
         reducer(xs, op="sum", weights=bad)
 
 
-@pytest.mark.parametrize("weights", [torch.tensor([1.0, -1.0]), torch.tensor([1e-20, -1e-20])])
+@pytest.mark.parametrize(
+    "weights",
+    [
+        torch.tensor([1.0, -1.0], dtype=torch.float64),
+        torch.tensor([1e-20, -1e-20], dtype=torch.float64),
+        torch.tensor([1.0, -1.0 + 1e-13], dtype=torch.float64),
+    ],
+)
 def test_weighted_mean_zero_or_near_zero_sum_rejected(weights):
     xs = _sample_tensors()[:2]
     reducer = Reducer(eps=1e-12)
@@ -103,11 +138,7 @@ def test_min_max_reject_complex(op):
 
 
 def test_strict_shape_false_allows_broadcastable_shapes():
-    xs = [
-        torch.tensor([[1.0, 2.0], [3.0, 4.0]]),
-        torch.tensor([10.0, 20.0]),
-        torch.tensor([[0.5], [1.5]]),
-    ]
+    xs = _broadcastable_tensors()
     reducer = Reducer(strict_shape=False)
     got = reducer(xs, op="sum")
     expected = xs[0] + xs[1] + xs[2]
@@ -158,4 +189,20 @@ def test_strict_device_false_moves_to_first_tensor_device():
 
     assert out.device == first.device
     expected = first + second.to(other)
+    assert torch.allclose(out, expected)
+
+
+def test_strict_device_false_can_move_to_cpu_first_device():
+    other = _available_non_cpu_device()
+    if other is None:
+        pytest.skip("CUDA/MPS unavailable; skipping mixed-device test")
+
+    first = torch.tensor([1.0, 2.0], device="cpu")
+    second = torch.tensor([3.0, 4.0], device=other)
+
+    reducer = Reducer(strict_device=False)
+    out = reducer([first, second], op="sum")
+
+    assert out.device == first.device
+    expected = first + second.to("cpu")
     assert torch.allclose(out, expected)
