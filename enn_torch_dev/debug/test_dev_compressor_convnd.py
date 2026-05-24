@@ -116,6 +116,17 @@ def test_compressor_use_conv_false_omits_conv_parameters():
     assert not any(key.startswith("conv.") for key in module.state_dict())
 
 
+def test_compressor_use_conv_false_loads_legacy_conv_state_dict_strict():
+    legacy = Compressor(4, num_slots=2, use_conv=True)
+    disabled = Compressor(4, num_slots=2, use_conv=False)
+
+    legacy_state = legacy.state_dict()
+    assert any(key.startswith("conv.") for key in legacy_state)
+    assert not any(key.startswith("conv.") for key in disabled.state_dict())
+
+    disabled.load_state_dict(legacy_state, strict=True)
+
+
 def test_compressor_score_hidden_dim_is_not_silently_clamped():
     module = Compressor(
         4,
