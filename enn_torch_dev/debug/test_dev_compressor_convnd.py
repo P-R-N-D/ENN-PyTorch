@@ -33,6 +33,15 @@ def test_convnd_fixed_local_ndim_rejects_rank_mismatch():
         layer(x)
 
 
+def test_convnd_rank0_and_rank_gt3_identity_fallback():
+    layer = ConvND(4)
+    rank0 = torch.randn(2, 3, 4)
+    rank4 = torch.randn(2, 3, 2, 3, 4, 5, 4)
+
+    assert layer(rank0) is rank0
+    assert layer(rank4) is rank4
+
+
 def test_compressor_masks_all_invalid_regions_without_nan():
     x = torch.randn(2, 3, 7, 4)
     mask = torch.ones(2, 3, 7, dtype=torch.bool)
@@ -71,11 +80,33 @@ def test_compressor_chunked_pooling_handles_empty_local_dim():
     chunked = Compressor(4, num_slots=2, use_conv=False, pool_chunk_size=4)
     chunked.load_state_dict(dense.state_dict())
 
-    dense_out = dense(x)
+    dense_out, weights = dense(x, return_weights=True)
     chunked_out = chunked(x)
 
     assert dense_out.shape == (2, 3, 2, 4)
+    assert weights.shape == (2, 3, 0, 2)
+    assert torch.allclose(dense_out, torch.zeros_like(dense_out))
+    assert torch.allclose(weights, torch.zeros_like(weights))
     assert torch.allclose(chunked_out, dense_out, atol=1e-6, rtol=1e-6)
+
+
+def test_compressor_use_conv_false_omits_conv_parameters():
+    module = Compressor(4, num_slots=2, use_conv=False)
+
+    assert isinstance(module.conv, torch.nn.Identity)
+    assert not any(key.startswith("conv.") for key in module.state_dict())
+
+
+def test_compressor_score_hidden_dim_is_not_silently_clamped():
+    module = Compressor(
+        4,
+        num_slots=2,
+        use_conv=False,
+        score_hidden_dim=7,
+    )
+
+    assert module.score[0].out_features == 7
+    assert module.score[-1].in_features == 7
 
 
 def test_compressor_chunked_pooling_scores_are_not_recomputed_between_passes():
