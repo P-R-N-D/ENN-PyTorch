@@ -98,22 +98,24 @@ class Compressor(nn.Module):
             if self.input_dim == self.dim
             else nn.Linear(self.input_dim, self.dim)
         )
-        if self.complex_mode == "reject":
-            self.complex_input_proj = nn.Identity()
+        if self.complex_mode == "real_imag":
+            complex_adapted_dim = self.input_dim * 2
+        elif self.complex_mode == "abs":
+            complex_adapted_dim = self.input_dim
+        elif self.complex_mode == "reject":
+            # Keep legacy projection parameters registered for strict
+            # load_state_dict compatibility with checkpoints created when
+            # the default complex_mode was "real_imag".
+            complex_adapted_dim = self.input_dim * 2
         else:
-            if self.complex_mode == "real_imag":
-                complex_adapted_dim = self.input_dim * 2
-            elif self.complex_mode == "abs":
-                complex_adapted_dim = self.input_dim
-            else:
-                raise AssertionError(
-                    f"Unreachable complex_mode: {self.complex_mode}"
-                )
-            self.complex_input_proj = (
-                nn.Identity()
-                if complex_adapted_dim == self.dim
-                else nn.Linear(complex_adapted_dim, self.dim)
+            raise AssertionError(
+                f"Unreachable complex_mode: {self.complex_mode}"
             )
+        self.complex_input_proj = (
+            nn.Identity()
+            if complex_adapted_dim == self.dim
+            else nn.Linear(complex_adapted_dim, self.dim)
+        )
 
         self.input_norm = nn.LayerNorm(self.dim)
         self.conv = ConvND(
