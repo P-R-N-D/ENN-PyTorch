@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import warnings
 from dataclasses import dataclass
 from typing import Any
 
 import torch
+import torch.nn.functional as F
 from torch import Tensor, nn
 
 from .layers import ConvND
@@ -543,25 +545,37 @@ class Compressor(nn.Module):
 @dataclass(frozen=True)
 class ContextSummary:
     """
-    Packed coarse context produced by ``Composer``.
+    Packed global-context representation produced by ``Composer``.
 
-    ``tokens`` is the dense sequence passed to global attention.
-    ``attn_bias`` is an optional key-side salience bias with shape
-    ``(B, 1, 1, T)``. Attention implementations may add it to attention
-    logits before softmax.
+    ``tokens`` is the dense compressed-context sequence passed to a generic
+    global attention stage. ``token_mask`` carries token validity metadata.
+    ``attn_bias`` is an optional additive key-side bias with shape
+    ``(B, 1, 1, T)`` for attention implementations that accept logit bias.
+
+    This container is attention-implementation agnostic. It does not
+    implement or assume cross-attention, self-attention internals, or a
+    specific attention backend.
     """
 
     tokens: Tensor
     token_mask: Tensor | None
     attn_bias: Tensor | None
-    salience: Tensor | None
-    score: Tensor | None
-    original_shape: tuple[int, int, int, int]
+    salience: Tensor | None = None
+    score: Tensor | None = None
+    original_shape: tuple[int, int, int, int] = (0, 0, 0, 0)
+    input_dtype: torch.dtype | None = None
+    token_dtype: torch.dtype | None = None
+    bias_dtype: torch.dtype | None = None
+    valid_token_count: Tensor | None = None
+    has_valid_tokens: Tensor | None = None
+    has_dummy_token: Tensor | None = None
+    bias_kind: str = "none"
 
 
 class Composer(nn.Module):
     """
-    Recompose compressed regional context into a coarse global context.
+    Recompose compressed regional context slots into a global context
+    token sequence.
 
     Expected input shape:
         (B, R, K, D)
@@ -570,14 +584,16 @@ class Composer(nn.Module):
         ``ContextSummary`` with ``tokens`` shaped ``(B, T, D)``,
         where ``T = R * K``.
 
-    This block is intentionally placed between ``Compressor`` and the
-    global attention layer. It owns coarse-context composition metadata and
-    optional TriAttention-like salience biasing:
+    ``Composer`` sits between a local/regional compression stage and a
+    generic global attention stage. It does not implement or assume
+    cross-attention or any specific attention backend. The caller decides
+    how to feed ``tokens``, ``token_mask``, and optional ``attn_bias`` into
+    its attention implementation.
 
-      - no hard routing by default;
-      - compressed tokens stay dense;
-      - soft top-k salience suppresses low-importance keys and highlights
-        high-importance keys through an attention-logit bias.
+    Optional salience bias provides Tri-Attention-inspired soft importance
+    control over compressed context keys. It suppresses low-salience tokens
+    through an additive attention-logit bias; it does not perform hard
+    routing or token pruning.
 
     ``context_mask`` is optional and should have shape ``(B, R, K)`` with
     True for valid compressed context slots. ``region_mask`` can be provided
@@ -585,17 +601,39 @@ class Composer(nn.Module):
     """
 
     SUPPORTED_SALIENCE_MODES = {"none", "score", "soft_topk"}
+    SUPPORTED_DTYPE_POLICIES = {"auto", "float32", "float64"}
+    SUPPORTED_INT64_POLICIES = {"float32", "float64"}
+    SUPPORTED_COMPLEX_MODES = {"abs", "real_imag"}
+    SUPPORTED_OUTPUT_DTYPES = {"stable", "input", "amp"}
+    SUPPORTED_BIAS_OUTPUT_DTYPES = {"stable", "token", "input", "amp"}
+    SUPPORTED_NONFINITE_POLICIES = {"error", "warn", "sanitize", "ignore"}
 
     def __init__(
         self,
         dim: int,
         *args: Any,
+        dtype_policy: str = "auto",
+        int64_policy: str = "float32",
+        complex_mode: str = "abs",
+        token_output_dtype: str = "stable",
+        bias_output_dtype: str = "stable",
         salience_mode: str = "none",
         salience_topk: int | float | None = None,
         salience_hidden_dim: int | None = None,
         salience_temperature: float = 1.0,
         salience_bias_scale: float = 1.0,
         detach_topk_threshold: bool = True,
+        ensure_nonempty: bool = True,
+        emit_mask_bias: bool = False,
+        mask_bias_value: float | None = None,
+        score_clip: float | None = 30.0,
+        centered_clip: float | None = 30.0,
+        bias_min: float | None = -80.0,
+        nonfinite_policy: str = "error",
+        salience_chunk_size: int | None = None,
+        salience_chunk_threshold: int = 65536,
+        return_score: bool = False,
+        return_salience: bool = False,
         activation: str = "gelu",
         dropout: float = 0.0,
         eps: float = 1e-6,
@@ -604,11 +642,45 @@ class Composer(nn.Module):
         _ = args
 
         self.dim = int(dim)
+        self.dtype_policy = self._norm_choice(
+            dtype_policy, self.SUPPORTED_DTYPE_POLICIES, "dtype_policy"
+        )
+        self.int64_policy = self._norm_choice(
+            int64_policy, self.SUPPORTED_INT64_POLICIES, "int64_policy"
+        )
+        self.complex_mode = self._norm_choice(
+            complex_mode, self.SUPPORTED_COMPLEX_MODES, "complex_mode"
+        )
+        self.token_output_dtype = self._norm_choice(
+            token_output_dtype,
+            self.SUPPORTED_OUTPUT_DTYPES,
+            "token_output_dtype",
+        )
+        self.bias_output_dtype = self._norm_choice(
+            bias_output_dtype,
+            self.SUPPORTED_BIAS_OUTPUT_DTYPES,
+            "bias_output_dtype",
+        )
         self.salience_mode = self._norm_salience_str(salience_mode)
         self.salience_topk = salience_topk
         self.salience_temperature = float(salience_temperature)
         self.salience_bias_scale = float(salience_bias_scale)
         self.detach_topk_threshold = bool(detach_topk_threshold)
+        self.ensure_nonempty = bool(ensure_nonempty)
+        self.emit_mask_bias = bool(emit_mask_bias)
+        self.mask_bias_value = mask_bias_value
+        self.score_clip = None if score_clip is None else float(score_clip)
+        self.centered_clip = None if centered_clip is None else float(centered_clip)
+        self.bias_min = None if bias_min is None else float(bias_min)
+        self.nonfinite_policy = self._norm_choice(
+            nonfinite_policy,
+            self.SUPPORTED_NONFINITE_POLICIES,
+            "nonfinite_policy",
+        )
+        self.salience_chunk_size = self._norm_chunk_size(salience_chunk_size)
+        self.salience_chunk_threshold = int(salience_chunk_threshold)
+        self.return_score = bool(return_score)
+        self.return_salience = bool(return_salience)
         self.eps = float(eps)
 
         if self.dim <= 0:
@@ -620,6 +692,17 @@ class Composer(nn.Module):
             )
         if self.eps <= 0:
             raise ValueError(f"eps must be positive, got {eps}")
+        if self.score_clip is not None and self.score_clip <= 0:
+            raise ValueError(f"score_clip must be positive, got {score_clip}")
+        if self.centered_clip is not None and self.centered_clip <= 0:
+            raise ValueError(
+                f"centered_clip must be positive, got {centered_clip}"
+            )
+        if self.salience_chunk_threshold <= 0:
+            raise ValueError(
+                "salience_chunk_threshold must be positive, got "
+                f"{salience_chunk_threshold}"
+            )
 
         hidden = (
             self.dim
@@ -632,6 +715,11 @@ class Composer(nn.Module):
                 f"{salience_hidden_dim}"
             )
 
+        self.complex_proj = (
+            nn.Linear(self.dim * 2, self.dim)
+            if self.complex_mode == "real_imag"
+            else nn.Identity()
+        )
         self.input_norm = nn.LayerNorm(self.dim)
         self.salience_score = nn.Sequential(
             nn.Linear(self.dim, hidden),
@@ -654,45 +742,85 @@ class Composer(nn.Module):
                 "Composer expects Tensor, got "
                 f"{type(context)!r}"
             )
+        if context.is_quantized:
+            raise TypeError("Composer does not accept quantized tensors directly.")
         if context.ndim != 4:
             raise ValueError(
                 "Composer expects shape (B, R, K, D). "
                 f"Got shape={tuple(context.shape)}."
             )
-        if context.shape[-1] != self.dim:
+        B, R, K, D = context.shape
+        if self.complex_mode == "real_imag" and context.is_complex():
+            expected_last = self.dim
+        else:
+            expected_last = self.dim
+        if D != expected_last:
             raise ValueError(
-                f"Expected last dim={self.dim}, got shape={tuple(context.shape)}"
+                f"Expected last dim={expected_last}, got shape={tuple(context.shape)}"
             )
-        if not context.is_floating_point():
-            raise TypeError(
-                "Composer requires floating point input. "
-                f"Got dtype={context.dtype}."
+        if B <= 0 or R <= 0 or K <= 0 or D <= 0:
+            raise ValueError(
+                "Composer requires positive B, R, K, and D. "
+                f"Got shape={tuple(context.shape)}."
             )
 
-        B, R, K, D = context.shape
+        input_dtype = context.dtype
+        stable_dtype = self._stable_dtype(context)
+        tokens = self._adapt_context(context, stable_dtype).reshape(B, R * K, self.dim)
+        tokens = self._cast_token_output(tokens, input_dtype=input_dtype)
+
         mask = self._norm_mask(
             context,
             context_mask=context_mask,
             region_mask=region_mask,
         )
-
-        tokens = context.reshape(B, R * K, D)
         token_mask = mask.reshape(B, R * K) if mask is not None else None
+
+        token_mask, tokens, valid_token_count, has_valid_tokens, has_dummy_token = (
+            self._ensure_nonempty_tokens(tokens, token_mask)
+        )
 
         score: Tensor | None = None
         salience: Tensor | None = None
         attn_bias: Tensor | None = None
+        bias_kind = "none"
 
         if self.salience_mode != "none":
-            score = self.salience_score(self.input_norm(tokens)).squeeze(-1)
-            if token_mask is not None:
-                min_value = torch.finfo(score.dtype).min
-                score = score.masked_fill(~token_mask, min_value)
-
-            salience, attn_bias = self._get_salience_and_bias(
-                score,
+            salience_result = self._compute_salience(
+                tokens,
                 token_mask=token_mask,
+                stable_dtype=stable_dtype,
             )
+            score = salience_result["score"]
+            salience = salience_result["salience"]
+            attn_bias = salience_result["bias"]
+            bias_kind = "salience"
+
+        if attn_bias is not None:
+            if token_mask is not None:
+                attn_bias = self._apply_mask_to_bias(
+                    attn_bias,
+                    token_mask,
+                    stable_dtype=stable_dtype,
+                    token_dtype=tokens.dtype,
+                    input_dtype=input_dtype,
+                )
+                bias_kind = "salience+mask"
+            else:
+                attn_bias = self._finalize_bias(
+                    attn_bias,
+                    stable_dtype=stable_dtype,
+                    token_dtype=tokens.dtype,
+                    input_dtype=input_dtype,
+                )
+        elif token_mask is not None and self.emit_mask_bias:
+            attn_bias = self._get_mask_bias(
+                token_mask,
+                stable_dtype=stable_dtype,
+                token_dtype=tokens.dtype,
+                input_dtype=input_dtype,
+            )
+            bias_kind = "mask"
 
         return ContextSummary(
             tokens=tokens,
@@ -700,7 +828,14 @@ class Composer(nn.Module):
             attn_bias=attn_bias,
             salience=salience,
             score=score,
-            original_shape=(B, R, K, D),
+            original_shape=(B, R, K, self.dim),
+            input_dtype=input_dtype,
+            token_dtype=tokens.dtype,
+            bias_dtype=attn_bias.dtype if attn_bias is not None else None,
+            valid_token_count=valid_token_count,
+            has_valid_tokens=has_valid_tokens,
+            has_dummy_token=has_dummy_token,
+            bias_kind=bias_kind,
         )
 
     def restore(
@@ -715,6 +850,11 @@ class Composer(nn.Module):
             raise TypeError(
                 f"restore expects Tensor, got {type(tokens)!r}"
             )
+        if not isinstance(composition, ContextSummary):
+            raise TypeError(
+                "composition must be ContextSummary, got "
+                f"{type(composition)!r}"
+            )
 
         B, R, K, D = composition.original_shape
         expected = (B, R * K, D)
@@ -727,7 +867,35 @@ class Composer(nn.Module):
         if composition.token_mask is not None:
             mask = composition.token_mask.reshape(B, R, K, 1)
             restored = restored.masked_fill(~mask, 0)
+        if composition.has_dummy_token is not None and composition.has_dummy_token.any():
+            restored = restored.clone()
+            restored[composition.has_dummy_token, 0, 0, :] = 0
         return restored
+
+    def _adapt_context(self, context: Tensor, stable_dtype: torch.dtype) -> Tensor:
+        if context.is_complex():
+            match self.complex_mode:
+                case "abs":
+                    return context.abs().to(dtype=stable_dtype)
+                case "real_imag":
+                    x = torch.view_as_real(context).flatten(-2)
+                    x = x.to(dtype=self._module_real_dtype())
+                    return self.complex_proj(x).to(dtype=stable_dtype)
+                case _:
+                    raise AssertionError(
+                        f"Unreachable complex_mode: {self.complex_mode}"
+                    )
+        return context.to(dtype=stable_dtype)
+
+    def _cast_token_output(
+        self, tokens: Tensor, *, input_dtype: torch.dtype
+    ) -> Tensor:
+        mode = self.token_output_dtype
+        if mode == "stable":
+            return tokens
+        if mode in {"input", "amp"} and self._is_real_floating_dtype(input_dtype):
+            return tokens.to(dtype=input_dtype)
+        return tokens
 
     def _norm_mask(
         self,
@@ -779,62 +947,411 @@ class Composer(nn.Module):
 
         return None
 
-    def _get_salience_and_bias(
-        self,
-        score: Tensor,
-        *args: Any,
-        token_mask: Tensor | None,
-    ) -> tuple[Tensor, Tensor]:
-        _ = args
-
-        if self.salience_mode == "score":
-            salience = torch.sigmoid(score)
-            if token_mask is not None:
-                salience = salience.masked_fill(~token_mask, 0)
-            return salience, self._get_bias_from_salience(
-                salience,
-                token_mask=token_mask,
+    def _ensure_nonempty_tokens(
+        self, tokens: Tensor, token_mask: Tensor | None
+    ) -> tuple[Tensor | None, Tensor, Tensor, Tensor, Tensor]:
+        B, T = tokens.shape[:2]
+        device = tokens.device
+        if token_mask is None:
+            valid_token_count = torch.full(
+                (B,), int(T), device=device, dtype=torch.long
+            )
+            has_valid_tokens = torch.ones(B, device=device, dtype=torch.bool)
+            has_dummy_token = torch.zeros(B, device=device, dtype=torch.bool)
+            return (
+                None,
+                tokens,
+                valid_token_count,
+                has_valid_tokens,
+                has_dummy_token,
             )
 
+        valid_token_count = token_mask.sum(dim=1, dtype=torch.long)
+        has_valid_tokens = valid_token_count > 0
+        has_dummy_token = torch.zeros(B, device=device, dtype=torch.bool)
+        if self.ensure_nonempty and not bool(has_valid_tokens.all().item()):
+            bad = ~has_valid_tokens
+            token_mask = token_mask.clone()
+            tokens = tokens.clone()
+            token_mask[bad, 0] = True
+            tokens[bad, 0, :] = 0
+            has_dummy_token[bad] = True
+        return (
+            token_mask,
+            tokens,
+            valid_token_count,
+            has_valid_tokens,
+            has_dummy_token,
+        )
+
+    def _compute_salience(
+        self,
+        tokens: Tensor,
+        *,
+        token_mask: Tensor | None,
+        stable_dtype: torch.dtype,
+    ) -> dict[str, Tensor | None]:
+        T = int(tokens.shape[1])
+        chunk_size = self._resolve_salience_chunk_size(T)
+        use_chunked = chunk_size is not None and chunk_size < T
+        if (
+            use_chunked
+            and self.salience_mode == "soft_topk"
+            and not self.detach_topk_threshold
+        ):
+            warnings.warn(
+                "Composer soft_topk with detach_topk_threshold=False uses dense "
+                "salience computation to preserve threshold gradient semantics.",
+                UserWarning,
+                stacklevel=2,
+            )
+            use_chunked = False
+        if use_chunked and self.salience_mode == "soft_topk" and self.training:
+            warnings.warn(
+                "Composer soft_topk uses dense salience computation during training "
+                "to avoid recomputing dropout-dependent scores across chunk passes.",
+                UserWarning,
+                stacklevel=2,
+            )
+            use_chunked = False
+
+        if not use_chunked:
+            return self._compute_salience_dense(
+                tokens, token_mask=token_mask, stable_dtype=stable_dtype
+            )
+        if self.salience_mode == "score":
+            return self._compute_score_salience_chunked(
+                tokens,
+                token_mask=token_mask,
+                stable_dtype=stable_dtype,
+                chunk_size=chunk_size,
+            )
         if self.salience_mode == "soft_topk":
+            return self._compute_soft_topk_salience_chunked(
+                tokens,
+                token_mask=token_mask,
+                stable_dtype=stable_dtype,
+                chunk_size=chunk_size,
+            )
+        raise AssertionError(f"Unreachable salience mode: {self.salience_mode}")
+
+    def _compute_salience_dense(
+        self,
+        tokens: Tensor,
+        *,
+        token_mask: Tensor | None,
+        stable_dtype: torch.dtype,
+    ) -> dict[str, Tensor | None]:
+        score = self._score_tokens(tokens, stable_dtype=stable_dtype)
+        if self.salience_mode == "score":
+            bias, salience = self._score_to_bias_and_salience(score)
+        elif self.salience_mode == "soft_topk":
             k = self._resolve_topk(score.shape[-1])
             if k is None:
-                salience = torch.sigmoid(score)
+                bias, salience = self._score_to_bias_and_salience(score)
             else:
-                topk_value = torch.topk(score, k=k, dim=-1).values[..., -1:]
+                score_for_topk = self._mask_score_for_topk(
+                    score, token_mask=token_mask
+                )
+                topk_value = torch.topk(score_for_topk, k=k, dim=-1).values[..., -1:]
                 if self.detach_topk_threshold:
                     topk_value = topk_value.detach()
                 centered = (score - topk_value) / self.salience_temperature
-                salience = torch.sigmoid(centered)
+                bias, salience = self._centered_to_bias_and_salience(centered)
+        else:
+            raise AssertionError(f"Unreachable salience mode: {self.salience_mode}")
 
-            if token_mask is not None:
-                salience = salience.masked_fill(~token_mask, 0)
+        if token_mask is not None and salience is not None:
+            salience = salience.masked_fill(~token_mask, 0)
+        return {
+            "score": score if self.return_score else None,
+            "salience": salience if self.return_salience else None,
+            "bias": bias,
+        }
 
-            return salience, self._get_bias_from_salience(
-                salience,
+    def _compute_score_salience_chunked(
+        self,
+        tokens: Tensor,
+        *,
+        token_mask: Tensor | None,
+        stable_dtype: torch.dtype,
+        chunk_size: int,
+    ) -> dict[str, Tensor | None]:
+        bias_chunks: list[Tensor] = []
+        score_chunks: list[Tensor] = []
+        salience_chunks: list[Tensor] = []
+        T = int(tokens.shape[1])
+        for start in range(0, T, chunk_size):
+            end = min(start + chunk_size, T)
+            score = self._score_tokens(tokens[:, start:end], stable_dtype=stable_dtype)
+            bias, salience = self._score_to_bias_and_salience(score)
+            bias_chunks.append(bias)
+            if self.return_score:
+                score_chunks.append(score)
+            if self.return_salience:
+                if token_mask is not None:
+                    salience = salience.masked_fill(~token_mask[:, start:end], 0)
+                salience_chunks.append(salience)
+        return {
+            "score": torch.cat(score_chunks, dim=1) if score_chunks else None,
+            "salience": torch.cat(salience_chunks, dim=1) if salience_chunks else None,
+            "bias": torch.cat(bias_chunks, dim=1),
+        }
+
+    def _compute_soft_topk_salience_chunked(
+        self,
+        tokens: Tensor,
+        *,
+        token_mask: Tensor | None,
+        stable_dtype: torch.dtype,
+        chunk_size: int,
+    ) -> dict[str, Tensor | None]:
+        T = int(tokens.shape[1])
+        k = self._resolve_topk(T)
+        if k is None:
+            return self._compute_score_salience_chunked(
+                tokens,
                 token_mask=token_mask,
+                stable_dtype=stable_dtype,
+                chunk_size=chunk_size,
             )
 
-        raise AssertionError(
-            f"Unreachable salience mode: {self.salience_mode}"
+        top_candidates: Tensor | None = None
+        with torch.no_grad():
+            for start in range(0, T, chunk_size):
+                end = min(start + chunk_size, T)
+                score = self._score_tokens(
+                    tokens[:, start:end], stable_dtype=stable_dtype
+                )
+                chunk_mask = token_mask[:, start:end] if token_mask is not None else None
+                score = self._mask_score_for_topk(score, token_mask=chunk_mask)
+                take = min(k, int(score.shape[-1]))
+                chunk_top = torch.topk(score, k=take, dim=-1).values
+                top_candidates = (
+                    chunk_top
+                    if top_candidates is None
+                    else torch.cat((top_candidates, chunk_top), dim=-1)
+                )
+                if int(top_candidates.shape[-1]) > k:
+                    top_candidates = torch.topk(top_candidates, k=k, dim=-1).values
+        if top_candidates is None:
+            raise AssertionError("Composer requires at least one token.")
+        threshold = torch.topk(top_candidates, k=min(k, top_candidates.shape[-1]), dim=-1).values[..., -1:]
+        threshold = threshold.detach()
+
+        bias_chunks: list[Tensor] = []
+        score_chunks: list[Tensor] = []
+        salience_chunks: list[Tensor] = []
+        for start in range(0, T, chunk_size):
+            end = min(start + chunk_size, T)
+            score = self._score_tokens(tokens[:, start:end], stable_dtype=stable_dtype)
+            centered = (score - threshold) / self.salience_temperature
+            bias, salience = self._centered_to_bias_and_salience(centered)
+            bias_chunks.append(bias)
+            if self.return_score:
+                score_chunks.append(score)
+            if self.return_salience:
+                if token_mask is not None:
+                    salience = salience.masked_fill(~token_mask[:, start:end], 0)
+                salience_chunks.append(salience)
+        return {
+            "score": torch.cat(score_chunks, dim=1) if score_chunks else None,
+            "salience": torch.cat(salience_chunks, dim=1) if salience_chunks else None,
+            "bias": torch.cat(bias_chunks, dim=1),
+        }
+
+    def _score_tokens(self, tokens: Tensor, *, stable_dtype: torch.dtype) -> Tensor:
+        device_type = tokens.device.type
+        module_dtype = self._module_real_dtype()
+        with torch.autocast(device_type=device_type, enabled=False):
+            x = tokens.to(dtype=module_dtype)
+            score = self.salience_score(self.input_norm(x)).squeeze(-1)
+            score = score.to(dtype=stable_dtype)
+            if self.score_clip is not None:
+                score = score.clamp(-self.score_clip, self.score_clip)
+            return self._handle_nonfinite("score", score)
+
+    def _score_to_bias_and_salience(self, score: Tensor) -> tuple[Tensor, Tensor]:
+        with torch.autocast(device_type=score.device.type, enabled=False):
+            bias = self.salience_bias_scale * F.logsigmoid(score)
+            if self.bias_min is not None:
+                bias = bias.clamp_min(self.bias_min)
+            bias = self._handle_nonfinite("attn_bias", bias)
+            salience = torch.sigmoid(score)
+            salience = self._handle_nonfinite("salience", salience)
+            return bias, salience
+
+    def _centered_to_bias_and_salience(self, centered: Tensor) -> tuple[Tensor, Tensor]:
+        with torch.autocast(device_type=centered.device.type, enabled=False):
+            if self.centered_clip is not None:
+                centered = centered.clamp(-self.centered_clip, self.centered_clip)
+            bias = self.salience_bias_scale * F.logsigmoid(centered)
+            if self.bias_min is not None:
+                bias = bias.clamp_min(self.bias_min)
+            bias = self._handle_nonfinite("attn_bias", bias)
+            salience = torch.sigmoid(centered)
+            salience = self._handle_nonfinite("salience", salience)
+            return bias, salience
+
+    def _mask_score_for_topk(
+        self, score: Tensor, *, token_mask: Tensor | None
+    ) -> Tensor:
+        if token_mask is None:
+            return score
+        return score.masked_fill(
+            ~token_mask, self._default_mask_bias_value(score.dtype)
         )
 
-    def _get_bias_from_salience(
+    def _apply_mask_to_bias(
         self,
-        salience: Tensor,
-        *args: Any,
-        token_mask: Tensor | None,
+        bias: Tensor,
+        token_mask: Tensor,
+        *,
+        stable_dtype: torch.dtype,
+        token_dtype: torch.dtype,
+        input_dtype: torch.dtype,
     ) -> Tensor:
-        _ = args
+        with torch.autocast(device_type=bias.device.type, enabled=False):
+            value = self._default_mask_bias_value(stable_dtype)
+            out = bias.to(dtype=stable_dtype).masked_fill(~token_mask, value)
+            return self._finalize_bias(
+                out,
+                stable_dtype=stable_dtype,
+                token_dtype=token_dtype,
+                input_dtype=input_dtype,
+            )
 
-        safe = salience.clamp_min(self.eps)
-        bias = self.salience_bias_scale * torch.log(safe)
+    def _finalize_bias(
+        self,
+        bias: Tensor,
+        *,
+        stable_dtype: torch.dtype,
+        token_dtype: torch.dtype,
+        input_dtype: torch.dtype,
+    ) -> Tensor:
+        out = bias.to(dtype=stable_dtype)[:, None, None, :]
+        return self._cast_bias_output(
+            out, token_dtype=token_dtype, input_dtype=input_dtype
+        )
 
-        if token_mask is not None:
-            min_value = torch.finfo(bias.dtype).min
-            bias = bias.masked_fill(~token_mask, min_value)
+    def _get_mask_bias(
+        self,
+        token_mask: Tensor,
+        *,
+        stable_dtype: torch.dtype,
+        token_dtype: torch.dtype,
+        input_dtype: torch.dtype,
+    ) -> Tensor:
+        with torch.autocast(device_type=token_mask.device.type, enabled=False):
+            bias = torch.zeros(
+                token_mask.shape, device=token_mask.device, dtype=stable_dtype
+            )
+            bias = bias.masked_fill(
+                ~token_mask, self._default_mask_bias_value(stable_dtype)
+            )
+            bias = bias[:, None, None, :]
+            return self._cast_bias_output(
+                bias, token_dtype=token_dtype, input_dtype=input_dtype
+            )
 
-        return bias[:, None, None, :]
+    def _cast_bias_output(
+        self,
+        bias: Tensor,
+        *,
+        token_dtype: torch.dtype,
+        input_dtype: torch.dtype,
+    ) -> Tensor:
+        mode = self.bias_output_dtype
+        if mode == "stable":
+            return bias
+        if mode in {"token", "amp"} and self._is_real_floating_dtype(token_dtype):
+            return bias.to(dtype=token_dtype)
+        if mode == "input" and self._is_real_floating_dtype(input_dtype):
+            return bias.to(dtype=input_dtype)
+        return bias
+
+    def _default_mask_bias_value(self, dtype: torch.dtype) -> float:
+        if self.mask_bias_value is not None:
+            return float(self.mask_bias_value)
+        if dtype in {torch.float16, torch.bfloat16}:
+            return -1.0e4
+        if dtype == torch.float64:
+            return -1.0e12
+        return -1.0e9
+
+    def _handle_nonfinite(self, name: str, value: Tensor) -> Tensor:
+        if self.nonfinite_policy == "ignore" or not value.is_floating_point():
+            return value
+        if value.numel() == 0:
+            return value
+        with torch.no_grad():
+            is_finite = bool(torch.isfinite(value.detach()).all().item())
+        if is_finite:
+            return value
+        message = f"Composer produced non-finite values in {name}."
+        if self.nonfinite_policy == "error":
+            raise FloatingPointError(message)
+        if self.nonfinite_policy == "warn":
+            warnings.warn(message, RuntimeWarning, stacklevel=3)
+            return value
+        if self.nonfinite_policy == "sanitize":
+            fill = self._default_mask_bias_value(value.dtype) if name == "attn_bias" else 0.0
+            return torch.nan_to_num(value, nan=fill, posinf=0.0, neginf=fill)
+        raise AssertionError(f"Unreachable nonfinite_policy: {self.nonfinite_policy}")
+
+    def _resolve_salience_chunk_size(self, total_tokens: int) -> int | None:
+        if self.salience_chunk_size is not None:
+            return min(self.salience_chunk_size, int(total_tokens))
+        if int(total_tokens) >= self.salience_chunk_threshold:
+            return min(self.salience_chunk_threshold, int(total_tokens))
+        return None
+
+    def _stable_dtype(self, x: Tensor) -> torch.dtype:
+        if self.dtype_policy == "float64":
+            return torch.float64
+        if self.dtype_policy == "float32":
+            return torch.float32
+        if x.dtype in {torch.float64, torch.complex128}:
+            return torch.float64
+        if x.dtype == torch.int64 and self.int64_policy == "float64":
+            return torch.float64
+        return torch.float32
+
+    def _module_real_dtype(self) -> torch.dtype:
+        dtype = self.input_norm.weight.dtype
+        if not torch.empty((), dtype=dtype).is_floating_point():
+            raise TypeError(f"Composer module dtype must be real floating, got {dtype}")
+        return dtype
+
+    @staticmethod
+    def _is_real_floating_dtype(dtype: torch.dtype) -> bool:
+        try:
+            t = torch.empty((), dtype=dtype)
+        except Exception:
+            return False
+        return bool(t.is_floating_point())
+
+    @staticmethod
+    def _norm_choice(value: str, supported: set[str], name: str) -> str:
+        normalized = str(value).lower().strip().replace("-", "_")
+        if normalized not in supported:
+            allowed = ", ".join(sorted(supported))
+            raise ValueError(f"{name} must be one of {allowed}. Got {value!r}")
+        return normalized
+
+    @staticmethod
+    def _norm_chunk_size(chunk_size: int | None) -> int | None:
+        if chunk_size is None:
+            return None
+        if isinstance(chunk_size, bool) or not isinstance(chunk_size, int):
+            raise TypeError(
+                f"salience_chunk_size must be int | None, got {type(chunk_size)!r}"
+            )
+        if chunk_size <= 0:
+            raise ValueError(
+                f"salience_chunk_size must be positive, got {chunk_size}"
+            )
+        return int(chunk_size)
 
     def _resolve_topk(self, total_tokens: int) -> int | None:
         if self.salience_topk is None:
