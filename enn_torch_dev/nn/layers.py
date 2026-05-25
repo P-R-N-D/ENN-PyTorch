@@ -177,20 +177,23 @@ class Reducer(nn.Module):
         with autocast_disabled(x.device):
             work = x.to(dtype=dtype)
             ws = self._norm_weight_compat(weights, ref=x, dtype=dtype)
-            if op == "sum":
-                if ws is not None:
-                    work = work * self._weight_view(ws, work)
-                return work.sum(dim=0)
-            if op == "mean":
-                if ws is None:
-                    return work.mean(dim=0)
-                coeffs = self._mean_coeffs_compat(ws)
-                return (work * self._weight_view(coeffs, work)).sum(dim=0)
-            if op == "min":
-                return work.amin(dim=0)
-            if op == "max":
-                return work.amax(dim=0)
-        raise AssertionError(f"Unreachable reducer op: {op}")
+
+            match op:
+                case "sum":
+                    if ws is not None:
+                        work = work * self._weight_view(ws, work)
+                    return work.sum(dim=0)
+                case "mean":
+                    if ws is None:
+                        return work.mean(dim=0)
+                    coeffs = self._mean_coeffs_compat(ws)
+                    return (work * self._weight_view(coeffs, work)).sum(dim=0)
+                case "min":
+                    return work.amin(dim=0)
+                case "max":
+                    return work.amax(dim=0)
+                case _:
+                    raise AssertionError(f"Unreachable reducer op: {op}")
 
     def _compat_reduction_dtype(self, x: Tensor, weights: Tensor | None) -> torch.dtype:
         if x.dtype == torch.float64 or self._weight_is_float64(weights):

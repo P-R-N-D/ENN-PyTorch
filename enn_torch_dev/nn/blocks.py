@@ -840,37 +840,39 @@ class Composer(nn.Module):
     ) -> tuple[Tensor, Tensor]:
         _ = args
 
-        if self.salience_mode == "score":
-            salience = torch.sigmoid(score)
-            if token_mask is not None:
-                salience = salience.masked_fill(~token_mask, 0)
-            return salience, self._get_bias_from_salience(
-                salience,
-                token_mask=token_mask,
-            )
-
-        if self.salience_mode == "soft_topk":
-            k = self._resolve_topk(score.shape[-1])
-            if k is None:
+        match self.salience_mode:
+            case "score":
                 salience = torch.sigmoid(score)
-            else:
-                topk_value = torch.topk(score, k=k, dim=-1).values[..., -1:]
-                if self.detach_topk_threshold:
-                    topk_value = topk_value.detach()
-                centered = (score - topk_value) / self.salience_temperature
-                salience = torch.sigmoid(centered)
+                if token_mask is not None:
+                    salience = salience.masked_fill(~token_mask, 0)
+                return salience, self._get_bias_from_salience(
+                    salience,
+                    token_mask=token_mask,
+                )
 
-            if token_mask is not None:
-                salience = salience.masked_fill(~token_mask, 0)
+            case "soft_topk":
+                k = self._resolve_topk(score.shape[-1])
+                if k is None:
+                    salience = torch.sigmoid(score)
+                else:
+                    topk_value = torch.topk(score, k=k, dim=-1).values[..., -1:]
+                    if self.detach_topk_threshold:
+                        topk_value = topk_value.detach()
+                    centered = (score - topk_value) / self.salience_temperature
+                    salience = torch.sigmoid(centered)
 
-            return salience, self._get_bias_from_salience(
-                salience,
-                token_mask=token_mask,
-            )
+                if token_mask is not None:
+                    salience = salience.masked_fill(~token_mask, 0)
 
-        raise AssertionError(
-            f"Unreachable salience mode: {self.salience_mode}"
-        )
+                return salience, self._get_bias_from_salience(
+                    salience,
+                    token_mask=token_mask,
+                )
+
+            case _:
+                raise AssertionError(
+                    f"Unreachable salience mode: {self.salience_mode}"
+                )
 
     def _get_bias_from_salience(
         self,
@@ -927,7 +929,7 @@ class Composer(nn.Module):
                 return "none"
             case "score" | "sigmoid" | "gate":
                 return "score"
-            case "soft_topk" | "soft-topk" | "topk" | "triattention":
+            case "soft_topk" | "soft-topk" | "topk":
                 return "soft_topk"
             case _:
                 supported = ", ".join(sorted(cls.SUPPORTED_SALIENCE_MODES))
