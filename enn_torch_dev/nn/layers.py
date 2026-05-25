@@ -711,7 +711,7 @@ class Reducer(nn.Module):
         )
 
 
-class ConvND(nn.Module):
+class LocalConvMixer(nn.Module):
     """
     Channel-last Conv1d/Conv2d/Conv3d adapter for region-local tensors.
 
@@ -759,7 +759,7 @@ class ConvND(nn.Module):
             )
         if self.kernel_size % 2 == 0:
             raise ValueError(
-                "ConvND requires an odd kernel_size so the local shape "
+                "LocalConvMixer requires an odd kernel_size so the local shape "
                 f"can be preserved. Got kernel_size={kernel_size}."
             )
 
@@ -815,7 +815,7 @@ class ConvND(nn.Module):
     def forward(self, x: Tensor, *args: Any) -> Tensor:
         _ = args
         if not isinstance(x, Tensor):
-            raise TypeError(f"ConvND expects Tensor, got {type(x)!r}")
+            raise TypeError(f"LocalConvMixer expects Tensor, got {type(x)!r}")
 
         if not self.enabled:
             return x
@@ -835,7 +835,7 @@ class ConvND(nn.Module):
         if self.local_ndim is not None:
             if local_ndim != self.local_ndim:
                 raise ValueError(
-                    "ConvND fixed local_ndim does not match input rank. "
+                    "LocalConvMixer fixed local_ndim does not match input rank. "
                     f"local_ndim={self.local_ndim}, "
                     f"input local rank={local_ndim}, "
                     f"shape={tuple(x.shape)}"

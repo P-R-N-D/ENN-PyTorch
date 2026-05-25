@@ -6,7 +6,7 @@ from typing import Any
 import torch
 from torch import Tensor, nn
 
-from .layers import ConvND
+from .layers import LocalConvMixer
 
 
 class Compressor(nn.Module):
@@ -22,7 +22,7 @@ class Compressor(nn.Module):
 
     The compressor is intentionally split into two stages:
 
-      1. Optional structured local mixing through ``ConvND``.
+      1. Optional structured local mixing through ``LocalConvMixer``.
          Conv1d/Conv2d/Conv3d is selected from the rank of
          ``local_shape``. Unsupported local ranks fall back to identity.
 
@@ -43,13 +43,13 @@ class Compressor(nn.Module):
         integral_mode: str = "cast",
         complex_mode: str | None = None,
         output_dtype: torch.dtype | None = None,
-        use_conv: bool = True,
-        conv_kernel_size: int = 3,
-        conv_bias: bool = True,
-        conv_activation: str = "gelu",
-        conv_local_ndim: int | None = None,
-        conv_residual: bool = True,
-        conv_residual_scale_init: float = 0.0,
+        use_local_mixer: bool = True,
+        local_kernel_size: int = 3,
+        local_mixer_bias: bool = True,
+        local_mixer_activation: str = "identity",
+        local_ndim: int | None = None,
+        local_mixer_residual: bool = True,
+        local_mixer_residual_scale_init: float = 0.0,
         hidden_dim: int | None = None,
         score_hidden_dim: int | None = 128,
         activation: str = "gelu",
@@ -118,18 +118,18 @@ class Compressor(nn.Module):
         )
 
         self.input_norm = nn.LayerNorm(self.dim)
-        self.conv = (
-            ConvND(
+        self.local_mixer = (
+            LocalConvMixer(
                 self.dim,
-                kernel_size=conv_kernel_size,
+                kernel_size=local_kernel_size,
                 enabled=True,
-                bias=conv_bias,
-                activation=conv_activation,
-                local_ndim=conv_local_ndim,
-                residual=conv_residual,
-                residual_scale_init=conv_residual_scale_init,
+                bias=local_mixer_bias,
+                activation=local_mixer_activation,
+                local_ndim=local_ndim,
+                residual=local_mixer_residual,
+                residual_scale_init=local_mixer_residual_scale_init,
             )
-            if use_conv
+            if use_local_mixer
             else nn.Identity()
         )
 
@@ -157,16 +157,20 @@ class Compressor(nn.Module):
         unexpected_keys: list[str],
         error_msgs: list[str],
     ) -> None:
-        if isinstance(self.conv, nn.Identity):
+        if isinstance(self.local_mixer, nn.Identity):
             legacy_conv_prefixes = (
                 f"{prefix}conv.conv1.",
                 f"{prefix}conv.conv2.",
                 f"{prefix}conv.conv3.",
+                f"{prefix}local_mixer.conv1.",
+                f"{prefix}local_mixer.conv2.",
+                f"{prefix}local_mixer.conv3.",
             )
             legacy_conv_keys = [
                 key
                 for key in tuple(state_dict.keys())
                 if key == f"{prefix}conv.residual_scale"
+                or key == f"{prefix}local_mixer.residual_scale"
                 or key.startswith(legacy_conv_prefixes)
             ]
             for key in legacy_conv_keys:
@@ -229,7 +233,7 @@ class Compressor(nn.Module):
         if mask is not None:
             h = h.masked_fill(~mask.unsqueeze(-1), 0)
 
-        h = self.conv(h)
+        h = self.local_mixer(h)
         h = self.value_norm(h)
 
         if mask is not None:
@@ -268,13 +272,13 @@ class Compressor(nn.Module):
             return z, weights
         return z
 
-    def forward_export(self, x: Tensor, local_mask: Tensor) -> Tensor:
+    def forward_compat(self, x: Tensor, local_mask: Tensor) -> Tensor:
         out = self._forward_impl(
             x, local_mask=local_mask, return_weights=False, force_dense=True
         )
         return out if isinstance(out, Tensor) else out[0]
 
-    def forward_export_nomask(self, x: Tensor) -> Tensor:
+    def forward_compat_nomask(self, x: Tensor) -> Tensor:
         out = self._forward_impl(
             x, local_mask=None, return_weights=False, force_dense=True
         )
@@ -572,7 +576,7 @@ class Composer(nn.Module):
 
     This block is intentionally placed between ``Compressor`` and the
     global attention layer. It owns coarse-context composition metadata and
-    optional TriAttention-like salience biasing:
+    optional salience biasing:
 
       - no hard routing by default;
       - compressed tokens stay dense;
