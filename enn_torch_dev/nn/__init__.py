@@ -5,10 +5,10 @@ from .blocks import (
     ContextSummary,
     Compressor,
 )
-from .layers import LocalConvMixer, Reducer
+from .layers import ConvMixer, Reducer
 
 __all__ = [
-    "LocalConvMixer",
+    "ConvMixer",
     "Composer",
     "ContextSummary",
     "Reducer",

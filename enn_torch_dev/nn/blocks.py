@@ -8,7 +8,7 @@ import torch
 from torch import Tensor, nn
 
 from ._compat import autocast_disabled, stable_work_dtype
-from .layers import LocalConvMixer
+from .layers import ConvMixer
 
 
 class Compressor(nn.Module):
@@ -24,7 +24,7 @@ class Compressor(nn.Module):
 
     The compressor is intentionally split into two stages:
 
-      1. Optional structured local mixing through ``LocalConvMixer``.
+      1. Optional structured local mixing through ``ConvMixer``.
          Conv1d/Conv2d/Conv3d is selected from the rank of
          ``local_shape``. Unsupported local ranks fall back to identity.
 
@@ -121,7 +121,7 @@ class Compressor(nn.Module):
 
         self.input_norm = nn.LayerNorm(self.dim)
         self.local_mixer = (
-            LocalConvMixer(
+            ConvMixer(
                 self.dim,
                 kernel_size=local_kernel_size,
                 enabled=True,
