@@ -644,6 +644,10 @@ class Composer(nn.Module):
             )
         if self.eps <= 0:
             raise ValueError(f"eps must be positive, got {eps}")
+        if self.salience_bias_scale < 0:
+            raise ValueError(
+                f"salience_bias_scale must be non-negative, got {salience_bias_scale}"
+            )
 
         hidden = (
             self.dim
