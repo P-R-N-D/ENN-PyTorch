@@ -806,7 +806,7 @@ class Reducer(nn.Module):
         )
 
 
-class LocalConvMixer(nn.Module):
+class ConvMixer(nn.Module):
     """
     Shape-preserving local convolution mixer for channel-last regional tensors.
 
@@ -860,7 +860,7 @@ class LocalConvMixer(nn.Module):
             )
         if self.kernel_size % 2 == 0:
             raise ValueError(
-                "LocalConvMixer requires an odd kernel_size so the local shape "
+                "ConvMixer requires an odd kernel_size so the local shape "
                 f"can be preserved. Got kernel_size={kernel_size}."
             )
 
@@ -916,7 +916,7 @@ class LocalConvMixer(nn.Module):
     def forward(self, x: Tensor, *args: Any) -> Tensor:
         _ = args
         if not isinstance(x, Tensor):
-            raise TypeError(f"LocalConvMixer expects Tensor, got {type(x)!r}")
+            raise TypeError(f"ConvMixer expects Tensor, got {type(x)!r}")
 
         if not self.enabled:
             return x
@@ -933,7 +933,7 @@ class LocalConvMixer(nn.Module):
         if self.local_ndim is not None:
             if local_ndim != self.local_ndim:
                 raise ValueError(
-                    "LocalConvMixer fixed local_ndim does not match input rank. "
+                    "ConvMixer fixed local_ndim does not match input rank. "
                     f"local_ndim={self.local_ndim}, "
                     f"input local rank={local_ndim}, "
                     f"shape={tuple(x.shape)}"
@@ -958,7 +958,7 @@ class LocalConvMixer(nn.Module):
     def _check_conv_route_dtype(self, x: Tensor) -> None:
         if x.is_quantized or x.is_complex() or x.dtype not in self.SUPPORTED_CONV_DTYPES:
             raise TypeError(
-                "LocalConvMixer requires real floating point input when "
+                "ConvMixer requires real floating point input when "
                 f"convolution is applied. Got dtype={x.dtype}."
             )
 
