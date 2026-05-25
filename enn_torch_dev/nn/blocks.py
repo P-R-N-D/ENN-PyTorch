@@ -699,6 +699,8 @@ class Composer(nn.Module):
 
         tokens = context.reshape(B, R * K, D)
         token_mask = mask.reshape(B, R * K) if mask is not None else None
+        if token_mask is not None:
+            tokens = tokens.masked_fill(~token_mask.unsqueeze(-1), 0)
 
         score: Tensor | None = None
         salience: Tensor | None = None
@@ -723,6 +725,32 @@ class Composer(nn.Module):
             score=score,
             original_shape=(B, R, K, D),
         )
+
+    def forward_compat(
+        self,
+        context: Tensor,
+        context_mask: Tensor | None = None,
+        region_mask: Tensor | None = None,
+    ) -> tuple[Tensor, Tensor, Tensor]:
+        summary = self.forward(
+            context,
+            context_mask=context_mask,
+            region_mask=region_mask,
+        )
+        tokens = summary.tokens
+        B, T, _ = tokens.shape
+        token_mask = (
+            torch.ones((B, T), device=tokens.device, dtype=torch.bool)
+            if summary.token_mask is None
+            else summary.token_mask
+        )
+        if summary.attn_bias is None:
+            attn_bias = torch.zeros(
+                (B, 1, 1, T), device=tokens.device, dtype=tokens.dtype
+            )
+        else:
+            attn_bias = summary.attn_bias
+        return tokens, token_mask, attn_bias
 
     def restore(
         self,
