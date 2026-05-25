@@ -121,6 +121,40 @@ def test_composer_mask_bias_can_be_emitted_without_salience():
     assert torch.all(summary.attn_bias[:, :, :, 4:8] < 0)
 
 
+def test_composer_mask_bias_token_output_dtype_fp16_stays_finite():
+    x = torch.randn(2, 3, 4, 5, dtype=torch.float16)
+    mask = torch.ones(2, 3, 4, dtype=torch.bool)
+    mask[:, 1] = False
+    module = Composer(
+        5,
+        emit_mask_bias=True,
+        token_output_dtype="input",
+        bias_output_dtype="input",
+    )
+
+    summary = module(x, context_mask=mask)
+
+    assert summary.attn_bias.dtype == torch.float16
+    assert torch.isfinite(summary.attn_bias).all()
+
+
+def test_composer_salience_masked_bias_token_output_dtype_fp16_stays_finite():
+    x = torch.randn(2, 3, 4, 5, dtype=torch.float16)
+    mask = torch.ones(2, 3, 4, dtype=torch.bool)
+    mask[:, 1] = False
+    module = Composer(
+        5,
+        salience_mode="score",
+        token_output_dtype="input",
+        bias_output_dtype="input",
+    )
+
+    summary = module(x, context_mask=mask)
+
+    assert summary.attn_bias.dtype == torch.float16
+    assert torch.isfinite(summary.attn_bias).all()
+
+
 @pytest.mark.parametrize("mode", ["score", "soft_topk"])
 def test_composer_salience_bias_is_finite_and_metadata_opt_in(mode):
     x = torch.randn(2, 3, 4, 5)

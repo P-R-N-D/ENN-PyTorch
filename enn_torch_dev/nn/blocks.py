@@ -1212,7 +1212,13 @@ class Composer(nn.Module):
         input_dtype: torch.dtype,
     ) -> Tensor:
         with torch.autocast(device_type=bias.device.type, enabled=False):
-            value = self._default_mask_bias_value(stable_dtype)
+            value = self._default_mask_bias_value(
+                self._mask_bias_value_dtype(
+                    stable_dtype=stable_dtype,
+                    token_dtype=token_dtype,
+                    input_dtype=input_dtype,
+                )
+            )
             out = bias.to(dtype=stable_dtype).masked_fill(~token_mask, value)
             return self._finalize_bias(
                 out,
@@ -1243,16 +1249,35 @@ class Composer(nn.Module):
         input_dtype: torch.dtype,
     ) -> Tensor:
         with torch.autocast(device_type=token_mask.device.type, enabled=False):
+            value = self._default_mask_bias_value(
+                self._mask_bias_value_dtype(
+                    stable_dtype=stable_dtype,
+                    token_dtype=token_dtype,
+                    input_dtype=input_dtype,
+                )
+            )
             bias = torch.zeros(
                 token_mask.shape, device=token_mask.device, dtype=stable_dtype
             )
-            bias = bias.masked_fill(
-                ~token_mask, self._default_mask_bias_value(stable_dtype)
-            )
+            bias = bias.masked_fill(~token_mask, value)
             bias = bias[:, None, None, :]
             return self._cast_bias_output(
                 bias, token_dtype=token_dtype, input_dtype=input_dtype
             )
+
+    def _mask_bias_value_dtype(
+        self,
+        *,
+        stable_dtype: torch.dtype,
+        token_dtype: torch.dtype,
+        input_dtype: torch.dtype,
+    ) -> torch.dtype:
+        mode = self.bias_output_dtype
+        if mode in {"token", "amp"} and self._is_real_floating_dtype(token_dtype):
+            return token_dtype
+        if mode == "input" and self._is_real_floating_dtype(input_dtype):
+            return input_dtype
+        return stable_dtype
 
     def _cast_bias_output(
         self,
