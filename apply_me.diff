@@ -1,0 +1,1250 @@
+diff --git a/enn_torch_dev/nn/_compat.py b/enn_torch_dev/nn/_compat.py
+new file mode 100644
+index 0000000..1111111
+--- /dev/null
++++ b/enn_torch_dev/nn/_compat.py
+@@ -0,0 +1,28 @@
++from __future__ import annotations
++
++import contextlib
++
++import torch
++
++
++def autocast_disabled(device: torch.device):
++    """
++    Disable autocast around numerically sensitive regions.
++
++    This helper intentionally stays small. Feature transforms may use AMP, but
++    reductions, softmax/log/exp, attention bias, and accumulation paths should
++    use an explicit FP32/FP64 work dtype.
++    """
++    device_type = torch.device(device).type
++    if device_type in {"cuda", "cpu", "xpu", "mps", "hpu"}:
++        return torch.autocast(device_type=device_type, enabled=False)
++    return contextlib.nullcontext()
++
++
++def stable_work_dtype(dtype: torch.dtype) -> torch.dtype:
++    if dtype == torch.float64:
++        return torch.float64
++    if dtype in {torch.float16, torch.bfloat16, torch.float32}:
++        return torch.float32
++    raise TypeError(f"Unsupported stable work dtype: {dtype}")
+
+diff --git a/enn_torch_dev/nn/layers.py b/enn_torch_dev/nn/layers.py
+index 169b27c..2222222 100644
+--- a/enn_torch_dev/nn/layers.py
++++ b/enn_torch_dev/nn/layers.py
+@@ -1,11 +1,13 @@
+ from __future__ import annotations
+ 
+ import math
+-from typing import Any
+ from collections.abc import Sequence
++from typing import Any
+ 
+ import torch
+ from torch import Tensor, nn
+ 
++from ._compat import autocast_disabled, stable_work_dtype
++
+ 
+ class Reducer(nn.Module):
+@@ -22,6 +24,10 @@ class Reducer(nn.Module):
+ 
+     ``master_dtype`` controls real-valued accumulation precision for numerically
+     sensitive reductions. It is also used to derive the complex accumulation
+     dtype. Pure integer sums are accumulated as int64.
++
++    ``forward_compat`` is the graph-compatible path. It accepts a stacked tensor
++    shaped ``(N, *data_shape)`` and uses the reducer's configured ``op`` instead
++    of a runtime string argument.
+     """
+@@ -38,21 +44,24 @@ class Reducer(nn.Module):
+         strict_device: bool = True,
+         eps: float = 1e-12,
+         master_dtype: torch.dtype = torch.float32,
++        op: str = "mean",
+     ) -> None:
+         super().__init__()
+         self.strict_shape = strict_shape
+         self.strict_dtype = strict_dtype
+         self.strict_device = strict_device
+         self.eps = float(eps)
+         self.master_dtype = master_dtype
++        self.op = self._norm_op_str(op)
+         self._verify_config()
+ 
+     def forward(
+         self,
+         tensors: Sequence[Tensor],
+-        op: str = "mean",
++        op: str | None = None,
+         weights: Sequence[float] | Tensor | None = None,
+         chunk_size: int | None = None,
+     ) -> Tensor:
+-        op = self._norm_op_str(op)
++        op = self.op if op is None else self._norm_op_str(op)
+         xs = self._norm_tensor(tensors)
+         chunk_size = self._norm_chunk_size(chunk_size)
+@@ -125,6 +134,70 @@ class Reducer(nn.Module):
+             case _:
+                 raise AssertionError(f"Unreachable reducer op: {op}")
+ 
++    def forward_compat(
++        self,
++        x: Tensor,
++        weights: Tensor | None = None,
++    ) -> Tensor:
++        """
++        Graph-compatible tensor-only reduction path.
++
++        ``x`` must be shaped ``(N, *data_shape)``. The first dimension is the
++        source/model axis. ``op`` is fixed by ``self.op`` to avoid runtime string
++        branching during ONNX / torch.export style graph capture.
++        """
++        if not isinstance(x, Tensor):
++            raise TypeError(f"Reducer.forward_compat expects Tensor, got {type(x)!r}")
++        if x.ndim < 1:
++            raise ValueError("Reducer.forward_compat expects x shaped (N, *data_shape).")
++        if x.dtype == torch.bool:
++            raise TypeError("Reducer.forward_compat does not support bool tensors.")
++        if x.is_quantized:
++            raise TypeError("Reducer.forward_compat does not support quantized tensors.")
++        if x.is_complex():
++            raise TypeError("Reducer.forward_compat does not support complex tensors.")
++
++        op = self.op
++        if op in self.ORDERED_OPS and weights is not None:
++            raise ValueError(f"{op!r} does not support weights.")
++
++        dtype = self._compat_reduction_dtype(x, weights=weights)
++        with autocast_disabled(x.device):
++            work = x.to(dtype=dtype)
++            ws = self._norm_weight_compat(weights, ref=x, dtype=dtype)
++
++            if op == "sum":
++                if ws is not None:
++                    work = work * self._weight_view(ws, work)
++                return work.sum(dim=0)
++
++            if op == "mean":
++                if ws is None:
++                    return work.mean(dim=0)
++                coeffs = self._mean_coeffs_compat(ws)
++                return (work * self._weight_view(coeffs, work)).sum(dim=0)
++
++            if op == "min":
++                return work.amin(dim=0)
++
++            if op == "max":
++                return work.amax(dim=0)
++
++        raise AssertionError(f"Unreachable reducer op: {op}")
++
++    def _compat_reduction_dtype(
++        self,
++        x: Tensor,
++        weights: Tensor | None,
++    ) -> torch.dtype:
++        if x.dtype == torch.float64 or self._weight_is_float64(weights):
++            return torch.float64
++        if self.master_dtype == torch.float64:
++            return torch.float64
++        return torch.float32
++
++    def _norm_weight_compat(
++        self,
++        weights: Tensor | None,
++        ref: Tensor,
++        dtype: torch.dtype,
++    ) -> Tensor | None:
++        if weights is None:
++            return None
++        if not isinstance(weights, Tensor):
++            raise TypeError("Reducer.forward_compat weights must be Tensor | None.")
++        if weights.requires_grad:
++            raise ValueError("Reducer weights must not require gradients.")
++        if weights.is_complex():
++            raise ValueError("Reducer does not support complex weights.")
++        if weights.ndim != 1:
++            raise ValueError(f"weights must be 1-D. Got shape={tuple(weights.shape)}.")
++        if weights.shape[0] != ref.shape[0]:
++            raise ValueError(
++                "weights length must match source axis. "
++                f"weights.shape[0]={weights.shape[0]}, source_count={ref.shape[0]}"
++            )
++        return weights.to(device=ref.device, dtype=dtype)
++
++    def _mean_coeffs_compat(self, weights: Tensor) -> Tensor:
++        scale_floor = torch.finfo(weights.dtype).tiny
++        scale = weights.abs().amax().clamp_min(scale_floor)
++        scaled = weights / scale
++        denom = scaled.sum()
++        safe_eps = torch.as_tensor(
++            max(self.eps, torch.finfo(weights.dtype).tiny),
++            device=weights.device,
++            dtype=weights.dtype,
++        )
++        sign = torch.where(denom < 0, -torch.ones_like(denom), torch.ones_like(denom))
++        safe_denom = torch.where(denom.abs() < safe_eps, sign * safe_eps, denom)
++        return scaled / safe_denom
++
++    @staticmethod
++    def _weight_view(weights: Tensor, x: Tensor) -> Tensor:
++        return weights.reshape((weights.shape[0],) + (1,) * (x.ndim - 1))
++
+@@ -706,29 +779,32 @@ class Reducer(nn.Module):
+         return (
++            f"op={self.op!r}, "
+             f"strict_shape={self.strict_shape}, "
+             f"strict_dtype={self.strict_dtype}, "
+             f"strict_device={self.strict_device}, "
+             f"eps={self.eps}, "
+             f"master_dtype={self.master_dtype}"
+         )
+ 
+ 
+-class ConvND(nn.Module):
++class LocalConvMixer(nn.Module):
+     """
+-    Channel-last Conv1d/Conv2d/Conv3d adapter for region-local tensors.
++    Shape-preserving local convolution mixer for channel-last regional tensors.
+ 
+     Expected input shape:
+         (B, R, *local_shape, D)
+ 
+-    The layer inspects ``local_shape`` unless ``local_ndim`` is fixed:
+-      - rank 1 -> depthwise-separable Conv1d
+-      - rank 2 -> depthwise-separable Conv2d
+-      - rank 3 -> depthwise-separable Conv3d
++    The module inspects ``local_shape`` unless ``local_ndim`` is fixed:
++      - rank 1 -> depthwise-separable Conv1d mixer
++      - rank 2 -> depthwise-separable Conv2d mixer
++      - rank 3 -> depthwise-separable Conv3d mixer
+       - rank 0 or rank > 3 -> identity fallback when ``local_ndim`` is None
+ 
+-    This is intentionally an adapter over PyTorch's optimized 1D/2D/3D
+-    convolution layers, not a custom arbitrary-rank convolution or pooling
+-    kernel.
++    This module performs local convolution routing and channel-last layout
++    adaptation. It does not perform dtype canonicalization, pooling, reduction,
++    compression, or arbitrary-rank convolution.
+     """
+ 
+     SUPPORTED_LOCAL_DIMS = {1, 2, 3}
++    SUPPORTED_CONV_DTYPES = {
++        torch.float16,
++        torch.bfloat16,
++        torch.float32,
++        torch.float64,
++    }
+@@ -808,7 +884,7 @@ class ConvND(nn.Module):
+     def forward(self, x: Tensor, *args: Any) -> Tensor:
+         _ = args
+         if not isinstance(x, Tensor):
+-            raise TypeError(f"ConvND expects Tensor, got {type(x)!r}")
++            raise TypeError(f"LocalConvMixer expects Tensor, got {type(x)!r}")
+ 
+         if not self.enabled:
+             return x
+@@ -823,9 +899,6 @@ class ConvND(nn.Module):
+                 f"Expected last dim={self.dim}, got shape={tuple(x.shape)}"
+             )
+ 
+-        if not x.is_floating_point():
+-            return x
+-
+         local_ndim = x.ndim - 3
+         if self.local_ndim is not None:
+             if local_ndim != self.local_ndim:
+@@ -838,18 +911,33 @@ class ConvND(nn.Module):
+                 )
+             local_ndim = self.local_ndim
+ 
++        if int(local_ndim) not in self.SUPPORTED_LOCAL_DIMS:
++            return x
++
++        self._check_conv_route_dtype(x)
++
+         match int(local_ndim):
+             case 1:
+                 return self._forward_1d(x)
+             case 2:
+                 return self._forward_2d(x)
+             case 3:
+                 return self._forward_3d(x)
+             case _:
+                 return x
+ 
++    def _check_conv_route_dtype(self, x: Tensor) -> None:
++        if x.is_quantized or x.is_complex() or x.dtype not in self.SUPPORTED_CONV_DTYPES:
++            raise TypeError(
++                "LocalConvMixer requires real floating point input when "
++                f"convolution is applied. Got dtype={x.dtype}."
++            )
++
+diff --git a/enn_torch_dev/nn/__init__.py b/enn_torch_dev/nn/__init__.py
+index 5781991..3333333 100644
+--- a/enn_torch_dev/nn/__init__.py
++++ b/enn_torch_dev/nn/__init__.py
+@@ -5,10 +5,10 @@ from .blocks import (
+     ContextSummary,
+     Compressor,
+ )
+-from .layers import ConvND, Reducer
++from .layers import LocalConvMixer, Reducer
+ 
+ __all__ = [
+-    "ConvND",
++    "LocalConvMixer",
+     "Composer",
+     "ContextSummary",
+     "Reducer",
+
+diff --git a/enn_torch_dev/nn/blocks.py b/enn_torch_dev/nn/blocks.py
+index aeb221e..4444444 100644
+--- a/enn_torch_dev/nn/blocks.py
++++ b/enn_torch_dev/nn/blocks.py
+@@ -1,12 +1,14 @@
+ from __future__ import annotations
+ 
++import math
+ from dataclasses import dataclass
+ from typing import Any
+ 
+ import torch
+ from torch import Tensor, nn
+ 
+-from .layers import ConvND
++from ._compat import autocast_disabled, stable_work_dtype
++from .layers import LocalConvMixer
+ 
+ 
+ class Compressor(nn.Module):
+@@ -16,13 +18,12 @@ class Compressor(nn.Module):
+     Expected input shape:
+         (B, R, *local_shape, D)
+ 
+     Output shape:
+         (B, R, K, D)
+ 
+     The compressor is intentionally split into two stages:
+ 
+-      1. Optional structured local mixing through ``ConvND``.
+-         Conv1d/Conv2d/Conv3d is selected from the rank of
+-         ``local_shape``. Unsupported local ranks fall back to identity.
++      1. Optional local pre-mixing through ``LocalConvMixer``. By default this
++         pre-mixer is linear; nonlinearity is kept in the slot scoring MLP.
+ 
+       2. Shape-agnostic gated pooling.
+@@ -39,18 +40,18 @@ class Compressor(nn.Module):
+         num_slots: int = 4,
+         input_dim: int | None = None,
+         integral_mode: str = "cast",
+-        complex_mode: str | None = None,
++        complex_mode: str | None = "real_imag",
+         output_dtype: torch.dtype | None = None,
+-        use_conv: bool = True,
+-        conv_kernel_size: int = 3,
+-        conv_bias: bool = True,
+-        conv_activation: str = "gelu",
+-        conv_local_ndim: int | None = None,
+-        conv_residual: bool = True,
+-        conv_residual_scale_init: float = 0.0,
++        use_local_mixer: bool = True,
++        local_kernel_size: int = 3,
++        local_mixer_bias: bool = True,
++        local_mixer_activation: str = "identity",
++        local_ndim: int | None = None,
++        local_mixer_residual: bool = True,
++        local_mixer_residual_scale_init: float = 0.0,
+         hidden_dim: int | None = None,
+         score_hidden_dim: int | None = 128,
+         activation: str = "gelu",
+@@ -120,17 +121,17 @@ class Compressor(nn.Module):
+         )
+ 
+         self.input_norm = nn.LayerNorm(self.dim)
+-        self.conv = (
+-            ConvND(
++        self.local_mixer = (
++            LocalConvMixer(
+                 self.dim,
+-                kernel_size=conv_kernel_size,
++                kernel_size=local_kernel_size,
+                 enabled=True,
+-                bias=conv_bias,
+-                activation=conv_activation,
+-                local_ndim=conv_local_ndim,
+-                residual=conv_residual,
+-                residual_scale_init=conv_residual_scale_init,
++                bias=local_mixer_bias,
++                activation=local_mixer_activation,
++                local_ndim=local_ndim,
++                residual=local_mixer_residual,
++                residual_scale_init=local_mixer_residual_scale_init,
+             )
+-            if use_conv
++            if use_local_mixer
+             else nn.Identity()
+         )
+@@ -156,16 +157,20 @@ class Compressor(nn.Module):
+         error_msgs: list[str],
+     ) -> None:
+-        if isinstance(self.conv, nn.Identity):
+-            legacy_conv_prefixes = (
++        if isinstance(self.local_mixer, nn.Identity):
++            legacy_prefixes = (
+                 f"{prefix}conv.conv1.",
+                 f"{prefix}conv.conv2.",
+                 f"{prefix}conv.conv3.",
++                f"{prefix}local_mixer.conv1.",
++                f"{prefix}local_mixer.conv2.",
++                f"{prefix}local_mixer.conv3.",
+             )
+-            legacy_conv_keys = [
++            legacy_keys = [
+                 key
+                 for key in tuple(state_dict.keys())
+                 if key == f"{prefix}conv.residual_scale"
+-                or key.startswith(legacy_conv_prefixes)
++                or key == f"{prefix}local_mixer.residual_scale"
++                or key.startswith(legacy_prefixes)
+             ]
+-            for key in legacy_conv_keys:
++            for key in legacy_keys:
+                 state_dict.pop(key, None)
+@@ -229,7 +234,7 @@ class Compressor(nn.Module):
+         if mask is not None:
+             h = h.masked_fill(~mask.unsqueeze(-1), 0)
+ 
+-        h = self.conv(h)
++        h = self.local_mixer(h)
+         h = self.value_norm(h)
+@@ -267,16 +272,16 @@ class Compressor(nn.Module):
+         if return_weights:
+             return z, weights
+         return z
+ 
+-    def forward_export(self, x: Tensor, local_mask: Tensor) -> Tensor:
++    def forward_compat(self, x: Tensor, local_mask: Tensor) -> Tensor:
+         out = self._forward_impl(
+             x, local_mask=local_mask, return_weights=False, force_dense=True
+         )
+         return out if isinstance(out, Tensor) else out[0]
+ 
+-    def forward_export_nomask(self, x: Tensor) -> Tensor:
++    def forward_compat_nomask(self, x: Tensor) -> Tensor:
+         out = self._forward_impl(
+             x, local_mask=None, return_weights=False, force_dense=True
+         )
+         return out if isinstance(out, Tensor) else out[0]
+@@ -312,17 +317,19 @@ class Compressor(nn.Module):
+     def _pool_dense(self, h_flat: Tensor, mask: Tensor | None
+     ) -> tuple[Tensor, Tensor]:
+         score = self.score(self.score_norm(h_flat))
+-        work_dtype = self._work_dtype(h_flat.dtype)
+-        weights = self._get_weight(score, mask)
+-        z = torch.matmul(
+-            weights.to(dtype=work_dtype).transpose(-1, -2),
+-            h_flat.to(dtype=work_dtype),
+-        )
+-        return z.to(dtype=h_flat.dtype), weights
++        with autocast_disabled(h_flat.device):
++            work_dtype = self._work_dtype(h_flat.dtype)
++            score = score.to(dtype=work_dtype)
++            weights = self._get_weight(score, mask)
++            z = torch.matmul(
++                weights.transpose(-1, -2),
++                h_flat.to(dtype=work_dtype),
++            )
++        return z.to(dtype=h_flat.dtype), weights
+ 
+     def _pool_chunked(self, h_flat: Tensor, mask: Tensor | None) -> Tensor:
+         chunk_size = self.pool_chunk_size
+         if chunk_size is None:
+@@ -333,82 +340,67 @@ class Compressor(nn.Module):
+         K = self.num_slots
+         if L == 0:
+             return h_flat.new_zeros((B, R, K, D))
+ 
+-        score_max: Tensor | None = None
+-        chunks: list[tuple[Tensor, Tensor, Tensor | None]] = []
++        work_dtype = self._work_dtype(h_flat.dtype)
++        with autocast_disabled(h_flat.device):
++            min_value = torch.finfo(work_dtype).min
++            running_max = h_flat.new_full((B, R, K), min_value, dtype=work_dtype)
++            denom = h_flat.new_zeros((B, R, K), dtype=work_dtype)
++            numer = h_flat.new_zeros((B, R, K, D), dtype=work_dtype)
+ 
+         for start in range(0, L, chunk_size):
+             end = min(start + chunk_size, L)
+             h_chunk = h_flat[:, :, start:end, :]
+-            work_dtype = self._work_dtype(h_flat.dtype)
+-            score = self.score(self.score_norm(h_chunk)).to(dtype=work_dtype)
+-            if mask is not None:
+-                mask_chunk_base = mask[:, :, start:end]
+-                score = score.masked_fill(
+-                    ~mask_chunk_base.unsqueeze(-1), torch.finfo(score.dtype).min
+-                )
+-            else:
+-                mask_chunk_base = None
+-            chunks.append((h_chunk, score, mask_chunk_base))
+-            chunk_max = score.amax(dim=2)
+-            score_max = chunk_max if score_max is None else torch.maximum(score_max, chunk_max)
+-
+-        if score_max is None:
+-            raise AssertionError("Compressor requires at least one local element.")
+-
+-        if mask is not None:
+-            valid_region = mask.any(dim=2)
+-            score_max = torch.where(
+-                valid_region.unsqueeze(-1),
+-                score_max,
+-                torch.zeros_like(score_max),
+-            )
+-
+-        work_dtype = self._work_dtype(h_flat.dtype)
+-        numer = h_flat.new_zeros((B, R, K, D), dtype=work_dtype)
+-        denom = h_flat.new_zeros((B, R, K), dtype=work_dtype)
++            score = self.score(self.score_norm(h_chunk))
+ 
+-        for h_chunk, score, mask_chunk_base in chunks:
+-            exp_score = torch.exp(score - score_max.unsqueeze(2))
+-            if mask_chunk_base is not None:
+-                exp_score = exp_score.masked_fill(~mask_chunk_base.unsqueeze(-1), 0.0)
+-
+-            denom = denom + exp_score.sum(dim=2)
+-            numer = numer + torch.matmul(
+-                exp_score.transpose(-1, -2),
+-                h_chunk.to(dtype=work_dtype),
+-            )
++            with autocast_disabled(h_flat.device):
++                score = score.to(dtype=work_dtype)
++                if mask is not None:
++                    mask_chunk = mask[:, :, start:end]
++                    score = score.masked_fill(~mask_chunk.unsqueeze(-1), min_value)
++                else:
++                    mask_chunk = None
++
++                chunk_max = score.amax(dim=2)
++                new_max = torch.maximum(running_max, chunk_max)
++
++                old_scale = torch.exp(running_max - new_max)
++                exp_score = torch.exp(score - new_max.unsqueeze(2))
++                if mask_chunk is not None:
++                    exp_score = exp_score.masked_fill(~mask_chunk.unsqueeze(-1), 0.0)
++
++                denom = denom * old_scale + exp_score.sum(dim=2)
++                numer = (
++                    numer * old_scale.unsqueeze(-1)
++                    + torch.matmul(
++                        exp_score.transpose(-1, -2),
++                        h_chunk.to(dtype=work_dtype),
++                    )
++                )
++                running_max = new_max
+ 
+-        safe_eps = self._safe_eps(denom.dtype)
+-        z = numer / denom.clamp_min(safe_eps).unsqueeze(-1)
++        with autocast_disabled(h_flat.device):
++            safe_eps = self._safe_eps(denom.dtype)
++            z = numer / denom.clamp_min(safe_eps).unsqueeze(-1)
+ 
+-        if mask is not None:
+-            valid_region = mask.any(dim=2).view(B, R, 1, 1)
+-            z = torch.where(valid_region, z, torch.zeros_like(z))
++            if mask is not None:
++                valid_region = mask.any(dim=2).view(B, R, 1, 1)
++                z = torch.where(valid_region, z, torch.zeros_like(z))
+ 
+         return z.to(dtype=h_flat.dtype)
+@@ -420,7 +412,6 @@ class Compressor(nn.Module):
+         self, score: Tensor, mask: Tensor | None
+     ) -> Tensor:
+-        out_dtype = score.dtype
+-        score = score.to(dtype=self._work_dtype(score.dtype))
++        out_dtype = score.dtype
+ 
+         if mask is None:
+             return torch.softmax(score, dim=2).to(dtype=out_dtype)
+@@ -459,8 +450,8 @@ class Compressor(nn.Module):
+ 
+     def _adapt_input(self, x: Tensor) -> Tensor:
+         if x.is_quantized:
+-            raise TypeError("Compressor does not accept quantized tensors directly.")
++            x = x.dequantize()
+         target_dtype = self._module_real_dtype()
+         if x.is_complex():
+             if self.complex_mode == "reject":
+@@ -486,9 +477,7 @@ class Compressor(nn.Module):
+             self._check_input_dim(x)
+             return self.real_input_proj(x.to(dtype=target_dtype))
+         elif x.dtype == torch.bool:
+-            raise TypeError("Compressor does not accept bool tensors as numeric input.")
+-        elif self.integral_mode == "reject":
++            self._check_input_dim(x)
++            return self.real_input_proj(x.to(dtype=target_dtype))
++        elif self.integral_mode == "reject":
+             raise TypeError(
+                 "Compressor received integral input, but integral_mode='reject'."
+             )
+@@ -531,13 +520,7 @@ class Compressor(nn.Module):
+ 
+     @staticmethod
+     def _work_dtype(dtype: torch.dtype) -> torch.dtype:
+-        if dtype == torch.float64:
+-            return torch.float64
+-        if dtype in {torch.float16, torch.bfloat16, torch.float32}:
+-            return torch.float32
+-        raise TypeError(f"Unsupported Compressor core dtype: {dtype}")
++        return stable_work_dtype(dtype)
+@@ -567,7 +550,7 @@ class Compressor(nn.Module):
+     @staticmethod
+     def _norm_complex_mode(mode: str | None) -> tuple[str, str]:
+         if mode is None:
+-            return "reject", "real_imag"
++            return "real_imag", "real_imag"
+@@ -595,20 +578,18 @@ class ContextSummary:
+ class Composer(nn.Module):
+     """
+-    Recompose compressed regional context into a coarse global context.
++    Pack compressed regional context into a dense global context sequence.
+ 
+     Expected input shape:
+         (B, R, K, D)
+@@ -618,15 +599,9 @@ class Composer(nn.Module):
+         ``ContextSummary`` with ``tokens`` shaped ``(B, T, D)``,
+         where ``T = R * K``.
+ 
+-    This block is intentionally placed between ``Compressor`` and the
+-    global attention layer. It owns coarse-context composition metadata and
+-    optional TriAttention-like salience biasing:
+-
+-      - no hard routing by default;
+-      - compressed tokens stay dense;
+-      - soft top-k salience suppresses low-importance keys and highlights
+-        high-importance keys through an attention-logit bias.
++    Composer preserves compressed context slots as dense tokens and may attach
++    an optional key-side attention bias for downstream attention.
+@@ -678,6 +653,10 @@ class Composer(nn.Module):
+         if self.eps <= 0:
+             raise ValueError(f"eps must be positive, got {eps}")
++        if self.salience_bias_scale < 0:
++            raise ValueError(
++                f"salience_bias_scale must be non-negative, got {salience_bias_scale}"
++            )
+@@ -708,15 +687,13 @@ class Composer(nn.Module):
+         if not isinstance(context, Tensor):
+             raise TypeError(
+                 "Composer expects Tensor, got "
+                 f"{type(context)!r}"
+             )
+         if context.ndim != 4:
+             raise ValueError(
+                 "Composer expects shape (B, R, K, D). "
+                 f"Got shape={tuple(context.shape)}."
+             )
++        context = self._adapt_context(context)
+         if context.shape[-1] != self.dim:
+             raise ValueError(
+                 f"Expected last dim={self.dim}, got shape={tuple(context.shape)}"
+             )
+-        if not context.is_floating_point():
+-            raise TypeError(
+-                "Composer requires floating point input. "
+-                f"Got dtype={context.dtype}."
+-            )
+@@ -734,18 +711,25 @@ class Composer(nn.Module):
+         tokens = context.reshape(B, R * K, D)
+         token_mask = mask.reshape(B, R * K) if mask is not None else None
++        if token_mask is not None:
++            tokens = tokens.masked_fill(~token_mask.unsqueeze(-1), 0)
+ 
+         score: Tensor | None = None
+         salience: Tensor | None = None
+         attn_bias: Tensor | None = None
+ 
+         if self.salience_mode != "none":
+             score = self.salience_score(self.input_norm(tokens)).squeeze(-1)
+-            if token_mask is not None:
+-                min_value = torch.finfo(score.dtype).min
+-                score = score.masked_fill(~token_mask, min_value)
+-
+-            salience, attn_bias = self._get_salience_and_bias(
+-                score,
+-                token_mask=token_mask,
+-            )
++            with autocast_disabled(tokens.device):
++                score = score.to(dtype=self._work_dtype(tokens.dtype))
++                if token_mask is not None:
++                    min_value = torch.finfo(score.dtype).min
++                    score = score.masked_fill(~token_mask, min_value)
++
++                salience, attn_bias = self._get_salience_and_bias(
++                    score,
++                    token_mask=token_mask,
++                )
+@@ -766,6 +750,47 @@ class Composer(nn.Module):
+             original_shape=(B, R, K, D),
+         )
+ 
++    def forward_compat(
++        self,
++        context: Tensor,
++        context_mask: Tensor | None = None,
++        region_mask: Tensor | None = None,
++    ) -> tuple[Tensor, Tensor, Tensor]:
++        summary = self.forward(
++            context,
++            context_mask=context_mask,
++            region_mask=region_mask,
++        )
++        tokens = summary.tokens
++        B, T, _ = tokens.shape
++
++        if summary.token_mask is None:
++            token_mask = torch.ones((B, T), device=tokens.device, dtype=torch.bool)
++        else:
++            token_mask = summary.token_mask
++
++        if summary.attn_bias is None:
++            attn_bias = torch.zeros(
++                (B, 1, 1, T),
++                device=tokens.device,
++                dtype=self._work_dtype(tokens.dtype),
++            )
++        else:
++            attn_bias = summary.attn_bias
++
++        return tokens, token_mask, attn_bias
++
++    def _adapt_context(self, context: Tensor) -> Tensor:
++        if context.is_quantized:
++            context = context.dequantize()
++        target_dtype = self._module_real_dtype()
++        if context.is_complex():
++            context = context.abs()
++        return context.to(dtype=target_dtype)
++
++    def _module_real_dtype(self) -> torch.dtype:
++        dtype = self.input_norm.weight.dtype
++        if not torch.empty((), dtype=dtype).is_floating_point():
++            raise TypeError(f"Composer module dtype must be real floating, got {dtype}")
++        return dtype
++
++    @staticmethod
++    def _work_dtype(dtype: torch.dtype) -> torch.dtype:
++        return stable_work_dtype(dtype)
++
+@@ -857,7 +882,7 @@ class Composer(nn.Module):
+                 raise ValueError(
+                     "float salience_topk must be in (0, 1]. "
+                     f"Got {self.salience_topk}"
+                 )
+-            k = int(torch.ceil(torch.tensor(total_tokens * ratio)).item())
++            k = math.ceil(int(total_tokens) * ratio)
+
+diff --git a/enn_torch_dev/debug/nn/test_conv_nd.py b/enn_torch_dev/debug/nn/test_local_conv_mixer.py
+similarity index 38%
+rename from enn_torch_dev/debug/nn/test_conv_nd.py
+rename to enn_torch_dev/debug/nn/test_local_conv_mixer.py
+index a82bf15..5555555 100644
+--- a/enn_torch_dev/debug/nn/test_conv_nd.py
++++ b/enn_torch_dev/debug/nn/test_local_conv_mixer.py
+@@ -3,19 +3,19 @@ from __future__ import annotations
+ import pytest
+ import torch
+ 
+-from enn_torch_dev.nn.layers import ConvND
++from enn_torch_dev.nn.layers import LocalConvMixer
+ 
+ 
+ @pytest.mark.parametrize(
+@@ -15,12 +15,12 @@ from enn_torch_dev.nn.layers import ConvND
+         (2, 3, 2, 5, 6, 4),
+     ],
+ )
+-def test_convnd_preserves_supported_local_shapes(shape):
++def test_local_conv_mixer_preserves_supported_local_shapes(shape):
+     x = torch.randn(*shape)
+-    layer = ConvND(4, residual_scale_init=0.0)
++    layer = LocalConvMixer(4, residual_scale_init=0.0)
+ 
+     y = layer(x)
+@@ -28,41 +28,102 @@ def test_convnd_preserves_supported_local_shapes(shape):
+     assert torch.isfinite(y).all()
+ 
+ 
+-def test_convnd_fixed_local_ndim_rejects_rank_mismatch():
++@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
++def test_local_conv_mixer_accepts_real_floating_dtypes(dtype):
++    x = torch.randn(2, 3, 5, 4, dtype=dtype)
++    layer = LocalConvMixer(4, residual_scale_init=0.0).to(dtype=dtype)
++
++    y = layer(x)
++
++    assert y.shape == x.shape
++    assert y.dtype == dtype
++    assert torch.isfinite(y).all()
++
++
++@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
++@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
++def test_local_conv_mixer_accepts_low_precision_floats_on_cuda(dtype):
++    x = torch.randn(2, 3, 5, 4, device="cuda", dtype=dtype)
++    layer = LocalConvMixer(4, residual_scale_init=0.0).cuda().to(dtype=dtype)
++
++    y = layer(x)
++
++    assert y.shape == x.shape
++    assert y.dtype == dtype
++    assert torch.isfinite(y.float()).all()
++
++
++@pytest.mark.parametrize(
++    "dtype",
++    [
++        torch.bool,
++        torch.int8,
++        torch.int16,
++        torch.int32,
++        torch.int64,
++        torch.uint8,
++        torch.complex64,
++        torch.complex128,
++    ],
++)
++def test_local_conv_mixer_rejects_unsupported_dtype_on_conv_route(dtype):
++    layer = LocalConvMixer(4)
++    x = torch.ones(2, 3, 5, 4, dtype=dtype)
++
++    with pytest.raises(TypeError, match="real floating point"):
++        layer(x)
++
++
++def test_local_conv_mixer_rejects_quantized_tensor_on_conv_route():
++    layer = LocalConvMixer(4)
++    base = torch.randn(2, 3, 5, 4)
++    x = torch.quantize_per_tensor(base, scale=0.1, zero_point=0, dtype=torch.qint8)
++
++    with pytest.raises(TypeError, match="real floating point"):
++        layer(x)
++
++
++@pytest.mark.parametrize("dtype", [torch.bool, torch.int64, torch.complex64])
++def test_local_conv_mixer_identity_fallback_does_not_validate_dtype(dtype):
++    layer = LocalConvMixer(4)
++    rank0 = torch.ones(2, 3, 4, dtype=dtype)
++    rank4 = torch.ones(2, 3, 2, 3, 4, 5, 4, dtype=dtype)
++
++    assert layer(rank0) is rank0
++    assert layer(rank4) is rank4
++
++
++def test_local_conv_mixer_fixed_local_ndim_rejects_rank_mismatch():
+     x = torch.randn(2, 3, 5, 6, 4)
+-    layer = ConvND(4, local_ndim=1)
++    layer = LocalConvMixer(4, local_ndim=1)
+ 
+     with pytest.raises(ValueError, match="fixed local_ndim"):
+         layer(x)
+ 
+ 
+-def test_convnd_rank0_and_rank_gt3_identity_fallback():
+-    layer = ConvND(4)
++def test_local_conv_mixer_rank0_and_rank_gt3_identity_fallback():
++    layer = LocalConvMixer(4)
+     rank0 = torch.randn(2, 3, 4)
+     rank4 = torch.randn(2, 3, 2, 3, 4, 5, 4)
+@@ -70,9 +131,9 @@ def test_convnd_rank0_and_rank_gt3_identity_fallback():
+     assert layer(rank4) is rank4
+ 
+ 
+-def test_convnd_disabled_omits_conv_parameters():
+-    layer = ConvND(4, enabled=False)
++def test_local_conv_mixer_disabled_omits_conv_parameters():
++    layer = LocalConvMixer(4, enabled=False)
+@@ -84,9 +145,9 @@ def test_convnd_disabled_omits_conv_parameters():
+     )
+ 
+ 
+-def test_convnd_disabled_loads_legacy_state_dict_strict():
+-    legacy = ConvND(4, enabled=True)
+-    disabled = ConvND(4, enabled=False)
++def test_local_conv_mixer_disabled_loads_legacy_state_dict_strict():
++    legacy = LocalConvMixer(4, enabled=True)
++    disabled = LocalConvMixer(4, enabled=False)
+@@ -95,8 +156,8 @@ def test_convnd_disabled_loads_legacy_state_dict_strict():
+     disabled.load_state_dict(legacy.state_dict(), strict=True)
+ 
+ 
+-def test_convnd_disabled_rejects_non_legacy_unexpected_key_strict():
+-    disabled = ConvND(4, enabled=False)
++def test_local_conv_mixer_disabled_rejects_non_legacy_unexpected_key_strict():
++    disabled = LocalConvMixer(4, enabled=False)
+     state = disabled.state_dict()
+     state["unexpected.weight"] = torch.randn(1)
+
+diff --git a/enn_torch_dev/debug/nn/test_compressor.py b/enn_torch_dev/debug/nn/test_compressor.py
+index d9dc816..6666666 100644
+--- a/enn_torch_dev/debug/nn/test_compressor.py
++++ b/enn_torch_dev/debug/nn/test_compressor.py
+@@ -10,7 +10,7 @@ def test_compressor_masks_all_invalid_regions_without_nan():
+     mask = torch.ones(2, 3, 7, dtype=torch.bool)
+     mask[0, 1] = False
+ 
+-    module = Compressor(4, num_slots=2, use_conv=False)
++    module = Compressor(4, num_slots=2, use_local_mixer=False)
+@@ -27,8 +27,8 @@ def test_compressor_chunked_pooling_matches_dense_pooling():
+     mask = torch.rand(2, 3, 17) > 0.25
+     mask[0, 2] = False
+ 
+-    dense = Compressor(4, num_slots=3, use_conv=False, pool_chunk_size=None)
+-    chunked = Compressor(4, num_slots=3, use_conv=False, pool_chunk_size=5)
++    dense = Compressor(4, num_slots=3, use_local_mixer=False, pool_chunk_size=None)
++    chunked = Compressor(4, num_slots=3, use_local_mixer=False, pool_chunk_size=5)
+@@ -44,8 +44,8 @@ def test_compressor_chunked_pooling_handles_empty_local_dim():
+ def test_compressor_chunked_pooling_handles_empty_local_dim():
+     x = torch.randn(2, 3, 0, 4)
+ 
+-    dense = Compressor(4, num_slots=2, use_conv=False, pool_chunk_size=None)
+-    chunked = Compressor(4, num_slots=2, use_conv=False, pool_chunk_size=4)
++    dense = Compressor(4, num_slots=2, use_local_mixer=False, pool_chunk_size=None)
++    chunked = Compressor(4, num_slots=2, use_local_mixer=False, pool_chunk_size=4)
+@@ -55,19 +55,19 @@ def test_compressor_chunked_pooling_handles_empty_local_dim():
+     assert torch.allclose(chunked_out, dense_out, atol=1e-6, rtol=1e-6)
+ 
+ 
+-def test_compressor_use_conv_false_omits_conv_parameters():
+-    module = Compressor(4, num_slots=2, use_conv=False)
++def test_compressor_use_local_mixer_false_omits_local_mixer_parameters():
++    module = Compressor(4, num_slots=2, use_local_mixer=False)
+ 
+-    assert isinstance(module.conv, torch.nn.Identity)
+-    assert not any(key.startswith("conv.") for key in module.state_dict())
++    assert isinstance(module.local_mixer, torch.nn.Identity)
++    assert not any(key.startswith("local_mixer.") for key in module.state_dict())
+ 
+ 
+-def test_compressor_use_conv_false_loads_legacy_conv_state_dict_strict():
+-    legacy = Compressor(4, num_slots=2, use_conv=True)
+-    disabled = Compressor(4, num_slots=2, use_conv=False)
++def test_compressor_use_local_mixer_false_loads_legacy_mixer_state_dict_strict():
++    legacy = Compressor(4, num_slots=2, use_local_mixer=True)
++    disabled = Compressor(4, num_slots=2, use_local_mixer=False)
+ 
+     legacy_state = legacy.state_dict()
+-    assert any(key.startswith("conv.") for key in legacy_state)
+-    assert not any(key.startswith("conv.") for key in disabled.state_dict())
++    assert any(key.startswith("local_mixer.") for key in legacy_state)
++    assert not any(key.startswith("local_mixer.") for key in disabled.state_dict())
+@@ -76,9 +76,9 @@ def test_compressor_use_conv_false_loads_legacy_conv_state_dict_strict():
+     disabled.load_state_dict(legacy_state, strict=True)
+ 
+ 
+-def test_compressor_use_conv_false_rejects_non_legacy_unexpected_key_strict():
+-    disabled = Compressor(4, num_slots=2, use_conv=False)
++def test_compressor_use_local_mixer_false_rejects_non_legacy_unexpected_key_strict():
++    disabled = Compressor(4, num_slots=2, use_local_mixer=False)
+     state = disabled.state_dict()
+-    state["conv.extra.weight"] = torch.randn(1)
++    state["local_mixer.extra.weight"] = torch.randn(1)
+@@ -95,7 +95,7 @@ def test_compressor_score_hidden_dim_is_not_silently_clamped():
+     module = Compressor(
+         4,
+         num_slots=2,
+-        use_conv=False,
++        use_local_mixer=False,
+         score_hidden_dim=7,
+@@ -107,7 +107,7 @@ def test_compressor_score_hidden_dim_is_not_silently_clamped():
+ def test_compressor_chunked_pooling_scores_are_not_recomputed_between_passes():
+     x = torch.randn(2, 3, 17, 4)
+-    module = Compressor(4, num_slots=3, use_conv=False, pool_chunk_size=5, dropout=0.5)
++    module = Compressor(4, num_slots=3, use_local_mixer=False, pool_chunk_size=5, dropout=0.5)
+@@ -128,7 +128,7 @@ def test_compressor_chunked_pooling_scores_are_not_recomputed_between_passes():
+-    assert calls == 4
++    assert calls == 4
+ 
+ 
+-def test_compressor_forward_export_has_stable_tensor_return():
++def test_compressor_forward_compat_has_stable_tensor_return():
+@@ -137,10 +137,10 @@ def test_compressor_forward_export_has_stable_tensor_return():
+ 
+-    module = Compressor(4, num_slots=2, use_conv=False, pool_chunk_size=2)
++    module = Compressor(4, num_slots=2, use_local_mixer=False, pool_chunk_size=2)
+ 
+-    masked = module.forward_export(x, mask)
+-    unmasked = module.forward_export_nomask(x)
++    masked = module.forward_compat(x, mask)
++    unmasked = module.forward_compat_nomask(x)
+@@ -156,7 +156,7 @@ def test_compressor_amp_friendly_dtypes_are_finite(dtype):
+     mask[1, 0] = False
+ 
+-    module = Compressor(4, num_slots=2, use_conv=False).to(dtype=dtype)
++    module = Compressor(4, num_slots=2, use_local_mixer=False).to(dtype=dtype)
+@@ -167,7 +167,14 @@ def test_compressor_amp_friendly_dtypes_are_finite(dtype):
+     assert torch.isfinite(out.float()).all()
+ 
+ 
++def test_compressor_accepts_bool_numeric_input():
++    x = torch.randint(0, 2, (2, 3, 5, 4), dtype=torch.bool)
++    module = Compressor(4, num_slots=2, use_local_mixer=False)
++    out = module(x)
++    assert out.is_floating_point()
++    assert out.shape == (2, 3, 2, 4)
++
++
+ def test_compressor_dense_preserves_float64_weights():
+@@ -227,23 +234,10 @@ def test_compressor_accepts_integral_numeric_input():
+-    module = Compressor(4, num_slots=2, use_conv=False)
++    module = Compressor(4, num_slots=2, use_local_mixer=False)
+@@ -237,8 +231,8 @@ def test_compressor_rejects_integral_input_when_configured():
+-    module = Compressor(4, num_slots=2, use_conv=False, integral_mode="reject")
++    module = Compressor(4, num_slots=2, use_local_mixer=False, integral_mode="reject")
+@@ -242,36 +236,19 @@ def test_compressor_rejects_integral_input_when_configured():
+-def test_compressor_default_rejects_complex_but_loads_legacy_default_state_dict():
+-    module = Compressor(4, num_slots=2, use_conv=False)
+-    legacy = Compressor(
+-        4, num_slots=2, use_conv=False, complex_mode="real_imag"
+-    )
++def test_compressor_default_accepts_complex_real_imag_input():
+     x = torch.randn(2, 3, 5, 4, dtype=torch.complex64)
++    module = Compressor(8, input_dim=4, num_slots=2, use_local_mixer=False)
+ 
+-    assert isinstance(module.complex_input_proj, torch.nn.Linear)
+-    assert "complex_input_proj.weight" in module.state_dict()
+-
+-    module.load_state_dict(legacy.state_dict(), strict=True)
+-
+-    with pytest.raises(TypeError, match="complex input"):
+-        module(x)
++    out = module(x)
++    assert out.is_floating_point()
++    assert out.shape == (2, 3, 2, 8)
+@@ -280,7 +257,7 @@ def test_compressor_explicit_reject_omits_complex_projection_when_dims_match():
+     module = Compressor(
+-        4, num_slots=2, use_conv=False, complex_mode="reject"
++        4, num_slots=2, use_local_mixer=False, complex_mode="reject"
+@@ -294,7 +271,7 @@ def test_compressor_explicit_reject_preserves_projection_when_input_dim_differs():
+     legacy = Compressor(
+-        8, input_dim=4, num_slots=2, use_conv=False, complex_mode="reject"
++        8, input_dim=4, num_slots=2, use_local_mixer=False, complex_mode="reject"
+     )
+     module = Compressor(
+-        8, input_dim=4, num_slots=2, use_conv=False, complex_mode="reject"
++        8, input_dim=4, num_slots=2, use_local_mixer=False, complex_mode="reject"
+     )
+@@ -318,7 +295,7 @@ def test_compressor_accepts_complex_real_imag_input():
+         dim=8,
+         input_dim=4,
+         num_slots=2,
+-        use_conv=False,
++        use_local_mixer=False,
+         complex_mode="real_imag",
+@@ -336,7 +313,7 @@ def test_compressor_accepts_complex_abs_input():
+         dim=4,
+         input_dim=4,
+         num_slots=2,
+-        use_conv=False,
++        use_local_mixer=False,
+         complex_mode="abs",
+
+diff --git a/enn_torch_dev/debug/nn/test_reducer.py b/enn_torch_dev/debug/nn/test_reducer.py
+new file mode 100644
+index 0000000..7777777
+--- /dev/null
++++ b/enn_torch_dev/debug/nn/test_reducer.py
+@@ -0,0 +1,83 @@
++from __future__ import annotations
++
++import pytest
++import torch
++
++from enn_torch_dev.nn.layers import Reducer
++
++
++def test_reducer_uses_default_op_when_forward_op_is_none():
++    xs = [torch.ones(2, 3), torch.full((2, 3), 3.0)]
++    reducer = Reducer(op="sum")
++
++    out = reducer(xs)
++
++    assert torch.allclose(out, torch.full((2, 3), 4.0))
++
++
++@pytest.mark.parametrize("op", ["sum", "mean", "min", "max"])
++def test_reducer_forward_compat_matches_stacked_reduction(op):
++    x = torch.randn(4, 2, 3)
++    reducer = Reducer(op=op)
++
++    out = reducer.forward_compat(x)
++
++    expected = {
++        "sum": x.to(torch.float32).sum(dim=0),
++        "mean": x.to(torch.float32).mean(dim=0),
++        "min": x.to(torch.float32).amin(dim=0),
++        "max": x.to(torch.float32).amax(dim=0),
++    }[op]
++    assert torch.allclose(out, expected)
++
++
++def test_reducer_forward_compat_weighted_sum():
++    x = torch.randn(3, 2, 4)
++    w = torch.tensor([0.2, 0.3, 0.5])
++    reducer = Reducer(op="sum")
++
++    out = reducer.forward_compat(x, weights=w)
++
++    expected = (x.to(torch.float32) * w.reshape(3, 1, 1)).sum(dim=0)
++    assert torch.allclose(out, expected)
++
++
++def test_reducer_forward_compat_weighted_mean():
++    x = torch.randn(3, 2, 4)
++    w = torch.tensor([2.0, 3.0, 5.0])
++    reducer = Reducer(op="mean")
++
++    out = reducer.forward_compat(x, weights=w)
++
++    coeff = w / w.sum()
++    expected = (x.to(torch.float32) * coeff.reshape(3, 1, 1)).sum(dim=0)
++    assert torch.allclose(out, expected)
++
++
++@pytest.mark.parametrize("op", ["min", "max"])
++def test_reducer_forward_compat_rejects_weights_for_ordered_ops(op):
++    x = torch.randn(3, 2, 4)
++    reducer = Reducer(op=op)
++
++    with pytest.raises(ValueError, match="does not support weights"):
++        reducer.forward_compat(x, weights=torch.ones(3))
++
++
++@pytest.mark.parametrize(
++    "x",
++    [
++        torch.ones(3, 2, dtype=torch.bool),
++        torch.randn(3, 2, dtype=torch.complex64),
++    ],
++)
++def test_reducer_forward_compat_rejects_unsupported_dtypes(x):
++    reducer = Reducer(op="mean")
++
++    with pytest.raises(TypeError):
++        reducer.forward_compat(x)
++
++
++def test_reducer_forward_compat_preserves_float64_accumulation():
++    x = torch.randn(3, 2, 4, dtype=torch.float64)
++    reducer = Reducer(op="mean")
++
++    out = reducer.forward_compat(x)
++
++    assert out.dtype == torch.float64
++    assert torch.allclose(out, x.mean(dim=0))
+
+diff --git a/enn_torch_dev/debug/nn/test_composer.py b/enn_torch_dev/debug/nn/test_composer.py
+new file mode 100644
+index 0000000..8888888
+--- /dev/null
++++ b/enn_torch_dev/debug/nn/test_composer.py
+@@ -0,0 +1,93 @@
++from __future__ import annotations
++
++import pytest
++import torch
++
++from enn_torch_dev.nn.blocks import Composer, ContextSummary
++
++
++def test_composer_forward_returns_context_summary():
++    x = torch.randn(2, 3, 4, 5)
++    composer = Composer(5)
++
++    summary = composer(x)
++
++    assert isinstance(summary, ContextSummary)
++    assert summary.tokens.shape == (2, 12, 5)
++    assert summary.token_mask is None
++    assert summary.attn_bias is None
++    assert summary.original_shape == (2, 3, 4, 5)
++
++
++def test_composer_masks_tokens_to_zero():
++    x = torch.randn(2, 3, 4, 5)
++    mask = torch.ones(2, 3, 4, dtype=torch.bool)
++    mask[0, 1, 2] = False
++    composer = Composer(5)
++
++    summary = composer(x, context_mask=mask)
++
++    flat_idx = 1 * 4 + 2
++    assert torch.allclose(summary.tokens[0, flat_idx], torch.zeros_like(summary.tokens[0, flat_idx]))
++    assert summary.token_mask is not None
++    assert not summary.token_mask[0, flat_idx]
++
++
++def test_composer_forward_compat_returns_tensors_without_none():
++    x = torch.randn(2, 3, 4, 5)
++    composer = Composer(5)
++
++    tokens, token_mask, attn_bias = composer.forward_compat(x)
++
++    assert tokens.shape == (2, 12, 5)
++    assert token_mask.shape == (2, 12)
++    assert token_mask.dtype == torch.bool
++    assert token_mask.all()
++    assert attn_bias.shape == (2, 1, 1, 12)
++    assert torch.allclose(attn_bias, torch.zeros_like(attn_bias))
++
++
++@pytest.mark.parametrize("mode", ["score", "soft_topk"])
++def test_composer_salience_modes_are_finite(mode):
++    x = torch.randn(2, 3, 4, 5)
++    mask = torch.rand(2, 3, 4) > 0.2
++    composer = Composer(5, salience_mode=mode, salience_topk=3)
++
++    summary = composer(x, context_mask=mask)
++
++    assert summary.score is not None
++    assert summary.salience is not None
++    assert summary.attn_bias is not None
++    assert torch.isfinite(summary.salience).all()
++    assert torch.isfinite(summary.attn_bias[summary.token_mask[:, None, None, :]]).all()
++
++
++def test_composer_rejects_negative_salience_bias_scale():
++    with pytest.raises(ValueError, match="non-negative"):
++        Composer(5, salience_bias_scale=-1.0)
++
++
++@pytest.mark.parametrize("dtype", [torch.int64, torch.bool, torch.complex64])
++def test_composer_accepts_common_input_dtypes(dtype):
++    if dtype == torch.complex64:
++        x = torch.randn(2, 3, 4, 5, dtype=torch.complex64)
++    elif dtype == torch.bool:
++        x = torch.randint(0, 2, (2, 3, 4, 5), dtype=torch.bool)
++    else:
++        x = torch.randint(0, 10, (2, 3, 4, 5), dtype=torch.int64)
++
++    composer = Composer(5)
++    summary = composer(x)
++
++    assert summary.tokens.is_floating_point()
++    assert summary.tokens.dtype == torch.float32
++
++
++def test_composer_restore_masks_invalid_slots():
++    x = torch.randn(2, 3, 4, 5)
++    mask = torch.ones(2, 3, 4, dtype=torch.bool)
++    mask[0, 1, 2] = False
++    composer = Composer(5)
++    summary = composer(x, context_mask=mask)
++
++    restored = composer.restore(summary.tokens, summary)
++
++    assert restored.shape == x.shape
++    assert torch.allclose(restored[0, 1, 2], torch.zeros_like(restored[0, 1, 2]))
