@@ -7,6 +7,8 @@ from collections.abc import Sequence
 import torch
 from torch import Tensor, nn
 
+from ._compat import autocast_disabled
+
 
 class Reducer(nn.Module):
     """
@@ -42,6 +44,7 @@ class Reducer(nn.Module):
         strict_device: bool = True,
         eps: float = 1e-12,
         master_dtype: torch.dtype = torch.float32,
+        op: str = "mean",
     ) -> None:
         super().__init__()
         self.strict_shape = strict_shape
@@ -49,16 +52,17 @@ class Reducer(nn.Module):
         self.strict_device = strict_device
         self.eps = float(eps)
         self.master_dtype = master_dtype
+        self.op = self._norm_op_str(op)
         self._verify_config()
 
     def forward(
         self,
         tensors: Sequence[Tensor],
-        op: str = "mean",
+        op: str | None = None,
         weights: Sequence[float] | Tensor | None = None,
         chunk_size: int | None = None,
     ) -> Tensor:
-        op = self._norm_op_str(op)
+        op = self.op if op is None else self._norm_op_str(op)
         xs = self._norm_tensor(tensors)
         chunk_size = self._norm_chunk_size(chunk_size)
         if chunk_size is not None and chunk_size >= len(xs):
@@ -148,6 +152,96 @@ class Reducer(nn.Module):
 
             case _:
                 raise AssertionError(f"Unreachable reducer op: {op}")
+
+    def forward_compat(
+        self,
+        x: Tensor,
+        weights: Tensor | None = None,
+    ) -> Tensor:
+        if not isinstance(x, Tensor):
+            raise TypeError(f"Reducer.forward_compat expects Tensor, got {type(x)!r}")
+        if x.ndim < 1:
+            raise ValueError("Reducer.forward_compat expects x shaped (N, *data_shape).")
+        if x.dtype == torch.bool:
+            raise TypeError("Reducer.forward_compat does not support bool tensors.")
+        if x.is_quantized:
+            raise TypeError("Reducer.forward_compat does not support quantized tensors.")
+        if x.is_complex():
+            raise TypeError("Reducer.forward_compat does not support complex tensors.")
+
+        op = self.op
+        if op in self.ORDERED_OPS and weights is not None:
+            raise ValueError(f"{op!r} does not support weights.")
+
+        dtype = self._compat_reduction_dtype(x, weights=weights)
+        with autocast_disabled(x.device):
+            work = x.to(dtype=dtype)
+            ws = self._norm_weight_compat(weights, ref=x, dtype=dtype)
+
+            match op:
+                case "sum":
+                    if ws is not None:
+                        work = work * self._weight_view(ws, work)
+                    return work.sum(dim=0)
+                case "mean":
+                    if ws is None:
+                        return work.mean(dim=0)
+                    coeffs = self._mean_coeffs_compat(ws)
+                    return (work * self._weight_view(coeffs, work)).sum(dim=0)
+                case "min":
+                    return work.amin(dim=0)
+                case "max":
+                    return work.amax(dim=0)
+                case _:
+                    raise AssertionError(f"Unreachable reducer op: {op}")
+
+    def _compat_reduction_dtype(self, x: Tensor, weights: Tensor | None) -> torch.dtype:
+        if x.dtype == torch.float64 or self._weight_is_float64(weights):
+            return torch.float64
+        if self.master_dtype == torch.float64:
+            return torch.float64
+        return torch.float32
+
+    def _norm_weight_compat(
+        self,
+        weights: Tensor | None,
+        ref: Tensor,
+        dtype: torch.dtype,
+    ) -> Tensor | None:
+        if weights is None:
+            return None
+        if not isinstance(weights, Tensor):
+            raise TypeError("Reducer.forward_compat weights must be Tensor | None.")
+        if weights.requires_grad:
+            raise ValueError("Reducer weights must not require gradients.")
+        if weights.is_complex():
+            raise ValueError("Reducer does not support complex weights.")
+        if weights.ndim != 1:
+            raise ValueError(f"weights must be 1-D. Got shape={tuple(weights.shape)}.")
+        if weights.shape[0] != ref.shape[0]:
+            raise ValueError(
+                "weights length must match source axis. "
+                f"weights.shape[0]={weights.shape[0]}, source_count={ref.shape[0]}"
+            )
+        return weights.to(device=ref.device, dtype=dtype)
+
+    def _mean_coeffs_compat(self, weights: Tensor) -> Tensor:
+        scale_floor = torch.finfo(weights.dtype).tiny
+        scale = weights.abs().amax().clamp_min(scale_floor)
+        scaled = weights / scale
+        denom = scaled.sum()
+        safe_eps = torch.as_tensor(
+            max(self.eps, torch.finfo(weights.dtype).tiny),
+            device=weights.device,
+            dtype=weights.dtype,
+        )
+        sign = torch.where(denom < 0, -torch.ones_like(denom), torch.ones_like(denom))
+        safe_denom = torch.where(denom.abs() < safe_eps, sign * safe_eps, denom)
+        return scaled / safe_denom
+
+    @staticmethod
+    def _weight_view(weights: Tensor, x: Tensor) -> Tensor:
+        return weights.reshape((weights.shape[0],) + (1,) * (x.ndim - 1))
 
     def _sum_range(
         self,
@@ -703,6 +797,7 @@ class Reducer(nn.Module):
 
     def extra_repr(self) -> str:
         return (
+            f"op={self.op!r}, "
             f"strict_shape={self.strict_shape}, "
             f"strict_dtype={self.strict_dtype}, "
             f"strict_device={self.strict_device}, "
@@ -711,25 +806,31 @@ class Reducer(nn.Module):
         )
 
 
-class ConvND(nn.Module):
+class LocalConvMixer(nn.Module):
     """
-    Channel-last Conv1d/Conv2d/Conv3d adapter for region-local tensors.
+    Shape-preserving local convolution mixer for channel-last regional tensors.
 
     Expected input shape:
         (B, R, *local_shape, D)
 
-    The layer inspects ``local_shape`` unless ``local_ndim`` is fixed:
-      - rank 1 -> depthwise-separable Conv1d
-      - rank 2 -> depthwise-separable Conv2d
-      - rank 3 -> depthwise-separable Conv3d
+    The module inspects ``local_shape`` unless ``local_ndim`` is fixed:
+      - rank 1 -> depthwise-separable Conv1d mixer
+      - rank 2 -> depthwise-separable Conv2d mixer
+      - rank 3 -> depthwise-separable Conv3d mixer
       - rank 0 or rank > 3 -> identity fallback when ``local_ndim`` is None
 
-    This is intentionally an adapter over PyTorch's optimized 1D/2D/3D
-    convolution layers, not a custom arbitrary-rank convolution or pooling
-    kernel.
+    This module handles local convolution routing and channel-last layout
+    adaptation. It does not perform dtype canonicalization, pooling, reduction,
+    compression, or arbitrary-rank convolution.
     """
 
     SUPPORTED_LOCAL_DIMS = {1, 2, 3}
+    SUPPORTED_CONV_DTYPES = {
+        torch.float16,
+        torch.bfloat16,
+        torch.float32,
+        torch.float64,
+    }
 
     def __init__(
         self,
@@ -759,7 +860,7 @@ class ConvND(nn.Module):
             )
         if self.kernel_size % 2 == 0:
             raise ValueError(
-                "ConvND requires an odd kernel_size so the local shape "
+                "LocalConvMixer requires an odd kernel_size so the local shape "
                 f"can be preserved. Got kernel_size={kernel_size}."
             )
 
@@ -815,7 +916,7 @@ class ConvND(nn.Module):
     def forward(self, x: Tensor, *args: Any) -> Tensor:
         _ = args
         if not isinstance(x, Tensor):
-            raise TypeError(f"ConvND expects Tensor, got {type(x)!r}")
+            raise TypeError(f"LocalConvMixer expects Tensor, got {type(x)!r}")
 
         if not self.enabled:
             return x
@@ -828,19 +929,21 @@ class ConvND(nn.Module):
                 f"Expected last dim={self.dim}, got shape={tuple(x.shape)}"
             )
 
-        if not x.is_floating_point():
-            return x
-
         local_ndim = x.ndim - 3
         if self.local_ndim is not None:
             if local_ndim != self.local_ndim:
                 raise ValueError(
-                    "ConvND fixed local_ndim does not match input rank. "
+                    "LocalConvMixer fixed local_ndim does not match input rank. "
                     f"local_ndim={self.local_ndim}, "
                     f"input local rank={local_ndim}, "
                     f"shape={tuple(x.shape)}"
                 )
             local_ndim = self.local_ndim
+
+        if int(local_ndim) not in self.SUPPORTED_LOCAL_DIMS:
+            return x
+
+        self._check_conv_route_dtype(x)
 
         match int(local_ndim):
             case 1:
@@ -851,6 +954,13 @@ class ConvND(nn.Module):
                 return self._forward_3d(x)
             case _:
                 return x
+
+    def _check_conv_route_dtype(self, x: Tensor) -> None:
+        if x.is_quantized or x.is_complex() or x.dtype not in self.SUPPORTED_CONV_DTYPES:
+            raise TypeError(
+                "LocalConvMixer requires real floating point input when "
+                f"convolution is applied. Got dtype={x.dtype}."
+            )
 
     def _forward_1d(self, x: Tensor) -> Tensor:
         B, R, L, D = x.shape

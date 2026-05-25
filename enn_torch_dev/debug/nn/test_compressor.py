@@ -11,7 +11,7 @@ def test_compressor_masks_all_invalid_regions_without_nan():
     mask = torch.ones(2, 3, 7, dtype=torch.bool)
     mask[0, 1] = False
 
-    module = Compressor(4, num_slots=2, use_conv=False)
+    module = Compressor(4, num_slots=2, use_local_mixer=False)
     out, weights = module(x, local_mask=mask, return_weights=True)
 
     assert out.shape == (2, 3, 2, 4)
@@ -27,8 +27,8 @@ def test_compressor_chunked_pooling_matches_dense_pooling():
     mask = torch.rand(2, 3, 17) > 0.25
     mask[0, 2] = False
 
-    dense = Compressor(4, num_slots=3, use_conv=False, pool_chunk_size=None)
-    chunked = Compressor(4, num_slots=3, use_conv=False, pool_chunk_size=5)
+    dense = Compressor(4, num_slots=3, use_local_mixer=False, pool_chunk_size=None)
+    chunked = Compressor(4, num_slots=3, use_local_mixer=False, pool_chunk_size=5)
     chunked.load_state_dict(dense.state_dict())
 
     dense_out = dense(x, local_mask=mask)
@@ -40,8 +40,8 @@ def test_compressor_chunked_pooling_matches_dense_pooling():
 def test_compressor_chunked_pooling_handles_empty_local_dim():
     x = torch.randn(2, 3, 0, 4)
 
-    dense = Compressor(4, num_slots=2, use_conv=False, pool_chunk_size=None)
-    chunked = Compressor(4, num_slots=2, use_conv=False, pool_chunk_size=4)
+    dense = Compressor(4, num_slots=2, use_local_mixer=False, pool_chunk_size=None)
+    chunked = Compressor(4, num_slots=2, use_local_mixer=False, pool_chunk_size=4)
     chunked.load_state_dict(dense.state_dict())
 
     dense_out, weights = dense(x, return_weights=True)
@@ -54,26 +54,26 @@ def test_compressor_chunked_pooling_handles_empty_local_dim():
     assert torch.allclose(chunked_out, dense_out, atol=1e-6, rtol=1e-6)
 
 
-def test_compressor_use_conv_false_omits_conv_parameters():
-    module = Compressor(4, num_slots=2, use_conv=False)
+def test_compressor_use_local_mixer_false_omits_conv_parameters():
+    module = Compressor(4, num_slots=2, use_local_mixer=False)
 
-    assert isinstance(module.conv, torch.nn.Identity)
-    assert not any(key.startswith("conv.") for key in module.state_dict())
+    assert isinstance(module.local_mixer, torch.nn.Identity)
+    assert not any(key.startswith("local_mixer.") for key in module.state_dict())
 
 
-def test_compressor_use_conv_false_loads_legacy_conv_state_dict_strict():
-    legacy = Compressor(4, num_slots=2, use_conv=True)
-    disabled = Compressor(4, num_slots=2, use_conv=False)
+def test_compressor_use_local_mixer_false_loads_legacy_conv_state_dict_strict():
+    legacy = Compressor(4, num_slots=2, use_local_mixer=True)
+    disabled = Compressor(4, num_slots=2, use_local_mixer=False)
 
     legacy_state = legacy.state_dict()
-    assert any(key.startswith("conv.") for key in legacy_state)
-    assert not any(key.startswith("conv.") for key in disabled.state_dict())
+    assert any(key.startswith("local_mixer.") for key in legacy_state)
+    assert not any(key.startswith("local_mixer.") for key in disabled.state_dict())
 
     disabled.load_state_dict(legacy_state, strict=True)
 
 
-def test_compressor_use_conv_false_rejects_non_legacy_unexpected_key_strict():
-    disabled = Compressor(4, num_slots=2, use_conv=False)
+def test_compressor_use_local_mixer_false_rejects_non_legacy_unexpected_key_strict():
+    disabled = Compressor(4, num_slots=2, use_local_mixer=False)
     state = disabled.state_dict()
     state["conv.extra.weight"] = torch.randn(1)
 
@@ -81,11 +81,27 @@ def test_compressor_use_conv_false_rejects_non_legacy_unexpected_key_strict():
         disabled.load_state_dict(state, strict=True)
 
 
+def test_compressor_use_local_mixer_true_loads_legacy_conv_keys_strict():
+    module = Compressor(4, num_slots=2, use_local_mixer=True)
+    legacy_state = {}
+    for key, value in module.state_dict().items():
+        if key.startswith("local_mixer."):
+            legacy_state[f"conv.{key[len('local_mixer.'):]}"] = value.clone()
+        else:
+            legacy_state[key] = value.clone()
+
+    reloaded = Compressor(4, num_slots=2, use_local_mixer=True)
+    reloaded.load_state_dict(legacy_state, strict=True)
+
+    for key, value in module.state_dict().items():
+        assert torch.equal(reloaded.state_dict()[key], value)
+
+
 def test_compressor_score_hidden_dim_is_not_silently_clamped():
     module = Compressor(
         4,
         num_slots=2,
-        use_conv=False,
+        use_local_mixer=False,
         score_hidden_dim=7,
     )
 
@@ -95,7 +111,7 @@ def test_compressor_score_hidden_dim_is_not_silently_clamped():
 
 def test_compressor_chunked_pooling_scores_are_not_recomputed_between_passes():
     x = torch.randn(2, 3, 17, 4)
-    module = Compressor(4, num_slots=3, use_conv=False, pool_chunk_size=5, dropout=0.5)
+    module = Compressor(4, num_slots=3, use_local_mixer=False, pool_chunk_size=5, dropout=0.5)
     module.train()
 
     calls = 0
@@ -115,14 +131,14 @@ def test_compressor_chunked_pooling_scores_are_not_recomputed_between_passes():
     assert calls == 4
 
 
-def test_compressor_forward_export_has_stable_tensor_return():
+def test_compressor_forward_compat_has_stable_tensor_return():
     x = torch.randn(2, 3, 5, 4)
     mask = torch.ones(2, 3, 5, dtype=torch.bool)
 
-    module = Compressor(4, num_slots=2, use_conv=False, pool_chunk_size=2)
+    module = Compressor(4, num_slots=2, use_local_mixer=False, pool_chunk_size=2)
 
-    masked = module.forward_export(x, mask)
-    unmasked = module.forward_export_nomask(x)
+    masked = module.forward_compat(x, mask)
+    unmasked = module.forward_compat_nomask(x)
 
     assert masked.shape == (2, 3, 2, 4)
     assert unmasked.shape == (2, 3, 2, 4)
@@ -134,7 +150,7 @@ def test_compressor_amp_friendly_dtypes_are_finite(dtype):
     mask = torch.rand(2, 3, 11) > 0.2
     mask[1, 0] = False
 
-    module = Compressor(4, num_slots=2, use_conv=False).to(dtype=dtype)
+    module = Compressor(4, num_slots=2, use_local_mixer=False).to(dtype=dtype)
     out = module(x, local_mask=mask)
 
     assert out.dtype == dtype
@@ -143,7 +159,7 @@ def test_compressor_amp_friendly_dtypes_are_finite(dtype):
 
 def test_compressor_dense_preserves_float64_weights():
     x = torch.randn(2, 3, 17, 4, dtype=torch.float64)
-    module = Compressor(4, num_slots=3, use_conv=False).to(dtype=torch.float64)
+    module = Compressor(4, num_slots=3, use_local_mixer=False).to(dtype=torch.float64)
 
     out, weights = module(x, return_weights=True)
 
@@ -159,10 +175,10 @@ def test_compressor_chunked_pooling_matches_dense_float64():
     mask[0, 2] = False
 
     dense = Compressor(
-        4, num_slots=3, use_conv=False, pool_chunk_size=None
+        4, num_slots=3, use_local_mixer=False, pool_chunk_size=None
     ).to(dtype=torch.float64)
     chunked = Compressor(
-        4, num_slots=3, use_conv=False, pool_chunk_size=5
+        4, num_slots=3, use_local_mixer=False, pool_chunk_size=5
     ).to(dtype=torch.float64)
     chunked.load_state_dict(dense.state_dict())
 
@@ -174,7 +190,7 @@ def test_compressor_chunked_pooling_matches_dense_float64():
 
 def test_compressor_accepts_integral_numeric_input():
     x = torch.randint(0, 10, (2, 3, 5, 4), dtype=torch.int64)
-    module = Compressor(4, num_slots=2, use_conv=False)
+    module = Compressor(4, num_slots=2, use_local_mixer=False)
 
     out = module(x)
 
@@ -185,16 +201,16 @@ def test_compressor_accepts_integral_numeric_input():
 
 def test_compressor_rejects_integral_input_when_configured():
     x = torch.randint(0, 10, (2, 3, 5, 4), dtype=torch.int64)
-    module = Compressor(4, num_slots=2, use_conv=False, integral_mode="reject")
+    module = Compressor(4, num_slots=2, use_local_mixer=False, integral_mode="reject")
 
     with pytest.raises(TypeError, match="integral input"):
         module(x)
 
 
 def test_compressor_default_rejects_complex_but_loads_legacy_default_state_dict():
-    module = Compressor(4, num_slots=2, use_conv=False)
+    module = Compressor(4, num_slots=2, use_local_mixer=False)
     legacy = Compressor(
-        4, num_slots=2, use_conv=False, complex_mode="real_imag"
+        4, num_slots=2, use_local_mixer=False, complex_mode="real_imag"
     )
     x = torch.randn(2, 3, 5, 4, dtype=torch.complex64)
 
@@ -209,7 +225,7 @@ def test_compressor_default_rejects_complex_but_loads_legacy_default_state_dict(
 
 def test_compressor_explicit_reject_omits_complex_projection_when_dims_match():
     module = Compressor(
-        4, num_slots=2, use_conv=False, complex_mode="reject"
+        4, num_slots=2, use_local_mixer=False, complex_mode="reject"
     )
     x = torch.randn(2, 3, 5, 4, dtype=torch.complex64)
 
@@ -222,10 +238,10 @@ def test_compressor_explicit_reject_omits_complex_projection_when_dims_match():
 
 def test_compressor_explicit_reject_preserves_projection_when_input_dim_differs():
     legacy = Compressor(
-        8, input_dim=4, num_slots=2, use_conv=False, complex_mode="reject"
+        8, input_dim=4, num_slots=2, use_local_mixer=False, complex_mode="reject"
     )
     module = Compressor(
-        8, input_dim=4, num_slots=2, use_conv=False, complex_mode="reject"
+        8, input_dim=4, num_slots=2, use_local_mixer=False, complex_mode="reject"
     )
 
     assert isinstance(module.real_input_proj, torch.nn.Linear)
@@ -246,7 +262,7 @@ def test_compressor_accepts_complex_real_imag_input():
         dim=8,
         input_dim=4,
         num_slots=2,
-        use_conv=False,
+        use_local_mixer=False,
         complex_mode="real_imag",
     )
 
@@ -263,7 +279,7 @@ def test_compressor_accepts_complex_abs_input():
         dim=4,
         input_dim=4,
         num_slots=2,
-        use_conv=False,
+        use_local_mixer=False,
         complex_mode="abs",
     )
 

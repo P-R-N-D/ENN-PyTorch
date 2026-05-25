@@ -206,3 +206,84 @@ def test_strict_device_false_can_move_to_cpu_first_device():
     assert out.device == first.device
     expected = first + second.to("cpu")
     assert torch.allclose(out, expected)
+
+
+def test_reducer_uses_default_op_when_forward_op_is_none():
+    xs = [torch.ones(2, 3), torch.full((2, 3), 3.0)]
+    reducer = Reducer(op="sum")
+
+    out = reducer(xs)
+
+    assert torch.allclose(out, torch.full((2, 3), 4.0))
+
+
+@pytest.mark.parametrize("op", ["sum", "mean", "min", "max"])
+def test_reducer_forward_compat_matches_stacked_reduction(op):
+    x = torch.randn(4, 2, 3)
+    reducer = Reducer(op=op)
+
+    out = reducer.forward_compat(x)
+
+    expected = {
+        "sum": x.to(torch.float32).sum(dim=0),
+        "mean": x.to(torch.float32).mean(dim=0),
+        "min": x.to(torch.float32).amin(dim=0),
+        "max": x.to(torch.float32).amax(dim=0),
+    }[op]
+    assert torch.allclose(out, expected)
+
+
+def test_reducer_forward_compat_weighted_sum():
+    x = torch.randn(3, 2, 4)
+    w = torch.tensor([0.2, 0.3, 0.5])
+    reducer = Reducer(op="sum")
+
+    out = reducer.forward_compat(x, weights=w)
+
+    expected = (x.to(torch.float32) * w.reshape(3, 1, 1)).sum(dim=0)
+    assert torch.allclose(out, expected)
+
+
+def test_reducer_forward_compat_weighted_mean():
+    x = torch.randn(3, 2, 4)
+    w = torch.tensor([2.0, 3.0, 5.0])
+    reducer = Reducer(op="mean")
+
+    out = reducer.forward_compat(x, weights=w)
+
+    coeff = w / w.sum()
+    expected = (x.to(torch.float32) * coeff.reshape(3, 1, 1)).sum(dim=0)
+    assert torch.allclose(out, expected)
+
+
+@pytest.mark.parametrize("op", ["min", "max"])
+def test_reducer_forward_compat_rejects_weights_for_ordered_ops(op):
+    x = torch.randn(3, 2, 4)
+    reducer = Reducer(op=op)
+
+    with pytest.raises(ValueError, match="does not support weights"):
+        reducer.forward_compat(x, weights=torch.ones(3))
+
+
+@pytest.mark.parametrize(
+    "x",
+    [
+        torch.ones(3, 2, dtype=torch.bool),
+        torch.randn(3, 2, dtype=torch.complex64),
+    ],
+)
+def test_reducer_forward_compat_rejects_unsupported_dtypes(x):
+    reducer = Reducer(op="mean")
+
+    with pytest.raises(TypeError):
+        reducer.forward_compat(x)
+
+
+def test_reducer_forward_compat_preserves_float64_accumulation():
+    x = torch.randn(3, 2, 4, dtype=torch.float64)
+    reducer = Reducer(op="mean")
+
+    out = reducer.forward_compat(x)
+
+    assert out.dtype == torch.float64
+    assert torch.allclose(out, x.mean(dim=0))

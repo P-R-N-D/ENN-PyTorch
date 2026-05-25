@@ -1,12 +1,14 @@
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import Any
 
 import torch
 from torch import Tensor, nn
 
-from .layers import ConvND
+from ._compat import autocast_disabled, stable_work_dtype
+from .layers import LocalConvMixer
 
 
 class Compressor(nn.Module):
@@ -22,7 +24,7 @@ class Compressor(nn.Module):
 
     The compressor is intentionally split into two stages:
 
-      1. Optional structured local mixing through ``ConvND``.
+      1. Optional structured local mixing through ``LocalConvMixer``.
          Conv1d/Conv2d/Conv3d is selected from the rank of
          ``local_shape``. Unsupported local ranks fall back to identity.
 
@@ -43,13 +45,13 @@ class Compressor(nn.Module):
         integral_mode: str = "cast",
         complex_mode: str | None = None,
         output_dtype: torch.dtype | None = None,
-        use_conv: bool = True,
-        conv_kernel_size: int = 3,
-        conv_bias: bool = True,
-        conv_activation: str = "gelu",
-        conv_local_ndim: int | None = None,
-        conv_residual: bool = True,
-        conv_residual_scale_init: float = 0.0,
+        use_local_mixer: bool = True,
+        local_kernel_size: int = 3,
+        local_mixer_bias: bool = True,
+        local_mixer_activation: str = "identity",
+        local_ndim: int | None = None,
+        local_mixer_residual: bool = True,
+        local_mixer_residual_scale_init: float = 0.0,
         hidden_dim: int | None = None,
         score_hidden_dim: int | None = 128,
         activation: str = "gelu",
@@ -118,18 +120,18 @@ class Compressor(nn.Module):
         )
 
         self.input_norm = nn.LayerNorm(self.dim)
-        self.conv = (
-            ConvND(
+        self.local_mixer = (
+            LocalConvMixer(
                 self.dim,
-                kernel_size=conv_kernel_size,
+                kernel_size=local_kernel_size,
                 enabled=True,
-                bias=conv_bias,
-                activation=conv_activation,
-                local_ndim=conv_local_ndim,
-                residual=conv_residual,
-                residual_scale_init=conv_residual_scale_init,
+                bias=local_mixer_bias,
+                activation=local_mixer_activation,
+                local_ndim=local_ndim,
+                residual=local_mixer_residual,
+                residual_scale_init=local_mixer_residual_scale_init,
             )
-            if use_conv
+            if use_local_mixer
             else nn.Identity()
         )
 
@@ -157,16 +159,40 @@ class Compressor(nn.Module):
         unexpected_keys: list[str],
         error_msgs: list[str],
     ) -> None:
-        if isinstance(self.conv, nn.Identity):
+        legacy_to_local_mixer = {
+            f"{prefix}conv.residual_scale": f"{prefix}local_mixer.residual_scale",
+        }
+        for legacy_key, local_key in tuple(legacy_to_local_mixer.items()):
+            if legacy_key in state_dict:
+                if local_key not in state_dict:
+                    state_dict[local_key] = state_dict[legacy_key]
+                state_dict.pop(legacy_key, None)
+        for legacy_prefix, local_prefix in (
+            (f"{prefix}conv.conv1.", f"{prefix}local_mixer.conv1."),
+            (f"{prefix}conv.conv2.", f"{prefix}local_mixer.conv2."),
+            (f"{prefix}conv.conv3.", f"{prefix}local_mixer.conv3."),
+        ):
+            for key in tuple(state_dict.keys()):
+                if key.startswith(legacy_prefix):
+                    remapped = f"{local_prefix}{key[len(legacy_prefix):]}"
+                    if remapped not in state_dict:
+                        state_dict[remapped] = state_dict[key]
+                    state_dict.pop(key, None)
+
+        if isinstance(self.local_mixer, nn.Identity):
             legacy_conv_prefixes = (
                 f"{prefix}conv.conv1.",
                 f"{prefix}conv.conv2.",
                 f"{prefix}conv.conv3.",
+                f"{prefix}local_mixer.conv1.",
+                f"{prefix}local_mixer.conv2.",
+                f"{prefix}local_mixer.conv3.",
             )
             legacy_conv_keys = [
                 key
                 for key in tuple(state_dict.keys())
                 if key == f"{prefix}conv.residual_scale"
+                or key == f"{prefix}local_mixer.residual_scale"
                 or key.startswith(legacy_conv_prefixes)
             ]
             for key in legacy_conv_keys:
@@ -229,7 +255,7 @@ class Compressor(nn.Module):
         if mask is not None:
             h = h.masked_fill(~mask.unsqueeze(-1), 0)
 
-        h = self.conv(h)
+        h = self.local_mixer(h)
         h = self.value_norm(h)
 
         if mask is not None:
@@ -268,13 +294,13 @@ class Compressor(nn.Module):
             return z, weights
         return z
 
-    def forward_export(self, x: Tensor, local_mask: Tensor) -> Tensor:
+    def forward_compat(self, x: Tensor, local_mask: Tensor) -> Tensor:
         out = self._forward_impl(
             x, local_mask=local_mask, return_weights=False, force_dense=True
         )
         return out if isinstance(out, Tensor) else out[0]
 
-    def forward_export_nomask(self, x: Tensor) -> Tensor:
+    def forward_compat_nomask(self, x: Tensor) -> Tensor:
         out = self._forward_impl(
             x, local_mask=None, return_weights=False, force_dense=True
         )
@@ -313,12 +339,14 @@ class Compressor(nn.Module):
         self, h_flat: Tensor, mask: Tensor | None
     ) -> tuple[Tensor, Tensor]:
         score = self.score(self.score_norm(h_flat))
-        work_dtype = self._work_dtype(h_flat.dtype)
-        weights = self._get_weight(score, mask)
-        z = torch.matmul(
-            weights.to(dtype=work_dtype).transpose(-1, -2),
-            h_flat.to(dtype=work_dtype),
-        )
+        with autocast_disabled(h_flat.device):
+            work_dtype = self._work_dtype(h_flat.dtype)
+            score = score.to(dtype=work_dtype)
+            weights = self._get_weight(score, mask)
+            z = torch.matmul(
+                weights.transpose(-1, -2),
+                h_flat.to(dtype=work_dtype),
+            )
         return z.to(dtype=h_flat.dtype), weights
 
     def _pool_chunked(self, h_flat: Tensor, mask: Tensor | None) -> Tensor:
@@ -332,57 +360,49 @@ class Compressor(nn.Module):
         if L == 0:
             return h_flat.new_zeros((B, R, K, D))
 
-        score_max: Tensor | None = None
-        chunks: list[tuple[Tensor, Tensor, Tensor | None]] = []
+        work_dtype = self._work_dtype(h_flat.dtype)
+        with autocast_disabled(h_flat.device):
+            min_value = torch.finfo(work_dtype).min
+            running_max = h_flat.new_full((B, R, K), min_value, dtype=work_dtype)
+            denom = h_flat.new_zeros((B, R, K), dtype=work_dtype)
+            numer = h_flat.new_zeros((B, R, K, D), dtype=work_dtype)
 
         for start in range(0, L, chunk_size):
             end = min(start + chunk_size, L)
             h_chunk = h_flat[:, :, start:end, :]
-            work_dtype = self._work_dtype(h_flat.dtype)
-            score = self.score(self.score_norm(h_chunk)).to(dtype=work_dtype)
-            if mask is not None:
-                mask_chunk_base = mask[:, :, start:end]
-                score = score.masked_fill(
-                    ~mask_chunk_base.unsqueeze(-1), torch.finfo(score.dtype).min
+            score = self.score(self.score_norm(h_chunk))
+            with autocast_disabled(h_flat.device):
+                score = score.to(dtype=work_dtype)
+                if mask is not None:
+                    mask_chunk = mask[:, :, start:end]
+                    score = score.masked_fill(~mask_chunk.unsqueeze(-1), min_value)
+                else:
+                    mask_chunk = None
+
+                chunk_max = score.amax(dim=2)
+                new_max = torch.maximum(running_max, chunk_max)
+                old_scale = torch.exp(running_max - new_max)
+                exp_score = torch.exp(score - new_max.unsqueeze(2))
+                if mask_chunk is not None:
+                    exp_score = exp_score.masked_fill(~mask_chunk.unsqueeze(-1), 0.0)
+
+                denom = denom * old_scale + exp_score.sum(dim=2)
+                numer = (
+                    numer * old_scale.unsqueeze(-1)
+                    + torch.matmul(
+                        exp_score.transpose(-1, -2),
+                        h_chunk.to(dtype=work_dtype),
+                    )
                 )
-            else:
-                mask_chunk_base = None
-            chunks.append((h_chunk, score, mask_chunk_base))
-            chunk_max = score.amax(dim=2)
-            score_max = chunk_max if score_max is None else torch.maximum(score_max, chunk_max)
+                running_max = new_max
 
-        if score_max is None:
-            raise AssertionError("Compressor requires at least one local element.")
+        with autocast_disabled(h_flat.device):
+            safe_eps = self._safe_eps(denom.dtype)
+            z = numer / denom.clamp_min(safe_eps).unsqueeze(-1)
 
-        if mask is not None:
-            valid_region = mask.any(dim=2)
-            score_max = torch.where(
-                valid_region.unsqueeze(-1),
-                score_max,
-                torch.zeros_like(score_max),
-            )
-
-        work_dtype = self._work_dtype(h_flat.dtype)
-        numer = h_flat.new_zeros((B, R, K, D), dtype=work_dtype)
-        denom = h_flat.new_zeros((B, R, K), dtype=work_dtype)
-
-        for h_chunk, score, mask_chunk_base in chunks:
-            exp_score = torch.exp(score - score_max.unsqueeze(2))
-            if mask_chunk_base is not None:
-                exp_score = exp_score.masked_fill(~mask_chunk_base.unsqueeze(-1), 0.0)
-
-            denom = denom + exp_score.sum(dim=2)
-            numer = numer + torch.matmul(
-                exp_score.transpose(-1, -2),
-                h_chunk.to(dtype=work_dtype),
-            )
-
-        safe_eps = self._safe_eps(denom.dtype)
-        z = numer / denom.clamp_min(safe_eps).unsqueeze(-1)
-
-        if mask is not None:
-            valid_region = mask.any(dim=2).view(B, R, 1, 1)
-            z = torch.where(valid_region, z, torch.zeros_like(z))
+            if mask is not None:
+                valid_region = mask.any(dim=2).view(B, R, 1, 1)
+                z = torch.where(valid_region, z, torch.zeros_like(z))
 
         return z.to(dtype=h_flat.dtype)
 
@@ -390,7 +410,6 @@ class Compressor(nn.Module):
         self, score: Tensor, mask: Tensor | None
     ) -> Tensor:
         out_dtype = score.dtype
-        score = score.to(dtype=self._work_dtype(score.dtype))
 
         if mask is None:
             return torch.softmax(score, dim=2).to(dtype=out_dtype)
@@ -416,7 +435,7 @@ class Compressor(nn.Module):
 
     def _adapt_input(self, x: Tensor) -> Tensor:
         if x.is_quantized:
-            raise TypeError("Compressor does not accept quantized tensors directly.")
+            x = x.dequantize()
         target_dtype = self._module_real_dtype()
         if x.is_complex():
             if self.complex_mode == "reject":
@@ -438,7 +457,8 @@ class Compressor(nn.Module):
             self._check_input_dim(x)
             return self.real_input_proj(x.to(dtype=target_dtype))
         elif x.dtype == torch.bool:
-            raise TypeError("Compressor does not accept bool tensors as numeric input.")
+            self._check_input_dim(x)
+            return self.real_input_proj(x.to(dtype=target_dtype))
         elif self.integral_mode == "reject":
             raise TypeError(
                 "Compressor received integral input, but integral_mode='reject'."
@@ -467,11 +487,7 @@ class Compressor(nn.Module):
 
     @staticmethod
     def _work_dtype(dtype: torch.dtype) -> torch.dtype:
-        if dtype == torch.float64:
-            return torch.float64
-        if dtype in {torch.float16, torch.bfloat16, torch.float32}:
-            return torch.float32
-        raise TypeError(f"Unsupported Compressor core dtype: {dtype}")
+        return stable_work_dtype(dtype)
 
     @staticmethod
     def _norm_optional_real_dtype(dtype: torch.dtype | None) -> torch.dtype | None:
@@ -572,7 +588,7 @@ class Composer(nn.Module):
 
     This block is intentionally placed between ``Compressor`` and the
     global attention layer. It owns coarse-context composition metadata and
-    optional TriAttention-like salience biasing:
+    optional salience biasing:
 
       - no hard routing by default;
       - compressed tokens stay dense;
@@ -620,6 +636,10 @@ class Composer(nn.Module):
             )
         if self.eps <= 0:
             raise ValueError(f"eps must be positive, got {eps}")
+        if self.salience_bias_scale < 0:
+            raise ValueError(
+                f"salience_bias_scale must be non-negative, got {salience_bias_scale}"
+            )
 
         hidden = (
             self.dim
@@ -678,6 +698,8 @@ class Composer(nn.Module):
 
         tokens = context.reshape(B, R * K, D)
         token_mask = mask.reshape(B, R * K) if mask is not None else None
+        if token_mask is not None:
+            tokens = tokens.masked_fill(~token_mask.unsqueeze(-1), 0)
 
         score: Tensor | None = None
         salience: Tensor | None = None
@@ -685,14 +707,15 @@ class Composer(nn.Module):
 
         if self.salience_mode != "none":
             score = self.salience_score(self.input_norm(tokens)).squeeze(-1)
-            if token_mask is not None:
-                min_value = torch.finfo(score.dtype).min
-                score = score.masked_fill(~token_mask, min_value)
-
-            salience, attn_bias = self._get_salience_and_bias(
-                score,
-                token_mask=token_mask,
-            )
+            with autocast_disabled(tokens.device):
+                score = score.to(dtype=self._work_dtype(tokens.dtype))
+                if token_mask is not None:
+                    min_value = torch.finfo(score.dtype).min
+                    score = score.masked_fill(~token_mask, min_value)
+                salience, attn_bias = self._get_salience_and_bias(
+                    score,
+                    token_mask=token_mask,
+                )
 
         return ContextSummary(
             tokens=tokens,
@@ -702,6 +725,36 @@ class Composer(nn.Module):
             score=score,
             original_shape=(B, R, K, D),
         )
+
+    def forward_compat(
+        self,
+        context: Tensor,
+        context_mask: Tensor | None = None,
+        region_mask: Tensor | None = None,
+    ) -> tuple[Tensor, Tensor, Tensor]:
+        summary = self.forward(
+            context,
+            context_mask=context_mask,
+            region_mask=region_mask,
+        )
+        tokens = summary.tokens
+        B, T, _ = tokens.shape
+        token_mask = (
+            torch.ones((B, T), device=tokens.device, dtype=torch.bool)
+            if summary.token_mask is None
+            else summary.token_mask
+        )
+        if summary.attn_bias is None:
+            attn_bias = torch.zeros(
+                (B, 1, 1, T), device=tokens.device, dtype=self._work_dtype(tokens.dtype)
+            )
+        else:
+            attn_bias = summary.attn_bias
+        return tokens, token_mask, attn_bias
+
+    @staticmethod
+    def _work_dtype(dtype: torch.dtype) -> torch.dtype:
+        return stable_work_dtype(dtype)
 
     def restore(
         self,
@@ -787,37 +840,39 @@ class Composer(nn.Module):
     ) -> tuple[Tensor, Tensor]:
         _ = args
 
-        if self.salience_mode == "score":
-            salience = torch.sigmoid(score)
-            if token_mask is not None:
-                salience = salience.masked_fill(~token_mask, 0)
-            return salience, self._get_bias_from_salience(
-                salience,
-                token_mask=token_mask,
-            )
-
-        if self.salience_mode == "soft_topk":
-            k = self._resolve_topk(score.shape[-1])
-            if k is None:
+        match self.salience_mode:
+            case "score":
                 salience = torch.sigmoid(score)
-            else:
-                topk_value = torch.topk(score, k=k, dim=-1).values[..., -1:]
-                if self.detach_topk_threshold:
-                    topk_value = topk_value.detach()
-                centered = (score - topk_value) / self.salience_temperature
-                salience = torch.sigmoid(centered)
+                if token_mask is not None:
+                    salience = salience.masked_fill(~token_mask, 0)
+                return salience, self._get_bias_from_salience(
+                    salience,
+                    token_mask=token_mask,
+                )
 
-            if token_mask is not None:
-                salience = salience.masked_fill(~token_mask, 0)
+            case "soft_topk":
+                k = self._resolve_topk(score.shape[-1])
+                if k is None:
+                    salience = torch.sigmoid(score)
+                else:
+                    topk_value = torch.topk(score, k=k, dim=-1).values[..., -1:]
+                    if self.detach_topk_threshold:
+                        topk_value = topk_value.detach()
+                    centered = (score - topk_value) / self.salience_temperature
+                    salience = torch.sigmoid(centered)
 
-            return salience, self._get_bias_from_salience(
-                salience,
-                token_mask=token_mask,
-            )
+                if token_mask is not None:
+                    salience = salience.masked_fill(~token_mask, 0)
 
-        raise AssertionError(
-            f"Unreachable salience mode: {self.salience_mode}"
-        )
+                return salience, self._get_bias_from_salience(
+                    salience,
+                    token_mask=token_mask,
+                )
+
+            case _:
+                raise AssertionError(
+                    f"Unreachable salience mode: {self.salience_mode}"
+                )
 
     def _get_bias_from_salience(
         self,
@@ -854,7 +909,7 @@ class Composer(nn.Module):
                     "float salience_topk must be in (0, 1]. "
                     f"Got {self.salience_topk}"
                 )
-            k = int(torch.ceil(torch.tensor(total_tokens * ratio)).item())
+            k = math.ceil(int(total_tokens) * ratio)
         else:
             raise TypeError(
                 "salience_topk must be int | float | None, got "
@@ -874,7 +929,7 @@ class Composer(nn.Module):
                 return "none"
             case "score" | "sigmoid" | "gate":
                 return "score"
-            case "soft_topk" | "soft-topk" | "topk" | "triattention":
+            case "soft_topk" | "soft-topk" | "topk":
                 return "soft_topk"
             case _:
                 supported = ", ".join(sorted(cls.SUPPORTED_SALIENCE_MODES))
