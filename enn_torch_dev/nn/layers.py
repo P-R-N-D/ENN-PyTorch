@@ -805,20 +805,20 @@ class Reducer(nn.Module):
 
 class LocalConvMixer(nn.Module):
     """
-    Channel-last Conv1d/Conv2d/Conv3d adapter for region-local tensors.
+    Shape-preserving local convolution mixer for channel-last regional tensors.
 
     Expected input shape:
         (B, R, *local_shape, D)
 
-    The layer inspects ``local_shape`` unless ``local_ndim`` is fixed:
-      - rank 1 -> depthwise-separable Conv1d
-      - rank 2 -> depthwise-separable Conv2d
-      - rank 3 -> depthwise-separable Conv3d
+    The module inspects ``local_shape`` unless ``local_ndim`` is fixed:
+      - rank 1 -> depthwise-separable Conv1d mixer
+      - rank 2 -> depthwise-separable Conv2d mixer
+      - rank 3 -> depthwise-separable Conv3d mixer
       - rank 0 or rank > 3 -> identity fallback when ``local_ndim`` is None
 
-    This is intentionally an adapter over PyTorch's optimized 1D/2D/3D
-    convolution layers, not a custom arbitrary-rank convolution or pooling
-    kernel.
+    This module handles local convolution routing and channel-last layout
+    adaptation. It does not perform dtype canonicalization, pooling, reduction,
+    compression, or arbitrary-rank convolution.
     """
 
     SUPPORTED_LOCAL_DIMS = {1, 2, 3}

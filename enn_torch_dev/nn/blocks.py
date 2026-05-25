@@ -360,57 +360,49 @@ class Compressor(nn.Module):
         if L == 0:
             return h_flat.new_zeros((B, R, K, D))
 
-        score_max: Tensor | None = None
-        chunks: list[tuple[Tensor, Tensor, Tensor | None]] = []
+        work_dtype = self._work_dtype(h_flat.dtype)
+        with autocast_disabled(h_flat.device):
+            min_value = torch.finfo(work_dtype).min
+            running_max = h_flat.new_full((B, R, K), min_value, dtype=work_dtype)
+            denom = h_flat.new_zeros((B, R, K), dtype=work_dtype)
+            numer = h_flat.new_zeros((B, R, K, D), dtype=work_dtype)
 
         for start in range(0, L, chunk_size):
             end = min(start + chunk_size, L)
             h_chunk = h_flat[:, :, start:end, :]
-            work_dtype = self._work_dtype(h_flat.dtype)
-            score = self.score(self.score_norm(h_chunk)).to(dtype=work_dtype)
-            if mask is not None:
-                mask_chunk_base = mask[:, :, start:end]
-                score = score.masked_fill(
-                    ~mask_chunk_base.unsqueeze(-1), torch.finfo(score.dtype).min
+            score = self.score(self.score_norm(h_chunk))
+            with autocast_disabled(h_flat.device):
+                score = score.to(dtype=work_dtype)
+                if mask is not None:
+                    mask_chunk = mask[:, :, start:end]
+                    score = score.masked_fill(~mask_chunk.unsqueeze(-1), min_value)
+                else:
+                    mask_chunk = None
+
+                chunk_max = score.amax(dim=2)
+                new_max = torch.maximum(running_max, chunk_max)
+                old_scale = torch.exp(running_max - new_max)
+                exp_score = torch.exp(score - new_max.unsqueeze(2))
+                if mask_chunk is not None:
+                    exp_score = exp_score.masked_fill(~mask_chunk.unsqueeze(-1), 0.0)
+
+                denom = denom * old_scale + exp_score.sum(dim=2)
+                numer = (
+                    numer * old_scale.unsqueeze(-1)
+                    + torch.matmul(
+                        exp_score.transpose(-1, -2),
+                        h_chunk.to(dtype=work_dtype),
+                    )
                 )
-            else:
-                mask_chunk_base = None
-            chunks.append((h_chunk, score, mask_chunk_base))
-            chunk_max = score.amax(dim=2)
-            score_max = chunk_max if score_max is None else torch.maximum(score_max, chunk_max)
+                running_max = new_max
 
-        if score_max is None:
-            raise AssertionError("Compressor requires at least one local element.")
+        with autocast_disabled(h_flat.device):
+            safe_eps = self._safe_eps(denom.dtype)
+            z = numer / denom.clamp_min(safe_eps).unsqueeze(-1)
 
-        if mask is not None:
-            valid_region = mask.any(dim=2)
-            score_max = torch.where(
-                valid_region.unsqueeze(-1),
-                score_max,
-                torch.zeros_like(score_max),
-            )
-
-        work_dtype = self._work_dtype(h_flat.dtype)
-        numer = h_flat.new_zeros((B, R, K, D), dtype=work_dtype)
-        denom = h_flat.new_zeros((B, R, K), dtype=work_dtype)
-
-        for h_chunk, score, mask_chunk_base in chunks:
-            exp_score = torch.exp(score - score_max.unsqueeze(2))
-            if mask_chunk_base is not None:
-                exp_score = exp_score.masked_fill(~mask_chunk_base.unsqueeze(-1), 0.0)
-
-            denom = denom + exp_score.sum(dim=2)
-            numer = numer + torch.matmul(
-                exp_score.transpose(-1, -2),
-                h_chunk.to(dtype=work_dtype),
-            )
-
-        safe_eps = self._safe_eps(denom.dtype)
-        z = numer / denom.clamp_min(safe_eps).unsqueeze(-1)
-
-        if mask is not None:
-            valid_region = mask.any(dim=2).view(B, R, 1, 1)
-            z = torch.where(valid_region, z, torch.zeros_like(z))
+            if mask is not None:
+                valid_region = mask.any(dim=2).view(B, R, 1, 1)
+                z = torch.where(valid_region, z, torch.zeros_like(z))
 
         return z.to(dtype=h_flat.dtype)
 
