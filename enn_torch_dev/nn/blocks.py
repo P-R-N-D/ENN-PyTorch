@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import Any
 
 import torch
 from torch import Tensor, nn
 
+from ._compat import autocast_disabled, stable_work_dtype
 from .layers import LocalConvMixer
 
 
@@ -161,8 +163,10 @@ class Compressor(nn.Module):
             f"{prefix}conv.residual_scale": f"{prefix}local_mixer.residual_scale",
         }
         for legacy_key, local_key in tuple(legacy_to_local_mixer.items()):
-            if legacy_key in state_dict and local_key not in state_dict:
-                state_dict[local_key] = state_dict.pop(legacy_key)
+            if legacy_key in state_dict:
+                if local_key not in state_dict:
+                    state_dict[local_key] = state_dict[legacy_key]
+                state_dict.pop(legacy_key, None)
         for legacy_prefix, local_prefix in (
             (f"{prefix}conv.conv1.", f"{prefix}local_mixer.conv1."),
             (f"{prefix}conv.conv2.", f"{prefix}local_mixer.conv2."),
@@ -172,7 +176,8 @@ class Compressor(nn.Module):
                 if key.startswith(legacy_prefix):
                     remapped = f"{local_prefix}{key[len(legacy_prefix):]}"
                     if remapped not in state_dict:
-                        state_dict[remapped] = state_dict.pop(key)
+                        state_dict[remapped] = state_dict[key]
+                    state_dict.pop(key, None)
 
         if isinstance(self.local_mixer, nn.Identity):
             legacy_conv_prefixes = (
@@ -334,12 +339,14 @@ class Compressor(nn.Module):
         self, h_flat: Tensor, mask: Tensor | None
     ) -> tuple[Tensor, Tensor]:
         score = self.score(self.score_norm(h_flat))
-        work_dtype = self._work_dtype(h_flat.dtype)
-        weights = self._get_weight(score, mask)
-        z = torch.matmul(
-            weights.to(dtype=work_dtype).transpose(-1, -2),
-            h_flat.to(dtype=work_dtype),
-        )
+        with autocast_disabled(h_flat.device):
+            work_dtype = self._work_dtype(h_flat.dtype)
+            score = score.to(dtype=work_dtype)
+            weights = self._get_weight(score, mask)
+            z = torch.matmul(
+                weights.transpose(-1, -2),
+                h_flat.to(dtype=work_dtype),
+            )
         return z.to(dtype=h_flat.dtype), weights
 
     def _pool_chunked(self, h_flat: Tensor, mask: Tensor | None) -> Tensor:
@@ -411,7 +418,6 @@ class Compressor(nn.Module):
         self, score: Tensor, mask: Tensor | None
     ) -> Tensor:
         out_dtype = score.dtype
-        score = score.to(dtype=self._work_dtype(score.dtype))
 
         if mask is None:
             return torch.softmax(score, dim=2).to(dtype=out_dtype)
@@ -437,7 +443,7 @@ class Compressor(nn.Module):
 
     def _adapt_input(self, x: Tensor) -> Tensor:
         if x.is_quantized:
-            raise TypeError("Compressor does not accept quantized tensors directly.")
+            x = x.dequantize()
         target_dtype = self._module_real_dtype()
         if x.is_complex():
             if self.complex_mode == "reject":
@@ -459,7 +465,8 @@ class Compressor(nn.Module):
             self._check_input_dim(x)
             return self.real_input_proj(x.to(dtype=target_dtype))
         elif x.dtype == torch.bool:
-            raise TypeError("Compressor does not accept bool tensors as numeric input.")
+            self._check_input_dim(x)
+            return self.real_input_proj(x.to(dtype=target_dtype))
         elif self.integral_mode == "reject":
             raise TypeError(
                 "Compressor received integral input, but integral_mode='reject'."
@@ -488,11 +495,7 @@ class Compressor(nn.Module):
 
     @staticmethod
     def _work_dtype(dtype: torch.dtype) -> torch.dtype:
-        if dtype == torch.float64:
-            return torch.float64
-        if dtype in {torch.float16, torch.bfloat16, torch.float32}:
-            return torch.float32
-        raise TypeError(f"Unsupported Compressor core dtype: {dtype}")
+        return stable_work_dtype(dtype)
 
     @staticmethod
     def _norm_optional_real_dtype(dtype: torch.dtype | None) -> torch.dtype | None:
@@ -708,14 +711,15 @@ class Composer(nn.Module):
 
         if self.salience_mode != "none":
             score = self.salience_score(self.input_norm(tokens)).squeeze(-1)
-            if token_mask is not None:
-                min_value = torch.finfo(score.dtype).min
-                score = score.masked_fill(~token_mask, min_value)
-
-            salience, attn_bias = self._get_salience_and_bias(
-                score,
-                token_mask=token_mask,
-            )
+            with autocast_disabled(tokens.device):
+                score = score.to(dtype=self._work_dtype(tokens.dtype))
+                if token_mask is not None:
+                    min_value = torch.finfo(score.dtype).min
+                    score = score.masked_fill(~token_mask, min_value)
+                salience, attn_bias = self._get_salience_and_bias(
+                    score,
+                    token_mask=token_mask,
+                )
 
         return ContextSummary(
             tokens=tokens,
@@ -746,11 +750,15 @@ class Composer(nn.Module):
         )
         if summary.attn_bias is None:
             attn_bias = torch.zeros(
-                (B, 1, 1, T), device=tokens.device, dtype=tokens.dtype
+                (B, 1, 1, T), device=tokens.device, dtype=self._work_dtype(tokens.dtype)
             )
         else:
             attn_bias = summary.attn_bias
         return tokens, token_mask, attn_bias
+
+    @staticmethod
+    def _work_dtype(dtype: torch.dtype) -> torch.dtype:
+        return stable_work_dtype(dtype)
 
     def restore(
         self,
@@ -903,7 +911,7 @@ class Composer(nn.Module):
                     "float salience_topk must be in (0, 1]. "
                     f"Got {self.salience_topk}"
                 )
-            k = int(torch.ceil(torch.tensor(total_tokens * ratio)).item())
+            k = math.ceil(int(total_tokens) * ratio)
         else:
             raise TypeError(
                 "salience_topk must be int | float | None, got "
