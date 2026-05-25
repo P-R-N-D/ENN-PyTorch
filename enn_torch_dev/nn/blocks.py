@@ -157,6 +157,23 @@ class Compressor(nn.Module):
         unexpected_keys: list[str],
         error_msgs: list[str],
     ) -> None:
+        legacy_to_local_mixer = {
+            f"{prefix}conv.residual_scale": f"{prefix}local_mixer.residual_scale",
+        }
+        for legacy_key, local_key in tuple(legacy_to_local_mixer.items()):
+            if legacy_key in state_dict and local_key not in state_dict:
+                state_dict[local_key] = state_dict.pop(legacy_key)
+        for legacy_prefix, local_prefix in (
+            (f"{prefix}conv.conv1.", f"{prefix}local_mixer.conv1."),
+            (f"{prefix}conv.conv2.", f"{prefix}local_mixer.conv2."),
+            (f"{prefix}conv.conv3.", f"{prefix}local_mixer.conv3."),
+        ):
+            for key in tuple(state_dict.keys()):
+                if key.startswith(legacy_prefix):
+                    remapped = f"{local_prefix}{key[len(legacy_prefix):]}"
+                    if remapped not in state_dict:
+                        state_dict[remapped] = state_dict.pop(key)
+
         if isinstance(self.local_mixer, nn.Identity):
             legacy_conv_prefixes = (
                 f"{prefix}conv.conv1.",

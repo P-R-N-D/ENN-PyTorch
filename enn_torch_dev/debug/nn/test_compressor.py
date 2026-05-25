@@ -81,6 +81,22 @@ def test_compressor_use_local_mixer_false_rejects_non_legacy_unexpected_key_stri
         disabled.load_state_dict(state, strict=True)
 
 
+def test_compressor_use_local_mixer_true_loads_legacy_conv_keys_strict():
+    module = Compressor(4, num_slots=2, use_local_mixer=True)
+    legacy_state = {}
+    for key, value in module.state_dict().items():
+        if key.startswith("local_mixer."):
+            legacy_state[f"conv.{key[len('local_mixer.'):]}"] = value.clone()
+        else:
+            legacy_state[key] = value.clone()
+
+    reloaded = Compressor(4, num_slots=2, use_local_mixer=True)
+    reloaded.load_state_dict(legacy_state, strict=True)
+
+    for key, value in module.state_dict().items():
+        assert torch.equal(reloaded.state_dict()[key], value)
+
+
 def test_compressor_score_hidden_dim_is_not_silently_clamped():
     module = Compressor(
         4,
