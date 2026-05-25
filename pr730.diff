@@ -1,0 +1,477 @@
+diff --git a/enn_torch_dev/nn/blocks.py b/enn_torch_dev/nn/blocks.py
+index 485fdec..0000000 100644
+--- a/enn_torch_dev/nn/blocks.py
++++ b/enn_torch_dev/nn/blocks.py
+@@ -589,8 +589,8 @@ class Composer(nn.Module):
+ 
+       - no hard routing by default;
+       - compressed tokens stay dense;
+-      - soft top-k salience suppresses low-importance keys and highlights
+-        high-importance keys through an attention-logit bias.
++      - soft top-k salience preserves high-salience keys near baseline
++        and suppresses low-salience keys through an attention-logit bias.
+ 
+     ``context_mask`` is optional and should have shape ``(B, R, K)`` with
+     True for valid compressed context slots. ``region_mask`` can be provided
+@@ -636,27 +636,52 @@ class Composer(nn.Module):
+         if self.dim <= 0:
+             raise ValueError(f"dim must be positive, got {dim}")
+-        if self.salience_temperature <= 0:
+-            raise ValueError(
+-                "salience_temperature must be positive, got "
+-                f"{salience_temperature}"
+-            )
+         if self.eps <= 0:
+             raise ValueError(f"eps must be positive, got {eps}")
+-        if self.salience_bias_scale < 0:
++
++        self._validate_salience_args(
++            salience_topk=salience_topk,
++            salience_hidden_dim=salience_hidden_dim,
++            salience_temperature=salience_temperature,
++            salience_bias_scale=salience_bias_scale,
++            detach_topk_threshold=detach_topk_threshold,
++            activation=activation,
++            dropout=dropout,
++        )
++
++        if (
++            self.salience_mode == "soft_topk"
++            and self.salience_temperature <= 0
++        ):
+             raise ValueError(
+-                f"salience_bias_scale must be non-negative, got {salience_bias_scale}"
++                "salience_temperature must be positive, got "
++                f"{salience_temperature}"
+             )
+ 
+-        hidden = (
+-            self.dim
+-            if salience_hidden_dim is None
+-            else int(salience_hidden_dim)
+-        )
+-        if hidden <= 0:
++        if self.salience_mode != "none" and self.salience_bias_scale < 0:
+             raise ValueError(
+-                "salience_hidden_dim must be positive, got "
+-                f"{salience_hidden_dim}"
++                "salience_bias_scale must be non-negative, got "
++                f"{salience_bias_scale}"
+             )
+ 
+-        self.input_norm = nn.LayerNorm(self.dim)
+-        self.salience_score = nn.Sequential(
+-            nn.Linear(self.dim, hidden),
+-            self._get_activation(activation),
+-            nn.Dropout(float(dropout)),
+-            nn.Linear(hidden, 1),
+-        )
++        self.input_norm: nn.LayerNorm | None = None
++        self.salience_score: nn.Sequential | None = None
++
++        if self.salience_mode != "none":
++            hidden = (
++                self.dim
++                if salience_hidden_dim is None
++                else int(salience_hidden_dim)
++            )
++            if hidden <= 0:
++                raise ValueError(
++                    "salience_hidden_dim must be positive, got "
++                    f"{salience_hidden_dim}"
++                )
++
++            self.input_norm = nn.LayerNorm(self.dim)
++            self.salience_score = nn.Sequential(
++                nn.Linear(self.dim, hidden),
++                self._get_activation(activation),
++                nn.Dropout(float(dropout)),
++                nn.Linear(hidden, 1),
++            )
+ 
+     def forward(
+         self,
+@@ -703,7 +728,14 @@ class Composer(nn.Module):
+         attn_bias: Tensor | None = None
+ 
+         if self.salience_mode != "none":
++            if self.input_norm is None or self.salience_score is None:
++                raise RuntimeError(
++                    "Composer salience modules are not initialized for "
++                    f"salience_mode={self.salience_mode!r}."
++                )
++
+             score = self.salience_score(self.input_norm(tokens)).squeeze(-1)
++
+             with autocast_disabled(tokens.device):
+                 score = score.to(dtype=self._work_dtype(tokens.dtype))
+                 if token_mask is not None:
+@@ -761,7 +793,9 @@ class Composer(nn.Module):
+ 
+         restored = tokens.reshape(B, R, K, D)
+         if composition.token_mask is not None:
+-            mask = composition.token_mask.reshape(B, R, K, 1)
++            mask = composition.token_mask.to(
++                device=tokens.device, dtype=torch.bool
++            ).reshape(B, R, K, 1)
+             restored = restored.masked_fill(~mask, 0)
+         return restored
+ 
+@@ -822,20 +856,48 @@ class Composer(nn.Module):
+                 )
+ 
+             case "soft_topk":
+-                k = self._resolve_topk(score.shape[-1])
+-                if k is None:
++                if score.shape[-1] == 0:
++                    salience = score.new_zeros(score.shape)
++                elif self.salience_topk is None:
+                     salience = torch.sigmoid(score)
++                elif token_mask is None:
++                    k = self._resolve_topk(score.shape[-1])
++                    if k is None:
++                        salience = torch.sigmoid(score)
++                    else:
++                        topk_value = torch.topk(
++                            score, k=k, dim=-1
++                        ).values[..., -1:]
++                        if self.detach_topk_threshold:
++                            topk_value = topk_value.detach()
++                        centered = (
++                            score - topk_value
++                        ) / self.salience_temperature
++                        salience = torch.sigmoid(centered)
+                 else:
+-                    topk_value = torch.topk(score, k=k, dim=-1).values[..., -1:]
++                    valid_counts = token_mask.sum(dim=-1)
++                    k_per_row = self._resolve_topk_per_row(valid_counts)
++                    if k_per_row is None:
++                        salience = torch.sigmoid(score)
++                    else:
++                        sorted_score = torch.sort(
++                            score, dim=-1, descending=True
++                        ).values
++                        safe_k = k_per_row.clamp_min(1)
++                        topk_value = sorted_score.gather(
++                            dim=-1,
++                            index=(safe_k - 1).unsqueeze(-1),
++                        )
++                        has_valid = k_per_row > 0
++
++                        if self.detach_topk_threshold:
++                            topk_value = topk_value.detach()
++
++                        centered = (
++                            score - topk_value
++                        ) / self.salience_temperature
++                        salience = torch.sigmoid(centered)
++                        salience = torch.where(
++                            has_valid.unsqueeze(-1),
++                            salience,
++                            torch.zeros_like(salience),
++                        )
+-                    if self.detach_topk_threshold:
+-                        topk_value = topk_value.detach()
+-                    centered = (score - topk_value) / self.salience_temperature
+-                    salience = torch.sigmoid(centered)
+ 
+                 if token_mask is not None:
+                     salience = salience.masked_fill(~token_mask, 0)
+@@ -864,6 +926,65 @@ class Composer(nn.Module):
+     def _work_dtype(dtype: torch.dtype) -> torch.dtype:
+         return stable_work_dtype(dtype)
+ 
++    def _validate_salience_args(
++        self,
++        *,
++        salience_topk: int | float | None,
++        salience_hidden_dim: int | None,
++        salience_temperature: float,
++        salience_bias_scale: float,
++        detach_topk_threshold: bool,
++        activation: str,
++        dropout: float,
++    ) -> None:
++        if self.salience_mode == "none":
++            self._reject_unused_arg(
++                "salience_topk", salience_topk, None, mode=self.salience_mode
++            )
++            self._reject_unused_arg(
++                "salience_hidden_dim",
++                salience_hidden_dim,
++                None,
++                mode=self.salience_mode,
++            )
++            self._reject_unused_arg(
++                "salience_temperature",
++                salience_temperature,
++                1.0,
++                mode=self.salience_mode,
++            )
++            self._reject_unused_arg(
++                "salience_bias_scale",
++                salience_bias_scale,
++                1.0,
++                mode=self.salience_mode,
++            )
++            self._reject_unused_arg(
++                "detach_topk_threshold",
++                detach_topk_threshold,
++                True,
++                mode=self.salience_mode,
++            )
++            self._reject_unused_arg(
++                "activation", activation, "gelu", mode=self.salience_mode
++            )
++            self._reject_unused_arg(
++                "dropout", dropout, 0.0, mode=self.salience_mode
++            )
++        elif self.salience_mode == "score":
++            self._reject_unused_arg(
++                "salience_topk", salience_topk, None, mode=self.salience_mode
++            )
++            self._reject_unused_arg(
++                "salience_temperature",
++                salience_temperature,
++                1.0,
++                mode=self.salience_mode,
++            )
++            self._reject_unused_arg(
++                "detach_topk_threshold",
++                detach_topk_threshold,
++                True,
++                mode=self.salience_mode,
++            )
++
++    @staticmethod
++    def _reject_unused_arg(
++        name: str, value: Any, default: Any, *, mode: str
++    ) -> None:
++        if isinstance(value, str) and isinstance(default, str):
++            is_default = value.lower().strip() == default.lower().strip()
++        else:
++            is_default = value == default
++
++        if not is_default:
++            raise ValueError(
++                f"{name} is not used when salience_mode={mode!r}."
++            )
++
+     def restore(
+         self,
+         tokens: Tensor,
+@@ -906,6 +1027,9 @@ class Composer(nn.Module):
+ 
+     def _resolve_topk(self, total_tokens: int) -> int | None:
+         if self.salience_topk is None:
+             return None
++        if int(total_tokens) <= 0:
++            return None
+ 
+         if isinstance(self.salience_topk, bool):
+             raise TypeError(
+@@ -937,6 +1061,37 @@ class Composer(nn.Module):
+ 
+         return min(k, int(total_tokens))
+ 
++    def _resolve_topk_per_row(self, valid_counts: Tensor) -> Tensor | None:
++        if self.salience_topk is None:
++            return None
++
++        if isinstance(self.salience_topk, bool):
++            raise TypeError(
++                "salience_topk must be int | float | None, not bool"
++            )
++
++        if isinstance(self.salience_topk, int):
++            k_value = int(self.salience_topk)
++            if k_value <= 0:
++                raise ValueError(
++                    f"salience_topk must be positive, got {k_value}"
++                )
++            k = torch.full_like(valid_counts, k_value)
++        elif isinstance(self.salience_topk, float):
++            ratio = float(self.salience_topk)
++            if not (0.0 < ratio <= 1.0):
++                raise ValueError(
++                    "float salience_topk must be in (0, 1]. "
++                    f"Got {self.salience_topk}"
++                )
++            k = torch.ceil(
++                valid_counts.to(dtype=torch.float32) * ratio
++            ).to(dtype=valid_counts.dtype)
++        else:
++            raise TypeError(
++                "salience_topk must be int | float | None, got "
++                f"{type(self.salience_topk)!r}"
++            )
++
++        return torch.minimum(k, valid_counts)
++
+     @classmethod
+     def _norm_salience_str(cls, mode: str) -> str:
+         normalized = str(mode).lower().strip()
+diff --git a/enn_torch_dev/debug/nn/test_composer.py b/enn_torch_dev/debug/nn/test_composer.py
+index ee85db2..0000000 100644
+--- a/enn_torch_dev/debug/nn/test_composer.py
++++ b/enn_torch_dev/debug/nn/test_composer.py
+@@ -5,6 +5,27 @@ import torch
+ 
+ from enn_torch_dev.nn.blocks import Composer
+ 
+ 
++class _FirstFeatureScore(torch.nn.Module):
++    def forward(self, x: torch.Tensor) -> torch.Tensor:
++        return x[..., :1]
++
++
++def _soft_topk_first_feature_composer(
++    *,
++    salience_topk: int | float | None,
++    temperature: float = 1.0,
++) -> Composer:
++    composer = Composer(
++        2,
++        salience_mode="soft_topk",
++        salience_topk=salience_topk,
++        salience_temperature=temperature,
++    )
++    composer.input_norm = torch.nn.Identity()
++    composer.salience_score = _FirstFeatureScore()
++    return composer
++
++
+ def test_composer_forward_compat_returns_fixed_tuple_shapes():
+     x = torch.randn(2, 3, 4, 5)
+     composer = Composer(5, salience_mode="none")
+@@ -33,7 +54,8 @@ def test_composer_salience_modes_are_finite(mode):
+ def test_composer_salience_modes_are_finite(mode):
+     x = torch.randn(2, 3, 4, 5)
+     mask = torch.rand(2, 3, 4) > 0.2
+-    composer = Composer(5, salience_mode=mode, salience_topk=3)
++    kwargs = {"salience_topk": 3} if mode == "soft_topk" else {}
++    composer = Composer(5, salience_mode=mode, **kwargs)
+ 
+     summary = composer(x, context_mask=mask)
+ 
+@@ -46,5 +68,119 @@ def test_composer_salience_modes_are_finite(mode):
+ 
+ 
+ def test_composer_rejects_negative_salience_bias_scale():
+     with pytest.raises(ValueError, match="non-negative"):
+-        Composer(5, salience_bias_scale=-1.0)
++        Composer(5, salience_mode="score", salience_bias_scale=-1.0)
++
++
++def test_composer_none_mode_has_no_salience_parameters():
++    composer = Composer(5, salience_mode="none")
++
++    keys = set(composer.state_dict())
++
++    assert not any(
++        key.startswith(("input_norm.", "salience_score.")) for key in keys
++    )
++
++
++def test_composer_rejects_unused_salience_args_in_none_mode():
++    with pytest.raises(ValueError, match="salience_topk"):
++        Composer(5, salience_mode="none", salience_topk=3)
++
++
++def test_composer_rejects_unused_topk_in_score_mode():
++    with pytest.raises(ValueError, match="salience_topk"):
++        Composer(5, salience_mode="score", salience_topk=3)
++
++
++def test_composer_rejects_unused_temperature_in_score_mode():
++    with pytest.raises(ValueError, match="salience_temperature"):
++        Composer(5, salience_mode="score", salience_temperature=0.5)
++
++
++def test_composer_soft_topk_uses_valid_token_count_for_integer_topk():
++    x = torch.tensor(
++        [[[[4.0, 0.0], [3.0, 0.0], [2.0, 0.0], [1.0, 0.0]]]]
++    )
++    mask = torch.tensor([[[True, True, False, False]]])
++    composer = _soft_topk_first_feature_composer(salience_topk=3)
++
++    summary = composer(x, context_mask=mask)
++
++    expected = torch.tensor(
++        [[torch.sigmoid(torch.tensor(1.0)).item(), 0.5, 0.0, 0.0]],
++        dtype=summary.salience.dtype,
++        device=summary.salience.device,
++    )
++    assert torch.allclose(summary.salience, expected)
++
++
++def test_composer_soft_topk_uses_valid_token_count_for_ratio_topk():
++    x = torch.tensor(
++        [[[[4.0, 0.0], [3.0, 0.0], [2.0, 0.0], [1.0, 0.0]]]]
++    )
++    mask = torch.tensor([[[True, True, False, False]]])
++    composer = _soft_topk_first_feature_composer(salience_topk=0.5)
++
++    summary = composer(x, context_mask=mask)
++
++    expected = torch.tensor(
++        [[0.5, torch.sigmoid(torch.tensor(-1.0)).item(), 0.0, 0.0]],
++        dtype=summary.salience.dtype,
++        device=summary.salience.device,
++    )
++    assert torch.allclose(summary.salience, expected)
++
++
++def test_composer_soft_topk_all_invalid_mask_returns_zero_salience():
++    x = torch.tensor([[[[4.0, 0.0], [3.0, 0.0]]]])
++    mask = torch.tensor([[[False, False]]])
++    composer = _soft_topk_first_feature_composer(salience_topk=1)
++
++    summary = composer(x, context_mask=mask)
++
++    assert summary.salience is not None
++    assert summary.attn_bias is not None
++    assert torch.equal(summary.salience, torch.zeros_like(summary.salience))
++
++    min_value = torch.finfo(summary.attn_bias.dtype).min
++    assert torch.equal(
++        summary.attn_bias,
++        torch.full_like(summary.attn_bias, min_value),
++    )
++
++
++def test_composer_region_mask_matches_equivalent_context_mask():
++    x = torch.randn(2, 3, 2, 5)
++    region_mask = torch.tensor(
++        [[True, False, True], [False, True, True]]
++    )
++    context_mask = region_mask.unsqueeze(-1).expand(2, 3, 2)
++    composer = Composer(5, salience_mode="soft_topk", salience_topk=1)
++
++    region_summary = composer(x, region_mask=region_mask)
++    context_summary = composer(x, context_mask=context_mask)
++
++    assert torch.equal(region_summary.token_mask, context_summary.token_mask)
++    assert torch.allclose(region_summary.tokens, context_summary.tokens)
++    assert region_summary.salience is not None
++    assert context_summary.salience is not None
++    assert torch.allclose(region_summary.salience, context_summary.salience)
++    assert region_summary.attn_bias is not None
++    assert context_summary.attn_bias is not None
++    assert torch.allclose(region_summary.attn_bias, context_summary.attn_bias)
++
++
++def test_composer_restore_masks_invalid_tokens():
++    x = torch.randn(1, 2, 2, 3)
++    mask = torch.tensor([[[True, False], [False, True]]])
++    composer = Composer(3, salience_mode="none")
++
++    summary = composer(x, context_mask=mask)
++    tokens = torch.ones_like(summary.tokens)
++    restored = composer.restore(tokens, summary)
++
++    expected_mask = mask.unsqueeze(-1).expand_as(restored)
++    assert torch.equal(
++        restored,
++        torch.where(expected_mask, torch.ones_like(restored), torch.zeros_like(restored)),
++    )
