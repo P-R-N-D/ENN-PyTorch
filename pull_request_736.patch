@@ -1,0 +1,383 @@
+diff --git a/enn_torch_dev/executor/graph.py b/enn_torch_dev/executor/graph.py
+--- a/enn_torch_dev/executor/graph.py+++ b/enn_torch_dev/executor/graph.py@@ -5,6 +5,7 @@ from torch import nn
+ 
+ from .node import NodeExecutor, NodeSpec
++from .schema import KeyRef
+ from .store import KVStore
+ from .subgraph import SubgraphExecutor, SubgraphSpec
+ 
+@@ -43,6 +44,7 @@         self._order: list[str] = []
+         self._children_by_parent: dict[str, tuple[str, ...]] = {}
+         self._parents_by_child: dict[str, set[str]] = {}
++        self._producer_by_output_key: dict[str, str] = {}
+ 
+         if nodes is not None:
+             for spec, module in nodes:
+@@ -69,15 +71,26 @@ 
+         name = self._validate_node_name(name)
+         module_key = _validate_module_key(module_key)
++        output_key = _validate_graph_key(
++            executor.output_key,
++            "GraphExecutor output_key",
++        )
+ 
+         if name in self._nodes:
+             raise ValueError(f"Duplicate node name: {name!r}")
+         if module_key in self.modules_by_key:
+             raise ValueError(f"Duplicate module_key: {module_key!r}")
++        producer = self._producer_by_output_key.get(output_key)
++        if producer is not None:
++            raise ValueError(
++                f"Duplicate output_key: {output_key!r} "
++                f"already produced by node {producer!r}"
++            )
+ 
+         self.modules_by_key[module_key] = module
+         self._nodes[name] = executor
+         self._order.append(name)
++        self._producer_by_output_key[output_key] = name
+         return name
+ 
+     def add_node(self, spec: NodeSpec, module: nn.Module) -> str:
+@@ -120,12 +133,106 @@             self._parents_by_child.setdefault(child, set()).add(name)
+         return name
+ 
++    def _input_refs_for_node(self, name: str) -> tuple[KeyRef, ...]:
++        node = self._nodes[name]
++        refs: list[KeyRef] = []
++
++        if isinstance(node, NodeExecutor):
++            refs.extend(node.spec.input_args)
++            refs.extend(node.spec.input_kwargs.values())
++        elif isinstance(node, SubgraphExecutor):
++            refs.extend(node.spec.input_kwargs.values())
++        else:
++            raise TypeError(f"Unsupported graph node executor: {type(node)!r}")
++
++        return tuple(refs)
++
++    def _dependencies_for_node(self, name: str) -> set[str]:
++        if name not in self._nodes:
++            raise KeyError(f"Unknown node: {name!r}")
++
++        deps: set[str] = set()
++        for child in self._children_by_parent.get(name, ()):
++            if child not in self._nodes:
++                raise RuntimeError(
++                    f"Subgraph {name!r} references missing child node: {child!r}"
++                )
++            deps.add(child)
++
++        for ref in self._input_refs_for_node(name):
++            producer = self._producer_by_output_key.get(ref.key)
++            if producer is not None:
++                deps.add(producer)
++
++        return deps
++
++    def _dependencies_by_node(self) -> dict[str, set[str]]:
++        return {
++            name: self._dependencies_for_node(name)
++            for name in self._order
++            if name in self._nodes
++        }
++
++    def execution_order(self) -> tuple[str, ...]:
++        deps = self._dependencies_by_node()
++        remaining = set(deps)
++        ready = [
++            name
++            for name in self._order
++            if name in remaining and not deps[name]
++        ]
++        ordered: list[str] = []
++
++        while ready:
++            name = ready.pop(0)
++            if name not in remaining:
++                continue
++
++            ordered.append(name)
++            remaining.remove(name)
++
++            for candidate in self._order:
++                if candidate not in remaining:
++                    continue
++                candidate_deps = deps[candidate]
++                if name not in candidate_deps:
++                    continue
++                candidate_deps.remove(name)
++                if not candidate_deps and candidate not in ready:
++                    ready.append(candidate)
++
++        if remaining:
++            unresolved = {
++                name: tuple(sorted(deps[name]))
++                for name in sorted(remaining)
++            }
++            raise RuntimeError(
++                "Cycle detected in graph execution dependencies: "
++                f"{unresolved!r}"
++            )
++
++        return tuple(ordered)
++
++    def _dependent_names(self, name: str) -> tuple[str, ...]:
++        deps = self._dependencies_by_node()
++        return tuple(
++            sorted(
++                candidate
++                for candidate, candidate_deps in deps.items()
++                if candidate != name and name in candidate_deps
++            )
++        )
++
+     def _remove_node_unchecked(self, name: str) -> None:
+         node = self._nodes.pop(name)
+         module_key = node.module_key
++        output_key = node.output_key
+ 
+         if module_key in self.modules_by_key:
+             del self.modules_by_key[module_key]
++
++        if self._producer_by_output_key.get(output_key) == name:
++            del self._producer_by_output_key[output_key]
+ 
+         try:
+             self._order.remove(name)
+@@ -150,11 +257,11 @@                 return
+             raise KeyError(f"Unknown node: {name!r}")
+ 
+-        parents = self._parents_by_child.get(name)
+-        if parents:
++        dependents = self._dependent_names(name)
++        if dependents:
+             raise ValueError(
+-                f"Cannot remove node {name!r}; it is referenced by parents: "
+-                f"{sorted(parents)!r}"
++                f"Cannot remove node {name!r}; it is referenced by "
++                f"parents/dependent nodes: {list(dependents)!r}"
+             )
+ 
+         self._remove_node_unchecked(name)
+@@ -183,19 +290,27 @@ 
+         removal_order = self._collect_subtree_postorder(name)
+         removal_set = set(removal_order)
++        deps = self._dependencies_by_node()
+ 
+         external_refs: dict[str, tuple[str, ...]] = {}
+         for node_name in removal_order:
+             external = tuple(
+-                sorted(self._parents_by_child.get(node_name, set()) - removal_set)
++                sorted(
++                    candidate
++                    for candidate, candidate_deps in deps.items()
++                    if (
++                        candidate not in removal_set
++                        and node_name in candidate_deps
++                    )
++                )
+             )
+             if external:
+                 external_refs[node_name] = external
+ 
+         if external_refs:
+             raise ValueError(
+-                "Cannot remove subtree with external parent references: "
+-                f"{external_refs!r}"
++                "Cannot remove subtree with external parent/dependent "
++                f"references: {external_refs!r}"
+             )
+ 
+         for node_name in removal_order:
+@@ -230,7 +345,7 @@         if not isinstance(store, KVStore):
+             raise TypeError(f"GraphExecutor.run expects KVStore, got {type(store)!r}")
+ 
+-        for name in tuple(self._order):
++        for name in self.execution_order():
+             node = self._nodes.get(name)
+             if node is None:
+                 raise RuntimeError(
+diff --git a/enn_torch_dev/debug/executor/test_execution_order.py b/enn_torch_dev/debug/executor/test_execution_order.py
+new file mode 100644
+index 0000000..1111111
+--- /dev/null
++++ b/enn_torch_dev/debug/executor/test_execution_order.py
+--- /dev/null+++ b/enn_torch_dev/debug/executor/test_execution_order.py@@ -0,0 +1,178 @@+from __future__ import annotations
++
++import pytest
++import torch
++from torch import nn
++
++from enn_torch_dev.executor import GraphExecutor, KVStore, KeyRef, NodeSpec, SubgraphSpec
++from enn_torch_dev.nn import Reducer
++
++
++class _AddOne(nn.Module):
++    def forward(self, x: torch.Tensor) -> torch.Tensor:
++        return x + 1.0
++
++
++class _TimesTwo(nn.Module):
++    def forward(self, x: torch.Tensor) -> torch.Tensor:
++        return x * 2.0
++
++
++def test_graph_executor_execution_order_uses_output_key_dependencies() -> None:
++    graph = GraphExecutor()
++    graph.add_node(
++        NodeSpec(
++            name="consumer",
++            input_args=[KeyRef("producer.out")],
++            output_key="consumer.out",
++        ),
++        _TimesTwo(),
++    )
++    graph.add_node(
++        NodeSpec(
++            name="producer",
++            input_args=[KeyRef("x")],
++            output_key="producer.out",
++        ),
++        _AddOne(),
++    )
++
++    assert graph.node_names() == ("consumer", "producer")
++    assert graph.execution_order() == ("producer", "consumer")
++
++    store = KVStore({"x": torch.ones(2, 3)})
++    graph.run(store)
++
++    assert torch.allclose(store.get("consumer.out"), torch.full((2, 3), 4.0))
++
++
++def test_graph_executor_execution_order_keeps_external_inputs_free() -> None:
++    graph = GraphExecutor()
++    graph.add_node(
++        NodeSpec(name="a", input_args=[KeyRef("external.x")], output_key="a.out"),
++        nn.Identity(),
++    )
++
++    assert graph.execution_order() == ("a",)
++
++
++def test_graph_executor_execution_order_runs_subgraph_after_children() -> None:
++    graph = GraphExecutor()
++    graph.add_node(
++        NodeSpec(name="a", input_args=[KeyRef("x")], output_key="a.out"),
++        _AddOne(),
++    )
++    graph.add_node(
++        NodeSpec(name="b", input_args=[KeyRef("x")], output_key="b.out"),
++        _TimesTwo(),
++    )
++    graph.add_subgraph(
++        SubgraphSpec(name="merge", children=["a", "b"], output_key="merge.out"),
++        Reducer(op="mean"),
++    )
++
++    assert graph.execution_order() == ("a", "b", "merge")
++
++    store = KVStore({"x": torch.ones(2, 3)})
++    graph.run(store)
++
++    assert torch.allclose(store.get("merge.out"), torch.full((2, 3), 2.0))
++
++
++def test_graph_executor_execution_order_handles_two_level_subgraphs() -> None:
++    graph = GraphExecutor()
++    graph.add_node(
++        NodeSpec(name="a", input_args=[KeyRef("x")], output_key="a.out"),
++        _AddOne(),
++    )
++    graph.add_node(
++        NodeSpec(name="b", input_args=[KeyRef("x")], output_key="b.out"),
++        _TimesTwo(),
++    )
++    graph.add_subgraph(
++        SubgraphSpec(name="ab", children=["a", "b"], output_key="ab.out"),
++        Reducer(op="mean"),
++    )
++    graph.add_node(
++        NodeSpec(name="c", input_args=[KeyRef("x")], output_key="c.out"),
++        nn.Identity(),
++    )
++    graph.add_subgraph(
++        SubgraphSpec(name="root", children=["ab", "c"], output_key="root.out"),
++        Reducer(op="mean"),
++    )
++
++    assert graph.execution_order() == ("a", "b", "ab", "c", "root")
++
++
++def test_graph_executor_rejects_duplicate_output_key() -> None:
++    graph = GraphExecutor()
++    graph.add_node(NodeSpec(name="a", output_key="shared.out"), nn.Identity())
++
++    with pytest.raises(ValueError, match="Duplicate output_key"):
++        graph.add_node(NodeSpec(name="b", output_key="shared.out"), nn.Identity())
++
++    with pytest.raises(ValueError, match="Duplicate output_key"):
++        graph.add_subgraph(
++            SubgraphSpec(name="merge", children=["a"], output_key="shared.out"),
++            Reducer(op="mean"),
++        )
++
++
++def test_graph_executor_detects_cycle_from_output_key_dependencies() -> None:
++    graph = GraphExecutor()
++    graph.add_node(
++        NodeSpec(name="a", input_args=[KeyRef("b.out")], output_key="a.out"),
++        nn.Identity(),
++    )
++    graph.add_node(
++        NodeSpec(name="b", input_args=[KeyRef("a.out")], output_key="b.out"),
++        nn.Identity(),
++    )
++
++    with pytest.raises(RuntimeError, match="Cycle detected"):
++        graph.execution_order()
++
++
++def test_graph_executor_remove_node_rejects_dataflow_dependent() -> None:
++    graph = GraphExecutor()
++    graph.add_node(NodeSpec(name="a", output_key="a.out"), nn.Identity())
++    graph.add_node(
++        NodeSpec(name="b", input_args=[KeyRef("a.out")], output_key="b.out"),
++        nn.Identity(),
++    )
++
++    with pytest.raises(ValueError, match="dependent nodes"):
++        graph.remove_node("a")
++
++
++def test_graph_executor_remove_subtree_rejects_external_dataflow_dependency() -> None:
++    graph = GraphExecutor()
++    graph.add_node(NodeSpec(name="a", output_key="a.out"), nn.Identity())
++    graph.add_node(
++        NodeSpec(name="b", input_args=[KeyRef("a.out")], output_key="b.out"),
++        nn.Identity(),
++    )
++
++    with pytest.raises(ValueError, match="external parent/dependent"):
++        graph.remove_subtree("a")
++
++
++def test_graph_executor_remove_node_cleans_output_producer_index() -> None:
++    graph = GraphExecutor()
++    graph.add_node(NodeSpec(name="a", output_key="a.out"), nn.Identity())
++
++    graph.remove_node("a")
++
++    graph.add_node(NodeSpec(name="b", output_key="a.out"), nn.Identity())
++    assert graph.execution_order() == ("b",)
++
++
++def test_graph_executor_remove_subtree_cleans_output_producer_index() -> None:
++    graph = GraphExecutor()
++    graph.add_node(NodeSpec(name="a", output_key="a.out"), nn.Identity())
++
++    graph.remove_subtree("a")
++
++    graph.add_node(NodeSpec(name="b", output_key="a.out"), nn.Identity())
++    assert graph.execution_order() == ("b",)
