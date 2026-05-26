@@ -59,7 +59,7 @@ class KVStore:
             and key == key.strip()
         )
 
-    def has(self, key: str) -> bool:
+    def has(self, key: object) -> bool:
         return self._is_valid_key(key) and key in self._data
 
     def keys(self) -> tuple[str, ...]:

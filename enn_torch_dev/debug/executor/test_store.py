@@ -74,8 +74,10 @@ def test_kv_store_has_returns_false_for_invalid_keys() -> None:
     store = KVStore({"x": torch.randn(2, 3)})
 
     assert not store.has("")
+    assert not store.has(123)
     assert not store.has(" x ")
     assert "" not in store
+    assert 123 not in store
     assert " x " not in store
 
 
