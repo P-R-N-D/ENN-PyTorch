@@ -58,6 +58,56 @@ class GraphExecutor(nn.Module):
     def _is_valid_node_name(name: object) -> bool:
         return _is_valid_graph_key(name)
 
+    def _has_structural_path(self, start: str, target: str) -> bool:
+        if start == target:
+            return True
+
+        seen: set[str] = set()
+        stack = [start]
+        while stack:
+            current = stack.pop()
+            if current in seen:
+                continue
+            seen.add(current)
+            for child in self._children_by_parent.get(current, ()):
+                if child == target:
+                    return True
+                if child not in seen:
+                    stack.append(child)
+        return False
+
+    def _normalize_subgraph_children(
+        self,
+        parent: str,
+        children: Sequence[str],
+    ) -> tuple[str, ...]:
+        parent = self._validate_node_name(parent)
+        if isinstance(children, (str, bytes, bytearray)) or children is None:
+            raise TypeError("subgraph children must be a sequence of node names.")
+
+        values = list(children)
+        if not values:
+            raise ValueError("subgraph children must not be empty.")
+
+        normalized: list[str] = []
+        seen: set[str] = set()
+        for child in values:
+            child_name = self._validate_node_name(child)
+            if child_name == parent:
+                raise ValueError("Subgraph cannot contain itself as a child.")
+            if child_name in seen:
+                raise ValueError(f"duplicate child node: {child_name!r}")
+            if child_name not in self._nodes:
+                raise KeyError(f"Unknown child node: {child_name!r}")
+            if self._has_structural_path(child_name, parent):
+                raise ValueError(
+                    f"Adding child {child_name!r} to subgraph {parent!r} "
+                    "would create a structural cycle."
+                )
+            seen.add(child_name)
+            normalized.append(child_name)
+        return tuple(normalized)
+
     def _add_executor(
         self,
         *,
@@ -108,10 +158,7 @@ class GraphExecutor(nn.Module):
                 f"add_subgraph expects SubgraphSpec, got {type(spec)!r}"
             )
 
-        children = tuple(self._validate_node_name(child) for child in spec.children)
-        for child in children:
-            if child not in self._nodes:
-                raise KeyError(f"Unknown child node: {child!r}")
+        children = self._normalize_subgraph_children(spec.name, spec.children)
 
         child_output_refs = [
             self.get_node(child).output_ref()
@@ -129,6 +176,71 @@ class GraphExecutor(nn.Module):
         for child in children:
             self._parents_by_child.setdefault(child, set()).add(name)
         return name
+
+    def _get_subgraph_executor(self, name: str) -> SubgraphExecutor:
+        node = self.get_node(name)
+        if not isinstance(node, SubgraphExecutor):
+            raise TypeError(f"Node {name!r} is not a SubgraphExecutor.")
+        return node
+
+    def set_subgraph_children(
+        self,
+        name: str,
+        children: Sequence[str],
+    ) -> tuple[str, ...]:
+        name = self._validate_node_name(name)
+        node = self._get_subgraph_executor(name)
+        normalized = self._normalize_subgraph_children(name, children)
+        child_output_refs = [
+            self.get_node(child).output_ref()
+            for child in normalized
+        ]
+
+        old_children = self._children_by_parent.get(name, ())
+        for child in old_children:
+            parents = self._parents_by_child.get(child)
+            if parents is None:
+                continue
+            parents.discard(name)
+            if not parents:
+                self._parents_by_child.pop(child, None)
+
+        self._children_by_parent[name] = normalized
+        for child in normalized:
+            self._parents_by_child.setdefault(child, set()).add(name)
+
+        node.set_children(normalized, child_output_refs)
+        return normalized
+
+    def attach_child(self, parent: str, child: str) -> tuple[str, ...]:
+        parent = self._validate_node_name(parent)
+        self._get_subgraph_executor(parent)
+        current = list(self.child_names(parent))
+        current.append(self._validate_node_name(child))
+        return self.set_subgraph_children(parent, current)
+
+    def detach_child(
+        self,
+        parent: str,
+        child: str,
+        *,
+        missing_ok: bool = False,
+    ) -> tuple[str, ...]:
+        parent = self._validate_node_name(parent)
+        self._get_subgraph_executor(parent)
+        child = self._validate_node_name(child)
+        current = list(self.child_names(parent))
+
+        if child not in current:
+            if missing_ok:
+                return tuple(current)
+            raise KeyError(f"Subgraph {parent!r} does not contain child {child!r}.")
+
+        updated = [name for name in current if name != child]
+        if not updated:
+            raise ValueError("Subgraph children must not be empty.")
+
+        return self.set_subgraph_children(parent, updated)
 
     def _input_refs_for_node(self, name: str) -> tuple[KeyRef, ...]:
         node = self._nodes[name]
