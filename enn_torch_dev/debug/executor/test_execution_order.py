@@ -227,3 +227,26 @@ def test_remove_node_in_cycle_still_rejects_external_dependent() -> None:
 
     with pytest.raises(ValueError, match="dependent nodes"):
         graph.remove_node("a")
+
+
+def test_remove_subtree_in_cycle_still_rejects_external_dependent() -> None:
+    graph = GraphExecutor()
+    graph.add_node(
+        NodeSpec(name="a", input_args=[KeyRef("b_out")], output_key="a_out"),
+        nn.Identity(),
+    )
+    graph.add_node(
+        NodeSpec(name="b", input_args=[KeyRef("a_out")], output_key="b_out"),
+        nn.Identity(),
+    )
+    graph.add_node(
+        NodeSpec(
+            name="outside",
+            input_args=[KeyRef("a_out")],
+            output_key="outside_out",
+        ),
+        nn.Identity(),
+    )
+
+    with pytest.raises(ValueError, match="external parent/dependent"):
+        graph.remove_subtree("a")

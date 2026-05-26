@@ -368,12 +368,32 @@ class GraphExecutor(nn.Module):
             )
 
             if allow_single_node_cycle_repair:
+                def _reachable(src: str, dst: str) -> bool:
+                    if src == dst:
+                        return True
+                    seen: set[str] = set()
+                    stack = [src]
+                    while stack:
+                        current = stack.pop()
+                        if current in seen:
+                            continue
+                        seen.add(current)
+                        for nxt in deps.get(current, set()):
+                            if nxt == dst:
+                                return True
+                            if nxt not in seen:
+                                stack.append(nxt)
+                    return False
+
                 dataflow_external = external_candidates - structural_external
                 external_candidates = set(structural_external)
                 external_candidates.update(
                     candidate
                     for candidate in dataflow_external
-                    if candidate not in cycle_nodes
+                    if not (
+                        _reachable(node_name, candidate)
+                        and _reachable(candidate, node_name)
+                    )
                 )
 
             external = tuple(sorted(external_candidates))
