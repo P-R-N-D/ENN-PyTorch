@@ -65,6 +65,13 @@ class NodeExecutor:
             raise RuntimeError("NodeSpec.module_key was not initialized.")
         return module_key
 
+    @property
+    def output_key(self) -> str:
+        return self.spec.output_key
+
+    def output_ref(self) -> KeyRef:
+        return KeyRef(self.output_key)
+
     def run(self, store: KVStore, module: nn.Module) -> Any:
         if not isinstance(store, KVStore):
             raise TypeError(f"NodeExecutor.run expects KVStore, got {type(store)!r}")
