@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
 from typing import Any
 
 import torch
@@ -9,6 +8,7 @@ from torch import Tensor, nn
 
 from ._compat import autocast_disabled, stable_work_dtype
 from .layers import ConvMixer
+from .types import ContextSummary
 
 
 class Compressor(nn.Module):
@@ -554,25 +554,6 @@ class Compressor(nn.Module):
                 return nn.Identity()
             case _:
                 raise ValueError(f"Unsupported activation: {name!r}")
-
-
-@dataclass(frozen=True)
-class ContextSummary:
-    """
-    Packed coarse context produced by ``Composer``.
-
-    ``tokens`` is the dense sequence passed to global attention.
-    ``attn_bias`` is an optional key-side salience bias with shape
-    ``(B, 1, 1, T)``. Attention implementations may add it to attention
-    logits before softmax.
-    """
-
-    tokens: Tensor
-    token_mask: Tensor | None
-    attn_bias: Tensor | None
-    salience: Tensor | None
-    score: Tensor | None
-    original_shape: tuple[int, int, int, int]
 
 
 class Composer(nn.Module):
