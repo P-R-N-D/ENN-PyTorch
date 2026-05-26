@@ -1,0 +1,536 @@
+diff --git a/enn_torch_dev/nn/types.py b/enn_torch_dev/nn/types.py
+new file mode 100644
+index 0000000..dd3e6ff
+--- /dev/null
++++ b/enn_torch_dev/nn/types.py
+@@ -0,0 +1,35 @@
++from __future__ import annotations
++
++from dataclasses import dataclass
++
++from torch import Tensor
++
++
++@dataclass(frozen=True)
++class ContextSummary:
++    """
++    Packed coarse context produced by ``Composer``.
++
++    ``tokens`` is the dense sequence passed to global attention.
++    ``attn_bias`` is an optional key-side salience bias with shape
++    ``(B, 1, 1, T)``. Attention implementations may add it to attention
++    logits before softmax.
++
++    Fields:
++      - tokens: dense global context tokens, shaped ``(B, T, D)``.
++      - token_mask: optional valid-token mask, shaped ``(B, T)``.
++      - attn_bias: optional key-side attention bias, shaped ``(B, 1, 1, T)``.
++      - salience: optional salience value per token, shaped ``(B, T)``.
++      - score: optional raw salience score per token, shaped ``(B, T)``.
++      - original_shape: compressed context shape ``(B, R, K, D)`` before
++        flattening.
++    """
++
++    tokens: Tensor
++    token_mask: Tensor | None
++    attn_bias: Tensor | None
++    salience: Tensor | None
++    score: Tensor | None
++    original_shape: tuple[int, int, int, int]
+diff --git a/enn_torch_dev/nn/blocks.py b/enn_torch_dev/nn/blocks.py
+index 913ea7a..3f7e7e8 100644
+--- a/enn_torch_dev/nn/blocks.py
++++ b/enn_torch_dev/nn/blocks.py
+@@ -3,7 +3,6 @@ from __future__ import annotations
+ 
+ import math
+-from dataclasses import dataclass
+ from typing import Any
+ 
+ import torch
+@@ -12,6 +11,7 @@ from torch import Tensor, nn
+ 
+ from ._compat import autocast_disabled, stable_work_dtype
+ from .layers import ConvMixer
++from .types import ContextSummary
+ 
+ 
+ class Compressor(nn.Module):
+@@ -551,26 +551,6 @@ class Compressor(nn.Module):
+                 raise ValueError(f"Unsupported activation: {name!r}")
+ 
+ 
+-@dataclass(frozen=True)
+-class ContextSummary:
+-    """
+-    Packed coarse context produced by ``Composer``.
+-
+-    ``tokens`` is the dense sequence passed to global attention.
+-    ``attn_bias`` is an optional key-side salience bias with shape
+-    ``(B, 1, 1, T)``. Attention implementations may add it to attention
+-    logits before softmax.
+-    """
+-
+-    tokens: Tensor
+-    token_mask: Tensor | None
+-    attn_bias: Tensor | None
+-    salience: Tensor | None
+-    score: Tensor | None
+-    original_shape: tuple[int, int, int, int]
+-
+-
+ class Composer(nn.Module):
+     """
+     Recompose compressed regional context into a coarse global context.
+diff --git a/enn_torch_dev/nn/__init__.py b/enn_torch_dev/nn/__init__.py
+index e063aab..07d3c51 100644
+--- a/enn_torch_dev/nn/__init__.py
++++ b/enn_torch_dev/nn/__init__.py
+@@ -1,10 +1,10 @@
+ from __future__ import annotations
+ 
+ from .blocks import (
+     Composer,
+-    ContextSummary,
+     Compressor,
+ )
+ from .layers import ConvMixer, Reducer
++from .types import ContextSummary
+ 
+ __all__ = [
+     "ConvMixer",
+diff --git a/enn_torch_dev/executor/__init__.py b/enn_torch_dev/executor/__init__.py
+new file mode 100644
+index 0000000..03b1cb0
+--- /dev/null
++++ b/enn_torch_dev/executor/__init__.py
+@@ -0,0 +1,14 @@
++from __future__ import annotations
++
++from .node import NodeExecutor, NodeSpec
++from .schema import GraphValue, KeyRef
++from .store import KVStore
++
++__all__ = [
++    "GraphValue",
++    "KeyRef",
++    "KVStore",
++    "NodeExecutor",
++    "NodeSpec",
++]
+diff --git a/enn_torch_dev/executor/schema.py b/enn_torch_dev/executor/schema.py
+new file mode 100644
+index 0000000..468aa92
+--- /dev/null
++++ b/enn_torch_dev/executor/schema.py
+@@ -0,0 +1,36 @@
++from __future__ import annotations
++
++from dataclasses import dataclass, field
++from typing import Any
++
++
++@dataclass(slots=True)
++class GraphValue:
++    """
++    One value stored in ``KVStore``.
++
++    ``data`` is the actual runtime payload. Metadata fields are intentionally
++    lightweight so this schema can wrap tensors, TensorDict-like containers,
++    lazy values, or later executor-specific payloads without committing the
++    store to a heavy backend.
++    """
++
++    data: Any
++    layout: str | None = None
++    mask_key: str | None = None
++    origin: str | None = None
++    meta: dict[str, Any] = field(default_factory=dict)
++
++
++@dataclass(frozen=True, slots=True)
++class KeyRef:
++    """
++    Reference to a key in ``KVStore``.
++
++    Node executors use ``KeyRef`` to bind module inputs without hard-coding
++    Python variables into the execution path.
++    """
++
++    key: str
++    optional: bool = False
++    default: Any = None
+diff --git a/enn_torch_dev/executor/store.py b/enn_torch_dev/executor/store.py
+new file mode 100644
+index 0000000..d7ac4f1
+--- /dev/null
++++ b/enn_torch_dev/executor/store.py
+@@ -0,0 +1,119 @@
++from __future__ import annotations
++
++from typing import Any, Mapping
++
++import torch
++from torch import Tensor
++
++from .schema import GraphValue, KeyRef
++
++
++class KVStore:
++    """
++    Runtime key-value store for executor-driven graph execution.
++
++    This is a data plane, not an execution backend:
++      - no graph topology;
++      - no topological ordering;
++      - no parent/child ownership;
++      - no tile/stream policy.
++
++    Values are stored as ``GraphValue`` wrappers so later executor stages can
++    attach lightweight metadata while keeping the initial implementation small.
++    """
++
++    def __init__(self, initial: Mapping[str, Any] | None = None) -> None:
++        self._data: dict[str, GraphValue] = {}
++
++        if initial is not None:
++            for key, value in initial.items():
++                self.set(key, value)
++
++    def __contains__(self, key: object) -> bool:
++        return isinstance(key, str) and key in self._data
++
++    def __len__(self) -> int:
++        return len(self._data)
++
++    def has(self, key: str) -> bool:
++        return key in self._data
++
++    def keys(self) -> tuple[str, ...]:
++        return tuple(self._data.keys())
++
++    def get(
++        self,
++        key: str,
++        *,
++        optional: bool = False,
++        default: Any = None,
++    ) -> Any:
++        if key not in self._data:
++            if optional:
++                return default
++            raise KeyError(f"KVStore missing key: {key!r}")
++
++        return self._data[key].data
++
++    def get_value(self, key: str) -> GraphValue:
++        if key not in self._data:
++            raise KeyError(f"KVStore missing key: {key!r}")
++
++        return self._data[key]
++
++    def set(
++        self,
++        key: str,
++        value: Any,
++        *,
++        layout: str | None = None,
++        mask_key: str | None = None,
++        origin: str | None = None,
++        meta: Mapping[str, Any] | None = None,
++    ) -> None:
++        if not isinstance(key, str) or not key.strip():
++            raise ValueError("KVStore key must be a non-empty string.")
++
++        self._data[key] = GraphValue(
++            data=value,
++            layout=layout,
++            mask_key=mask_key,
++            origin=origin,
++            meta=dict(meta or {}),
++        )
++
++    def resolve(self, ref: KeyRef) -> Any:
++        if not isinstance(ref, KeyRef):
++            raise TypeError(f"KVStore.resolve expects KeyRef, got {type(ref)!r}")
++
++        return self.get(
++            ref.key,
++            optional=ref.optional,
++            default=ref.default,
++        )
++
++    def delete(self, key: str, *, missing_ok: bool = False) -> None:
++        if key not in self._data:
++            if missing_ok:
++                return
++            raise KeyError(f"KVStore missing key: {key!r}")
++
++        del self._data[key]
++
++    def clear(self) -> None:
++        self._data.clear()
++
++    def to(
++        self,
++        device: torch.device | str,
++        *,
++        keys: list[str] | tuple[str, ...] | None = None,
++        non_blocking: bool = False,
++    ) -> "KVStore":
++        target_keys = self.keys() if keys is None else tuple(keys)
++
++        for key in target_keys:
++            gv = self.get_value(key)
++            value = gv.data
++
++            if isinstance(value, Tensor):
++                self.set(
++                    key,
++                    value.to(device=device, non_blocking=non_blocking),
++                    layout=gv.layout,
++                    mask_key=gv.mask_key,
++                    origin=gv.origin,
++                    meta=gv.meta,
++                )
++
++        return self
++
++    def shallow_copy(self) -> "KVStore":
++        copied = KVStore()
++        copied._data = dict(self._data)
++        return copied
+diff --git a/enn_torch_dev/executor/node.py b/enn_torch_dev/executor/node.py
+new file mode 100644
+index 0000000..fa35f65
+--- /dev/null
++++ b/enn_torch_dev/executor/node.py
+@@ -0,0 +1,59 @@
++from __future__ import annotations
++
++from dataclasses import dataclass, field
++from typing import Any
++
++from torch import nn
++
++from .schema import KeyRef
++from .store import KVStore
++
++
++@dataclass(slots=True)
++class NodeSpec:
++    """
++    Minimal executable leaf-node schema.
++
++    ``module`` is the attached ``nn.Module``. Inputs are resolved from
++    ``KVStore`` through ``KeyRef`` instances and the result is written back to
++    ``output_key``.
++    """
++
++    name: str
++    module: nn.Module
++    input_args: list[KeyRef] = field(default_factory=list)
++    input_kwargs: dict[str, KeyRef] = field(default_factory=dict)
++    output_key: str = ""
++
++
++class NodeExecutor:
++    """
++    Leaf executor that calls one ``nn.Module``.
++
++    This class deliberately knows nothing about graph topology. It only binds
++    store values to module arguments, runs the module, and writes the output.
++    """
++
++    def __init__(self, spec: NodeSpec) -> None:
++        if not isinstance(spec, NodeSpec):
++            raise TypeError(f"NodeExecutor expects NodeSpec, got {type(spec)!r}")
++        if not isinstance(spec.module, nn.Module):
++            raise TypeError("NodeSpec.module must be an nn.Module.")
++        if not isinstance(spec.name, str) or not spec.name.strip():
++            raise ValueError("NodeSpec.name must be a non-empty string.")
++        if not isinstance(spec.output_key, str) or not spec.output_key.strip():
++            raise ValueError("NodeSpec.output_key must be a non-empty string.")
++
++        self.spec = spec
++
++    @property
++    def module(self) -> nn.Module:
++        return self.spec.module
++
++    def run(self, store: KVStore) -> Any:
++        if not isinstance(store, KVStore):
++            raise TypeError(f"NodeExecutor.run expects KVStore, got {type(store)!r}")
++
++        args = [store.resolve(ref) for ref in self.spec.input_args]
++        kwargs = {
++            name: store.resolve(ref)
++            for name, ref in self.spec.input_kwargs.items()
++        }
++        out = self.spec.module(*args, **kwargs)
++        store.set(self.spec.output_key, out, origin=self.spec.name)
++        return out
+diff --git a/enn_torch_dev/debug/executor/test_store.py b/enn_torch_dev/debug/executor/test_store.py
+new file mode 100644
+index 0000000..7b7f37d
+--- /dev/null
++++ b/enn_torch_dev/debug/executor/test_store.py
+@@ -0,0 +1,68 @@
++from __future__ import annotations
++
++import pytest
++import torch
++
++from enn_torch_dev.executor import GraphValue, KVStore, KeyRef
++
++
++def test_kv_store_set_get_and_metadata() -> None:
++    x = torch.randn(2, 3)
++    store = KVStore()
++
++    store.set(
++        "input.x",
++        x,
++        layout="B,D",
++        mask_key="input.mask",
++        origin="test",
++        meta={"kind": "feature"},
++    )
++
++    assert store.has("input.x")
++    assert torch.equal(store.get("input.x"), x)
++
++    value = store.get_value("input.x")
++    assert isinstance(value, GraphValue)
++    assert value.layout == "B,D"
++    assert value.mask_key == "input.mask"
++    assert value.origin == "test"
++    assert value.meta == {"kind": "feature"}
++
++
++def test_kv_store_resolve_keyref() -> None:
++    x = torch.randn(2, 3)
++    store = KVStore({"x": x})
++
++    assert torch.equal(store.resolve(KeyRef("x")), x)
++
++
++def test_kv_store_optional_keyref_returns_default() -> None:
++    store = KVStore()
++
++    assert store.resolve(KeyRef("missing", optional=True, default=123)) == 123
++
++
++def test_kv_store_missing_key_raises() -> None:
++    store = KVStore()
++
++    with pytest.raises(KeyError, match="missing"):
++        store.get("missing")
++
++
++def test_kv_store_rejects_empty_key() -> None:
++    store = KVStore()
++
++    with pytest.raises(ValueError, match="non-empty"):
++        store.set("", torch.tensor(1.0))
++
++
++def test_kv_store_to_moves_tensor_values_only() -> None:
++    x = torch.randn(2, 3)
++    store = KVStore({"x": x, "name": "raw"})
++
++    store.to("cpu")
++
++    assert store.get("x").device.type == "cpu"
++    assert store.get("name") == "raw"
++
++
++def test_kv_store_shallow_copy_preserves_values() -> None:
++    store = KVStore({"x": torch.randn(2, 3)})
++    copied = store.shallow_copy()
++
++    assert copied is not store
++    assert torch.equal(copied.get("x"), store.get("x"))
+diff --git a/enn_torch_dev/debug/executor/test_node.py b/enn_torch_dev/debug/executor/test_node.py
+new file mode 100644
+index 0000000..fe95b36
+--- /dev/null
++++ b/enn_torch_dev/debug/executor/test_node.py
+@@ -0,0 +1,69 @@
++from __future__ import annotations
++
++import pytest
++import torch
++from torch import nn
++
++from enn_torch_dev.executor import KVStore, KeyRef, NodeExecutor, NodeSpec
++
++
++def test_node_executor_runs_module_and_writes_output() -> None:
++    x = torch.randn(2, 4)
++    store = KVStore({"x": x})
++    module = nn.Linear(4, 3)
++
++    node = NodeExecutor(
++        NodeSpec(
++            name="linear",
++            module=module,
++            input_args=[KeyRef("x")],
++            output_key="y",
++        )
++    )
++
++    out = node.run(store)
++
++    assert store.has("y")
++    assert torch.equal(store.get("y"), out)
++    assert out.shape == (2, 3)
++
++
++class _AddBias(nn.Module):
++    def forward(self, x: torch.Tensor, bias: torch.Tensor | float) -> torch.Tensor:
++        return x + bias
++
++
++def test_node_executor_resolves_kwargs_and_optional_default() -> None:
++    x = torch.randn(2, 3)
++    store = KVStore({"x": x})
++    node = NodeExecutor(
++        NodeSpec(
++            name="add_bias",
++            module=_AddBias(),
++            input_args=[KeyRef("x")],
++            input_kwargs={"bias": KeyRef("missing.bias", optional=True, default=1.5)},
++            output_key="y",
++        )
++    )
++
++    out = node.run(store)
++
++    assert torch.allclose(out, x + 1.5)
++    assert torch.allclose(store.get("y"), x + 1.5)
++
++
++def test_node_executor_rejects_empty_output_key() -> None:
++    with pytest.raises(ValueError, match="output_key"):
++        NodeExecutor(
++            NodeSpec(
++                name="bad",
++                module=nn.Identity(),
++                output_key="",
++            )
++        )
++
++
++def test_node_executor_missing_input_key_raises() -> None:
++    node = NodeExecutor(
++        NodeSpec(
++            name="identity",
++            module=nn.Identity(),
++            input_args=[KeyRef("missing")],
++            output_key="out",
++        )
++    )
++
++    with pytest.raises(KeyError, match="missing"):
++        node.run(KVStore())
