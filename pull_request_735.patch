@@ -1,0 +1,748 @@
+diff --git a/enn_torch_dev/executor/__init__.py b/enn_torch_dev/executor/__init__.py
+--- a/enn_torch_dev/executor/__init__.py
++++ b/enn_torch_dev/executor/__init__.py
+@@ -4,6 +4,7 @@
+ from .node import NodeExecutor, NodeSpec
+ from .schema import GraphValue, KeyRef
+ from .store import KVStore
++from .subgraph import SubgraphExecutor, SubgraphSpec
+ 
+ __all__ = [
+     "GraphValue",
+@@ -12,4 +13,6 @@
+     "KVStore",
+     "NodeExecutor",
+     "NodeSpec",
++    "SubgraphExecutor",
++    "SubgraphSpec",
+ ]
+diff --git a/enn_torch_dev/executor/node.py b/enn_torch_dev/executor/node.py
+--- a/enn_torch_dev/executor/node.py
++++ b/enn_torch_dev/executor/node.py
+@@ -65,6 +65,13 @@
+             raise RuntimeError("NodeSpec.module_key was not initialized.")
+         return module_key
+ 
++    @property
++    def output_key(self) -> str:
++        return self.spec.output_key
++
++    def output_ref(self) -> KeyRef:
++        return KeyRef(self.output_key)
++
+     def run(self, store: KVStore, module: nn.Module) -> Any:
+         if not isinstance(store, KVStore):
+             raise TypeError(f"NodeExecutor.run expects KVStore, got {type(store)!r}")
+diff --git a/enn_torch_dev/executor/graph.py b/enn_torch_dev/executor/graph.py
+--- a/enn_torch_dev/executor/graph.py
++++ b/enn_torch_dev/executor/graph.py
+@@ -6,6 +6,9 @@
+ 
+ from .node import NodeExecutor, NodeSpec
+ from .store import KVStore
++from .subgraph import SubgraphExecutor, SubgraphSpec
++
++GraphNodeExecutor = NodeExecutor | SubgraphExecutor
+ 
+ 
+ def _is_valid_graph_key(value: object) -> bool:
+@@ -36,8 +39,10 @@
+     ) -> None:
+         super().__init__()
+         self.modules_by_key = nn.ModuleDict()
+-        self._nodes: dict[str, NodeExecutor] = {}
++        self._nodes: dict[str, GraphNodeExecutor] = {}
+         self._order: list[str] = []
++        self._children_by_parent: dict[str, tuple[str, ...]] = {}
++        self._parents_by_child: dict[str, set[str]] = {}
+ 
+         if nodes is not None:
+             for spec, module in nodes:
+@@ -51,14 +56,19 @@
+     def _is_valid_node_name(name: object) -> bool:
+         return _is_valid_graph_key(name)
+ 
+-    def add_node(self, spec: NodeSpec, module: nn.Module) -> str:
+-        if not isinstance(spec, NodeSpec):
+-            raise TypeError(f"add_node expects NodeSpec, got {type(spec)!r}")
++    def _add_executor(
++        self,
++        *,
++        name: str,
++        module_key: str,
++        executor: GraphNodeExecutor,
++        module: nn.Module,
++    ) -> str:
+         if not isinstance(module, nn.Module):
+-            raise TypeError("add_node module must be an nn.Module.")
+-
+-        name = self._validate_node_name(spec.name)
+-        module_key = _validate_module_key(spec.module_key)
++            raise TypeError("executor module must be an nn.Module.")
++
++        name = self._validate_node_name(name)
++        module_key = _validate_module_key(module_key)
+ 
+         if name in self._nodes:
+             raise ValueError(f"Duplicate node name: {name!r}")
+@@ -66,17 +76,51 @@
+             raise ValueError(f"Duplicate module_key: {module_key!r}")
+ 
+         self.modules_by_key[module_key] = module
+-        self._nodes[name] = NodeExecutor(spec)
++        self._nodes[name] = executor
+         self._order.append(name)
+         return name
+ 
+-    def remove_node(self, name: str, *, missing_ok: bool = False) -> None:
+-        name = self._validate_node_name(name)
+-        if name not in self._nodes:
+-            if missing_ok:
+-                return
+-            raise KeyError(f"Unknown node: {name!r}")
+-
++    def add_node(self, spec: NodeSpec, module: nn.Module) -> str:
++        if not isinstance(spec, NodeSpec):
++            raise TypeError(f"add_node expects NodeSpec, got {type(spec)!r}")
++
++        executor = NodeExecutor(spec)
++        return self._add_executor(
++            name=spec.name,
++            module_key=executor.module_key,
++            executor=executor,
++            module=module,
++        )
++
++    def add_subgraph(self, spec: SubgraphSpec, module: nn.Module) -> str:
++        if not isinstance(spec, SubgraphSpec):
++            raise TypeError(
++                f"add_subgraph expects SubgraphSpec, got {type(spec)!r}"
++            )
++
++        children = tuple(self._validate_node_name(child) for child in spec.children)
++        for child in children:
++            if child not in self._nodes:
++                raise KeyError(f"Unknown child node: {child!r}")
++
++        child_output_refs = [
++            self.get_node(child).output_ref()
++            for child in children
++        ]
++        executor = SubgraphExecutor(spec, child_output_refs)
++        name = self._add_executor(
++            name=spec.name,
++            module_key=executor.module_key,
++            executor=executor,
++            module=module,
++        )
++
++        self._children_by_parent[name] = children
++        for child in children:
++            self._parents_by_child.setdefault(child, set()).add(name)
++        return name
++
++    def _remove_node_unchecked(self, name: str) -> None:
+         node = self._nodes.pop(name)
+         module_key = node.module_key
+ 
+@@ -88,7 +132,77 @@
+         except ValueError:
+             pass
+ 
+-    def get_node(self, name: str) -> NodeExecutor:
++        children = self._children_by_parent.pop(name, ())
++        for child in children:
++            parents = self._parents_by_child.get(child)
++            if parents is None:
++                continue
++            parents.discard(name)
++            if not parents:
++                self._parents_by_child.pop(child, None)
++
++        self._parents_by_child.pop(name, None)
++
++    def remove_node(self, name: str, *, missing_ok: bool = False) -> None:
++        name = self._validate_node_name(name)
++        if name not in self._nodes:
++            if missing_ok:
++                return
++            raise KeyError(f"Unknown node: {name!r}")
++
++        parents = self._parents_by_child.get(name)
++        if parents:
++            raise ValueError(
++                f"Cannot remove node {name!r}; it is referenced by parents: "
++                f"{sorted(parents)!r}"
++            )
++
++        self._remove_node_unchecked(name)
++
++    def _collect_subtree_postorder(self, name: str) -> tuple[str, ...]:
++        seen: set[str] = set()
++        ordered: list[str] = []
++
++        def visit(node_name: str) -> None:
++            if node_name in seen:
++                return
++            seen.add(node_name)
++            for child_name in self._children_by_parent.get(node_name, ()):
++                visit(child_name)
++            ordered.append(node_name)
++
++        visit(name)
++        return tuple(ordered)
++
++    def remove_subtree(self, name: str, *, missing_ok: bool = False) -> None:
++        name = self._validate_node_name(name)
++        if name not in self._nodes:
++            if missing_ok:
++                return
++            raise KeyError(f"Unknown node: {name!r}")
++
++        removal_order = self._collect_subtree_postorder(name)
++        removal_set = set(removal_order)
++
++        external_refs: dict[str, tuple[str, ...]] = {}
++        for node_name in removal_order:
++            external = tuple(
++                sorted(self._parents_by_child.get(node_name, set()) - removal_set)
++            )
++            if external:
++                external_refs[node_name] = external
++
++        if external_refs:
++            raise ValueError(
++                "Cannot remove subtree with external parent references: "
++                f"{external_refs!r}"
++            )
++
++        for node_name in removal_order:
++            if node_name in self._nodes:
++                self._remove_node_unchecked(node_name)
++
++    def get_node(self, name: str) -> GraphNodeExecutor:
+         name = self._validate_node_name(name)
+         if name not in self._nodes:
+             raise KeyError(f"Unknown node: {name!r}")
+@@ -99,6 +213,18 @@
+ 
+     def node_names(self) -> tuple[str, ...]:
+         return tuple(self._order)
++
++    def child_names(self, name: str) -> tuple[str, ...]:
++        name = self._validate_node_name(name)
++        if name not in self._nodes:
++            raise KeyError(f"Unknown node: {name!r}")
++        return self._children_by_parent.get(name, ())
++
++    def parent_names(self, name: str) -> tuple[str, ...]:
++        name = self._validate_node_name(name)
++        if name not in self._nodes:
++            raise KeyError(f"Unknown node: {name!r}")
++        return tuple(sorted(self._parents_by_child.get(name, set())))
+ 
+     def run(self, store: KVStore) -> KVStore:
+         if not isinstance(store, KVStore):
+diff --git a/enn_torch_dev/executor/subgraph.py b/enn_torch_dev/executor/subgraph.py
+new file mode 100644
+index 0000000..1111111
+--- /dev/null
++++ b/enn_torch_dev/executor/subgraph.py
+@@ -0,0 +1,158 @@
++from __future__ import annotations
++
++from collections.abc import Mapping, Sequence
++from dataclasses import dataclass, field
++from typing import Any
++
++from torch import nn
++
++from .schema import KeyRef
++from .store import KVStore
++
++
++def _validate_subgraph_key(value: object, field_name: str) -> str:
++    label = f"SubgraphSpec.{field_name}"
++    if not isinstance(value, str):
++        raise TypeError(f"{label} must be a string.")
++    if not value:
++        raise ValueError(f"{label} must be a non-empty string.")
++    if value != value.strip():
++        raise ValueError(
++            f"{label} must not have leading or trailing whitespace."
++        )
++    return value
++
++
++@dataclass(slots=True)
++class SubgraphSpec:
++    """
++    Parent-node schema that aggregates already-registered child nodes.
++
++    ``children`` contains graph node names. A child may be a leaf
++    ``NodeExecutor`` or another ``SubgraphExecutor``.
++    """
++
++    name: str
++    children: list[str]
++    module_key: str | None = None
++    input_kwargs: dict[str, KeyRef] = field(default_factory=dict)
++    output_key: str = ""
++
++    def __post_init__(self) -> None:
++        self.name = _validate_subgraph_key(self.name, "name")
++        if self.module_key is None:
++            self.module_key = self.name
++        else:
++            self.module_key = _validate_subgraph_key(
++                self.module_key, "module_key"
++            )
++        self.output_key = _validate_subgraph_key(self.output_key, "output_key")
++        self.children = self._validate_children(self.children)
++        self.input_kwargs = self._validate_input_kwargs(self.input_kwargs)
++
++    @staticmethod
++    def _validate_children(children: object) -> list[str]:
++        if isinstance(children, (str, bytes, bytearray)) or children is None:
++            raise TypeError("SubgraphSpec.children must be a sequence of strings.")
++
++        try:
++            values = list(children)  # type: ignore[arg-type]
++        except TypeError as exc:
++            raise TypeError(
++                "SubgraphSpec.children must be a sequence of strings."
++            ) from exc
++
++        if not values:
++            raise ValueError("SubgraphSpec.children must not be empty.")
++
++        out: list[str] = []
++        seen: set[str] = set()
++        for child in values:
++            normalized = _validate_subgraph_key(child, "children")
++            if normalized in seen:
++                raise ValueError(
++                    f"SubgraphSpec.children contains duplicate child: {normalized!r}"
++                )
++            seen.add(normalized)
++            out.append(normalized)
++        return out
++
++    @staticmethod
++    def _validate_input_kwargs(value: object) -> dict[str, KeyRef]:
++        if not isinstance(value, Mapping):
++            raise TypeError("SubgraphSpec.input_kwargs must be a mapping.")
++
++        out: dict[str, KeyRef] = {}
++        for key, ref in value.items():
++            norm_key = _validate_subgraph_key(key, "input_kwargs key")
++            if not isinstance(ref, KeyRef):
++                raise TypeError(
++                    "SubgraphSpec.input_kwargs values must be KeyRef instances."
++                )
++            out[norm_key] = ref
++        return out
++
++
++class SubgraphExecutor:
++    """Parent executor that aggregates child node outputs."""
++
++    def __init__(
++        self,
++        spec: SubgraphSpec,
++        child_output_refs: Sequence[KeyRef],
++    ) -> None:
++        if not isinstance(spec, SubgraphSpec):
++            raise TypeError(
++                f"SubgraphExecutor expects SubgraphSpec, got {type(spec)!r}"
++            )
++
++        refs = list(child_output_refs)
++        if not refs:
++            raise ValueError("SubgraphExecutor requires child output references.")
++        for ref in refs:
++            if not isinstance(ref, KeyRef):
++                raise TypeError(
++                    "SubgraphExecutor child_output_refs must contain KeyRef instances."
++                )
++
++        self.spec = spec
++        self._child_output_refs = tuple(refs)
++
++    @property
++    def module_key(self) -> str:
++        module_key = self.spec.module_key
++        if module_key is None:
++            raise RuntimeError("SubgraphSpec.module_key was not initialized.")
++        return module_key
++
++    @property
++    def output_key(self) -> str:
++        return self.spec.output_key
++
++    def output_ref(self) -> KeyRef:
++        return KeyRef(self.output_key)
++
++    @property
++    def children(self) -> tuple[str, ...]:
++        return tuple(self.spec.children)
++
++    @property
++    def child_output_refs(self) -> tuple[KeyRef, ...]:
++        return self._child_output_refs
++
++    def run(self, store: KVStore, module: nn.Module) -> Any:
++        if not isinstance(store, KVStore):
++            raise TypeError(
++                f"SubgraphExecutor.run expects KVStore, got {type(store)!r}"
++            )
++        if not isinstance(module, nn.Module):
++            raise TypeError("SubgraphExecutor.run module must be an nn.Module.")
++
++        values = [store.resolve(ref) for ref in self._child_output_refs]
++        kwargs = {
++            name: store.resolve(ref)
++            for name, ref in self.spec.input_kwargs.items()
++        }
++        out = module(values, **kwargs)
++        store.set(self.spec.output_key, out, origin=self.spec.name)
++        return out
+diff --git a/enn_torch_dev/debug/executor/test_subgraph.py b/enn_torch_dev/debug/executor/test_subgraph.py
+new file mode 100644
+index 0000000..1111111
+--- /dev/null
++++ b/enn_torch_dev/debug/executor/test_subgraph.py
+@@ -0,0 +1,333 @@
++from __future__ import annotations
++
++import pytest
++import torch
++from torch import nn
++
++from enn_torch_dev.executor import (
++    GraphExecutor,
++    KVStore,
++    KeyRef,
++    NodeSpec,
++    SubgraphExecutor,
++    SubgraphSpec,
++)
++from enn_torch_dev.nn import Reducer
++
++
++class _Scale(nn.Module):
++    def __init__(self, scale: float) -> None:
++        super().__init__()
++        self.scale = float(scale)
++
++    def forward(self, x: torch.Tensor) -> torch.Tensor:
++        return x * self.scale
++
++
++class _WeightedReducer(nn.Module):
++    def forward(
++        self,
++        values: list[torch.Tensor],
++        weight: torch.Tensor,
++    ) -> torch.Tensor:
++        return values[0] + values[1] * weight
++
++
++def test_subgraph_executor_reduces_child_outputs() -> None:
++    store = KVStore(
++        {
++            "a": torch.ones(2, 3),
++            "b": torch.full((2, 3), 3.0),
++        }
++    )
++    executor = SubgraphExecutor(
++        SubgraphSpec(
++            name="merge",
++            children=["a", "b"],
++            output_key="out",
++        ),
++        [KeyRef("a"), KeyRef("b")],
++    )
++
++    out = executor.run(store, Reducer(op="mean"))
++
++    assert torch.allclose(out, torch.full((2, 3), 2.0))
++    assert torch.allclose(store.get("out"), torch.full((2, 3), 2.0))
++
++
++def test_subgraph_executor_resolves_input_kwargs() -> None:
++    store = KVStore(
++        {
++            "a": torch.ones(2, 3),
++            "b": torch.full((2, 3), 3.0),
++            "w": torch.tensor(2.0),
++        }
++    )
++    executor = SubgraphExecutor(
++        SubgraphSpec(
++            name="weighted",
++            children=["a", "b"],
++            input_kwargs={"weight": KeyRef("w")},
++            output_key="out",
++        ),
++        [KeyRef("a"), KeyRef("b")],
++    )
++
++    out = executor.run(store, _WeightedReducer())
++
++    assert torch.allclose(out, torch.full((2, 3), 7.0))
++
++
++def test_graph_executor_runs_leaf_nodes_then_subgraph() -> None:
++    x = torch.ones(2, 3)
++    graph = GraphExecutor()
++    graph.add_node(
++        NodeSpec(name="a", input_args=[KeyRef("x")], output_key="a.out"),
++        _Scale(1.0),
++    )
++    graph.add_node(
++        NodeSpec(name="b", input_args=[KeyRef("x")], output_key="b.out"),
++        _Scale(3.0),
++    )
++    graph.add_subgraph(
++        SubgraphSpec(
++            name="merge",
++            children=["a", "b"],
++            output_key="merge.out",
++        ),
++        Reducer(op="mean"),
++    )
++    store = KVStore({"x": x})
++
++    graph.run(store)
++
++    assert torch.allclose(store.get("a.out"), x)
++    assert torch.allclose(store.get("b.out"), x * 3.0)
++    assert torch.allclose(store.get("merge.out"), x * 2.0)
++
++
++def test_graph_executor_runs_two_level_subgraph_tree() -> None:
++    x = torch.ones(2, 3)
++    graph = GraphExecutor()
++    graph.add_node(
++        NodeSpec(name="a", input_args=[KeyRef("x")], output_key="a.out"),
++        _Scale(1.0),
++    )
++    graph.add_node(
++        NodeSpec(name="b", input_args=[KeyRef("x")], output_key="b.out"),
++        _Scale(3.0),
++    )
++    graph.add_subgraph(
++        SubgraphSpec(
++            name="ab",
++            children=["a", "b"],
++            output_key="ab.out",
++        ),
++        Reducer(op="mean"),
++    )
++    graph.add_node(
++        NodeSpec(name="c", input_args=[KeyRef("x")], output_key="c.out"),
++        _Scale(5.0),
++    )
++    graph.add_subgraph(
++        SubgraphSpec(
++            name="root",
++            children=["ab", "c"],
++            output_key="root.out",
++        ),
++        Reducer(op="mean"),
++    )
++
++    store = KVStore({"x": x})
++    graph.run(store)
++
++    assert torch.allclose(store.get("ab.out"), x * 2.0)
++    assert torch.allclose(store.get("root.out"), x * 3.5)
++
++
++def test_graph_executor_get_node_can_return_subgraph_executor() -> None:
++    graph = GraphExecutor()
++    graph.add_node(NodeSpec(name="a", output_key="a.out"), nn.Identity())
++    graph.add_node(NodeSpec(name="b", output_key="b.out"), nn.Identity())
++    graph.add_subgraph(
++        SubgraphSpec(name="merge", children=["a", "b"], output_key="out"),
++        Reducer(op="mean"),
++    )
++
++    node = graph.get_node("merge")
++
++    assert isinstance(node, SubgraphExecutor)
++    assert node.children == ("a", "b")
++    assert node.output_key == "out"
++
++
++def test_graph_executor_child_and_parent_names() -> None:
++    graph = GraphExecutor()
++    graph.add_node(NodeSpec(name="a", output_key="a.out"), nn.Identity())
++    graph.add_node(NodeSpec(name="b", output_key="b.out"), nn.Identity())
++    graph.add_subgraph(
++        SubgraphSpec(name="merge", children=["a", "b"], output_key="out"),
++        Reducer(op="mean"),
++    )
++
++    assert graph.child_names("merge") == ("a", "b")
++    assert graph.parent_names("a") == ("merge",)
++    assert graph.parent_names("b") == ("merge",)
++    assert graph.child_names("a") == ()
++
++
++def test_graph_executor_remove_node_removes_root_only_and_keeps_children() -> None:
++    graph = GraphExecutor()
++    graph.add_node(NodeSpec(name="a", output_key="a.out"), nn.Identity())
++    graph.add_node(NodeSpec(name="b", output_key="b.out"), nn.Identity())
++    graph.add_subgraph(
++        SubgraphSpec(name="merge", children=["a", "b"], output_key="out"),
++        Reducer(op="mean"),
++    )
++
++    graph.remove_node("merge")
++
++    assert graph.node_names() == ("a", "b")
++    assert graph.has_node("a")
++    assert graph.has_node("b")
++    assert not graph.has_node("merge")
++    assert graph.parent_names("a") == ()
++    assert graph.parent_names("b") == ()
++
++
++def test_graph_executor_remove_node_rejects_node_referenced_by_parent() -> None:
++    graph = GraphExecutor()
++    graph.add_node(NodeSpec(name="a", output_key="a.out"), nn.Identity())
++    graph.add_node(NodeSpec(name="b", output_key="b.out"), nn.Identity())
++    graph.add_subgraph(
++        SubgraphSpec(name="merge", children=["a", "b"], output_key="merge.out"),
++        Reducer(op="mean"),
++    )
++    graph.add_subgraph(
++        SubgraphSpec(name="root", children=["merge"], output_key="root.out"),
++        Reducer(op="mean"),
++    )
++
++    with pytest.raises(ValueError, match="referenced by parents"):
++        graph.remove_node("merge")
++
++
++def test_graph_executor_remove_subtree_removes_descendants() -> None:
++    graph = GraphExecutor()
++    graph.add_node(NodeSpec(name="a", output_key="a.out"), nn.Identity())
++    graph.add_node(NodeSpec(name="b", output_key="b.out"), nn.Identity())
++    graph.add_subgraph(
++        SubgraphSpec(name="merge", children=["a", "b"], output_key="merge.out"),
++        Reducer(op="mean"),
++    )
++    graph.add_node(NodeSpec(name="c", output_key="c.out"), nn.Identity())
++    graph.add_subgraph(
++        SubgraphSpec(name="root", children=["merge", "c"], output_key="root.out"),
++        Reducer(op="mean"),
++    )
++
++    graph.remove_subtree("root")
++
++    assert graph.node_names() == ()
++    for name in ("a", "b", "merge", "c", "root"):
++        assert not graph.has_node(name)
++
++
++def test_graph_executor_remove_subtree_rejects_external_parent_reference() -> None:
++    graph = GraphExecutor()
++    graph.add_node(NodeSpec(name="a", output_key="a.out"), nn.Identity())
++    graph.add_node(NodeSpec(name="b", output_key="b.out"), nn.Identity())
++    graph.add_node(NodeSpec(name="c", output_key="c.out"), nn.Identity())
++    graph.add_subgraph(
++        SubgraphSpec(name="merge", children=["a", "b"], output_key="merge.out"),
++        Reducer(op="mean"),
++    )
++    graph.add_subgraph(
++        SubgraphSpec(name="another", children=["a", "c"], output_key="another.out"),
++        Reducer(op="mean"),
++    )
++
++    with pytest.raises(ValueError, match="external parent"):
++        graph.remove_subtree("merge")
++
++
++def test_graph_executor_add_subgraph_rejects_unknown_child() -> None:
++    graph = GraphExecutor()
++
++    with pytest.raises(KeyError, match="missing"):
++        graph.add_subgraph(
++            SubgraphSpec(name="merge", children=["missing"], output_key="out"),
++            Reducer(op="mean"),
++        )
++
++
++def test_graph_executor_add_subgraph_rejects_duplicate_name_and_module_key() -> None:
++    graph = GraphExecutor()
++    graph.add_node(NodeSpec(name="a", output_key="a.out"), nn.Identity())
++    graph.add_node(NodeSpec(name="b", output_key="b.out"), nn.Identity())
++
++    graph.add_subgraph(
++        SubgraphSpec(name="merge", children=["a", "b"], output_key="out"),
++        Reducer(op="mean"),
++    )
++
++    with pytest.raises(ValueError, match="Duplicate node name"):
++        graph.add_subgraph(
++            SubgraphSpec(
++                name="merge",
++                module_key="merge2",
++                children=["a", "b"],
++                output_key="out2",
++            ),
++            Reducer(op="mean"),
++        )
++
++    with pytest.raises(ValueError, match="Duplicate module_key"):
++        graph.add_subgraph(
++            SubgraphSpec(
++                name="merge2",
++                module_key="merge",
++                children=["a", "b"],
++                output_key="out2",
++            ),
++            Reducer(op="mean"),
++        )
++
++
++def test_subgraph_spec_validates_children_and_kwargs() -> None:
++    with pytest.raises(ValueError, match="children"):
++        SubgraphSpec(name="empty", children=[], output_key="out")
++
++    with pytest.raises(TypeError, match="children"):
++        SubgraphSpec(name="bad", children="abc", output_key="out")
++
++    with pytest.raises(ValueError, match="duplicate child"):
++        SubgraphSpec(name="dup", children=["a", "a"], output_key="out")
++
++    with pytest.raises(TypeError, match="KeyRef"):
++        SubgraphSpec(
++            name="bad_kwargs",
++            children=["a"],
++            input_kwargs={"weight": object()},
++            output_key="out",
++        )
++
++
++def test_graph_executor_state_dict_exposes_subgraph_module() -> None:
++    graph = GraphExecutor()
++    graph.add_node(NodeSpec(name="a", output_key="a.out"), nn.Identity())
++    graph.add_node(NodeSpec(name="b", output_key="b.out"), nn.Identity())
++    graph.add_subgraph(
++        SubgraphSpec(
++            name="merge",
++            module_key="merge_module",
++            children=["a", "b"],
++            output_key="out",
++        ),
++        nn.Linear(3, 3),
++    )
++
++    keys = set(graph.state_dict())
++
++    assert "modules_by_key.merge_module.weight" in keys
++    assert "modules_by_key.merge_module.bias" in keys
