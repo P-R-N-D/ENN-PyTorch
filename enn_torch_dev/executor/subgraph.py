@@ -140,6 +140,27 @@ class SubgraphExecutor:
     def child_output_refs(self) -> tuple[KeyRef, ...]:
         return self._child_output_refs
 
+    def set_children(
+        self,
+        children: Sequence[str],
+        child_output_refs: Sequence[KeyRef],
+    ) -> None:
+        normalized_children = SubgraphSpec._validate_children(children)
+        refs = list(child_output_refs)
+        if len(refs) != len(normalized_children):
+            raise ValueError(
+                "SubgraphExecutor children and child_output_refs must have "
+                "the same length."
+            )
+        for ref in refs:
+            if not isinstance(ref, KeyRef):
+                raise TypeError(
+                    "SubgraphExecutor child_output_refs must contain KeyRef instances."
+                )
+
+        self.spec.children = normalized_children
+        self._child_output_refs = tuple(refs)
+
     def run(self, store: KVStore, module: nn.Module) -> Any:
         if not isinstance(store, KVStore):
             raise TypeError(
