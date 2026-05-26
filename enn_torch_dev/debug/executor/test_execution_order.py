@@ -111,3 +111,119 @@ def test_output_key_reusable_after_remove() -> None:
     store = KVStore({"x": torch.tensor([1.0])})
     graph.run(store)
     assert store.has("shared")
+
+
+class _EchoOptional(nn.Module):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x
+
+
+def test_optional_keyrefs_do_not_create_hard_dependencies_or_cycles() -> None:
+    graph = GraphExecutor()
+    graph.add_node(
+        NodeSpec(
+            name="a",
+            input_kwargs={
+                "x": KeyRef("b_out", optional=True, default=torch.tensor([1.0]))
+            },
+            output_key="a_out",
+        ),
+        _EchoOptional(),
+    )
+    graph.add_node(
+        NodeSpec(
+            name="b",
+            input_kwargs={
+                "x": KeyRef("a_out", optional=True, default=torch.tensor([2.0]))
+            },
+            output_key="b_out",
+        ),
+        _EchoOptional(),
+    )
+
+    assert graph.execution_order() == ("a", "b")
+
+    store = KVStore()
+    graph.run(store)
+
+    assert torch.equal(store.get("a_out"), torch.tensor([1.0]))
+    assert torch.equal(store.get("b_out"), torch.tensor([1.0]))
+
+
+def test_optional_keyrefs_do_not_block_node_removal() -> None:
+    graph = GraphExecutor()
+    graph.add_node(NodeSpec(name="a", output_key="a_out"), nn.Identity())
+    graph.add_node(
+        NodeSpec(
+            name="b",
+            input_kwargs={
+                "x": KeyRef("a_out", optional=True, default=torch.tensor([0.0]))
+            },
+            output_key="b_out",
+        ),
+        _EchoOptional(),
+    )
+
+    graph.remove_node("a")
+
+    assert not graph.has_node("a")
+    assert graph.has_node("b")
+
+
+def test_remove_node_can_break_dataflow_cycle() -> None:
+    graph = GraphExecutor()
+    graph.add_node(
+        NodeSpec(name="a", input_args=[KeyRef("b_out")], output_key="a_out"),
+        nn.Identity(),
+    )
+    graph.add_node(
+        NodeSpec(name="b", input_args=[KeyRef("a_out")], output_key="b_out"),
+        nn.Identity(),
+    )
+
+    with pytest.raises(RuntimeError, match="Cycle detected"):
+        graph.execution_order()
+
+    graph.remove_node("a")
+
+    assert not graph.has_node("a")
+    assert graph.execution_order() == ("b",)
+
+
+def test_remove_subtree_can_break_single_node_dataflow_cycle() -> None:
+    graph = GraphExecutor()
+    graph.add_node(
+        NodeSpec(name="a", input_args=[KeyRef("b_out")], output_key="a_out"),
+        nn.Identity(),
+    )
+    graph.add_node(
+        NodeSpec(name="b", input_args=[KeyRef("a_out")], output_key="b_out"),
+        nn.Identity(),
+    )
+
+    with pytest.raises(RuntimeError, match="Cycle detected"):
+        graph.execution_order()
+
+    graph.remove_subtree("a")
+
+    assert not graph.has_node("a")
+    assert graph.execution_order() == ("b",)
+
+
+def test_remove_node_in_cycle_still_rejects_external_dependent() -> None:
+    graph = GraphExecutor()
+    graph.add_node(
+        NodeSpec(name="a", input_args=[KeyRef("b_out")], output_key="a_out"),
+        nn.Identity(),
+    )
+    graph.add_node(
+        NodeSpec(name="b", input_args=[KeyRef("a_out")], output_key="b_out"),
+        nn.Identity(),
+    )
+    graph.add_node(
+        NodeSpec(name="outside", input_args=[KeyRef("a_out")], output_key="outside_out"),
+        nn.Identity(),
+    )
+
+    with pytest.raises(ValueError, match="dependent nodes"):
+        graph.remove_node("a")

@@ -157,6 +157,8 @@ class GraphExecutor(nn.Module):
             deps.add(child)
 
         for ref in self._input_refs_for_node(name):
+            if ref.optional:
+                continue
             producer = self._producer_by_output_key.get(ref.key)
             if producer is not None:
                 deps.add(producer)
@@ -169,6 +171,40 @@ class GraphExecutor(nn.Module):
             for name in self._order
             if name in self._nodes
         }
+
+    def _cycle_node_names(
+        self,
+        deps: dict[str, set[str]] | None = None,
+    ) -> set[str]:
+        work = {
+            name: set(node_deps)
+            for name, node_deps in (deps or self._dependencies_by_node()).items()
+        }
+        remaining = set(work)
+        ready = [
+            name
+            for name in self._order
+            if name in remaining and not work[name]
+        ]
+
+        while ready:
+            name = ready.pop(0)
+            if name not in remaining:
+                continue
+
+            remaining.remove(name)
+
+            for candidate in self._order:
+                if candidate not in remaining:
+                    continue
+                candidate_deps = work[candidate]
+                if name not in candidate_deps:
+                    continue
+                candidate_deps.remove(name)
+                if not candidate_deps and candidate not in ready:
+                    ready.append(candidate)
+
+        return remaining
 
     def execution_order(self) -> tuple[str, ...]:
         deps = self._dependencies_by_node()
@@ -247,12 +283,48 @@ class GraphExecutor(nn.Module):
                 return
             raise KeyError(f"Unknown node: {name!r}")
 
-        dependents = self._dependent_names(name)
-        if dependents:
+        structural_parents = tuple(sorted(self._parents_by_child.get(name, set())))
+        if structural_parents:
             raise ValueError(
                 f"Cannot remove node {name!r}; it is referenced by "
-                f"parents/dependent nodes: {list(dependents)!r}"
+                f"parents: {list(structural_parents)!r}"
             )
+
+        dependents = self._dependent_names(name)
+        if dependents:
+            deps = self._dependencies_by_node()
+            cycle_nodes = self._cycle_node_names(deps)
+
+            def _reachable(src: str, dst: str) -> bool:
+                if src == dst:
+                    return True
+                seen: set[str] = set()
+                stack = [src]
+                while stack:
+                    current = stack.pop()
+                    if current in seen:
+                        continue
+                    seen.add(current)
+                    for nxt in deps.get(current, set()):
+                        if nxt == dst:
+                            return True
+                        if nxt not in seen:
+                            stack.append(nxt)
+                return False
+
+            blocking_dependents = tuple(
+                dependent
+                for dependent in dependents
+                if (
+                    dependent not in cycle_nodes
+                    or not (_reachable(name, dependent) and _reachable(dependent, name))
+                )
+            )
+            if name not in cycle_nodes or blocking_dependents:
+                raise ValueError(
+                    f"Cannot remove node {name!r}; it is referenced by "
+                    f"dependent nodes: {list(dependents)!r}"
+                )
 
         self._remove_node_unchecked(name)
 
@@ -281,16 +353,30 @@ class GraphExecutor(nn.Module):
         removal_order = self._collect_subtree_postorder(name)
         removal_set = set(removal_order)
         deps = self._dependencies_by_node()
+        cycle_nodes = self._cycle_node_names(deps)
+        allow_single_node_cycle_repair = len(removal_order) == 1 and name in cycle_nodes
 
         external_refs: dict[str, tuple[str, ...]] = {}
         for node_name in removal_order:
-            external = tuple(
-                sorted(
-                    candidate
-                    for candidate, candidate_deps in deps.items()
-                    if candidate not in removal_set and node_name in candidate_deps
-                )
+            external_candidates = {
+                candidate
+                for candidate, candidate_deps in deps.items()
+                if candidate not in removal_set and node_name in candidate_deps
+            }
+            structural_external = (
+                self._parents_by_child.get(node_name, set()) - removal_set
             )
+
+            if allow_single_node_cycle_repair:
+                dataflow_external = external_candidates - structural_external
+                external_candidates = set(structural_external)
+                external_candidates.update(
+                    candidate
+                    for candidate in dataflow_external
+                    if candidate not in cycle_nodes
+                )
+
+            external = tuple(sorted(external_candidates))
             if external:
                 external_refs[node_name] = external
 
