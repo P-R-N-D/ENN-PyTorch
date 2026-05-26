@@ -30,19 +30,37 @@ class KVStore:
                 self.set(key, value)
 
     def __contains__(self, key: object) -> bool:
-        return isinstance(key, str) and key in self._data
+        return (
+            isinstance(key, str)
+            and self._is_valid_key(key)
+            and key in self._data
+        )
 
     def __len__(self) -> int:
         return len(self._data)
 
     @staticmethod
     def _validate_key(key: str) -> str:
-        if not isinstance(key, str) or not key.strip():
+        if not isinstance(key, str):
+            raise TypeError("KVStore key must be a string.")
+        if not key:
             raise ValueError("KVStore key must be a non-empty string.")
+        if key != key.strip():
+            raise ValueError(
+                "KVStore key must not have leading or trailing whitespace."
+            )
         return key
 
-    def has(self, key: str) -> bool:
-        return key in self._data
+    @staticmethod
+    def _is_valid_key(key: object) -> bool:
+        return (
+            isinstance(key, str)
+            and bool(key)
+            and key == key.strip()
+        )
+
+    def has(self, key: object) -> bool:
+        return self._is_valid_key(key) and key in self._data
 
     def keys(self) -> tuple[str, ...]:
         return tuple(self._data.keys())

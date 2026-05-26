@@ -13,6 +13,24 @@ def test_node_spec_defaults_module_key_to_name() -> None:
     assert spec.module_key == "linear"
 
 
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"name": " linear ", "output_key": "y"},
+        {"name": "linear", "module_key": " linear ", "output_key": "y"},
+        {"name": "linear", "output_key": " y "},
+    ],
+)
+def test_node_spec_rejects_surrounding_whitespace(kwargs: dict[str, str]) -> None:
+    with pytest.raises(ValueError, match="whitespace"):
+        NodeSpec(**kwargs)
+
+
+def test_node_spec_rejects_non_string_name() -> None:
+    with pytest.raises(TypeError, match="string"):
+        NodeSpec(name=123, output_key="y")
+
+
 def test_node_executor_runs_module_and_writes_output() -> None:
     x = torch.randn(2, 4)
     store = KVStore({"x": x})

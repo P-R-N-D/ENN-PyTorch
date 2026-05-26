@@ -36,5 +36,11 @@ class KeyRef:
     default: Any = None
 
     def __post_init__(self) -> None:
-        if not isinstance(self.key, str) or not self.key.strip():
+        if not isinstance(self.key, str):
+            raise TypeError("KeyRef.key must be a string.")
+        if not self.key:
             raise ValueError("KeyRef.key must be a non-empty string.")
+        if self.key != self.key.strip():
+            raise ValueError(
+                "KeyRef.key must not have leading or trailing whitespace."
+            )
