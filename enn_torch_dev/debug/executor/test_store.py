@@ -55,9 +55,28 @@ def test_kv_store_resolve_keyref() -> None:
     assert torch.equal(store.resolve(KeyRef("x")), x)
 
 
+def test_keyref_rejects_non_string_key() -> None:
+    with pytest.raises(TypeError, match="string"):
+        KeyRef(123)
+
+
 def test_keyref_rejects_empty_key() -> None:
     with pytest.raises(ValueError, match="non-empty"):
         KeyRef("")
+
+
+def test_keyref_rejects_surrounding_whitespace_key() -> None:
+    with pytest.raises(ValueError, match="whitespace"):
+        KeyRef(" x ")
+
+
+def test_kv_store_has_returns_false_for_invalid_keys() -> None:
+    store = KVStore({"x": torch.randn(2, 3)})
+
+    assert not store.has("")
+    assert not store.has(" x ")
+    assert "" not in store
+    assert " x " not in store
 
 
 def test_kv_store_optional_keyref_returns_default() -> None:
@@ -78,6 +97,27 @@ def test_kv_store_rejects_empty_key() -> None:
 
     with pytest.raises(ValueError, match="non-empty"):
         store.set("", torch.tensor(1.0))
+
+
+def test_kv_store_rejects_non_string_key() -> None:
+    store = KVStore()
+
+    with pytest.raises(TypeError, match="string"):
+        store.get(123)
+
+
+@pytest.mark.parametrize("bad_key", [" x", "x ", "\tx"])
+def test_kv_store_rejects_surrounding_whitespace_key(bad_key: str) -> None:
+    store = KVStore({"x": torch.randn(2, 3)})
+
+    with pytest.raises(ValueError, match="whitespace"):
+        store.get(bad_key)
+
+    with pytest.raises(ValueError, match="whitespace"):
+        store.set(bad_key, torch.tensor(1.0))
+
+    with pytest.raises(ValueError, match="whitespace"):
+        store.delete(bad_key)
 
 
 def test_kv_store_to_moves_tensor_values_only() -> None:

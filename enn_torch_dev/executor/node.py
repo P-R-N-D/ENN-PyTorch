@@ -9,6 +9,19 @@ from .schema import KeyRef
 from .store import KVStore
 
 
+def _validate_spec_key(value: object, field_name: str) -> str:
+    label = f"NodeSpec.{field_name}"
+    if not isinstance(value, str):
+        raise TypeError(f"{label} must be a string.")
+    if not value:
+        raise ValueError(f"{label} must be a non-empty string.")
+    if value != value.strip():
+        raise ValueError(
+            f"{label} must not have leading or trailing whitespace."
+        )
+    return value
+
+
 @dataclass(slots=True)
 class NodeSpec:
     """
@@ -26,14 +39,14 @@ class NodeSpec:
     output_key: str = ""
 
     def __post_init__(self) -> None:
-        if not isinstance(self.name, str) or not self.name.strip():
-            raise ValueError("NodeSpec.name must be a non-empty string.")
+        self.name = _validate_spec_key(self.name, "name")
         if self.module_key is None:
             self.module_key = self.name
-        elif not isinstance(self.module_key, str) or not self.module_key.strip():
-            raise ValueError("NodeSpec.module_key must be a non-empty string.")
-        if not isinstance(self.output_key, str) or not self.output_key.strip():
-            raise ValueError("NodeSpec.output_key must be a non-empty string.")
+        else:
+            self.module_key = _validate_spec_key(
+                self.module_key, "module_key"
+            )
+        self.output_key = _validate_spec_key(self.output_key, "output_key")
 
 
 class NodeExecutor:
