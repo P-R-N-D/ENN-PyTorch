@@ -30,11 +30,34 @@ def test_kv_store_set_get_and_metadata() -> None:
     assert value.meta == {"kind": "feature"}
 
 
+def test_kv_store_set_value_preserves_graph_value() -> None:
+    x = torch.randn(2, 3)
+    value = GraphValue(data=x, layout="B,D", origin="prepared")
+    store = KVStore()
+
+    store.set_value("prepared.x", value)
+
+    assert store.get_value("prepared.x") is value
+    assert torch.equal(store.get("prepared.x"), x)
+
+
+def test_kv_store_set_value_rejects_non_graph_value() -> None:
+    store = KVStore()
+
+    with pytest.raises(TypeError, match="GraphValue"):
+        store.set_value("x", torch.tensor(1.0))
+
+
 def test_kv_store_resolve_keyref() -> None:
     x = torch.randn(2, 3)
     store = KVStore({"x": x})
 
     assert torch.equal(store.resolve(KeyRef("x")), x)
+
+
+def test_keyref_rejects_empty_key() -> None:
+    with pytest.raises(ValueError, match="non-empty"):
+        KeyRef("")
 
 
 def test_kv_store_optional_keyref_returns_default() -> None:

@@ -34,3 +34,7 @@ class KeyRef:
     key: str
     optional: bool = False
     default: Any = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.key, str) or not self.key.strip():
+            raise ValueError("KeyRef.key must be a non-empty string.")

@@ -35,13 +35,26 @@ class KVStore:
     def __len__(self) -> int:
         return len(self._data)
 
+    @staticmethod
+    def _validate_key(key: str) -> str:
+        if not isinstance(key, str) or not key.strip():
+            raise ValueError("KVStore key must be a non-empty string.")
+        return key
+
     def has(self, key: str) -> bool:
         return key in self._data
 
     def keys(self) -> tuple[str, ...]:
         return tuple(self._data.keys())
 
-    def get(self, key: str, *, optional: bool = False, default: Any = None) -> Any:
+    def get(
+        self,
+        key: str,
+        *,
+        optional: bool = False,
+        default: Any = None,
+    ) -> Any:
+        key = self._validate_key(key)
         if key not in self._data:
             if optional:
                 return default
@@ -50,24 +63,52 @@ class KVStore:
         return self._data[key].data
 
     def get_value(self, key: str) -> GraphValue:
+        key = self._validate_key(key)
         if key not in self._data:
             raise KeyError(f"KVStore missing key: {key!r}")
 
         return self._data[key]
 
-    def set(self, key: str, value: Any, *, layout: str | None = None, mask_key: str | None = None, origin: str | None = None, meta: Mapping[str, Any] | None = None) -> None:
-        if not isinstance(key, str) or not key.strip():
-            raise ValueError("KVStore key must be a non-empty string.")
+    def set(
+        self,
+        key: str,
+        value: Any,
+        *,
+        layout: str | None = None,
+        mask_key: str | None = None,
+        origin: str | None = None,
+        meta: Mapping[str, Any] | None = None,
+    ) -> None:
+        self.set_value(
+            key,
+            GraphValue(
+                data=value,
+                layout=layout,
+                mask_key=mask_key,
+                origin=origin,
+                meta=dict(meta or {}),
+            ),
+        )
 
-        self._data[key] = GraphValue(data=value, layout=layout, mask_key=mask_key, origin=origin, meta=dict(meta or {}))
+    def set_value(self, key: str, value: GraphValue) -> None:
+        key = self._validate_key(key)
+        if not isinstance(value, GraphValue):
+            raise TypeError(f"set_value expects GraphValue, got {type(value)!r}")
+
+        self._data[key] = value
 
     def resolve(self, ref: KeyRef) -> Any:
         if not isinstance(ref, KeyRef):
             raise TypeError(f"KVStore.resolve expects KeyRef, got {type(ref)!r}")
 
-        return self.get(ref.key, optional=ref.optional, default=ref.default)
+        return self.get(
+            ref.key,
+            optional=ref.optional,
+            default=ref.default,
+        )
 
     def delete(self, key: str, *, missing_ok: bool = False) -> None:
+        key = self._validate_key(key)
         if key not in self._data:
             if missing_ok:
                 return
@@ -78,7 +119,13 @@ class KVStore:
     def clear(self) -> None:
         self._data.clear()
 
-    def to(self, device: torch.device | str, *, keys: list[str] | tuple[str, ...] | None = None, non_blocking: bool = False) -> "KVStore":
+    def to(
+        self,
+        device: torch.device | str,
+        *,
+        keys: list[str] | tuple[str, ...] | None = None,
+        non_blocking: bool = False,
+    ) -> "KVStore":
         target_keys = self.keys() if keys is None else tuple(keys)
 
         for key in target_keys:
@@ -86,7 +133,14 @@ class KVStore:
             value = gv.data
 
             if isinstance(value, Tensor):
-                self.set(key, value.to(device=device, non_blocking=non_blocking), layout=gv.layout, mask_key=gv.mask_key, origin=gv.origin, meta=gv.meta)
+                self.set(
+                    key,
+                    value.to(device=device, non_blocking=non_blocking),
+                    layout=gv.layout,
+                    mask_key=gv.mask_key,
+                    origin=gv.origin,
+                    meta=gv.meta,
+                )
 
         return self
 
