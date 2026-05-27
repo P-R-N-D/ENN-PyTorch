@@ -1,0 +1,375 @@
+diff --git a/enn_torch_dev/executor/__init__.py b/enn_torch_dev/executor/__init__.py
+index 808c0dc..e33b7a4 100644
+--- a/enn_torch_dev/executor/__init__.py
++++ b/enn_torch_dev/executor/__init__.py
+@@ -8,6 +8,7 @@ from .store import KVStore
+ from .subgraph import SubgraphExecutor, SubgraphSpec
+ from .tile import TileExecutor, TileSpec
++from .tile_policy import TileMeta, TilePolicy
+
+ __all__ = [
+     "GraphValue",
+@@ -20,4 +21,6 @@ __all__ = [
+     "SubgraphSpec",
+     "TileExecutor",
+     "TileSpec",
++    "TileMeta",
++    "TilePolicy",
+ ]
+diff --git a/enn_torch_dev/executor/tile_policy.py b/enn_torch_dev/executor/tile_policy.py
+new file mode 100644
+index 0000000..e2a4d1b
+--- /dev/null
++++ b/enn_torch_dev/executor/tile_policy.py
+@@ -0,0 +1,184 @@
++from __future__ import annotations
++
++from dataclasses import dataclass
++from itertools import product
++from typing import Any
++
++from torch import Tensor
++
++
++def _is_sequence(value: object) -> bool:
++    return not isinstance(value, (str, bytes, bytearray)) and value is not None
++
++
++def _normalize_int_tuple(
++    value: object,
++    *,
++    field_name: str,
++    allow_none: bool = False,
++) -> tuple[int, ...] | None:
++    if value is None:
++        if allow_none:
++            return None
++        raise TypeError(f"{field_name} must be a sequence of positive integers.")
++    if not _is_sequence(value):
++        raise TypeError(f"{field_name} must be a sequence of positive integers.")
++
++    try:
++        items = tuple(value)  # type: ignore[arg-type]
++    except TypeError as exc:
++        raise TypeError(
++            f"{field_name} must be a sequence of positive integers."
++        ) from exc
++
++    if not items:
++        raise ValueError(f"{field_name} must not be empty.")
++    if not all(isinstance(item, int) for item in items):
++        raise TypeError(f"{field_name} must contain integers only.")
++    if not all(item > 0 for item in items):
++        raise ValueError(f"{field_name} values must be positive.")
++    return items
++
++
++def _normalize_dims(value: object, *, rank: int) -> tuple[int, ...] | None:
++    if value is None:
++        return None
++    if not _is_sequence(value):
++        raise TypeError("dims must be a sequence of integers.")
++
++    try:
++        dims = tuple(value)  # type: ignore[arg-type]
++    except TypeError as exc:
++        raise TypeError("dims must be a sequence of integers.") from exc
++
++    if len(dims) != rank:
++        raise ValueError("dims length must match tile_shape length.")
++    if not all(isinstance(dim, int) for dim in dims):
++        raise TypeError("dims must contain integers only.")
++    return dims
++
++
++def _tile_starts(
++    *,
++    length: int,
++    tile_size: int,
++    stride: int,
++    drop_last: bool,
++) -> tuple[int, ...]:
++    if length <= 0:
++        return ()
++    if drop_last:
++        if length < tile_size:
++            return ()
++        return tuple(range(0, length - tile_size + 1, stride))
++
++    return tuple(range(0, length, stride))
++
++
++@dataclass(frozen=True, slots=True)
++class TileMeta:
++    """
++    Location metadata for one tile.
++
++    ``start`` and ``end`` are coordinates on the tiled dimensions. ``slices`` is
++    the full slicing tuple for the original tensor, and ``dims`` is the
++    normalized positive dimension tuple that was tiled.
++    """
++
++    index: int
++    start: tuple[int, ...]
++    end: tuple[int, ...]
++    slices: tuple[slice, ...]
++    full_shape: tuple[int, ...]
++    dims: tuple[int, ...]
++
++
++@dataclass(slots=True)
++class TilePolicy:
++    """
++    Split a tensor into positional tiles.
++
++    This policy belongs to the executor layer because it is an execution/data
++    partitioning rule, not a trainable neural network layer. Learnable
++    reconstruction or local/global fusion should live in ``nn`` modules.
++    """
++
++    tile_shape: tuple[int, ...]
++    stride: tuple[int, ...] | None = None
++    dims: tuple[int, ...] | None = None
++    drop_last: bool = False
++
++    def __post_init__(self) -> None:
++        tile_shape = _normalize_int_tuple(
++            self.tile_shape,
++            field_name="tile_shape",
++        )
++        assert tile_shape is not None
++        self.tile_shape = tile_shape
++
++        stride = _normalize_int_tuple(
++            self.stride,
++            field_name="stride",
++            allow_none=True,
++        )
++        self.stride = tile_shape if stride is None else stride
++        if len(self.stride) != len(self.tile_shape):
++            raise ValueError("stride length must match tile_shape length.")
++
++        self.dims = _normalize_dims(self.dims, rank=len(self.tile_shape))
++        if not isinstance(self.drop_last, bool):
++            raise TypeError("drop_last must be a bool.")
++
++    def _normalized_dims_for(self, x: Tensor) -> tuple[int, ...]:
++        ndim = x.ndim
++        rank = len(self.tile_shape)
++        if rank > ndim:
++            raise ValueError(
++                f"tile rank {rank} cannot exceed tensor ndim {ndim}."
++            )
++
++        if self.dims is None:
++            dims = tuple(range(ndim - rank, ndim))
++        else:
++            dims = tuple(dim + ndim if dim < 0 else dim for dim in self.dims)
++
++        for dim in dims:
++            if dim < 0 or dim >= ndim:
++                raise ValueError(f"tile dim out of range for ndim {ndim}: {dim!r}")
++        if len(set(dims)) != len(dims):
++            raise ValueError("dims must not contain duplicate dimensions.")
++        return dims
++
++    def split(self, x: Tensor) -> tuple[list[Tensor], list[TileMeta]]:
++        if not isinstance(x, Tensor):
++            raise TypeError(f"TilePolicy.split expects Tensor, got {type(x)!r}")
++
++        dims = self._normalized_dims_for(x)
++        starts_by_dim = [
++            _tile_starts(
++                length=int(x.shape[dim]),
++                tile_size=tile_size,
++                stride=stride,
++                drop_last=self.drop_last,
++            )
++            for dim, tile_size, stride in zip(dims, self.tile_shape, self.stride)
++        ]
++
++        if any(not starts for starts in starts_by_dim):
++            return [], []
++
++        tiles: list[Tensor] = []
++        metas: list[TileMeta] = []
++        full_shape = tuple(int(size) for size in x.shape)
++
++        for index, starts in enumerate(product(*starts_by_dim)):
++            ends = tuple(
++                min(start + tile_size, int(x.shape[dim]))
++                for start, tile_size, dim in zip(starts, self.tile_shape, dims)
++            )
++            slices: list[Any] = [slice(None)] * x.ndim
++            for dim, start, end in zip(dims, starts, ends):
++                slices[dim] = slice(start, end)
++            slice_tuple = tuple(slices)
++
++            tiles.append(x[slice_tuple])
++            metas.append(
++                TileMeta(
++                    index=index,
++                    start=tuple(int(start) for start in starts),
++                    end=tuple(int(end) for end in ends),
++                    slices=slice_tuple,
++                    full_shape=full_shape,
++                    dims=dims,
++                )
++            )
++
++        return tiles, metas
+diff --git a/enn_torch_dev/debug/executor/test_tile_policy.py b/enn_torch_dev/debug/executor/test_tile_policy.py
+new file mode 100644
+index 0000000..c0a5e70
+--- /dev/null
++++ b/enn_torch_dev/debug/executor/test_tile_policy.py
+@@ -0,0 +1,165 @@
++from __future__ import annotations
++
++import pytest
++import torch
++
++from enn_torch_dev.executor import TileMeta, TilePolicy
++
++
++def test_tile_policy_splits_1d_tensor() -> None:
++    x = torch.arange(5)
++    policy = TilePolicy(tile_shape=(2,))
++
++    tiles, metas = policy.split(x)
++
++    assert [tile.tolist() for tile in tiles] == [[0, 1], [2, 3], [4]]
++    assert [meta.start for meta in metas] == [(0,), (2,), (4,)]
++    assert [meta.end for meta in metas] == [(2,), (4,), (5,)]
++    assert metas[0].full_shape == (5,)
++    assert metas[0].dims == (0,)
++    assert isinstance(metas[0], TileMeta)
++
++
++def test_tile_policy_drop_last_discards_incomplete_1d_tile() -> None:
++    x = torch.arange(5)
++    policy = TilePolicy(tile_shape=(2,), drop_last=True)
++
++    tiles, metas = policy.split(x)
++
++    assert [tile.tolist() for tile in tiles] == [[0, 1], [2, 3]]
++    assert [meta.start for meta in metas] == [(0,), (2,)]
++    assert [meta.end for meta in metas] == [(2,), (4,)]
++
++
++def test_tile_policy_splits_2d_tensor_with_edge_tiles() -> None:
++    x = torch.arange(12).reshape(3, 4)
++    policy = TilePolicy(tile_shape=(2, 3))
++
++    tiles, metas = policy.split(x)
++
++    assert [tuple(tile.shape) for tile in tiles] == [
++        (2, 3),
++        (2, 1),
++        (1, 3),
++        (1, 1),
++    ]
++    assert [meta.start for meta in metas] == [
++        (0, 0),
++        (0, 3),
++        (2, 0),
++        (2, 3),
++    ]
++    assert [meta.end for meta in metas] == [
++        (2, 3),
++        (2, 4),
++        (3, 3),
++        (3, 4),
++    ]
++    assert metas[0].slices == (slice(0, 2), slice(0, 3))
++
++
++def test_tile_policy_splits_only_selected_bchw_dims() -> None:
++    x = torch.arange(2 * 3 * 4 * 5).reshape(2, 3, 4, 5)
++    policy = TilePolicy(tile_shape=(2, 3), stride=(2, 3), dims=(-2, -1))
++
++    tiles, metas = policy.split(x)
++
++    assert len(tiles) == 4
++    assert [tuple(tile.shape) for tile in tiles] == [
++        (2, 3, 2, 3),
++        (2, 3, 2, 2),
++        (2, 3, 2, 3),
++        (2, 3, 2, 2),
++    ]
++    assert metas[0].dims == (2, 3)
++    assert metas[0].full_shape == (2, 3, 4, 5)
++    assert metas[0].slices == (
++        slice(None),
++        slice(None),
++        slice(0, 2),
++        slice(0, 3),
++    )
++
++
++def test_tile_policy_drop_last_discards_incomplete_spatial_tiles() -> None:
++    x = torch.arange(1 * 1 * 4 * 5).reshape(1, 1, 4, 5)
++    policy = TilePolicy(
++        tile_shape=(3, 3),
++        stride=(3, 3),
++        dims=(-2, -1),
++        drop_last=True,
++    )
++
++    tiles, metas = policy.split(x)
++
++    assert len(tiles) == 1
++    assert tuple(tiles[0].shape) == (1, 1, 3, 3)
++    assert metas[0].start == (0, 0)
++    assert metas[0].end == (3, 3)
++
++
++def test_tile_policy_supports_overlap_stride() -> None:
++    x = torch.arange(5)
++    policy = TilePolicy(tile_shape=(3,), stride=(2,))
++
++    tiles, metas = policy.split(x)
++
++    assert [tile.tolist() for tile in tiles] == [[0, 1, 2], [2, 3, 4], [4]]
++    assert [meta.start for meta in metas] == [(0,), (2,), (4,)]
++
++
++def test_tile_policy_empty_dim_returns_no_tiles() -> None:
++    x = torch.empty(0)
++    policy = TilePolicy(tile_shape=(2,))
++
++    tiles, metas = policy.split(x)
++
++    assert tiles == []
++    assert metas == []
++
++
++def test_tile_policy_validates_init_arguments() -> None:
++    with pytest.raises(ValueError, match="tile_shape"):
++        TilePolicy(tile_shape=())
++
++    with pytest.raises(ValueError, match="positive"):
++        TilePolicy(tile_shape=(0,))
++
++    with pytest.raises(ValueError, match="stride length"):
++        TilePolicy(tile_shape=(2, 2), stride=(1,))
++
++    with pytest.raises(ValueError, match="dims length"):
++        TilePolicy(tile_shape=(2, 2), dims=(0,))
++
++    with pytest.raises(TypeError, match="drop_last"):
++        TilePolicy(tile_shape=(2,), drop_last=1)
++
++
++def test_tile_policy_validates_split_arguments() -> None:
++    with pytest.raises(TypeError, match="Tensor"):
++        TilePolicy(tile_shape=(2,)).split([1, 2, 3])
++
++    with pytest.raises(ValueError, match="cannot exceed"):
++        TilePolicy(tile_shape=(2, 2, 2)).split(torch.zeros(2, 2))
++
++    with pytest.raises(ValueError, match="duplicate"):
++        TilePolicy(tile_shape=(2, 2), dims=(-1, 1)).split(torch.zeros(2, 2))
++
++    with pytest.raises(ValueError, match="out of range"):
++        TilePolicy(tile_shape=(2,), dims=(2,)).split(torch.zeros(2, 2))
