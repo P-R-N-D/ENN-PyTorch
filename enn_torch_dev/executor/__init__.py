@@ -5,6 +5,7 @@ from .node import NodeExecutor, NodeSpec
 from .schema import GraphValue, KeyRef
 from .store import KVStore
 from .subgraph import SubgraphExecutor, SubgraphSpec
+from .tile import TileExecutor, TileSpec
 
 __all__ = [
     "GraphValue",
@@ -15,4 +16,6 @@ __all__ = [
     "NodeSpec",
     "SubgraphExecutor",
     "SubgraphSpec",
+    "TileExecutor",
+    "TileSpec",
 ]
