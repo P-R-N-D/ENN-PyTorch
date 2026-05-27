@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
 
 import torch
 from torch import Tensor
@@ -22,19 +22,31 @@ class KVStore:
     attach lightweight metadata while keeping the initial implementation small.
     """
 
-    def __init__(self, initial: Mapping[str, Any] | None = None) -> None:
+    def __init__(
+        self,
+        initial: Mapping[str, Any] | None = None,
+        *,
+        parent: "KVStore | None" = None,
+    ) -> None:
+        if parent is not None and not isinstance(parent, KVStore):
+            raise TypeError(f"KVStore parent must be KVStore, got {type(parent)!r}")
+
         self._data: dict[str, GraphValue] = {}
+        self._parent = parent
 
         if initial is not None:
             for key, value in initial.items():
                 self.set(key, value)
 
+    @property
+    def parent(self) -> "KVStore | None":
+        return self._parent
+
+    def fork(self, initial: Mapping[str, Any] | None = None) -> "KVStore":
+        return KVStore(initial, parent=self)
+
     def __contains__(self, key: object) -> bool:
-        return (
-            isinstance(key, str)
-            and self._is_valid_key(key)
-            and key in self._data
-        )
+        return self.has(key)
 
     def __len__(self) -> int:
         return len(self._data)
@@ -53,17 +65,32 @@ class KVStore:
 
     @staticmethod
     def _is_valid_key(key: object) -> bool:
-        return (
-            isinstance(key, str)
-            and bool(key)
-            and key == key.strip()
-        )
+        return isinstance(key, str) and bool(key) and key == key.strip()
 
     def has(self, key: object) -> bool:
-        return self._is_valid_key(key) and key in self._data
+        if not self._is_valid_key(key):
+            return False
+        if key in self._data:
+            return True
+        return self._parent.has(key) if self._parent is not None else False
 
-    def keys(self) -> tuple[str, ...]:
+    def local_keys(self) -> tuple[str, ...]:
         return tuple(self._data.keys())
+
+    def keys(self, *, include_parent: bool = False) -> tuple[str, ...]:
+        if not include_parent or self._parent is None:
+            return self.local_keys()
+
+        out: list[str] = []
+        seen: set[str] = set()
+        for key in self._parent.keys(include_parent=True):
+            out.append(key)
+            seen.add(key)
+        for key in self._data:
+            if key not in seen:
+                out.append(key)
+                seen.add(key)
+        return tuple(out)
 
     def get(
         self,
@@ -73,19 +100,21 @@ class KVStore:
         default: Any = None,
     ) -> Any:
         key = self._validate_key(key)
-        if key not in self._data:
-            if optional:
-                return default
-            raise KeyError(f"KVStore missing key: {key!r}")
-
-        return self._data[key].data
+        if key in self._data:
+            return self._data[key].data
+        if self._parent is not None:
+            return self._parent.get(key, optional=optional, default=default)
+        if optional:
+            return default
+        raise KeyError(f"KVStore missing key: {key!r}")
 
     def get_value(self, key: str) -> GraphValue:
         key = self._validate_key(key)
-        if key not in self._data:
-            raise KeyError(f"KVStore missing key: {key!r}")
-
-        return self._data[key]
+        if key in self._data:
+            return self._data[key]
+        if self._parent is not None:
+            return self._parent.get_value(key)
+        raise KeyError(f"KVStore missing key: {key!r}")
 
     def set(
         self,
@@ -130,12 +159,35 @@ class KVStore:
         if key not in self._data:
             if missing_ok:
                 return
-            raise KeyError(f"KVStore missing key: {key!r}")
+            raise KeyError(f"KVStore missing local key: {key!r}")
 
         del self._data[key]
 
     def clear(self) -> None:
         self._data.clear()
+
+    def commit_to(
+        self,
+        target: "KVStore",
+        *,
+        keys: Sequence[str] | None = None,
+        overwrite: bool = True,
+    ) -> "KVStore":
+        if not isinstance(target, KVStore):
+            raise TypeError(f"target must be KVStore, got {type(target)!r}")
+
+        selected = self.local_keys() if keys is None else tuple(keys)
+        for key in selected:
+            key = self._validate_key(key)
+            if key not in self._data:
+                raise KeyError(
+                    f"KVStore.commit_to can only commit local keys, got {key!r}"
+                )
+            if (not overwrite) and target.has(key):
+                continue
+            target.set_value(key, self._data[key])
+
+        return target
 
     def to(
         self,
@@ -144,7 +196,7 @@ class KVStore:
         keys: list[str] | tuple[str, ...] | None = None,
         non_blocking: bool = False,
     ) -> "KVStore":
-        target_keys = self.keys() if keys is None else tuple(keys)
+        target_keys = self.local_keys() if keys is None else tuple(keys)
 
         for key in target_keys:
             gv = self.get_value(key)
@@ -163,6 +215,6 @@ class KVStore:
         return self
 
     def shallow_copy(self) -> "KVStore":
-        copied = KVStore()
+        copied = KVStore(parent=self._parent)
         copied._data = dict(self._data)
         return copied
