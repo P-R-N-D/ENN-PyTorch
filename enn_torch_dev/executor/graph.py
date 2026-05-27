@@ -209,7 +209,7 @@ class GraphExecutor(nn.Module):
         for child in normalized:
             self._parents_by_child.setdefault(child, set()).add(name)
 
-        node.set_children(normalized, child_output_refs)
+        node._set_children(normalized, child_output_refs)
         return normalized
 
     def attach_child(self, parent: str, child: str) -> tuple[str, ...]:

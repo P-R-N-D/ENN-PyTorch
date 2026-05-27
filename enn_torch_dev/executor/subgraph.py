@@ -140,7 +140,7 @@ class SubgraphExecutor:
     def child_output_refs(self) -> tuple[KeyRef, ...]:
         return self._child_output_refs
 
-    def set_children(
+    def _set_children(
         self,
         children: Sequence[str],
         child_output_refs: Sequence[KeyRef],
