@@ -8,7 +8,8 @@ from .subgraph import SubgraphExecutor, SubgraphSpec
 from .tile import TileExecutor, TileSpec
 
 __all__ = [
-    "GraphValue",    "GraphExecutor",
+    "GraphValue",
+    "GraphExecutor",
     "KeyRef",
     "KVStore",
     "NodeExecutor",
