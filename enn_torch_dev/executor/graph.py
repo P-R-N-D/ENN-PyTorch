@@ -643,15 +643,23 @@ class GraphExecutor(nn.Module):
             )
 
         expected_module_keys: set[str] = set()
+        module_key_producers: dict[str, str] = {}
         expected_producers: dict[str, str] = {}
         for name in self._order:
             node = self._nodes[name]
             module_key = node.module_key
+            module_key_producer = module_key_producers.get(module_key)
+            if module_key_producer is not None:
+                raise RuntimeError(
+                    f"Graph has duplicate module_key {module_key!r} used by "
+                    f"{module_key_producer!r} and {name!r}."
+                )
             if module_key not in self.modules_by_key:
                 raise RuntimeError(
                     f"Graph module registry is missing module_key {module_key!r} "
                     f"for node {name!r}."
                 )
+            module_key_producers[module_key] = name
             expected_module_keys.add(module_key)
 
             output_key = node.output_key
@@ -672,6 +680,15 @@ class GraphExecutor(nn.Module):
             raise RuntimeError("Graph output producer index is inconsistent.")
 
         expected_parents: dict[str, set[str]] = {}
+        for name, node in self._nodes.items():
+            if (
+                isinstance(node, SubgraphExecutor)
+                and name not in self._children_by_parent
+            ):
+                raise RuntimeError(
+                    f"Graph children index is missing for subgraph {name!r}."
+                )
+
         for parent, children in self._children_by_parent.items():
             if parent not in self._nodes:
                 raise RuntimeError(
@@ -687,6 +704,10 @@ class GraphExecutor(nn.Module):
                     f"Graph children index is inconsistent for parent {parent!r}."
                 )
 
+            if len(set(children)) != len(children):
+                raise RuntimeError(
+                    f"Graph children index contains duplicate children for parent {parent!r}."
+                )
             expected_child_output_keys: list[str] = []
             for child in children:
                 if child not in self._nodes:

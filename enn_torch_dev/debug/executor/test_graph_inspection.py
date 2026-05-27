@@ -154,3 +154,49 @@ def test_validate_detects_child_output_ref_mismatch() -> None:
 
     with pytest.raises(RuntimeError, match="child output references"):
         graph.validate()
+
+
+def test_validate_detects_missing_children_index_for_subgraph() -> None:
+    graph = _make_graph()
+    graph._children_by_parent.pop("merge")
+    for child in ("a", "b"):
+        parents = graph._parents_by_child.get(child)
+        if parents is not None:
+            parents.discard("merge")
+            if not parents:
+                graph._parents_by_child.pop(child, None)
+
+    with pytest.raises(RuntimeError, match="children index is missing"):
+        graph.validate()
+
+
+def test_validate_detects_duplicate_module_key() -> None:
+    graph = GraphExecutor()
+    graph.add_node(
+        NodeSpec(name="a", module_key="shared", output_key="a.out"),
+        nn.Identity(),
+    )
+    graph.add_node(
+        NodeSpec(name="b", module_key="other", output_key="b.out"),
+        nn.Identity(),
+    )
+    graph.get_node("b").spec.module_key = "shared"
+
+    with pytest.raises(RuntimeError, match="duplicate module_key"):
+        graph.validate()
+
+
+def test_validate_detects_duplicate_children_in_subgraph() -> None:
+    graph = _make_graph()
+    merge = graph.get_node("merge")
+    merge.spec.children = ["a", "a"]
+    merge._child_output_refs = (KeyRef("a.out"), KeyRef("a.out"))
+    graph._children_by_parent["merge"] = ("a", "a")
+    parents = graph._parents_by_child.get("b")
+    if parents is not None:
+        parents.discard("merge")
+        if not parents:
+            graph._parents_by_child.pop("b", None)
+
+    with pytest.raises(RuntimeError, match="duplicate children"):
+        graph.validate()
