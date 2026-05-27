@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
+from typing import Any
 
 from torch import nn
 
@@ -545,6 +546,168 @@ class GraphExecutor(nn.Module):
         if name not in self._nodes:
             raise KeyError(f"Unknown node: {name!r}")
         return tuple(sorted(self._parents_by_child.get(name, set())))
+
+    def dependency_names(self, name: str) -> tuple[str, ...]:
+        name = self._validate_node_name(name)
+        if name not in self._nodes:
+            raise KeyError(f"Unknown node: {name!r}")
+
+        deps = self._dependencies_for_node(name)
+        return tuple(node_name for node_name in self._order if node_name in deps)
+
+    def dependent_names(self, name: str) -> tuple[str, ...]:
+        name = self._validate_node_name(name)
+        if name not in self._nodes:
+            raise KeyError(f"Unknown node: {name!r}")
+
+        deps = self._dependencies_by_node()
+        return tuple(
+            node_name
+            for node_name in self._order
+            if node_name != name and name in deps.get(node_name, set())
+        )
+
+    def root_names(self) -> tuple[str, ...]:
+        deps = self._dependencies_by_node()
+        depended_on: set[str] = set()
+        for node_deps in deps.values():
+            depended_on.update(node_deps)
+
+        return tuple(
+            name
+            for name in self._order
+            if name in self._nodes and name not in depended_on
+        )
+
+    def leaf_names(self) -> tuple[str, ...]:
+        return tuple(
+            name
+            for name in self._order
+            if name in self._nodes and not self._children_by_parent.get(name)
+        )
+
+    def output_key(self, name: str) -> str:
+        return self.get_node(name).output_key
+
+    def _normalize_output_names(
+        self,
+        names: Sequence[str] | None,
+    ) -> tuple[str, ...]:
+        if names is None:
+            return self.root_names()
+        if isinstance(names, (str, bytes, bytearray)):
+            raise TypeError("names must be a sequence of node names, not a string.")
+
+        try:
+            values = tuple(names)
+        except TypeError as exc:
+            raise TypeError("names must be a sequence of node names.") from exc
+
+        return tuple(self._validate_node_name(name) for name in values)
+
+    def output_keys(
+        self,
+        names: Sequence[str] | None = None,
+    ) -> tuple[str, ...]:
+        normalized = self._normalize_output_names(names)
+        return tuple(self.output_key(name) for name in normalized)
+
+    def collect_outputs(
+        self,
+        store: KVStore,
+        names: Sequence[str] | None = None,
+        *,
+        by: str = "node",
+    ) -> dict[str, Any]:
+        if not isinstance(store, KVStore):
+            raise TypeError(
+                f"GraphExecutor.collect_outputs expects KVStore, got {type(store)!r}"
+            )
+        if by not in {"node", "key"}:
+            raise ValueError("collect_outputs by must be either 'node' or 'key'.")
+
+        outputs: dict[str, Any] = {}
+        for name in self._normalize_output_names(names):
+            key = self.output_key(name)
+            outputs[name if by == "node" else key] = store.get(key)
+        return outputs
+
+    def validate(self) -> None:
+        order_set = set(self._order)
+        node_set = set(self._nodes)
+        if len(order_set) != len(self._order):
+            raise RuntimeError("Graph execution order contains duplicate nodes.")
+        if order_set != node_set:
+            raise RuntimeError(
+                "Graph execution order and node registry are inconsistent."
+            )
+
+        expected_module_keys: set[str] = set()
+        expected_producers: dict[str, str] = {}
+        for name in self._order:
+            node = self._nodes[name]
+            module_key = node.module_key
+            if module_key not in self.modules_by_key:
+                raise RuntimeError(
+                    f"Graph module registry is missing module_key {module_key!r} "
+                    f"for node {name!r}."
+                )
+            expected_module_keys.add(module_key)
+
+            output_key = node.output_key
+            producer = expected_producers.get(output_key)
+            if producer is not None:
+                raise RuntimeError(
+                    f"Graph has duplicate output_key {output_key!r} produced by "
+                    f"{producer!r} and {name!r}."
+                )
+            expected_producers[output_key] = name
+
+        registered_module_keys = set(self.modules_by_key.keys())
+        if registered_module_keys != expected_module_keys:
+            raise RuntimeError(
+                "Graph module registry does not match node module keys."
+            )
+        if self._producer_by_output_key != expected_producers:
+            raise RuntimeError("Graph output producer index is inconsistent.")
+
+        expected_parents: dict[str, set[str]] = {}
+        for parent, children in self._children_by_parent.items():
+            if parent not in self._nodes:
+                raise RuntimeError(
+                    f"Graph children index references unknown parent {parent!r}."
+                )
+            node = self._nodes[parent]
+            if not isinstance(node, SubgraphExecutor):
+                raise RuntimeError(
+                    f"Graph children index references non-subgraph parent {parent!r}."
+                )
+            if tuple(children) != node.children:
+                raise RuntimeError(
+                    f"Graph children index is inconsistent for parent {parent!r}."
+                )
+
+            expected_child_output_keys: list[str] = []
+            for child in children:
+                if child not in self._nodes:
+                    raise RuntimeError(
+                        f"Graph children index references unknown child {child!r}."
+                    )
+                expected_parents.setdefault(child, set()).add(parent)
+                expected_child_output_keys.append(self._nodes[child].output_key)
+
+            actual_child_output_keys = tuple(
+                ref.key for ref in node.child_output_refs
+            )
+            if tuple(expected_child_output_keys) != actual_child_output_keys:
+                raise RuntimeError(
+                    f"Subgraph child output references are inconsistent for {parent!r}."
+                )
+
+        if self._parents_by_child != expected_parents:
+            raise RuntimeError("Graph parent index is inconsistent.")
+
+        self.execution_order()
 
     def run(self, store: KVStore) -> KVStore:
         if not isinstance(store, KVStore):
