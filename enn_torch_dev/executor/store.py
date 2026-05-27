@@ -183,7 +183,7 @@ class KVStore:
                 raise KeyError(
                     f"KVStore.commit_to can only commit local keys, got {key!r}"
                 )
-            if (not overwrite) and key in target._data:
+            if (not overwrite) and target.has(key):
                 continue
             target.set_value(key, self._data[key])
 

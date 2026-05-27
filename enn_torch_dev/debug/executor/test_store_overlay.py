@@ -65,6 +65,17 @@ def test_commit_to_default_selected_and_no_overwrite() -> None:
     assert target2.get("y") == 20
 
 
+def test_commit_to_overwrite_false_respects_target_parent_visible_key() -> None:
+    source = KVStore({"x": 10})
+    target_parent = KVStore({"x": 999})
+    target = target_parent.fork()
+
+    source.commit_to(target, overwrite=False)
+
+    assert target.local_keys() == ()
+    assert target.get("x") == 999
+
+
 def test_commit_rejects_parent_only_key() -> None:
     parent = KVStore({"x": 1})
     child = parent.fork()
