@@ -125,11 +125,20 @@ def test_tile_policy_validates_init_arguments() -> None:
     with pytest.raises(ValueError, match="positive"):
         TilePolicy(tile_shape=(0,))
 
+    with pytest.raises(TypeError, match="integers"):
+        TilePolicy(tile_shape=(True,))
+
     with pytest.raises(ValueError, match="stride length"):
         TilePolicy(tile_shape=(2, 2), stride=(1,))
 
+    with pytest.raises(TypeError, match="integers"):
+        TilePolicy(tile_shape=(2,), stride=(False,))
+
     with pytest.raises(ValueError, match="dims length"):
         TilePolicy(tile_shape=(2, 2), dims=(0,))
+
+    with pytest.raises(TypeError, match="integers"):
+        TilePolicy(tile_shape=(2,), dims=(True,))
 
     with pytest.raises(TypeError, match="drop_last"):
         TilePolicy(tile_shape=(2,), drop_last=1)

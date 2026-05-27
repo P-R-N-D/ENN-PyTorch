@@ -33,7 +33,10 @@ def _normalize_int_tuple(
 
     if not items:
         raise ValueError(f"{field_name} must not be empty.")
-    if not all(isinstance(item, int) for item in items):
+    if not all(
+        isinstance(item, int) and not isinstance(item, bool)
+        for item in items
+    ):
         raise TypeError(f"{field_name} must contain integers only.")
     if not all(item > 0 for item in items):
         raise ValueError(f"{field_name} values must be positive.")
@@ -53,7 +56,10 @@ def _normalize_dims(value: object, *, rank: int) -> tuple[int, ...] | None:
 
     if len(dims) != rank:
         raise ValueError("dims length must match tile_shape length.")
-    if not all(isinstance(dim, int) for dim in dims):
+    if not all(
+        isinstance(dim, int) and not isinstance(dim, bool)
+        for dim in dims
+    ):
         raise TypeError("dims must contain integers only.")
     return dims
 
