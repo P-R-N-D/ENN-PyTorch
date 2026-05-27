@@ -1,0 +1,335 @@
+diff --git a/enn_torch_dev/executor/__init__.py b/enn_torch_dev/executor/__init__.py
+index 9edce513..9f4d1d2b 100644
+--- a/enn_torch_dev/executor/__init__.py
++++ b/enn_torch_dev/executor/__init__.py
+@@ -6,6 +6,7 @@ from .node import NodeExecutor, NodeSpec
+ from .schema import GraphValue, KeyRef
+ from .store import KVStore
+ from .subgraph import SubgraphExecutor, SubgraphSpec
++from .segment import SegmentExecutor, SegmentSpec
+ 
+ __all__ = [
+     "GraphValue",
+@@ -17,4 +18,6 @@ __all__ = [
+     "NodeSpec",
+     "SubgraphExecutor",
+     "SubgraphSpec",
++    "SegmentExecutor",
++    "SegmentSpec",
+ ]
+diff --git a/enn_torch_dev/executor/segment.py b/enn_torch_dev/executor/segment.py
+new file mode 100644
+index 0000000..b1c9e40
+--- /dev/null
++++ b/enn_torch_dev/executor/segment.py
+@@ -0,0 +1,117 @@
++from __future__ import annotations
++
++from collections.abc import Sequence
++from dataclasses import dataclass
++from typing import Any
++
++from .graph import GraphExecutor
++from .store import KVStore
++
++
++def _validate_segment_key(value: object, field_name: str) -> str:
++    label = f"SegmentSpec.{field_name}"
++    if not isinstance(value, str):
++        raise TypeError(f"{label} must be a string.")
++    if not value:
++        raise ValueError(f"{label} must be a non-empty string.")
++    if value != value.strip():
++        raise ValueError(
++            f"{label} must not have leading or trailing whitespace."
++        )
++    return value
++
++
++def _normalize_output_names(value: object) -> list[str] | None:
++    if value is None:
++        return None
++    if isinstance(value, (str, bytes, bytearray)):
++        raise TypeError("SegmentSpec.output_names must be a sequence of strings.")
++
++    try:
++        names = list(value)  # type: ignore[arg-type]
++    except TypeError as exc:
++        raise TypeError(
++            "SegmentSpec.output_names must be a sequence of strings."
++        ) from exc
++
++    return [
++        _validate_segment_key(name, "output_names")
++        for name in names
++    ]
++
++
++@dataclass(slots=True)
++class SegmentSpec:
++    """
++    Segment execution schema.
++
++    ``segment_input_key`` is written into each forked segment store before the
++    graph runs. ``output_names`` is forwarded to ``GraphExecutor.collect_outputs``;
++    when omitted, graph root nodes are collected.
++    """
++
++    segment_input_key: str
++    output_names: list[str] | None = None
++    output_by: str = "node"
++    segment_index_key: str | None = None
++
++    def __post_init__(self) -> None:
++        self.segment_input_key = _validate_segment_key(
++            self.segment_input_key,
++            "segment_input_key",
++        )
++        self.output_names = _normalize_output_names(self.output_names)
++        if self.output_by not in {"node", "key"}:
++            raise ValueError("SegmentSpec.output_by must be either 'node' or 'key'.")
++        if self.segment_index_key is not None:
++            self.segment_index_key = _validate_segment_key(
++                self.segment_index_key,
++                "segment_index_key",
++            )
++
++
++class SegmentExecutor:
++    """
++    Run one graph over a sequence of segment values.
++
++    The executor forks ``base_store`` for each segment, writes the segment value
++    into the forked store, runs the graph, and collects the requested graph
++    outputs from that fork. It does not slice tensors or aggregate segment
++    outputs; tile/stream-specific logic should build on top of this class.
++    """
++
++    def __init__(self, graph: GraphExecutor, spec: SegmentSpec) -> None:
++        if not isinstance(graph, GraphExecutor):
++            raise TypeError(
++                f"SegmentExecutor graph must be GraphExecutor, got {type(graph)!r}"
++            )
++        if not isinstance(spec, SegmentSpec):
++            raise TypeError(
++                f"SegmentExecutor spec must be SegmentSpec, got {type(spec)!r}"
++            )
++
++        self.graph = graph
++        self.spec = spec
++
++    @staticmethod
++    def _normalize_segments(segments: object) -> tuple[Any, ...]:
++        if isinstance(segments, (str, bytes, bytearray)) or segments is None:
++            raise TypeError("segments must be a sequence of segment values.")
++
++        try:
++            return tuple(segments)  # type: ignore[arg-type]
++        except TypeError as exc:
++            raise TypeError("segments must be a sequence of segment values.") from exc
++
++    def run_segment(
++        self,
++        base_store: KVStore,
++        segment: Any,
++        *,
++        index: int | None = None,
++    ) -> dict[str, Any]:
++        if not isinstance(base_store, KVStore):
++            raise TypeError(f"base_store must be KVStore, got {type(base_store)!r}")
++
++        segment_store = base_store.fork()
++        segment_store.set(self.spec.segment_input_key, segment)
++        if self.spec.segment_index_key is not None:
++            segment_store.set(self.spec.segment_index_key, index)
++
++        self.graph.run(segment_store)
++        return self.graph.collect_outputs(
++            segment_store,
++            names=self.spec.output_names,
++            by=self.spec.output_by,
++        )
++
++    def run(
++        self,
++        base_store: KVStore,
++        segments: Sequence[Any],
++    ) -> list[dict[str, Any]]:
++        normalized_segments = self._normalize_segments(segments)
++        return [
++            self.run_segment(base_store, segment, index=index)
++            for index, segment in enumerate(normalized_segments)
++        ]
+diff --git a/enn_torch_dev/debug/executor/test_segment.py b/enn_torch_dev/debug/executor/test_segment.py
+new file mode 100644
+index 0000000..f3f12e7
+--- /dev/null
++++ b/enn_torch_dev/debug/executor/test_segment.py
+@@ -0,0 +1,160 @@
++from __future__ import annotations
++
++import pytest
++import torch
++from torch import nn
++
++from enn_torch_dev.executor import (
++    GraphExecutor,
++    KVStore,
++    KeyRef,
++    NodeSpec,
++    SegmentExecutor,
++    SegmentSpec,
++)
++
++
++class _AddBias(nn.Module):
++    def forward(self, x: torch.Tensor, bias: torch.Tensor) -> torch.Tensor:
++        return x + bias
++
++
++class _AddIndex(nn.Module):
++    def forward(self, x: torch.Tensor, index: int) -> torch.Tensor:
++        return x + float(index)
++
++
++def _make_bias_graph() -> GraphExecutor:
++    graph = GraphExecutor()
++    graph.add_node(
++        NodeSpec(
++            name="root",
++            input_args=[KeyRef("segment.x")],
++            input_kwargs={"bias": KeyRef("global.bias")},
++            output_key="root.out",
++        ),
++        _AddBias(),
++    )
++    return graph
++
++
++def test_segment_executor_runs_graph_for_each_segment() -> None:
++    graph = _make_bias_graph()
++    executor = SegmentExecutor(
++        graph,
++        SegmentSpec(
++            segment_input_key="segment.x",
++            output_names=["root"],
++        ),
++    )
++    base_store = KVStore({"global.bias": torch.tensor([10.0])})
++
++    results = executor.run(
++        base_store,
++        [torch.tensor([1.0]), torch.tensor([2.0])],
++    )
++
++    assert len(results) == 2
++    assert torch.equal(results[0]["root"], torch.tensor([11.0]))
++    assert torch.equal(results[1]["root"], torch.tensor([12.0]))
++
++
++def test_segment_executor_does_not_pollute_base_store() -> None:
++    graph = _make_bias_graph()
++    executor = SegmentExecutor(
++        graph,
++        SegmentSpec(
++            segment_input_key="segment.x",
++            output_names=["root"],
++        ),
++    )
++    base_store = KVStore({"global.bias": torch.tensor([10.0])})
++
++    executor.run(base_store, [torch.tensor([1.0])])
++
++    assert not base_store.has("segment.x")
++    assert not base_store.has("root.out")
++    assert base_store.has("global.bias")
++
++
++def test_segment_executor_can_collect_by_output_key() -> None:
++    graph = _make_bias_graph()
++    executor = SegmentExecutor(
++        graph,
++        SegmentSpec(
++            segment_input_key="segment.x",
++            output_names=["root"],
++            output_by="key",
++        ),
++    )
++    base_store = KVStore({"global.bias": torch.tensor([10.0])})
++
++    results = executor.run(base_store, [torch.tensor([1.0])])
++
++    assert set(results[0]) == {"root.out"}
++    assert torch.equal(results[0]["root.out"], torch.tensor([11.0]))
++
++
++def test_segment_executor_uses_root_outputs_when_output_names_omitted() -> None:
++    graph = _make_bias_graph()
++    executor = SegmentExecutor(
++        graph,
++        SegmentSpec(segment_input_key="segment.x"),
++    )
++    base_store = KVStore({"global.bias": torch.tensor([10.0])})
++
++    results = executor.run(base_store, [torch.tensor([3.0])])
++
++    assert set(results[0]) == {"root"}
++    assert torch.equal(results[0]["root"], torch.tensor([13.0]))
++
++
++def test_segment_index_key_is_written_to_segment_store() -> None:
++    graph = GraphExecutor()
++    graph.add_node(
++        NodeSpec(
++            name="root",
++            input_args=[KeyRef("segment.x")],
++            input_kwargs={"index": KeyRef("segment.index")},
++            output_key="root.out",
++        ),
++        _AddIndex(),
++    )
++    executor = SegmentExecutor(
++        graph,
++        SegmentSpec(
++            segment_input_key="segment.x",
++            output_names=["root"],
++            segment_index_key="segment.index",
++        ),
++    )
++
++    results = executor.run(
++        KVStore(),
++        [torch.tensor([10.0]), torch.tensor([10.0])],
++    )
++
++    assert torch.equal(results[0]["root"], torch.tensor([10.0]))
++    assert torch.equal(results[1]["root"], torch.tensor([11.0]))
++
++
++def test_segment_executor_empty_segments_returns_empty_list() -> None:
++    graph = _make_bias_graph()
++    executor = SegmentExecutor(
++        graph,
++        SegmentSpec(segment_input_key="segment.x", output_names=["root"]),
++    )
++
++    assert executor.run(KVStore({"global.bias": torch.tensor([10.0])}), []) == []
++
++
++def test_segment_executor_validates_inputs() -> None:
++    graph = _make_bias_graph()
++
++    with pytest.raises(ValueError, match="output_by"):
++        SegmentSpec(segment_input_key="segment.x", output_by="bad")
++
++    with pytest.raises(TypeError, match="output_names"):
++        SegmentSpec(segment_input_key="segment.x", output_names="root")
++
++    with pytest.raises(TypeError, match="segments"):
++        SegmentExecutor(
++            graph,
++            SegmentSpec(segment_input_key="segment.x", output_names=["root"]),
++        ).run(KVStore({"global.bias": torch.tensor([10.0])}), None)
++
++    with pytest.raises(TypeError, match="GraphExecutor"):
++        SegmentExecutor(object(), SegmentSpec(segment_input_key="segment.x"))
