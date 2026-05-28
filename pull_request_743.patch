@@ -1,0 +1,396 @@
+diff --git a/enn_torch_dev/executor/__init__.py b/enn_torch_dev/executor/__init__.py
+index cfe7eaf..390c9c2 100644
+--- a/enn_torch_dev/executor/__init__.py
++++ b/enn_torch_dev/executor/__init__.py
+@@ -9,6 +9,7 @@ from .store import KVStore
+ from .subgraph import SubgraphExecutor, SubgraphSpec
+ from .tile import TileExecutor, TileSpec
+ from .tile_policy import TileMeta, TilePolicy
++from .tile_reconstruct import TileReconstructSpec, TileReconstructor
+
+ __all__ = [
+     "GraphValue",
+@@ -23,4 +24,6 @@ __all__ = [
+     "TileSpec",
+     "TileMeta",
+     "TilePolicy",
++    "TileReconstructSpec",
++    "TileReconstructor",
+ ]
+diff --git a/enn_torch_dev/executor/tile_reconstruct.py b/enn_torch_dev/executor/tile_reconstruct.py
+new file mode 100644
+index 0000000..0d4b8b0
+--- /dev/null
++++ b/enn_torch_dev/executor/tile_reconstruct.py
+@@ -0,0 +1,160 @@
++from __future__ import annotations
++
++from collections.abc import Sequence
++from dataclasses import dataclass
++
++import torch
++from torch import Tensor
++
++from .tile_policy import TileMeta
++
++
++@dataclass(slots=True)
++class TileReconstructSpec:
++    """
++    Tile reconstruction policy.
++
++    ``overwrite`` writes later tiles over earlier tiles in overlap regions.
++    ``sum`` accumulates overlap regions. ``mean`` accumulates and divides by
++    write counts.
++    """
++
++    reduction: str = "overwrite"
++
++    def __post_init__(self) -> None:
++        if self.reduction not in {"overwrite", "sum", "mean"}:
++            raise ValueError(
++                "TileReconstructSpec.reduction must be one of "
++                "'overwrite', 'sum', or 'mean'."
++            )
++
++
++class TileReconstructor:
++    """
++    Reconstruct a full tensor from tile outputs and ``TileMeta`` positions.
++
++    This is an executor-layer assembly policy, not a trainable ``nn.Module``.
++    Learned local/global fusion or weighted reconstruction should live in the
++    ``nn`` layer.
++    """
++
++    def __init__(self, spec: TileReconstructSpec | None = None) -> None:
++        if spec is None:
++            spec = TileReconstructSpec()
++        if not isinstance(spec, TileReconstructSpec):
++            raise TypeError(
++                f"TileReconstructor spec must be TileReconstructSpec, got {type(spec)!r}"
++            )
++        self.spec = spec
++
++    @staticmethod
++    def _validate_inputs(
++        tiles: Sequence[Tensor],
++        metas: Sequence[TileMeta],
++    ) -> tuple[tuple[Tensor, ...], tuple[TileMeta, ...]]:
++        if isinstance(tiles, (str, bytes, bytearray)) or tiles is None:
++            raise TypeError("tiles must be a sequence of Tensor values.")
++        if isinstance(metas, (str, bytes, bytearray)) or metas is None:
++            raise TypeError("metas must be a sequence of TileMeta values.")
++
++        tile_values = tuple(tiles)
++        meta_values = tuple(metas)
++        if not tile_values:
++            raise ValueError("tiles must not be empty.")
++        if len(tile_values) != len(meta_values):
++            raise ValueError(
++                f"tiles and metas must have the same length: "
++                f"{len(tile_values)} != {len(meta_values)}"
++            )
++
++        for tile in tile_values:
++            if not isinstance(tile, Tensor):
++                raise TypeError(f"tiles must contain Tensor values, got {type(tile)!r}")
++        for meta in meta_values:
++            if not isinstance(meta, TileMeta):
++                raise TypeError(
++                    f"metas must contain TileMeta values, got {type(meta)!r}"
++                )
++        return tile_values, meta_values
++
++    @staticmethod
++    def _output_shape_for(first_tile: Tensor, first_meta: TileMeta) -> tuple[int, ...]:
++        rank = len(first_meta.full_shape)
++        if first_tile.ndim != rank:
++            raise ValueError(
++                f"tile ndim must match TileMeta.full_shape rank: "
++                f"{first_tile.ndim} != {rank}"
++            )
++
++        shape = [int(size) for size in first_tile.shape]
++        for dim in first_meta.dims:
++            shape[dim] = int(first_meta.full_shape[dim])
++        return tuple(shape)
++
++    @staticmethod
++    def _validate_tile_against_meta(
++        tile: Tensor,
++        meta: TileMeta,
++        *,
++        output_shape: tuple[int, ...],
++        dims: tuple[int, ...],
++    ) -> tuple[slice, ...]:
++        rank = len(output_shape)
++        if tile.ndim != rank:
++            raise ValueError(
++                f"tile ndim must match reconstructed rank: {tile.ndim} != {rank}"
++            )
++        if len(meta.full_shape) != rank:
++            raise ValueError(
++                f"TileMeta.full_shape rank must match reconstructed rank: "
++                f"{len(meta.full_shape)} != {rank}"
++            )
++        if meta.dims != dims:
++            raise ValueError("all TileMeta.dims values must match.")
++        if len(meta.start) != len(dims) or len(meta.end) != len(dims):
++            raise ValueError("TileMeta start/end length must match dims length.")
++
++        slices = [slice(None)] * rank
++        dim_to_position = {dim: pos for pos, dim in enumerate(dims)}
++        for dim, pos in dim_to_position.items():
++            start = int(meta.start[pos])
++            end = int(meta.end[pos])
++            span = end - start
++            if span < 0:
++                raise ValueError("TileMeta end must be greater than or equal to start.")
++            if tile.shape[dim] != span:
++                raise ValueError(
++                    f"tile shape at dim {dim} does not match TileMeta span: "
++                    f"{int(tile.shape[dim])} != {span}"
++                )
++            slices[dim] = slice(start, end)
++
++        for dim, size in enumerate(tile.shape):
++            if dim in dim_to_position:
++                continue
++            if int(size) != int(output_shape[dim]):
++                raise ValueError(
++                    f"non-tiled tile dimension {dim} does not match output shape: "
++                    f"{int(size)} != {int(output_shape[dim])}"
++                )
++
++        return tuple(slices)
++
++    def reconstruct(
++        self,
++        tiles: Sequence[Tensor],
++        metas: Sequence[TileMeta],
++    ) -> Tensor:
++        tile_values, meta_values = self._validate_inputs(tiles, metas)
++
++        first_tile = tile_values[0]
++        first_meta = meta_values[0]
++        dims = first_meta.dims
++        output_shape = self._output_shape_for(first_tile, first_meta)
++
++        output = torch.zeros(
++            output_shape,
++            dtype=first_tile.dtype,
++            device=first_tile.device,
++        )
++        counts = None
++        if self.spec.reduction == "mean":
++            counts = torch.zeros(output_shape, dtype=torch.float32, device=first_tile.device)
++
++        for tile, meta in zip(tile_values, meta_values):
++            if tile.device != first_tile.device:
++                raise ValueError("all tiles must be on the same device.")
++            if tile.dtype != first_tile.dtype:
++                raise ValueError("all tiles must have the same dtype.")
++
++            slice_tuple = self._validate_tile_against_meta(
++                tile,
++                meta,
++                output_shape=output_shape,
++                dims=dims,
++            )
++            if self.spec.reduction == "overwrite":
++                output[slice_tuple] = tile
++            else:
++                output[slice_tuple] = output[slice_tuple] + tile
++                if counts is not None:
++                    counts[slice_tuple] = counts[slice_tuple] + 1
++
++        if counts is not None:
++            output = torch.where(counts > 0, output / counts.to(output.dtype), output)
++        return output
+diff --git a/enn_torch_dev/debug/executor/test_tile_reconstruct.py b/enn_torch_dev/debug/executor/test_tile_reconstruct.py
+new file mode 100644
+index 0000000..1a3cc42
+--- /dev/null
++++ b/enn_torch_dev/debug/executor/test_tile_reconstruct.py
+@@ -0,0 +1,192 @@
++from __future__ import annotations
++
++import pytest
++import torch
++
++from enn_torch_dev.executor import (
++    TilePolicy,
++    TileReconstructSpec,
++    TileReconstructor,
++)
++
++
++def test_tile_reconstructor_reconstructs_1d_tensor() -> None:
++    x = torch.arange(5, dtype=torch.float32)
++    tiles, metas = TilePolicy(tile_shape=(2,)).split(x)
++
++    out = TileReconstructor().reconstruct([tile * 2 for tile in tiles], metas)
++
++    assert torch.equal(out, x * 2)
++
++
++def test_tile_reconstructor_reconstructs_2d_tensor() -> None:
++    x = torch.arange(12, dtype=torch.float32).reshape(3, 4)
++    tiles, metas = TilePolicy(tile_shape=(2, 3)).split(x)
++
++    out = TileReconstructor().reconstruct(tiles, metas)
++
++    assert torch.equal(out, x)
++
++
++def test_tile_reconstructor_reconstructs_bchw_spatial_tiles() -> None:
++    x = torch.arange(1 * 1 * 4 * 5, dtype=torch.float32).reshape(1, 1, 4, 5)
++    tiles, metas = TilePolicy(tile_shape=(2, 3), dims=(-2, -1)).split(x)
++
++    out = TileReconstructor().reconstruct(tiles, metas)
++
++    assert torch.equal(out, x)
++
++
++def test_tile_reconstructor_allows_output_channel_change() -> None:
++    x = torch.arange(1 * 1 * 4 * 5, dtype=torch.float32).reshape(1, 1, 4, 5)
++    tiles, metas = TilePolicy(tile_shape=(2, 3), dims=(-2, -1)).split(x)
++    output_tiles = [
++        torch.cat([tile, tile + 100.0], dim=1)
++        for tile in tiles
++    ]
++
++    out = TileReconstructor().reconstruct(output_tiles, metas)
++
++    assert out.shape == (1, 2, 4, 5)
++    assert torch.equal(out[:, 0:1], x)
++    assert torch.equal(out[:, 1:2], x + 100.0)
++
++
++def test_tile_reconstructor_overwrite_overlap_uses_later_tiles() -> None:
++    x = torch.zeros(5)
++    tiles, metas = TilePolicy(tile_shape=(3,), stride=(2,)).split(x)
++    output_tiles = [
++        torch.full_like(tile, float(index))
++        for index, tile in enumerate(tiles)
++    ]
++
++    out = TileReconstructor(TileReconstructSpec("overwrite")).reconstruct(
++        output_tiles,
++        metas,
++    )
++
++    assert torch.equal(out, torch.tensor([0.0, 0.0, 1.0, 1.0, 2.0]))
++
++
++def test_tile_reconstructor_sum_overlap_accumulates() -> None:
++    x = torch.zeros(5)
++    tiles, metas = TilePolicy(tile_shape=(3,), stride=(2,)).split(x)
++    output_tiles = [torch.ones_like(tile) for tile in tiles]
++
++    out = TileReconstructor(TileReconstructSpec("sum")).reconstruct(
++        output_tiles,
++        metas,
++    )
++
++    assert torch.equal(out, torch.tensor([1.0, 1.0, 2.0, 1.0, 2.0]))
++
++
++def test_tile_reconstructor_mean_overlap_averages() -> None:
++    x = torch.zeros(5)
++    tiles, metas = TilePolicy(tile_shape=(3,), stride=(2,)).split(x)
++    output_tiles = [torch.ones_like(tile) * (index + 1) for index, tile in enumerate(tiles)]
++
++    out = TileReconstructor(TileReconstructSpec("mean")).reconstruct(
++        output_tiles,
++        metas,
++    )
++
++    assert torch.equal(out, torch.tensor([1.0, 1.0, 1.5, 2.0, 2.5]))
++
++
++def test_tile_reconstructor_handles_drop_last_holes_with_sum() -> None:
++    x = torch.zeros(5)
++    tiles, metas = TilePolicy(tile_shape=(3,), stride=(3,), drop_last=True).split(x)
++    output_tiles = [torch.ones_like(tile) for tile in tiles]
++
++    out = TileReconstructor(TileReconstructSpec("sum")).reconstruct(
++        output_tiles,
++        metas,
++    )
++
++    assert torch.equal(out, torch.tensor([1.0, 1.0, 1.0, 0.0, 0.0]))
++
++
++def test_tile_reconstructor_handles_drop_last_holes_with_mean() -> None:
++    x = torch.zeros(5)
++    tiles, metas = TilePolicy(tile_shape=(3,), stride=(3,), drop_last=True).split(x)
++    output_tiles = [torch.ones_like(tile) for tile in tiles]
++
++    out = TileReconstructor(TileReconstructSpec("mean")).reconstruct(
++        output_tiles,
++        metas,
++    )
++
++    assert torch.equal(out, torch.tensor([1.0, 1.0, 1.0, 0.0, 0.0]))
++
++
++def test_tile_reconstructor_validates_reduction() -> None:
++    with pytest.raises(ValueError, match="reduction"):
++        TileReconstructSpec("bad")
++
++
++def test_tile_reconstructor_rejects_empty_tiles() -> None:
++    with pytest.raises(ValueError, match="empty"):
++        TileReconstructor().reconstruct([], [])
++
++
++def test_tile_reconstructor_rejects_length_mismatch() -> None:
++    x = torch.arange(4, dtype=torch.float32)
++    tiles, metas = TilePolicy(tile_shape=(2,)).split(x)
++
++    with pytest.raises(ValueError, match="same length"):
++        TileReconstructor().reconstruct(tiles, metas[:1])
++
++
++def test_tile_reconstructor_rejects_non_tensor_tile() -> None:
++    x = torch.arange(4, dtype=torch.float32)
++    _, metas = TilePolicy(tile_shape=(2,)).split(x)
++
++    with pytest.raises(TypeError, match="Tensor"):
++        TileReconstructor().reconstruct([object(), object()], metas)
++
++
++def test_tile_reconstructor_rejects_bad_meta() -> None:
++    x = torch.arange(4, dtype=torch.float32)
++    tiles, _ = TilePolicy(tile_shape=(2,)).split(x)
++
++    with pytest.raises(TypeError, match="TileMeta"):
++        TileReconstructor().reconstruct(tiles, [object(), object()])
++
++
++def test_tile_reconstructor_rejects_tile_shape_span_mismatch() -> None:
++    x = torch.arange(4, dtype=torch.float32)
++    tiles, metas = TilePolicy(tile_shape=(2,)).split(x)
++
++    with pytest.raises(ValueError, match="span"):
++        TileReconstructor().reconstruct([torch.zeros(3), tiles[1]], metas)
++
++
++def test_tile_reconstructor_rejects_non_tiled_dim_mismatch() -> None:
++    x = torch.zeros(1, 1, 4, 4)
++    tiles, metas = TilePolicy(tile_shape=(2, 2), dims=(-2, -1)).split(x)
++    bad_tiles = [torch.zeros(1, 2, *tile.shape[-2:]) for tile in tiles]
++    bad_tiles[1] = torch.zeros(1, 3, *tiles[1].shape[-2:])
++
++    with pytest.raises(ValueError, match="non-tiled"):
++        TileReconstructor().reconstruct(bad_tiles, metas)
++
++
++def test_tile_reconstructor_rejects_mismatched_dtype() -> None:
++    x = torch.arange(4, dtype=torch.float32)
++    tiles, metas = TilePolicy(tile_shape=(2,)).split(x)
++
++    with pytest.raises(ValueError, match="dtype"):
++        TileReconstructor().reconstruct([tiles[0], tiles[1].to(torch.float64)], metas)
