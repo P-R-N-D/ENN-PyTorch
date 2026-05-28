@@ -302,6 +302,34 @@ def test_state_route_carry_preserves_metadata_when_transforming_tensor_state() -
     assert not carried.data.requires_grad
 
 
+def test_state_route_carry_transforms_nested_tensor_state() -> None:
+    route = StateRoute("ctx.state.in", "ctx.state.out")
+    store = KVStore()
+    h_source = torch.ones(1, 2, 3, requires_grad=True)
+    c_source = torch.ones(1, 2, 3, requires_grad=True)
+    h = h_source * 2.0
+    c = c_source * 3.0
+    state = (h, {"cell": [c]})
+    store.set("ctx.state.out", state, layout="state", origin="ctx")
+
+    route.carry(store, detach=True, clone=True)
+
+    carried = store.get("ctx.state.in")
+    carried_h = carried[0]
+    carried_c = carried[1]["cell"][0]
+
+    assert torch.equal(carried_h, h)
+    assert torch.equal(carried_c, c)
+    assert not carried_h.requires_grad
+    assert not carried_c.requires_grad
+    assert carried_h.data_ptr() != h.data_ptr()
+    assert carried_c.data_ptr() != c.data_ptr()
+
+    carried_value = store.get_value("ctx.state.in")
+    assert carried_value.layout == "state"
+    assert carried_value.origin == "ctx"
+
+
 def test_state_route_carry_feeds_next_recurrent_run() -> None:
     route = StateRoute("ctx.state.in", "ctx.state.out")
     graph = GraphExecutor()

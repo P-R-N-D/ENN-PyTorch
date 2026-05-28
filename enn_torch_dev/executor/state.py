@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass
+from typing import Any
 
 from torch import Tensor
 
@@ -135,6 +136,37 @@ class StateRoute:
         return store
 
     @staticmethod
+    def _carried_payload(
+        payload: Any,
+        *,
+        detach: bool,
+        clone: bool,
+    ) -> Any:
+        if isinstance(payload, Tensor):
+            if detach:
+                payload = payload.detach()
+            if clone:
+                payload = payload.clone()
+            return payload
+
+        if isinstance(payload, tuple):
+            return tuple(
+                StateRoute._carried_payload(item, detach=detach, clone=clone)
+                for item in payload
+            )
+        if isinstance(payload, list):
+            return [
+                StateRoute._carried_payload(item, detach=detach, clone=clone)
+                for item in payload
+            ]
+        if isinstance(payload, Mapping):
+            return {
+                key: StateRoute._carried_payload(item, detach=detach, clone=clone)
+                for key, item in payload.items()
+            }
+        return payload
+
+    @staticmethod
     def _carried_value(
         value: GraphValue,
         *,
@@ -142,14 +174,10 @@ class StateRoute:
         clone: bool,
     ) -> GraphValue:
         data = value.data
-        if isinstance(data, Tensor):
-            if detach:
-                data = data.detach()
-            if clone:
-                data = data.clone()
-
-        if data is value.data:
+        if not detach and not clone:
             return value
+
+        data = StateRoute._carried_payload(data, detach=detach, clone=clone)
         return GraphValue(
             data=data,
             layout=value.layout,
@@ -169,8 +197,9 @@ class StateRoute:
         """
         Copy the routed output state into the routed input state slot.
 
-        ``detach`` and ``clone`` only apply to Tensor state payloads. Other
-        payloads are carried unchanged. This helper does not reset state or
+        ``detach`` and ``clone`` apply recursively to Tensor payloads inside
+        tuples, lists, and mappings. Other payloads are carried unchanged. This
+        helper does not reset state or
         manage stream lifecycle; those policies belong to a future stream/state
         runner.
         """
