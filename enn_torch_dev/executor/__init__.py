@@ -7,6 +7,7 @@ from .store import KVStore
 from .subgraph import SubgraphExecutor, SubgraphSpec
 from .tile import TileExecutor, TileSpec
 from .tile_policy import TileMeta, TilePolicy
+from .tile_reconstruct import TileReconstructSpec, TileReconstructor
 
 __all__ = [
     "GraphValue",
@@ -21,4 +22,6 @@ __all__ = [
     "TileSpec",
     "TileMeta",
     "TilePolicy",
+    "TileReconstructSpec",
+    "TileReconstructor",
 ]
