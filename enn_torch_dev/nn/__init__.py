@@ -7,6 +7,7 @@ from .blocks import (
 from .attention import GlobalSelfAttentionBlock
 from .fusion import LocalGlobalFusion
 from .layers import ConvMixer, Reducer
+from .recurrent import RecurrentContextHead
 from .types import ContextSummary
 
 __all__ = [
@@ -17,4 +18,5 @@ __all__ = [
     "GlobalSelfAttentionBlock",
     "LocalGlobalFusion",
     "Reducer",
+    "RecurrentContextHead",
 ]
