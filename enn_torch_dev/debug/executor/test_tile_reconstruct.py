@@ -13,8 +13,18 @@ def test_reconstruct_1d() -> None:
         TileMeta(1, (2,), (4,), (slice(2, 4),), (5,), (0,)),
         TileMeta(2, (4,), (5,), (slice(4, 5),), (5,), (0,)),
     ]
-    out = TileReconstructor(TileReconstructSpec()).reconstruct(tiles, metas)
+    out = TileReconstructor().reconstruct(tiles, metas)
     assert out.tolist() == [1, 2, 3, 4, 5]
+
+
+def test_tile_reconstructor_default_spec_is_overwrite() -> None:
+    reconstructor = TileReconstructor()
+
+    assert reconstructor.spec.reduction == "overwrite"
+
+    metas = [TileMeta(0, (0,), (1,), (slice(0, 1),), (1,), (0,))]
+    out = reconstructor.reconstruct([torch.tensor([3.0])], metas)
+    assert torch.equal(out, torch.tensor([3.0]))
 
 
 def test_reconstruct_2d() -> None:
@@ -25,7 +35,7 @@ def test_reconstruct_2d() -> None:
         TileMeta(2, (2, 0), (3, 2), (slice(2, 3), slice(0, 2)), (3, 3), (0, 1)),
         TileMeta(3, (2, 2), (3, 3), (slice(2, 3), slice(2, 3)), (3, 3), (0, 1)),
     ]
-    out = TileReconstructor(TileReconstructSpec()).reconstruct(tiles, metas)
+    out = TileReconstructor().reconstruct(tiles, metas)
     assert tuple(out.shape) == (3, 3)
 
 

@@ -22,7 +22,9 @@ class TileReconstructSpec:
 
 
 class TileReconstructor:
-    def __init__(self, spec: TileReconstructSpec) -> None:
+    def __init__(self, spec: TileReconstructSpec | None = None) -> None:
+        if spec is None:
+            spec = TileReconstructSpec()
         if not isinstance(spec, TileReconstructSpec):
             raise TypeError(
                 f"TileReconstructor spec must be TileReconstructSpec, got {type(spec)!r}"
