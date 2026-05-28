@@ -40,6 +40,16 @@ class _RunningSum(nn.Module):
         return out
 
 
+class _AddOptionalValue(nn.Module):
+    def forward(self, x: torch.Tensor, value: torch.Tensor) -> torch.Tensor:
+        return x + value
+
+
+class _MakeOptionalValue(nn.Module):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x + 100.0
+
+
 def _make_double_graph() -> GraphExecutor:
     graph = GraphExecutor()
     graph.add_node(
@@ -69,8 +79,8 @@ def test_stream_pipeline_runs_chunks_in_order() -> None:
     )
 
     assert [out.item() for out in outputs] == [2.0, 4.0, 6.0]
-    assert torch.equal(store.get("chunk.x"), torch.tensor([3.0]))
-    assert torch.equal(store.get("double.out"), torch.tensor([6.0]))
+    assert not store.has("chunk.x")
+    assert not store.has("double.out")
 
 
 def test_stream_pipeline_writes_outputs_key() -> None:
@@ -134,7 +144,7 @@ def test_stream_pipeline_forwards_chunk_index() -> None:
     )
 
     assert [out.item() for out in outputs] == [10.0, 11.0, 12.0]
-    assert store.get("chunk.index") == 2
+    assert not store.has("chunk.index")
 
 
 def test_stream_pipeline_carries_state_between_chunks() -> None:
@@ -167,7 +177,75 @@ def test_stream_pipeline_carries_state_between_chunks() -> None:
 
     assert [out.item() for out in outputs] == [1.0, 3.0, 6.0]
     assert torch.equal(store.get("sum.state.in"), torch.tensor([6.0]))
-    assert torch.equal(store.get("sum.state.out"), torch.tensor([6.0]))
+    assert not store.has("sum.state.out")
+
+
+def test_stream_pipeline_isolates_stale_optional_outputs_between_chunks() -> None:
+    graph = GraphExecutor()
+    graph.add_node(
+        NodeSpec(
+            name="consumer",
+            input_args=[KeyRef("chunk.x")],
+            input_kwargs={
+                "value": KeyRef(
+                    "producer.out",
+                    optional=True,
+                    default=torch.tensor([0.0]),
+                )
+            },
+            output_key="consumer.out",
+        ),
+        _AddOptionalValue(),
+    )
+    graph.add_node(
+        NodeSpec(
+            name="producer",
+            input_args=[KeyRef("chunk.x")],
+            output_key="producer.out",
+        ),
+        _MakeOptionalValue(),
+    )
+    pipeline = StreamPipeline(
+        graph,
+        StreamPipelineSpec(
+            chunk_input_key="chunk.x",
+            output_name="consumer",
+        ),
+    )
+    store = KVStore()
+
+    outputs = pipeline.run(store, [torch.tensor([1.0]), torch.tensor([2.0])])
+
+    assert [out.item() for out in outputs] == [1.0, 2.0]
+    assert not store.has("producer.out")
+    assert not store.has("consumer.out")
+
+
+def test_stream_pipeline_forces_return_state_for_state_routes() -> None:
+    route = StateRoute("sum.state.in", "sum.state.out", return_state_key="return_state")
+    graph = GraphExecutor()
+    graph.add_node(
+        NodeSpec(
+            name="sum",
+            input_args=[KeyRef("chunk.x")],
+            input_kwargs=route.input_kwargs(),
+            output_key="sum.out",
+            output_keys=route.output_keys("sum.out"),
+        ),
+        _RunningSum(),
+    )
+    pipeline = StreamPipeline(
+        graph,
+        StreamPipelineSpec(chunk_input_key="chunk.x", output_name="sum"),
+        state_routes=[route],
+    )
+    store = KVStore({"return_state": False})
+
+    outputs = pipeline.run(store, [torch.tensor([1.0]), torch.tensor([2.0])])
+
+    assert [out.item() for out in outputs] == [1.0, 3.0]
+    assert torch.equal(store.get("sum.state.in"), torch.tensor([3.0]))
+    assert store.get("return_state") is False
 
 
 def test_stream_pipeline_allows_empty_chunks() -> None:

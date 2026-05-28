@@ -131,20 +131,28 @@ class StreamPipeline:
         outputs: list[Any] = []
 
         for index, chunk in enumerate(normalized_chunks):
-            store.set(self.spec.chunk_input_key, chunk, origin="StreamPipeline")
+            chunk_store = store.fork()
+            chunk_store.set(self.spec.chunk_input_key, chunk, origin="StreamPipeline")
             if self.spec.chunk_index_key is not None:
-                store.set(self.spec.chunk_index_key, index, origin="StreamPipeline")
+                chunk_store.set(self.spec.chunk_index_key, index, origin="StreamPipeline")
 
-            self.graph.run(store)
+            for route in self.state_routes:
+                route.enable_return_state(chunk_store)
+
+            self.graph.run(chunk_store)
             result = self.graph.collect_outputs(
-                store,
+                chunk_store,
                 names=[self.spec.output_name],
                 by=self.spec.output_by,
             )[result_key]
             outputs.append(result)
 
             for route in self.state_routes:
-                route.carry(store)
+                route.carry(chunk_store)
+                store.set_value(
+                    route.state_input_key,
+                    chunk_store.get_value(route.state_input_key),
+                )
 
         if self.spec.outputs_key is not None:
             store.set(self.spec.outputs_key, outputs, origin="StreamPipeline")
