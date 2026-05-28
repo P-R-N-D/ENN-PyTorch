@@ -139,6 +139,12 @@ def test_recurrent_context_head_validates_constructor_arguments() -> None:
     with pytest.raises(ValueError, match="dropout"):
         RecurrentContextHead(input_dim=8, dropout=1.5)
 
+    with pytest.raises(ValueError, match="num_layers > 1"):
+        RecurrentContextHead(input_dim=8, num_layers=1, dropout=0.1)
+
+    # Valid: GRU dropout is applied between stacked recurrent layers.
+    RecurrentContextHead(input_dim=8, num_layers=2, dropout=0.1)
+
     with pytest.raises(TypeError, match="batch_first"):
         RecurrentContextHead(input_dim=8, batch_first=1)
 

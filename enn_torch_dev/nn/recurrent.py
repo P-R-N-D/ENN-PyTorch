@@ -64,6 +64,11 @@ class RecurrentContextHead(nn.Module):
         )
         self.num_layers = _validate_positive_int(num_layers, "num_layers")
         self.dropout = _validate_dropout(dropout)
+        if self.num_layers == 1 and self.dropout > 0.0:
+            raise ValueError(
+                "dropout requires num_layers > 1 because GRU applies dropout "
+                "only between stacked recurrent layers."
+            )
         self.batch_first = _validate_bool(batch_first, "batch_first")
         self.residual = _validate_bool(residual, "residual")
         self.use_norm = _validate_bool(norm, "norm")
