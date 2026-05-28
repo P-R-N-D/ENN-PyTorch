@@ -131,3 +131,25 @@ class StateRoute:
             raise TypeError(f"StateRoute.enable_return_state expects KVStore, got {type(store)!r}")
         store.set(self.return_state_key, True)
         return store
+
+    def carry(self, store: KVStore, *, missing_ok: bool = False) -> KVStore:
+        """
+        Copy the routed output state into the routed input state slot.
+
+        This is an explicit one-step carry helper. It does not detach tensors,
+        reset state, or manage stream lifecycle; those policies belong to a
+        future stream/state runner.
+        """
+        if not isinstance(store, KVStore):
+            raise TypeError(f"StateRoute.carry expects KVStore, got {type(store)!r}")
+        if not isinstance(missing_ok, bool):
+            raise TypeError("StateRoute.carry missing_ok must be a bool.")
+
+        try:
+            value = store.get_value(self.state_output_key)
+        except KeyError:
+            if missing_ok:
+                return store
+            raise
+        store.set_value(self.state_input_key, value)
+        return store

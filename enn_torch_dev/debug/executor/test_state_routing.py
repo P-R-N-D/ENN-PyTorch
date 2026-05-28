@@ -4,7 +4,14 @@ import pytest
 import torch
 from torch import nn
 
-from enn_torch_dev.executor import GraphExecutor, KVStore, KeyRef, NodeSpec, StateRoute
+from enn_torch_dev.executor import (
+    GraphExecutor,
+    GraphValue,
+    KVStore,
+    KeyRef,
+    NodeSpec,
+    StateRoute,
+)
 from enn_torch_dev.nn import RecurrentContextHead
 
 
@@ -170,6 +177,89 @@ def test_state_route_can_carry_state_between_runs_manually() -> None:
     store.set("ctx.state.in", first_state)
     graph.run(store)
 
+    assert store.get("ctx.state.out").shape == first_state.shape
+
+
+def test_state_route_carry_copies_output_state_to_input_state() -> None:
+    route = StateRoute("ctx.state.in", "ctx.state.out")
+    store = KVStore()
+    state = torch.randn(1, 2, 3)
+    store.set("ctx.state.out", state)
+
+    returned = route.carry(store)
+
+    assert returned is store
+    assert torch.equal(store.get("ctx.state.in"), state)
+
+
+def test_state_route_carry_preserves_graph_value_metadata() -> None:
+    route = StateRoute("ctx.state.in", "ctx.state.out")
+    store = KVStore()
+    value = GraphValue(
+        data=torch.randn(1, 2, 3),
+        layout="state",
+        origin="ctx",
+        meta={"step": 1},
+    )
+    store.set_value("ctx.state.out", value)
+
+    route.carry(store)
+
+    carried = store.get_value("ctx.state.in")
+    assert carried is value
+    assert carried.layout == "state"
+    assert carried.origin == "ctx"
+    assert carried.meta == {"step": 1}
+
+
+def test_state_route_carry_missing_output_raises_by_default() -> None:
+    route = StateRoute("ctx.state.in", "ctx.state.out")
+
+    with pytest.raises(KeyError, match="ctx.state.out"):
+        route.carry(KVStore())
+
+
+def test_state_route_carry_missing_output_can_be_ignored() -> None:
+    route = StateRoute("ctx.state.in", "ctx.state.out")
+    store = KVStore()
+
+    returned = route.carry(store, missing_ok=True)
+
+    assert returned is store
+    assert not store.has("ctx.state.in")
+
+
+def test_state_route_carry_validates_inputs() -> None:
+    route = StateRoute("ctx.state.in", "ctx.state.out")
+
+    with pytest.raises(TypeError, match="KVStore"):
+        route.carry(object())
+
+    with pytest.raises(TypeError, match="missing_ok"):
+        route.carry(KVStore(), missing_ok=1)
+
+
+def test_state_route_carry_feeds_next_recurrent_run() -> None:
+    route = StateRoute("ctx.state.in", "ctx.state.out")
+    graph = GraphExecutor()
+    graph.add_node(
+        NodeSpec(
+            name="ctx",
+            input_args=[KeyRef("x")],
+            input_kwargs=route.input_kwargs(),
+            output_key="ctx.out",
+            output_keys=route.output_keys("ctx.out"),
+        ),
+        RecurrentContextHead(input_dim=4, hidden_dim=3),
+    )
+    store = KVStore({"x": torch.randn(2, 5, 4)})
+
+    graph.run(store)
+    first_state = store.get("ctx.state.out")
+    route.carry(store)
+    graph.run(store)
+
+    assert torch.equal(store.get("ctx.state.in"), first_state)
     assert store.get("ctx.state.out").shape == first_state.shape
 
 
