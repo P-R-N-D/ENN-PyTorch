@@ -7,6 +7,7 @@ from .schema import GraphValue, KeyRef
 from .store import KVStore
 from .state import StateRoute
 from .subgraph import SubgraphExecutor, SubgraphSpec
+from .stream import StreamPipeline, StreamPipelineSpec
 from .tile import TileExecutor, TileSpec
 from .tile_policy import TileMeta, TilePolicy
 from .tile_pipeline import TilePipeline, TilePipelineSpec
@@ -22,6 +23,8 @@ __all__ = [
     "NodeExecutor",
     "NodeSpec",
     "StateRoute",
+    "StreamPipeline",
+    "StreamPipelineSpec",
     "SubgraphExecutor",
     "SubgraphSpec",
     "TileExecutor",
