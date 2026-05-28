@@ -4,6 +4,7 @@ from .blocks import (
     Composer,
     Compressor,
 )
+from .attention import GlobalSelfAttentionBlock
 from .fusion import LocalGlobalFusion
 from .layers import ConvMixer, Reducer
 from .types import ContextSummary
@@ -13,6 +14,7 @@ __all__ = [
     "Composer",
     "Compressor",
     "ContextSummary",
+    "GlobalSelfAttentionBlock",
     "LocalGlobalFusion",
     "Reducer",
 ]
