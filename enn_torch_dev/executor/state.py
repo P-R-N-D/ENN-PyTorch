@@ -63,11 +63,20 @@ class StateRoute:
             self.return_state_key,
             "return_state_key",
         )
+        if self.return_state_key in {self.state_input_key, self.state_output_key}:
+            raise ValueError(
+                "StateRoute.return_state_key must be distinct from "
+                "state_input_key and state_output_key."
+            )
 
     def input_kwargs(
         self,
         existing: Mapping[str, KeyRef] | None = None,
+        *,
+        state_optional: bool = True,
     ) -> dict[str, KeyRef]:
+        if not isinstance(state_optional, bool):
+            raise TypeError("StateRoute.input_kwargs state_optional must be a bool.")
         if existing is None:
             out: dict[str, KeyRef] = {}
         elif isinstance(existing, Mapping):
@@ -91,7 +100,7 @@ class StateRoute:
 
         out[self.state_arg] = KeyRef(
             self.state_input_key,
-            optional=True,
+            optional=state_optional,
             default=None,
         )
         out[self.return_state_arg] = KeyRef(
@@ -106,9 +115,14 @@ class StateRoute:
             primary_output_key,
             "primary_output_key",
         )
-        if primary_output_key == self.state_output_key:
+        reserved = {
+            self.state_input_key,
+            self.state_output_key,
+            self.return_state_key,
+        }
+        if primary_output_key in reserved:
             raise ValueError(
-                "StateRoute primary_output_key and state_output_key must differ."
+                "StateRoute primary_output_key must differ from state/control keys."
             )
         return primary_output_key, self.state_output_key
 

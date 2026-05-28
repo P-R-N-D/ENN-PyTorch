@@ -2,9 +2,15 @@ from __future__ import annotations
 
 import pytest
 import torch
+from torch import nn
 
 from enn_torch_dev.executor import GraphExecutor, KVStore, KeyRef, NodeSpec, StateRoute
 from enn_torch_dev.nn import RecurrentContextHead
+
+
+class _StateProducer(nn.Module):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return torch.zeros(1, x.shape[0], 3, dtype=x.dtype, device=x.device)
 
 
 def test_state_route_builds_input_kwargs_and_output_keys() -> None:
@@ -52,6 +58,22 @@ def test_state_route_enable_return_state_writes_flag() -> None:
     assert store.get("flag") is True
 
 
+
+
+def test_state_route_can_make_state_input_required() -> None:
+    route = StateRoute("ctx.state.in", "ctx.state.out")
+
+    kwargs = route.input_kwargs(state_optional=False)
+
+    assert kwargs["state"] == KeyRef("ctx.state.in", optional=False, default=None)
+
+
+def test_state_route_rejects_bad_state_optional_flag() -> None:
+    route = StateRoute("ctx.state.in", "ctx.state.out")
+
+    with pytest.raises(TypeError, match="state_optional"):
+        route.input_kwargs(state_optional=1)
+
 def test_state_route_validates_constructor_arguments() -> None:
     with pytest.raises(TypeError, match="state_input_key"):
         StateRoute(1, "state.out")
@@ -62,8 +84,20 @@ def test_state_route_validates_constructor_arguments() -> None:
     with pytest.raises(ValueError, match="differ"):
         StateRoute("state.in", "state.out", state_arg="state", return_state_arg="state")
 
+    with pytest.raises(ValueError, match="return_state_key"):
+        StateRoute("state.in", "state.out", return_state_key="state.in")
+
+    with pytest.raises(ValueError, match="return_state_key"):
+        StateRoute("state.in", "state.out", return_state_key="state.out")
+
     with pytest.raises(ValueError, match="primary_output_key"):
         StateRoute("state.in", "state.out").output_keys("state.out")
+
+    with pytest.raises(ValueError, match="primary_output_key"):
+        StateRoute("state.in", "state.out").output_keys("state.in")
+
+    with pytest.raises(ValueError, match="primary_output_key"):
+        StateRoute("state.in", "state.out").output_keys("__state.return_state__")
 
     with pytest.raises(TypeError, match="KVStore"):
         StateRoute("state.in", "state.out").enable_return_state(object())
@@ -138,6 +172,40 @@ def test_state_route_can_carry_state_between_runs_manually() -> None:
 
     assert store.get("ctx.state.out").shape == first_state.shape
 
+
+
+
+def test_state_route_required_state_preserves_graph_dependency() -> None:
+    route = StateRoute("ctx.state.in", "ctx.state.out")
+    graph = GraphExecutor()
+    graph.add_node(
+        NodeSpec(
+            name="ctx",
+            input_args=[KeyRef("x")],
+            input_kwargs=route.input_kwargs(state_optional=False),
+            output_key="ctx.out",
+            output_keys=route.output_keys("ctx.out"),
+        ),
+        RecurrentContextHead(input_dim=4, hidden_dim=3),
+    )
+    graph.add_node(
+        NodeSpec(
+            name="state_producer",
+            input_args=[KeyRef("x")],
+            output_key="ctx.state.in",
+        ),
+        _StateProducer(),
+    )
+
+    assert graph.execution_order() == ("state_producer", "ctx")
+    assert graph.dependency_names("ctx") == ("state_producer",)
+
+    store = KVStore({"x": torch.randn(2, 5, 4)})
+    graph.run(store)
+
+    assert store.get("ctx.out").shape == (2, 5, 4)
+    assert store.get("ctx.state.in").shape == (1, 2, 3)
+    assert store.get("ctx.state.out").shape == (1, 2, 3)
 
 def test_state_route_enable_return_state_is_optional() -> None:
     route = StateRoute("ctx.state.in", "ctx.state.out", return_state_key="flag")
