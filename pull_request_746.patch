@@ -1,0 +1,342 @@
+diff --git a/enn_torch_dev/executor/__init__.py b/enn_torch_dev/executor/__init__.py
+index 409766a..d879f54 100644
+--- a/enn_torch_dev/executor/__init__.py
++++ b/enn_torch_dev/executor/__init__.py
+@@ -2,6 +2,7 @@ from __future__ import annotations
+
+ from .graph import GraphExecutor
++from .global_local import GlobalLocalPipeline, GlobalLocalPipelineSpec
+ from .node import NodeExecutor, NodeSpec
+ from .schema import GraphValue, KeyRef
+ from .store import KVStore
+@@ -15,6 +16,8 @@ from .tile_reconstruct import TileReconstructSpec, TileReconstructor
+ __all__ = [
+     "GraphValue",
+     "GraphExecutor",
++    "GlobalLocalPipeline",
++    "GlobalLocalPipelineSpec",
+     "KeyRef",
+     "KVStore",
+     "NodeExecutor",
+diff --git a/enn_torch_dev/executor/global_local.py b/enn_torch_dev/executor/global_local.py
+new file mode 100644
+index 0000000..a2bd2d3
+--- /dev/null
++++ b/enn_torch_dev/executor/global_local.py
+@@ -0,0 +1,114 @@
++from __future__ import annotations
++
++from dataclasses import dataclass
++
++from torch import Tensor
++
++from enn_torch_dev.nn import LocalGlobalFusion
++
++from .graph import GraphExecutor
++from .store import KVStore
++from .tile_pipeline import TilePipeline
++
++
++def _validate_global_local_key(value: object, field_name: str) -> str:
++    label = f"GlobalLocalPipelineSpec.{field_name}"
++    if not isinstance(value, str):
++        raise TypeError(f"{label} must be a string.")
++    if not value:
++        raise ValueError(f"{label} must be a non-empty string.")
++    if value != value.strip():
++        raise ValueError(
++            f"{label} must not have leading or trailing whitespace."
++        )
++    return value
++
++
++@dataclass(slots=True)
++class GlobalLocalPipelineSpec:
++    """
++    Global/local fusion orchestration schema.
++
++    ``global_output_name`` is always a node name from ``global_graph``.
++    ``global_output_by`` controls whether the global graph output is collected
++    by node name or by output key. ``fused_output_key`` optionally writes the
++    fused tensor back into the base ``KVStore``.
++    """
++
++    global_output_name: str
++    fused_output_key: str | None = None
++    global_output_by: str = "node"
++
++    def __post_init__(self) -> None:
++        self.global_output_name = _validate_global_local_key(
++            self.global_output_name,
++            "global_output_name",
++        )
++        if self.fused_output_key is not None:
++            self.fused_output_key = _validate_global_local_key(
++                self.fused_output_key,
++                "fused_output_key",
++            )
++        if self.global_output_by not in {"node", "key"}:
++            raise ValueError(
++                "GlobalLocalPipelineSpec.global_output_by must be either "
++                "'node' or 'key'."
++            )
++
++
++class GlobalLocalPipeline:
++    """
++    Run a global graph, run a tiled/local pipeline, then fuse both outputs.
++
++    The global branch is intentionally supplied as a ``GraphExecutor`` so users
++    can attach attention, transformer, recurrent, or other context modules as
++    graph nodes. This class only orchestrates execution and scalar gate fusion.
++    """
++
++    def __init__(
++        self,
++        *,
++        global_graph: GraphExecutor,
++        tile_pipeline: TilePipeline,
++        fusion: LocalGlobalFusion,
++        spec: GlobalLocalPipelineSpec,
++    ) -> None:
++        if not isinstance(global_graph, GraphExecutor):
++            raise TypeError(
++                "GlobalLocalPipeline global_graph must be GraphExecutor, "
++                f"got {type(global_graph)!r}"
++            )
++        if not isinstance(tile_pipeline, TilePipeline):
++            raise TypeError(
++                "GlobalLocalPipeline tile_pipeline must be TilePipeline, "
++                f"got {type(tile_pipeline)!r}"
++            )
++        if not isinstance(fusion, LocalGlobalFusion):
++            raise TypeError(
++                f"GlobalLocalPipeline fusion must be LocalGlobalFusion, got {type(fusion)!r}"
++            )
++        if not isinstance(spec, GlobalLocalPipelineSpec):
++            raise TypeError(
++                "GlobalLocalPipeline spec must be GlobalLocalPipelineSpec, "
++                f"got {type(spec)!r}"
++            )
++
++        global_graph.output_key(spec.global_output_name)
++
++        self.global_graph = global_graph
++        self.tile_pipeline = tile_pipeline
++        self.fusion = fusion
++        self.spec = spec
++
++    def _global_result_key(self) -> str:
++        if self.spec.global_output_by == "node":
++            return self.spec.global_output_name
++        return self.global_graph.output_key(self.spec.global_output_name)
++
++    def run(self, store: KVStore) -> Tensor:
++        if not isinstance(store, KVStore):
++            raise TypeError(
++                f"GlobalLocalPipeline.run expects KVStore, got {type(store)!r}"
++            )
++
++        self.global_graph.run(store)
++        global_outputs = self.global_graph.collect_outputs(
++            store,
++            names=[self.spec.global_output_name],
++            by=self.spec.global_output_by,
++        )
++        global_out = global_outputs[self._global_result_key()]
++        local_out = self.tile_pipeline.run(store)
++        fused = self.fusion(global_out, local_out)
++
++        if self.spec.fused_output_key is not None:
++            store.set(self.spec.fused_output_key, fused, origin="GlobalLocalPipeline")
++        return fused
+diff --git a/enn_torch_dev/debug/executor/test_global_local.py b/enn_torch_dev/debug/executor/test_global_local.py
+new file mode 100644
+index 0000000..c87bc1e
+--- /dev/null
++++ b/enn_torch_dev/debug/executor/test_global_local.py
+@@ -0,0 +1,169 @@
++from __future__ import annotations
++
++import pytest
++import torch
++from torch import nn
++
++from enn_torch_dev.executor import (
++    GlobalLocalPipeline,
++    GlobalLocalPipelineSpec,
++    GraphExecutor,
++    KVStore,
++    KeyRef,
++    NodeSpec,
++    TilePipeline,
++    TilePipelineSpec,
++    TilePolicy,
++)
++from enn_torch_dev.nn import LocalGlobalFusion
++
++
++class _AddBias(nn.Module):
++    def forward(self, x: torch.Tensor, bias: torch.Tensor) -> torch.Tensor:
++        return x + bias
++
++
++class _TakeFirst(nn.Module):
++    def forward(self, x: torch.Tensor) -> torch.Tensor:
++        return x[:1]
++
++
++def _make_global_graph() -> GraphExecutor:
++    graph = GraphExecutor()
++    graph.add_node(
++        NodeSpec(
++            name="global",
++            input_args=[KeyRef("x")],
++            input_kwargs={"bias": KeyRef("global.bias")},
++            output_key="global.out",
++        ),
++        _AddBias(),
++    )
++    return graph
++
++
++def _make_tile_pipeline() -> TilePipeline:
++    tile_graph = GraphExecutor()
++    tile_graph.add_node(
++        NodeSpec(
++            name="local",
++            input_args=[KeyRef("tile.x")],
++            input_kwargs={"bias": KeyRef("local.bias")},
++            output_key="local.out",
++        ),
++        _AddBias(),
++    )
++    return TilePipeline(
++        tile_graph,
++        TilePolicy(tile_shape=(2,)),
++        TilePipelineSpec(
++            input_key="x",
++            tile_input_key="tile.x",
++            output_name="local",
++        ),
++    )
++
++
++def test_global_local_pipeline_runs_global_local_and_fuses() -> None:
++    pipeline = GlobalLocalPipeline(
++        global_graph=_make_global_graph(),
++        tile_pipeline=_make_tile_pipeline(),
++        fusion=LocalGlobalFusion(init_logit=0.0, learnable=False),
++        spec=GlobalLocalPipelineSpec(global_output_name="global"),
++    )
++    x = torch.arange(5, dtype=torch.float32)
++    store = KVStore(
++        {
++            "x": x,
++            "global.bias": torch.tensor(10.0),
++            "local.bias": torch.tensor(2.0),
++        }
++    )
++
++    out = pipeline.run(store)
++
++    assert torch.equal(out, x + 6.0)
++    assert torch.equal(store.get("global.out"), x + 10.0)
++    assert not store.has("tile.x")
++    assert not store.has("local.out")
++
++
++def test_global_local_pipeline_writes_fused_output_key() -> None:
++    pipeline = GlobalLocalPipeline(
++        global_graph=_make_global_graph(),
++        tile_pipeline=_make_tile_pipeline(),
++        fusion=LocalGlobalFusion(init_logit=0.0, learnable=False),
++        spec=GlobalLocalPipelineSpec(
++            global_output_name="global",
++            fused_output_key="fused.out",
++        ),
++    )
++    x = torch.arange(4, dtype=torch.float32)
++    store = KVStore(
++        {
++            "x": x,
++            "global.bias": torch.tensor(4.0),
++            "local.bias": torch.tensor(2.0),
++        }
++    )
++
++    out = pipeline.run(store)
++
++    assert store.has("fused.out")
++    assert torch.equal(store.get("fused.out"), out)
++
++
++def test_global_local_pipeline_supports_global_output_by_key() -> None:
++    pipeline = GlobalLocalPipeline(
++        global_graph=_make_global_graph(),
++        tile_pipeline=_make_tile_pipeline(),
++        fusion=LocalGlobalFusion(init_logit=0.0, learnable=False),
++        spec=GlobalLocalPipelineSpec(
++            global_output_name="global",
++            global_output_by="key",
++        ),
++    )
++    x = torch.arange(3, dtype=torch.float32)
++    store = KVStore(
++        {
++            "x": x,
++            "global.bias": torch.tensor(10.0),
++            "local.bias": torch.tensor(2.0),
++        }
++    )
++
++    out = pipeline.run(store)
++
++    assert torch.equal(out, x + 6.0)
++
++
++def test_global_local_pipeline_forwards_fusion_shape_errors() -> None:
++    global_graph = GraphExecutor()
++    global_graph.add_node(
++        NodeSpec(name="global", input_args=[KeyRef("x")], output_key="global.out"),
++        _TakeFirst(),
++    )
++    pipeline = GlobalLocalPipeline(
++        global_graph=global_graph,
++        tile_pipeline=_make_tile_pipeline(),
++        fusion=LocalGlobalFusion(),
++        spec=GlobalLocalPipelineSpec(global_output_name="global"),
++    )
++
++    with pytest.raises(ValueError, match="same shape"):
++        pipeline.run(
++            KVStore(
++                {
++                    "x": torch.arange(5, dtype=torch.float32),
++                    "local.bias": torch.tensor(0.0),
++                }
++            )
++        )
++
++
++def test_global_local_pipeline_rejects_unknown_global_output() -> None:
++    with pytest.raises(KeyError, match="missing"):
++        GlobalLocalPipeline(
++            global_graph=_make_global_graph(),
++            tile_pipeline=_make_tile_pipeline(),
++            fusion=LocalGlobalFusion(),
++            spec=GlobalLocalPipelineSpec(global_output_name="missing"),
++        )
++
++
++def test_global_local_pipeline_validates_inputs() -> None:
++    with pytest.raises(ValueError, match="global_output_by"):
++        GlobalLocalPipelineSpec(global_output_name="global", global_output_by="bad")
++
++    with pytest.raises(TypeError, match="GraphExecutor"):
++        GlobalLocalPipeline(
++            global_graph=object(),
++            tile_pipeline=_make_tile_pipeline(),
++            fusion=LocalGlobalFusion(),
++            spec=GlobalLocalPipelineSpec(global_output_name="global"),
++        )
