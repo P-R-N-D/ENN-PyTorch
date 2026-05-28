@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from .graph import GraphExecutor
+from .global_local import GlobalLocalPipeline, GlobalLocalPipelineSpec
 from .node import NodeExecutor, NodeSpec
 from .schema import GraphValue, KeyRef
 from .store import KVStore
@@ -13,6 +14,8 @@ from .tile_reconstruct import TileReconstructSpec, TileReconstructor
 __all__ = [
     "GraphValue",
     "GraphExecutor",
+    "GlobalLocalPipeline",
+    "GlobalLocalPipelineSpec",
     "KeyRef",
     "KVStore",
     "NodeExecutor",
