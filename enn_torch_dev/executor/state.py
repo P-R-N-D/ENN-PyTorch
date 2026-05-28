@@ -2,8 +2,11 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass
+from typing import Any
 
-from .schema import KeyRef
+from torch import Tensor
+
+from .schema import GraphValue, KeyRef
 from .store import KVStore
 
 
@@ -132,18 +135,82 @@ class StateRoute:
         store.set(self.return_state_key, True)
         return store
 
-    def carry(self, store: KVStore, *, missing_ok: bool = False) -> KVStore:
+    @staticmethod
+    def _carried_payload(
+        payload: Any,
+        *,
+        detach: bool,
+        clone: bool,
+    ) -> Any:
+        if isinstance(payload, Tensor):
+            if detach:
+                payload = payload.detach()
+            if clone:
+                payload = payload.clone()
+            return payload
+
+        if isinstance(payload, tuple):
+            return tuple(
+                StateRoute._carried_payload(item, detach=detach, clone=clone)
+                for item in payload
+            )
+        if isinstance(payload, list):
+            return [
+                StateRoute._carried_payload(item, detach=detach, clone=clone)
+                for item in payload
+            ]
+        if isinstance(payload, Mapping):
+            return {
+                key: StateRoute._carried_payload(item, detach=detach, clone=clone)
+                for key, item in payload.items()
+            }
+        return payload
+
+    @staticmethod
+    def _carried_value(
+        value: GraphValue,
+        *,
+        detach: bool,
+        clone: bool,
+    ) -> GraphValue:
+        data = value.data
+        if not detach and not clone:
+            return value
+
+        data = StateRoute._carried_payload(data, detach=detach, clone=clone)
+        return GraphValue(
+            data=data,
+            layout=value.layout,
+            mask_key=value.mask_key,
+            origin=value.origin,
+            meta=dict(value.meta),
+        )
+
+    def carry(
+        self,
+        store: KVStore,
+        *,
+        missing_ok: bool = False,
+        detach: bool = False,
+        clone: bool = False,
+    ) -> KVStore:
         """
         Copy the routed output state into the routed input state slot.
 
-        This is an explicit one-step carry helper. It does not detach tensors,
-        reset state, or manage stream lifecycle; those policies belong to a
-        future stream/state runner.
+        ``detach`` and ``clone`` apply recursively to Tensor payloads inside
+        tuples, lists, and mappings. Other payloads are carried unchanged. This
+        helper does not reset state or
+        manage stream lifecycle; those policies belong to a future stream/state
+        runner.
         """
         if not isinstance(store, KVStore):
             raise TypeError(f"StateRoute.carry expects KVStore, got {type(store)!r}")
         if not isinstance(missing_ok, bool):
             raise TypeError("StateRoute.carry missing_ok must be a bool.")
+        if not isinstance(detach, bool):
+            raise TypeError("StateRoute.carry detach must be a bool.")
+        if not isinstance(clone, bool):
+            raise TypeError("StateRoute.carry clone must be a bool.")
 
         try:
             value = store.get_value(self.state_output_key)
@@ -151,5 +218,5 @@ class StateRoute:
             if missing_ok:
                 return store
             raise
-        store.set_value(self.state_input_key, value)
+        store.set_value(self.state_input_key, self._carried_value(value, detach=detach, clone=clone))
         return store

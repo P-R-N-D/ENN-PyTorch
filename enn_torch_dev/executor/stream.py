@@ -20,6 +20,12 @@ def _validate_stream_key(value: object, field_name: str) -> str:
     return value
 
 
+def _validate_stream_bool(value: object, field_name: str) -> bool:
+    if not isinstance(value, bool):
+        raise TypeError(f"StreamPipelineSpec.{field_name} must be a bool.")
+    return value
+
+
 def _normalize_chunks(chunks: object) -> tuple[Any, ...]:
     if chunks is None or isinstance(chunks, (str, bytes, bytearray)):
         raise TypeError("chunks must be a sequence of chunk values.")
@@ -62,6 +68,8 @@ class StreamPipelineSpec:
     output_by: str = "node"
     chunk_index_key: str | None = None
     outputs_key: str | None = None
+    state_detach: bool = False
+    state_clone: bool = False
 
     def __post_init__(self) -> None:
         self.chunk_input_key = _validate_stream_key(
@@ -83,6 +91,8 @@ class StreamPipelineSpec:
                 self.outputs_key,
                 "outputs_key",
             )
+        self.state_detach = _validate_stream_bool(self.state_detach, "state_detach")
+        self.state_clone = _validate_stream_bool(self.state_clone, "state_clone")
 
 
 class StreamPipeline:
@@ -148,7 +158,11 @@ class StreamPipeline:
             outputs.append(result)
 
             for route in self.state_routes:
-                route.carry(chunk_store)
+                route.carry(
+                    chunk_store,
+                    detach=self.spec.state_detach,
+                    clone=self.spec.state_clone,
+                )
                 store.set_value(
                     route.state_input_key,
                     chunk_store.get_value(route.state_input_key),

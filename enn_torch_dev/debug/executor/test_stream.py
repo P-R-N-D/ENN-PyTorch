@@ -248,6 +248,65 @@ def test_stream_pipeline_forces_return_state_for_state_routes() -> None:
     assert store.get("return_state") is False
 
 
+def test_stream_pipeline_can_detach_carried_state() -> None:
+    route = StateRoute("sum.state.in", "sum.state.out")
+    graph = GraphExecutor()
+    graph.add_node(
+        NodeSpec(
+            name="sum",
+            input_args=[KeyRef("chunk.x")],
+            input_kwargs=route.input_kwargs(),
+            output_key="sum.out",
+            output_keys=route.output_keys("sum.out"),
+        ),
+        _RunningSum(),
+    )
+    pipeline = StreamPipeline(
+        graph,
+        StreamPipelineSpec(
+            chunk_input_key="chunk.x",
+            output_name="sum",
+            state_detach=True,
+        ),
+        state_routes=[route],
+    )
+    store = KVStore()
+
+    pipeline.run(store, [torch.ones(1, requires_grad=True)])
+
+    assert not store.get("sum.state.in").requires_grad
+
+
+def test_stream_pipeline_can_clone_carried_state() -> None:
+    route = StateRoute("sum.state.in", "sum.state.out")
+    graph = GraphExecutor()
+    graph.add_node(
+        NodeSpec(
+            name="sum",
+            input_args=[KeyRef("chunk.x")],
+            input_kwargs=route.input_kwargs(),
+            output_key="sum.out",
+            output_keys=route.output_keys("sum.out"),
+        ),
+        _RunningSum(),
+    )
+    pipeline = StreamPipeline(
+        graph,
+        StreamPipelineSpec(
+            chunk_input_key="chunk.x",
+            output_name="sum",
+            state_clone=True,
+        ),
+        state_routes=[route],
+    )
+    store = KVStore()
+
+    outputs = pipeline.run(store, [torch.ones(1)])
+
+    assert torch.equal(store.get("sum.state.in"), outputs[0])
+    assert store.get("sum.state.in").data_ptr() != outputs[0].data_ptr()
+
+
 def test_stream_pipeline_allows_empty_chunks() -> None:
     pipeline = StreamPipeline(
         _make_double_graph(),
@@ -286,6 +345,16 @@ def test_stream_pipeline_validates_inputs() -> None:
             output_name="double_node",
             output_by="bad",
         )
+
+    with pytest.raises(TypeError, match="state_detach"):
+        StreamPipelineSpec(
+            chunk_input_key="chunk.x",
+            output_name="double_node",
+            state_detach=1,
+        )
+
+    with pytest.raises(TypeError, match="state_clone"):
+        StreamPipelineSpec(chunk_input_key="chunk.x", output_name="double_node", state_clone=1)
 
     with pytest.raises(TypeError, match="GraphExecutor"):
         StreamPipeline(
