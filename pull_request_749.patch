@@ -1,0 +1,416 @@
+diff --git a/enn_torch_dev/executor/node.py b/enn_torch_dev/executor/node.py
+index cb7e813..b7b93d4 100644
+--- a/enn_torch_dev/executor/node.py
++++ b/enn_torch_dev/executor/node.py
+@@ -2,6 +2,7 @@ from __future__ import annotations
+
+ from dataclasses import dataclass, field
+ from typing import Any
++from collections.abc import Sequence
+
+ from torch import nn
+
+@@ -24,6 +25,34 @@ def _validate_spec_key(value: object, field_name: str) -> str:
+     return value
+
+
++def _normalize_output_keys(
++    value: object,
++    *,
++    primary_output_key: str,
++) -> tuple[str, ...] | None:
++    if value is None:
++        return None
++    if isinstance(value, (str, bytes, bytearray)):
++        raise TypeError("NodeSpec.output_keys must be a sequence of strings.")
++
++    try:
++        values = tuple(value)  # type: ignore[arg-type]
++    except TypeError as exc:
++        raise TypeError("NodeSpec.output_keys must be a sequence of strings.") from exc
++
++    if not values:
++        raise ValueError("NodeSpec.output_keys must not be empty.")
++
++    out: list[str] = []
++    seen: set[str] = set()
++    for key in values:
++        normalized = _validate_spec_key(key, "output_keys")
++        if normalized in seen:
++            raise ValueError(f"NodeSpec.output_keys contains duplicate key: {normalized!r}")
++        seen.add(normalized)
++        out.append(normalized)
++    if out[0] != primary_output_key:
++        raise ValueError("NodeSpec.output_keys first entry must match output_key.")
++    return tuple(out)
++
++
+ @dataclass(slots=True)
+ class NodeSpec:
+@@ -40,6 +69,7 @@ class NodeSpec:
+     input_args: list[KeyRef] = field(default_factory=list)
+     input_kwargs: dict[str, KeyRef] = field(default_factory=dict)
+     output_key: str = ""
++    output_keys: Sequence[str] | None = None
+
+     def __post_init__(self) -> None:
+         self.name = _validate_spec_key(self.name, "name")
+@@ -50,6 +80,10 @@ class NodeSpec:
+                 self.module_key, "module_key"
+             )
+         self.output_key = _validate_spec_key(self.output_key, "output_key")
++        self.output_keys = _normalize_output_keys(
++            self.output_keys,
++            primary_output_key=self.output_key,
++        )
+
+
+ class NodeExecutor:
+@@ -71,6 +105,13 @@ class NodeExecutor:
+     def output_key(self) -> str:
+         return self.spec.output_key
+
++    @property
++    def output_keys(self) -> tuple[str, ...]:
++        output_keys = self.spec.output_keys
++        if output_keys is None:
++            return (self.output_key,)
++        return tuple(output_keys)
++
+     def output_ref(self) -> KeyRef:
+         return KeyRef(self.output_key)
+
+@@ -85,6 +126,18 @@ class NodeExecutor:
+             for name, ref in self.spec.input_kwargs.items()
+         }
+         out = module(*args, **kwargs)
+-        store.set(self.spec.output_key, out, origin=self.spec.name)
++        output_keys = self.spec.output_keys
++        if output_keys is None:
++            store.set(self.spec.output_key, out, origin=self.spec.name)
++            return out
++
++        if not isinstance(out, (tuple, list)):
++            raise TypeError(
++                "NodeExecutor multi-output nodes must return a tuple or list."
++            )
++        if len(out) != len(output_keys):
++            raise ValueError(
++                f"NodeExecutor expected {len(output_keys)} outputs, got {len(out)}."
++            )
++        for key, value in zip(output_keys, out):
++            store.set(key, value, origin=self.spec.name)
+         return out
+diff --git a/enn_torch_dev/executor/subgraph.py b/enn_torch_dev/executor/subgraph.py
+index 29448f7..4d95f25 100644
+--- a/enn_torch_dev/executor/subgraph.py
++++ b/enn_torch_dev/executor/subgraph.py
+@@ -131,6 +131,10 @@ class SubgraphExecutor:
+     def output_key(self) -> str:
+         return self.spec.output_key
+
++    @property
++    def output_keys(self) -> tuple[str, ...]:
++        return (self.output_key,)
++
+     def output_ref(self) -> KeyRef:
+         return KeyRef(self.output_key)
+
+diff --git a/enn_torch_dev/executor/graph.py b/enn_torch_dev/executor/graph.py
+index 2e4eb3d..4825de6 100644
+--- a/enn_torch_dev/executor/graph.py
++++ b/enn_torch_dev/executor/graph.py
+@@ -124,21 +124,33 @@ class GraphExecutor(nn.Module):
+
+         name = self._validate_node_name(name)
+         module_key = _validate_module_key(module_key)
+-        output_key = _validate_graph_key(executor.output_key, "GraphExecutor output_key")
++        output_keys = tuple(
++            _validate_graph_key(key, "GraphExecutor output_key")
++            for key in executor.output_keys
++        )
++        if not output_keys:
++            raise ValueError("GraphExecutor executor must produce at least one output_key.")
++        if len(set(output_keys)) != len(output_keys):
++            raise ValueError(
++                f"GraphExecutor executor has duplicate output_keys: {output_keys!r}"
++            )
++        if output_keys[0] != executor.output_key:
++            raise ValueError(
++                "GraphExecutor executor.output_keys first entry must match output_key."
++            )
+
+         if name in self._nodes:
+             raise ValueError(f"Duplicate node name: {name!r}")
+         if module_key in self.modules_by_key:
+             raise ValueError(f"Duplicate module_key: {module_key!r}")
+
+-        producer = self._producer_by_output_key.get(output_key)
+-        if producer is not None:
+-            raise ValueError(
+-                f"Duplicate output_key: {output_key!r} already produced by node {producer!r}"
+-            )
++        for output_key in output_keys:
++            producer = self._producer_by_output_key.get(output_key)
++            if producer is not None:
++                raise ValueError(
++                    f"Duplicate output_key: {output_key!r} already produced by node {producer!r}"
++                )
+
+         self.modules_by_key[module_key] = module
+         self._nodes[name] = executor
+         self._order.append(name)
+-        self._producer_by_output_key[output_key] = name
++        for output_key in output_keys:
++            self._producer_by_output_key[output_key] = name
+         return name
+
+@@ -367,13 +379,13 @@ class GraphExecutor(nn.Module):
+         node = self._nodes.pop(name)
+         module_key = node.module_key
+-        output_key = node.output_key
++        output_keys = node.output_keys
+
+         if module_key in self.modules_by_key:
+             del self.modules_by_key[module_key]
+
+-        if self._producer_by_output_key.get(output_key) == name:
+-            del self._producer_by_output_key[output_key]
++        for output_key in output_keys:
++            if self._producer_by_output_key.get(output_key) == name:
++                del self._producer_by_output_key[output_key]
+
+         try:
+             self._order.remove(name)
+@@ -664,15 +676,23 @@ class GraphExecutor(nn.Module):
+             module_key_producers[module_key] = name
+             expected_module_keys.add(module_key)
+
+-            output_key = node.output_key
+-            producer = expected_producers.get(output_key)
+-            if producer is not None:
+-                raise RuntimeError(
+-                    f"Graph has duplicate output_key {output_key!r} produced by "
+-                    f"{producer!r} and {name!r}."
+-                )
+-            expected_producers[output_key] = name
++            output_keys = node.output_keys
++            if not output_keys:
++                raise RuntimeError(f"Graph node {name!r} has no output_keys.")
++            if output_keys[0] != node.output_key:
++                raise RuntimeError(
++                    f"Graph node {name!r} output_keys first entry does not match output_key."
++                )
++            if len(set(output_keys)) != len(output_keys):
++                raise RuntimeError(f"Graph node {name!r} has duplicate output_keys.")
++            for output_key in output_keys:
++                producer = expected_producers.get(output_key)
++                if producer is not None:
++                    raise RuntimeError(
++                        f"Graph has duplicate output_key {output_key!r} produced by "
++                        f"{producer!r} and {name!r}."
++                    )
++                expected_producers[output_key] = name
+
+         registered_module_keys = set(self.modules_by_key.keys())
+diff --git a/enn_torch_dev/debug/executor/test_node_multi_output.py b/enn_torch_dev/debug/executor/test_node_multi_output.py
+new file mode 100644
+index 0000000..f5e6f98
+--- /dev/null
++++ b/enn_torch_dev/debug/executor/test_node_multi_output.py
+@@ -0,0 +1,158 @@
++from __future__ import annotations
++
++import pytest
++import torch
++from torch import nn
++
++from enn_torch_dev.executor import GraphExecutor, KVStore, KeyRef, NodeSpec
++from enn_torch_dev.nn import RecurrentContextHead
++
++
++class _Pair(nn.Module):
++    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
++        return x + 1.0, x + 2.0
++
++
++class _Scalar(nn.Module):
++    def forward(self, x: torch.Tensor) -> torch.Tensor:
++        return x + 1.0
++
++
++class _Triple(nn.Module):
++    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
++        return x, x + 1.0, x + 2.0
++
++
++def test_node_multi_output_stores_each_key() -> None:
++    graph = GraphExecutor()
++    graph.add_node(
++        NodeSpec(
++            name="pair",
++            input_args=[KeyRef("x")],
++            output_key="pair.out",
++            output_keys=("pair.out", "pair.state"),
++        ),
++        _Pair(),
++    )
++    store = KVStore({"x": torch.tensor([1.0])})
++
++    graph.run(store)
++
++    assert torch.equal(store.get("pair.out"), torch.tensor([2.0]))
++    assert torch.equal(store.get("pair.state"), torch.tensor([3.0]))
++    assert graph.output_key("pair") == "pair.out"
++    assert graph.output_keys(["pair"]) == ("pair.out",)
++
++
++def test_node_single_output_still_stores_whole_output() -> None:
++    graph = GraphExecutor()
++    graph.add_node(
++        NodeSpec(name="scalar", input_args=[KeyRef("x")], output_key="scalar.out"),
++        _Scalar(),
++    )
++    store = KVStore({"x": torch.tensor([1.0])})
++
++    graph.run(store)
++
++    assert torch.equal(store.get("scalar.out"), torch.tensor([2.0]))
++
++
++def test_node_spec_validates_output_keys() -> None:
++    with pytest.raises(TypeError, match="output_keys"):
++        NodeSpec(name="bad", output_key="bad.out", output_keys="bad.out")
++
++    with pytest.raises(ValueError, match="empty"):
++        NodeSpec(name="bad", output_key="bad.out", output_keys=())
++
++    with pytest.raises(ValueError, match="duplicate"):
++        NodeSpec(
++            name="bad",
++            output_key="bad.out",
++            output_keys=("bad.out", "bad.out"),
++        )
++
++    with pytest.raises(ValueError, match="first entry"):
++        NodeSpec(
++            name="bad",
++            output_key="bad.out",
++            output_keys=("other.out", "bad.state"),
++        )
++
++
++def test_node_multi_output_rejects_non_sequence_output() -> None:
++    graph = GraphExecutor()
++    graph.add_node(
++        NodeSpec(
++            name="bad",
++            input_args=[KeyRef("x")],
++            output_key="bad.out",
++            output_keys=("bad.out", "bad.state"),
++        ),
++        _Scalar(),
++    )
++
++    with pytest.raises(TypeError, match="tuple or list"):
++        graph.run(KVStore({"x": torch.tensor([1.0])}))
++
++
++def test_node_multi_output_rejects_output_length_mismatch() -> None:
++    graph = GraphExecutor()
++    graph.add_node(
++        NodeSpec(
++            name="bad",
++            input_args=[KeyRef("x")],
++            output_key="bad.out",
++            output_keys=("bad.out", "bad.state"),
++        ),
++        _Triple(),
++    )
++
++    with pytest.raises(ValueError, match="expected 2 outputs"):
++        graph.run(KVStore({"x": torch.tensor([1.0])}))
++
++
++def test_graph_rejects_duplicate_secondary_output_key() -> None:
++    graph = GraphExecutor()
++    graph.add_node(
++        NodeSpec(
++            name="pair",
++            output_key="pair.out",
++            output_keys=("pair.out", "shared.out"),
++        ),
++        _Pair(),
++    )
++
++    with pytest.raises(ValueError, match="Duplicate output_key"):
++        graph.add_node(NodeSpec(name="other", output_key="shared.out"), nn.Identity())
++
++
++def test_graph_dependency_tracks_secondary_output_key() -> None:
++    graph = GraphExecutor()
++    graph.add_node(
++        NodeSpec(
++            name="consumer",
++            input_args=[KeyRef("pair.state")],
++            output_key="consumer.out",
++        ),
++        nn.Identity(),
++    )
++    graph.add_node(
++        NodeSpec(
++            name="pair",
++            input_args=[KeyRef("x")],
++            output_key="pair.out",
++            output_keys=("pair.out", "pair.state"),
++        ),
++        _Pair(),
++    )
++
++    assert graph.execution_order() == ("pair", "consumer")
++    assert graph.dependency_names("consumer") == ("pair",)
++
++    store = KVStore({"x": torch.tensor([1.0])})
++    graph.run(store)
++    assert torch.equal(store.get("consumer.out"), torch.tensor([3.0]))
++
++
++def test_remove_node_cleans_secondary_output_key_index() -> None:
++    graph = GraphExecutor()
++    graph.add_node(
++        NodeSpec(name="pair", output_key="pair.out", output_keys=("pair.out", "pair.state")),
++        _Pair(),
++    )
++
++    graph.remove_node("pair")
++    graph.add_node(NodeSpec(name="other", output_key="pair.state"), nn.Identity())
++
++    assert graph.output_key("other") == "pair.state"
++
++
++def test_recurrent_context_head_can_route_output_and_state() -> None:
++    graph = GraphExecutor()
++    graph.add_node(
++        NodeSpec(
++            name="ctx",
++            input_args=[KeyRef("x")],
++            input_kwargs={
++                "state": KeyRef("state.in", optional=True, default=None),
++                "return_state": KeyRef("return_state"),
++            },
++            output_key="ctx.out",
++            output_keys=("ctx.out", "ctx.state"),
++        ),
++        RecurrentContextHead(input_dim=4, hidden_dim=3),
++    )
++    store = KVStore(
++        {
++            "x": torch.randn(2, 5, 4),
++            "return_state": True,
++        }
++    )
++
++    graph.run(store)
++
++    assert store.get("ctx.out").shape == (2, 5, 4)
++    assert store.get("ctx.state").shape == (1, 2, 3)
