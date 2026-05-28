@@ -4,13 +4,15 @@ from .blocks import (
     Composer,
     Compressor,
 )
+from .fusion import LocalGlobalFusion
 from .layers import ConvMixer, Reducer
 from .types import ContextSummary
 
 __all__ = [
     "ConvMixer",
     "Composer",
-    "ContextSummary",
-    "Reducer",
     "Compressor",
+    "ContextSummary",
+    "LocalGlobalFusion",
+    "Reducer",
 ]
