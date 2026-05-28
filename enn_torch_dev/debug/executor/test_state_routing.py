@@ -238,6 +238,69 @@ def test_state_route_carry_validates_inputs() -> None:
     with pytest.raises(TypeError, match="missing_ok"):
         route.carry(KVStore(), missing_ok=1)
 
+    with pytest.raises(TypeError, match="detach"):
+        route.carry(KVStore(), missing_ok=True, detach=1)
+
+    with pytest.raises(TypeError, match="clone"):
+        route.carry(KVStore(), missing_ok=True, clone=1)
+
+
+def test_state_route_carry_can_detach_tensor_state() -> None:
+    route = StateRoute("ctx.state.in", "ctx.state.out")
+    store = KVStore()
+    source = torch.ones(1, 2, 3, requires_grad=True)
+    state = source * 2.0
+    store.set("ctx.state.out", state)
+
+    route.carry(store, detach=True)
+
+    carried = store.get("ctx.state.in")
+    assert torch.equal(carried, state)
+    assert not carried.requires_grad
+
+
+def test_state_route_carry_can_clone_tensor_state() -> None:
+    route = StateRoute("ctx.state.in", "ctx.state.out")
+    store = KVStore()
+    state = torch.randn(1, 2, 3)
+    store.set("ctx.state.out", state)
+
+    route.carry(store, clone=True)
+
+    carried = store.get("ctx.state.in")
+    assert torch.equal(carried, state)
+    assert carried.data_ptr() != state.data_ptr()
+
+
+def test_state_route_carry_can_detach_and_clone_tensor_state() -> None:
+    route = StateRoute("ctx.state.in", "ctx.state.out")
+    store = KVStore()
+    source = torch.ones(1, 2, 3, requires_grad=True)
+    state = source * 2.0
+    store.set("ctx.state.out", state)
+
+    route.carry(store, detach=True, clone=True)
+
+    carried = store.get("ctx.state.in")
+    assert torch.equal(carried, state)
+    assert not carried.requires_grad
+    assert carried.data_ptr() != state.data_ptr()
+
+
+def test_state_route_carry_preserves_metadata_when_transforming_tensor_state() -> None:
+    route = StateRoute("ctx.state.in", "ctx.state.out")
+    store = KVStore()
+    state = torch.ones(1, 2, 3, requires_grad=True) * 2.0
+    store.set("ctx.state.out", state, layout="state", origin="ctx", meta={"step": 2})
+
+    route.carry(store, detach=True)
+
+    carried = store.get_value("ctx.state.in")
+    assert carried.layout == "state"
+    assert carried.origin == "ctx"
+    assert carried.meta == {"step": 2}
+    assert not carried.data.requires_grad
+
 
 def test_state_route_carry_feeds_next_recurrent_run() -> None:
     route = StateRoute("ctx.state.in", "ctx.state.out")
