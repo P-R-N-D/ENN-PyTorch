@@ -122,23 +122,38 @@ class GraphExecutor(nn.Module):
 
         name = self._validate_node_name(name)
         module_key = _validate_module_key(module_key)
-        output_key = _validate_graph_key(executor.output_key, "GraphExecutor output_key")
+        output_keys = tuple(
+            _validate_graph_key(key, "GraphExecutor output_key")
+            for key in executor.output_keys
+        )
+        if not output_keys:
+            raise ValueError("GraphExecutor executor must produce at least one output_key.")
+        if len(set(output_keys)) != len(output_keys):
+            raise ValueError(
+                f"GraphExecutor executor has duplicate output_keys: {output_keys!r}"
+            )
+        if output_keys[0] != executor.output_key:
+            raise ValueError(
+                "GraphExecutor executor.output_keys first entry must match output_key."
+            )
 
         if name in self._nodes:
             raise ValueError(f"Duplicate node name: {name!r}")
         if module_key in self.modules_by_key:
             raise ValueError(f"Duplicate module_key: {module_key!r}")
 
-        producer = self._producer_by_output_key.get(output_key)
-        if producer is not None:
-            raise ValueError(
-                f"Duplicate output_key: {output_key!r} already produced by node {producer!r}"
-            )
+        for output_key in output_keys:
+            producer = self._producer_by_output_key.get(output_key)
+            if producer is not None:
+                raise ValueError(
+                    f"Duplicate output_key: {output_key!r} already produced by node {producer!r}"
+                )
 
         self.modules_by_key[module_key] = module
         self._nodes[name] = executor
         self._order.append(name)
-        self._producer_by_output_key[output_key] = name
+        for output_key in output_keys:
+            self._producer_by_output_key[output_key] = name
         return name
 
     def add_node(self, spec: NodeSpec, module: nn.Module) -> str:
@@ -365,13 +380,14 @@ class GraphExecutor(nn.Module):
     def _remove_node_unchecked(self, name: str) -> None:
         node = self._nodes.pop(name)
         module_key = node.module_key
-        output_key = node.output_key
+        output_keys = node.output_keys
 
         if module_key in self.modules_by_key:
             del self.modules_by_key[module_key]
 
-        if self._producer_by_output_key.get(output_key) == name:
-            del self._producer_by_output_key[output_key]
+        for output_key in output_keys:
+            if self._producer_by_output_key.get(output_key) == name:
+                del self._producer_by_output_key[output_key]
 
         try:
             self._order.remove(name)
@@ -662,14 +678,23 @@ class GraphExecutor(nn.Module):
             module_key_producers[module_key] = name
             expected_module_keys.add(module_key)
 
-            output_key = node.output_key
-            producer = expected_producers.get(output_key)
-            if producer is not None:
+            output_keys = node.output_keys
+            if not output_keys:
+                raise RuntimeError(f"Graph node {name!r} has no output_keys.")
+            if output_keys[0] != node.output_key:
                 raise RuntimeError(
-                    f"Graph has duplicate output_key {output_key!r} produced by "
-                    f"{producer!r} and {name!r}."
+                    f"Graph node {name!r} output_keys first entry does not match output_key."
                 )
-            expected_producers[output_key] = name
+            if len(set(output_keys)) != len(output_keys):
+                raise RuntimeError(f"Graph node {name!r} has duplicate output_keys.")
+            for output_key in output_keys:
+                producer = expected_producers.get(output_key)
+                if producer is not None:
+                    raise RuntimeError(
+                        f"Graph has duplicate output_key {output_key!r} produced by "
+                        f"{producer!r} and {name!r}."
+                    )
+                expected_producers[output_key] = name
 
         registered_module_keys = set(self.modules_by_key.keys())
         if registered_module_keys != expected_module_keys:
