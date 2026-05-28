@@ -132,6 +132,7 @@ class StateRoute:
         store.set(self.return_state_key, True)
         return store
 
+
     def carry(self, store: KVStore, *, missing_ok: bool = False) -> KVStore:
         """
         Copy the routed output state into the routed input state slot.
