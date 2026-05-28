@@ -69,6 +69,16 @@ def test_global_self_attention_block_accepts_3d_attn_mask() -> None:
     assert out.shape == x.shape
 
 
+def test_global_self_attention_block_accepts_composer_attention_bias() -> None:
+    block = GlobalSelfAttentionBlock(embed_dim=8, num_heads=2)
+    x = torch.randn(2, 5, 8)
+    attn_bias = torch.zeros(2, 1, 1, 5)
+
+    out = block(x, attn_mask=attn_bias)
+
+    assert out.shape == x.shape
+
+
 def test_global_self_attention_block_rejects_all_masked_key_padding_row() -> None:
     block = GlobalSelfAttentionBlock(embed_dim=8, num_heads=2)
     x = torch.randn(2, 5, 8)
@@ -91,6 +101,16 @@ def test_global_self_attention_block_rejects_all_masked_attn_row() -> None:
 
     with pytest.raises(ValueError, match="fully mask"):
         block(x, attn_mask=mask)
+
+
+def test_global_self_attention_block_rejects_combined_all_masked_row() -> None:
+    block = GlobalSelfAttentionBlock(embed_dim=4, num_heads=1)
+    x = torch.randn(1, 2, 4)
+    key_padding_mask = torch.tensor([[False, True]])
+    attn_mask = torch.tensor([[True, False], [False, False]])
+
+    with pytest.raises(ValueError, match="combined"):
+        block(x, key_padding_mask=key_padding_mask, attn_mask=attn_mask)
 
 
 def test_global_self_attention_block_rejects_embed_dim_mismatch() -> None:
@@ -137,6 +157,23 @@ def test_global_self_attention_block_rejects_bad_masks() -> None:
 
     with pytest.raises(TypeError, match="bool or floating"):
         block(x, attn_mask=torch.zeros(5, 5, dtype=torch.int64))
+
+
+def test_global_self_attention_block_rejects_nan_dropout() -> None:
+    with pytest.raises(ValueError, match="dropout"):
+        GlobalSelfAttentionBlock(embed_dim=8, num_heads=2, dropout=float("nan"))
+
+
+def test_global_self_attention_block_allows_fp32_additive_mask_for_low_precision_input() -> None:
+    if not torch.cuda.is_available():
+        pytest.skip("low-precision MultiheadAttention test requires CUDA")
+
+    block = GlobalSelfAttentionBlock(embed_dim=8, num_heads=2).cuda().to(torch.float16)
+    x = torch.randn(2, 5, 8, device="cuda", dtype=torch.float16)
+    attn_mask = torch.zeros(5, 5, device="cuda", dtype=torch.float32)
+    out = block(x, attn_mask=attn_mask)
+    assert out.shape == x.shape
+    assert out.dtype == x.dtype
 
 
 def test_global_self_attention_block_rejects_float_mask_dtype_mismatch() -> None:

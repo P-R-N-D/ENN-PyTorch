@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from numbers import Real
 
 import torch
@@ -24,7 +25,7 @@ def _validate_dropout(value: object) -> float:
     if not isinstance(value, Real) or isinstance(value, bool):
         raise TypeError("dropout must be a real number.")
     value = float(value)
-    if value < 0.0 or value > 1.0:
+    if not math.isfinite(value) or value < 0.0 or value > 1.0:
         raise ValueError("dropout must be between 0.0 and 1.0.")
     return value
 
@@ -34,6 +35,14 @@ def _mask_has_all_blocked_rows(mask: Tensor) -> bool:
         return bool(mask.all(dim=-1).any().item())
     if torch.is_floating_point(mask):
         return bool(torch.isneginf(mask).all(dim=-1).any().item())
+    return False
+
+
+def _is_allowed_float_mask_dtype(mask_dtype: torch.dtype, input_dtype: torch.dtype) -> bool:
+    if mask_dtype == input_dtype:
+        return True
+    if mask_dtype == torch.float32 and input_dtype in {torch.float16, torch.bfloat16}:
+        return True
     return False
 
 
@@ -126,17 +135,20 @@ class GlobalSelfAttentionBlock(nn.Module):
         seq_len: int,
         device: torch.device,
         dtype: torch.dtype,
-    ) -> None:
+    ) -> Tensor | None:
         if attn_mask is None:
-            return
+            return None
         if not isinstance(attn_mask, Tensor):
             raise TypeError(f"attn_mask must be a torch.Tensor, got {type(attn_mask)!r}")
         if attn_mask.device != device:
             raise ValueError("attn_mask must be on the same device as x.")
         if attn_mask.dtype != torch.bool and not torch.is_floating_point(attn_mask):
             raise TypeError("attn_mask must use bool or floating dtype.")
-        if torch.is_floating_point(attn_mask) and attn_mask.dtype != dtype:
-            raise ValueError("floating attn_mask must have the same dtype as x.")
+        if (
+            torch.is_floating_point(attn_mask)
+            and not _is_allowed_float_mask_dtype(attn_mask.dtype, dtype)
+        ):
+            raise ValueError("floating attn_mask must have the same dtype as x, or be fp32 for low-precision x.")
 
         if attn_mask.ndim == 2:
             expected = (seq_len, seq_len)
@@ -151,11 +163,78 @@ class GlobalSelfAttentionBlock(nn.Module):
                     "3D attn_mask must have shape (B * num_heads, N, N): "
                     f"{tuple(attn_mask.shape)} != {expected}"
                 )
+        elif attn_mask.ndim == 4:
+            batch, heads, query, key = tuple(attn_mask.shape)
+            if batch != batch_size:
+                raise ValueError(
+                    f"4D attn_mask batch dimension must match B: {batch} != {batch_size}"
+                )
+            if heads not in {1, self.num_heads}:
+                raise ValueError(
+                    "4D attn_mask head dimension must be 1 or num_heads: "
+                    f"{heads} not in {{1, {self.num_heads}}}"
+                )
+            if query not in {1, seq_len}:
+                raise ValueError(
+                    "4D attn_mask query dimension must be 1 or N: "
+                    f"{query} not in {{1, {seq_len}}}"
+                )
+            if key != seq_len:
+                raise ValueError(
+                    f"4D attn_mask key dimension must match N: {key} != {seq_len}"
+                )
+            attn_mask = (
+                attn_mask.expand(batch_size, self.num_heads, seq_len, seq_len)
+                .reshape(batch_size * self.num_heads, seq_len, seq_len)
+                .contiguous()
+            )
         else:
-            raise ValueError("attn_mask must be 2D or 3D.")
+            raise ValueError("attn_mask must be 2D, 3D, or 4D.")
 
         if _mask_has_all_blocked_rows(attn_mask):
             raise ValueError("attn_mask must not fully mask any query row.")
+        return attn_mask
+
+    def _validate_combined_masks(
+        self,
+        key_padding_mask: Tensor | None,
+        attn_mask: Tensor | None,
+        *,
+        batch_size: int,
+        seq_len: int,
+    ) -> None:
+        if key_padding_mask is None and attn_mask is None:
+            return
+
+        blocked = None
+        if key_padding_mask is not None:
+            if key_padding_mask.dtype == torch.bool:
+                key_blocked = key_padding_mask
+            else:
+                key_blocked = torch.isneginf(key_padding_mask)
+            blocked = key_blocked[:, None, None, :].expand(
+                batch_size, self.num_heads, seq_len, seq_len
+            )
+
+        if attn_mask is not None:
+            if attn_mask.dtype == torch.bool:
+                attn_blocked = attn_mask
+            else:
+                attn_blocked = torch.isneginf(attn_mask)
+
+            if attn_blocked.ndim == 2:
+                attn_blocked = attn_blocked[None, None, :, :].expand(
+                    batch_size, self.num_heads, seq_len, seq_len
+                )
+            else:
+                attn_blocked = attn_blocked.reshape(batch_size, self.num_heads, seq_len, seq_len)
+
+            blocked = attn_blocked if blocked is None else blocked | attn_blocked
+
+        if blocked is not None and bool(blocked.all(dim=-1).any().item()):
+            raise ValueError(
+                "combined key_padding_mask and attn_mask must not fully mask any query row."
+            )
 
     def forward(
         self,
@@ -175,12 +254,18 @@ class GlobalSelfAttentionBlock(nn.Module):
 
             dtype=x.dtype,
         )
-        self._validate_attn_mask(
+        attn_mask = self._validate_attn_mask(
             attn_mask,
             batch_size=batch_size,
             seq_len=seq_len,
             device=x.device,
             dtype=x.dtype,
+        )
+        self._validate_combined_masks(
+            key_padding_mask,
+            attn_mask,
+            batch_size=batch_size,
+            seq_len=seq_len,
         )
 
         y, _ = self.attention(
