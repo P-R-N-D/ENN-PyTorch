@@ -81,6 +81,15 @@ def test_local_global_fusion_rejects_dtype_mismatch() -> None:
         )
 
 
+def test_local_global_fusion_rejects_non_floating_dtype() -> None:
+    module = LocalGlobalFusion()
+
+    with pytest.raises(TypeError, match="floating dtype"):
+        module(torch.zeros(2, 3, dtype=torch.int64), torch.ones(2, 3, dtype=torch.int64))
+    with pytest.raises(TypeError, match="floating dtype"):
+        module(torch.zeros(2, 3, dtype=torch.bool), torch.ones(2, 3, dtype=torch.bool))
+
+
 def test_local_global_fusion_rejects_non_tensor_inputs() -> None:
     module = LocalGlobalFusion()
 
@@ -95,4 +104,3 @@ def test_local_global_fusion_validates_constructor_arguments() -> None:
         LocalGlobalFusion(init_logit="0.0")  # type: ignore[arg-type]
     with pytest.raises(TypeError, match="learnable"):
         LocalGlobalFusion(learnable=1)  # type: ignore[arg-type]
-

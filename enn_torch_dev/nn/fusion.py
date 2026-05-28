@@ -58,6 +58,8 @@ class LocalGlobalFusion(nn.Module):
             raise ValueError("global_out and local_out must be on the same device.")
         if global_out.dtype != local_out.dtype:
             raise ValueError("global_out and local_out must have the same dtype.")
+        if not torch.is_floating_point(global_out):
+            raise TypeError("global_out and local_out must use a floating dtype.")
 
         gate = self.gate.to(device=global_out.device, dtype=global_out.dtype)
         return gate * local_out + (1.0 - gate) * global_out
