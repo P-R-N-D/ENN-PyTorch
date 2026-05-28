@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -22,6 +23,34 @@ def _validate_spec_key(value: object, field_name: str) -> str:
     return value
 
 
+def _normalize_output_keys(
+    value: object,
+    *,
+    primary_output_key: str,
+) -> tuple[str, ...] | None:
+    if value is None:
+        return None
+    if isinstance(value, (str, bytes, bytearray)):
+        raise TypeError("NodeSpec.output_keys must be a sequence of strings.")
+    try:
+        values = tuple(value)  # type: ignore[arg-type]
+    except TypeError as exc:
+        raise TypeError("NodeSpec.output_keys must be a sequence of strings.") from exc
+    if not values:
+        raise ValueError("NodeSpec.output_keys must not be empty.")
+    out: list[str] = []
+    seen: set[str] = set()
+    for key in values:
+        normalized = _validate_spec_key(key, "output_keys")
+        if normalized in seen:
+            raise ValueError(f"NodeSpec.output_keys contains duplicate key: {normalized!r}")
+        seen.add(normalized)
+        out.append(normalized)
+    if out[0] != primary_output_key:
+        raise ValueError("NodeSpec.output_keys first entry must match output_key.")
+    return tuple(out)
+
+
 @dataclass(slots=True)
 class NodeSpec:
     """
@@ -37,6 +66,7 @@ class NodeSpec:
     input_args: list[KeyRef] = field(default_factory=list)
     input_kwargs: dict[str, KeyRef] = field(default_factory=dict)
     output_key: str = ""
+    output_keys: Sequence[str] | None = None
 
     def __post_init__(self) -> None:
         self.name = _validate_spec_key(self.name, "name")
@@ -47,6 +77,10 @@ class NodeSpec:
                 self.module_key, "module_key"
             )
         self.output_key = _validate_spec_key(self.output_key, "output_key")
+        self.output_keys = _normalize_output_keys(
+            self.output_keys,
+            primary_output_key=self.output_key,
+        )
 
 
 class NodeExecutor:
@@ -69,6 +103,13 @@ class NodeExecutor:
     def output_key(self) -> str:
         return self.spec.output_key
 
+    @property
+    def output_keys(self) -> tuple[str, ...]:
+        output_keys = self.spec.output_keys
+        if output_keys is None:
+            return (self.output_key,)
+        return tuple(output_keys)
+
     def output_ref(self) -> KeyRef:
         return KeyRef(self.output_key)
 
@@ -84,5 +125,18 @@ class NodeExecutor:
             for name, ref in self.spec.input_kwargs.items()
         }
         out = module(*args, **kwargs)
-        store.set(self.spec.output_key, out, origin=self.spec.name)
+        output_keys = self.spec.output_keys
+        if output_keys is None:
+            store.set(self.spec.output_key, out, origin=self.spec.name)
+            return out
+        if not isinstance(out, (tuple, list)):
+            raise TypeError(
+                "NodeExecutor multi-output nodes must return a tuple or list."
+            )
+        if len(out) != len(output_keys):
+            raise ValueError(
+                f"NodeExecutor expected {len(output_keys)} outputs, got {len(out)}."
+            )
+        for key, value in zip(output_keys, out):
+            store.set(key, value, origin=self.spec.name)
         return out

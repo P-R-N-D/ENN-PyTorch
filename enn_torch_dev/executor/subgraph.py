@@ -129,6 +129,10 @@ class SubgraphExecutor:
     def output_key(self) -> str:
         return self.spec.output_key
 
+    @property
+    def output_keys(self) -> tuple[str, ...]:
+        return (self.output_key,)
+
     def output_ref(self) -> KeyRef:
         return KeyRef(self.output_key)
 
