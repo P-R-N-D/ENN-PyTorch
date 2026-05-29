@@ -177,6 +177,94 @@ tile=True, stream=True, global_local=True
 `ExecutorModeSpec` is intentionally not a model wrapper. Automatic construction
 of graphs and pipelines belongs to a later layer.
 
+## ExecutorPlan
+
+`ExecutorPlan` is the next thin layer after `ExecutorModeSpec`.
+
+```text
+ExecutorModeSpec
+  declares which modes are intended
+
+ExecutorPlan
+  validates that the required executor components were supplied
+```
+
+`ExecutorModeSpec` only records the requested execution modes. `ExecutorPlan`
+checks that those declared modes match the executor objects supplied by the
+caller. `ExecutorPlan` still does not run the model, build graphs, create
+pipelines, or own training/inference policy.
+
+```python
+from enn_torch_dev.executor import ExecutorModeSpec, ExecutorPlan
+
+plain_plan = ExecutorPlan(
+    mode=ExecutorModeSpec(),
+    graph=graph,
+)
+
+tile_plan = ExecutorPlan(
+    mode=ExecutorModeSpec(tile=True),
+    tile_pipeline=tile_pipeline,
+)
+
+stream_plan = ExecutorPlan(
+    mode=ExecutorModeSpec(stream=True),
+    stream_pipeline=stream_pipeline,
+)
+
+global_local_plan = ExecutorPlan(
+    mode=ExecutorModeSpec(tile=True, global_local=True),
+    global_local_pipeline=global_local_pipeline,
+)
+
+stream_tile_plan = ExecutorPlan(
+    mode=ExecutorModeSpec(tile=True, stream=True),
+    stream_pipeline=stream_pipeline,
+    tile_pipeline=tile_pipeline,
+)
+
+stream_global_local_plan = ExecutorPlan(
+    mode=ExecutorModeSpec(tile=True, stream=True, global_local=True),
+    stream_pipeline=stream_pipeline,
+    global_local_pipeline=global_local_pipeline,
+)
+```
+
+The component rules are:
+
+```text
+plain mode
+  -> requires graph
+
+tile=True
+  -> requires tile_pipeline
+
+stream=True
+  -> requires stream_pipeline
+
+global_local=True
+  -> requires global_local_pipeline
+  -> does not accept a separate tile_pipeline
+  -> uses the TilePipeline embedded in GlobalLocalPipeline
+
+stream=True and tile=True
+  -> requires stream_pipeline and tile_pipeline
+  -> stream is the outer order/time layer
+  -> tile is the inner spatial/local layer
+
+stream=True and global_local=True
+  -> requires stream_pipeline and global_local_pipeline
+  -> stream is the outer order/time layer
+  -> global/local tiled fusion is the inner per-chunk layer
+```
+
+When stream is combined with any spatial/tiled mode, stream is always the outer
+layer. The stream layer controls chunk order and carried state; tile or
+global/local execution is applied inside each stream chunk.
+
+This keeps the planned order explicit before a future `Model(...)` wrapper
+decides how to call or compose those components.
+
 ## Global/local fusion
 
 `GlobalLocalPipeline` is a separate orchestration layer for combining a global branch and a local/tiled branch.
@@ -228,6 +316,9 @@ Supported:
 ExecutorModeSpec
   declarative mode flags for higher-level wrappers
 
+ExecutorPlan
+  validates mode flags against supplied executor components
+
 GraphExecutor
   dependency-ordered node execution
 
@@ -268,7 +359,7 @@ automatic Model(tile=True) / Model(stream=True) wrapper
 
 ## Recommended next layer
 
-After this terminology is stable, a higher-level model API can be designed around the two modes.
+After this terminology is stable, a higher-level model API can be designed around the two modes and the validated executor plan.
 
 ```python
 tile=True
@@ -283,10 +374,17 @@ tile=True and stream=True
   tile controls spatial/local processing inside each chunk
 ```
 
-In code, that layer should start from `ExecutorModeSpec`:
+In code, that layer should proceed in this order:
 
-```python
-mode = ExecutorModeSpec(tile=True, stream=True)
+```text
+public Model parameters
+  -> ExecutorModeSpec
+  -> ExecutorPlan
+  -> concrete GraphExecutor / TilePipeline / StreamPipeline / GlobalLocalPipeline
 ```
+
+The public `Model(...)` naming should be decided after this plan layer is
+stable. Do not expose `tile`, `stream`, and `global_local` as three unrelated
+peer concepts without explaining their different layers.
 
 Do not merge tile and stream into one concept. They solve different problems.
