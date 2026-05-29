@@ -65,14 +65,29 @@ def test_state_route_enable_return_state_writes_flag() -> None:
     assert store.get("flag") is True
 
 
-def test_state_route_reset_deletes_input_state() -> None:
+def test_state_route_reset_clears_local_input_state() -> None:
     route = StateRoute("ctx.state.in", "ctx.state.out")
     store = KVStore({"ctx.state.in": torch.zeros(1, 2, 3)})
 
     returned = route.reset(store)
 
     assert returned is store
-    assert not store.has("ctx.state.in")
+    assert store.has("ctx.state.in")
+    assert store.get("ctx.state.in") is None
+
+
+def test_state_route_reset_masks_inherited_input_state() -> None:
+    route = StateRoute("ctx.state.in", "ctx.state.out")
+    parent = KVStore({"ctx.state.in": torch.tensor([100.0])})
+    store = parent.fork()
+
+    returned = route.reset(store)
+
+    assert returned is store
+    assert store.has("ctx.state.in")
+    assert store.get("ctx.state.in") is None
+    assert torch.equal(parent.get("ctx.state.in"), torch.tensor([100.0]))
+    assert set(store.local_keys()) == {"ctx.state.in"}
 
 
 def test_state_route_reset_missing_is_noop_by_default() -> None:
