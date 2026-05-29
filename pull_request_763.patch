@@ -1,0 +1,328 @@
+diff --git a/enn_torch_dev/executor/__init__.py b/enn_torch_dev/executor/__init__.py
+index b4c0ead..17cc5cd 100644
+--- a/enn_torch_dev/executor/__init__.py
++++ b/enn_torch_dev/executor/__init__.py
+@@ -5,6 +5,7 @@ from __future__ import annotations
+ from .graph import GraphExecutor
+ from .global_local import GlobalLocalPipeline, GlobalLocalPipelineSpec
+ from .modes import ExecutorModeSpec
++from .model_spec import ModelExecutionSpec
+ from .node import NodeExecutor, NodeSpec
+ from .plan import ExecutorPlan
+ from .schema import GraphValue, KeyRef
+@@ -25,6 +26,7 @@ __all__ = [
+     "ExecutorModeSpec",
+     "ExecutorPlan",
++    "ModelExecutionSpec",
+     "KeyRef",
+     "KVStore",
+     "NodeExecutor",
+diff --git a/enn_torch_dev/executor/model_spec.py b/enn_torch_dev/executor/model_spec.py
+new file mode 100644
+index 0000000..e81ab2e
+--- /dev/null
++++ b/enn_torch_dev/executor/model_spec.py
+@@ -0,0 +1,149 @@
++from __future__ import annotations
++
++from dataclasses import dataclass
++
++from .modes import ExecutorModeSpec
++
++
++_CONTEXTS = {"local", "global_local"}
++
++
++def _validate_context(value: object) -> str:
++    if not isinstance(value, str):
++        raise TypeError("ModelExecutionSpec.context must be a string.")
++    if value not in _CONTEXTS:
++        raise ValueError(
++            "ModelExecutionSpec.context must be either 'local' or 'global_local'."
++        )
++    return value
++
++
++def _validate_bool(value: object, field_name: str) -> bool:
++    if not isinstance(value, bool):
++        raise TypeError(f"ModelExecutionSpec.{field_name} must be a bool.")
++    return value
++
++
++def _is_sequence(value: object) -> bool:
++    return value is not None and not isinstance(value, (str, bytes, bytearray))
++
++
++def _normalize_positive_int_tuple(
++    value: object,
++    *,
++    field_name: str,
++) -> tuple[int, ...] | None:
++    if value is None:
++        return None
++    if not _is_sequence(value):
++        raise TypeError(f"ModelExecutionSpec.{field_name} must be a sequence of positive integers.")
++
++    try:
++        items = tuple(value)  # type: ignore[arg-type]
++    except TypeError as exc:
++        raise TypeError(
++            f"ModelExecutionSpec.{field_name} must be a sequence of positive integers."
++        ) from exc
++
++    if not items:
++        raise ValueError(f"ModelExecutionSpec.{field_name} must not be empty.")
++    if not all(isinstance(item, int) and not isinstance(item, bool) for item in items):
++        raise TypeError(f"ModelExecutionSpec.{field_name} must contain integers only.")
++    if not all(item > 0 for item in items):
++        raise ValueError(f"ModelExecutionSpec.{field_name} values must be positive.")
++    return items
++
++
++def _normalize_int_tuple(
++    value: object,
++    *,
++    field_name: str,
++) -> tuple[int, ...] | None:
++    if value is None:
++        return None
++    if not _is_sequence(value):
++        raise TypeError(f"ModelExecutionSpec.{field_name} must be a sequence of integers.")
++
++    try:
++        items = tuple(value)  # type: ignore[arg-type]
++    except TypeError as exc:
++        raise TypeError(
++            f"ModelExecutionSpec.{field_name} must be a sequence of integers."
++        ) from exc
++
++    if not items:
++        raise ValueError(f"ModelExecutionSpec.{field_name} must not be empty.")
++    if not all(isinstance(item, int) and not isinstance(item, bool) for item in items):
++        raise TypeError(f"ModelExecutionSpec.{field_name} must contain integers only.")
++    return items
++
++
++@dataclass(slots=True)
++class ModelExecutionSpec:
++    """
++    Public ``Model(...)`` execution parameter schema.
++
++    This is a naming layer over ``ExecutorModeSpec``. Public model APIs should
++    use ``context`` / ``tile`` / ``stateful`` instead of exposing ``tile``,
++    ``stream``, and ``global_local`` as unrelated peer flags.
++    """
++
++    context: str = "local"
++    tile: bool = False
++    stateful: bool = False
++    tile_shape: tuple[int, ...] | None = None
++    tile_stride: tuple[int, ...] | None = None
++    tile_dims: tuple[int, ...] | None = None
++
++    def __post_init__(self) -> None:
++        self.context = _validate_context(self.context)
++        self.tile = _validate_bool(self.tile, "tile")
++        self.stateful = _validate_bool(self.stateful, "stateful")
++        self.tile_shape = _normalize_positive_int_tuple(
++            self.tile_shape,
++            field_name="tile_shape",
++        )
++        self.tile_stride = _normalize_positive_int_tuple(
++            self.tile_stride,
++            field_name="tile_stride",
++        )
++        self.tile_dims = _normalize_int_tuple(
++            self.tile_dims,
++            field_name="tile_dims",
++        )
++
++        if self.tile:
++            if self.tile_shape is None:
++                raise ValueError("ModelExecutionSpec.tile=True requires tile_shape.")
++            if self.tile_stride is not None and len(self.tile_stride) != len(self.tile_shape):
++                raise ValueError(
++                    "ModelExecutionSpec.tile_stride length must match tile_shape length."
++                )
++            if self.tile_dims is not None and len(self.tile_dims) != len(self.tile_shape):
++                raise ValueError(
++                    "ModelExecutionSpec.tile_dims length must match tile_shape length."
++                )
++        elif self.tile_shape is not None or self.tile_stride is not None or self.tile_dims is not None:
++            raise ValueError(
++                "ModelExecutionSpec tile_shape, tile_stride, and tile_dims require tile=True."
++            )
++
++        if self.context == "global_local" and not self.tile:
++            raise ValueError(
++                "ModelExecutionSpec context='global_local' requires tile=True in v0."
++            )
++
++    @property
++    def uses_global_local(self) -> bool:
++        return self.context == "global_local"
++
++    @property
++    def executor_mode(self) -> ExecutorModeSpec:
++        return ExecutorModeSpec(
++            tile=self.tile,
++            stream=self.stateful,
++            global_local=self.uses_global_local,
++        )
++
++    def to_executor_mode_spec(self) -> ExecutorModeSpec:
++        return self.executor_mode
+diff --git a/enn_torch_dev/debug/executor/test_model_spec.py b/enn_torch_dev/debug/executor/test_model_spec.py
+new file mode 100644
+index 0000000..58e8ae6
+--- /dev/null
++++ b/enn_torch_dev/debug/executor/test_model_spec.py
+@@ -0,0 +1,148 @@
++from __future__ import annotations
++
++import pytest
++
++from enn_torch_dev.executor import ExecutorModeSpec, ModelExecutionSpec
++
++
++def test_model_execution_spec_defaults_to_plain_local_mode() -> None:
++    spec = ModelExecutionSpec()
++
++    assert spec.context == "local"
++    assert not spec.tile
++    assert not spec.stateful
++    assert spec.tile_shape is None
++    assert spec.executor_mode == ExecutorModeSpec()
++
++
++def test_model_execution_spec_maps_local_tiled_mode() -> None:
++    spec = ModelExecutionSpec(
++        context="local",
++        tile=True,
++        tile_shape=[2, 3],
++        tile_stride=[1, 2],
++        tile_dims=[-2, -1],
++    )
++
++    assert spec.tile_shape == (2, 3)
++    assert spec.tile_stride == (1, 2)
++    assert spec.tile_dims == (-2, -1)
++    assert spec.to_executor_mode_spec() == ExecutorModeSpec(tile=True)
++
++
++def test_model_execution_spec_maps_global_local_mode() -> None:
++    spec = ModelExecutionSpec(
++        context="global_local",
++        tile=True,
++        tile_shape=(4, 4),
++    )
++
++    assert spec.uses_global_local
++    assert spec.executor_mode == ExecutorModeSpec(tile=True, global_local=True)
++
++
++def test_model_execution_spec_maps_stateful_local_mode() -> None:
++    spec = ModelExecutionSpec(stateful=True)
++
++    assert spec.executor_mode == ExecutorModeSpec(stream=True)
++
++
++def test_model_execution_spec_maps_stateful_tiled_mode() -> None:
++    spec = ModelExecutionSpec(
++        tile=True,
++        stateful=True,
++        tile_shape=(8,),
++    )
++
++    assert spec.executor_mode == ExecutorModeSpec(tile=True, stream=True)
++
++
++def test_model_execution_spec_maps_stateful_global_local_mode() -> None:
++    spec = ModelExecutionSpec(
++        context="global_local",
++        tile=True,
++        stateful=True,
++        tile_shape=(8, 8),
++    )
++
++    assert spec.executor_mode == ExecutorModeSpec(
++        tile=True,
++        stream=True,
++        global_local=True,
++    )
++
++
++def test_model_execution_spec_requires_tile_shape_when_tiling() -> None:
++    with pytest.raises(ValueError, match="tile=True requires tile_shape"):
++        ModelExecutionSpec(tile=True)
++
++
++def test_model_execution_spec_rejects_tile_options_when_tile_is_disabled() -> None:
++    with pytest.raises(ValueError, match="require tile=True"):
++        ModelExecutionSpec(tile_shape=(4,))
++
++    with pytest.raises(ValueError, match="require tile=True"):
++        ModelExecutionSpec(tile_stride=(4,))
++
++    with pytest.raises(ValueError, match="require tile=True"):
++        ModelExecutionSpec(tile_dims=(-1,))
++
++
++def test_model_execution_spec_requires_tile_for_global_local_context() -> None:
++    with pytest.raises(ValueError, match="global_local.*requires tile=True"):
++        ModelExecutionSpec(context="global_local")
++
++
++def test_model_execution_spec_validates_context() -> None:
++    with pytest.raises(TypeError, match="context"):
++        ModelExecutionSpec(context=1)
++
++    with pytest.raises(ValueError, match="local.*global_local"):
++        ModelExecutionSpec(context="global")
++
++
++def test_model_execution_spec_validates_bool_flags() -> None:
++    with pytest.raises(TypeError, match="tile"):
++        ModelExecutionSpec(tile=1)
++
++    with pytest.raises(TypeError, match="stateful"):
++        ModelExecutionSpec(stateful="yes")
++
++
++def test_model_execution_spec_validates_tile_shape() -> None:
++    with pytest.raises(TypeError, match="tile_shape"):
++        ModelExecutionSpec(tile=True, tile_shape=4)
++
++    with pytest.raises(ValueError, match="tile_shape"):
++        ModelExecutionSpec(tile=True, tile_shape=())
++
++    with pytest.raises(TypeError, match="tile_shape"):
++        ModelExecutionSpec(tile=True, tile_shape=(True,))
++
++    with pytest.raises(ValueError, match="positive"):
++        ModelExecutionSpec(tile=True, tile_shape=(0,))
++
++
++def test_model_execution_spec_validates_tile_stride() -> None:
++    with pytest.raises(TypeError, match="tile_stride"):
++        ModelExecutionSpec(tile=True, tile_shape=(4,), tile_stride=2)
++
++    with pytest.raises(ValueError, match="tile_stride length"):
++        ModelExecutionSpec(tile=True, tile_shape=(4, 4), tile_stride=(2,))
++
++    with pytest.raises(TypeError, match="tile_stride"):
++        ModelExecutionSpec(tile=True, tile_shape=(4,), tile_stride=(False,))
++
++    with pytest.raises(ValueError, match="positive"):
++        ModelExecutionSpec(tile=True, tile_shape=(4,), tile_stride=(-1,))
++
++
++def test_model_execution_spec_validates_tile_dims() -> None:
++    with pytest.raises(TypeError, match="tile_dims"):
++        ModelExecutionSpec(tile=True, tile_shape=(4,), tile_dims=-1)
++
++    with pytest.raises(ValueError, match="tile_dims length"):
++        ModelExecutionSpec(tile=True, tile_shape=(4, 4), tile_dims=(-1,))
++
++    with pytest.raises(TypeError, match="tile_dims"):
++        ModelExecutionSpec(tile=True, tile_shape=(4,), tile_dims=(True,))
