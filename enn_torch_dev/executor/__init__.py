@@ -3,6 +3,7 @@ from __future__ import annotations
 from .graph import GraphExecutor
 from .global_local import GlobalLocalPipeline, GlobalLocalPipelineSpec
 from .modes import ExecutorModeSpec
+from .model_spec import ModelExecutionSpec
 from .node import NodeExecutor, NodeSpec
 from .plan import ExecutorPlan
 from .schema import GraphValue, KeyRef
@@ -22,6 +23,7 @@ __all__ = [
     "GlobalLocalPipelineSpec",
     "ExecutorModeSpec",
     "ExecutorPlan",
+    "ModelExecutionSpec",
     "KeyRef",
     "KVStore",
     "NodeExecutor",
