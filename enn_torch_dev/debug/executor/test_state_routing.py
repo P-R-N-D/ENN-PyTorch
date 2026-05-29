@@ -65,6 +65,41 @@ def test_state_route_enable_return_state_writes_flag() -> None:
     assert store.get("flag") is True
 
 
+def test_state_route_reset_deletes_input_state() -> None:
+    route = StateRoute("ctx.state.in", "ctx.state.out")
+    store = KVStore({"ctx.state.in": torch.zeros(1, 2, 3)})
+
+    returned = route.reset(store)
+
+    assert returned is store
+    assert not store.has("ctx.state.in")
+
+
+def test_state_route_reset_missing_is_noop_by_default() -> None:
+    route = StateRoute("ctx.state.in", "ctx.state.out")
+    store = KVStore()
+
+    returned = route.reset(store)
+
+    assert returned is store
+    assert not store.has("ctx.state.in")
+
+
+def test_state_route_reset_missing_can_raise() -> None:
+    route = StateRoute("ctx.state.in", "ctx.state.out")
+
+    with pytest.raises(KeyError, match="ctx.state.in"):
+        route.reset(KVStore(), missing_ok=False)
+
+
+def test_state_route_reset_validates_inputs() -> None:
+    route = StateRoute("ctx.state.in", "ctx.state.out")
+
+    with pytest.raises(TypeError, match="KVStore"):
+        route.reset(object())
+
+    with pytest.raises(TypeError, match="missing_ok"):
+        route.reset(KVStore(), missing_ok=1)
 
 
 def test_state_route_can_make_state_input_required() -> None:

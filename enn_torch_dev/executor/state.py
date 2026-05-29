@@ -135,6 +135,16 @@ class StateRoute:
         store.set(self.return_state_key, True)
         return store
 
+    def reset(self, store: KVStore, *, missing_ok: bool = True) -> KVStore:
+        """Delete the routed input state slot from ``store``."""
+        if not isinstance(store, KVStore):
+            raise TypeError(f"StateRoute.reset expects KVStore, got {type(store)!r}")
+        if not isinstance(missing_ok, bool):
+            raise TypeError("StateRoute.reset missing_ok must be a bool.")
+
+        store.delete(self.state_input_key, missing_ok=missing_ok)
+        return store
+
     @staticmethod
     def _carried_payload(
         payload: Any,
