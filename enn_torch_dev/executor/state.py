@@ -135,6 +135,26 @@ class StateRoute:
         store.set(self.return_state_key, True)
         return store
 
+    def reset(self, store: KVStore, *, missing_ok: bool = True) -> KVStore:
+        """
+        Clear the routed input state slot from ``store``.
+
+        ``KVStore`` supports parent lookup, so deleting only the local key would
+        still expose an inherited parent state. Reset therefore writes a local
+        ``None`` value when a state is resolvable, masking any parent value.
+        """
+        if not isinstance(store, KVStore):
+            raise TypeError(f"StateRoute.reset expects KVStore, got {type(store)!r}")
+        if not isinstance(missing_ok, bool):
+            raise TypeError("StateRoute.reset missing_ok must be a bool.")
+
+        if not store.has(self.state_input_key):
+            if missing_ok:
+                return store
+            raise KeyError(f"KVStore missing key: {self.state_input_key!r}")
+        store.set(self.state_input_key, None, origin="StateRoute.reset")
+        return store
+
     @staticmethod
     def _carried_payload(
         payload: Any,

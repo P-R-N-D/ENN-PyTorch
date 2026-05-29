@@ -307,6 +307,94 @@ def test_stream_pipeline_can_clone_carried_state() -> None:
     assert store.get("sum.state.in").data_ptr() != outputs[0].data_ptr()
 
 
+def test_stream_pipeline_reset_state_clears_previous_stream_state() -> None:
+    route = StateRoute("sum.state.in", "sum.state.out")
+    graph = GraphExecutor()
+    graph.add_node(
+        NodeSpec(
+            name="sum",
+            input_args=[KeyRef("chunk.x")],
+            input_kwargs=route.input_kwargs(),
+            output_key="sum.out",
+            output_keys=route.output_keys("sum.out"),
+        ),
+        _RunningSum(),
+    )
+    pipeline = StreamPipeline(
+        graph,
+        StreamPipelineSpec(
+            chunk_input_key="chunk.x",
+            output_name="sum",
+            reset_state=True,
+        ),
+        state_routes=[route],
+    )
+    store = KVStore({"sum.state.in": torch.tensor([100.0])})
+
+    outputs = pipeline.run(store, [torch.tensor([1.0]), torch.tensor([2.0])])
+
+    assert [out.item() for out in outputs] == [1.0, 3.0]
+    assert torch.equal(store.get("sum.state.in"), torch.tensor([3.0]))
+
+
+def test_stream_pipeline_reset_state_masks_parent_stream_state() -> None:
+    route = StateRoute("sum.state.in", "sum.state.out")
+    graph = GraphExecutor()
+    graph.add_node(
+        NodeSpec(
+            name="sum",
+            input_args=[KeyRef("chunk.x")],
+            input_kwargs=route.input_kwargs(),
+            output_key="sum.out",
+            output_keys=route.output_keys("sum.out"),
+        ),
+        _RunningSum(),
+    )
+    pipeline = StreamPipeline(
+        graph,
+        StreamPipelineSpec(
+            chunk_input_key="chunk.x",
+            output_name="sum",
+            reset_state=True,
+        ),
+        state_routes=[route],
+    )
+    parent = KVStore({"sum.state.in": torch.tensor([100.0])})
+    store = parent.fork()
+
+    outputs = pipeline.run(store, [torch.tensor([1.0]), torch.tensor([2.0])])
+
+    assert [out.item() for out in outputs] == [1.0, 3.0]
+    assert torch.equal(store.get("sum.state.in"), torch.tensor([3.0]))
+    assert torch.equal(parent.get("sum.state.in"), torch.tensor([100.0]))
+
+
+def test_stream_pipeline_keeps_previous_state_without_reset_state() -> None:
+    route = StateRoute("sum.state.in", "sum.state.out")
+    graph = GraphExecutor()
+    graph.add_node(
+        NodeSpec(
+            name="sum",
+            input_args=[KeyRef("chunk.x")],
+            input_kwargs=route.input_kwargs(),
+            output_key="sum.out",
+            output_keys=route.output_keys("sum.out"),
+        ),
+        _RunningSum(),
+    )
+    pipeline = StreamPipeline(
+        graph,
+        StreamPipelineSpec(chunk_input_key="chunk.x", output_name="sum"),
+        state_routes=[route],
+    )
+    store = KVStore({"sum.state.in": torch.tensor([100.0])})
+
+    outputs = pipeline.run(store, [torch.tensor([1.0]), torch.tensor([2.0])])
+
+    assert [out.item() for out in outputs] == [101.0, 103.0]
+    assert torch.equal(store.get("sum.state.in"), torch.tensor([103.0]))
+
+
 def test_stream_pipeline_allows_empty_chunks() -> None:
     pipeline = StreamPipeline(
         _make_double_graph(),
@@ -355,6 +443,9 @@ def test_stream_pipeline_validates_inputs() -> None:
 
     with pytest.raises(TypeError, match="state_clone"):
         StreamPipelineSpec(chunk_input_key="chunk.x", output_name="double_node", state_clone=1)
+
+    with pytest.raises(TypeError, match="reset_state"):
+        StreamPipelineSpec(chunk_input_key="chunk.x", output_name="double_node", reset_state=1)
 
     with pytest.raises(TypeError, match="GraphExecutor"):
         StreamPipeline(

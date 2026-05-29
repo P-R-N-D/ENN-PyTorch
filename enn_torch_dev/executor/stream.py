@@ -70,6 +70,7 @@ class StreamPipelineSpec:
     outputs_key: str | None = None
     state_detach: bool = False
     state_clone: bool = False
+    reset_state: bool = False
 
     def __post_init__(self) -> None:
         self.chunk_input_key = _validate_stream_key(
@@ -93,6 +94,7 @@ class StreamPipelineSpec:
             )
         self.state_detach = _validate_stream_bool(self.state_detach, "state_detach")
         self.state_clone = _validate_stream_bool(self.state_clone, "state_clone")
+        self.reset_state = _validate_stream_bool(self.reset_state, "reset_state")
 
 
 class StreamPipeline:
@@ -139,6 +141,10 @@ class StreamPipeline:
         normalized_chunks = _normalize_chunks(chunks)
         result_key = self._result_key()
         outputs: list[Any] = []
+
+        if self.spec.reset_state:
+            for route in self.state_routes:
+                route.reset(store, missing_ok=True)
 
         for index, chunk in enumerate(normalized_chunks):
             chunk_store = store.fork()
