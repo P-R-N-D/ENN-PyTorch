@@ -253,3 +253,124 @@ def test_executor_model_delegates_runner_validation() -> None:
     )
     with pytest.raises(ValueError, match="only valid for stream"):
         plain.run(KVStore({"x": torch.tensor([1.0])}), chunks=[torch.tensor([1.0])])
+
+
+def test_executor_model_public_plain_flow_end_to_end() -> None:
+    spec = ModelExecutionSpec(context="local", tile=False, stateful=False)
+    model = ExecutorModel.from_components(spec, graph=_make_graph())
+    store = KVStore({"x": torch.tensor([1.0])})
+
+    result = model.run(store)
+
+    assert model.spec is spec
+    assert model.plan.mode == ExecutorModeSpec()
+    assert model.plan.execution_layers == ("graph",)
+    assert model.plan.component_names == ("graph",)
+    assert model.runner.plan is model.plan
+    assert result is store
+    assert torch.equal(store.get("out"), torch.tensor([2.0]))
+
+
+def test_executor_model_public_tiled_flow_end_to_end() -> None:
+    tile_pipeline = _make_tile_pipeline()
+    spec = ModelExecutionSpec(
+        context="local",
+        tile=True,
+        stateful=False,
+        tile_shape=tile_pipeline.tile_policy.tile_shape,
+    )
+    model = ExecutorModel.from_components(spec, tile_pipeline=tile_pipeline)
+    store = KVStore({"x": torch.arange(4, dtype=torch.float32)})
+
+    result = model.run(store)
+
+    assert model.plan.mode == ExecutorModeSpec(tile=True)
+    assert model.plan.execution_layers == ("tile",)
+    assert model.plan.component_names == ("tile_pipeline",)
+    assert torch.equal(result, torch.arange(4, dtype=torch.float32) + 1.0)
+    assert torch.equal(store.get("tile.out"), result)
+
+
+def test_executor_model_public_stateful_flow_end_to_end() -> None:
+    spec = ModelExecutionSpec(context="local", tile=False, stateful=True)
+    model = ExecutorModel.from_components(
+        spec,
+        stream_pipeline=_make_stream_pipeline(),
+    )
+    store = KVStore()
+
+    outputs = model.run(
+        store,
+        chunks=[torch.tensor([1.0]), torch.tensor([2.0])],
+    )
+
+    assert model.plan.mode == ExecutorModeSpec(stream=True)
+    assert model.plan.execution_layers == ("stream",)
+    assert model.plan.component_names == ("stream_pipeline",)
+    assert [out.item() for out in outputs] == [2.0, 4.0]
+    assert store.get("stream.outputs") is outputs
+
+
+def test_executor_model_public_global_local_flow_end_to_end() -> None:
+    global_local_pipeline = _make_global_local_pipeline()
+    spec = ModelExecutionSpec(
+        context="global_local",
+        tile=True,
+        stateful=False,
+        tile_shape=global_local_pipeline.tile_pipeline.tile_policy.tile_shape,
+    )
+    model = ExecutorModel.from_components(
+        spec,
+        global_local_pipeline=global_local_pipeline,
+    )
+    x = torch.arange(4, dtype=torch.float32)
+    store = KVStore(
+        {
+            "x": x,
+            "global.bias": torch.tensor(10.0),
+            "local.bias": torch.tensor(2.0),
+        }
+    )
+
+    result = model.run(store)
+
+    assert model.plan.mode == ExecutorModeSpec(tile=True, global_local=True)
+    assert model.plan.execution_layers == ("global_local",)
+    assert model.plan.component_names == ("global_local_pipeline",)
+    assert torch.equal(result, x + 6.0)
+    assert torch.equal(store.get("fused.out"), result)
+
+
+def test_executor_model_public_stateful_global_local_flow_uses_stream_outer() -> None:
+    global_local_pipeline = _make_global_local_pipeline()
+    spec = ModelExecutionSpec(
+        context="global_local",
+        tile=True,
+        stateful=True,
+        tile_shape=global_local_pipeline.tile_pipeline.tile_policy.tile_shape,
+    )
+    model = ExecutorModel.from_components(
+        spec,
+        stream_pipeline=_make_stream_pipeline(),
+        global_local_pipeline=global_local_pipeline,
+    )
+    store = KVStore(
+        {
+            "x": torch.arange(4, dtype=torch.float32),
+            "global.bias": torch.tensor(10.0),
+            "local.bias": torch.tensor(2.0),
+        }
+    )
+
+    outputs = model.run(store, chunks=[torch.tensor([3.0])])
+
+    assert model.plan.mode == ExecutorModeSpec(
+        tile=True,
+        stream=True,
+        global_local=True,
+    )
+    assert model.plan.execution_layers == ("stream", "global_local")
+    assert model.plan.component_names == ("stream_pipeline", "global_local_pipeline")
+    assert [out.item() for out in outputs] == [6.0]
+    assert store.get("stream.outputs") is outputs
+    assert not store.has("fused.out")
