@@ -7,6 +7,7 @@ from .graph import GraphExecutor
 from .modes import ExecutorModeSpec
 from .plan import ExecutorPlan
 from .stream import StreamPipeline
+from .tile_policy import TilePolicy
 from .tile_pipeline import TilePipeline
 
 
@@ -162,6 +163,17 @@ class ModelExecutionSpec:
 
     def to_executor_mode_spec(self) -> ExecutorModeSpec:
         return self.executor_mode
+
+    def create_tile_policy(self) -> TilePolicy:
+        """Create a ``TilePolicy`` from the public tile configuration."""
+        if not self.tile:
+            raise ValueError("ModelExecutionSpec.create_tile_policy requires tile=True.")
+        assert self.tile_shape is not None
+        return TilePolicy(
+            tile_shape=self.tile_shape,
+            stride=self.tile_stride,
+            dims=self.tile_dims,
+        )
 
     def create_plan(
         self,

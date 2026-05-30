@@ -207,6 +207,50 @@ def test_model_execution_spec_validates_tile_dims() -> None:
         ModelExecutionSpec(tile=True, tile_shape=(4,), tile_dims=(True,))  # type: ignore[arg-type]
 
 
+def test_model_execution_spec_create_tile_policy_from_tile_config() -> None:
+    spec = ModelExecutionSpec(
+        tile=True,
+        tile_shape=[2, 3],
+        tile_stride=[1, 2],
+        tile_dims=[-2, -1],
+    )
+
+    policy = spec.create_tile_policy()
+
+    assert isinstance(policy, TilePolicy)
+    assert policy.tile_shape == (2, 3)
+    assert policy.stride == (1, 2)
+    assert policy.dims == (-2, -1)
+    assert policy.drop_last is False
+
+
+def test_model_execution_spec_create_tile_policy_defaults_stride_to_tile_shape() -> None:
+    spec = ModelExecutionSpec(
+        tile=True,
+        tile_shape=(4, 5),
+    )
+
+    policy = spec.create_tile_policy()
+
+    assert policy.tile_shape == (4, 5)
+    assert policy.stride == (4, 5)
+    assert policy.dims is None
+
+
+def test_model_execution_spec_create_tile_policy_requires_tile_enabled() -> None:
+    with pytest.raises(ValueError, match="requires tile=True"):
+        ModelExecutionSpec().create_tile_policy()
+
+
+def test_model_execution_spec_create_tile_policy_matches_direct_tile_policy() -> None:
+    spec = ModelExecutionSpec(tile=True, tile_shape=(3,), tile_stride=(2,), tile_dims=(-1,))
+
+    policy = spec.create_tile_policy()
+    expected = TilePolicy(tile_shape=(3,), stride=(2,), dims=(-1,))
+
+    assert policy == expected
+
+
 def test_model_execution_spec_create_plan_for_plain_mode() -> None:
     spec = ModelExecutionSpec()
 
