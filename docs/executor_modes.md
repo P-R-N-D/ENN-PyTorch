@@ -388,18 +388,29 @@ ExecutorModel is not:
   an optimizer / scheduler owner
 ```
 
-Basic construction can start from components:
+Basic construction can start from already-built components. `ModelExecutionSpec`
+validates the public model-side intent; it does not create or reconfigure the
+supplied pipelines.
 
 ```python
 from enn_torch_dev.executor import ExecutorModel, ModelExecutionSpec
 
+spec = ModelExecutionSpec(
+    tile=True,
+    tile_shape=tile_pipeline.tile_policy.tile_shape,
+)
+
 model = ExecutorModel.from_components(
-    ModelExecutionSpec(tile=True, tile_shape=(128, 128)),
+    spec,
     tile_pipeline=tile_pipeline,
 )
 
 out = model.run(store)
 ```
+
+The actual tiling behavior comes from the `TilePolicy` inside `tile_pipeline`.
+In v0, `tile_shape` documents and validates the public spec intent; callers
+should construct the supplied `TilePipeline` with a matching policy.
 
 The explicit form is also valid:
 
@@ -542,8 +553,8 @@ using the public naming above and the validated executor plan.
 ```text
 public Model parameters
   -> context / tile / stateful
-  -> ExecutorModeSpec
   -> ModelExecutionSpec
+  -> ExecutorModeSpec
   -> ExecutorPlan
   -> ExecutorModel
   -> ExecutorRunner
