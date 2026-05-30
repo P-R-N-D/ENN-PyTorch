@@ -8,7 +8,7 @@ from .modes import ExecutorModeSpec
 from .plan import ExecutorPlan
 from .stream import StreamPipeline
 from .tile_policy import TilePolicy
-from .tile_pipeline import TilePipeline
+from .tile_pipeline import TilePipeline, TilePipelineSpec
 
 
 _CONTEXTS = {"local", "global_local"}
@@ -173,6 +173,32 @@ class ModelExecutionSpec:
             tile_shape=self.tile_shape,
             stride=self.tile_stride,
             dims=self.tile_dims,
+        )
+
+    def create_tile_pipeline_spec(
+        self,
+        *,
+        input_key: str,
+        tile_input_key: str,
+        output_name: str,
+        output_key: str | None = None,
+        output_by: str = "node",
+        tile_index_key: str | None = None,
+        tile_meta_key: str | None = None,
+    ) -> TilePipelineSpec:
+        """Create a ``TilePipelineSpec`` for a caller-provided tile graph."""
+        if not self.tile:
+            raise ValueError(
+                "ModelExecutionSpec.create_tile_pipeline_spec requires tile=True."
+            )
+        return TilePipelineSpec(
+            input_key=input_key,
+            tile_input_key=tile_input_key,
+            output_name=output_name,
+            output_key=output_key,
+            output_by=output_by,
+            tile_index_key=tile_index_key,
+            tile_meta_key=tile_meta_key,
         )
 
     def create_plan(
