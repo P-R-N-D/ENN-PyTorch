@@ -6,6 +6,7 @@ from .modes import ExecutorModeSpec
 from .model_spec import ModelExecutionSpec
 from .node import NodeExecutor, NodeSpec
 from .plan import ExecutorPlan
+from .runner import ExecutorRunner
 from .schema import GraphValue, KeyRef
 from .store import KVStore
 from .state import StateRoute
@@ -23,6 +24,7 @@ __all__ = [
     "GlobalLocalPipelineSpec",
     "ExecutorModeSpec",
     "ExecutorPlan",
+    "ExecutorRunner",
     "ModelExecutionSpec",
     "KeyRef",
     "KVStore",
