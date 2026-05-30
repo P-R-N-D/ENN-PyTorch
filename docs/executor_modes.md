@@ -358,6 +358,91 @@ tile_dims
   tensor dimensions that are tiled
 ```
 
+## ExecutorModel
+
+`ExecutorModel` is the thin executor-layer wrapper above `ModelExecutionSpec`,
+`ExecutorPlan`, and `ExecutorRunner`.
+
+```text
+ModelExecutionSpec
+  public naming and validation
+
+ExecutorPlan
+  validated executor component wiring
+
+ExecutorRunner
+  dispatches execution to the selected top-level component
+
+ExecutorModel
+  binds the three pieces and exposes run(...)
+```
+
+It is intentionally still not a public trainable model abstraction:
+
+```text
+ExecutorModel is not:
+  torch.nn.Module
+  an automatic graph builder
+  an automatic pipeline builder
+  a training loop
+  an optimizer / scheduler owner
+```
+
+Basic construction can start from already-built components. `ModelExecutionSpec`
+validates the public model-side intent; it does not create or reconfigure the
+supplied pipelines.
+
+```python
+from enn_torch_dev.executor import ExecutorModel, ModelExecutionSpec
+
+spec = ModelExecutionSpec(
+    tile=True,
+    tile_shape=tile_pipeline.tile_policy.tile_shape,
+)
+
+model = ExecutorModel.from_components(
+    spec,
+    tile_pipeline=tile_pipeline,
+)
+
+out = model.run(store)
+```
+
+The actual tiling behavior comes from the `TilePolicy` inside `tile_pipeline`.
+In v0, `tile_shape` documents and validates the public spec intent; callers
+should construct the supplied `TilePipeline` with a matching policy.
+
+The explicit form is also valid:
+
+```python
+spec = ModelExecutionSpec(stateful=True)
+plan = spec.create_plan(stream_pipeline=stream_pipeline)
+model = ExecutorModel(spec=spec, plan=plan)
+
+outputs = model.run(store, chunks=chunks)
+```
+
+Execution is delegated to `ExecutorRunner`:
+
+```text
+plain
+  -> graph.run(store)
+
+tile
+  -> tile_pipeline.run(store)
+
+stateful / stream
+  -> stream_pipeline.run(store, chunks)
+
+global_local
+  -> global_local_pipeline.run(store)
+```
+
+When `stateful=True` is combined with tile or global-local context, `ExecutorModel`
+does not synthesize nested execution. The supplied `stream_pipeline` remains the
+outer executable component, and any tile/global-local behavior must already be
+represented inside that stream pipeline.
+
 ## Global/local fusion
 
 `GlobalLocalPipeline` is a separate orchestration layer for combining a global branch and a local/tiled branch.
@@ -412,6 +497,15 @@ ExecutorModeSpec
 ExecutorPlan
   validates mode flags against supplied executor components
 
+ModelExecutionSpec
+  public context / tile / stateful parameter schema
+
+ExecutorRunner
+  executes a validated ExecutorPlan
+
+ExecutorModel
+  binds ModelExecutionSpec, ExecutorPlan, and ExecutorRunner
+
 GraphExecutor
   dependency-ordered node execution
 
@@ -447,7 +541,8 @@ batch-level reset masks
 detach intervals
 truncated BPTT scheduler
 multi-output stream collection
-automatic public Model(...) wrapper
+automatic graph/pipeline builder
+torch.nn.Module public Model(...) wrapper
 ```
 
 ## Recommended next layer
@@ -458,8 +553,11 @@ using the public naming above and the validated executor plan.
 ```text
 public Model parameters
   -> context / tile / stateful
+  -> ModelExecutionSpec
   -> ExecutorModeSpec
   -> ExecutorPlan
+  -> ExecutorModel
+  -> ExecutorRunner
   -> concrete GraphExecutor / TilePipeline / StreamPipeline / GlobalLocalPipeline
 ```
 
