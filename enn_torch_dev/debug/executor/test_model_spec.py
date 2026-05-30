@@ -1,8 +1,67 @@
 from __future__ import annotations
 
 import pytest
+from torch import nn
 
-from enn_torch_dev.executor import ExecutorModeSpec, ModelExecutionSpec
+from enn_torch_dev.executor import (
+    ExecutorModeSpec,
+    ExecutorPlan,
+    GlobalLocalPipeline,
+    GlobalLocalPipelineSpec,
+    GraphExecutor,
+    KeyRef,
+    ModelExecutionSpec,
+    NodeSpec,
+    StreamPipeline,
+    StreamPipelineSpec,
+    TilePipeline,
+    TilePipelineSpec,
+    TilePolicy,
+)
+from enn_torch_dev.nn import LocalGlobalFusion
+
+
+def _make_graph(*, input_key: str = "x", output_key: str = "out") -> GraphExecutor:
+    graph = GraphExecutor()
+    graph.add_node(
+        NodeSpec(
+            name="node",
+            input_args=[KeyRef(input_key)],
+            output_key=output_key,
+        ),
+        nn.Identity(),
+    )
+    return graph
+
+
+def _make_tile_pipeline() -> TilePipeline:
+    graph = _make_graph(input_key="tile.x", output_key="tile.out")
+    return TilePipeline(
+        graph,
+        TilePolicy(tile_shape=(1,)),
+        TilePipelineSpec(
+            input_key="x",
+            tile_input_key="tile.x",
+            output_name="node",
+        ),
+    )
+
+
+def _make_stream_pipeline() -> StreamPipeline:
+    graph = _make_graph(input_key="chunk.x", output_key="chunk.out")
+    return StreamPipeline(
+        graph,
+        StreamPipelineSpec(chunk_input_key="chunk.x", output_name="node"),
+    )
+
+
+def _make_global_local_pipeline() -> GlobalLocalPipeline:
+    return GlobalLocalPipeline(
+        global_graph=_make_graph(input_key="x", output_key="global.out"),
+        tile_pipeline=_make_tile_pipeline(),
+        fusion=LocalGlobalFusion(init_logit=0.0, learnable=False),
+        spec=GlobalLocalPipelineSpec(global_output_name="node"),
+    )
 
 
 def test_model_execution_spec_defaults_to_plain_local_mode() -> None:
@@ -146,3 +205,89 @@ def test_model_execution_spec_validates_tile_dims() -> None:
 
     with pytest.raises(TypeError, match="tile_dims"):
         ModelExecutionSpec(tile=True, tile_shape=(4,), tile_dims=(True,))  # type: ignore[arg-type]
+
+
+def test_model_execution_spec_create_plan_for_plain_mode() -> None:
+    spec = ModelExecutionSpec()
+
+    plan = spec.create_plan(graph=_make_graph())
+
+    assert isinstance(plan, ExecutorPlan)
+    assert plan.mode == ExecutorModeSpec()
+    assert plan.component_names == ("graph",)
+
+
+def test_model_execution_spec_create_plan_for_tiled_mode() -> None:
+    spec = ModelExecutionSpec(tile=True, tile_shape=(1,))
+
+    plan = spec.create_plan(tile_pipeline=_make_tile_pipeline())
+
+    assert plan.mode == ExecutorModeSpec(tile=True)
+    assert plan.component_names == ("tile_pipeline",)
+
+
+def test_model_execution_spec_create_plan_for_stateful_mode() -> None:
+    spec = ModelExecutionSpec(stateful=True)
+
+    plan = spec.create_plan(stream_pipeline=_make_stream_pipeline())
+
+    assert plan.mode == ExecutorModeSpec(stream=True)
+    assert plan.component_names == ("stream_pipeline",)
+
+
+def test_model_execution_spec_create_plan_for_stateful_tiled_mode() -> None:
+    spec = ModelExecutionSpec(tile=True, stateful=True, tile_shape=(1,))
+
+    plan = spec.create_plan(
+        tile_pipeline=_make_tile_pipeline(),
+        stream_pipeline=_make_stream_pipeline(),
+    )
+
+    assert plan.mode == ExecutorModeSpec(tile=True, stream=True)
+    assert plan.execution_layers == ("stream", "tile")
+    assert plan.component_names == ("stream_pipeline", "tile_pipeline")
+
+
+def test_model_execution_spec_create_plan_for_global_local_mode() -> None:
+    spec = ModelExecutionSpec(context="global_local", tile=True, tile_shape=(1,))
+
+    plan = spec.create_plan(global_local_pipeline=_make_global_local_pipeline())
+
+    assert plan.mode == ExecutorModeSpec(tile=True, global_local=True)
+    assert plan.component_names == ("global_local_pipeline",)
+
+
+def test_model_execution_spec_create_plan_for_stateful_global_local_mode() -> None:
+    spec = ModelExecutionSpec(
+        context="global_local",
+        tile=True,
+        stateful=True,
+        tile_shape=(1,),
+    )
+
+    plan = spec.create_plan(
+        stream_pipeline=_make_stream_pipeline(),
+        global_local_pipeline=_make_global_local_pipeline(),
+    )
+
+    assert plan.mode == ExecutorModeSpec(
+        tile=True,
+        stream=True,
+        global_local=True,
+    )
+    assert plan.execution_layers == ("stream", "global_local")
+    assert plan.component_names == ("stream_pipeline", "global_local_pipeline")
+
+
+def test_model_execution_spec_create_plan_uses_executor_plan_validation() -> None:
+    with pytest.raises(ValueError, match="plain mode requires graph"):
+        ModelExecutionSpec().create_plan()
+
+    with pytest.raises(ValueError, match="tile mode requires tile_pipeline"):
+        ModelExecutionSpec(tile=True, tile_shape=(1,)).create_plan()
+
+    with pytest.raises(ValueError, match="stream mode requires stream_pipeline"):
+        ModelExecutionSpec(stateful=True).create_plan()
+
+    with pytest.raises(ValueError, match="global_local mode requires"):
+        ModelExecutionSpec(context="global_local", tile=True, tile_shape=(1,)).create_plan()

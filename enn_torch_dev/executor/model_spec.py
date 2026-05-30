@@ -2,7 +2,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from .global_local import GlobalLocalPipeline
+from .graph import GraphExecutor
 from .modes import ExecutorModeSpec
+from .plan import ExecutorPlan
+from .stream import StreamPipeline
+from .tile_pipeline import TilePipeline
 
 
 _CONTEXTS = {"local", "global_local"}
@@ -157,3 +162,20 @@ class ModelExecutionSpec:
 
     def to_executor_mode_spec(self) -> ExecutorModeSpec:
         return self.executor_mode
+
+    def create_plan(
+        self,
+        *,
+        graph: GraphExecutor | None = None,
+        tile_pipeline: TilePipeline | None = None,
+        stream_pipeline: StreamPipeline | None = None,
+        global_local_pipeline: GlobalLocalPipeline | None = None,
+    ) -> ExecutorPlan:
+        """Create an ``ExecutorPlan`` from this public model execution spec."""
+        return ExecutorPlan(
+            mode=self.executor_mode,
+            graph=graph,
+            tile_pipeline=tile_pipeline,
+            stream_pipeline=stream_pipeline,
+            global_local_pipeline=global_local_pipeline,
+        )
