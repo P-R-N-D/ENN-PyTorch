@@ -9,6 +9,7 @@ from .plan import ExecutorPlan
 from .stream import StreamPipeline
 from .tile_policy import TilePolicy
 from .tile_pipeline import TilePipeline, TilePipelineSpec
+from .tile_reconstruct import TileReconstructor
 
 
 _CONTEXTS = {"local", "global_local"}
@@ -199,6 +200,37 @@ class ModelExecutionSpec:
             output_by=output_by,
             tile_index_key=tile_index_key,
             tile_meta_key=tile_meta_key,
+        )
+
+    def create_tile_pipeline(
+        self,
+        graph: GraphExecutor,
+        *,
+        input_key: str,
+        tile_input_key: str,
+        output_name: str,
+        output_key: str | None = None,
+        output_by: str = "node",
+        tile_index_key: str | None = None,
+        tile_meta_key: str | None = None,
+        tile_reconstructor: TileReconstructor | None = None,
+    ) -> TilePipeline:
+        """Create a ``TilePipeline`` from a caller-provided tile graph."""
+        tile_policy = self.create_tile_policy()
+        tile_spec = self.create_tile_pipeline_spec(
+            input_key=input_key,
+            tile_input_key=tile_input_key,
+            output_name=output_name,
+            output_key=output_key,
+            output_by=output_by,
+            tile_index_key=tile_index_key,
+            tile_meta_key=tile_meta_key,
+        )
+        return TilePipeline(
+            graph,
+            tile_policy,
+            tile_spec,
+            tile_reconstructor=tile_reconstructor,
         )
 
     def create_plan(

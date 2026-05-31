@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import pytest
+import torch
 from torch import nn
 
 from enn_torch_dev.executor import (
@@ -9,6 +10,7 @@ from enn_torch_dev.executor import (
     GlobalLocalPipeline,
     GlobalLocalPipelineSpec,
     GraphExecutor,
+    KVStore,
     KeyRef,
     ModelExecutionSpec,
     NodeSpec,
@@ -307,6 +309,90 @@ def test_model_execution_spec_create_tile_pipeline_spec_delegates_validation() -
             tile_input_key="tile.x",
             output_name="local",
             output_by="bad",
+        )
+
+
+def test_model_execution_spec_create_tile_pipeline_from_graph_and_keys() -> None:
+    spec = ModelExecutionSpec(tile=True, tile_shape=(1,))
+    graph = _make_graph(input_key="tile.x", output_key="tile.out")
+
+    pipeline = spec.create_tile_pipeline(
+        graph,
+        input_key="x",
+        tile_input_key="tile.x",
+        output_name="node",
+        output_key="model.out",
+    )
+
+    assert isinstance(pipeline, TilePipeline)
+    assert pipeline.graph is graph
+    assert pipeline.tile_policy == spec.create_tile_policy()
+    assert pipeline.spec.input_key == "x"
+    assert pipeline.spec.tile_input_key == "tile.x"
+    assert pipeline.spec.output_name == "node"
+    assert pipeline.spec.output_key == "model.out"
+
+    store = KVStore({"x": torch.tensor([1.0, 2.0])})
+    out = pipeline.run(store)
+
+    assert torch.equal(out, torch.tensor([1.0, 2.0]))
+    assert torch.equal(store.get("model.out"), out)
+
+
+def test_model_execution_spec_create_tile_pipeline_supports_optional_spec_keys() -> None:
+    spec = ModelExecutionSpec(
+        tile=True,
+        tile_shape=(1,),
+        tile_stride=(1,),
+        tile_dims=(-1,),
+    )
+
+    pipeline = spec.create_tile_pipeline(
+        _make_graph(input_key="tile.x", output_key="tile.out"),
+        input_key="x",
+        tile_input_key="tile.x",
+        output_name="node",
+        output_by="key",
+        tile_index_key="tile.index",
+        tile_meta_key="tile.meta",
+    )
+
+    assert pipeline.tile_policy.tile_shape == (1,)
+    assert pipeline.tile_policy.stride == (1,)
+    assert pipeline.tile_policy.dims == (-1,)
+    assert pipeline.spec.output_by == "key"
+    assert pipeline.spec.tile_index_key == "tile.index"
+    assert pipeline.spec.tile_meta_key == "tile.meta"
+
+
+def test_model_execution_spec_create_tile_pipeline_requires_tile_enabled() -> None:
+    with pytest.raises(ValueError, match="requires tile=True"):
+        ModelExecutionSpec().create_tile_pipeline(
+            _make_graph(input_key="tile.x", output_key="tile.out"),
+            input_key="x",
+            tile_input_key="tile.x",
+            output_name="node",
+        )
+
+
+def test_model_execution_spec_create_tile_pipeline_delegates_validation() -> None:
+    spec = ModelExecutionSpec(tile=True, tile_shape=(1,))
+
+    with pytest.raises(ValueError, match="output_by"):
+        spec.create_tile_pipeline(
+            _make_graph(input_key="tile.x", output_key="tile.out"),
+            input_key="x",
+            tile_input_key="tile.x",
+            output_name="node",
+            output_by="bad",
+        )
+
+    with pytest.raises(KeyError, match="missing"):
+        spec.create_tile_pipeline(
+            _make_graph(input_key="tile.x", output_key="tile.out"),
+            input_key="x",
+            tile_input_key="tile.x",
+            output_name="missing",
         )
 
 
