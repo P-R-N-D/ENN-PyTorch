@@ -251,6 +251,65 @@ def test_model_execution_spec_create_tile_policy_matches_direct_tile_policy() ->
     assert policy == expected
 
 
+def test_model_execution_spec_create_tile_pipeline_spec_from_keys() -> None:
+    spec = ModelExecutionSpec(tile=True, tile_shape=(2, 3))
+
+    pipeline_spec = spec.create_tile_pipeline_spec(
+        input_key="x",
+        tile_input_key="tile.x",
+        output_name="local",
+    )
+
+    assert isinstance(pipeline_spec, TilePipelineSpec)
+    assert pipeline_spec.input_key == "x"
+    assert pipeline_spec.tile_input_key == "tile.x"
+    assert pipeline_spec.output_name == "local"
+    assert pipeline_spec.output_key is None
+    assert pipeline_spec.output_by == "node"
+    assert pipeline_spec.tile_index_key is None
+    assert pipeline_spec.tile_meta_key is None
+
+
+def test_model_execution_spec_create_tile_pipeline_spec_supports_optional_keys() -> None:
+    spec = ModelExecutionSpec(tile=True, tile_shape=(2,))
+
+    pipeline_spec = spec.create_tile_pipeline_spec(
+        input_key="x",
+        tile_input_key="tile.x",
+        output_name="local",
+        output_key="model.out",
+        output_by="key",
+        tile_index_key="tile.index",
+        tile_meta_key="tile.meta",
+    )
+
+    assert pipeline_spec.output_key == "model.out"
+    assert pipeline_spec.output_by == "key"
+    assert pipeline_spec.tile_index_key == "tile.index"
+    assert pipeline_spec.tile_meta_key == "tile.meta"
+
+
+def test_model_execution_spec_create_tile_pipeline_spec_requires_tile_enabled() -> None:
+    with pytest.raises(ValueError, match="requires tile=True"):
+        ModelExecutionSpec().create_tile_pipeline_spec(
+            input_key="x",
+            tile_input_key="tile.x",
+            output_name="local",
+        )
+
+
+def test_model_execution_spec_create_tile_pipeline_spec_delegates_validation() -> None:
+    spec = ModelExecutionSpec(tile=True, tile_shape=(2,))
+
+    with pytest.raises(ValueError, match="output_by"):
+        spec.create_tile_pipeline_spec(
+            input_key="x",
+            tile_input_key="tile.x",
+            output_name="local",
+            output_by="bad",
+        )
+
+
 def test_model_execution_spec_create_plan_for_plain_mode() -> None:
     spec = ModelExecutionSpec()
 
