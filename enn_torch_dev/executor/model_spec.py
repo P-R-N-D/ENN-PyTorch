@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from .global_local import GlobalLocalPipeline
+from .global_local import GlobalLocalPipeline, GlobalLocalPipelineSpec
 from .graph import GraphExecutor
 from .modes import ExecutorModeSpec
 from .plan import ExecutorPlan
@@ -231,6 +231,25 @@ class ModelExecutionSpec:
             tile_policy,
             tile_spec,
             tile_reconstructor=tile_reconstructor,
+        )
+
+    def create_global_local_pipeline_spec(
+        self,
+        *,
+        global_output_name: str,
+        fused_output_key: str | None = None,
+        global_output_by: str = "node",
+    ) -> GlobalLocalPipelineSpec:
+        """Create a ``GlobalLocalPipelineSpec`` for caller-provided branches."""
+        if not self.uses_global_local:
+            raise ValueError(
+                "ModelExecutionSpec.create_global_local_pipeline_spec requires "
+                "context='global_local'."
+            )
+        return GlobalLocalPipelineSpec(
+            global_output_name=global_output_name,
+            fused_output_key=fused_output_key,
+            global_output_by=global_output_by,
         )
 
     def create_plan(

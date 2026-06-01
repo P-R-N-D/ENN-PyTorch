@@ -396,6 +396,58 @@ def test_model_execution_spec_create_tile_pipeline_delegates_validation() -> Non
         )
 
 
+def test_model_execution_spec_create_global_local_pipeline_spec_from_keys() -> None:
+    spec = ModelExecutionSpec(
+        context="global_local",
+        tile=True,
+        tile_shape=(1,),
+    )
+
+    pipeline_spec = spec.create_global_local_pipeline_spec(
+        global_output_name="global",
+    )
+
+    assert isinstance(pipeline_spec, GlobalLocalPipelineSpec)
+    assert pipeline_spec.global_output_name == "global"
+    assert pipeline_spec.fused_output_key is None
+    assert pipeline_spec.global_output_by == "node"
+
+
+def test_model_execution_spec_create_global_local_pipeline_spec_supports_optional_keys() -> None:
+    spec = ModelExecutionSpec(
+        context="global_local",
+        tile=True,
+        tile_shape=(1,),
+    )
+
+    pipeline_spec = spec.create_global_local_pipeline_spec(
+        global_output_name="global",
+        fused_output_key="fused.out",
+        global_output_by="key",
+    )
+
+    assert pipeline_spec.global_output_name == "global"
+    assert pipeline_spec.fused_output_key == "fused.out"
+    assert pipeline_spec.global_output_by == "key"
+
+
+def test_model_execution_spec_create_global_local_pipeline_spec_requires_global_local_context() -> None:
+    with pytest.raises(ValueError, match="context='global_local'"):
+        ModelExecutionSpec(tile=True, tile_shape=(1,)).create_global_local_pipeline_spec(
+            global_output_name="global",
+        )
+
+
+def test_model_execution_spec_create_global_local_pipeline_spec_delegates_validation() -> None:
+    spec = ModelExecutionSpec(context="global_local", tile=True, tile_shape=(1,))
+
+    with pytest.raises(ValueError, match="global_output_by"):
+        spec.create_global_local_pipeline_spec(
+            global_output_name="global",
+            global_output_by="bad",
+        )
+
+
 def test_model_execution_spec_create_plan_for_plain_mode() -> None:
     spec = ModelExecutionSpec()
 
