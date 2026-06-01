@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from enn_torch_dev.nn import LocalGlobalFusion
+
 from .global_local import GlobalLocalPipeline, GlobalLocalPipelineSpec
 from .graph import GraphExecutor
 from .modes import ExecutorModeSpec
@@ -250,6 +252,29 @@ class ModelExecutionSpec:
             global_output_name=global_output_name,
             fused_output_key=fused_output_key,
             global_output_by=global_output_by,
+        )
+
+    def create_global_local_pipeline(
+        self,
+        *,
+        global_graph: GraphExecutor,
+        tile_pipeline: TilePipeline,
+        fusion: LocalGlobalFusion,
+        global_output_name: str,
+        fused_output_key: str | None = None,
+        global_output_by: str = "node",
+    ) -> GlobalLocalPipeline:
+        """Create a ``GlobalLocalPipeline`` from caller-provided branches."""
+        spec = self.create_global_local_pipeline_spec(
+            global_output_name=global_output_name,
+            fused_output_key=fused_output_key,
+            global_output_by=global_output_by,
+        )
+        return GlobalLocalPipeline(
+            global_graph=global_graph,
+            tile_pipeline=tile_pipeline,
+            fusion=fusion,
+            spec=spec,
         )
 
     def create_plan(

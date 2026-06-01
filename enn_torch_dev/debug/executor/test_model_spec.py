@@ -448,6 +448,96 @@ def test_model_execution_spec_create_global_local_pipeline_spec_delegates_valida
         )
 
 
+def test_model_execution_spec_create_global_local_pipeline_from_components() -> None:
+    spec = ModelExecutionSpec(
+        context="global_local",
+        tile=True,
+        tile_shape=(1,),
+    )
+    global_graph = _make_graph(input_key="x", output_key="global.out")
+    tile_pipeline = _make_tile_pipeline()
+    fusion = LocalGlobalFusion(init_logit=0.0, learnable=False)
+
+    pipeline = spec.create_global_local_pipeline(
+        global_graph=global_graph,
+        tile_pipeline=tile_pipeline,
+        fusion=fusion,
+        global_output_name="node",
+        fused_output_key="fused.out",
+    )
+
+    assert isinstance(pipeline, GlobalLocalPipeline)
+    assert pipeline.global_graph is global_graph
+    assert pipeline.tile_pipeline is tile_pipeline
+    assert pipeline.fusion is fusion
+    assert pipeline.spec.global_output_name == "node"
+    assert pipeline.spec.fused_output_key == "fused.out"
+
+    store = KVStore({"x": torch.tensor([1.0, 2.0])})
+    out = pipeline.run(store)
+
+    assert torch.equal(out, torch.tensor([1.0, 2.0]))
+    assert torch.equal(store.get("fused.out"), out)
+
+
+def test_model_execution_spec_create_global_local_pipeline_supports_output_by_key() -> None:
+    spec = ModelExecutionSpec(
+        context="global_local",
+        tile=True,
+        tile_shape=(1,),
+    )
+
+    pipeline = spec.create_global_local_pipeline(
+        global_graph=_make_graph(input_key="x", output_key="global.out"),
+        tile_pipeline=_make_tile_pipeline(),
+        fusion=LocalGlobalFusion(init_logit=0.0, learnable=False),
+        global_output_name="node",
+        fused_output_key="fused.out",
+        global_output_by="key",
+    )
+
+    assert pipeline.spec.global_output_name == "node"
+    assert pipeline.spec.fused_output_key == "fused.out"
+    assert pipeline.spec.global_output_by == "key"
+
+    store = KVStore({"x": torch.tensor([1.0, 2.0])})
+    out = pipeline.run(store)
+
+    assert torch.equal(out, torch.tensor([1.0, 2.0]))
+    assert torch.equal(store.get("fused.out"), out)
+
+
+def test_model_execution_spec_create_global_local_pipeline_requires_global_local_context() -> None:
+    with pytest.raises(ValueError, match="context='global_local'"):
+        ModelExecutionSpec(tile=True, tile_shape=(1,)).create_global_local_pipeline(
+            global_graph=_make_graph(input_key="x", output_key="global.out"),
+            tile_pipeline=_make_tile_pipeline(),
+            fusion=LocalGlobalFusion(init_logit=0.0, learnable=False),
+            global_output_name="node",
+        )
+
+
+def test_model_execution_spec_create_global_local_pipeline_delegates_validation() -> None:
+    spec = ModelExecutionSpec(context="global_local", tile=True, tile_shape=(1,))
+
+    with pytest.raises(ValueError, match="global_output_by"):
+        spec.create_global_local_pipeline(
+            global_graph=_make_graph(input_key="x", output_key="global.out"),
+            tile_pipeline=_make_tile_pipeline(),
+            fusion=LocalGlobalFusion(init_logit=0.0, learnable=False),
+            global_output_name="node",
+            global_output_by="bad",
+        )
+
+    with pytest.raises(TypeError, match="global_graph"):
+        spec.create_global_local_pipeline(
+            global_graph=object(),
+            tile_pipeline=_make_tile_pipeline(),
+            fusion=LocalGlobalFusion(init_logit=0.0, learnable=False),
+            global_output_name="node",
+        )
+
+
 def test_model_execution_spec_create_plan_for_plain_mode() -> None:
     spec = ModelExecutionSpec()
 
