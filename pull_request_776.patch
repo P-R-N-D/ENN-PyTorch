@@ -1,0 +1,164 @@
+diff --git a/enn_torch_dev/executor/model_spec.py b/enn_torch_dev/executor/model_spec.py
+index f1f7933..8bb27c1 100644
+--- a/enn_torch_dev/executor/model_spec.py
++++ b/enn_torch_dev/executor/model_spec.py
+@@ -2,6 +2,7 @@ from __future__ import annotations
+
+ from dataclasses import dataclass
+
++from collections.abc import Sequence
+ from enn_torch_dev.nn import LocalGlobalFusion
+
+ from .global_local import GlobalLocalPipeline, GlobalLocalPipelineSpec
+@@ -10,6 +11,7 @@ from .graph import GraphExecutor
+ from .modes import ExecutorModeSpec
+ from .plan import ExecutorPlan
+ from .stream import StreamPipeline, StreamPipelineSpec
++from .state import StateRoute
+ from .tile_policy import TilePolicy
+ from .tile_pipeline import TilePipeline, TilePipelineSpec
+ from .tile_reconstruct import TileReconstructor
+@@ -307,6 +309,38 @@ class ModelExecutionSpec:
+             reset_state=reset_state,
+         )
+
++    def create_stream_pipeline(
++        self,
++        graph: GraphExecutor,
++        *,
++        chunk_input_key: str,
++        output_name: str,
++        output_by: str = "node",
++        chunk_index_key: str | None = None,
++        outputs_key: str | None = None,
++        state_detach: bool = False,
++        state_clone: bool = False,
++        reset_state: bool = False,
++        state_routes: Sequence[StateRoute] = (),
++    ) -> StreamPipeline:
++        """Create a ``StreamPipeline`` from a caller-provided stream graph."""
++        stream_spec = self.create_stream_pipeline_spec(
++            chunk_input_key=chunk_input_key,
++            output_name=output_name,
++            output_by=output_by,
++            chunk_index_key=chunk_index_key,
++            outputs_key=outputs_key,
++            state_detach=state_detach,
++            state_clone=state_clone,
++            reset_state=reset_state,
++        )
++        return StreamPipeline(
++            graph,
++            stream_spec,
++            state_routes=state_routes,
++        )
++
+     def create_plan(
+         self,
+         *,
+diff --git a/enn_torch_dev/debug/executor/test_model_spec.py b/enn_torch_dev/debug/executor/test_model_spec.py
+index a6fdcfe..5fd70fd 100644
+--- a/enn_torch_dev/debug/executor/test_model_spec.py
++++ b/enn_torch_dev/debug/executor/test_model_spec.py
+@@ -16,6 +16,7 @@ from enn_torch_dev.executor import (
+     KeyRef,
+     ModelExecutionSpec,
+     NodeSpec,
++    StateRoute,
+     StreamPipeline,
+     StreamPipelineSpec,
+     TilePipeline,
+@@ -588,6 +589,89 @@ def test_model_execution_spec_create_stream_pipeline_spec_delegates_validation()
+         )
+
+
++def test_model_execution_spec_create_stream_pipeline_from_graph_and_keys() -> None:
++    spec = ModelExecutionSpec(stateful=True)
++    graph = _make_graph(input_key="chunk.x", output_key="chunk.out")
++
++    pipeline = spec.create_stream_pipeline(
++        graph,
++        chunk_input_key="chunk.x",
++        output_name="node",
++        outputs_key="stream.outputs",
++    )
++
++    assert isinstance(pipeline, StreamPipeline)
++    assert pipeline.graph is graph
++    assert pipeline.spec.chunk_input_key == "chunk.x"
++    assert pipeline.spec.output_name == "node"
++    assert pipeline.spec.outputs_key == "stream.outputs"
++    assert pipeline.state_routes == ()
++
++    store = KVStore()
++    outputs = pipeline.run(store, [torch.tensor([1.0]), torch.tensor([2.0])])
++
++    assert [out.item() for out in outputs] == [1.0, 2.0]
++    assert store.get("stream.outputs") is outputs
++
++
++def test_model_execution_spec_create_stream_pipeline_supports_optional_spec_keys_and_state_routes() -> None:
++    spec = ModelExecutionSpec(stateful=True)
++    state_route = StateRoute("state.in", "state.out")
++
++    pipeline = spec.create_stream_pipeline(
++        _make_graph(input_key="chunk.x", output_key="chunk.out"),
++        chunk_input_key="chunk.x",
++        output_name="node",
++        output_by="key",
++        chunk_index_key="chunk.index",
++        outputs_key="stream.outputs",
++        state_detach=True,
++        state_clone=True,
++        reset_state=True,
++        state_routes=[state_route],
++    )
++
++    assert pipeline.spec.output_by == "key"
++    assert pipeline.spec.chunk_index_key == "chunk.index"
++    assert pipeline.spec.outputs_key == "stream.outputs"
++    assert pipeline.spec.state_detach is True
++    assert pipeline.spec.state_clone is True
++    assert pipeline.spec.reset_state is True
++    assert pipeline.state_routes == (state_route,)
++
++
++def test_model_execution_spec_create_stream_pipeline_requires_stateful_enabled() -> None:
++    with pytest.raises(ValueError, match="requires stateful=True"):
++        ModelExecutionSpec().create_stream_pipeline(
++            _make_graph(input_key="chunk.x", output_key="chunk.out"),
++            chunk_input_key="chunk.x",
++            output_name="node",
++        )
++
++
++def test_model_execution_spec_create_stream_pipeline_delegates_validation() -> None:
++    spec = ModelExecutionSpec(stateful=True)
++
++    with pytest.raises(ValueError, match="output_by"):
++        spec.create_stream_pipeline(
++            _make_graph(input_key="chunk.x", output_key="chunk.out"),
++            chunk_input_key="chunk.x",
++            output_name="node",
++            output_by="bad",
++        )
++
++    with pytest.raises(KeyError, match="missing"):
++        spec.create_stream_pipeline(
++            _make_graph(input_key="chunk.x", output_key="chunk.out"),
++            chunk_input_key="chunk.x",
++            output_name="missing",
++        )
++
++    with pytest.raises(TypeError, match="state_routes"):
++        spec.create_stream_pipeline(
++            _make_graph(input_key="chunk.x", output_key="chunk.out"),
++            chunk_input_key="chunk.x",
++            output_name="node",
++            state_routes=[object()],
++        )
++
++
+ def test_model_execution_spec_create_plan_for_plain_mode() -> None:
+     spec = ModelExecutionSpec()
+
