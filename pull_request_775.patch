@@ -1,0 +1,128 @@
+diff --git a/enn_torch_dev/executor/model_spec.py b/enn_torch_dev/executor/model_spec.py
+index ce01cc0..244dfc0 100644
+--- a/enn_torch_dev/executor/model_spec.py
++++ b/enn_torch_dev/executor/model_spec.py
+@@ -8,7 +8,7 @@ from .global_local import GlobalLocalPipeline, GlobalLocalPipelineSpec
+ from .graph import GraphExecutor
+ from .modes import ExecutorModeSpec
+ from .plan import ExecutorPlan
+-from .stream import StreamPipeline
++from .stream import StreamPipeline, StreamPipelineSpec
+ from .tile_policy import TilePolicy
+ from .tile_pipeline import TilePipeline, TilePipelineSpec
+ from .tile_reconstruct import TileReconstructor
+@@ -278,6 +278,37 @@ class ModelExecutionSpec:
+             spec=spec,
+         )
+
++    def create_stream_pipeline_spec(
++        self,
++        *,
++        chunk_input_key: str,
++        output_name: str,
++        output_by: str = "node",
++        chunk_index_key: str | None = None,
++        outputs_key: str | None = None,
++        state_detach: bool = False,
++        state_clone: bool = False,
++        reset_state: bool = False,
++    ) -> StreamPipelineSpec:
++        """Create a ``StreamPipelineSpec`` for public stateful execution."""
++        if not self.stateful:
++            raise ValueError(
++                "ModelExecutionSpec.create_stream_pipeline_spec requires stateful=True."
++            )
++        return StreamPipelineSpec(
++            chunk_input_key=chunk_input_key,
++            output_name=output_name,
++            output_by=output_by,
++            chunk_index_key=chunk_index_key,
++            outputs_key=outputs_key,
++            state_detach=state_detach,
++            state_clone=state_clone,
++            reset_state=reset_state,
++        )
++
+     def create_plan(
+         self,
+         *,
+diff --git a/enn_torch_dev/debug/executor/test_model_spec.py b/enn_torch_dev/debug/executor/test_model_spec.py
+index a6fdcfe..2d48244 100644
+--- a/enn_torch_dev/debug/executor/test_model_spec.py
++++ b/enn_torch_dev/debug/executor/test_model_spec.py
+@@ -542,6 +542,62 @@ def test_model_execution_spec_create_global_local_pipeline_delegates_validation(
+         )
+
+
++def test_model_execution_spec_create_stream_pipeline_spec_from_keys() -> None:
++    spec = ModelExecutionSpec(stateful=True)
++
++    pipeline_spec = spec.create_stream_pipeline_spec(
++        chunk_input_key="chunk.x",
++        output_name="node",
++    )
++
++    assert isinstance(pipeline_spec, StreamPipelineSpec)
++    assert pipeline_spec.chunk_input_key == "chunk.x"
++    assert pipeline_spec.output_name == "node"
++    assert pipeline_spec.output_by == "node"
++    assert pipeline_spec.chunk_index_key is None
++    assert pipeline_spec.outputs_key is None
++    assert pipeline_spec.state_detach is False
++    assert pipeline_spec.state_clone is False
++    assert pipeline_spec.reset_state is False
++
++
++def test_model_execution_spec_create_stream_pipeline_spec_supports_optional_keys_and_state_policy() -> None:
++    spec = ModelExecutionSpec(stateful=True)
++
++    pipeline_spec = spec.create_stream_pipeline_spec(
++        chunk_input_key="chunk.x",
++        output_name="node",
++        output_by="key",
++        chunk_index_key="chunk.index",
++        outputs_key="stream.outputs",
++        state_detach=True,
++        state_clone=True,
++        reset_state=True,
++    )
++
++    assert pipeline_spec.chunk_input_key == "chunk.x"
++    assert pipeline_spec.output_name == "node"
++    assert pipeline_spec.output_by == "key"
++    assert pipeline_spec.chunk_index_key == "chunk.index"
++    assert pipeline_spec.outputs_key == "stream.outputs"
++    assert pipeline_spec.state_detach is True
++    assert pipeline_spec.state_clone is True
++    assert pipeline_spec.reset_state is True
++
++
++def test_model_execution_spec_create_stream_pipeline_spec_requires_stateful_enabled() -> None:
++    with pytest.raises(ValueError, match="requires stateful=True"):
++        ModelExecutionSpec().create_stream_pipeline_spec(
++            chunk_input_key="chunk.x",
++            output_name="node",
++        )
++
++
++def test_model_execution_spec_create_stream_pipeline_spec_delegates_validation() -> None:
++    spec = ModelExecutionSpec(stateful=True)
++
++    with pytest.raises(ValueError, match="output_by"):
++        spec.create_stream_pipeline_spec(
++            chunk_input_key="chunk.x",
++            output_name="node",
++            output_by="bad",
++        )
++
++    with pytest.raises(TypeError, match="state_detach"):
++        spec.create_stream_pipeline_spec(
++            chunk_input_key="chunk.x",
++            output_name="node",
++            state_detach=1,  # type: ignore[arg-type]
++        )
++
++
+ def test_model_execution_spec_create_plan_for_plain_mode() -> None:
+     spec = ModelExecutionSpec()
+
