@@ -443,10 +443,10 @@ global_local_pipeline = spec.create_global_local_pipeline(
 This still does not create the global graph, tile graph, or fusion module. It
 only connects already-built components through the executor pipeline classes.
 
-The plan layer remains explicit:
+The plan layer remains explicit and must match the active `ModelExecutionSpec`:
 
 ```python
-plan = spec.create_plan(tile_pipeline=tile_pipeline)
+plan = spec.create_plan(global_local_pipeline=global_local_pipeline)
 model = ExecutorModel(spec=spec, plan=plan)
 ```
 
