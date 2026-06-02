@@ -1,0 +1,122 @@
+diff --git a/enn_torch_dev/debug/executor/test_model.py b/enn_torch_dev/debug/executor/test_model.py
+index f7ab671..b8fc6de 100644
+--- a/enn_torch_dev/debug/executor/test_model.py
++++ b/enn_torch_dev/debug/executor/test_model.py
+@@ -377,3 +377,108 @@ def test_executor_model_public_stateful_global_local_flow_uses_stream_outer() -> None:
+     assert model.plan.component_names == ("stream_pipeline", "global_local_pipeline")
+     assert [out.item() for out in outputs] == [6.0]
+     assert store.get("stream.outputs") is outputs
+     assert not store.has("fused.out")
++
++
++def test_executor_model_tile_factory_flow_end_to_end() -> None:
++    spec = ModelExecutionSpec(tile=True, tile_shape=(2,))
++    tile_graph = _make_graph(input_key="tile.x", output_key="tile.out")
++
++    tile_pipeline = spec.create_tile_pipeline(
++        tile_graph,
++        input_key="x",
++        tile_input_key="tile.x",
++        output_name="node",
++        output_key="model.out",
++    )
++    plan = spec.create_plan(tile_pipeline=tile_pipeline)
++    model = ExecutorModel(spec=spec, plan=plan)
++    store = KVStore({"x": torch.arange(4, dtype=torch.float32)})
++
++    result = model.run(store)
++
++    assert model.plan.mode == ExecutorModeSpec(tile=True)
++    assert model.plan.execution_layers == ("tile",)
++    assert model.plan.component_names == ("tile_pipeline",)
++    assert torch.equal(result, torch.arange(4, dtype=torch.float32) + 1.0)
++    assert torch.equal(store.get("model.out"), result)
++
++
++def test_executor_model_global_local_factory_flow_end_to_end() -> None:
++    spec = ModelExecutionSpec(context="global_local", tile=True, tile_shape=(2,))
++
++    global_graph = GraphExecutor()
++    global_graph.add_node(
++        NodeSpec(
++            name="global",
++            input_args=[KeyRef("x")],
++            input_kwargs={"bias": KeyRef("global.bias")},
++            output_key="global.out",
++        ),
++        _AddBias(),
++    )
++
++    local_graph = GraphExecutor()
++    local_graph.add_node(
++        NodeSpec(
++            name="local",
++            input_args=[KeyRef("tile.x")],
++            input_kwargs={"bias": KeyRef("local.bias")},
++            output_key="local.out",
++        ),
++        _AddBias(),
++    )
++
++    tile_pipeline = spec.create_tile_pipeline(
++        local_graph,
++        input_key="x",
++        tile_input_key="tile.x",
++        output_name="local",
++    )
++    global_local_pipeline = spec.create_global_local_pipeline(
++        global_graph=global_graph,
++        tile_pipeline=tile_pipeline,
++        fusion=LocalGlobalFusion(init_logit=0.0, learnable=False),
++        global_output_name="global",
++        fused_output_key="fused.out",
++    )
++    plan = spec.create_plan(global_local_pipeline=global_local_pipeline)
++    model = ExecutorModel(spec=spec, plan=plan)
++
++    x = torch.arange(4, dtype=torch.float32)
++    store = KVStore(
++        {
++            "x": x,
++            "global.bias": torch.tensor(10.0),
++            "local.bias": torch.tensor(2.0),
++        }
++    )
++
++    result = model.run(store)
++
++    assert model.plan.mode == ExecutorModeSpec(tile=True, global_local=True)
++    assert model.plan.execution_layers == ("global_local",)
++    assert model.plan.component_names == ("global_local_pipeline",)
++    assert torch.equal(result, x + 6.0)
++    assert torch.equal(store.get("fused.out"), result)
++
++
++def test_executor_model_stream_factory_flow_end_to_end() -> None:
++    spec = ModelExecutionSpec(stateful=True)
++    stream_graph = _make_graph(
++        input_key="chunk.x",
++        output_key="chunk.out",
++        module=_Double(),
++    )
++
++    stream_pipeline = spec.create_stream_pipeline(
++        stream_graph,
++        chunk_input_key="chunk.x",
++        output_name="node",
++        outputs_key="stream.outputs",
++    )
++    plan = spec.create_plan(stream_pipeline=stream_pipeline)
++    model = ExecutorModel(spec=spec, plan=plan)
++    store = KVStore()
++
++    outputs = model.run(
++        store,
++        chunks=[torch.tensor([1.0]), torch.tensor([2.0])],
++    )
++
++    assert model.plan.mode == ExecutorModeSpec(stream=True)
++    assert model.plan.execution_layers == ("stream",)
++    assert model.plan.component_names == ("stream_pipeline",)
++    assert [out.item() for out in outputs] == [2.0, 4.0]
++    assert store.get("stream.outputs") is outputs
