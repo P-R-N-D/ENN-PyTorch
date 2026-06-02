@@ -358,6 +358,98 @@ tile_dims
   tensor dimensions that are tiled
 ```
 
+## ModelExecutionSpec factory helpers
+
+`ModelExecutionSpec` also provides small factory helpers that bridge public
+model-side configuration to executor-side objects. These helpers do not create
+model branches automatically. They either create specs/policies from validated
+public parameters or wrap caller-provided executor components.
+
+Available helpers:
+
+```text
+create_tile_policy()
+  tile_shape / tile_stride / tile_dims
+  -> TilePolicy
+
+create_tile_pipeline_spec(...)
+  input/output key schema
+  -> TilePipelineSpec
+
+create_tile_pipeline(graph, ...)
+  caller-provided GraphExecutor
+  + create_tile_policy()
+  + create_tile_pipeline_spec(...)
+  -> TilePipeline
+
+create_global_local_pipeline_spec(...)
+  global output key schema
+  -> GlobalLocalPipelineSpec
+
+create_global_local_pipeline(...)
+  caller-provided global_graph
+  + caller-provided tile_pipeline
+  + caller-provided fusion
+  + create_global_local_pipeline_spec(...)
+  -> GlobalLocalPipeline
+
+create_plan(...)
+  caller-provided graph/pipelines
+  -> ExecutorPlan
+```
+
+The tiled local branch can be built from a caller-provided tile graph:
+
+```python
+spec = ModelExecutionSpec(tile=True, tile_shape=(128, 128))
+
+tile_pipeline = spec.create_tile_pipeline(
+    tile_graph,
+    input_key="x",
+    tile_input_key="tile.x",
+    output_name="local",
+    output_key="local.out",
+)
+```
+
+This creates the `TilePolicy` and `TilePipelineSpec`, but it does not create the
+tile graph itself. The caller still supplies `tile_graph`.
+
+The global-local branch can be built from caller-provided components:
+
+```python
+spec = ModelExecutionSpec(
+    context="global_local",
+    tile=True,
+    tile_shape=(128, 128),
+)
+
+tile_pipeline = spec.create_tile_pipeline(
+    tile_graph,
+    input_key="x",
+    tile_input_key="tile.x",
+    output_name="local",
+)
+
+global_local_pipeline = spec.create_global_local_pipeline(
+    global_graph=global_graph,
+    tile_pipeline=tile_pipeline,
+    fusion=fusion,
+    global_output_name="global",
+    fused_output_key="fused.out",
+)
+```
+
+This still does not create the global graph, tile graph, or fusion module. It
+only connects already-built components through the executor pipeline classes.
+
+The plan layer remains explicit:
+
+```python
+plan = spec.create_plan(tile_pipeline=tile_pipeline)
+model = ExecutorModel(spec=spec, plan=plan)
+```
+
 ## ExecutorModel
 
 `ExecutorModel` is the thin executor-layer wrapper above `ModelExecutionSpec`,
@@ -397,7 +489,14 @@ from enn_torch_dev.executor import ExecutorModel, ModelExecutionSpec
 
 spec = ModelExecutionSpec(
     tile=True,
-    tile_shape=tile_pipeline.tile_policy.tile_shape,
+    tile_shape=(128, 128),
+)
+
+tile_pipeline = spec.create_tile_pipeline(
+    tile_graph,
+    input_key="x",
+    tile_input_key="tile.x",
+    output_name="local",
 )
 
 model = ExecutorModel.from_components(
@@ -410,7 +509,8 @@ out = model.run(store)
 
 The actual tiling behavior comes from the `TilePolicy` inside `tile_pipeline`.
 In v0, `tile_shape` documents and validates the public spec intent; callers
-should construct the supplied `TilePipeline` with a matching policy.
+should either use `create_tile_pipeline(...)` or construct the supplied
+`TilePipeline` with a matching policy.
 
 The explicit form is also valid:
 
@@ -498,7 +598,7 @@ ExecutorPlan
   validates mode flags against supplied executor components
 
 ModelExecutionSpec
-  public context / tile / stateful parameter schema
+  public context / tile / stateful schema and executor factory helpers
 
 ExecutorRunner
   executes a validated ExecutorPlan
@@ -541,7 +641,7 @@ batch-level reset masks
 detach intervals
 truncated BPTT scheduler
 multi-output stream collection
-automatic graph/pipeline builder
+automatic graph / branch / fusion builder
 torch.nn.Module public Model(...) wrapper
 ```
 
@@ -556,6 +656,7 @@ public Model parameters
   -> ModelExecutionSpec
   -> ExecutorModeSpec
   -> ExecutorPlan
+  -> ModelExecutionSpec factory helpers for caller-provided components
   -> ExecutorModel
   -> ExecutorRunner
   -> concrete GraphExecutor / TilePipeline / StreamPipeline / GlobalLocalPipeline
