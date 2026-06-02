@@ -8,7 +8,7 @@ from .global_local import GlobalLocalPipeline, GlobalLocalPipelineSpec
 from .graph import GraphExecutor
 from .modes import ExecutorModeSpec
 from .plan import ExecutorPlan
-from .stream import StreamPipeline
+from .stream import StreamPipeline, StreamPipelineSpec
 from .tile_policy import TilePolicy
 from .tile_pipeline import TilePipeline, TilePipelineSpec
 from .tile_reconstruct import TileReconstructor
@@ -275,6 +275,34 @@ class ModelExecutionSpec:
             tile_pipeline=tile_pipeline,
             fusion=fusion,
             spec=spec,
+        )
+
+    def create_stream_pipeline_spec(
+        self,
+        *,
+        chunk_input_key: str,
+        output_name: str,
+        output_by: str = "node",
+        chunk_index_key: str | None = None,
+        outputs_key: str | None = None,
+        state_detach: bool = False,
+        state_clone: bool = False,
+        reset_state: bool = False,
+    ) -> StreamPipelineSpec:
+        """Create a ``StreamPipelineSpec`` for public stateful execution."""
+        if not self.stateful:
+            raise ValueError(
+                "ModelExecutionSpec.create_stream_pipeline_spec requires stateful=True."
+            )
+        return StreamPipelineSpec(
+            chunk_input_key=chunk_input_key,
+            output_name=output_name,
+            output_by=output_by,
+            chunk_index_key=chunk_index_key,
+            outputs_key=outputs_key,
+            state_detach=state_detach,
+            state_clone=state_clone,
+            reset_state=reset_state,
         )
 
     def create_plan(
