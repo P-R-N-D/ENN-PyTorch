@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 
 from enn_torch_dev.nn import LocalGlobalFusion
@@ -8,6 +9,7 @@ from .global_local import GlobalLocalPipeline, GlobalLocalPipelineSpec
 from .graph import GraphExecutor
 from .modes import ExecutorModeSpec
 from .plan import ExecutorPlan
+from .state import StateRoute
 from .stream import StreamPipeline, StreamPipelineSpec
 from .tile_policy import TilePolicy
 from .tile_pipeline import TilePipeline, TilePipelineSpec
@@ -303,6 +305,37 @@ class ModelExecutionSpec:
             state_detach=state_detach,
             state_clone=state_clone,
             reset_state=reset_state,
+        )
+
+    def create_stream_pipeline(
+        self,
+        graph: GraphExecutor,
+        *,
+        chunk_input_key: str,
+        output_name: str,
+        output_by: str = "node",
+        chunk_index_key: str | None = None,
+        outputs_key: str | None = None,
+        state_detach: bool = False,
+        state_clone: bool = False,
+        reset_state: bool = False,
+        state_routes: Sequence[StateRoute] = (),
+    ) -> StreamPipeline:
+        """Create a ``StreamPipeline`` from a caller-provided stream graph."""
+        stream_spec = self.create_stream_pipeline_spec(
+            chunk_input_key=chunk_input_key,
+            output_name=output_name,
+            output_by=output_by,
+            chunk_index_key=chunk_index_key,
+            outputs_key=outputs_key,
+            state_detach=state_detach,
+            state_clone=state_clone,
+            reset_state=reset_state,
+        )
+        return StreamPipeline(
+            graph,
+            stream_spec,
+            state_routes=state_routes,
         )
 
     def create_plan(
