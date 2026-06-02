@@ -429,25 +429,33 @@ tile graph itself. The caller still supplies `tile_graph`.
 The global-local branch can be built from caller-provided components:
 
 ```python
-spec = ModelExecutionSpec(
+global_local_spec = ModelExecutionSpec(
     context="global_local",
     tile=True,
     tile_shape=(128, 128),
 )
 
-tile_pipeline = spec.create_tile_pipeline(
+tile_pipeline = global_local_spec.create_tile_pipeline(
     tile_graph,
     input_key="x",
     tile_input_key="tile.x",
     output_name="local",
 )
 
-global_local_pipeline = spec.create_global_local_pipeline(
+global_local_pipeline = global_local_spec.create_global_local_pipeline(
     global_graph=global_graph,
     tile_pipeline=tile_pipeline,
     fusion=fusion,
     global_output_name="global",
     fused_output_key="fused.out",
+)
+
+global_local_plan = global_local_spec.create_plan(
+    global_local_pipeline=global_local_pipeline,
+)
+global_local_model = ExecutorModel(
+    spec=global_local_spec,
+    plan=global_local_plan,
 )
 ```
 
@@ -458,15 +466,18 @@ The stateful/stream branch can be built from a caller-provided stream graph and
 explicit state routes:
 
 ```python
-spec = ModelExecutionSpec(stateful=True)
+stream_spec = ModelExecutionSpec(stateful=True)
 
-stream_pipeline = spec.create_stream_pipeline(
+stream_pipeline = stream_spec.create_stream_pipeline(
     stream_graph,
     chunk_input_key="chunk.x",
     output_name="step",
     outputs_key="stream.outputs",
     state_routes=[state_route],
 )
+
+stream_plan = stream_spec.create_plan(stream_pipeline=stream_pipeline)
+stream_model = ExecutorModel(spec=stream_spec, plan=stream_plan)
 ```
 
 This creates the `StreamPipelineSpec`, but it does not create chunks or infer
@@ -475,13 +486,6 @@ state routes. The caller still supplies ordered chunks at run time and explicit
 
 ```python
 outputs = stream_pipeline.run(store, chunks)
-```
-
-The plan layer remains explicit and must match the active `ModelExecutionSpec`:
-
-```python
-plan = spec.create_plan(global_local_pipeline=global_local_pipeline)
-model = ExecutorModel(spec=spec, plan=plan)
 ```
 
 ## ExecutorModel
