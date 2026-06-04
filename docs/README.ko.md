@@ -220,13 +220,13 @@ enn_torch/
   data/       # memmap staging, dataset, sampler, loader, stream
   nn/         # 모델 구조, layer, block, kernel
   runtime/    # train/predict workflow, worker loop, distributed, export
+notebook.ipynb
+raw_data.xlsx
+README.md
 docs/
   README.ko.md
   README.en.md
   assets/
-notebook.ipynb
-raw_data.xlsx
-README.md
 pyproject.toml
 ```
 
