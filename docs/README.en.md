@@ -1,5 +1,5 @@
 <p align="right">
-  <a href="README.md">Language</a> · <a href="README.ko.md">한국어</a> · <strong>English</strong>
+  <a href="../README.md">Language</a> · <a href="README.ko.md">한국어</a> · <strong>English</strong>
 </p>
 
 # ENN-PyTorch
@@ -25,11 +25,11 @@ This repository includes an end-to-end execution case using traffic-flow predict
 | Artifacts | Prediction result sheets, checkpoint, evaluation metrics |
 
 <p align="center">
-  <img src="docs/assets/notebook_execution.png" alt="Completed Jupyter Notebook execution" width="660">
+  <img src="assets/notebook_execution.png" alt="Completed Jupyter Notebook execution" width="660">
 </p>
 
 <p align="center">
-  <img src="docs/assets/gpu_load.png" alt="GPU runtime and utilization check" width="660">
+  <img src="assets/gpu_load.png" alt="GPU runtime and utilization check" width="660">
 </p>
 
 ---
@@ -39,7 +39,7 @@ This repository includes an end-to-end execution case using traffic-flow predict
 The result below is from a workflow validation case using traffic-flow prediction data. The goal is not to present prediction accuracy as the main achievement, but to verify that input data can pass through the training and inference runtime and produce output artifacts.
 
 <p align="center">
-  <img src="docs/assets/result_timeseries.svg" alt="Measured versus predicted values by time" width="660">
+  <img src="assets/result_timeseries.svg" alt="Measured versus predicted values by time" width="660">
 </p>
 
 <details>
@@ -223,7 +223,10 @@ enn_torch/
 notebook.ipynb
 raw_data.xlsx
 README.md
-README.en.md
+docs/
+  README.ko.md
+  README.en.md
+  assets/
 pyproject.toml
 ```
 

@@ -10,9 +10,9 @@
 </p>
 
 <p align="center">
-  <a href="README.ko.md"><strong>한국어</strong></a>
+  <a href="docs/README.ko.md"><strong>한국어</strong></a>
   &nbsp;·&nbsp;
-  <a href="README.en.md"><strong>English</strong></a>
+  <a href="docs/README.en.md"><strong>English</strong></a>
 </p>
 
 ---
@@ -21,8 +21,8 @@
 
 | Language | README |
 |---|---|
-| 한국어 | [README.ko.md](README.ko.md) |
-| English | [README.en.md](README.en.md) |
+| 한국어 | [docs/README.ko.md](docs/README.ko.md) |
+| English | [docs/README.en.md](docs/README.en.md) |
 
 ---
 
