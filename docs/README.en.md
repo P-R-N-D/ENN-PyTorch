@@ -236,7 +236,7 @@ pyproject.toml
 
 Detailed architecture documentation is available separately.
 
-- [ENN-PyTorch Technical Documentation](https://prnd-kimjeseok.notion.site/ENN-PyTorch-367602ff0db180a182a1f517f292f0ab)
+- [ENN-PyTorch Technical Documentation (Korean)](https://prnd-kimjeseok.notion.site/ENN-PyTorch-367602ff0db180a182a1f517f292f0ab)
 
 The documentation covers the project overview, overall architecture, model structure, kernel and precision execution strategy, data pipeline, training and inference runtime, model saving and export, and operational debugging guide.
 
