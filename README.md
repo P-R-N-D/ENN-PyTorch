@@ -1,6 +1,11 @@
 <p align="right">
-  <strong>한국어</strong> · <a href="README.en.md">English</a>
+  <strong><a href="README.ko.md">한국어</a></strong> · <a href="README.en.md">English</a>
 </p>
+
+<!--
+GitHub은 README 렌더링에서 Markdown include directive를 지원하지 않습니다.
+따라서 README.md는 기본 진입점으로 README.ko.md 내용을 미러링합니다.
+-->
 
 # ENN-PyTorch
 
@@ -223,6 +228,7 @@ enn_torch/
 notebook.ipynb
 raw_data.xlsx
 README.md
+README.ko.md
 README.en.md
 pyproject.toml
 ```
