@@ -6,7 +6,7 @@
 </p>
 
 <p align="center">
-  README language / README 언어를 선택하세요.
+  언어를 선택하세요.<br>Select language.
 </p>
 
 <p align="center">
