@@ -582,6 +582,49 @@ does not synthesize nested execution. The supplied or factory-created
 tile/global-local behavior must already be represented inside that stream
 pipeline.
 
+## Future torch.nn.Module Model wrapper
+
+A future public `Model(...)` wrapper should sit above `ExecutorModel`. It can
+be a trainable `torch.nn.Module`, but it should preserve the executor boundary
+instead of absorbing graph and pipeline construction.
+
+```text
+Model
+  torch.nn.Module-facing API
+  owns public forward(...) shape
+
+ModelExecutionSpec
+  validates context / tile / stateful intent
+
+ExecutorModel
+  runs a validated ExecutorPlan through ExecutorRunner
+```
+
+The wrapper may:
+
+```text
+hold ModelExecutionSpec / ExecutorModel
+normalize forward(...) inputs into a KVStore or caller-provided store
+call executor_model.run(...)
+require chunks for stateful/stream execution
+expose one public entry point for plain, tile, global-local, and stateful modes
+```
+
+The wrapper should not:
+
+```text
+auto-build GraphExecutor branches
+auto-build global/local branch modules or fusion
+infer StateRoute values
+chunk streams automatically
+own training loops, optimizers, or schedulers
+```
+
+Graph, branch, fusion, state-route, and chunking automation should remain in a
+separate builder layer. That keeps `Model(...)` as the PyTorch-facing wrapper
+and keeps executor composition testable through `ModelExecutionSpec`,
+`ExecutorPlan`, and `ExecutorModel`.
+
 ## Global/local fusion
 
 `GlobalLocalPipeline` is a separate orchestration layer for combining a global branch and a local/tiled branch.
