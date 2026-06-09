@@ -582,11 +582,11 @@ does not synthesize nested execution. The supplied or factory-created
 tile/global-local behavior must already be represented inside that stream
 pipeline.
 
-## Future torch.nn.Module Model wrapper
+## torch.nn.Module Model wrapper
 
-A future public `Model(...)` wrapper should sit above `ExecutorModel`. It can
-be a trainable `torch.nn.Module`, but it should preserve the executor boundary
-instead of absorbing graph and pipeline construction.
+The public `Model(...)` wrapper sits above `ExecutorModel`. It is a
+`torch.nn.Module`, but it preserves the executor boundary instead of absorbing
+graph and pipeline construction.
 
 ```text
 Model
@@ -620,9 +620,23 @@ chunk streams automatically
 own training loops, optimizers, or schedulers
 ```
 
-Graph, branch, fusion, state-route, and chunking automation should remain in a
-separate builder layer. That keeps `Model(...)` as the PyTorch-facing wrapper
-and keeps executor composition testable through `ModelExecutionSpec`,
+`Model.forward(...)` delegates to `ExecutorModel.run(...)`.
+
+```python
+model = Model.from_components(spec, graph=graph)
+out = model(store)
+```
+
+For stream execution, chunks remain explicit:
+
+```python
+model = Model.from_components(spec, stream_pipeline=stream_pipeline)
+outputs = model(store, chunks=chunks)
+```
+
+Graph, branch, fusion, state-route, and chunking automation remain in a
+separate future builder layer. That keeps `Model(...)` as the PyTorch-facing
+wrapper and keeps executor composition testable through `ModelExecutionSpec`,
 `ExecutorPlan`, and `ExecutorModel`.
 
 ## Global/local fusion
@@ -688,6 +702,10 @@ ExecutorRunner
 ExecutorModel
   binds ModelExecutionSpec, ExecutorPlan, and ExecutorRunner
 
+Model
+  thin torch.nn.Module wrapper around ExecutorModel
+  delegates forward(...) to ExecutorModel.run(...)
+
 GraphExecutor
   dependency-ordered node execution
 
@@ -724,13 +742,12 @@ state route inference / detach intervals
 truncated BPTT scheduler
 multi-output stream collection
 automatic graph / branch / fusion builder
-torch.nn.Module public Model(...) wrapper
 ```
 
 ## Recommended next layer
 
-After this terminology is stable, a higher-level model API can be implemented
-using the public naming above and the validated executor plan.
+After the thin `Model(...)` wrapper, the next higher-level layer can add
+optional builders using the public naming above and the validated executor plan.
 
 ```text
 public Model parameters
@@ -739,6 +756,7 @@ public Model parameters
   -> ExecutorModeSpec
   -> ExecutorPlan
   -> ModelExecutionSpec factory helpers for caller-provided components
+  -> Model
   -> ExecutorModel
   -> ExecutorRunner
   -> concrete GraphExecutor / TilePipeline / StreamPipeline / GlobalLocalPipeline

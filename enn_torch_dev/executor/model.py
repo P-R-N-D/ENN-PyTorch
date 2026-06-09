@@ -1,8 +1,10 @@
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
 from typing import Any
+
+from torch import nn
 
 from .global_local import GlobalLocalPipeline
 from .graph import GraphExecutor
@@ -12,6 +14,37 @@ from .runner import ExecutorRunner
 from .store import KVStore
 from .stream import StreamPipeline
 from .tile_pipeline import TilePipeline
+
+
+def _iter_plan_modules(plan: ExecutorPlan) -> Iterable[tuple[str, nn.Module]]:
+    """Yield unique ``nn.Module`` instances owned by an executor plan."""
+
+    seen: set[int] = set()
+
+    def yield_once(
+        label: str, module: nn.Module | None
+    ) -> Iterable[tuple[str, nn.Module]]:
+        if module is None:
+            return
+        module_id = id(module)
+        if module_id in seen:
+            return
+        seen.add(module_id)
+        yield label, module
+
+    yield from yield_once("graph", plan.graph)
+
+    if plan.tile_pipeline is not None:
+        yield from yield_once("tile_graph", plan.tile_pipeline.graph)
+
+    if plan.stream_pipeline is not None:
+        yield from yield_once("stream_graph", plan.stream_pipeline.graph)
+
+    if plan.global_local_pipeline is not None:
+        pipeline = plan.global_local_pipeline
+        yield from yield_once("global_graph", pipeline.global_graph)
+        yield from yield_once("global_local_tile_graph", pipeline.tile_pipeline.graph)
+        yield from yield_once("global_local_fusion", pipeline.fusion)
 
 
 @dataclass(slots=True)
@@ -75,3 +108,57 @@ class ExecutorModel:
         chunks: Sequence[Any] | None = None,
     ) -> Any:
         return self.runner.run(store, chunks=chunks)
+
+
+class Model(nn.Module):
+    """
+    Thin public ``torch.nn.Module`` adapter around ``ExecutorModel``.
+
+    ``Model`` owns the PyTorch-facing ``forward(...)`` entry point and delegates
+    execution to an already-wired ``ExecutorModel``. It does not build graphs,
+    create pipelines, infer state routes, chunk streams, or own training policy.
+    """
+
+    def __init__(self, executor_model: ExecutorModel) -> None:
+        super().__init__()
+        if not isinstance(executor_model, ExecutorModel):
+            raise TypeError(
+                f"Model.executor_model must be ExecutorModel, got {type(executor_model)!r}"
+            )
+        self.executor_model = executor_model
+        self._executor_modules = nn.ModuleDict(_iter_plan_modules(executor_model.plan))
+
+    @classmethod
+    def from_components(
+        cls,
+        spec: ModelExecutionSpec,
+        *,
+        graph: GraphExecutor | None = None,
+        tile_pipeline: TilePipeline | None = None,
+        stream_pipeline: StreamPipeline | None = None,
+        global_local_pipeline: GlobalLocalPipeline | None = None,
+    ) -> "Model":
+        executor_model = ExecutorModel.from_components(
+            spec,
+            graph=graph,
+            tile_pipeline=tile_pipeline,
+            stream_pipeline=stream_pipeline,
+            global_local_pipeline=global_local_pipeline,
+        )
+        return cls(executor_model)
+
+    @property
+    def spec(self) -> ModelExecutionSpec:
+        return self.executor_model.spec
+
+    @property
+    def plan(self) -> ExecutorPlan:
+        return self.executor_model.plan
+
+    def forward(
+        self,
+        store: KVStore,
+        *,
+        chunks: Sequence[Any] | None = None,
+    ) -> Any:
+        return self.executor_model.run(store, chunks=chunks)
