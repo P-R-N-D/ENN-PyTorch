@@ -4,6 +4,8 @@ from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
+from torch import nn
+
 from .global_local import GlobalLocalPipeline
 from .graph import GraphExecutor
 from .model_spec import ModelExecutionSpec
@@ -75,3 +77,56 @@ class ExecutorModel:
         chunks: Sequence[Any] | None = None,
     ) -> Any:
         return self.runner.run(store, chunks=chunks)
+
+
+class Model(nn.Module):
+    """
+    Thin public ``torch.nn.Module`` adapter around ``ExecutorModel``.
+
+    ``Model`` owns the PyTorch-facing ``forward(...)`` entry point and delegates
+    execution to an already-wired ``ExecutorModel``. It does not build graphs,
+    create pipelines, infer state routes, chunk streams, or own training policy.
+    """
+
+    def __init__(self, executor_model: ExecutorModel) -> None:
+        super().__init__()
+        if not isinstance(executor_model, ExecutorModel):
+            raise TypeError(
+                f"Model.executor_model must be ExecutorModel, got {type(executor_model)!r}"
+            )
+        self.executor_model = executor_model
+
+    @classmethod
+    def from_components(
+        cls,
+        spec: ModelExecutionSpec,
+        *,
+        graph: GraphExecutor | None = None,
+        tile_pipeline: TilePipeline | None = None,
+        stream_pipeline: StreamPipeline | None = None,
+        global_local_pipeline: GlobalLocalPipeline | None = None,
+    ) -> "Model":
+        executor_model = ExecutorModel.from_components(
+            spec,
+            graph=graph,
+            tile_pipeline=tile_pipeline,
+            stream_pipeline=stream_pipeline,
+            global_local_pipeline=global_local_pipeline,
+        )
+        return cls(executor_model)
+
+    @property
+    def spec(self) -> ModelExecutionSpec:
+        return self.executor_model.spec
+
+    @property
+    def plan(self) -> ExecutorPlan:
+        return self.executor_model.plan
+
+    def forward(
+        self,
+        store: KVStore,
+        *,
+        chunks: Sequence[Any] | None = None,
+    ) -> Any:
+        return self.executor_model.run(store, chunks=chunks)

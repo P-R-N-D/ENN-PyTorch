@@ -4,7 +4,7 @@ from .graph import GraphExecutor
 from .global_local import GlobalLocalPipeline, GlobalLocalPipelineSpec
 from .modes import ExecutorModeSpec
 from .model_spec import ModelExecutionSpec
-from .model import ExecutorModel
+from .model import ExecutorModel, Model
 from .node import NodeExecutor, NodeSpec
 from .plan import ExecutorPlan
 from .runner import ExecutorRunner
@@ -28,6 +28,7 @@ __all__ = [
     "ExecutorRunner",
     "ModelExecutionSpec",
     "ExecutorModel",
+    "Model",
     "KeyRef",
     "KVStore",
     "NodeExecutor",
