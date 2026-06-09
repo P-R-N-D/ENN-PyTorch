@@ -40,6 +40,15 @@ class _AddBias(nn.Module):
         return x + bias
 
 
+class _ParamScale(nn.Module):
+    def __init__(self, value: float = 2.0) -> None:
+        super().__init__()
+        self.weight = nn.Parameter(torch.tensor(value))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x * self.weight
+
+
 def _make_graph(
     *,
     input_key: str = "x",
@@ -119,7 +128,7 @@ def _make_global_local_pipeline() -> GlobalLocalPipeline:
     return GlobalLocalPipeline(
         global_graph=global_graph,
         tile_pipeline=tile_pipeline,
-        fusion=LocalGlobalFusion(init_logit=0.0, learnable=False),
+        fusion=LocalGlobalFusion(init_logit=0.0),
         spec=GlobalLocalPipelineSpec(
             global_output_name="global",
             fused_output_key="fused.out",
@@ -188,7 +197,9 @@ def test_executor_model_from_components_runs_global_local_pipeline() -> None:
     assert torch.equal(store.get("fused.out"), result)
 
 
-def test_executor_model_from_components_runs_stateful_global_local_as_stream_outer() -> None:
+def test_executor_model_from_components_runs_stateful_global_local_as_stream_outer() -> (
+    None
+):
     model = ExecutorModel.from_components(
         ModelExecutionSpec(
             context="global_local",
@@ -435,7 +446,7 @@ def test_executor_model_global_local_factory_flow_end_to_end() -> None:
     global_local_pipeline = spec.create_global_local_pipeline(
         global_graph=global_graph,
         tile_pipeline=tile_pipeline,
-        fusion=LocalGlobalFusion(init_logit=0.0, learnable=False),
+        fusion=LocalGlobalFusion(init_logit=0.0),
         global_output_name="global",
         fused_output_key="fused.out",
     )
@@ -505,6 +516,52 @@ def test_model_wraps_executor_model_as_torch_module() -> None:
     assert model.plan is executor_model.plan
     assert result is store
     assert torch.equal(store.get("out"), torch.tensor([2.0]))
+
+
+def test_model_registers_executor_graph_modules() -> None:
+    module = _ParamScale()
+    graph = _make_graph(module=module)
+    model = Model.from_components(ModelExecutionSpec(), graph=graph)
+
+    assert list(model.parameters()) == [module.weight]
+    assert any(key.endswith("modules_by_key.node.weight") for key in model.state_dict())
+
+    model.eval()
+    assert not graph.training
+    assert not module.training
+
+    model.to(dtype=torch.float64)
+    assert module.weight.dtype == torch.float64
+
+    store = KVStore({"x": torch.tensor([3.0], dtype=torch.float64)})
+    result = model(store)
+
+    assert result is store
+    assert torch.equal(store.get("out"), torch.tensor([6.0], dtype=torch.float64))
+
+
+def test_model_registers_global_local_graphs_and_fusion() -> None:
+    pipeline = _make_global_local_pipeline()
+    model = Model.from_components(
+        ModelExecutionSpec(context="global_local", tile=True, tile_shape=(2,)),
+        global_local_pipeline=pipeline,
+    )
+
+    state_keys = model.state_dict().keys()
+    module_names = dict(model.named_modules())
+
+    assert pipeline.fusion.logit in list(model.parameters())
+    assert any(key.endswith("global_local_fusion.logit") for key in state_keys)
+    assert "_executor_modules.global_graph" in module_names
+    assert "_executor_modules.global_local_tile_graph" in module_names
+
+    model.eval()
+    assert not pipeline.global_graph.training
+    assert not pipeline.tile_pipeline.graph.training
+    assert not pipeline.fusion.training
+
+    model.to(dtype=torch.float64)
+    assert pipeline.fusion.logit.dtype == torch.float64
 
 
 def test_model_rejects_invalid_executor_model() -> None:

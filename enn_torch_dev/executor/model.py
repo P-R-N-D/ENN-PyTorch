@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -14,6 +14,37 @@ from .runner import ExecutorRunner
 from .store import KVStore
 from .stream import StreamPipeline
 from .tile_pipeline import TilePipeline
+
+
+def _iter_plan_modules(plan: ExecutorPlan) -> Iterable[tuple[str, nn.Module]]:
+    """Yield unique ``nn.Module`` instances owned by an executor plan."""
+
+    seen: set[int] = set()
+
+    def yield_once(
+        label: str, module: nn.Module | None
+    ) -> Iterable[tuple[str, nn.Module]]:
+        if module is None:
+            return
+        module_id = id(module)
+        if module_id in seen:
+            return
+        seen.add(module_id)
+        yield label, module
+
+    yield from yield_once("graph", plan.graph)
+
+    if plan.tile_pipeline is not None:
+        yield from yield_once("tile_graph", plan.tile_pipeline.graph)
+
+    if plan.stream_pipeline is not None:
+        yield from yield_once("stream_graph", plan.stream_pipeline.graph)
+
+    if plan.global_local_pipeline is not None:
+        pipeline = plan.global_local_pipeline
+        yield from yield_once("global_graph", pipeline.global_graph)
+        yield from yield_once("global_local_tile_graph", pipeline.tile_pipeline.graph)
+        yield from yield_once("global_local_fusion", pipeline.fusion)
 
 
 @dataclass(slots=True)
@@ -95,6 +126,7 @@ class Model(nn.Module):
                 f"Model.executor_model must be ExecutorModel, got {type(executor_model)!r}"
             )
         self.executor_model = executor_model
+        self._executor_modules = nn.ModuleDict(_iter_plan_modules(executor_model.plan))
 
     @classmethod
     def from_components(
