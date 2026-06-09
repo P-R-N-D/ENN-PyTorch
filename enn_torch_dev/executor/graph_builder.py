@@ -29,15 +29,16 @@ def _normalize_ref_sequence(
         return []
     if isinstance(value, (str, bytes, bytearray)):
         raise TypeError(f"{label} must be a sequence of strings/KeyRefs, not a string.")
-
-    try:
-        refs = list(value)
-    except TypeError as exc:
-        raise TypeError(f"{label} must be a sequence of strings/KeyRefs.") from exc
+    if isinstance(value, Mapping):
+        raise TypeError(
+            f"{label} must be a sequence of strings/KeyRefs, not a mapping."
+        )
+    if not isinstance(value, Sequence):
+        raise TypeError(f"{label} must be a sequence of strings/KeyRefs.")
 
     return [
         _normalize_ref(ref, f"{label}[{index}]")
-        for index, ref in enumerate(refs)
+        for index, ref in enumerate(value)
     ]
 
 

@@ -119,6 +119,26 @@ def test_graph_builder_rejects_string_input_args() -> None:
         )
 
 
+def test_graph_builder_rejects_mapping_input_args() -> None:
+    with pytest.raises(TypeError, match="input_args"):
+        GraphBuilder().add(
+            name="bad",
+            module=nn.Identity(),
+            input_args={"x": "store_key"},  # type: ignore[arg-type]
+            output_key="y",
+        )
+
+
+def test_graph_builder_rejects_non_sequence_iterable_input_args() -> None:
+    with pytest.raises(TypeError, match="input_args"):
+        GraphBuilder().add(
+            name="bad",
+            module=nn.Identity(),
+            input_args=iter(["x"]),  # type: ignore[arg-type]
+            output_key="y",
+        )
+
+
 def test_graph_builder_rejects_non_mapping_input_kwargs() -> None:
     with pytest.raises(TypeError, match="input_kwargs"):
         GraphBuilder().add(
