@@ -634,10 +634,62 @@ model = Model.from_components(spec, stream_pipeline=stream_pipeline)
 outputs = model(store, chunks=chunks)
 ```
 
-Graph, branch, fusion, state-route, and chunking automation remain in a
+Branch, fusion, state-route, pipeline, and chunking automation remain in a
 separate future builder layer. That keeps `Model(...)` as the PyTorch-facing
 wrapper and keeps executor composition testable through `ModelExecutionSpec`,
 `ExecutorPlan`, and `ExecutorModel`.
+
+## GraphBuilder
+
+`GraphBuilder` is a thin convenience layer for constructing leaf-node
+`GraphExecutor` instances. It builds graphs, not executor plans, pipelines, or
+models.
+
+```text
+nn.Module + input/output key metadata
+  -> NodeSpec / KeyRef
+  -> GraphExecutor
+```
+
+The builder may:
+
+```text
+convert string input keys to KeyRef
+preserve explicit KeyRef optional/default policies
+create NodeSpec objects for caller-provided nn.Module nodes
+return a validated GraphExecutor
+```
+
+The builder should not:
+
+```text
+create tile/global-local/stream pipelines
+create ModelExecutionSpec / ExecutorPlan / ExecutorModel / Model
+infer StateRoute values
+create fusion modules
+own training loops, optimizers, or schedulers
+```
+
+Example:
+
+```python
+builder = GraphBuilder()
+
+builder.add(
+    name="encode",
+    module=encoder,
+    input_args=["x"],
+    output_key="encoded",
+)
+builder.add(
+    name="head",
+    module=head,
+    input_args=["encoded"],
+    output_key="logits",
+)
+
+graph = builder.build()
+```
 
 ## Global/local fusion
 
@@ -706,6 +758,10 @@ Model
   thin torch.nn.Module wrapper around ExecutorModel
   delegates forward(...) to ExecutorModel.run(...)
 
+GraphBuilder
+  convenience layer for building GraphExecutor leaf-node graphs
+  from nn.Module + key metadata
+
 GraphExecutor
   dependency-ordered node execution
 
@@ -741,17 +797,19 @@ batch-level reset masks
 state route inference / detach intervals
 truncated BPTT scheduler
 multi-output stream collection
-automatic graph / branch / fusion builder
+automatic branch / fusion / full model builder
 ```
 
 ## Recommended next layer
 
-After the thin `Model(...)` wrapper, the next higher-level layer can add
-optional builders using the public naming above and the validated executor plan.
+After `GraphBuilder`, the next higher-level layer can add optional branch,
+pipeline, and full-model builders using the public naming above and the
+validated executor plan.
 
 ```text
 public Model parameters
   -> context / tile / stateful
+  -> GraphBuilder for caller-provided modules
   -> ModelExecutionSpec
   -> ExecutorModeSpec
   -> ExecutorPlan

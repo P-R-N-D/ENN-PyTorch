@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from .graph import GraphExecutor
+from .graph_builder import GraphBuilder
 from .global_local import GlobalLocalPipeline, GlobalLocalPipelineSpec
 from .modes import ExecutorModeSpec
 from .model_spec import ModelExecutionSpec
@@ -21,6 +22,7 @@ from .tile_reconstruct import TileReconstructSpec, TileReconstructor
 __all__ = [
     "GraphValue",
     "GraphExecutor",
+    "GraphBuilder",
     "GlobalLocalPipeline",
     "GlobalLocalPipelineSpec",
     "ExecutorModeSpec",
