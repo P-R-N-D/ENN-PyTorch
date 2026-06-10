@@ -203,6 +203,87 @@ def test_model_builder_build_tile_registers_graph_parameters() -> None:
     )
 
 
+def test_model_builder_build_stream_runs_stateful_model() -> None:
+    model = (
+        ModelBuilder()
+        .add(
+            name="step",
+            module=_Double(),
+            input_args=["chunk.x"],
+            output_key="chunk.out",
+        )
+        .build_stream(
+            chunk_input_key="chunk.x",
+            output_name="step",
+            outputs_key="stream.outputs",
+        )
+    )
+    store = KVStore()
+
+    outputs = model(
+        store,
+        chunks=[torch.tensor([1.0]), torch.tensor([2.0])],
+    )
+
+    assert model.plan.mode == ExecutorModeSpec(stream=True)
+    assert model.spec.stateful is True
+    assert [out.item() for out in outputs] == [2.0, 4.0]
+    assert store.get("stream.outputs") is outputs
+
+
+def test_model_builder_build_stream_preserves_stream_spec_settings() -> None:
+    model = (
+        ModelBuilder()
+        .add(
+            name="step",
+            module=_Double(),
+            input_args=["chunk.x"],
+            output_key="chunk.out",
+        )
+        .build_stream(
+            chunk_input_key="chunk.x",
+            output_name="step",
+            output_by="key",
+            chunk_index_key="chunk.index",
+            outputs_key="stream.outputs",
+            state_detach=True,
+            state_clone=True,
+            reset_state=True,
+        )
+    )
+
+    assert model.plan.stream_pipeline is not None
+    stream_spec = model.plan.stream_pipeline.spec
+    assert stream_spec.chunk_input_key == "chunk.x"
+    assert stream_spec.output_name == "step"
+    assert stream_spec.output_by == "key"
+    assert stream_spec.chunk_index_key == "chunk.index"
+    assert stream_spec.outputs_key == "stream.outputs"
+    assert stream_spec.state_detach is True
+    assert stream_spec.state_clone is True
+    assert stream_spec.reset_state is True
+
+
+def test_model_builder_build_stream_registers_graph_parameters() -> None:
+    module = _ParamScale()
+    model = (
+        ModelBuilder()
+        .add(
+            name="scale",
+            module=module,
+            input_args=["chunk.x"],
+            output_key="chunk.out",
+        )
+        .build_stream(chunk_input_key="chunk.x", output_name="scale")
+    )
+
+    assert list(model.parameters()) == [module.weight]
+    assert any(
+        key.endswith("modules_by_key.scale.weight")
+        for key in model.state_dict()
+    )
+
+
 def test_model_builder_rejects_invalid_graph_builder() -> None:
     with pytest.raises(TypeError, match="GraphBuilder"):
         ModelBuilder(graph_builder=object())  # type: ignore[arg-type]
@@ -237,4 +318,32 @@ def test_model_builder_build_tile_delegates_graph_validation() -> None:
             input_key="x",
             tile_input_key="tile.x",
             output_name="node",
+        )
+
+
+def test_model_builder_build_stream_delegates_graph_validation() -> None:
+    builder = ModelBuilder()
+    builder.add(name="node", module=nn.Identity(), output_key="x")
+    builder.add(name="node", module=nn.Identity(), output_key="y")
+
+    with pytest.raises(ValueError, match="Duplicate node name"):
+        builder.build_stream(
+            chunk_input_key="chunk.x",
+            output_name="node",
+        )
+
+
+def test_model_builder_build_stream_delegates_graph_executor_output_validation() -> None:
+    builder = ModelBuilder()
+    builder.add(
+        name="node",
+        module=nn.Identity(),
+        input_args=["chunk.x"],
+        output_key="x",
+    )
+
+    with pytest.raises(KeyError, match="missing"):
+        builder.build_stream(
+            chunk_input_key="chunk.x",
+            output_name="missing",
         )

@@ -7,6 +7,7 @@ from torch import nn
 from .graph_builder import GraphBuilder, KeyRefLike
 from .model import Model
 from .model_spec import ModelExecutionSpec
+from .state import StateRoute
 
 
 class ModelBuilder:
@@ -14,8 +15,8 @@ class ModelBuilder:
     Plain graph convenience builder for public ``Model`` objects.
 
     ``ModelBuilder`` starts from a ``GraphBuilder`` and can assemble the
-    local/plain path or an explicit tiled path. It does not build stream,
-    global/local, fusion, or state-route components.
+    local/plain path, an explicit tiled path, or an explicit stream path. It
+    does not build global/local, fusion, or infer state-route components.
     """
 
     def __init__(self, *, graph_builder: GraphBuilder | None = None) -> None:
@@ -84,3 +85,33 @@ class ModelBuilder:
             tile_meta_key=tile_meta_key,
         )
         return Model.from_components(spec, tile_pipeline=tile_pipeline)
+
+    def build_stream(
+        self,
+        *,
+        chunk_input_key: str,
+        output_name: str,
+        output_by: str = "node",
+        chunk_index_key: str | None = None,
+        outputs_key: str | None = None,
+        state_detach: bool = False,
+        state_clone: bool = False,
+        reset_state: bool = False,
+        state_routes: Sequence[StateRoute] = (),
+        validate: bool = True,
+    ) -> Model:
+        graph = self.graph_builder.build(validate=validate)
+        spec = ModelExecutionSpec(stateful=True)
+        stream_pipeline = spec.create_stream_pipeline(
+            graph,
+            chunk_input_key=chunk_input_key,
+            output_name=output_name,
+            output_by=output_by,
+            chunk_index_key=chunk_index_key,
+            outputs_key=outputs_key,
+            state_detach=state_detach,
+            state_clone=state_clone,
+            reset_state=reset_state,
+            state_routes=state_routes,
+        )
+        return Model.from_components(spec, stream_pipeline=stream_pipeline)
