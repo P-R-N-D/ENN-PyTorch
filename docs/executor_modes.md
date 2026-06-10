@@ -762,6 +762,10 @@ GraphBuilder
   convenience layer for building GraphExecutor leaf-node graphs
   from nn.Module + key metadata
 
+ModelBuilder
+  plain GraphBuilder -> Model convenience layer
+  does not build tile / stream / global-local pipelines
+
 GraphExecutor
   dependency-ordered node execution
 
@@ -797,7 +801,8 @@ batch-level reset masks
 state route inference / detach intervals
 truncated BPTT scheduler
 multi-output stream collection
-automatic branch / fusion / full model builder
+automatic branch / fusion builder
+tile / stream / global-local ModelBuilder modes
 ```
 
 ## Future builder layer
@@ -825,25 +830,24 @@ ModelBuilder
   -> Model
 ```
 
-`GraphBuilder` is the only builder currently implemented. It should stay
-focused on `GraphExecutor` construction and should not create pipelines, plans,
-or models.
+`GraphBuilder` builds `GraphExecutor` objects and should stay focused on graph
+construction. It should not create pipelines, plans, or models.
 
 A future `BranchBuilder` may make repeated branch wiring less verbose, but it
 should still use caller-provided modules or graphs. It should not invent model
 architecture, create fusion modules implicitly, infer `StateRoute` values, or
 chunk streams automatically.
 
-A future `ModelBuilder` can be a final convenience layer that assembles
-already-built graph/branch/pipeline components into `Model`. It should still
-delegate validation to `ModelExecutionSpec`, `ExecutorPlan`, and the executor
-pipeline specs.
+`ModelBuilder` currently provides only the plain graph convenience path. Future
+extensions may assemble already-built graph/branch/pipeline components into
+`Model`. They should still delegate validation to `ModelExecutionSpec`,
+`ExecutorPlan`, and the executor pipeline specs.
 
 ## Recommended next layer
 
-After `GraphBuilder`, the next higher-level layer can add optional
-`BranchBuilder` and `ModelBuilder` helpers using the public naming above and
-the validated executor plan.
+After the plain `ModelBuilder`, the next higher-level layer can add optional
+`BranchBuilder` helpers and additional `ModelBuilder` modes using the public
+naming above and the validated executor plan.
 
 ```text
 public Model parameters
@@ -854,7 +858,7 @@ public Model parameters
   -> ExecutorModeSpec
   -> ExecutorPlan
   -> ModelExecutionSpec factory helpers for caller-provided components
-  -> optional ModelBuilder convenience assembly
+  -> ModelBuilder convenience assembly
   -> Model
   -> ExecutorModel
   -> ExecutorRunner
