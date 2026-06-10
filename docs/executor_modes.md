@@ -655,6 +655,47 @@ model = (
 outputs = model(store, chunks=chunks)
 ```
 
+A future global-local `ModelBuilder` path should keep branch ownership explicit.
+The builder's internal `GraphBuilder` should produce the local/tiled graph, while
+the caller still supplies the global graph and fusion module:
+
+```python
+model = (
+    ModelBuilder()
+    .add(
+        name="local",
+        module=local_module,
+        input_args=["tile.x"],
+        output_key="local.out",
+    )
+    .build_global_local(
+        global_graph=global_graph,
+        fusion=fusion,
+        tile_shape=(2,),
+        input_key="x",
+        tile_input_key="tile.x",
+        local_output_name="local",
+        global_output_name="global",
+        fused_output_key="fused.out",
+    )
+)
+```
+
+That future helper should only assemble already-built components:
+
+```text
+local GraphBuilder -> local GraphExecutor
+caller-provided global_graph
+caller-provided fusion
+ModelExecutionSpec(context="global_local", tile=True, ...)
+  -> TilePipeline
+  -> GlobalLocalPipeline
+  -> Model
+```
+
+It should not create the global graph, create the fusion module, infer branch
+structure, or choose global/local tensor keys implicitly.
+
 Branch, fusion, state-route, pipeline, and chunking automation remain in a
 separate future builder layer. That keeps `Model(...)` as the PyTorch-facing
 wrapper and keeps executor composition testable through `ModelExecutionSpec`,
@@ -823,7 +864,7 @@ state route inference / detach intervals
 truncated BPTT scheduler
 multi-output stream collection
 automatic branch / fusion builder
-global-local ModelBuilder mode
+global-local ModelBuilder implementation
 ```
 
 ## Future builder layer
@@ -863,6 +904,13 @@ chunk streams automatically.
 stream paths. Future extensions may assemble already-built graph/branch/pipeline
 components into `Model`. They should still delegate validation to
 `ModelExecutionSpec`, `ExecutorPlan`, and the executor pipeline specs.
+
+The intended global-local `ModelBuilder` extension should use the current
+`ModelBuilder` graph as the local/tiled branch only. It should require a
+caller-provided `global_graph` and caller-provided `fusion`, then delegate to the
+existing `ModelExecutionSpec.create_tile_pipeline(...)` and
+`ModelExecutionSpec.create_global_local_pipeline(...)` helpers. This keeps
+global/local branch construction separate from model assembly.
 
 ## Recommended next layer
 
