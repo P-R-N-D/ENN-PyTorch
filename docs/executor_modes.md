@@ -655,9 +655,9 @@ model = (
 outputs = model(store, chunks=chunks)
 ```
 
-A future global-local `ModelBuilder` path should keep branch ownership explicit.
-The builder's internal `GraphBuilder` should produce the local/tiled graph, while
-the caller still supplies the global graph and fusion module:
+The explicit global-local `ModelBuilder` path keeps branch ownership explicit.
+The builder's internal `GraphBuilder` produces the local/tiled graph, while the
+caller still supplies the global graph and fusion module:
 
 ```python
 model = (
@@ -681,7 +681,7 @@ model = (
 )
 ```
 
-That future helper should only assemble already-built components:
+That helper only assembles already-built components:
 
 ```text
 local GraphBuilder -> local GraphExecutor
@@ -825,8 +825,8 @@ GraphBuilder
   from nn.Module + key metadata
 
 ModelBuilder
-  plain / tile / stream GraphBuilder -> Model convenience layer
-  does not build global-local pipelines
+  plain / tile / stream / global-local GraphBuilder -> Model convenience layer
+  does not create global graphs or fusion modules
 
 GraphExecutor
   dependency-ordered node execution
@@ -864,7 +864,6 @@ state route inference / detach intervals
 truncated BPTT scheduler
 multi-output stream collection
 automatic branch / fusion builder
-global-local ModelBuilder implementation
 ```
 
 ## Future builder layer
@@ -900,23 +899,23 @@ should still use caller-provided modules or graphs. It should not invent model
 architecture, create fusion modules implicitly, infer `StateRoute` values, or
 chunk streams automatically.
 
-`ModelBuilder` currently provides the plain graph, explicit tiled, and explicit
-stream paths. Future extensions may assemble already-built graph/branch/pipeline
-components into `Model`. They should still delegate validation to
-`ModelExecutionSpec`, `ExecutorPlan`, and the executor pipeline specs.
+`ModelBuilder` currently provides the plain graph, explicit tiled, explicit
+stream, and explicit global-local paths. Extensions should still delegate
+validation to `ModelExecutionSpec`, `ExecutorPlan`, and the executor pipeline
+specs.
 
-The intended global-local `ModelBuilder` extension should use the current
-`ModelBuilder` graph as the local/tiled branch only. It should require a
-caller-provided `global_graph` and caller-provided `fusion`, then delegate to the
-existing `ModelExecutionSpec.create_tile_pipeline(...)` and
+The global-local `ModelBuilder` path uses the current `ModelBuilder` graph as
+the local/tiled branch only. It requires a caller-provided `global_graph` and
+caller-provided `fusion`, then delegates to the existing
+`ModelExecutionSpec.create_tile_pipeline(...)` and
 `ModelExecutionSpec.create_global_local_pipeline(...)` helpers. This keeps
 global/local branch construction separate from model assembly.
 
 ## Recommended next layer
 
-After the plain/tile/stream `ModelBuilder`, the next higher-level layer can add
-optional `BranchBuilder` helpers and global-local `ModelBuilder` modes using
-the public naming above and the validated executor plan.
+After the plain/tile/stream/global-local `ModelBuilder`, the next higher-level
+layer can add optional `BranchBuilder` helpers using the public naming above and
+the validated executor plan.
 
 ```text
 public Model parameters
