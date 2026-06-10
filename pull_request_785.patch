@@ -1,0 +1,300 @@
+diff --git a/docs/executor_modes.md b/docs/executor_modes.md
+index 331c8a8..edf254b 100644
+--- a/docs/executor_modes.md
++++ b/docs/executor_modes.md
+@@ -762,6 +762,10 @@ GraphBuilder
+   convenience layer for building GraphExecutor leaf-node graphs
+   from nn.Module + key metadata
+ 
++ModelBuilder
++  plain GraphBuilder -> Model convenience layer
++  does not build tile / stream / global-local pipelines
++
+ GraphExecutor
+   dependency-ordered node execution
+ 
+@@ -797,7 +801,8 @@ batch-level reset masks
+ state route inference / detach intervals
+ truncated BPTT scheduler
+ multi-output stream collection
+-automatic branch / fusion / full model builder
++automatic branch / fusion builder
++tile / stream / global-local ModelBuilder modes
+ ```
+ 
+ ## Future builder layer
+@@ -825,25 +830,24 @@ ModelBuilder
+   -> Model
+ ```
+ 
+-`GraphBuilder` is the only builder currently implemented. It should stay
+-focused on `GraphExecutor` construction and should not create pipelines, plans,
+-or models.
++`GraphBuilder` builds `GraphExecutor` objects and should stay focused on graph
++construction. It should not create pipelines, plans, or models.
+ 
+ A future `BranchBuilder` may make repeated branch wiring less verbose, but it
+ should still use caller-provided modules or graphs. It should not invent model
+ architecture, create fusion modules implicitly, infer `StateRoute` values, or
+ chunk streams automatically.
+ 
+-A future `ModelBuilder` can be a final convenience layer that assembles
+-already-built graph/branch/pipeline components into `Model`. It should still
+-delegate validation to `ModelExecutionSpec`, `ExecutorPlan`, and the executor
+-pipeline specs.
++`ModelBuilder` currently provides only the plain graph convenience path. Future
++extensions may assemble already-built graph/branch/pipeline components into
++`Model`. They should still delegate validation to `ModelExecutionSpec`,
++`ExecutorPlan`, and the executor pipeline specs.
+ 
+ ## Recommended next layer
+ 
+-After `GraphBuilder`, the next higher-level layer can add optional
+-`BranchBuilder` and `ModelBuilder` helpers using the public naming above and
+-the validated executor plan.
++After the plain `ModelBuilder`, the next higher-level layer can add optional
++`BranchBuilder` helpers and additional `ModelBuilder` modes using the public
++naming above and the validated executor plan.
+ 
+ ```text
+ public Model parameters
+@@ -854,7 +858,7 @@ public Model parameters
+   -> ExecutorModeSpec
+   -> ExecutorPlan
+   -> ModelExecutionSpec factory helpers for caller-provided components
+-  -> optional ModelBuilder convenience assembly
++  -> ModelBuilder convenience assembly
+   -> Model
+   -> ExecutorModel
+   -> ExecutorRunner
+diff --git a/enn_torch_dev/debug/executor/test_model_builder.py b/enn_torch_dev/debug/executor/test_model_builder.py
+new file mode 100644
+index 0000000..d352009
+--- /dev/null
++++ b/enn_torch_dev/debug/executor/test_model_builder.py
+@@ -0,0 +1,139 @@
++from __future__ import annotations
++
++import pytest
++import torch
++from torch import nn
++
++from enn_torch_dev.executor import (
++    ExecutorModeSpec,
++    GraphBuilder,
++    KVStore,
++    Model,
++    ModelBuilder,
++)
++
++
++class _AddOne(nn.Module):
++    def forward(self, x: torch.Tensor) -> torch.Tensor:
++        return x + 1.0
++
++
++class _AddBias(nn.Module):
++    def forward(self, x: torch.Tensor, bias: torch.Tensor) -> torch.Tensor:
++        return x + bias
++
++
++class _ParamScale(nn.Module):
++    def __init__(self, value: float = 2.0) -> None:
++        super().__init__()
++        self.weight = nn.Parameter(torch.tensor(value))
++
++    def forward(self, x: torch.Tensor) -> torch.Tensor:
++        return x * self.weight
++
++
++def test_model_builder_builds_plain_model_from_modules() -> None:
++    builder = ModelBuilder()
++
++    returned = builder.add(
++        name="encode",
++        module=_AddOne(),
++        input_args=["x"],
++        output_key="encoded",
++    )
++    assert returned is builder
++
++    builder.add(
++        name="head",
++        module=_AddBias(),
++        input_args=["encoded"],
++        input_kwargs={"bias": "bias"},
++        output_key="logits",
++    )
++
++    model = builder.build()
++    store = KVStore(
++        {
++            "x": torch.tensor([1.0]),
++            "bias": torch.tensor([3.0]),
++        }
++    )
++
++    result = model(store)
++
++    assert isinstance(model, Model)
++    assert model.plan.mode == ExecutorModeSpec()
++    assert result is store
++    assert torch.equal(store.get("encoded"), torch.tensor([2.0]))
++    assert torch.equal(store.get("logits"), torch.tensor([5.0]))
++
++
++def test_model_builder_registers_graph_parameters() -> None:
++    module = _ParamScale()
++    model = (
++        ModelBuilder()
++        .add(
++            name="scale",
++            module=module,
++            input_args=["x"],
++            output_key="out",
++        )
++        .build()
++    )
++
++    assert list(model.parameters()) == [module.weight]
++    assert any(
++        key.endswith("modules_by_key.scale.weight")
++        for key in model.state_dict()
++    )
++
++    model.to(dtype=torch.float64)
++    assert module.weight.dtype == torch.float64
++
++    store = KVStore({"x": torch.tensor([3.0], dtype=torch.float64)})
++    result = model(store)
++
++    assert result is store
++    assert torch.equal(store.get("out"), torch.tensor([6.0], dtype=torch.float64))
++
++
++def test_model_builder_accepts_existing_graph_builder() -> None:
++    graph_builder = GraphBuilder()
++    graph_builder.add(
++        name="node",
++        module=_AddOne(),
++        input_args=["x"],
++        output_key="out",
++    )
++
++    builder = ModelBuilder(graph_builder=graph_builder)
++    model = builder.build()
++    store = KVStore({"x": torch.tensor([1.0])})
++
++    model(store)
++
++    assert builder.graph_builder is graph_builder
++    assert torch.equal(store.get("out"), torch.tensor([2.0]))
++
++
++def test_model_builder_rejects_invalid_graph_builder() -> None:
++    with pytest.raises(TypeError, match="GraphBuilder"):
++        ModelBuilder(graph_builder=object())  # type: ignore[arg-type]
++
++
++def test_model_builder_delegates_add_validation() -> None:
++    with pytest.raises(TypeError, match="module must be an nn.Module"):
++        ModelBuilder().add(
++            name="bad",
++            module=object(),  # type: ignore[arg-type]
++            output_key="y",
++        )
++
++
++def test_model_builder_delegates_graph_validation_on_build() -> None:
++    builder = ModelBuilder()
++    builder.add(name="node", module=nn.Identity(), output_key="x")
++    builder.add(name="node", module=nn.Identity(), output_key="y")
++
++    with pytest.raises(ValueError, match="Duplicate node name"):
++        builder.build()
+diff --git a/enn_torch_dev/executor/__init__.py b/enn_torch_dev/executor/__init__.py
+index 431e639..a61696c 100644
+--- a/enn_torch_dev/executor/__init__.py
++++ b/enn_torch_dev/executor/__init__.py
+@@ -6,6 +6,7 @@ from .global_local import GlobalLocalPipeline, GlobalLocalPipelineSpec
+ from .modes import ExecutorModeSpec
+ from .model_spec import ModelExecutionSpec
+ from .model import ExecutorModel, Model
++from .model_builder import ModelBuilder
+ from .node import NodeExecutor, NodeSpec
+ from .plan import ExecutorPlan
+ from .runner import ExecutorRunner
+@@ -31,6 +32,7 @@ __all__ = [
+     "ModelExecutionSpec",
+     "ExecutorModel",
+     "Model",
++    "ModelBuilder",
+     "KeyRef",
+     "KVStore",
+     "NodeExecutor",
+@@ -48,4 +50,4 @@ __all__ = [
+     "TilePipelineSpec",
+     "TileReconstructSpec",
+     "TileReconstructor",
+-]
+\ No newline at end of file
++]
+diff --git a/enn_torch_dev/executor/model_builder.py b/enn_torch_dev/executor/model_builder.py
+new file mode 100644
+index 0000000..0188668
+--- /dev/null
++++ b/enn_torch_dev/executor/model_builder.py
+@@ -0,0 +1,53 @@
++from __future__ import annotations
++
++from collections.abc import Mapping, Sequence
++
++from torch import nn
++
++from .graph_builder import GraphBuilder, KeyRefLike
++from .model import Model
++from .model_spec import ModelExecutionSpec
++
++
++class ModelBuilder:
++    """
++    Plain graph convenience builder for public ``Model`` objects.
++
++    ``ModelBuilder`` v0 is intentionally limited to the local/plain graph path:
++    ``GraphBuilder -> GraphExecutor -> ModelExecutionSpec() -> Model``.
++    It does not build tile, stream, global/local, fusion, or state-route
++    components.
++    """
++
++    def __init__(self, *, graph_builder: GraphBuilder | None = None) -> None:
++        if graph_builder is None:
++            graph_builder = GraphBuilder()
++        if not isinstance(graph_builder, GraphBuilder):
++            raise TypeError("ModelBuilder graph_builder must be GraphBuilder.")
++        self.graph_builder = graph_builder
++
++    def add(
++        self,
++        *,
++        name: str,
++        module: nn.Module,
++        output_key: str,
++        input_args: Sequence[KeyRefLike] | None = None,
++        input_kwargs: Mapping[str, KeyRefLike] | None = None,
++        module_key: str | None = None,
++        output_keys: Sequence[str] | None = None,
++    ) -> "ModelBuilder":
++        self.graph_builder.add(
++            name=name,
++            module=module,
++            input_args=input_args,
++            input_kwargs=input_kwargs,
++            output_key=output_key,
++            module_key=module_key,
++            output_keys=output_keys,
++        )
++        return self
++
++    def build(self, *, validate: bool = True) -> Model:
++        graph = self.graph_builder.build(validate=validate)
++        return Model.from_components(ModelExecutionSpec(), graph=graph)
