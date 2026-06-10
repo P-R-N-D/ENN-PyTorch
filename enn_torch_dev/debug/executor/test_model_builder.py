@@ -23,6 +23,11 @@ class _AddBias(nn.Module):
         return x + bias
 
 
+class _Double(nn.Module):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x * 2.0
+
+
 class _ParamScale(nn.Module):
     def __init__(self, value: float = 2.0) -> None:
         super().__init__()
@@ -116,6 +121,88 @@ def test_model_builder_accepts_existing_graph_builder() -> None:
     assert torch.equal(store.get("out"), torch.tensor([2.0]))
 
 
+def test_model_builder_build_tile_runs_tiled_model() -> None:
+    model = (
+        ModelBuilder()
+        .add(
+            name="local",
+            module=_Double(),
+            input_args=["tile.x"],
+            output_key="local.out",
+        )
+        .build_tile(
+            tile_shape=(2,),
+            input_key="x",
+            tile_input_key="tile.x",
+            output_name="local",
+            output_key="tile.out",
+        )
+    )
+    x = torch.arange(4, dtype=torch.float32)
+    store = KVStore({"x": x})
+
+    result = model(store)
+
+    assert model.plan.mode == ExecutorModeSpec(tile=True)
+    assert model.spec.tile_shape == (2,)
+    assert torch.equal(result, x * 2.0)
+    assert torch.equal(store.get("tile.out"), result)
+
+
+def test_model_builder_build_tile_preserves_tile_policy_settings() -> None:
+    model = (
+        ModelBuilder()
+        .add(
+            name="local",
+            module=_Double(),
+            input_args=["tile.x"],
+            output_key="local.out",
+        )
+        .build_tile(
+            tile_shape=(2,),
+            tile_stride=(1,),
+            tile_dims=(0,),
+            input_key="x",
+            tile_input_key="tile.x",
+            output_name="local",
+        )
+    )
+
+    assert model.spec.tile_shape == (2,)
+    assert model.spec.tile_stride == (1,)
+    assert model.spec.tile_dims == (0,)
+    assert model.plan.tile_pipeline is not None
+    assert model.plan.tile_pipeline.tile_policy.tile_shape == (2,)
+    assert model.plan.tile_pipeline.tile_policy.stride == (1,)
+    assert model.plan.tile_pipeline.tile_policy.dims == (0,)
+
+
+def test_model_builder_build_tile_registers_graph_parameters() -> None:
+    module = _ParamScale()
+    model = (
+        ModelBuilder()
+        .add(
+            name="scale",
+            module=module,
+            input_args=["tile.x"],
+            output_key="tile.out",
+        )
+        .build_tile(
+            tile_shape=(2,),
+            input_key="x",
+            tile_input_key="tile.x",
+            output_name="scale",
+            output_key="model.out",
+        )
+    )
+
+    assert list(model.parameters()) == [module.weight]
+    assert any(
+        key.endswith("modules_by_key.scale.weight")
+        for key in model.state_dict()
+    )
+
+
 def test_model_builder_rejects_invalid_graph_builder() -> None:
     with pytest.raises(TypeError, match="GraphBuilder"):
         ModelBuilder(graph_builder=object())  # type: ignore[arg-type]
@@ -137,3 +224,17 @@ def test_model_builder_delegates_graph_validation_on_build() -> None:
 
     with pytest.raises(ValueError, match="Duplicate node name"):
         builder.build()
+
+
+def test_model_builder_build_tile_delegates_graph_validation() -> None:
+    builder = ModelBuilder()
+    builder.add(name="node", module=nn.Identity(), output_key="x")
+    builder.add(name="node", module=nn.Identity(), output_key="y")
+
+    with pytest.raises(ValueError, match="Duplicate node name"):
+        builder.build_tile(
+            tile_shape=(2,),
+            input_key="x",
+            tile_input_key="tile.x",
+            output_name="node",
+        )

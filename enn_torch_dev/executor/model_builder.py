@@ -13,10 +13,9 @@ class ModelBuilder:
     """
     Plain graph convenience builder for public ``Model`` objects.
 
-    ``ModelBuilder`` v0 is intentionally limited to the local/plain graph path:
-    ``GraphBuilder -> GraphExecutor -> ModelExecutionSpec() -> Model``.
-    It does not build tile, stream, global/local, fusion, or state-route
-    components.
+    ``ModelBuilder`` starts from a ``GraphBuilder`` and can assemble the
+    local/plain path or an explicit tiled path. It does not build stream,
+    global/local, fusion, or state-route components.
     """
 
     def __init__(self, *, graph_builder: GraphBuilder | None = None) -> None:
@@ -51,3 +50,37 @@ class ModelBuilder:
     def build(self, *, validate: bool = True) -> Model:
         graph = self.graph_builder.build(validate=validate)
         return Model.from_components(ModelExecutionSpec(), graph=graph)
+
+    def build_tile(
+        self,
+        *,
+        tile_shape: Sequence[int],
+        input_key: str,
+        tile_input_key: str,
+        output_name: str,
+        output_key: str | None = None,
+        output_by: str = "node",
+        tile_stride: Sequence[int] | None = None,
+        tile_dims: Sequence[int] | None = None,
+        tile_index_key: str | None = None,
+        tile_meta_key: str | None = None,
+        validate: bool = True,
+    ) -> Model:
+        graph = self.graph_builder.build(validate=validate)
+        spec = ModelExecutionSpec(
+            tile=True,
+            tile_shape=tile_shape,
+            tile_stride=tile_stride,
+            tile_dims=tile_dims,
+        )
+        tile_pipeline = spec.create_tile_pipeline(
+            graph,
+            input_key=input_key,
+            tile_input_key=tile_input_key,
+            output_name=output_name,
+            output_key=output_key,
+            output_by=output_by,
+            tile_index_key=tile_index_key,
+            tile_meta_key=tile_meta_key,
+        )
+        return Model.from_components(spec, tile_pipeline=tile_pipeline)
