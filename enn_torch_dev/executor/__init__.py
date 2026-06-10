@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from .branch_builder import BranchBuilder
 from .graph import GraphExecutor
 from .graph_builder import GraphBuilder
 from .global_local import GlobalLocalPipeline, GlobalLocalPipelineSpec
@@ -21,6 +22,7 @@ from .tile_pipeline import TilePipeline, TilePipelineSpec
 from .tile_reconstruct import TileReconstructSpec, TileReconstructor
 
 __all__ = [
+    "BranchBuilder",
     "GraphValue",
     "GraphExecutor",
     "GraphBuilder",

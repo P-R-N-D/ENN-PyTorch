@@ -755,8 +755,8 @@ graph = builder.build()
 
 ## BranchBuilder
 
-`BranchBuilder` is a future convenience layer for repeated branch graph wiring.
-It should build branch-level `GraphExecutor` components, not executor plans,
+`BranchBuilder` is a graph-only convenience layer for repeated branch graph
+wiring. It builds branch-level `GraphExecutor` components, not executor plans,
 pipelines, or public models.
 
 ```text
@@ -910,6 +910,10 @@ GraphBuilder
   convenience layer for building GraphExecutor leaf-node graphs
   from nn.Module + key metadata
 
+BranchBuilder
+  graph-only local / global / stream branch wiring convenience layer
+  returns GraphExecutor components
+
 ModelBuilder
   plain / tile / stream / global-local GraphBuilder -> Model convenience layer
   does not create global graphs or fusion modules
@@ -950,7 +954,6 @@ state route inference / detach intervals
 truncated BPTT scheduler
 multi-output stream collection
 automatic branch / fusion builder
-BranchBuilder implementation
 ```
 
 ## Future builder layer
@@ -981,16 +984,13 @@ ModelBuilder
 `GraphBuilder` builds `GraphExecutor` objects and should stay focused on graph
 construction. It should not create pipelines, plans, or models.
 
-A future `BranchBuilder` may make repeated branch wiring less verbose, but it
-should still use caller-provided modules or graphs. It should not invent model
-architecture, create fusion modules implicitly, infer `StateRoute` values, or
-chunk streams automatically.
-
-The first `BranchBuilder` implementation should stay graph-only. It can wrap
-`GraphBuilder` to encode common branch key conventions, but it should return
-`GraphExecutor` components that are still passed explicitly to `ModelBuilder` or
-`ModelExecutionSpec` factory helpers. That keeps branch graph construction
-separate from pipeline and model assembly.
+`BranchBuilder` makes repeated branch wiring less verbose while staying
+graph-only. It uses caller-provided modules, wraps `GraphBuilder` to encode
+common branch key conventions, and returns `GraphExecutor` components that are
+still passed explicitly to `ModelBuilder` or `ModelExecutionSpec` factory
+helpers. It should not invent model architecture, create fusion modules
+implicitly, infer `StateRoute` values, or chunk streams automatically. This keeps
+branch graph construction separate from pipeline and model assembly.
 
 `ModelBuilder` currently provides the plain graph, explicit tiled, explicit
 stream, and explicit global-local paths. Extensions should still delegate
