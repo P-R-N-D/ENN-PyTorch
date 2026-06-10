@@ -634,6 +634,27 @@ model = Model.from_components(spec, stream_pipeline=stream_pipeline)
 outputs = model(store, chunks=chunks)
 ```
 
+The same explicit stream path can be assembled through `ModelBuilder` when the
+caller provides the per-chunk module and graph key metadata:
+
+```python
+model = (
+    ModelBuilder()
+    .add(
+        name="step",
+        module=step_module,
+        input_args=["chunk.x"],
+        output_key="chunk.out",
+    )
+    .build_stream(
+        chunk_input_key="chunk.x",
+        output_name="step",
+        outputs_key="stream.outputs",
+    )
+)
+outputs = model(store, chunks=chunks)
+```
+
 Branch, fusion, state-route, pipeline, and chunking automation remain in a
 separate future builder layer. That keeps `Model(...)` as the PyTorch-facing
 wrapper and keeps executor composition testable through `ModelExecutionSpec`,
@@ -763,8 +784,8 @@ GraphBuilder
   from nn.Module + key metadata
 
 ModelBuilder
-  plain / tile GraphBuilder -> Model convenience layer
-  does not build stream / global-local pipelines
+  plain / tile / stream GraphBuilder -> Model convenience layer
+  does not build global-local pipelines
 
 GraphExecutor
   dependency-ordered node execution
@@ -802,7 +823,7 @@ state route inference / detach intervals
 truncated BPTT scheduler
 multi-output stream collection
 automatic branch / fusion builder
-stream / global-local ModelBuilder modes
+global-local ModelBuilder mode
 ```
 
 ## Future builder layer
@@ -838,17 +859,16 @@ should still use caller-provided modules or graphs. It should not invent model
 architecture, create fusion modules implicitly, infer `StateRoute` values, or
 chunk streams automatically.
 
-`ModelBuilder` currently provides the plain graph convenience path and an
-explicit tiled path. Future extensions may assemble already-built
-graph/branch/pipeline components into `Model`. They should still delegate
-validation to `ModelExecutionSpec`, `ExecutorPlan`, and the executor pipeline
-specs.
+`ModelBuilder` currently provides the plain graph, explicit tiled, and explicit
+stream paths. Future extensions may assemble already-built graph/branch/pipeline
+components into `Model`. They should still delegate validation to
+`ModelExecutionSpec`, `ExecutorPlan`, and the executor pipeline specs.
 
 ## Recommended next layer
 
-After the plain/tile `ModelBuilder`, the next higher-level layer can add
-optional `BranchBuilder` helpers and additional `ModelBuilder` modes using the
-public naming above and the validated executor plan.
+After the plain/tile/stream `ModelBuilder`, the next higher-level layer can add
+optional `BranchBuilder` helpers and global-local `ModelBuilder` modes using
+the public naming above and the validated executor plan.
 
 ```text
 public Model parameters
