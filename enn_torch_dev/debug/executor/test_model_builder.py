@@ -7,10 +7,12 @@ from torch import nn
 from enn_torch_dev.executor import (
     ExecutorModeSpec,
     GraphBuilder,
+    GraphExecutor,
     KVStore,
     Model,
     ModelBuilder,
 )
+from enn_torch_dev.nn import LocalGlobalFusion
 
 
 class _AddOne(nn.Module):
@@ -35,6 +37,23 @@ class _ParamScale(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return x * self.weight
+
+
+def _make_global_graph(module: nn.Module | None = None) -> GraphExecutor:
+    if module is None:
+        module = _AddBias()
+    input_kwargs = {"bias": "global.bias"} if isinstance(module, _AddBias) else None
+    return (
+        GraphBuilder()
+        .add(
+            name="global",
+            module=module,
+            input_args=["x"],
+            input_kwargs=input_kwargs,
+            output_key="global.out",
+        )
+        .build()
+    )
 
 
 def test_model_builder_builds_plain_model_from_modules() -> None:
@@ -284,6 +303,117 @@ def test_model_builder_build_stream_registers_graph_parameters() -> None:
     )
 
 
+def test_model_builder_build_global_local_runs_model() -> None:
+    model = (
+        ModelBuilder()
+        .add(
+            name="local",
+            module=_AddBias(),
+            input_args=["tile.x"],
+            input_kwargs={"bias": "local.bias"},
+            output_key="local.out",
+        )
+        .build_global_local(
+            global_graph=_make_global_graph(),
+            fusion=LocalGlobalFusion(init_logit=0.0, learnable=False),
+            tile_shape=(2,),
+            input_key="x",
+            tile_input_key="tile.x",
+            local_output_name="local",
+            global_output_name="global",
+            fused_output_key="fused.out",
+        )
+    )
+    x = torch.arange(4, dtype=torch.float32)
+    store = KVStore(
+        {
+            "x": x,
+            "global.bias": torch.tensor(10.0),
+            "local.bias": torch.tensor(2.0),
+        }
+    )
+
+    result = model(store)
+
+    assert model.plan.mode == ExecutorModeSpec(tile=True, global_local=True)
+    assert model.spec.context == "global_local"
+    assert torch.equal(result, x + 6.0)
+    assert torch.equal(store.get("fused.out"), result)
+
+
+def test_model_builder_build_global_local_preserves_tile_policy_settings() -> None:
+    model = (
+        ModelBuilder()
+        .add(
+            name="local",
+            module=_Double(),
+            input_args=["tile.x"],
+            output_key="local.out",
+        )
+        .build_global_local(
+            global_graph=_make_global_graph(module=_Double()),
+            fusion=LocalGlobalFusion(init_logit=0.0, learnable=False),
+            tile_shape=(2,),
+            tile_stride=(1,),
+            tile_dims=(0,),
+            input_key="x",
+            tile_input_key="tile.x",
+            local_output_name="local",
+            global_output_name="global",
+        )
+    )
+
+    assert model.spec.tile_shape == (2,)
+    assert model.spec.tile_stride == (1,)
+    assert model.spec.tile_dims == (0,)
+    assert model.plan.global_local_pipeline is not None
+    tile_policy = model.plan.global_local_pipeline.tile_pipeline.tile_policy
+    assert tile_policy.tile_shape == (2,)
+    assert tile_policy.stride == (1,)
+    assert tile_policy.dims == (0,)
+
+
+def test_model_builder_build_global_local_registers_branch_and_fusion_parameters() -> None:
+    local_module = _ParamScale(value=2.0)
+    global_module = _ParamScale(value=3.0)
+    fusion = LocalGlobalFusion()
+    model = (
+        ModelBuilder()
+        .add(
+            name="local",
+            module=local_module,
+            input_args=["tile.x"],
+            output_key="local.out",
+        )
+        .build_global_local(
+            global_graph=_make_global_graph(module=global_module),
+            fusion=fusion,
+            tile_shape=(2,),
+            input_key="x",
+            tile_input_key="tile.x",
+            local_output_name="local",
+            global_output_name="global",
+            fused_output_key="fused.out",
+        )
+    )
+
+    parameter_ids = {id(parameter) for parameter in model.parameters()}
+    assert id(local_module.weight) in parameter_ids
+    assert id(global_module.weight) in parameter_ids
+    assert id(fusion.logit) in parameter_ids
+
+    state_keys = set(model.state_dict())
+    assert any(
+        key.endswith("global_local_tile_graph.modules_by_key.local.weight")
+        for key in state_keys
+    )
+    assert any(
+        key.endswith("global_graph.modules_by_key.global.weight")
+        for key in state_keys
+    )
+    assert any(key.endswith("global_local_fusion.logit") for key in state_keys)
+
+
 def test_model_builder_rejects_invalid_graph_builder() -> None:
     with pytest.raises(TypeError, match="GraphBuilder"):
         ModelBuilder(graph_builder=object())  # type: ignore[arg-type]
@@ -346,4 +476,42 @@ def test_model_builder_build_stream_delegates_graph_executor_output_validation()
         builder.build_stream(
             chunk_input_key="chunk.x",
             output_name="missing",
+        )
+
+
+def test_model_builder_build_global_local_delegates_local_graph_validation() -> None:
+    builder = ModelBuilder()
+    builder.add(name="node", module=nn.Identity(), output_key="x")
+    builder.add(name="node", module=nn.Identity(), output_key="y")
+
+    with pytest.raises(ValueError, match="Duplicate node name"):
+        builder.build_global_local(
+            global_graph=_make_global_graph(),
+            fusion=LocalGlobalFusion(init_logit=0.0, learnable=False),
+            tile_shape=(2,),
+            input_key="x",
+            tile_input_key="tile.x",
+            local_output_name="node",
+            global_output_name="global",
+        )
+
+
+def test_model_builder_build_global_local_delegates_global_output_validation() -> None:
+    builder = ModelBuilder()
+    builder.add(
+        name="local",
+        module=nn.Identity(),
+        input_args=["tile.x"],
+        output_key="local.out",
+    )
+
+    with pytest.raises(KeyError, match="missing"):
+        builder.build_global_local(
+            global_graph=_make_global_graph(),
+            fusion=LocalGlobalFusion(init_logit=0.0, learnable=False),
+            tile_shape=(2,),
+            input_key="x",
+            tile_input_key="tile.x",
+            local_output_name="local",
+            global_output_name="missing",
         )
