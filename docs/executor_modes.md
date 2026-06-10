@@ -763,8 +763,8 @@ GraphBuilder
   from nn.Module + key metadata
 
 ModelBuilder
-  plain GraphBuilder -> Model convenience layer
-  does not build tile / stream / global-local pipelines
+  plain / tile GraphBuilder -> Model convenience layer
+  does not build stream / global-local pipelines
 
 GraphExecutor
   dependency-ordered node execution
@@ -802,7 +802,7 @@ state route inference / detach intervals
 truncated BPTT scheduler
 multi-output stream collection
 automatic branch / fusion builder
-tile / stream / global-local ModelBuilder modes
+stream / global-local ModelBuilder modes
 ```
 
 ## Future builder layer
@@ -838,16 +838,17 @@ should still use caller-provided modules or graphs. It should not invent model
 architecture, create fusion modules implicitly, infer `StateRoute` values, or
 chunk streams automatically.
 
-`ModelBuilder` currently provides only the plain graph convenience path. Future
-extensions may assemble already-built graph/branch/pipeline components into
-`Model`. They should still delegate validation to `ModelExecutionSpec`,
-`ExecutorPlan`, and the executor pipeline specs.
+`ModelBuilder` currently provides the plain graph convenience path and an
+explicit tiled path. Future extensions may assemble already-built
+graph/branch/pipeline components into `Model`. They should still delegate
+validation to `ModelExecutionSpec`, `ExecutorPlan`, and the executor pipeline
+specs.
 
 ## Recommended next layer
 
-After the plain `ModelBuilder`, the next higher-level layer can add optional
-`BranchBuilder` helpers and additional `ModelBuilder` modes using the public
-naming above and the validated executor plan.
+After the plain/tile `ModelBuilder`, the next higher-level layer can add
+optional `BranchBuilder` helpers and additional `ModelBuilder` modes using the
+public naming above and the validated executor plan.
 
 ```text
 public Model parameters
