@@ -1,0 +1,72 @@
+diff --git a/enn_torch_dev/debug/executor/test_public_api_exports.py b/enn_torch_dev/debug/executor/test_public_api_exports.py
+new file mode 100644
+index 0000000..ce6c70d
+--- /dev/null
++++ b/enn_torch_dev/debug/executor/test_public_api_exports.py
+@@ -0,0 +1,66 @@
++from __future__ import annotations
++
++import enn_torch_dev.executor as executor
++
++
++_DOCUMENTED_BUILDER_IMPORTS = {
++    "BranchBuilder",
++    "GraphBuilder",
++    "KVStore",
++    "Model",
++    "ModelBuilder",
++    "ModelExecutionSpec",
++}
++
++
++_CORE_EXECUTOR_IMPORTS = {
++    "ExecutorModeSpec",
++    "ExecutorModel",
++    "ExecutorPlan",
++    "ExecutorRunner",
++    "GlobalLocalPipeline",
++    "GlobalLocalPipelineSpec",
++    "GraphExecutor",
++    "KeyRef",
++    "NodeExecutor",
++    "NodeSpec",
++    "StateRoute",
++    "StreamPipeline",
++    "StreamPipelineSpec",
++    "TilePipeline",
++    "TilePipelineSpec",
++    "TilePolicy",
++}
++
++
++def test_executor_all_entries_resolve_to_module_attributes() -> None:
++    assert len(executor.__all__) == len(set(executor.__all__))
++
++    for name in executor.__all__:
++        assert hasattr(executor, name), name
++
++
++def test_documented_builder_imports_are_public_exports() -> None:
++    missing = _DOCUMENTED_BUILDER_IMPORTS.difference(executor.__all__)
++
++    assert missing == set()
++
++
++def test_core_executor_imports_are_public_exports() -> None:
++    missing = _CORE_EXECUTOR_IMPORTS.difference(executor.__all__)
++
++    assert missing == set()
++
++
++def test_documented_builder_import_statement_matches_public_namespace() -> None:
++    namespace: dict[str, object] = {}
++    exec(
++        "from enn_torch_dev.executor import ("
++        "BranchBuilder, GraphBuilder, KVStore, Model, "
++        "ModelBuilder, ModelExecutionSpec"
++        ")",
++        namespace,
++    )
++
++    for name in _DOCUMENTED_BUILDER_IMPORTS:
++        assert namespace[name] is getattr(executor, name)
