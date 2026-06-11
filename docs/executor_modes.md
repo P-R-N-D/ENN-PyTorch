@@ -703,6 +703,10 @@ wrapper and keeps executor composition testable through `ModelExecutionSpec`,
 
 ## GraphBuilder
 
+For user-facing builder recipes, see
+[executor_builders.md](executor_builders.md). This section keeps the lower-level
+executor mode and boundary details.
+
 `GraphBuilder` is a thin convenience layer for constructing leaf-node
 `GraphExecutor` instances. It builds graphs, not executor plans, pipelines, or
 models.
