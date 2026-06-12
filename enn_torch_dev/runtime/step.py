@@ -152,6 +152,8 @@ class RuntimeStep:
             raise TypeError("RuntimeStep.run expects a KVBatch.")
 
         resource_samples: list[ResourceSample] = []
+        if self.resource_monitor is not None:
+            self.resource_monitor.reset_peak_memory_stats()
         self._sample_resource(resource_samples, "before_step")
 
         phase = RuntimePhase.TO_STORE

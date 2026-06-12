@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable, Iterator
 from dataclasses import dataclass, field
+from typing import Any
 
 import torch
 from torch import nn
@@ -12,7 +13,22 @@ def _dtype_name(dtype: torch.dtype) -> str:
 
 
 def _tensor_nbytes(tensor: torch.Tensor) -> int:
-    return int(tensor.numel()) * int(tensor.element_size())
+    try:
+        return int(tensor.untyped_storage().nbytes())
+    except Exception:
+        return int(tensor.numel()) * int(tensor.element_size())
+
+
+def _storage_marker(tensor: torch.Tensor) -> tuple[str, int] | tuple[str, int, int]:
+    try:
+        storage = tensor.untyped_storage()
+        return (str(tensor.device), int(storage.data_ptr()))
+    except Exception:
+        return (
+            str(tensor.device),
+            int(tensor.data_ptr()),
+            int(tensor.storage_offset()),
+        )
 
 
 def _add_count(target: dict[str, int], key: str, value: int) -> None:
@@ -22,13 +38,34 @@ def _add_count(target: dict[str, int], key: str, value: int) -> None:
 def _unique_named_tensors(
     named_tensors: Iterable[tuple[str, torch.Tensor]],
 ) -> Iterator[tuple[str, torch.Tensor]]:
-    seen: set[int] = set()
+    seen: set[tuple[str, int] | tuple[str, int, int]] = set()
     for name, tensor in named_tensors:
-        marker = id(tensor)
+        marker = _storage_marker(tensor)
         if marker in seen:
             continue
         seen.add(marker)
         yield name, tensor
+
+
+def _iter_state_tensors(value: Any, seen_containers: set[int]) -> Iterator[torch.Tensor]:
+    if isinstance(value, torch.Tensor):
+        yield value
+        return
+    if isinstance(value, dict):
+        marker = id(value)
+        if marker in seen_containers:
+            return
+        seen_containers.add(marker)
+        for nested in value.values():
+            yield from _iter_state_tensors(nested, seen_containers)
+        return
+    if isinstance(value, (list, tuple, set)):
+        marker = id(value)
+        if marker in seen_containers:
+            return
+        seen_containers.add(marker)
+        for nested in value:
+            yield from _iter_state_tensors(nested, seen_containers)
 
 
 @dataclass(frozen=True, slots=True)
@@ -115,16 +152,15 @@ class OptimizerFootprint:
         state_bytes = 0
         bytes_by_dtype: dict[str, int] = {}
         tensors_by_dtype: dict[str, int] = {}
-        seen: set[int] = set()
+        seen_tensors: set[tuple[str, int] | tuple[str, int, int]] = set()
+        seen_containers: set[int] = set()
 
         for state in optimizer.state.values():
-            for value in state.values():
-                if not isinstance(value, torch.Tensor):
+            for value in _iter_state_tensors(state, seen_containers):
+                marker = _storage_marker(value)
+                if marker in seen_tensors:
                     continue
-                marker = id(value)
-                if marker in seen:
-                    continue
-                seen.add(marker)
+                seen_tensors.add(marker)
                 state_tensor_count += 1
                 nbytes = _tensor_nbytes(value)
                 dtype_key = _dtype_name(value.dtype)

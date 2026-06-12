@@ -6,7 +6,12 @@ from torch import nn
 
 from enn_torch_dev.data import DataSchema, FieldSpec, KVBatch, KeyMapping
 from enn_torch_dev.executor import GraphExecutor, KeyRef, NodeSpec
-from enn_torch_dev.runtime import ResourceMonitor, RuntimeStep, StepStatus
+from enn_torch_dev.runtime import (
+    ResourceMonitor,
+    ResourceSample,
+    RuntimeStep,
+    StepStatus,
+)
 
 
 class _Double(nn.Module):
@@ -141,3 +146,29 @@ def test_runtime_step_preserves_samples_on_data_fault() -> None:
 
     assert result.status is StepStatus.DATA_FAULT
     assert _phases(result) == ["before_step"]
+
+
+class _RecordingMonitor(ResourceMonitor):
+    def __init__(self) -> None:
+        super().__init__()
+        self.calls: list[str] = []
+
+    def reset_peak_memory_stats(self) -> None:
+        self.calls.append("reset")
+
+    def sample(self, phase: object) -> ResourceSample:
+        self.calls.append(f"sample:{phase}")
+        return ResourceSample(timestamp_ns=len(self.calls), phase=str(phase))
+
+
+def test_runtime_step_resets_peak_stats_before_first_resource_sample() -> None:
+    monitor = _RecordingMonitor()
+
+    result = RuntimeStep(
+        _graph(),
+        schema=_schema(),
+        resource_monitor=monitor,
+    ).run(_batch())
+
+    assert result.status is StepStatus.SUCCESS
+    assert monitor.calls[:2] == ["reset", "sample:before_step"]
