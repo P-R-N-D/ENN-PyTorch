@@ -7,7 +7,7 @@ from tensordict import TensorDictBase
 
 from enn_torch_dev.executor import KVStore
 
-from .schema import DataSchema, KeyMapping
+from .schema import DataSchema, FieldSpec, KeyMapping
 
 
 def _validate_tensor(value: object, label: str) -> torch.Tensor:
@@ -53,7 +53,7 @@ class BatchCost:
         if not isinstance(td, TensorDictBase):
             raise TypeError(f"from_tensordict expects TensorDictBase, got {type(td)!r}")
         host_bytes = 0
-        for value in td.values(include_nested=True, leaves_only=True):
+        for value in td.values():
             if isinstance(value, torch.Tensor):
                 host_bytes += _tensor_bytes(value)
         batch_size = None
@@ -123,18 +123,29 @@ class KVBatch:
                 continue
             field_spec.validate_tensor(self.td[field_spec.name])
 
+    @staticmethod
+    def _optional_fields(schema: DataSchema | None) -> dict[str, FieldSpec]:
+        if schema is None:
+            return {}
+        return {field.name: field for field in schema.fields if not field.required}
+
     def to_store(self, mapping: KeyMapping | DataSchema) -> KVStore:
+        schema: DataSchema | None = None
         if isinstance(mapping, DataSchema):
-            self.validate_schema(mapping)
-            key_mapping = mapping.key_mapping
+            schema = mapping
+            self.validate_schema(schema)
+            key_mapping = schema.key_mapping
         elif isinstance(mapping, KeyMapping):
             key_mapping = mapping
         else:
             raise TypeError("to_store expects a KeyMapping or DataSchema.")
 
+        optional_fields = self._optional_fields(schema)
         store = KVStore()
         for source_key, target_key in key_mapping.all_items():
             if source_key not in self.td.keys():
+                if source_key in optional_fields:
+                    continue
                 raise KeyError(f"TensorDict missing key required by mapping: {source_key!r}")
             value = self.td[source_key]
             if not isinstance(value, torch.Tensor):
