@@ -49,6 +49,17 @@ def test_field_spec_validates_tensor_contract() -> None:
         field.validate_tensor(torch.zeros(2, 4, dtype=torch.float32))
 
 
+def test_field_spec_normalizes_dtype_name_strings() -> None:
+    field = FieldSpec("features", "torch.float32", shape=(2, 3))
+
+    assert field.dtype is torch.float32
+    assert field.dtype_name() == "float32"
+    field.validate_tensor(torch.zeros(2, 3, dtype=torch.float32))
+
+    with pytest.raises(TypeError, match="dtype"):
+        field.validate_tensor(torch.zeros(2, 3, dtype=torch.float64))
+
+
 def test_data_schema_rejects_duplicate_fields() -> None:
     with pytest.raises(ValueError, match="duplicate"):
         DataSchema(
@@ -71,6 +82,15 @@ def test_key_mapping_rejects_duplicate_kvstore_targets() -> None:
         mapping.all_items()
 
 
+def test_data_schema_rejects_mapping_sources_not_declared_as_fields() -> None:
+    with pytest.raises(ValueError, match="declared fields"):
+        DataSchema(
+            schema_id="bad.mapping",
+            fields=(FieldSpec("features", torch.float32),),
+            key_mapping=KeyMapping(inputs={"typo": "x"}),
+        )
+
+
 def test_dataset_manifest_roundtrips_schema_contract() -> None:
     schema = _schema()
 
@@ -85,7 +105,13 @@ def test_dataset_manifest_roundtrips_schema_contract() -> None:
     assert restored.schema_id == schema.schema_id
     assert restored.key_mapping.inputs == schema.key_mapping.inputs
     assert restored.field("features").shape == (2, 3)
+    assert restored.field("features").dtype is torch.float32
     assert restored.field("labels").required is False
+
+    with pytest.raises(TypeError, match="dtype"):
+        restored.field("features").validate_tensor(
+            torch.zeros(2, 3, dtype=torch.float64)
+        )
 
 
 def test_manifest_to_dict_is_json_ready() -> None:

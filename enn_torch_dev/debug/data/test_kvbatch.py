@@ -6,7 +6,7 @@ from tensordict import TensorDict
 from torch import nn
 
 from enn_torch_dev.data import BatchCost, DataSchema, FieldSpec, KVBatch, KeyMapping
-from enn_torch_dev.executor import GraphBuilder
+from enn_torch_dev.executor import GraphExecutor, KeyRef, NodeSpec
 
 
 class _Double(nn.Module):
@@ -52,15 +52,17 @@ def test_kvbatch_to_store_exposes_tensor_keys_for_graph_executor() -> None:
     )
 
     store = batch.to_store(schema)
-    graph = (
-        GraphBuilder()
-        .add(
-            name="double",
-            module=_Double(),
-            input_args=["x"],
-            output_key="pred",
-        )
-        .build()
+    graph = GraphExecutor(
+        [
+            (
+                NodeSpec(
+                    name="double_node",
+                    input_args=[KeyRef("x")],
+                    output_key="pred",
+                ),
+                _Double(),
+            )
+        ]
     )
 
     graph.run(store)
@@ -87,6 +89,32 @@ def test_kvbatch_allows_missing_optional_schema_fields() -> None:
     assert store.has("x")
     assert not store.has("y")
     assert not store.has("mask")
+
+
+def test_kvbatch_rejects_schema_id_mismatch() -> None:
+    schema = _schema()
+    batch = KVBatch(
+        td=_tensordict(),
+        row_ids=torch.tensor([0, 1]),
+        schema_id="other.schema",
+    )
+
+    with pytest.raises(ValueError, match="schema_id"):
+        batch.to_store(schema)
+
+
+def test_kvbatch_uses_schema_id_from_schema_when_batch_schema_id_is_empty() -> None:
+    schema = _schema()
+    batch = KVBatch(
+        td=_tensordict(),
+        row_ids=torch.tensor([0, 1]),
+        schema_id="",
+    )
+
+    store = batch.to_store(schema)
+
+    assert store.get_value("x").meta["schema_id"] == schema.schema_id
+    assert store.get_value("row_id").meta["schema_id"] == schema.schema_id
 
 
 def test_kvbatch_rejects_missing_required_field() -> None:

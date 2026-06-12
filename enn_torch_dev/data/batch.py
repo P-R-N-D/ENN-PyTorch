@@ -131,8 +131,16 @@ class KVBatch:
 
     def to_store(self, mapping: KeyMapping | DataSchema) -> KVStore:
         schema: DataSchema | None = None
+        effective_schema_id = self.schema_id
         if isinstance(mapping, DataSchema):
             schema = mapping
+            if self.schema_id and self.schema_id != schema.schema_id:
+                raise ValueError(
+                    "KVBatch.schema_id must match DataSchema.schema_id when "
+                    "converting through a schema: "
+                    f"{self.schema_id!r} != {schema.schema_id!r}."
+                )
+            effective_schema_id = self.schema_id or schema.schema_id
             self.validate_schema(schema)
             key_mapping = schema.key_mapping
         elif isinstance(mapping, KeyMapping):
@@ -156,22 +164,27 @@ class KVBatch:
                 target_key,
                 value,
                 origin="KVBatch",
-                meta={"source_key": source_key, "schema_id": self.schema_id},
+                meta={"source_key": source_key, "schema_id": effective_schema_id},
             )
 
-        store.set("row_id", self.row_ids, origin="KVBatch", meta={"schema_id": self.schema_id})
+        store.set(
+            "row_id",
+            self.row_ids,
+            origin="KVBatch",
+            meta={"schema_id": effective_schema_id},
+        )
         if self.source_ids is not None:
             store.set(
                 "source_id",
                 self.source_ids,
                 origin="KVBatch",
-                meta={"schema_id": self.schema_id},
+                meta={"schema_id": effective_schema_id},
             )
         if self.sample_ids is not None:
             store.set(
                 "sample_id",
                 self.sample_ids,
                 origin="KVBatch",
-                meta={"schema_id": self.schema_id},
+                meta={"schema_id": effective_schema_id},
             )
         return store

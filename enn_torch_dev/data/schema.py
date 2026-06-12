@@ -36,6 +36,18 @@ def _normalize_shape(value: object) -> tuple[int | None, ...]:
     return shape
 
 
+def _normalize_dtype(value: object) -> torch.dtype:
+    if isinstance(value, torch.dtype):
+        return value
+    if isinstance(value, str):
+        dtype_name = value.removeprefix("torch.")
+        dtype = getattr(torch, dtype_name, None)
+        if isinstance(dtype, torch.dtype):
+            return dtype
+        raise ValueError(f"Unknown torch dtype name: {value!r}")
+    raise TypeError("FieldSpec.dtype must be a torch.dtype or dtype name string.")
+
+
 def _normalize_batch_axis(value: object) -> int:
     if not isinstance(value, int) or isinstance(value, bool):
         raise TypeError("FieldSpec.batch_axis must be an integer.")
@@ -92,8 +104,7 @@ class FieldSpec:
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "name", _validate_key(self.name, "FieldSpec.name"))
-        if not isinstance(self.dtype, (torch.dtype, str)):
-            raise TypeError("FieldSpec.dtype must be a torch.dtype or dtype name string.")
+        object.__setattr__(self, "dtype", _normalize_dtype(self.dtype))
         object.__setattr__(self, "shape", _normalize_shape(self.shape))
         object.__setattr__(self, "batch_axis", _normalize_batch_axis(self.batch_axis))
         if not isinstance(self.required, bool):
@@ -103,14 +114,12 @@ class FieldSpec:
             raise TypeError("FieldSpec.description must be a string or None.")
 
     def dtype_name(self) -> str:
-        if isinstance(self.dtype, torch.dtype):
-            return str(self.dtype).removeprefix("torch.")
-        return self.dtype
+        return str(self.dtype).removeprefix("torch.")
 
     def validate_tensor(self, value: torch.Tensor) -> None:
         if not isinstance(value, torch.Tensor):
             raise TypeError(f"Field {self.name!r} expects a torch.Tensor, got {type(value)!r}.")
-        if isinstance(self.dtype, torch.dtype) and value.dtype != self.dtype:
+        if value.dtype != self.dtype:
             raise TypeError(
                 f"Field {self.name!r} expects dtype {self.dtype}, got {value.dtype}."
             )
@@ -178,6 +187,15 @@ class DataSchema:
         if not isinstance(self.metadata, Mapping):
             raise TypeError("DataSchema.metadata must be a mapping.")
         object.__setattr__(self, "metadata", dict(self.metadata))
+
+        field_names = {field_spec.name for field_spec in self.fields}
+        mapped_sources = [source for source, _target in self.key_mapping.all_items()]
+        unknown_sources = [source for source in mapped_sources if source not in field_names]
+        if unknown_sources:
+            raise ValueError(
+                "DataSchema key_mapping source keys must be declared fields: "
+                f"{unknown_sources!r}"
+            )
 
     @property
     def field_names(self) -> tuple[str, ...]:
