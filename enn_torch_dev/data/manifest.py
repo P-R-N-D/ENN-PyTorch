@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import json
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 from .schema import DataSchema, FieldSpec, KeyMapping
@@ -31,6 +33,23 @@ def _normalize_shape(value: object) -> tuple[int | None, ...]:
             raise TypeError("TensorFieldManifest.shape entries must be integers or None.")
         if isinstance(item, int) and item < 0:
             raise ValueError("TensorFieldManifest.shape integer entries must be non-negative.")
+    return items
+
+
+def _normalize_storage_shape(value: object) -> tuple[int, ...] | None:
+    if value is None:
+        return None
+    if isinstance(value, (str, bytes, bytearray)):
+        raise TypeError("TensorFieldManifest.storage_shape must be a sequence.")
+    try:
+        items = tuple(value)  # type: ignore[arg-type]
+    except TypeError as exc:
+        raise TypeError("TensorFieldManifest.storage_shape must be a sequence.") from exc
+    for item in items:
+        if not isinstance(item, int) or isinstance(item, bool):
+            raise TypeError("TensorFieldManifest.storage_shape entries must be integers.")
+        if item < 0:
+            raise ValueError("TensorFieldManifest.storage_shape entries must be non-negative.")
     return items
 
 
@@ -65,6 +84,7 @@ class TensorFieldManifest:
     shape: Sequence[int | None] | None
     batch_axis: int = 0
     storage_key: str | None = None
+    storage_shape: Sequence[int] | None = None
     required: bool = True
     role: str = "feature"
 
@@ -80,12 +100,23 @@ class TensorFieldManifest:
                 "storage_key",
                 _validate_key(self.storage_key, "TensorFieldManifest.storage_key"),
             )
+        object.__setattr__(
+            self,
+            "storage_shape",
+            _normalize_storage_shape(self.storage_shape),
+        )
         if not isinstance(self.required, bool):
             raise TypeError("TensorFieldManifest.required must be a bool.")
         object.__setattr__(self, "role", _validate_key(self.role, "TensorFieldManifest.role"))
 
     @classmethod
-    def from_field_spec(cls, spec: FieldSpec, *, storage_key: str | None = None) -> "TensorFieldManifest":
+    def from_field_spec(
+        cls,
+        spec: FieldSpec,
+        *,
+        storage_key: str | None = None,
+        storage_shape: Sequence[int] | None = None,
+    ) -> "TensorFieldManifest":
         if not isinstance(spec, FieldSpec):
             raise TypeError("from_field_spec expects a FieldSpec.")
         return cls(
@@ -94,6 +125,7 @@ class TensorFieldManifest:
             shape=spec.shape,
             batch_axis=spec.batch_axis,
             storage_key=storage_key or spec.name,
+            storage_shape=storage_shape,
             required=spec.required,
             role=spec.role,
         )
@@ -105,9 +137,25 @@ class TensorFieldManifest:
             "shape": list(self.shape),
             "batch_axis": self.batch_axis,
             "storage_key": self.storage_key,
+            "storage_shape": None if self.storage_shape is None else list(self.storage_shape),
             "required": self.required,
             "role": self.role,
         }
+
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, Any]) -> "TensorFieldManifest":
+        if not isinstance(payload, Mapping):
+            raise TypeError("TensorFieldManifest.from_dict expects a mapping.")
+        return cls(
+            name=payload["name"],
+            dtype=payload["dtype"],
+            shape=payload.get("shape"),
+            batch_axis=payload.get("batch_axis", 0),
+            storage_key=payload.get("storage_key"),
+            storage_shape=payload.get("storage_shape"),
+            required=payload.get("required", True),
+            role=payload.get("role", "feature"),
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -143,6 +191,30 @@ class DatasetManifest:
         object.__setattr__(self, "metadata", dict(self.metadata))
 
     @classmethod
+    def from_dict(cls, payload: Mapping[str, Any]) -> "DatasetManifest":
+        if not isinstance(payload, Mapping):
+            raise TypeError("DatasetManifest.from_dict expects a mapping.")
+        key_mapping_payload = payload["key_mapping"]
+        if not isinstance(key_mapping_payload, Mapping):
+            raise TypeError("DatasetManifest key_mapping payload must be a mapping.")
+        return cls(
+            schema_id=payload["schema_id"],
+            num_rows=payload["num_rows"],
+            fields=[
+                TensorFieldManifest.from_dict(field_payload)
+                for field_payload in payload["fields"]
+            ],
+            key_mapping=KeyMapping(
+                inputs=key_mapping_payload.get("inputs", {}),
+                labels=key_mapping_payload.get("labels", {}),
+                metadata=key_mapping_payload.get("metadata", {}),
+            ),
+            schema_version=payload.get("schema_version", 1),
+            storage_format=payload.get("storage_format", "tensordict"),
+            metadata=payload.get("metadata", {}),
+        )
+
+    @classmethod
     def from_schema(
         cls,
         schema: DataSchema,
@@ -156,7 +228,12 @@ class DatasetManifest:
         return cls(
             schema_id=schema.schema_id,
             num_rows=num_rows,
-            fields=[TensorFieldManifest.from_field_spec(field) for field in schema.fields],
+            fields=[
+                TensorFieldManifest.from_field_spec(
+                    field,
+                )
+                for field in schema.fields
+            ],
             key_mapping=schema.key_mapping,
             schema_version=schema.version,
             storage_format=storage_format,
@@ -197,3 +274,17 @@ class DatasetManifest:
             },
             "metadata": dict(self.metadata),
         }
+
+    def to_json(self, path: str | Path) -> None:
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps(self.to_dict(), indent=2, sort_keys=True),
+            encoding="utf-8",
+        )
+
+    @classmethod
+    def from_json(cls, path: str | Path) -> "DatasetManifest":
+        path = Path(path)
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        return cls.from_dict(payload)
