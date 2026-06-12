@@ -97,6 +97,22 @@ def test_data_cost_probe_deduplicates_aliased_storage() -> None:
     assert cost.bytes_by_dtype == {"float32": 6 * 4}
 
 
+def test_data_cost_probe_counts_full_storage_bytes_for_split_aliases() -> None:
+    base = torch.arange(12, dtype=torch.float32).reshape(4, 3)
+
+    cost = DataCostProbe().estimate_mapping(
+        {
+            "head": base[:1],
+            "tail": base[1:],
+        },
+        batch_size=4,
+    )
+
+    assert cost.tensor_count == 1
+    assert cost.total_tensor_bytes == base.untyped_storage().nbytes()
+    assert cost.bytes_by_dtype == {"float32": base.untyped_storage().nbytes()}
+
+
 def test_data_cost_probe_handles_zero_batch_size() -> None:
     td = TensorDict(
         {

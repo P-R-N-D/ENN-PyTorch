@@ -20,13 +20,18 @@ def _sample(
     reserved: int | None = None,
     max_allocated: int | None = None,
     max_reserved: int | None = None,
+    device_index: int | None = None,
 ) -> ResourceSample:
     return ResourceSample(
         timestamp_ns=1,
         phase=phase,
         cpu_rss_bytes=cpu,
         cuda_available=allocated is not None,
-        cuda_device_index=0 if allocated is not None else None,
+        cuda_device_index=(
+            device_index
+            if device_index is not None
+            else 0 if allocated is not None else None
+        ),
         cuda_allocated_bytes=allocated,
         cuda_reserved_bytes=reserved,
         cuda_max_allocated_bytes=max_allocated,
@@ -66,6 +71,60 @@ def test_model_cost_probe_computes_phase_deltas() -> None:
     assert cost.phase_deltas[0].end_phase == "after_to_store"
     assert cost.phase_deltas[0].cpu_rss_delta_bytes == 60
     assert cost.phase_deltas[1].cuda_allocated_delta_bytes == 40
+
+
+def test_model_cost_probe_skips_cuda_delta_across_devices() -> None:
+    result = _result(
+        (
+            _sample(
+                "before_step",
+                cpu=100,
+                allocated=10,
+                reserved=20,
+                max_allocated=30,
+                max_reserved=40,
+                device_index=0,
+            ),
+            _sample(
+                "after_forward",
+                cpu=150,
+                allocated=70,
+                reserved=90,
+                max_allocated=110,
+                max_reserved=130,
+                device_index=1,
+            ),
+        )
+    )
+
+    cost = ModelCostProbe().estimate_step(result)
+
+    assert cost.total_cpu_rss_delta_bytes == 50
+    assert cost.total_cuda_allocated_delta_bytes is None
+    assert cost.total_cuda_reserved_delta_bytes is None
+    assert cost.total_cuda_max_allocated_delta_bytes is None
+    assert cost.total_cuda_max_reserved_delta_bytes is None
+    assert cost.phase_deltas[0].cpu_rss_delta_bytes == 50
+    assert cost.phase_deltas[0].cuda_allocated_delta_bytes is None
+
+
+def test_model_cost_probe_row_count_uses_batch_size_for_multidimensional_row_ids() -> None:
+    result = StepResult(
+        status=StepStatus.SUCCESS,
+        phase=None,
+        batch_size=2,
+        row_ids=torch.tensor([[10, 100], [11, 101]]),
+        resource_samples=(
+            _sample("before_step", cpu=10),
+            _sample("after_forward", cpu=15),
+        ),
+    )
+
+    cost = ModelCostProbe().estimate_step(result)
+
+    assert result.row_ids.numel() == 4
+    assert cost.row_count == 2
+    assert cost.row_count == result.batch_size
 
 
 def test_model_cost_probe_handles_cuda_none_fields() -> None:

@@ -20,7 +20,10 @@ def _add_count(target: dict[str, int], key: str, value: int) -> None:
 
 
 def _tensor_nbytes(tensor: torch.Tensor) -> int:
-    return int(tensor.numel()) * int(tensor.element_size())
+    try:
+        return int(tensor.untyped_storage().nbytes())
+    except Exception:
+        return int(tensor.numel()) * int(tensor.element_size())
 
 
 def _storage_marker(tensor: torch.Tensor) -> tuple[object, ...]:
@@ -210,7 +213,7 @@ class ModelCostProbe:
         return ModelCost(
             status=result.status,
             batch_size=result.batch_size,
-            row_count=int(result.row_ids.numel()),
+            row_count=result.batch_size,
             total_cpu_rss_delta_bytes=None if total is None else total.cpu_rss_delta_bytes,
             total_cuda_allocated_delta_bytes=(
                 None if total is None else total.cuda_allocated_delta_bytes
@@ -229,24 +232,35 @@ class ModelCostProbe:
 
     @staticmethod
     def _delta_pair(start: ResourceSample, end: ResourceSample) -> ResourceDelta:
+        same_cuda_device = start.cuda_device_index == end.cuda_device_index
         return ResourceDelta(
             start_phase=start.phase,
             end_phase=end.phase,
             cpu_rss_delta_bytes=_optional_delta(end.cpu_rss_bytes, start.cpu_rss_bytes),
-            cuda_allocated_delta_bytes=_optional_delta(
-                end.cuda_allocated_bytes,
-                start.cuda_allocated_bytes,
+            cuda_allocated_delta_bytes=(
+                _optional_delta(end.cuda_allocated_bytes, start.cuda_allocated_bytes)
+                if same_cuda_device
+                else None
             ),
-            cuda_reserved_delta_bytes=_optional_delta(
-                end.cuda_reserved_bytes,
-                start.cuda_reserved_bytes,
+            cuda_reserved_delta_bytes=(
+                _optional_delta(end.cuda_reserved_bytes, start.cuda_reserved_bytes)
+                if same_cuda_device
+                else None
             ),
-            cuda_max_allocated_delta_bytes=_optional_delta(
-                end.cuda_max_allocated_bytes,
-                start.cuda_max_allocated_bytes,
+            cuda_max_allocated_delta_bytes=(
+                _optional_delta(
+                    end.cuda_max_allocated_bytes,
+                    start.cuda_max_allocated_bytes,
+                )
+                if same_cuda_device
+                else None
             ),
-            cuda_max_reserved_delta_bytes=_optional_delta(
-                end.cuda_max_reserved_bytes,
-                start.cuda_max_reserved_bytes,
+            cuda_max_reserved_delta_bytes=(
+                _optional_delta(
+                    end.cuda_max_reserved_bytes,
+                    start.cuda_max_reserved_bytes,
+                )
+                if same_cuda_device
+                else None
             ),
         )

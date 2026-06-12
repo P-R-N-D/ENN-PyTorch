@@ -80,8 +80,8 @@ def test_cost_probes_integrate_with_reader_loader_and_runtime_step(tmp_path) -> 
 
     assert data_cost.batch_size == 2
     assert data_cost.tensor_count == 2
-    assert data_cost.total_tensor_bytes == (2 * 3 * 4) + (2 * 3 * 4)
-    assert data_cost.bytes_per_row == 24.0
+    assert data_cost.total_tensor_bytes == (6 * 3 * 4) + (6 * 3 * 4)
+    assert data_cost.bytes_per_row == 72.0
 
     step_result = RuntimeStep(
         _graph(),

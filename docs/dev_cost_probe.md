@@ -50,9 +50,9 @@ Recorded values include:
 - dtype-grouped byte counts;
 - device-grouped byte counts.
 
-Tensor storage aliases are counted once. This keeps data cost from
-double-counting repeated views over the same storage while still reporting the
-visible tensor footprint for the first occurrence.
+Tensor storage aliases are counted once. Shared storage is charged by the full
+backing storage bytes for the first occurrence, so sliced views do not
+underestimate the storage cost and repeated aliases do not double-count it.
 
 Nested `TensorDict` values are traversed recursively using dotted keys such as
 `nested.mask`.
