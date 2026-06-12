@@ -1,0 +1,859 @@
+diff --git a/docs/dev_cost_probe.md b/docs/dev_cost_probe.md
+new file mode 100644
+index 0000000..8eb0190
+--- /dev/null
++++ b/docs/dev_cost_probe.md
+@@ -0,0 +1,138 @@
++# Development Cost Probe
++
++This document describes the fifth data/runtime rewrite slice for
++`enn_torch_dev`.
++
++## Goal
++
++Previous slices established:
++
++```text
++DataSchema / KVBatch
++  -> TensorDict staging / reader
++  -> PlainLoader
++  -> RuntimeStep
++  -> StepResult / fault classification
++  -> ModelFootprint / ResourceMonitor
++```
++
++This slice adds the first cost probe layer:
++
++```text
++KVBatch / TensorDict
++  -> DataCostProbe
++
++StepResult.resource_samples
++  -> ModelCostProbe
++```
++
++The goal is not automatic batch sizing yet. The goal is to turn tensor batches
++and runtime resource samples into stable cost records that future
++`BudgetedBatcher`, `AutoGovernor`, and calibration cache components can consume.
++
++## DataCostProbe
++
++`DataCostProbe` estimates tensor memory cost for hot-path tensor batches.
++
++Supported inputs are:
++
++- `KVBatch` through `estimate_kvbatch(batch)`;
++- `TensorDictBase` through `estimate_tensordict(td)`;
++- a small tensor mapping through `estimate_mapping(mapping, batch_size=...)`.
++
++Recorded values include:
++
++- batch size;
++- unique tensor count;
++- total tensor bytes;
++- bytes per row;
++- per-tensor key, dtype, shape, numel, element size, bytes, and device;
++- dtype-grouped byte counts;
++- device-grouped byte counts.
++
++Tensor storage aliases are counted once. This keeps data cost aligned with the
++actual allocation estimate instead of double-counting views.
++
++Nested `TensorDict` values are traversed recursively using dotted keys such as
++`nested.mask`.
++
++When `batch_size == 0`, `bytes_per_row` is `None` so callers do not accidentally
++hide division-by-zero semantics behind a synthetic value.
++
++Non-tensor values in mappings are ignored. They are not part of the tensor hot
++path cost model.
++
++## ModelCostProbe
++
++`ModelCostProbe` estimates runtime memory deltas from a `StepResult`.
++
++It reads `StepResult.resource_samples` and computes deltas between adjacent
++samples. For example:
++
++```text
++before_step -> after_to_store
++after_to_store -> after_zero_grad
++after_zero_grad -> after_forward
++after_forward -> after_loss
++after_loss -> after_backward
++after_backward -> after_optimizer
++```
++
++Forward-only steps naturally contain fewer samples:
++
++```text
++before_step -> after_to_store
++after_to_store -> after_forward
++```
++
++Faulted steps are allowed to contain a truncated sample sequence. The probe only
++computes deltas for available adjacent pairs.
++
++Recorded values include:
++
++- step status;
++- batch size;
++- row count;
++- total CPU RSS delta;
++- total CUDA allocated delta;
++- total CUDA reserved delta;
++- total CUDA max allocated delta;
++- total CUDA max reserved delta;
++- per-phase resource deltas.
++
++If a field is unavailable in either endpoint sample, the corresponding delta is
++`None`.
++
++## Out of Scope
++
++- Dynamic batch size selection.
++- BudgetedBatcher.
++- AutoGovernor.
++- OOM recovery.
++- Batch split retry.
++- AMP or precision fallback.
++- SPDL integration.
++- GPU-specific profile presets.
++- Calibration cache.
++- Telemetry JSON writer.
++- `run_profile.json`.
++- DataFrame, Arrow, WebDataset, or Hugging Face ingestion cost models.
++
++## Test Commands
++
++```bash
++python -m pytest enn_torch_dev/debug/runtime/test_data_cost_probe.py -q
++python -m pytest enn_torch_dev/debug/runtime/test_model_cost_probe.py -q
++python -m pytest enn_torch_dev/debug/runtime/test_cost_probe_integration.py -q
++python -m pytest enn_torch_dev/debug/runtime -q
++python -m pytest enn_torch_dev/debug/data -q
++python -m pytest enn_torch_dev/debug -q
++```
++
++## Next Step
++
++The next slice should add a minimal `BudgetedBatcher`.
++
++That component can consume `DataCost` and `ModelCost` values, combine them with
++resource budgets, and choose conservative batch sizes without hardcoding a GPU
++profile.
+diff --git a/enn_torch_dev/debug/runtime/test_cost_probe_integration.py b/enn_torch_dev/debug/runtime/test_cost_probe_integration.py
+new file mode 100644
+index 0000000..4bf428f
+--- /dev/null
++++ b/enn_torch_dev/debug/runtime/test_cost_probe_integration.py
+@@ -0,0 +1,105 @@
++from __future__ import annotations
++
++import torch
++from torch import nn
++
++from enn_torch_dev.data import (
++    DataSchema,
++    FieldSpec,
++    KeyMapping,
++    StagingSpec,
++    TensorDictReader,
++    TensorDictStagingWriter,
++)
++from enn_torch_dev.executor import GraphExecutor, KeyRef, NodeSpec
++from enn_torch_dev.runtime import (
++    DataCostProbe,
++    ModelCostProbe,
++    PlainLoader,
++    ResourceMonitor,
++    RuntimeStep,
++    StepStatus,
++)
++
++
++class _Double(nn.Module):
++    def forward(self, x: torch.Tensor) -> torch.Tensor:
++        return x * 2.0
++
++
++def _schema() -> DataSchema:
++    return DataSchema(
++        schema_id="cost.integration",
++        fields=(
++            FieldSpec("features", torch.float32, shape=(None, 3)),
++            FieldSpec("labels", torch.float32, shape=(None, 3)),
++        ),
++        key_mapping=KeyMapping(
++            inputs={"features": "x"},
++            labels={"labels": "y"},
++        ),
++    )
++
++
++def _reader(tmp_path) -> TensorDictReader:
++    features = torch.arange(18, dtype=torch.float32).reshape(6, 3)
++    labels = features * 2.0
++    root = tmp_path / "stage"
++    TensorDictStagingWriter(
++        StagingSpec(root=root, schema=_schema()),
++    ).write(
++        {
++            "features": features,
++            "labels": labels,
++            "row_id": torch.arange(100, 106),
++        }
++    )
++    return TensorDictReader(root)
++
++
++def _graph() -> GraphExecutor:
++    return GraphExecutor(
++        [
++            (
++                NodeSpec(
++                    name="double",
++                    input_args=[KeyRef("x")],
++                    output_key="pred",
++                ),
++                _Double(),
++            )
++        ]
++    )
++
++
++def test_cost_probes_integrate_with_reader_loader_and_runtime_step(tmp_path) -> None:
++    reader = _reader(tmp_path)
++    batch = next(iter(PlainLoader(reader, batch_size=2)))
++
++    data_cost = DataCostProbe().estimate_kvbatch(batch)
++
++    assert data_cost.batch_size == 2
++    assert data_cost.tensor_count == 2
++    assert data_cost.total_tensor_bytes == (2 * 3 * 4) + (2 * 3 * 4)
++    assert data_cost.bytes_per_row == 24.0
++
++    step_result = RuntimeStep(
++        _graph(),
++        schema=reader.schema,
++        resource_monitor=ResourceMonitor(),
++    ).run(batch)
++
++    model_cost = ModelCostProbe().estimate_step(step_result)
++
++    assert step_result.status is StepStatus.SUCCESS
++    assert model_cost.status is StepStatus.SUCCESS
++    assert model_cost.batch_size == batch.batch_size
++    assert model_cost.row_count == int(batch.row_ids.numel())
++    assert [delta.start_phase for delta in model_cost.phase_deltas] == [
++        "before_step",
++        "after_to_store",
++    ]
++    assert [delta.end_phase for delta in model_cost.phase_deltas] == [
++        "after_to_store",
++        "after_forward",
++    ]
+diff --git a/enn_torch_dev/debug/runtime/test_data_cost_probe.py b/enn_torch_dev/debug/runtime/test_data_cost_probe.py
+new file mode 100644
+index 0000000..0adf3cb
+--- /dev/null
++++ b/enn_torch_dev/debug/runtime/test_data_cost_probe.py
+@@ -0,0 +1,138 @@
++from __future__ import annotations
++
++import pytest
++import torch
++from tensordict import TensorDict
++
++from enn_torch_dev.data import KVBatch
++from enn_torch_dev.runtime import DataCostProbe
++
++
++def _td(num_rows: int = 2) -> TensorDict:
++    return TensorDict(
++        {
++            "features": torch.arange(num_rows * 3, dtype=torch.float32).reshape(num_rows, 3),
++            "labels": torch.arange(num_rows, dtype=torch.float32).reshape(num_rows, 1),
++        },
++        batch_size=(num_rows,),
++    )
++
++
++def _kvbatch(num_rows: int = 2) -> KVBatch:
++    return KVBatch(
++        td=_td(num_rows),
++        row_ids=torch.arange(num_rows),
++        schema_id="cost.data",
++    )
++
++
++def test_data_cost_probe_estimates_kvbatch_tensor_bytes() -> None:
++    cost = DataCostProbe().estimate_kvbatch(_kvbatch(num_rows=2))
++
++    assert cost.batch_size == 2
++    assert cost.tensor_count == 2
++    assert cost.total_tensor_bytes == (6 * 4) + (2 * 4)
++    assert cost.bytes_per_row == 16.0
++    assert {tensor.key for tensor in cost.tensors} == {"features", "labels"}
++    assert cost.bytes_by_dtype == {"float32": 32}
++    assert cost.bytes_by_device == {"cpu": 32}
++
++
++def test_data_cost_probe_estimates_tensordict() -> None:
++    cost = DataCostProbe().estimate_tensordict(_td(num_rows=3))
++
++    assert cost.batch_size == 3
++    assert cost.tensor_count == 2
++    assert cost.total_tensor_bytes == (9 * 4) + (3 * 4)
++    assert cost.bytes_per_row == 16.0
++
++
++def test_data_cost_probe_groups_by_dtype_and_device() -> None:
++    td = TensorDict(
++        {
++            "x": torch.ones(2, 3, dtype=torch.float32),
++            "mask": torch.ones(2, dtype=torch.bool),
++        },
++        batch_size=(2,),
++    )
++
++    cost = DataCostProbe().estimate_tensordict(td)
++
++    assert cost.bytes_by_dtype == {"bool": 2, "float32": 24}
++    assert cost.bytes_by_device == {"cpu": 26}
++
++
++def test_data_cost_probe_handles_nested_tensordict() -> None:
++    td = TensorDict(
++        {
++            "x": torch.ones(2, 3),
++            "nested": TensorDict(
++                {
++                    "mask": torch.ones(2, dtype=torch.bool),
++                },
++                batch_size=(2,),
++            ),
++        },
++        batch_size=(2,),
++    )
++
++    cost = DataCostProbe().estimate_tensordict(td)
++    assert {tensor.key for tensor in cost.tensors} == {"x", "nested.mask"}
++    assert cost.total_tensor_bytes == 24 + 2
++
++
++def test_data_cost_probe_deduplicates_aliased_storage() -> None:
++    base = torch.arange(6, dtype=torch.float32).reshape(2, 3)
++    td = TensorDict(
++        {
++            "left": base,
++            "right": base.view(2, 3),
++        },
++        batch_size=(2,),
++    )
++
++    cost = DataCostProbe().estimate_tensordict(td)
++    assert cost.tensor_count == 1
++    assert cost.total_tensor_bytes == 6 * 4
++    assert cost.bytes_by_dtype == {"float32": 6 * 4}
++
++
++def test_data_cost_probe_handles_zero_batch_size() -> None:
++    td = TensorDict(
++        {
++            "x": torch.empty(0, 3, dtype=torch.float32),
++        },
++        batch_size=(0,),
++    )
++
++    cost = DataCostProbe().estimate_tensordict(td)
++    assert cost.batch_size == 0
++    assert cost.total_tensor_bytes == 0
++    assert cost.bytes_per_row is None
++
++
++def test_data_cost_probe_mapping_skips_non_tensor_values() -> None:
++    cost = DataCostProbe().estimate_mapping(
++        {
++            "x": torch.ones(2, 3),
++            "tag": "not a tensor",
++            "metadata": {"source": "synthetic"},
++        },
++        batch_size=2,
++    )
++
++    assert cost.batch_size == 2
++    assert cost.tensor_count == 1
++    assert cost.total_tensor_bytes == 2 * 3 * 4
++
++
++def test_data_cost_probe_rejects_invalid_inputs() -> None:
++    probe = DataCostProbe()
++    with pytest.raises(TypeError, match="KVBatch"):
++        probe.estimate_kvbatch(object())  # type: ignore[arg-type]
++    with pytest.raises(TypeError, match="TensorDictBase"):
++        probe.estimate_tensordict(object())  # type: ignore[arg-type]
++    with pytest.raises(TypeError, match="Mapping"):
++        probe.estimate_mapping(object())  # type: ignore[arg-type]
++    with pytest.raises(ValueError, match="non-negative"):
++        probe.estimate_mapping({}, batch_size=-1)
+diff --git a/enn_torch_dev/debug/runtime/test_model_cost_probe.py b/enn_torch_dev/debug/runtime/test_model_cost_probe.py
+new file mode 100644
+index 0000000..26f9f5a
+--- /dev/null
++++ b/enn_torch_dev/debug/runtime/test_model_cost_probe.py
+@@ -0,0 +1,156 @@
++from __future__ import annotations
++
++import pytest
++import torch
++
++from enn_torch_dev.runtime import (
++    ModelCostProbe,
++    ResourceSample,
++    RuntimePhase,
++    StepResult,
++    StepStatus,
++)
++
++
++def _sample(
++    phase: str,
++    *,
++    cpu: int | None = None,
++    allocated: int | None = None,
++    reserved: int | None = None,
++    max_allocated: int | None = None,
++    max_reserved: int | None = None,
++) -> ResourceSample:
++    return ResourceSample(
++        timestamp_ns=1,
++        phase=phase,
++        cpu_rss_bytes=cpu,
++        cuda_available=allocated is not None,
++        cuda_device_index=0 if allocated is not None else None,
++        cuda_allocated_bytes=allocated,
++        cuda_reserved_bytes=reserved,
++        cuda_max_allocated_bytes=max_allocated,
++        cuda_max_reserved_bytes=max_reserved,
++    )
++
++
++def _result(samples: tuple[ResourceSample, ...]) -> StepResult:
++    return StepResult(
++        status=StepStatus.SUCCESS,
++        phase=None,
++        batch_size=2,
++        row_ids=torch.tensor([10, 11]),
++        resource_samples=samples,
++    )
++
++
++def test_model_cost_probe_computes_phase_deltas() -> None:
++    result = _result(
++        (
++            _sample("before_step", cpu=100, allocated=10, reserved=20),
++            _sample("after_to_store", cpu=160, allocated=30, reserved=45),
++            _sample("after_forward", cpu=220, allocated=70, reserved=90),
++        )
++    )
++
++    cost = ModelCostProbe().estimate_step(result)
++
++    assert cost.status is StepStatus.SUCCESS
++    assert cost.batch_size == 2
++    assert cost.row_count == 2
++    assert cost.total_cpu_rss_delta_bytes == 120
++    assert cost.total_cuda_allocated_delta_bytes == 60
++    assert cost.total_cuda_reserved_delta_bytes == 70
++    assert len(cost.phase_deltas) == 2
++    assert cost.phase_deltas[0].start_phase == "before_step"
++    assert cost.phase_deltas[0].end_phase == "after_to_store"
++    assert cost.phase_deltas[0].cpu_rss_delta_bytes == 60
++    assert cost.phase_deltas[1].cuda_allocated_delta_bytes == 40
++
++
++def test_model_cost_probe_handles_cuda_none_fields() -> None:
++    result = _result(
++        (
++            _sample("before_step", cpu=100),
++            _sample("after_forward", cpu=130),
++        )
++    )
++
++    cost = ModelCostProbe().estimate_step(result)
++    assert cost.total_cpu_rss_delta_bytes == 30
++    assert cost.total_cuda_allocated_delta_bytes is None
++    assert cost.phase_deltas[0].cuda_allocated_delta_bytes is None
++
++
++def test_model_cost_probe_handles_forward_only_samples() -> None:
++    result = _result(
++        (
++            _sample("before_step", cpu=1),
++            _sample("after_to_store", cpu=3),
++            _sample("after_forward", cpu=8),
++        )
++    )
++
++    cost = ModelCostProbe().estimate_step(result)
++    assert [(d.start_phase, d.end_phase) for d in cost.phase_deltas] == [
++        ("before_step", "after_to_store"),
++        ("after_to_store", "after_forward"),
++    ]
++
++
++def test_model_cost_probe_handles_training_samples() -> None:
++    result = _result(
++        tuple(
++            _sample(phase, cpu=index * 10)
++            for index, phase in enumerate(
++                [
++                    "before_step",
++                    "after_to_store",
++                    "after_zero_grad",
++                    "after_forward",
++                    "after_loss",
++                    "after_backward",
++                    "after_optimizer",
++                ]
++            )
++        )
++    )
++
++    cost = ModelCostProbe().estimate_step(result)
++    assert len(cost.phase_deltas) == 6
++    assert cost.total_cpu_rss_delta_bytes == 60
++    assert cost.phase_deltas[-1].start_phase == "after_backward"
++    assert cost.phase_deltas[-1].end_phase == "after_optimizer"
++
++
++def test_model_cost_probe_handles_fault_truncated_samples() -> None:
++    result = StepResult(
++        status=StepStatus.RUNTIME_FAULT,
++        phase=RuntimePhase.FORWARD,
++        batch_size=2,
++        row_ids=torch.tensor([0, 1]),
++        resource_samples=(
++            _sample("before_step", cpu=10),
++            _sample("after_to_store", cpu=20),
++        ),
++    )
++
++    cost = ModelCostProbe().estimate_step(result)
++    assert cost.status is StepStatus.RUNTIME_FAULT
++    assert len(cost.phase_deltas) == 1
++    assert cost.total_cpu_rss_delta_bytes == 10
++
++
++def test_model_cost_probe_handles_empty_or_single_sample() -> None:
++    empty = ModelCostProbe().estimate_step(_result(()))
++    one = ModelCostProbe().estimate_step(_result((_sample("before_step", cpu=1),)))
++
++    assert empty.phase_deltas == ()
++    assert empty.total_cpu_rss_delta_bytes is None
++    assert one.phase_deltas == ()
++    assert one.total_cpu_rss_delta_bytes is None
++
++
++def test_model_cost_probe_rejects_invalid_input() -> None:
++    with pytest.raises(TypeError, match="StepResult"):
++        ModelCostProbe().estimate_step(object())  # type: ignore[arg-type]
+diff --git a/enn_torch_dev/runtime/__init__.py b/enn_torch_dev/runtime/__init__.py
+index 88caeeb..47acc87 100644
+--- a/enn_torch_dev/runtime/__init__.py
++++ b/enn_torch_dev/runtime/__init__.py
+@@ -2,18 +2,32 @@ from __future__ import annotations
+ 
+ from .faults import ResourceSample, RuntimePhase, StepResult, StepStatus
+ from .footprint import ModelFootprint, OptimizerFootprint
++from .cost import (
++    DataCost,
++    DataCostProbe,
++    ModelCost,
++    ModelCostProbe,
++    ResourceDelta,
++    TensorCost,
++)
+ from .loader import PlainLoader
+ from .resources import ResourceMonitor
+ from .step import RuntimeStep
+ 
+ __all__ = [
++    "DataCost",
++    "DataCostProbe",
+     "ModelFootprint",
++    "ModelCost",
++    "ModelCostProbe",
+     "OptimizerFootprint",
+     "PlainLoader",
+     "ResourceMonitor",
++    "ResourceDelta",
+     "ResourceSample",
+     "RuntimePhase",
+     "RuntimeStep",
+     "StepResult",
+     "StepStatus",
++    "TensorCost",
+ ]
+diff --git a/enn_torch_dev/runtime/cost.py b/enn_torch_dev/runtime/cost.py
+new file mode 100644
+index 0000000..af32145
+--- /dev/null
++++ b/enn_torch_dev/runtime/cost.py
+@@ -0,0 +1,255 @@
++from __future__ import annotations
++
++from collections.abc import Mapping
++from dataclasses import dataclass, field
++
++import torch
++from tensordict import TensorDictBase
++
++from enn_torch_dev.data import KVBatch
++
++from .faults import ResourceSample, StepResult, StepStatus
++
++
++def _dtype_name(dtype: torch.dtype) -> str:
++    return str(dtype).removeprefix("torch.")
++
++
++def _add_count(target: dict[str, int], key: str, value: int) -> None:
++    target[key] = int(target.get(key, 0)) + int(value)
++
++
++def _tensor_nbytes(tensor: torch.Tensor) -> int:
++    try:
++        return int(tensor.untyped_storage().nbytes())
++    except Exception:
++        return int(tensor.numel()) * int(tensor.element_size())
++
++
++def _storage_marker(tensor: torch.Tensor) -> tuple[object, ...]:
++    try:
++        storage = tensor.untyped_storage()
++        data_ptr = int(storage.data_ptr())
++        nbytes = int(storage.nbytes())
++        if data_ptr == 0 and nbytes == 0:
++            return ("empty", str(tensor.device), id(tensor))
++        return ("storage", str(tensor.device), data_ptr)
++    except Exception:
++        try:
++            return (
++                "tensor",
++                str(tensor.device),
++                int(tensor.data_ptr()),
++                int(tensor.storage_offset()),
++            )
++        except Exception:
++            return ("object", id(tensor))
++
++
++def _normalize_key(prefix: str, key: object) -> str:
++    key_text = ".".join(str(part) for part in key) if isinstance(key, tuple) else str(key)
++    if not prefix:
++        return key_text
++    return f"{prefix}.{key_text}"
++
++
++def _iter_tensors(value: object, *, prefix: str = ""):
++    if isinstance(value, torch.Tensor):
++        yield prefix, value
++        return
++    if isinstance(value, TensorDictBase):
++        for key, nested in value.items():
++            yield from _iter_tensors(nested, prefix=_normalize_key(prefix, key))
++        return
++    if isinstance(value, Mapping):
++        for key, nested in value.items():
++            yield from _iter_tensors(nested, prefix=_normalize_key(prefix, key))
++
++
++def _optional_delta(end: int | None, start: int | None) -> int | None:
++    if end is None or start is None:
++        return None
++    return int(end) - int(start)
++
++
++@dataclass(frozen=True, slots=True)
++class TensorCost:
++    key: str
++    dtype: str
++    shape: tuple[int, ...]
++    numel: int
++    element_size: int
++    nbytes: int
++    device: str
++
++
++@dataclass(frozen=True, slots=True)
++class DataCost:
++    batch_size: int
++    tensor_count: int
++    total_tensor_bytes: int
++    bytes_per_row: float | None
++    tensors: tuple[TensorCost, ...]
++    bytes_by_dtype: dict[str, int] = field(default_factory=dict)
++    bytes_by_device: dict[str, int] = field(default_factory=dict)
++
++
++class DataCostProbe:
++    """Estimate tensor memory cost for KVBatch and TensorDict hot paths."""
++
++    def estimate_kvbatch(self, batch: KVBatch) -> DataCost:
++        if not isinstance(batch, KVBatch):
++            raise TypeError("DataCostProbe.estimate_kvbatch expects a KVBatch.")
++        return self.estimate_tensordict(batch.td)
++
++    def estimate_tensordict(self, td: TensorDictBase) -> DataCost:
++        if not isinstance(td, TensorDictBase):
++            raise TypeError("DataCostProbe.estimate_tensordict expects TensorDictBase.")
++        if not td.batch_size:
++            raise ValueError("TensorDict must have a non-empty batch_size.")
++        return self.estimate_mapping(td, batch_size=int(td.batch_size[0]))
++
++    def estimate_mapping(
++        self,
++        mapping: Mapping[str, object] | TensorDictBase,
++        *,
++        batch_size: int | None = None,
++    ) -> DataCost:
++        if not isinstance(mapping, (Mapping, TensorDictBase)):
++            raise TypeError("DataCostProbe.estimate_mapping expects a Mapping.")
++        if batch_size is not None and (
++            not isinstance(batch_size, int) or isinstance(batch_size, bool)
++        ):
++            raise TypeError("batch_size must be an integer or None.")
++        if batch_size is not None and batch_size < 0:
++            raise ValueError("batch_size must be non-negative.")
++
++        inferred_batch_size = batch_size
++        seen: set[tuple[object, ...]] = set()
++        tensor_costs: list[TensorCost] = []
++        bytes_by_dtype: dict[str, int] = {}
++        bytes_by_device: dict[str, int] = {}
++        total_tensor_bytes = 0
++
++        for key, value in mapping.items():
++            for tensor_key, tensor in _iter_tensors(value, prefix=str(key)):
++                if inferred_batch_size is None and tensor.ndim > 0:
++                    inferred_batch_size = int(tensor.shape[0])
++                marker = _storage_marker(tensor)
++                if marker in seen:
++                    continue
++                seen.add(marker)
++
++                dtype = _dtype_name(tensor.dtype)
++                device = str(tensor.device)
++                nbytes = _tensor_nbytes(tensor)
++                cost = TensorCost(
++                    key=tensor_key,
++                    dtype=dtype,
++                    shape=tuple(int(dim) for dim in tensor.shape),
++                    numel=int(tensor.numel()),
++                    element_size=int(tensor.element_size()),
++                    nbytes=nbytes,
++                    device=device,
++                )
++                tensor_costs.append(cost)
++                total_tensor_bytes += nbytes
++                _add_count(bytes_by_dtype, dtype, nbytes)
++                _add_count(bytes_by_device, device, nbytes)
++
++        final_batch_size = int(inferred_batch_size or 0)
++        bytes_per_row = (
++            float(total_tensor_bytes) / float(final_batch_size)
++            if final_batch_size > 0
++            else None
++        )
++        return DataCost(
++            batch_size=final_batch_size,
++            tensor_count=len(tensor_costs),
++            total_tensor_bytes=total_tensor_bytes,
++            bytes_per_row=bytes_per_row,
++            tensors=tuple(tensor_costs),
++            bytes_by_dtype=dict(sorted(bytes_by_dtype.items())),
++            bytes_by_device=dict(sorted(bytes_by_device.items())),
++        )
++
++
++@dataclass(frozen=True, slots=True)
++class ResourceDelta:
++    start_phase: str
++    end_phase: str
++    cpu_rss_delta_bytes: int | None = None
++    cuda_allocated_delta_bytes: int | None = None
++    cuda_reserved_delta_bytes: int | None = None
++    cuda_max_allocated_delta_bytes: int | None = None
++    cuda_max_reserved_delta_bytes: int | None = None
++
++
++@dataclass(frozen=True, slots=True)
++class ModelCost:
++    status: StepStatus
++    batch_size: int
++    row_count: int
++    total_cpu_rss_delta_bytes: int | None
++    total_cuda_allocated_delta_bytes: int | None
++    total_cuda_reserved_delta_bytes: int | None
++    total_cuda_max_allocated_delta_bytes: int | None
++    total_cuda_max_reserved_delta_bytes: int | None
++    phase_deltas: tuple[ResourceDelta, ...]
++
++
++class ModelCostProbe:
++    """Estimate per-step resource deltas from RuntimeStep samples."""
++
++    def estimate_step(self, result: StepResult) -> ModelCost:
++        if not isinstance(result, StepResult):
++            raise TypeError("ModelCostProbe.estimate_step expects a StepResult.")
++        samples = tuple(result.resource_samples)
++        phase_deltas = tuple(
++            self._delta_pair(start, end)
++            for start, end in zip(samples, samples[1:])
++        )
++        total = self._delta_pair(samples[0], samples[-1]) if len(samples) >= 2 else None
++        return ModelCost(
++            status=result.status,
++            batch_size=result.batch_size,
++            row_count=int(result.row_ids.numel()),
++            total_cpu_rss_delta_bytes=None if total is None else total.cpu_rss_delta_bytes,
++            total_cuda_allocated_delta_bytes=(
++                None if total is None else total.cuda_allocated_delta_bytes
++            ),
++            total_cuda_reserved_delta_bytes=(
++                None if total is None else total.cuda_reserved_delta_bytes
++            ),
++            total_cuda_max_allocated_delta_bytes=(
++                None if total is None else total.cuda_max_allocated_delta_bytes
++            ),
++            total_cuda_max_reserved_delta_bytes=(
++                None if total is None else total.cuda_max_reserved_delta_bytes
++            ),
++            phase_deltas=phase_deltas,
++        )
++
++    @staticmethod
++    def _delta_pair(start: ResourceSample, end: ResourceSample) -> ResourceDelta:
++        return ResourceDelta(
++            start_phase=start.phase,
++            end_phase=end.phase,
++            cpu_rss_delta_bytes=_optional_delta(end.cpu_rss_bytes, start.cpu_rss_bytes),
++            cuda_allocated_delta_bytes=_optional_delta(
++                end.cuda_allocated_bytes,
++                start.cuda_allocated_bytes,
++            ),
++            cuda_reserved_delta_bytes=_optional_delta(
++                end.cuda_reserved_bytes,
++                start.cuda_reserved_bytes,
++            ),
++            cuda_max_allocated_delta_bytes=_optional_delta(
++                end.cuda_max_allocated_bytes,
++                start.cuda_max_allocated_bytes,
++            ),
++            cuda_max_reserved_delta_bytes=_optional_delta(
++                end.cuda_max_reserved_bytes,
++                start.cuda_max_reserved_bytes,
++            ),
++        )
