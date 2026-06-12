@@ -25,6 +25,19 @@ class RuntimePhase(Enum):
 
 
 @dataclass(frozen=True, slots=True)
+class ResourceSample:
+    timestamp_ns: int
+    phase: str
+    cpu_rss_bytes: int | None = None
+    cuda_available: bool = False
+    cuda_device_index: int | None = None
+    cuda_allocated_bytes: int | None = None
+    cuda_reserved_bytes: int | None = None
+    cuda_max_allocated_bytes: int | None = None
+    cuda_max_reserved_bytes: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class StepResult:
     status: StepStatus
     phase: RuntimePhase | None
@@ -34,6 +47,7 @@ class StepResult:
     store: KVStore | None = None
     error_type: str | None = None
     error_message: str | None = None
+    resource_samples: tuple[ResourceSample, ...] = ()
 
     @property
     def ok(self) -> bool:

@@ -7,7 +7,8 @@ import torch
 from enn_torch_dev.data import DataSchema, KVBatch
 from enn_torch_dev.executor import GraphExecutor, KVStore
 
-from .faults import RuntimePhase, StepResult, StepStatus
+from .faults import ResourceSample, RuntimePhase, StepResult, StepStatus
+from .resources import ResourceMonitor
 
 
 LossFn = Callable[[KVStore], torch.Tensor]
@@ -30,6 +31,7 @@ def _make_result(
     loss: torch.Tensor | None = None,
     store: KVStore | None = None,
     error: BaseException | None = None,
+    resource_samples: list[ResourceSample] | None = None,
 ) -> StepResult:
     return StepResult(
         status=status,
@@ -40,6 +42,7 @@ def _make_result(
         store=store,
         error_type=None if error is None else type(error).__name__,
         error_message=None if error is None else str(error),
+        resource_samples=tuple(resource_samples or ()),
     )
 
 
@@ -59,6 +62,7 @@ class RuntimeStep:
         loss_fn: LossFn | None = None,
         optimizer: torch.optim.Optimizer | None = None,
         zero_grad: bool = True,
+        resource_monitor: ResourceMonitor | None = None,
         raise_unknown: bool = True,
     ) -> None:
         if not isinstance(executor, GraphExecutor):
@@ -73,6 +77,11 @@ class RuntimeStep:
             )
         if not isinstance(zero_grad, bool):
             raise TypeError("RuntimeStep.zero_grad must be a bool.")
+        if resource_monitor is not None and not isinstance(
+            resource_monitor,
+            ResourceMonitor,
+        ):
+            raise TypeError("RuntimeStep.resource_monitor must be a ResourceMonitor or None.")
         if not isinstance(raise_unknown, bool):
             raise TypeError("RuntimeStep.raise_unknown must be a bool.")
 
@@ -81,7 +90,17 @@ class RuntimeStep:
         self.loss_fn = loss_fn
         self.optimizer = optimizer
         self.zero_grad = zero_grad
+        self.resource_monitor = resource_monitor
         self.raise_unknown = raise_unknown
+
+    def _sample_resource(
+        self,
+        samples: list[ResourceSample],
+        phase: str,
+    ) -> None:
+        if self.resource_monitor is None:
+            return
+        samples.append(self.resource_monitor.sample(phase))
 
     def _exception_result(
         self,
@@ -91,6 +110,7 @@ class RuntimeStep:
         error: BaseException,
         store: KVStore | None = None,
         loss: torch.Tensor | None = None,
+        resource_samples: list[ResourceSample] | None = None,
     ) -> StepResult:
         if _is_oom_error(error):
             return _make_result(
@@ -100,6 +120,7 @@ class RuntimeStep:
                 loss=loss,
                 store=store,
                 error=error,
+                resource_samples=resource_samples,
             )
         if phase is RuntimePhase.TO_STORE and isinstance(
             error,
@@ -112,6 +133,7 @@ class RuntimeStep:
                 loss=loss,
                 store=store,
                 error=error,
+                resource_samples=resource_samples,
             )
         if self.raise_unknown:
             raise error
@@ -122,17 +144,27 @@ class RuntimeStep:
             loss=loss,
             store=store,
             error=error,
+            resource_samples=resource_samples,
         )
 
     def run(self, batch: KVBatch) -> StepResult:
         if not isinstance(batch, KVBatch):
             raise TypeError("RuntimeStep.run expects a KVBatch.")
 
+        resource_samples: list[ResourceSample] = []
+        self._sample_resource(resource_samples, "before_step")
+
         phase = RuntimePhase.TO_STORE
         try:
             store = batch.to_store(self.schema)
         except Exception as exc:
-            return self._exception_result(batch=batch, phase=phase, error=exc)
+            return self._exception_result(
+                batch=batch,
+                phase=phase,
+                error=exc,
+                resource_samples=resource_samples,
+            )
+        self._sample_resource(resource_samples, "after_to_store")
 
         if self.optimizer is not None and self.zero_grad:
             phase = RuntimePhase.OPTIMIZER
@@ -144,7 +176,9 @@ class RuntimeStep:
                     phase=phase,
                     store=store,
                     error=exc,
+                    resource_samples=resource_samples,
                 )
+            self._sample_resource(resource_samples, "after_zero_grad")
 
         phase = RuntimePhase.FORWARD
         try:
@@ -155,7 +189,9 @@ class RuntimeStep:
                 phase=phase,
                 store=store,
                 error=exc,
+                resource_samples=resource_samples,
             )
+        self._sample_resource(resource_samples, "after_forward")
 
         loss: torch.Tensor | None = None
         if self.loss_fn is not None:
@@ -167,6 +203,7 @@ class RuntimeStep:
                         "RuntimeStep.loss_fn must return a torch.Tensor, "
                         f"got {type(loss)!r}."
                     )
+                self._sample_resource(resource_samples, "after_loss")
                 if not bool(torch.isfinite(loss.detach()).all()):
                     return _make_result(
                         status=StepStatus.NONFINITE_FAULT,
@@ -174,6 +211,7 @@ class RuntimeStep:
                         batch=batch,
                         loss=loss,
                         store=store,
+                        resource_samples=resource_samples,
                     )
             except Exception as exc:
                 return self._exception_result(
@@ -182,6 +220,7 @@ class RuntimeStep:
                     loss=loss,
                     store=store,
                     error=exc,
+                    resource_samples=resource_samples,
                 )
 
         if loss is not None and self.optimizer is not None:
@@ -195,7 +234,9 @@ class RuntimeStep:
                     loss=loss,
                     store=store,
                     error=exc,
+                    resource_samples=resource_samples,
                 )
+            self._sample_resource(resource_samples, "after_backward")
 
             phase = RuntimePhase.OPTIMIZER
             try:
@@ -207,7 +248,9 @@ class RuntimeStep:
                     loss=loss,
                     store=store,
                     error=exc,
+                    resource_samples=resource_samples,
                 )
+            self._sample_resource(resource_samples, "after_optimizer")
 
         return _make_result(
             status=StepStatus.SUCCESS,
@@ -215,4 +258,5 @@ class RuntimeStep:
             batch=batch,
             loss=loss,
             store=store,
+            resource_samples=resource_samples,
         )
