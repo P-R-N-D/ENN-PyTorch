@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+
 import pytest
 import torch
 from torch import nn
@@ -142,6 +144,79 @@ def test_reader_iter_batches_drop_last(tmp_path) -> None:
     assert [batch.batch_size for batch in batches] == [3, 3]
     assert torch.equal(batches[0].row_ids, payload["row_id"][0:3])
     assert torch.equal(batches[1].row_ids, payload["row_id"][3:6])
+
+
+def test_reader_skips_absent_optional_mapped_field(tmp_path) -> None:
+    root = tmp_path / "stage"
+    features = torch.arange(12, dtype=torch.float32).reshape(4, 3)
+    TensorDictStagingWriter(
+        StagingSpec(root=root, schema=_schema()),
+    ).write({"features": features})
+
+    reader = TensorDictReader(root)
+    assert reader.schema.key_mapping == _schema().key_mapping
+    labels_manifest = reader.manifest.fields[1]
+    assert labels_manifest.name == "labels"
+    assert labels_manifest.storage_key is None
+    assert labels_manifest.storage_shape is None
+
+    batch = reader.get_kvbatch(torch.tensor([0, 1]))
+    batch.validate_schema(reader.schema)
+    store = batch.to_store(reader.schema)
+
+    assert torch.equal(store.get("x"), features[:2])
+    assert not store.has("y")
+
+
+def test_reader_rejects_required_manifest_field_without_storage(tmp_path) -> None:
+    root = tmp_path / "stage"
+    TensorDictStagingWriter(
+        StagingSpec(root=root, schema=_schema()),
+    ).write(_payload())
+    manifest_path = root / "manifest.json"
+    payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    payload["fields"][0]["storage_key"] = None
+    payload["fields"][0]["storage_shape"] = None
+    manifest_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="Required manifest field"):
+        TensorDictReader(root)
+
+
+def test_reader_rejects_bool_tensor_indices(tmp_path) -> None:
+    reader, _payload = _stage(tmp_path)
+    indices = torch.tensor([True, False, True])
+
+    with pytest.raises(TypeError, match="bool"):
+        reader.get_rows(indices)
+
+
+def test_reader_rejects_bool_tensor_row_id_indices(tmp_path) -> None:
+    reader, _payload = _stage(tmp_path)
+    indices = torch.tensor([True, False, True])
+
+    with pytest.raises(TypeError, match="bool"):
+        reader.get_row_ids(indices)
+
+
+def test_reader_get_rows_empty_slice_has_zero_batch_size(tmp_path) -> None:
+    reader, _payload = _stage(tmp_path)
+
+    td = reader.get_rows(slice(0, 0))
+
+    assert td.batch_size == torch.Size([0])
+    assert td["features"].shape == torch.Size([0, 3])
+    assert td["labels"].shape == torch.Size([0, 1])
+
+
+def test_reader_get_kvbatch_empty_slice_has_zero_batch_size(tmp_path) -> None:
+    reader, _payload = _stage(tmp_path)
+
+    batch = reader.get_kvbatch(slice(0, 0))
+
+    assert batch.batch_size == 0
+    assert batch.td.batch_size == torch.Size([0])
+    assert batch.row_ids.shape == torch.Size([0])
 
 
 def test_reader_rejects_out_of_range_indices(tmp_path) -> None:

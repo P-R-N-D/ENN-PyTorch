@@ -33,6 +33,8 @@ def _normalize_indices(
             indices = indices.reshape(1)
         if indices.ndim != 1:
             raise ValueError("indices tensor must be 1-D.")
+        if indices.dtype == torch.bool:
+            raise TypeError("indices tensor must not use torch.bool dtype.")
         if not indices.dtype.is_floating_point and not indices.dtype.is_complex:
             index_tensor = indices.detach().cpu().to(torch.long)
         else:
@@ -48,7 +50,7 @@ def _normalize_indices(
 
 def _batch_size_from_indices(indices: torch.Tensor | slice, *, num_rows: int) -> int:
     if isinstance(indices, slice):
-        return len(range(indices.start or 0, indices.stop or num_rows, indices.step or 1))
+        return len(range(indices.start, indices.stop, indices.step))
     return int(indices.numel())
 
 
@@ -57,10 +59,7 @@ class TensorDictReader:
         self._root = Path(root)
         self._manifest = DatasetManifest.from_json(self._root / "manifest.json")
         self._schema = self._manifest.to_schema()
-        self._fields = {
-            field.name: self._load_field(field)
-            for field in self._manifest.fields
-        }
+        self._fields = self._load_fields()
         self._row_ids = self._load_row_ids()
 
     @property
@@ -79,16 +78,21 @@ class TensorDictReader:
     def num_rows(self) -> int:
         return self._manifest.num_rows
 
-    def _load_field(self, field: TensorFieldManifest):
-        if field.storage_key is None:
-            raise ValueError(f"Manifest field {field.name!r} has no storage_key.")
-        if field.storage_shape is None:
-            raise ValueError(f"Manifest field {field.name!r} has no storage_shape.")
-        return load_memmap_tensor(
-            resolve_storage_path(self._root, field.storage_key),
-            dtype=_dtype_from_name(field.dtype),
-            shape=field.storage_shape,
-        )
+    def _load_fields(self) -> dict[str, object]:
+        fields: dict[str, object] = {}
+        for field in self._manifest.fields:
+            if field.storage_key is None or field.storage_shape is None:
+                if field.required:
+                    raise ValueError(
+                        f"Required manifest field {field.name!r} has no storage."
+                    )
+                continue
+            fields[field.name] = load_memmap_tensor(
+                resolve_storage_path(self._root, field.storage_key),
+                dtype=_dtype_from_name(field.dtype),
+                shape=field.storage_shape,
+            )
+        return fields
 
     def _load_row_ids(self):
         row_id_storage_key = self._manifest.metadata.get("row_id_storage_key")

@@ -134,7 +134,7 @@ class TensorDictStagingWriter:
                 "and must not be declared as a DataSchema field."
             )
 
-        stored_fields: list[tuple[FieldSpec, torch.Tensor]] = []
+        stored_tensors: dict[str, torch.Tensor] = {}
         num_rows: int | None = None
         for field_spec in schema.fields:
             _validate_batch_axis(field_spec)
@@ -152,7 +152,7 @@ class TensorDictStagingWriter:
                     "All staged fields must have the same row count; "
                     f"{field_spec.name!r} has {field_rows}, expected {num_rows}."
                 )
-            stored_fields.append((field_spec, tensor))
+            stored_tensors[field_spec.name] = tensor
 
         if num_rows is None:
             raise ValueError("No schema-declared tensor fields were provided for staging.")
@@ -169,7 +169,23 @@ class TensorDictStagingWriter:
         _prepare_root(root, overwrite=self._spec.overwrite)
 
         field_manifests: list[TensorFieldManifest] = []
-        for field_spec, tensor in stored_fields:
+        for field_spec in schema.fields:
+            tensor = stored_tensors.get(field_spec.name)
+            if tensor is None:
+                field_manifests.append(
+                    TensorFieldManifest(
+                        name=field_spec.name,
+                        dtype=field_spec.dtype_name(),
+                        shape=field_spec.shape,
+                        batch_axis=field_spec.batch_axis,
+                        storage_key=None,
+                        storage_shape=None,
+                        required=field_spec.required,
+                        role=field_spec.role,
+                    )
+                )
+                continue
+
             storage_key = tensor_storage_key(field_spec.name)
             write_memmap_tensor(
                 tensor,

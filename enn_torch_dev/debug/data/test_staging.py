@@ -81,6 +81,22 @@ def test_staging_rejects_missing_required_field(tmp_path) -> None:
         ).write(payload)
 
 
+def test_staging_preserves_absent_optional_field_in_manifest(tmp_path) -> None:
+    root = tmp_path / "stage"
+    payload = {"features": _payload()["features"]}
+
+    result = TensorDictStagingWriter(
+        StagingSpec(root=root, schema=_schema()),
+    ).write(payload)
+
+    assert [field.name for field in result.manifest.fields] == ["features", "labels", "mask"]
+    labels_manifest = result.manifest.fields[1]
+    assert labels_manifest.required is False
+    assert labels_manifest.storage_key is None
+    assert labels_manifest.storage_shape is None
+    assert result.manifest.key_mapping == _schema().key_mapping
+
+
 def test_staging_rejects_dtype_mismatch(tmp_path) -> None:
     payload = _payload()
     payload["features"] = payload["features"].to(torch.float64)

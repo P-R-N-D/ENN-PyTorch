@@ -106,8 +106,8 @@ class KVBatch:
         if not td.batch_size:
             raise ValueError("KVBatch TensorDict must have a non-empty batch_size.")
         batch_size = int(td.batch_size[0])
-        if batch_size <= 0:
-            raise ValueError("KVBatch batch_size must be positive.")
+        if batch_size < 0:
+            raise ValueError("KVBatch batch_size must be non-negative.")
         return batch_size
 
     @property
