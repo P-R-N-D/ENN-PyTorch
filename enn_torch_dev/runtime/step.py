@@ -131,13 +131,25 @@ class RuntimeStep:
         phase = RuntimePhase.TO_STORE
         try:
             store = batch.to_store(self.schema)
-        except BaseException as exc:
+        except Exception as exc:
             return self._exception_result(batch=batch, phase=phase, error=exc)
+
+        if self.optimizer is not None and self.zero_grad:
+            phase = RuntimePhase.OPTIMIZER
+            try:
+                self.optimizer.zero_grad(set_to_none=True)
+            except Exception as exc:
+                return self._exception_result(
+                    batch=batch,
+                    phase=phase,
+                    store=store,
+                    error=exc,
+                )
 
         phase = RuntimePhase.FORWARD
         try:
             self.executor.run(store)
-        except BaseException as exc:
+        except Exception as exc:
             return self._exception_result(
                 batch=batch,
                 phase=phase,
@@ -163,7 +175,7 @@ class RuntimeStep:
                         loss=loss,
                         store=store,
                     )
-            except BaseException as exc:
+            except Exception as exc:
                 return self._exception_result(
                     batch=batch,
                     phase=phase,
@@ -173,23 +185,10 @@ class RuntimeStep:
                 )
 
         if loss is not None and self.optimizer is not None:
-            if self.zero_grad:
-                phase = RuntimePhase.OPTIMIZER
-                try:
-                    self.optimizer.zero_grad(set_to_none=True)
-                except BaseException as exc:
-                    return self._exception_result(
-                        batch=batch,
-                        phase=phase,
-                        loss=loss,
-                        store=store,
-                        error=exc,
-                    )
-
             phase = RuntimePhase.BACKWARD
             try:
                 loss.backward()
-            except BaseException as exc:
+            except Exception as exc:
                 return self._exception_result(
                     batch=batch,
                     phase=phase,
@@ -201,7 +200,7 @@ class RuntimeStep:
             phase = RuntimePhase.OPTIMIZER
             try:
                 self.optimizer.step()
-            except BaseException as exc:
+            except Exception as exc:
                 return self._exception_result(
                     batch=batch,
                     phase=phase,

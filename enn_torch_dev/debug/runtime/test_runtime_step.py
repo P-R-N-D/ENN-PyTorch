@@ -30,6 +30,28 @@ class _RaiseUnknown(nn.Module):
         raise RuntimeError("unknown failure")
 
 
+class _GradCheckingLinear(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.weight = nn.Parameter(torch.full((1, 3), 0.1))
+        self.check_grad_is_none = False
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.check_grad_is_none and self.weight.grad is not None:
+            raise AssertionError("stale gradient was not cleared before forward")
+        return x @ self.weight.t()
+
+
+class _RaiseKeyboardInterrupt(nn.Module):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        raise KeyboardInterrupt
+
+
+class _RaiseSystemExit(nn.Module):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        raise SystemExit
+
+
 def _schema() -> DataSchema:
     return DataSchema(
         schema_id="runtime.step",
@@ -115,6 +137,34 @@ def test_runtime_step_loss_backward_optimizer_success() -> None:
     assert result.loss is not None
     assert torch.isfinite(result.loss.detach())
     assert not torch.equal(model.weight.detach(), before)
+
+
+def test_runtime_step_clears_stale_gradients_before_forward() -> None:
+    model = _GradCheckingLinear()
+    graph = _graph(model)
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
+    labels = torch.ones(2, 1, dtype=torch.float32)
+    batch = _batch(labels=labels)
+
+    def loss_fn(store):
+        return torch.nn.functional.mse_loss(store.get("pred"), store.get("y"))
+
+    step = RuntimeStep(
+        graph,
+        schema=_schema(),
+        loss_fn=loss_fn,
+        optimizer=optimizer,
+    )
+
+    first = step.run(batch)
+
+    assert first.status is StepStatus.SUCCESS
+    assert model.weight.grad is not None
+
+    model.check_grad_is_none = True
+    second = step.run(batch)
+
+    assert second.status is StepStatus.SUCCESS
 
 
 def test_runtime_step_preserves_row_ids_on_success() -> None:
@@ -222,6 +272,24 @@ def test_runtime_step_unknown_exception_can_return_runtime_fault() -> None:
     assert result.status is StepStatus.RUNTIME_FAULT
     assert result.phase is RuntimePhase.FORWARD
     assert result.error_type == "RuntimeError"
+
+
+def test_runtime_step_keyboard_interrupt_is_not_swallowed() -> None:
+    with pytest.raises(KeyboardInterrupt):
+        RuntimeStep(
+            _graph(_RaiseKeyboardInterrupt()),
+            schema=_schema(),
+            raise_unknown=False,
+        ).run(_batch())
+
+
+def test_runtime_step_system_exit_is_not_swallowed() -> None:
+    with pytest.raises(SystemExit):
+        RuntimeStep(
+            _graph(_RaiseSystemExit()),
+            schema=_schema(),
+            raise_unknown=False,
+        ).run(_batch())
 
 
 def test_runtime_step_rejects_non_kvbatch() -> None:

@@ -42,10 +42,11 @@ Those features need a stable step boundary before they can be tuned safely.
 `RuntimeStep` runs one `KVBatch` through:
 
 1. `KVBatch.to_store(schema)`;
-2. `GraphExecutor.run(store)`;
-3. optional `loss_fn(store)`;
-4. optional `loss.backward()`;
-5. optional `optimizer.step()`.
+2. optional `optimizer.zero_grad(set_to_none=True)` before forward;
+3. `GraphExecutor.run(store)`;
+4. optional `loss_fn(store)`;
+5. optional `loss.backward()`;
+6. optional `optimizer.step()`.
 
 `loss_fn(store)` is intentionally store-based so graph outputs, labels, masks,
 and future metadata can be read without coupling the runtime to one model
