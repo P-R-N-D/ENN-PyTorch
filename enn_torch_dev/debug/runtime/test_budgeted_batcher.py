@@ -87,13 +87,13 @@ def test_budgeted_batcher_adds_cost_hint_with_probe() -> None:
     batches = list(
         BudgetedBatcher(
             [batch],
-            BatchBudget(max_host_bytes=64),
+            BatchBudget(max_host_bytes=80),
             cost_probe=DataCostProbe(),
         )
     )
 
     assert batches[0].cost_hint is not None
-    assert batches[0].cost_hint.host_bytes == 32
+    assert batches[0].cost_hint.host_bytes == 80
     assert batches[0].cost_hint.device_bytes == 0
     assert batches[0].cost_hint.num_items == 2
 
@@ -104,17 +104,96 @@ def test_budgeted_batcher_materializes_byte_budget_slices_for_probe() -> None:
     batches = list(
         BudgetedBatcher(
             [batch],
-            BatchBudget(max_host_bytes=20),
+            BatchBudget(max_host_bytes=40),
             cost_probe=DataCostProbe(),
         )
     )
 
     assert [subbatch.batch_size for subbatch in batches] == [1, 1, 1, 1, 1]
-    assert [subbatch.cost_hint.host_bytes for subbatch in batches] == [16, 16, 16, 16, 16]
+    assert [subbatch.cost_hint.host_bytes for subbatch in batches] == [
+        40,
+        40,
+        40,
+        40,
+        40,
+    ]
     assert torch.equal(
         torch.cat([subbatch.row_ids for subbatch in batches]),
         batch.row_ids,
     )
+
+
+def test_budgeted_batcher_scales_cost_hint_for_byte_budget_without_probe() -> None:
+    cost_hint = BatchCost(
+        host_bytes=101,
+        device_bytes=0,
+        num_items=5,
+        num_tokens=11,
+        num_tiles=6,
+    )
+    batch = _batch(5, cost_hint=cost_hint)
+
+    batches = list(BudgetedBatcher([batch], BatchBudget(max_host_bytes=21)))
+
+    assert [subbatch.batch_size for subbatch in batches] == [1, 1, 1, 1, 1]
+    assert [subbatch.cost_hint.host_bytes for subbatch in batches] == [
+        21,
+        21,
+        21,
+        21,
+        21,
+    ]
+    assert [subbatch.cost_hint.num_items for subbatch in batches] == [1, 1, 1, 1, 1]
+    assert [subbatch.cost_hint.num_tokens for subbatch in batches] == [3, 3, 3, 3, 3]
+    assert [subbatch.cost_hint.num_tiles for subbatch in batches] == [2, 2, 2, 2, 2]
+
+
+def test_budgeted_batcher_uses_probe_when_cost_hint_lacks_required_byte_field() -> None:
+    batch = _batch(5, cost_hint=BatchCost(num_items=5))
+
+    batches = list(
+        BudgetedBatcher(
+            [batch],
+            BatchBudget(max_host_bytes=40),
+            cost_probe=DataCostProbe(),
+        )
+    )
+
+    assert [subbatch.batch_size for subbatch in batches] == [1, 1, 1, 1, 1]
+    assert [subbatch.cost_hint.host_bytes for subbatch in batches] == [
+        40,
+        40,
+        40,
+        40,
+        40,
+    ]
+
+
+def test_budgeted_batcher_probe_cost_includes_identity_tensors() -> None:
+    batch = _batch(2)
+
+    batches = list(
+        BudgetedBatcher(
+            [batch],
+            BatchBudget(max_host_bytes=80),
+            cost_probe=DataCostProbe(),
+        )
+    )
+
+    assert batches[0].cost_hint.host_bytes == 80
+
+
+def test_budgeted_batcher_identity_tensors_can_exceed_byte_budget() -> None:
+    batch = _batch(1)
+
+    with pytest.raises(BatchBudgetExceeded, match="host_bytes"):
+        list(
+            BudgetedBatcher(
+                [batch],
+                BatchBudget(max_host_bytes=39),
+                cost_probe=DataCostProbe(),
+            )
+        )
 
 
 def test_budgeted_batcher_prefers_existing_cost_hint() -> None:

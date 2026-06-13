@@ -3,6 +3,8 @@ from __future__ import annotations
 from collections.abc import Iterable, Iterator
 from dataclasses import dataclass, replace
 
+import torch
+
 from enn_torch_dev.data import BatchCost, KVBatch
 
 from .cost import DataCost, DataCostProbe
@@ -18,7 +20,20 @@ def _validate_optional_limit(value: object, label: str) -> int | None:
     return value
 
 
-def _batch_cost_from_data_cost(data_cost: DataCost) -> BatchCost:
+def _tensor_payload_bytes(tensor: torch.Tensor) -> int:
+    return int(tensor.numel()) * int(tensor.element_size())
+
+
+def _identity_host_bytes(batch: KVBatch) -> int:
+    total = _tensor_payload_bytes(batch.row_ids)
+    if batch.source_ids is not None:
+        total += _tensor_payload_bytes(batch.source_ids)
+    if batch.sample_ids is not None:
+        total += _tensor_payload_bytes(batch.sample_ids)
+    return total
+
+
+def _batch_cost_from_data_cost(data_cost: DataCost, batch: KVBatch) -> BatchCost:
     host_bytes = sum(
         nbytes for device, nbytes in data_cost.bytes_by_device.items() if device == "cpu"
     )
@@ -26,9 +41,27 @@ def _batch_cost_from_data_cost(data_cost: DataCost) -> BatchCost:
         nbytes for device, nbytes in data_cost.bytes_by_device.items() if device != "cpu"
     )
     return BatchCost(
-        host_bytes=host_bytes,
+        host_bytes=host_bytes + _identity_host_bytes(batch),
         device_bytes=device_bytes,
         num_items=data_cost.batch_size,
+    )
+
+
+def _ceil_scaled(value: int | None, numerator: int, denominator: int) -> int | None:
+    if value is None:
+        return None
+    return (value * numerator + denominator - 1) // denominator
+
+
+def _scale_batch_cost(cost: BatchCost, *, batch_size: int, parent_size: int) -> BatchCost:
+    if parent_size <= 0:
+        return BatchCost(num_items=batch_size)
+    return BatchCost(
+        host_bytes=_ceil_scaled(cost.host_bytes, batch_size, parent_size),
+        device_bytes=_ceil_scaled(cost.device_bytes, batch_size, parent_size),
+        num_items=batch_size,
+        num_tokens=_ceil_scaled(cost.num_tokens, batch_size, parent_size),
+        num_tiles=_ceil_scaled(cost.num_tiles, batch_size, parent_size),
     )
 
 
@@ -140,10 +173,12 @@ class BudgetedBatcher:
             yield from self._yield_budgeted(subbatch)
 
     def _attach_cost_if_needed(self, batch: KVBatch) -> tuple[KVBatch, BatchCost]:
-        if batch.cost_hint is not None:
+        if batch.cost_hint is not None and not self._missing_required_fields(batch.cost_hint):
             cost = batch.cost_hint
         elif self.cost_probe is not None:
-            cost = _batch_cost_from_data_cost(self.cost_probe.estimate_kvbatch(batch))
+            cost = _batch_cost_from_data_cost(self.cost_probe.estimate_kvbatch(batch), batch)
+        elif batch.cost_hint is not None:
+            cost = batch.cost_hint
         else:
             cost = BatchCost(num_items=batch.batch_size)
 
@@ -152,7 +187,7 @@ class BudgetedBatcher:
             return batch, cost
         return replace(batch, cost_hint=cost), cost
 
-    def _validate_cost_fields(self, cost: BatchCost) -> None:
+    def _missing_required_fields(self, cost: BatchCost) -> list[str]:
         missing: list[str] = []
         if self.budget.max_host_bytes is not None and cost.host_bytes is None:
             missing.append("host_bytes")
@@ -160,6 +195,10 @@ class BudgetedBatcher:
             missing.append("device_bytes")
         if self.budget.max_items is not None and cost.num_items is None:
             missing.append("num_items")
+        return missing
+
+    def _validate_cost_fields(self, cost: BatchCost) -> None:
+        missing = self._missing_required_fields(cost)
         if missing:
             raise ValueError(
                 "BatchBudget requires cost fields that are not available: "
@@ -194,7 +233,14 @@ class BudgetedBatcher:
         target_size = self._target_split_size(batch, cost)
         for start in range(0, batch.batch_size, target_size):
             end = min(start + target_size, batch.batch_size)
-            yield _slice_kvbatch(batch, start, end)
+            cost_hint = None
+            if self.cost_probe is None and batch.cost_hint is not None:
+                cost_hint = _scale_batch_cost(
+                    cost,
+                    batch_size=end - start,
+                    parent_size=batch.batch_size,
+                )
+            yield _slice_kvbatch(batch, start, end, cost_hint=cost_hint)
 
     def _target_split_size(self, batch: KVBatch, cost: BatchCost) -> int:
         target_size = batch.batch_size
@@ -244,7 +290,13 @@ class BudgetedBatcher:
         )
 
 
-def _slice_kvbatch(batch: KVBatch, start: int, end: int) -> KVBatch:
+def _slice_kvbatch(
+    batch: KVBatch,
+    start: int,
+    end: int,
+    *,
+    cost_hint: BatchCost | None = None,
+) -> KVBatch:
     td = batch.td[start:end].clone(recurse=True)
     return KVBatch(
         td=td,
@@ -253,5 +305,5 @@ def _slice_kvbatch(batch: KVBatch, start: int, end: int) -> KVBatch:
         sample_ids=None if batch.sample_ids is None else batch.sample_ids[start:end],
         schema_id=batch.schema_id,
         shard_id=batch.shard_id,
-        cost_hint=None,
+        cost_hint=cost_hint,
     )
