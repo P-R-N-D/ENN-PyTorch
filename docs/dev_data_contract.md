@@ -77,6 +77,6 @@ python -m pytest enn_torch_dev/debug
 1. TensorDict and MemoryMappedTensor staging.
 2. Plain loader plus `RuntimeStep` fault classification.
 3. Model footprint and resource monitoring.
-4. SPDL static tensor pipeline.
+4. SPDL tensor adapter and static tensor pipeline.
 5. Telemetry and `run_profile.json`.
 6. AutoGovernor, BudgetedBatcher, recovery, precision runtime, and sharding.
