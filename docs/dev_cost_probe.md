@@ -132,8 +132,8 @@ python -m pytest enn_torch_dev/debug -q
 
 ## Next Step
 
-The next runtime-facing slices should add an SPDL loader around
-`SpdlTensorAdapter`, then a minimal `BudgetedBatcher`.
+After `SPDLLoader`, the next runtime-facing slice should add a minimal
+`BudgetedBatcher`.
 
 `BudgetedBatcher` can consume `DataCost` and `ModelCost` values, combine them
 with resource budgets, and choose conservative batch sizes without hardcoding a
