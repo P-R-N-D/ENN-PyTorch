@@ -101,7 +101,7 @@ operate on `KVBatch` streams rather than on SPDL-specific objects.
 - Pinned memory.
 - Device transfer.
 - Dynamic batch-size selection.
-- `BudgetedBatcher`.
+- Budgeted batching internals, covered in `docs/dev_budgeted_batcher.md`.
 - OOM recovery and batch split retry.
 - AutoGovernor.
 - ShardController and distributed resume.
@@ -119,9 +119,9 @@ python -m pytest enn_torch_dev/debug/data -q
 python -m pytest enn_torch_dev/debug -q
 ```
 
-## Next Step
+## Follow-up
 
-The next runtime-facing slice should add a minimal `BudgetedBatcher`. It should
-consume `KVBatch` streams from either `PlainLoader` or `SPDLLoader`, combine
-`BatchCost` / `DataCost` / `ModelCost` observations with resource budgets, and
-choose conservative batch sizes without hardcoding GPU profiles.
+The budget boundary over `PlainLoader` and `SPDLLoader` streams is documented in
+`docs/dev_budgeted_batcher.md`. After that, the next runtime-facing slice should
+add an OOM retry runner that can use budgeted splitting without making the
+loader layer responsible for model execution or recovery policy.

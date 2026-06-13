@@ -130,11 +130,9 @@ python -m pytest enn_torch_dev/debug/data -q
 python -m pytest enn_torch_dev/debug -q
 ```
 
-## Next Step
+## Follow-up
 
-After `SPDLLoader`, the next runtime-facing slice should add a minimal
-`BudgetedBatcher`.
-
-`BudgetedBatcher` can consume `DataCost` and `ModelCost` values, combine them
-with resource budgets, and choose conservative batch sizes without hardcoding a
-GPU profile.
+`BudgetedBatcher` now consumes `BatchCost` and `DataCostProbe` observations as a
+static budget gate over `KVBatch` streams. The next runtime-facing slice should
+add an OOM retry runner that can use budgeted splitting and `RuntimeStep` fault
+classification without moving execution policy into the cost probe layer.

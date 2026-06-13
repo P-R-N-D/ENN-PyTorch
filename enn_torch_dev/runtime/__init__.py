@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from .batching import BatchBudget, BatchBudgetExceeded, BudgetedBatcher
 from .cost import (
     DataCost,
     DataCostProbe,
@@ -15,6 +16,9 @@ from .resources import ResourceMonitor
 from .step import RuntimeStep
 
 __all__ = [
+    "BatchBudget",
+    "BatchBudgetExceeded",
+    "BudgetedBatcher",
     "DataCost",
     "DataCostProbe",
     "ModelFootprint",
