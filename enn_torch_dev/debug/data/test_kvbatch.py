@@ -147,3 +147,14 @@ def test_kvbatch_with_key_mapping_requires_mapped_keys() -> None:
 
     with pytest.raises(KeyError, match="missing"):
         batch.to_store(mapping)
+
+
+def test_key_mapping_rejects_reserved_identity_targets() -> None:
+    with pytest.raises(ValueError, match="reserved"):
+        KeyMapping(inputs={"features": "row_id"})
+
+    with pytest.raises(ValueError, match="reserved"):
+        KeyMapping(inputs={"features": "x"}, labels={"labels": "source_id"})
+
+    with pytest.raises(ValueError, match="reserved"):
+        KeyMapping(inputs={"features": "x"}, metadata={"mask": "sample_id"})

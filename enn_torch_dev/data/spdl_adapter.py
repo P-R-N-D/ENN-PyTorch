@@ -7,7 +7,7 @@ import torch
 from tensordict import TensorDict, TensorDictBase
 
 from .batch import BatchCost, KVBatch
-from .schema import DataSchema
+from .schema import DataSchema, RUNTIME_IDENTITY_KVSTORE_KEYS
 
 
 TensorBatchSource = Mapping[str, object] | TensorDictBase
@@ -129,7 +129,8 @@ class SpdlTensorAdapter:
 
     def _validate_identity_keys(self) -> None:
         field_names = set(self._schema.field_names)
-        for key in self._keys.as_tuple():
+        reserved_field_names = set(self._keys.as_tuple()) | RUNTIME_IDENTITY_KVSTORE_KEYS
+        for key in reserved_field_names:
             if key in field_names:
                 raise ValueError(
                     f"{key!r} is reserved for runtime identity and must not be "
@@ -146,6 +147,7 @@ class SpdlTensorAdapter:
 
     def _normalize(self, source: TensorBatchSource) -> _NormalizedSpdlBatch:
         data, identities, source_batch_size = self._split_source(source)
+        self._validate_declared_keys(data)
         self._schema.validate_keys(tuple(data.keys()))
         self._validate_schema_fields(data)
         batch_size = self._infer_batch_size(data, source_batch_size=source_batch_size)
@@ -201,6 +203,11 @@ class SpdlTensorAdapter:
             if key in identity_keys:
                 identities[key] = value
                 continue
+            if key not in self._schema.field_names:
+                raise KeyError(
+                    "SPDL tensor batch contains a key not declared in DataSchema: "
+                    f"{key!r}."
+                )
             if not isinstance(value, torch.Tensor):
                 raise TypeError(
                     f"SPDL batch key {key!r} must hold a torch.Tensor, got {type(value)!r}."
@@ -209,6 +216,15 @@ class SpdlTensorAdapter:
                 raise ValueError(f"SPDL batch key {key!r} must include a batch dimension.")
             data[key] = value
         return data, identities, source_batch_size
+
+    def _validate_declared_keys(self, data: Mapping[str, torch.Tensor]) -> None:
+        field_names = set(self._schema.field_names)
+        unknown_keys = [key for key in data if key not in field_names]
+        if unknown_keys:
+            raise KeyError(
+                "SPDL tensor batch contains keys not declared in DataSchema: "
+                f"{unknown_keys!r}."
+            )
 
     def _validate_schema_fields(self, data: Mapping[str, torch.Tensor]) -> None:
         for field in self._schema.fields:

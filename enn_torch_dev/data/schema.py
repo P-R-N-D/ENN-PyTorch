@@ -7,6 +7,9 @@ from typing import Any
 import torch
 
 
+RUNTIME_IDENTITY_KVSTORE_KEYS = frozenset(("row_id", "source_id", "sample_id"))
+
+
 def _validate_key(value: object, label: str) -> str:
     if not isinstance(value, str):
         raise TypeError(f"{label} must be a string.")
@@ -153,6 +156,22 @@ class KeyMapping:
         )
         if not self.inputs:
             raise ValueError("KeyMapping.inputs must not be empty.")
+        self._validate_reserved_targets()
+
+    def _validate_reserved_targets(self) -> None:
+        targets = [
+            *self.inputs.values(),
+            *self.labels.values(),
+            *self.metadata.values(),
+        ]
+        reserved_targets = [
+            target for target in targets if target in RUNTIME_IDENTITY_KVSTORE_KEYS
+        ]
+        if reserved_targets:
+            raise ValueError(
+                "KeyMapping target keys are reserved for runtime identity: "
+                f"{reserved_targets!r}."
+            )
 
     def all_items(self) -> tuple[tuple[str, str], ...]:
         items: list[tuple[str, str]] = []

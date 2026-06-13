@@ -27,10 +27,16 @@ pipelines or tune SPDL workers.
 - `TensorDictBase`.
 
 The adapter validates the payload against `DataSchema`, strips runtime identity
-keys from the TensorDict payload, and returns either:
+keys from the TensorDict payload, rejects schema-unknown payload keys, and
+returns either:
 
 - a schema-validated `TensorDict` through `to_tensordict(...)`; or
 - a `KVBatch` through `to_kvbatch(...)`.
+
+SPDL output may contain only tensor fields declared in `DataSchema` plus the
+configured identity input keys. Optional schema fields may be absent, but extra
+SPDL auxiliary values must be removed in the source plugin stage or declared as
+schema fields before reaching this adapter.
 
 Runtime identity keys are reserved and must not be declared as `DataSchema`
 fields:
@@ -42,6 +48,11 @@ fields:
 All identity tensors must be 1-D integer tensors with the same length as the
 batch size. They are moved to CPU `torch.long` tensors before entering
 `KVBatch`.
+
+`row_id`, `source_id`, and `sample_id` are also fixed KVStore runtime identity
+targets written by `KVBatch.to_store(...)`. They remain reserved even when the
+adapter is configured with custom SPDL input identity key names, and
+`KeyMapping` targets must not use those names.
 
 ## Why no direct SPDL import?
 

@@ -193,3 +193,44 @@ def test_spdl_adapter_rejects_non_zero_batch_axis() -> None:
 
     with pytest.raises(NotImplementedError, match="batch_axis=0"):
         SpdlTensorAdapter(schema)
+
+
+def test_spdl_adapter_rejects_reserved_key_mapping_target() -> None:
+    with pytest.raises(ValueError, match="reserved"):
+        DataSchema(
+            schema_id="bad.target",
+            fields=(FieldSpec("uid", torch.long, shape=(None,)),),
+            key_mapping=KeyMapping(inputs={"uid": "row_id"}),
+        )
+
+
+def test_spdl_adapter_rejects_unknown_tensor_key() -> None:
+    payload = _payload()
+    payload["extra"] = torch.ones(4)
+    adapter = SpdlTensorAdapter(_schema())
+
+    with pytest.raises(KeyError, match="not declared"):
+        adapter.to_kvbatch(payload)
+
+
+def test_spdl_adapter_rejects_unknown_non_tensor_key() -> None:
+    payload = _payload()
+    payload["extra"] = "plugin-aux"  # type: ignore[assignment]
+    adapter = SpdlTensorAdapter(_schema())
+
+    with pytest.raises(KeyError, match="not declared"):
+        adapter.to_kvbatch(payload)
+
+
+def test_spdl_adapter_rejects_fixed_identity_schema_field_even_with_custom_row_id_key() -> None:
+    schema = DataSchema(
+        schema_id="bad.fixed.identity",
+        fields=(
+            FieldSpec("row_id", torch.long, shape=(None,)),
+            FieldSpec("features", torch.float32, shape=(None, 3)),
+        ),
+        key_mapping=KeyMapping(inputs={"features": "x"}),
+    )
+
+    with pytest.raises(ValueError, match="reserved"):
+        SpdlTensorAdapter(schema, row_id_key="spdl_row_id")
