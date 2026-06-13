@@ -33,6 +33,12 @@ items are already `Mapping[str, Tensor]` or `TensorDictBase` batches.
 The loader is sequential and deterministic. It does not prefetch, shuffle,
 spawn workers, transfer tensors to devices, or choose batch sizes.
 
+`SPDLLoader` stores and iterates over the provided source object directly. If
+the source is a one-shot iterator or generator, it is consumed after one full
+pass and the same loader instance will not replay batches for another epoch.
+Callers that need epoch-level replay should provide a re-iterable source, build
+a new loader/source per epoch, or introduce a future source-factory layer.
+
 ## Cost Hint
 
 When a `DataCostProbe` is provided, `SPDLLoader` estimates the produced
