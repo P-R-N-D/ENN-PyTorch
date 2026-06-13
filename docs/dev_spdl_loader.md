@@ -44,13 +44,16 @@ a new loader/source per epoch, or introduce a future source-factory layer.
 When a `DataCostProbe` is provided, `SPDLLoader` estimates the produced
 `KVBatch` and stores a coarse `BatchCost` in `KVBatch.cost_hint`:
 
-- CPU tensor bytes are recorded as `host_bytes`;
+- CPU `TensorDict` payload bytes plus runtime identity tensor bytes
+  (`row_ids`, `source_ids`, and `sample_ids`) are recorded as `host_bytes`;
 - non-CPU tensor bytes are recorded as `device_bytes`;
 - `DataCost.batch_size` is recorded as `num_items`.
 
 This hint is intentionally smaller than `DataCost`. Rich per-tensor cost records
 remain available through `DataCostProbe` for future calibration and governor
-logic.
+logic. The byte semantics match `BudgetedBatcher`: byte budgets represent the
+coarse runtime input cost, including both payload tensors and identity tensors
+that are inserted into the runtime store.
 
 ## Example
 

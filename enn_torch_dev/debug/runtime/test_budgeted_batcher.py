@@ -4,12 +4,20 @@ import pytest
 import torch
 from tensordict import TensorDict
 
-from enn_torch_dev.data import BatchCost, KVBatch
+from enn_torch_dev.data import (
+    BatchCost,
+    DataSchema,
+    FieldSpec,
+    KVBatch,
+    KeyMapping,
+    SpdlTensorAdapter,
+)
 from enn_torch_dev.runtime import (
     BatchBudget,
     BatchBudgetExceeded,
     BudgetedBatcher,
     DataCostProbe,
+    SPDLLoader,
 )
 
 
@@ -33,6 +41,28 @@ def _batch(num_rows: int = 4, *, cost_hint: BatchCost | None = None) -> KVBatch:
         shard_id=7,
         cost_hint=cost_hint,
     )
+
+
+def _spdl_schema() -> DataSchema:
+    return DataSchema(
+        schema_id="runtime.budgeted.spdl",
+        fields=(
+            FieldSpec("features", torch.float32, shape=(None, 3)),
+            FieldSpec("labels", torch.float32, shape=(None, 1), required=False),
+        ),
+        key_mapping=KeyMapping(inputs={"features": "x"}, labels={"labels": "y"}),
+    )
+
+
+def _spdl_payload(num_rows: int) -> dict[str, torch.Tensor]:
+    return {
+        "features": torch.arange(num_rows * 3, dtype=torch.float32).reshape(
+            num_rows,
+            3,
+        ),
+        "labels": torch.arange(num_rows, dtype=torch.float32).reshape(num_rows, 1),
+        "row_id": torch.arange(100, 100 + num_rows),
+    }
 
 
 def test_budgeted_batcher_passes_batches_within_budget() -> None:
@@ -191,6 +221,42 @@ def test_budgeted_batcher_identity_tensors_can_exceed_byte_budget() -> None:
             BudgetedBatcher(
                 [batch],
                 BatchBudget(max_host_bytes=39),
+                cost_probe=DataCostProbe(),
+            )
+        )
+
+
+def test_budgeted_batcher_respects_spdl_loader_identity_inclusive_cost_hint() -> None:
+    loader = SPDLLoader(
+        [_spdl_payload(2)],
+        SpdlTensorAdapter(_spdl_schema()),
+        cost_probe=DataCostProbe(),
+    )
+
+    batches = list(
+        BudgetedBatcher(
+            loader,
+            BatchBudget(max_host_bytes=24),
+            cost_probe=DataCostProbe(),
+        )
+    )
+
+    assert [batch.batch_size for batch in batches] == [1, 1]
+    assert [batch.cost_hint.host_bytes for batch in batches] == [24, 24]
+
+
+def test_budgeted_batcher_rejects_spdl_loader_hint_when_identity_bytes_exceed_budget() -> None:
+    loader = SPDLLoader(
+        [_spdl_payload(1)],
+        SpdlTensorAdapter(_spdl_schema()),
+        cost_probe=DataCostProbe(),
+    )
+
+    with pytest.raises(BatchBudgetExceeded, match="host_bytes"):
+        list(
+            BudgetedBatcher(
+                loader,
+                BatchBudget(max_host_bytes=23),
                 cost_probe=DataCostProbe(),
             )
         )

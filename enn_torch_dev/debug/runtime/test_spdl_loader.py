@@ -93,7 +93,20 @@ def test_spdl_loader_adds_cost_hint_when_cost_probe_is_provided() -> None:
     batch = next(iter(SPDLLoader([payload], _adapter(), cost_probe=DataCostProbe())))
 
     assert batch.cost_hint is not None
-    assert batch.cost_hint.host_bytes == 32
+    assert batch.cost_hint.host_bytes == 48
+    assert batch.cost_hint.device_bytes == 0
+    assert batch.cost_hint.num_items == 2
+
+
+def test_spdl_loader_cost_hint_includes_optional_identity_tensors() -> None:
+    payload = _payload(0, 2)
+    payload["source_id"] = torch.tensor([1, 2])
+    payload["sample_id"] = torch.tensor([10, 11])
+
+    batch = next(iter(SPDLLoader([payload], _adapter(), cost_probe=DataCostProbe())))
+
+    assert batch.cost_hint is not None
+    assert batch.cost_hint.host_bytes == 80
     assert batch.cost_hint.device_bytes == 0
     assert batch.cost_hint.num_items == 2
 
