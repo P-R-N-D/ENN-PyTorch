@@ -245,8 +245,9 @@ class BudgetedBatcher:
 
 
 def _slice_kvbatch(batch: KVBatch, start: int, end: int) -> KVBatch:
+    td = batch.td[start:end].clone(recurse=True)
     return KVBatch(
-        td=batch.td[start:end],
+        td=td,
         row_ids=batch.row_ids[start:end],
         source_ids=None if batch.source_ids is None else batch.source_ids[start:end],
         sample_ids=None if batch.sample_ids is None else batch.sample_ids[start:end],

@@ -98,6 +98,25 @@ def test_budgeted_batcher_adds_cost_hint_with_probe() -> None:
     assert batches[0].cost_hint.num_items == 2
 
 
+def test_budgeted_batcher_materializes_byte_budget_slices_for_probe() -> None:
+    batch = _batch(5)
+
+    batches = list(
+        BudgetedBatcher(
+            [batch],
+            BatchBudget(max_host_bytes=20),
+            cost_probe=DataCostProbe(),
+        )
+    )
+
+    assert [subbatch.batch_size for subbatch in batches] == [1, 1, 1, 1, 1]
+    assert [subbatch.cost_hint.host_bytes for subbatch in batches] == [16, 16, 16, 16, 16]
+    assert torch.equal(
+        torch.cat([subbatch.row_ids for subbatch in batches]),
+        batch.row_ids,
+    )
+
+
 def test_budgeted_batcher_prefers_existing_cost_hint() -> None:
     cost_hint = BatchCost(host_bytes=1, device_bytes=0, num_items=4)
     batch = _batch(4, cost_hint=cost_hint)
