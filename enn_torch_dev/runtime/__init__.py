@@ -10,7 +10,7 @@ from .cost import (
 )
 from .faults import ResourceSample, RuntimePhase, StepResult, StepStatus
 from .footprint import ModelFootprint, OptimizerFootprint
-from .loader import PlainLoader
+from .loader import PlainLoader, SPDLLoader
 from .resources import ResourceMonitor
 from .step import RuntimeStep
 
@@ -27,6 +27,7 @@ __all__ = [
     "ResourceSample",
     "RuntimePhase",
     "RuntimeStep",
+    "SPDLLoader",
     "StepResult",
     "StepStatus",
     "TensorCost",

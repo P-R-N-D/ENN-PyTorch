@@ -128,8 +128,9 @@ python -m pytest enn_torch_dev/debug/data -q
 python -m pytest enn_torch_dev/debug -q
 ```
 
-## Next Step
+## Follow-up
 
-The next slice should add a minimal SPDL loader that wraps an iterable SPDL
-pipeline and yields `KVBatch` objects through `SpdlTensorAdapter`. After that,
-`BudgetedBatcher` can consume the same `KVBatch` stream used by `PlainLoader`.
+The follow-up loader boundary is documented in `docs/dev_spdl_loader.md`.
+`SPDLLoader` wraps an iterable tensor source and yields `KVBatch` objects through
+`SpdlTensorAdapter`. Once both `PlainLoader` and `SPDLLoader` expose `KVBatch`
+streams, the next runtime-facing slice should add a minimal `BudgetedBatcher`.
