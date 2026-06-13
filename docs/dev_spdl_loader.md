@@ -44,13 +44,16 @@ a new loader/source per epoch, or introduce a future source-factory layer.
 When a `DataCostProbe` is provided, `SPDLLoader` estimates the produced
 `KVBatch` and stores a coarse `BatchCost` in `KVBatch.cost_hint`:
 
-- CPU tensor bytes are recorded as `host_bytes`;
+- CPU `TensorDict` payload bytes plus runtime identity tensor bytes
+  (`row_ids`, `source_ids`, and `sample_ids`) are recorded as `host_bytes`;
 - non-CPU tensor bytes are recorded as `device_bytes`;
 - `DataCost.batch_size` is recorded as `num_items`.
 
 This hint is intentionally smaller than `DataCost`. Rich per-tensor cost records
 remain available through `DataCostProbe` for future calibration and governor
-logic.
+logic. The byte semantics match `BudgetedBatcher`: byte budgets represent the
+coarse runtime input cost, including both payload tensors and identity tensors
+that are inserted into the runtime store.
 
 ## Example
 
@@ -101,7 +104,7 @@ operate on `KVBatch` streams rather than on SPDL-specific objects.
 - Pinned memory.
 - Device transfer.
 - Dynamic batch-size selection.
-- `BudgetedBatcher`.
+- Budgeted batching internals, covered in `docs/dev_budgeted_batcher.md`.
 - OOM recovery and batch split retry.
 - AutoGovernor.
 - ShardController and distributed resume.
@@ -119,9 +122,9 @@ python -m pytest enn_torch_dev/debug/data -q
 python -m pytest enn_torch_dev/debug -q
 ```
 
-## Next Step
+## Follow-up
 
-The next runtime-facing slice should add a minimal `BudgetedBatcher`. It should
-consume `KVBatch` streams from either `PlainLoader` or `SPDLLoader`, combine
-`BatchCost` / `DataCost` / `ModelCost` observations with resource budgets, and
-choose conservative batch sizes without hardcoding GPU profiles.
+The budget boundary over `PlainLoader` and `SPDLLoader` streams is documented in
+`docs/dev_budgeted_batcher.md`. After that, the next runtime-facing slice should
+add an OOM retry runner that can use budgeted splitting without making the
+loader layer responsible for model execution or recovery policy.

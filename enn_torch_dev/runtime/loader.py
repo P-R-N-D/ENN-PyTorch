@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections.abc import Iterable, Iterator, Mapping
 from dataclasses import replace
 
+import torch
 from tensordict import TensorDictBase
 
 from enn_torch_dev.data import (
@@ -110,10 +111,23 @@ class SPDLLoader:
     def _estimate_batch_cost(self, batch: KVBatch) -> BatchCost:
         assert self.cost_probe is not None
         data_cost = self.cost_probe.estimate_kvbatch(batch)
-        return _batch_cost_from_data_cost(data_cost)
+        return _batch_cost_from_data_cost(data_cost, batch)
 
 
-def _batch_cost_from_data_cost(data_cost: DataCost) -> BatchCost:
+def _tensor_payload_bytes(tensor: torch.Tensor) -> int:
+    return int(tensor.numel()) * int(tensor.element_size())
+
+
+def _identity_host_bytes(batch: KVBatch) -> int:
+    total = _tensor_payload_bytes(batch.row_ids)
+    if batch.source_ids is not None:
+        total += _tensor_payload_bytes(batch.source_ids)
+    if batch.sample_ids is not None:
+        total += _tensor_payload_bytes(batch.sample_ids)
+    return total
+
+
+def _batch_cost_from_data_cost(data_cost: DataCost, batch: KVBatch) -> BatchCost:
     host_bytes = sum(
         nbytes for device, nbytes in data_cost.bytes_by_device.items() if device == "cpu"
     )
@@ -121,7 +135,7 @@ def _batch_cost_from_data_cost(data_cost: DataCost) -> BatchCost:
         nbytes for device, nbytes in data_cost.bytes_by_device.items() if device != "cpu"
     )
     return BatchCost(
-        host_bytes=host_bytes,
+        host_bytes=host_bytes + _identity_host_bytes(batch),
         device_bytes=device_bytes,
         num_items=data_cost.batch_size,
     )
