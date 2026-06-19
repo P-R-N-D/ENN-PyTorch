@@ -10,7 +10,7 @@ Do not defer required documentation updates to a follow-up task. Do not edit unr
 
 | Change type | Code paths to check | Test paths to check | AI-facing docs likely to update | Compatibility risks |
 |---|---|---|---|---|
-| public API / `__all__` | `enn_torch/__init__.py`, package `__init__.py` files, `enn_torch_dev/*/__init__.py` | `enn_torch_dev/debug/executor/test_public_api_exports.py`, relevant area tests | `docs/CONTEXT.md`, `docs/CURRENT_STATE.md`, `docs/TESTING.md` | Breaking imports, exposing active-development APIs as stable, changing lazy import behavior |
+| public API / `__all__` | `enn_torch/__init__.py`, package `__init__.py` files, `enn_torch_dev/*/__init__.py` | Stable `enn_torch` targeted import/API smoke checks; `enn_torch_dev/debug/executor/test_public_api_exports.py` for executor public exports; relevant area tests when covered | `docs/CONTEXT.md`, `docs/CURRENT_STATE.md`, `docs/TESTING.md` | Breaking imports, exposing active-development APIs as stable, changing lazy import behavior |
 | configuration | `pyproject.toml`, `requirements.txt`, `requirements-dev.txt`, `MANIFEST.in`, config modules | Relevant debug tests plus packaging review | `docs/CONTEXT.md`, `docs/CURRENT_STATE.md`, `docs/TESTING.md` | Python version drift, dependency mismatch, package data omissions |
 | checkpoint and save/load | `enn_torch/runtime/io.py`, `enn_torch/runtime/workflows.py`, related runtime modules | Targeted runtime tests if present; otherwise document untested scope | `docs/RUNTIME_SAFETY.md`, `docs/CHANGE_CHECKLIST.md`, `docs/CONTEXT.md` | Overwriting user artifacts, adding generated files, changing formats |
 | data schema and manifest | `enn_torch_dev/data/schema.py`, `manifest.py`, `batch.py`, `staging.py`, `readers.py` | `enn_torch_dev/debug/data -q` | `docs/CURRENT_STATE.md`, `docs/TESTING.md`, `docs/RUNTIME_SAFETY.md` | Breaking staged data compatibility, identity tensor semantics, schema validation changes |
@@ -22,7 +22,7 @@ Do not defer required documentation updates to a follow-up task. Do not edit unr
 | runtime safety and artifacts | Runtime IO/export/checkpoint code, staging writers, loaders, notebooks | Targeted tests using temp directories | `docs/RUNTIME_SAFETY.md`, `docs/CONTEXT.md` | Data loss, committed artifacts, secret leakage, long-running validation |
 | repository structure | Top-level files, package directories, `docs/`, `.github/` | `git diff --check`, path existence checks | `docs/CONTEXT.md`, `docs/CURRENT_STATE.md`, `docs/TESTING.md`, this file | Broken relative links, package discovery changes, forbidden AI-doc paths |
 | documentation-only changes | Changed Markdown files | `git diff --check`; link/path review | Affected docs only | Churn, stale instructions, treating plans as implementation |
-| Notion reference alignment | Repository docs that mention external Notion context | No Notion edits; verify against current repository implementation | `docs/CONTEXT.md`, `docs/CURRENT_STATE.md` | Letting external notes override current code, presenting unapproved roadmap as current state |
+| Notion reference alignment | Repository docs that mention external Notion context | No Notion edits; verify against current repository implementation and tests | `docs/CONTEXT.md`, `docs/CURRENT_STATE.md` | Treating Notion as implementation source of truth, classifying external reference material as historical implementation, presenting unapproved roadmap as current state |
 
 ## Required final-report result
 

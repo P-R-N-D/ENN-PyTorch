@@ -3,9 +3,10 @@
 Status categories:
 
 - **CURRENT**: implemented in the current repository.
-- **ACTIVE DEVELOPMENT**: implemented under development-focused paths or documented as a current rewrite slice.
+- **ACTIVE DEVELOPMENT**: implemented under development-focused paths with current code evidence such as implemented modules, public exports, or tests. A design document alone is not enough to classify an area as active development.
 - **PLANNED**: explicitly described as future work, not current behavior.
 - **HISTORICAL**: design-record or background information.
+- **EXTERNAL REFERENCE**: supporting technical reference, not implementation source of truth.
 - **MAINTAINER DECISION REQUIRED**: not settled by the current repository.
 
 | Area | Status | Current evidence and notes |
@@ -22,7 +23,7 @@ Status categories:
 | `enn_torch_dev/debug` | CURRENT | Pytest debug suite for development data, executor, nn, and runtime areas. Do not add agent instruction Markdown files here. |
 | Existing `docs/dev_*.md` | HISTORICAL | Implementation-slice design records for `enn_torch_dev`. Their `Next Step`, `Follow-up`, and `Out of Scope` sections are not current task instructions or confirmed roadmap items. |
 | Existing executor documents | CURRENT | `docs/executor_modes.md` defines tile/stream terminology. `docs/executor_builders.md` is user-facing guidance for executor builder APIs. |
-| Notion ENN-PyTorch technical docs | HISTORICAL | Supporting external references for structure and terminology only. Current GitHub implementation and tests remain primary evidence. |
+| Notion ENN-PyTorch technical docs | EXTERNAL REFERENCE | Supporting technical reference for structure and terminology only, not implementation source of truth. Current GitHub implementation and tests remain primary evidence. |
 | Relationship between `enn_torch` and `enn_torch_dev` | MAINTAINER DECISION REQUIRED | The repository does not clearly settle whether `enn_torch_dev` replaces, runs parallel to, or partially migrates into `enn_torch`. Do not decide this in agent work. |
 
 ## Planned items noted in design records
