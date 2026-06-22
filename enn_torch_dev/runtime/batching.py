@@ -240,7 +240,7 @@ class BudgetedBatcher:
                     batch_size=end - start,
                     parent_size=batch.batch_size,
                 )
-            yield _slice_kvbatch(batch, start, end, cost_hint=cost_hint)
+            yield slice_kvbatch(batch, start, end, cost_hint=cost_hint)
 
     def _target_split_size(self, batch: KVBatch, cost: BatchCost) -> int:
         target_size = batch.batch_size
@@ -290,19 +290,20 @@ class BudgetedBatcher:
         )
 
 
-def _slice_kvbatch(
+def slice_kvbatch(
     batch: KVBatch,
     start: int,
     end: int,
     *,
     cost_hint: BatchCost | None = None,
 ) -> KVBatch:
+    """Return a materialized row slice of a KVBatch preserving runtime identity."""
     td = batch.td[start:end].clone(recurse=True)
     return KVBatch(
         td=td,
-        row_ids=batch.row_ids[start:end],
-        source_ids=None if batch.source_ids is None else batch.source_ids[start:end],
-        sample_ids=None if batch.sample_ids is None else batch.sample_ids[start:end],
+        row_ids=batch.row_ids[start:end].clone(),
+        source_ids=None if batch.source_ids is None else batch.source_ids[start:end].clone(),
+        sample_ids=None if batch.sample_ids is None else batch.sample_ids[start:end].clone(),
         schema_id=batch.schema_id,
         shard_id=batch.shard_id,
         cost_hint=cost_hint,
