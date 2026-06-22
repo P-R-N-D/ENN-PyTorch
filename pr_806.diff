@@ -1,0 +1,740 @@
+diff --git a/docs/CHANGE_CHECKLIST.md b/docs/CHANGE_CHECKLIST.md
+index 7c53016..48179b7 100644
+--- a/docs/CHANGE_CHECKLIST.md
++++ b/docs/CHANGE_CHECKLIST.md
+@@ -15,8 +15,8 @@ Do not defer required documentation updates to a follow-up task. Do not edit unr
+ | checkpoint and save/load | `enn_torch/runtime/io.py`, `enn_torch/runtime/workflows.py`, related runtime modules | Targeted runtime tests if present; otherwise document untested scope | `docs/RUNTIME_SAFETY.md`, `docs/CHANGE_CHECKLIST.md`, `docs/CONTEXT.md` | Overwriting user artifacts, adding generated files, changing formats |
+ | data schema and manifest | `enn_torch_dev/data/schema.py`, `manifest.py`, `batch.py`, `staging.py`, `readers.py` | `enn_torch_dev/debug/data -q` | `docs/CURRENT_STATE.md`, `docs/TESTING.md`, `docs/RUNTIME_SAFETY.md` | Breaking staged data compatibility, identity tensor semantics, schema validation changes |
+ | executor graph/node/tile/stream/state | `enn_torch_dev/executor/**` | `enn_torch_dev/debug/executor -q` | `docs/CURRENT_STATE.md`, `docs/TESTING.md`, executor docs if behavior changes | Execution ordering, state routing, public exports, tile/stream terminology |
+-| runtime step, retry, and fault classification | `enn_torch_dev/runtime/step.py`, `retry.py`, `faults.py`, loader/runtime integration | `enn_torch_dev/debug/runtime -q` | `docs/CURRENT_STATE.md`, `docs/TESTING.md`, `docs/RUNTIME_SAFETY.md` | Incorrect success/fault reporting, retry loops, row-order changes, unverified failure modes, optimizer/loss behavior changes |
+-| resource monitoring and cost/batching | `enn_torch_dev/runtime/cost.py`, `footprint.py`, `resources.py`, `batching.py` | `enn_torch_dev/debug/runtime -q` | `docs/CURRENT_STATE.md`, `docs/TESTING.md`, `docs/RUNTIME_SAFETY.md` | CPU/CUDA assumptions, memory accounting semantics, oversized batch behavior |
++| runtime step, retry, governor, and fault classification | `enn_torch_dev/runtime/step.py`, `retry.py`, `governor.py`, `faults.py`, loader/runtime integration | `enn_torch_dev/debug/runtime -q` | `docs/CURRENT_STATE.md`, `docs/TESTING.md`, `docs/RUNTIME_SAFETY.md` | Incorrect success/fault reporting, retry loops, budget oscillation, row-order changes, unverified failure modes, optimizer/loss behavior changes |
++| resource monitoring and cost/batching | `enn_torch_dev/runtime/cost.py`, `footprint.py`, `resources.py`, `batching.py`, `governor.py` | `enn_torch_dev/debug/runtime -q` | `docs/CURRENT_STATE.md`, `docs/TESTING.md`, `docs/RUNTIME_SAFETY.md` | CPU/CUDA assumptions, memory accounting semantics, oversized batch behavior, unsafe budget growth or shrink bounds |
+ | dependency and optional extras | `pyproject.toml`, `requirements.txt`, `requirements-dev.txt` | Targeted import/test for affected dependency; report missing optional packages | `docs/CONTEXT.md`, `docs/TESTING.md`, `docs/RUNTIME_SAFETY.md` | Unrequested dependency changes, optional backend availability, platform markers |
+ | test layout and commands | `enn_torch_dev/debug/**`, pytest paths | New or moved tests themselves | `docs/TESTING.md`, `docs/CONTEXT.md` | Documenting non-existent commands, hiding skipped dependency or CUDA coverage |
+ | runtime safety and artifacts | Runtime IO/export/checkpoint code, staging writers, loaders, notebooks | Targeted tests using temp directories | `docs/RUNTIME_SAFETY.md`, `docs/CONTEXT.md` | Data loss, committed artifacts, secret leakage, long-running validation |
+diff --git a/docs/CURRENT_STATE.md b/docs/CURRENT_STATE.md
+index 250cc40..b0564b0 100644
+--- a/docs/CURRENT_STATE.md
++++ b/docs/CURRENT_STATE.md
+@@ -19,7 +19,7 @@ Status categories:
+ | `enn_torch_dev/data` | ACTIVE DEVELOPMENT | Development namespace for `DataSchema`, `FieldSpec`, `KeyMapping`, `KVBatch`, `BatchCost`, manifests, TensorDict staging/reading, and SPDL tensor adapter boundaries. |
+ | `enn_torch_dev/executor` | ACTIVE DEVELOPMENT | Development namespace for `KVStore`, node/subgraph/graph execution, plans, runners, model specs, graph/model/branch builders, tile, stream, global-local, and state routing. |
+ | `enn_torch_dev/nn` | ACTIVE DEVELOPMENT | Development namespace for blocks, attention, fusion, layers, recurrent components, and related types. |
+-| `enn_torch_dev/runtime` | ACTIVE DEVELOPMENT | Development namespace for loaders, runtime steps, fault/status records, model/resource cost probes, model/optimizer footprint, resource monitoring, budgeted batching, and OOM-class runtime retry. |
++| `enn_torch_dev/runtime` | ACTIVE DEVELOPMENT | Development namespace for loaders, runtime steps, fault/status records, model/resource cost probes, model/optimizer footprint, resource monitoring, budgeted batching, OOM-class runtime retry, and conservative runtime budget governance. |
+ | `enn_torch_dev/debug` | CURRENT | Pytest debug suite for development data, executor, nn, and runtime areas. Do not add agent instruction Markdown files here. |
+ | Existing `docs/dev_*.md` | HISTORICAL | Implementation-slice design records for `enn_torch_dev`. Their `Next Step`, `Follow-up`, and `Out of Scope` sections are not current task instructions or confirmed roadmap items. |
+ | Existing executor documents | CURRENT | `docs/executor_modes.md` defines tile/stream terminology. `docs/executor_builders.md` is user-facing guidance for executor builder APIs. |
+diff --git a/docs/dev_runtime_governor.md b/docs/dev_runtime_governor.md
+new file mode 100644
+index 0000000..ef96657
+--- /dev/null
++++ b/docs/dev_runtime_governor.md
+@@ -0,0 +1,105 @@
++# Development Runtime Governor
++
++This document describes the tenth data/runtime rewrite slice for `enn_torch_dev`.
++
++## Goal
++
++`BudgetedBatcher` applies a static pre-execution `BatchBudget`, and
++`RuntimeRetryRunner` handles side-effect-safe OOM retry after `RuntimeStep` returns
++`StepResult` objects. This slice adds a conservative observation layer that adjusts
++future budgets from already-produced results:
++
++```text
++KVBatch stream
++  -> BudgetedBatcher(current_budget)
++  -> RuntimeRetryRunner
++  -> RuntimeStep.run(batch)
++  -> StepResult stream
++  -> ConservativeRuntimeGovernor.observe_results(...)
++  -> next BatchBudget
++```
++
++The governor does not run a model, catch exceptions, split batches, own retry, or
++probe costs directly. It only observes `StepResult` streams and updates a stored
++`BatchBudget` using static conservative rules.
++
++## Contract
++
++`GovernorPolicy` owns static bounds and scaling rules:
++
++- `shrink_factor`: multiplicative decrease applied to configured budget fields
++  after any `StepStatus.OOM_FAULT` result;
++- `grow_factor`: multiplicative increase applied after a success streak;
++- `grow_after_successes`: number of all-success observations required before
++  growth;
++- `min_items`, `max_items`, `min_host_bytes`, `max_host_bytes`,
++  `min_device_bytes`, and `max_device_bytes`: optional lower/upper bounds for
++  future `BatchBudget` values.
++
++`ConservativeRuntimeGovernor` exposes:
++
++- `current_budget` for the active budget;
++- `observe_results(results)` to consume an iterable of `StepResult` objects,
++  update the active budget, and return a `GovernorDecision`.
++
++`GovernorDecision` records the previous and next budgets, observed statuses,
++consecutive success/OOM counters, a reason string, and peak resource values
++reported by attached `ResourceSample` objects.
++
++## Decision Rules
++
++For each observation:
++
++1. empty result streams keep the current budget unchanged;
++2. any `StepStatus.OOM_FAULT` shrinks configured budget fields and resets the
++   success streak;
++3. all-success observations increment the success streak and grow the budget only
++   after `grow_after_successes` observations;
++4. non-OOM faults keep the budget unchanged and reset success/OOM streaks;
++5. lower and upper bounds are always respected;
++6. resource samples are recorded in the decision and reason text, but they do not
++   drive automatic tuning beyond the static rules in this slice.
++
++## Relationship to Retry and Batching
++
++`BudgetedBatcher` remains the static gate that applies the current budget to
++incoming `KVBatch` objects.
++
++`RuntimeRetryRunner` remains the side-effect-safe post-execution OOM retry
++boundary.
++
++`ConservativeRuntimeGovernor` observes the resulting `StepResult` stream and
++produces the next budget for a future pass. It should not be folded into either
++`BudgetedBatcher` or `RuntimeRetryRunner`.
++
++## Out of Scope
++
++- AutoGovernor full implementation.
++- Learned or model-specific tuning.
++- Persistent calibration cache or history database.
++- ResourceMonitor feedback loops beyond recording observed peaks.
++- ModelCostProbe-driven policy changes.
++- SPDL queue-depth tuning.
++- Device transfer.
++- AMP or precision fallback.
++- Optimizer rollback or training semantic recovery.
++- Distributed coordination.
++
++## Test Commands
++
++```bash
++python -m pytest enn_torch_dev/debug/runtime/test_runtime_governor.py -q
++python -m pytest enn_torch_dev/debug/runtime/test_runtime_retry.py -q
++python -m pytest enn_torch_dev/debug/runtime/test_budgeted_batcher.py -q
++python -m pytest enn_torch_dev/debug/runtime -q
++python -m pytest enn_torch_dev/debug/data -q
++python -m pytest enn_torch_dev/debug -q
++git diff --check
++```
++
++## Next Step
++
++A later slice can wire this governor into a higher-level orchestration loop that
++feeds each `GovernorDecision.next_budget` back into `BudgetedBatcher`. That loop
++should remain conservative and should not add persistent calibration or learned
++autotuning without a separate design decision.
+diff --git a/docs/dev_runtime_retry.md b/docs/dev_runtime_retry.md
+index 0c96286..789be72 100644
+--- a/docs/dev_runtime_retry.md
++++ b/docs/dev_runtime_retry.md
+@@ -113,8 +113,8 @@ python -m pytest enn_torch_dev/debug -q
+ git diff --check
+ ```
+ 
+-## Next Step
++## Follow-up
+ 
+-The next runtime-facing slice can add a conservative governor layer that consumes
+-`BatchCost`, `ModelCost`, retry outcomes, and `ResourceMonitor` samples to adjust
+-future budgets. That governor should not be folded into `RuntimeRetryRunner`.
++The conservative governor follow-up is tracked in `docs/dev_runtime_governor.md`.
++`RuntimeRetryRunner` remains limited to post-execution side-effect-safe OOM retry;
++budget adjustment should stay outside the retry runner.
+diff --git a/enn_torch_dev/debug/runtime/test_runtime_governor.py b/enn_torch_dev/debug/runtime/test_runtime_governor.py
+new file mode 100644
+index 0000000..2fb677e
+--- /dev/null
++++ b/enn_torch_dev/debug/runtime/test_runtime_governor.py
+@@ -0,0 +1,196 @@
++from __future__ import annotations
++
++import pytest
++import torch
++
++from enn_torch_dev.runtime import (
++    BatchBudget,
++    ConservativeRuntimeGovernor,
++    GovernorPolicy,
++    ResourceSample,
++    RuntimeGovernorState,
++    StepResult,
++    StepStatus,
++)
++
++
++def _result(
++    status: StepStatus,
++    *,
++    samples: tuple[ResourceSample, ...] = (),
++) -> StepResult:
++    return StepResult(
++        status=status,
++        phase=None,
++        batch_size=2,
++        row_ids=torch.arange(2),
++        resource_samples=samples,
++    )
++
++
++def test_governor_keeps_budget_without_results() -> None:
++    budget = BatchBudget(max_items=8)
++    governor = ConservativeRuntimeGovernor(budget)
++
++    decision = governor.observe_results([])
++
++    assert decision.previous_budget == budget
++    assert decision.next_budget == budget
++    assert governor.current_budget == budget
++    assert decision.statuses == ()
++    assert decision.reason.startswith("no_results")
++
++
++def test_governor_keeps_budget_before_success_growth_threshold() -> None:
++    budget = BatchBudget(max_items=8)
++    governor = ConservativeRuntimeGovernor(
++        budget,
++        policy=GovernorPolicy(grow_after_successes=2, grow_factor=1.5),
++    )
++
++    decision = governor.observe_results([_result(StepStatus.SUCCESS)])
++
++    assert decision.next_budget.max_items == 8
++    assert decision.consecutive_successes == 1
++    assert governor.current_budget.max_items == 8
++
++
++def test_governor_grows_budget_after_success_streak() -> None:
++    governor = ConservativeRuntimeGovernor(
++        BatchBudget(max_items=8),
++        policy=GovernorPolicy(grow_after_successes=2, grow_factor=1.5, max_items=16),
++    )
++
++    first = governor.observe_results([_result(StepStatus.SUCCESS)])
++    second = governor.observe_results([_result(StepStatus.SUCCESS)])
++
++    assert first.next_budget.max_items == 8
++    assert second.previous_budget.max_items == 8
++    assert second.next_budget.max_items == 12
++    assert governor.current_budget.max_items == 12
++    assert governor.state.consecutive_successes == 0
++    assert "success_streak:2" in second.reason
++
++
++def test_governor_shrinks_budget_on_oom() -> None:
++    governor = ConservativeRuntimeGovernor(
++        BatchBudget(max_items=8, max_host_bytes=100, max_device_bytes=200),
++        policy=GovernorPolicy(shrink_factor=0.5, min_items=2),
++    )
++
++    decision = governor.observe_results([_result(StepStatus.OOM_FAULT)])
++
++    assert decision.next_budget.max_items == 4
++    assert decision.next_budget.max_host_bytes == 50
++    assert decision.next_budget.max_device_bytes == 100
++    assert decision.consecutive_successes == 0
++    assert decision.consecutive_ooms == 1
++    assert governor.current_budget == decision.next_budget
++    assert decision.reason.startswith("oom_fault")
++
++
++def test_governor_respects_bounds() -> None:
++    governor = ConservativeRuntimeGovernor(
++        BatchBudget(max_items=2, max_host_bytes=4, max_device_bytes=4),
++        policy=GovernorPolicy(
++            shrink_factor=0.5,
++            grow_factor=4.0,
++            grow_after_successes=1,
++            min_items=2,
++            max_items=8,
++            min_host_bytes=3,
++            max_host_bytes=6,
++            min_device_bytes=3,
++            max_device_bytes=6,
++        ),
++    )
++
++    oom = governor.observe_results([_result(StepStatus.OOM_FAULT)])
++    success = governor.observe_results([_result(StepStatus.SUCCESS)])
++
++    assert oom.next_budget.max_items == 2
++    assert oom.next_budget.max_host_bytes == 3
++    assert oom.next_budget.max_device_bytes == 3
++    assert success.next_budget.max_items == 8
++    assert success.next_budget.max_host_bytes == 6
++    assert success.next_budget.max_device_bytes == 6
++
++
++def test_governor_keeps_budget_for_non_oom_faults() -> None:
++    governor = ConservativeRuntimeGovernor(BatchBudget(max_items=8))
++    governor.observe_results([_result(StepStatus.SUCCESS)])
++
++    decision = governor.observe_results([_result(StepStatus.DATA_FAULT)])
++
++    assert decision.next_budget.max_items == 8
++    assert decision.consecutive_successes == 0
++    assert decision.consecutive_ooms == 0
++    assert decision.reason.startswith("non_oom_fault")
++
++
++def test_governor_records_resource_peaks_in_decision_and_reason() -> None:
++    sample = ResourceSample(
++        timestamp_ns=10,
++        phase="after_forward",
++        cpu_rss_bytes=123,
++        cuda_available=True,
++        cuda_max_allocated_bytes=456,
++        cuda_max_reserved_bytes=789,
++    )
++    governor = ConservativeRuntimeGovernor(BatchBudget(max_items=8))
++
++    decision = governor.observe_results([_result(StepStatus.SUCCESS, samples=(sample,))])
++
++    assert decision.peak_cpu_rss_bytes == 123
++    assert decision.peak_cuda_allocated_bytes == 456
++    assert decision.peak_cuda_reserved_bytes == 789
++    assert "peak_cpu_rss_bytes=123" in decision.reason
++    assert "peak_cuda_allocated_bytes=456" in decision.reason
++    assert "peak_cuda_reserved_bytes=789" in decision.reason
++
++
++def test_governor_rejects_invalid_policy_values() -> None:
++    with pytest.raises(ValueError, match="shrink_factor"):
++        GovernorPolicy(shrink_factor=1.0)
++    with pytest.raises(ValueError, match="grow_factor"):
++        GovernorPolicy(grow_factor=1.0)
++    with pytest.raises(ValueError, match="grow_after_successes"):
++        GovernorPolicy(grow_after_successes=0)
++    with pytest.raises(ValueError, match="min_items"):
++        GovernorPolicy(min_items=0)
++    with pytest.raises(ValueError, match="items"):
++        GovernorPolicy(min_items=8, max_items=4)
++    with pytest.raises(ValueError, match="host_bytes"):
++        GovernorPolicy(min_host_bytes=8, max_host_bytes=4)
++    with pytest.raises(TypeError, match="max_device_bytes"):
++        GovernorPolicy(max_device_bytes="large")  # type: ignore[arg-type]
++
++
++def test_governor_rejects_invalid_arguments() -> None:
++    with pytest.raises(TypeError, match="budget"):
++        ConservativeRuntimeGovernor(object())  # type: ignore[arg-type]
++    with pytest.raises(TypeError, match="policy"):
++        ConservativeRuntimeGovernor(BatchBudget(max_items=1), policy=object())  # type: ignore[arg-type]
++    with pytest.raises(TypeError, match="state"):
++        ConservativeRuntimeGovernor(BatchBudget(max_items=1), state=object())  # type: ignore[arg-type]
++
++    governor = ConservativeRuntimeGovernor(BatchBudget(max_items=1))
++    with pytest.raises(TypeError, match="iterable"):
++        governor.observe_results(_result(StepStatus.SUCCESS))  # type: ignore[arg-type]
++    with pytest.raises(TypeError, match="StepResult"):
++        governor.observe_results([object()])  # type: ignore[list-item]
++
++
++def test_governor_can_reuse_explicit_state() -> None:
++    state = RuntimeGovernorState(consecutive_successes=1)
++    governor = ConservativeRuntimeGovernor(
++        BatchBudget(max_items=4),
++        policy=GovernorPolicy(grow_after_successes=2, grow_factor=2.0),
++        state=state,
++    )
++
++    decision = governor.observe_results([_result(StepStatus.SUCCESS)])
++
++    assert decision.next_budget.max_items == 8
++    assert state.last_decision is decision
++    assert state.consecutive_successes == 0
+diff --git a/enn_torch_dev/runtime/__init__.py b/enn_torch_dev/runtime/__init__.py
+index ec1d172..b71efa8 100644
+--- a/enn_torch_dev/runtime/__init__.py
++++ b/enn_torch_dev/runtime/__init__.py
+@@ -10,6 +10,12 @@ from .cost import (
+     TensorCost,
+ )
+ from .faults import ResourceSample, RuntimePhase, StepResult, StepStatus
++from .governor import (
++    ConservativeRuntimeGovernor,
++    GovernorDecision,
++    GovernorPolicy,
++    RuntimeGovernorState,
++)
+ from .footprint import ModelFootprint, OptimizerFootprint
+ from .loader import PlainLoader, SPDLLoader
+ from .resources import ResourceMonitor
+@@ -20,8 +26,11 @@ __all__ = [
+     "BatchBudget",
+     "BatchBudgetExceeded",
+     "BudgetedBatcher",
++    "ConservativeRuntimeGovernor",
+     "DataCost",
+     "DataCostProbe",
++    "GovernorDecision",
++    "GovernorPolicy",
+     "ModelFootprint",
+     "ModelCost",
+     "ModelCostProbe",
+@@ -31,6 +40,7 @@ __all__ = [
+     "ResourceDelta",
+     "ResourceSample",
+     "RetryPolicy",
++    "RuntimeGovernorState",
+     "RuntimePhase",
+     "RuntimeStep",
+     "RuntimeRetryRunner",
+diff --git a/enn_torch_dev/runtime/governor.py b/enn_torch_dev/runtime/governor.py
+new file mode 100644
+index 0000000..d4e1464
+--- /dev/null
++++ b/enn_torch_dev/runtime/governor.py
+@@ -0,0 +1,339 @@
++from __future__ import annotations
++
++import math
++from collections.abc import Iterable
++from dataclasses import dataclass
++
++from .batching import BatchBudget
++from .faults import ResourceSample, StepResult, StepStatus
++
++
++def _validate_optional_limit(
++    value: object,
++    label: str,
++    *,
++    positive: bool = False,
++) -> int | None:
++    if value is None:
++        return None
++    if not isinstance(value, int) or isinstance(value, bool):
++        raise TypeError(f"{label} must be an integer or None.")
++    if positive and value <= 0:
++        raise ValueError(f"{label} must be positive.")
++    if not positive and value < 0:
++        raise ValueError(f"{label} must be non-negative.")
++    return value
++
++
++def _validate_factor(value: object, label: str, *, shrink: bool) -> float:
++    if not isinstance(value, (int, float)) or isinstance(value, bool):
++        raise TypeError(f"{label} must be a number.")
++    factor = float(value)
++    if shrink:
++        if not 0.0 < factor < 1.0:
++            raise ValueError(f"{label} must be greater than 0 and less than 1.")
++    elif factor <= 1.0:
++        raise ValueError(f"{label} must be greater than 1.")
++    return factor
++
++
++def _check_bounds(lower: int | None, upper: int | None, label: str) -> None:
++    if lower is not None and upper is not None and lower > upper:
++        raise ValueError(f"{label} minimum must be less than or equal to maximum.")
++
++
++@dataclass(frozen=True, slots=True)
++class GovernorPolicy:
++    """Conservative bounds and scaling rules for runtime budget decisions."""
++
++    shrink_factor: float = 0.5
++    grow_factor: float = 1.25
++    grow_after_successes: int = 3
++    min_items: int | None = 1
++    max_items: int | None = None
++    min_host_bytes: int | None = None
++    max_host_bytes: int | None = None
++    min_device_bytes: int | None = None
++    max_device_bytes: int | None = None
++
++    def __post_init__(self) -> None:
++        object.__setattr__(
++            self,
++            "shrink_factor",
++            _validate_factor(self.shrink_factor, "GovernorPolicy.shrink_factor", shrink=True),
++        )
++        object.__setattr__(
++            self,
++            "grow_factor",
++            _validate_factor(self.grow_factor, "GovernorPolicy.grow_factor", shrink=False),
++        )
++        if not isinstance(self.grow_after_successes, int) or isinstance(
++            self.grow_after_successes,
++            bool,
++        ):
++            raise TypeError("GovernorPolicy.grow_after_successes must be an integer.")
++        if self.grow_after_successes <= 0:
++            raise ValueError("GovernorPolicy.grow_after_successes must be positive.")
++        object.__setattr__(
++            self,
++            "min_items",
++            _validate_optional_limit(self.min_items, "GovernorPolicy.min_items", positive=True),
++        )
++        object.__setattr__(
++            self,
++            "max_items",
++            _validate_optional_limit(self.max_items, "GovernorPolicy.max_items", positive=True),
++        )
++        object.__setattr__(
++            self,
++            "min_host_bytes",
++            _validate_optional_limit(self.min_host_bytes, "GovernorPolicy.min_host_bytes"),
++        )
++        object.__setattr__(
++            self,
++            "max_host_bytes",
++            _validate_optional_limit(self.max_host_bytes, "GovernorPolicy.max_host_bytes"),
++        )
++        object.__setattr__(
++            self,
++            "min_device_bytes",
++            _validate_optional_limit(self.min_device_bytes, "GovernorPolicy.min_device_bytes"),
++        )
++        object.__setattr__(
++            self,
++            "max_device_bytes",
++            _validate_optional_limit(self.max_device_bytes, "GovernorPolicy.max_device_bytes"),
++        )
++        _check_bounds(self.min_items, self.max_items, "GovernorPolicy.items")
++        _check_bounds(self.min_host_bytes, self.max_host_bytes, "GovernorPolicy.host_bytes")
++        _check_bounds(self.min_device_bytes, self.max_device_bytes, "GovernorPolicy.device_bytes")
++
++
++@dataclass(frozen=True, slots=True)
++class GovernorDecision:
++    """A single budget decision derived from observed StepResult objects."""
++
++    previous_budget: BatchBudget
++    next_budget: BatchBudget
++    reason: str
++    statuses: tuple[StepStatus, ...]
++    consecutive_successes: int
++    consecutive_ooms: int
++    peak_cpu_rss_bytes: int | None = None
++    peak_cuda_allocated_bytes: int | None = None
++    peak_cuda_reserved_bytes: int | None = None
++
++
++@dataclass(slots=True)
++class RuntimeGovernorState:
++    """Mutable conservative governor state."""
++
++    consecutive_successes: int = 0
++    consecutive_ooms: int = 0
++    last_decision: GovernorDecision | None = None
++
++
++class ConservativeRuntimeGovernor:
++    """Observe StepResult streams and conservatively adjust future BatchBudget values."""
++
++    def __init__(
++        self,
++        budget: BatchBudget,
++        *,
++        policy: GovernorPolicy | None = None,
++        state: RuntimeGovernorState | None = None,
++    ) -> None:
++        if not isinstance(budget, BatchBudget):
++            raise TypeError("ConservativeRuntimeGovernor.budget must be a BatchBudget.")
++        if policy is not None and not isinstance(policy, GovernorPolicy):
++            raise TypeError("ConservativeRuntimeGovernor.policy must be a GovernorPolicy or None.")
++        if state is not None and not isinstance(state, RuntimeGovernorState):
++            raise TypeError(
++                "ConservativeRuntimeGovernor.state must be a RuntimeGovernorState or None."
++            )
++        self._budget = budget
++        self.policy = policy or GovernorPolicy()
++        self.state = state or RuntimeGovernorState()
++
++    @property
++    def current_budget(self) -> BatchBudget:
++        return self._budget
++
++    def observe_results(self, results: Iterable[StepResult]) -> GovernorDecision:
++        if isinstance(results, StepResult):
++            raise TypeError(
++                "ConservativeRuntimeGovernor.observe_results expects an iterable of StepResult."
++            )
++        if not isinstance(results, Iterable):
++            raise TypeError(
++                "ConservativeRuntimeGovernor.observe_results expects an iterable of StepResult."
++            )
++
++        result_tuple = tuple(results)
++        for result in result_tuple:
++            if not isinstance(result, StepResult):
++                raise TypeError(
++                    "ConservativeRuntimeGovernor.observe_results source must yield StepResult."
++                )
++
++        decision = self._decide(result_tuple)
++        self._budget = decision.next_budget
++        self.state.last_decision = decision
++        return decision
++
++    def _decide(self, results: tuple[StepResult, ...]) -> GovernorDecision:
++        previous_budget = self._budget
++        statuses = tuple(result.status for result in results)
++        peaks = _resource_peaks(results)
++
++        if not results:
++            reason = _with_resource_suffix("no_results: budget unchanged", peaks)
++            return GovernorDecision(
++                previous_budget=previous_budget,
++                next_budget=previous_budget,
++                reason=reason,
++                statuses=statuses,
++                consecutive_successes=self.state.consecutive_successes,
++                consecutive_ooms=self.state.consecutive_ooms,
++                **peaks,
++            )
++
++        if any(status is StepStatus.OOM_FAULT for status in statuses):
++            self.state.consecutive_successes = 0
++            self.state.consecutive_ooms += 1
++            next_budget = self._shrink_budget(previous_budget)
++            reason = _with_resource_suffix("oom_fault: shrink budget", peaks)
++            return GovernorDecision(
++                previous_budget=previous_budget,
++                next_budget=next_budget,
++                reason=reason,
++                statuses=statuses,
++                consecutive_successes=self.state.consecutive_successes,
++                consecutive_ooms=self.state.consecutive_ooms,
++                **peaks,
++            )
++
++        if all(status is StepStatus.SUCCESS for status in statuses):
++            successes = self.state.consecutive_successes + 1
++            self.state.consecutive_ooms = 0
++            if successes >= self.policy.grow_after_successes:
++                self.state.consecutive_successes = 0
++                next_budget = self._grow_budget(previous_budget)
++                reason = _with_resource_suffix(
++                    f"success_streak:{successes}: grow budget",
++                    peaks,
++                )
++            else:
++                self.state.consecutive_successes = successes
++                next_budget = previous_budget
++                reason = _with_resource_suffix(
++                    f"success_streak:{successes}/{self.policy.grow_after_successes}: budget unchanged",
++                    peaks,
++                )
++            return GovernorDecision(
++                previous_budget=previous_budget,
++                next_budget=next_budget,
++                reason=reason,
++                statuses=statuses,
++                consecutive_successes=self.state.consecutive_successes,
++                consecutive_ooms=self.state.consecutive_ooms,
++                **peaks,
++            )
++
++        self.state.consecutive_successes = 0
++        self.state.consecutive_ooms = 0
++        reason = _with_resource_suffix("non_oom_fault: budget unchanged", peaks)
++        return GovernorDecision(
++            previous_budget=previous_budget,
++            next_budget=previous_budget,
++            reason=reason,
++            statuses=statuses,
++            consecutive_successes=self.state.consecutive_successes,
++            consecutive_ooms=self.state.consecutive_ooms,
++            **peaks,
++        )
++
++    def _shrink_budget(self, budget: BatchBudget) -> BatchBudget:
++        return BatchBudget(
++            max_host_bytes=_shrink_limit(
++                budget.max_host_bytes,
++                factor=self.policy.shrink_factor,
++                lower=self.policy.min_host_bytes,
++            ),
++            max_device_bytes=_shrink_limit(
++                budget.max_device_bytes,
++                factor=self.policy.shrink_factor,
++                lower=self.policy.min_device_bytes,
++            ),
++            max_items=_shrink_limit(
++                budget.max_items,
++                factor=self.policy.shrink_factor,
++                lower=self.policy.min_items,
++            ),
++        )
++
++    def _grow_budget(self, budget: BatchBudget) -> BatchBudget:
++        return BatchBudget(
++            max_host_bytes=_grow_limit(
++                budget.max_host_bytes,
++                factor=self.policy.grow_factor,
++                upper=self.policy.max_host_bytes,
++            ),
++            max_device_bytes=_grow_limit(
++                budget.max_device_bytes,
++                factor=self.policy.grow_factor,
++                upper=self.policy.max_device_bytes,
++            ),
++            max_items=_grow_limit(
++                budget.max_items,
++                factor=self.policy.grow_factor,
++                upper=self.policy.max_items,
++            ),
++        )
++
++
++def _shrink_limit(value: int | None, *, factor: float, lower: int | None) -> int | None:
++    if value is None:
++        return None
++    if value == 0:
++        return 0
++    floor = 1 if lower is None else lower
++    return max(floor, int(value * factor))
++
++
++def _grow_limit(value: int | None, *, factor: float, upper: int | None) -> int | None:
++    if value is None:
++        return None
++    grown = math.ceil(value * factor)
++    if upper is not None:
++        grown = min(grown, upper)
++    return grown
++
++
++def _resource_peaks(results: tuple[StepResult, ...]) -> dict[str, int | None]:
++    samples: list[ResourceSample] = []
++    for result in results:
++        samples.extend(result.resource_samples)
++    return {
++        "peak_cpu_rss_bytes": _max_optional(sample.cpu_rss_bytes for sample in samples),
++        "peak_cuda_allocated_bytes": _max_optional(
++            sample.cuda_max_allocated_bytes for sample in samples
++        ),
++        "peak_cuda_reserved_bytes": _max_optional(
++            sample.cuda_max_reserved_bytes for sample in samples
++        ),
++    }
++
++
++def _max_optional(values: Iterable[int | None]) -> int | None:
++    present = [value for value in values if value is not None]
++    if not present:
++        return None
++    return max(present)
++
++
++def _with_resource_suffix(reason: str, peaks: dict[str, int | None]) -> str:
++    details = [f"{key}={value}" for key, value in peaks.items() if value is not None]
++    if not details:
++        return reason
++    return f"{reason}; " + ", ".join(details)
