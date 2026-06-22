@@ -7,7 +7,15 @@ from typing import Protocol, runtime_checkable
 from enn_torch_dev.data import KVBatch
 
 from .batching import slice_kvbatch
-from .faults import StepResult, StepStatus
+from .faults import RuntimePhase, StepResult, StepStatus
+
+_RETRYABLE_OOM_PHASES = frozenset(
+    (
+        RuntimePhase.TO_STORE,
+        RuntimePhase.FORWARD,
+        RuntimePhase.LOSS,
+    )
+)
 
 
 @runtime_checkable
@@ -45,7 +53,7 @@ class RetryPolicy:
 
 
 class RuntimeRetryRunner:
-    """Run RuntimeStep over KVBatch streams with minimal OOM-class retry."""
+    """Run RuntimeStep over KVBatch streams with side-effect-safe OOM-class retry."""
 
     def __init__(
         self,
@@ -88,19 +96,49 @@ class RuntimeRetryRunner:
             yield result
             return
 
-        for subbatch in self._split_for_retry(batch):
+        subbatches = tuple(self._split_for_retry(batch))
+        if len(subbatches) < 2:
+            yield result
+            return
+
+        self._drop_retry_result_references(result)
+        del result
+
+        for subbatch in subbatches:
             yield from self._run_with_retry(subbatch, retry_count=retry_count + 1)
 
     def _should_retry(self, result: StepResult) -> bool:
-        return self.policy.retry_oom and result.status is StepStatus.OOM_FAULT
+        return (
+            self.policy.retry_oom
+            and result.status is StepStatus.OOM_FAULT
+            and result.phase in _RETRYABLE_OOM_PHASES
+            and getattr(self.runtime_step, "optimizer", None) is None
+        )
+
+    def _drop_retry_result_references(self, result: StepResult) -> None:
+        """Hook called before retrying so full-batch OOM results can be released."""
 
     def _split_for_retry(self, batch: KVBatch) -> Iterator[KVBatch]:
-        target_size = (batch.batch_size + self.policy.split_factor - 1) // self.policy.split_factor
-        target_size = max(self.policy.min_items, target_size)
-        if target_size >= batch.batch_size:
-            target_size = batch.batch_size - 1
-        target_size = max(1, target_size)
-
-        for start in range(0, batch.batch_size, target_size):
-            end = min(start + target_size, batch.batch_size)
+        for start, end in self._split_ranges(batch.batch_size):
             yield slice_kvbatch(batch, start, end, cost_hint=None)
+
+    def _split_ranges(self, batch_size: int) -> tuple[tuple[int, int], ...]:
+        target_size = (batch_size + self.policy.split_factor - 1) // self.policy.split_factor
+        target_size = max(self.policy.min_items, target_size)
+        if target_size >= batch_size:
+            return ()
+
+        ranges: list[tuple[int, int]] = []
+        start = 0
+        while start < batch_size:
+            end = min(start + target_size, batch_size)
+            if batch_size - end and batch_size - end < self.policy.min_items:
+                end = batch_size
+            ranges.append((start, end))
+            start = end
+
+        if len(ranges) < 2:
+            return ()
+        if any(end - start < self.policy.min_items for start, end in ranges):
+            return ()
+        return tuple(ranges)

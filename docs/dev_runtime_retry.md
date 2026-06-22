@@ -25,7 +25,7 @@ when the result status is `StepStatus.OOM_FAULT`.
 `RetryPolicy` owns static retry limits:
 
 - `max_retry_depth`: maximum split/retry depth after the first failed execution;
-- `min_items`: do not split batches at or below this batch size;
+- `min_items`: hard floor for every retried subbatch; batches at or below this size are not split;
 - `split_factor`: approximate number of chunks to split an oversized batch into;
 - `retry_oom`: enable or disable OOM retry.
 
@@ -38,6 +38,9 @@ The runner preserves source order and row order. When a batch is split, subbatch
 preserve `TensorDict` payload, `row_ids`, `source_ids`, `sample_ids`, `schema_id`,
 and `shard_id` through the shared runtime slicing helper. The split `KVBatch`
 uses materialized slices for both the `TensorDict` payload and identity tensors.
+`min_items` applies to every retried subbatch; if a split plan would create a
+smaller remainder and cannot merge it into a valid multi-chunk split, the runner
+yields the original OOM result instead of retrying a microbatch.
 
 ## Retry Behavior
 
@@ -47,13 +50,24 @@ For each batch:
 2. yield successful results unchanged;
 3. yield non-OOM faults unchanged;
 4. when the result is `StepStatus.OOM_FAULT`, `retry_oom=True`, retry depth is
-   still available, and the batch is larger than `min_items`, split the batch;
-5. execute split batches in row order;
-6. yield the final OOM `StepResult` when the batch can no longer be split or the
+   still available, the phase is side-effect-safe, the runtime step has no
+   optimizer, and the batch is larger than `min_items`, compute a valid split
+   plan;
+5. retry only `RuntimePhase.TO_STORE`, `RuntimePhase.FORWARD`, and
+   `RuntimePhase.LOSS` OOM results;
+6. do not retry `RuntimePhase.BACKWARD`, `RuntimePhase.OPTIMIZER`, or
+   `phase=None` OOM results;
+7. before executing subbatches, drop failed full-batch OOM result references to
+   `store` and `loss` so heavyweight intermediates are not kept alive by the
+   retry loop;
+8. execute split batches in row order;
+9. yield the final OOM `StepResult` when the batch can no longer be split or the
    retry budget is exhausted.
 
 The runner does not catch arbitrary Python exceptions from the runtime step. It
-operates on the existing `RuntimeStep` fault-classification contract.
+operates on the existing `RuntimeStep` fault-classification contract. This is a
+side-effect-safe retry boundary only: runtime steps with a non-`None`
+`optimizer` attribute are not retried, even for `FORWARD` OOM results.
 
 ## Relationship to BudgetedBatcher
 
@@ -76,6 +90,10 @@ own model execution and retry policy does not own resource/cost probing.
 - Calibration cache.
 - Device transfer.
 - AMP or precision fallback.
+- Optimizer updates or training-step retry semantics.
+- Gradient accumulation.
+- Optimizer state rollback or recovery.
+- Preserving one-logical-batch-one-update semantics across split retries.
 - Checkpoint/resume.
 - Distributed retry.
 - SPDL queue-depth tuning.

@@ -7,6 +7,7 @@ import torch
 from tensordict import TensorDict
 
 from enn_torch_dev.data import KVBatch
+from enn_torch_dev.executor import KVStore
 from enn_torch_dev.runtime import (
     RetryPolicy,
     RuntimePhase,
@@ -207,6 +208,133 @@ def test_runtime_retry_runner_materializes_split_identity_tensors() -> None:
         assert subbatch.sample_ids is not None
         assert batch.sample_ids is not None
         assert _storage_ptr(subbatch.sample_ids) != _storage_ptr(batch.sample_ids)
+
+
+def test_runtime_retry_runner_does_not_run_remainder_below_min_items() -> None:
+    step = FakeRuntimeStep(_oom)
+    batch = _batch(5)
+
+    results = list(
+        RuntimeRetryRunner(
+            step,
+            policy=RetryPolicy(min_items=4, split_factor=2),
+        ).run_batch(batch)
+    )
+
+    assert [result.status for result in results] == [StepStatus.OOM_FAULT]
+    assert [result.batch_size for result in results] == [5]
+    assert [call.batch_size for call in step.calls] == [5]
+
+
+def test_runtime_retry_runner_keeps_valid_split_at_or_above_min_items() -> None:
+    def run(batch: KVBatch) -> StepResult:
+        if batch.batch_size > 6:
+            return _oom(batch)
+        return _success(batch)
+
+    step = FakeRuntimeStep(run)
+    batch = _batch(10)
+
+    results = list(
+        RuntimeRetryRunner(
+            step,
+            policy=RetryPolicy(min_items=4, split_factor=3),
+        ).run_batch(batch)
+    )
+
+    retried_sizes = [call.batch_size for call in step.calls[1:]]
+    assert retried_sizes == [4, 6]
+    assert all(size >= 4 for size in retried_sizes)
+    assert [result.status for result in results] == [StepStatus.SUCCESS, StepStatus.SUCCESS]
+    assert [result.batch_size for result in results] == [4, 6]
+    assert torch.equal(torch.cat([result.row_ids for result in results]), batch.row_ids)
+
+
+def test_runtime_retry_runner_drops_failed_result_references_before_retry() -> None:
+    class SpyRetryRunner(RuntimeRetryRunner):
+        def __init__(self, step: FakeRuntimeStep) -> None:
+            super().__init__(step)
+            self.cleanup_call_counts: list[int] = []
+            self.cleanup_saw_heavy_refs: list[tuple[bool, bool]] = []
+
+        def _drop_retry_result_references(self, result: StepResult) -> None:
+            self.cleanup_call_counts.append(len(self.runtime_step.calls))
+            self.cleanup_saw_heavy_refs.append((result.store is not None, result.loss is not None))
+
+    def run(batch: KVBatch) -> StepResult:
+        if batch.batch_size > 2:
+            store = KVStore()
+            store.set("heavy", torch.ones(batch.batch_size), origin="test")
+            return StepResult(
+                status=StepStatus.OOM_FAULT,
+                phase=RuntimePhase.FORWARD,
+                batch_size=batch.batch_size,
+                row_ids=batch.row_ids.detach().cpu().clone(),
+                loss=torch.ones((), requires_grad=True),
+                store=store,
+                error_type="OOM_FAULT",
+                error_message="CUDA out of memory",
+            )
+        return _success(batch)
+
+    step = FakeRuntimeStep(run)
+    runner = SpyRetryRunner(step)
+
+    results = list(runner.run_batch(_batch(4)))
+
+    assert [result.status for result in results] == [StepStatus.SUCCESS, StepStatus.SUCCESS]
+    assert runner.cleanup_call_counts == [1]
+    assert runner.cleanup_saw_heavy_refs == [(True, True)]
+    assert [call.batch_size for call in step.calls] == [4, 2, 2]
+
+
+@pytest.mark.parametrize(
+    "phase",
+    [RuntimePhase.TO_STORE, RuntimePhase.FORWARD, RuntimePhase.LOSS],
+)
+def test_runtime_retry_runner_retries_side_effect_safe_oom_phases(
+    phase: RuntimePhase,
+) -> None:
+    def run(batch: KVBatch) -> StepResult:
+        if batch.batch_size > 2:
+            return _result(batch, StepStatus.OOM_FAULT, phase=phase)
+        return _success(batch)
+
+    step = FakeRuntimeStep(run)
+    batch = _batch(4)
+
+    results = list(RuntimeRetryRunner(step).run_batch(batch))
+
+    assert [result.status for result in results] == [StepStatus.SUCCESS, StepStatus.SUCCESS]
+    assert [call.batch_size for call in step.calls] == [4, 2, 2]
+
+
+@pytest.mark.parametrize(
+    "phase",
+    [RuntimePhase.BACKWARD, RuntimePhase.OPTIMIZER, None],
+)
+def test_runtime_retry_runner_does_not_retry_side_effect_or_unknown_oom_phases(
+    phase: RuntimePhase | None,
+) -> None:
+    step = FakeRuntimeStep(lambda batch: _result(batch, StepStatus.OOM_FAULT, phase=phase))
+    batch = _batch(4)
+
+    results = list(RuntimeRetryRunner(step).run_batch(batch))
+
+    assert [result.status for result in results] == [StepStatus.OOM_FAULT]
+    assert [result.phase for result in results] == [phase]
+    assert [call.batch_size for call in step.calls] == [4]
+
+
+def test_runtime_retry_runner_does_not_retry_runtime_step_with_optimizer() -> None:
+    step = FakeRuntimeStep(_oom)
+    step.optimizer = object()  # type: ignore[attr-defined]
+    batch = _batch(4)
+
+    results = list(RuntimeRetryRunner(step).run_batch(batch))
+
+    assert [result.status for result in results] == [StepStatus.OOM_FAULT]
+    assert [call.batch_size for call in step.calls] == [4]
 
 
 def test_runtime_retry_runner_returns_oom_when_min_items_still_fails() -> None:
