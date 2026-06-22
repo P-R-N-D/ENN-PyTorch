@@ -15,7 +15,8 @@ Use this document before running code that can allocate accelerator memory, writ
 - Do not automatically download external data or models.
 - Do not assume TensorRT, CoreML, TensorFlow, ExecuTorch, NVIDIA Transformer Engine, Intel Extension for PyTorch, pandas, polars, Spark, safetensors, or other optional backends are installed.
 - Do not add checkpoints, exports, predictions, memmaps, or temporary artifacts to Git.
-- Do not run destructive commands or use root, sudo, or administrator privileges for repository tasks.
+- Do not use `sudo`, administrator elevation, or destructive root-level operations for repository tasks.
+- Root-based container workspaces are allowed for safe repository-local checks such as `git diff --check`, `python -m py_compile`, and `python -m pytest`, as long as the task does not change system paths, install global packages, modify ownership/permissions, or touch data outside the workspace.
 - Do not record secrets, tokens, API keys, or real credentials.
 - Do not create `.env` files.
 
