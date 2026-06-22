@@ -113,8 +113,13 @@ python -m pytest enn_torch_dev/debug -q
 git diff --check
 ```
 
-## Next Step
+## Follow-up Context
 
-The next runtime-facing slice can add a conservative governor layer that consumes
-`BatchCost`, `ModelCost`, retry outcomes, and `ResourceMonitor` samples to adjust
-future budgets. That governor should not be folded into `RuntimeRetryRunner`.
+The conservative runtime governor slice now lives outside `RuntimeRetryRunner`.
+It observes already-produced `StepResult` streams and chooses a future
+`BatchBudget` without owning model execution, retry execution, batch splitting,
+cost probing, or `ResourceMonitor` feedback loops.
+
+Future governor work that uses `BatchCost`, `ModelCost`, learned calibration, or
+resource-monitor feedback should remain a separate follow-up and should not be
+folded into `RuntimeRetryRunner`.
