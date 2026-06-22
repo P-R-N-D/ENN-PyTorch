@@ -40,7 +40,9 @@ and `shard_id` through the shared runtime slicing helper. The split `KVBatch`
 uses materialized slices for both the `TensorDict` payload and identity tensors.
 `min_items` applies to every retried subbatch; if a split plan would create a
 smaller remainder and cannot merge it into a valid multi-chunk split, the runner
-yields the original OOM result instead of retrying a microbatch.
+yields the original OOM result instead of retrying a microbatch. The runner
+computes only `(start, end)` split ranges before cleanup; actual `KVBatch`
+subbatches are materialized only after failed-result references are dropped.
 
 ## Retry Behavior
 
@@ -57,9 +59,9 @@ For each batch:
    `RuntimePhase.LOSS` OOM results;
 6. do not retry `RuntimePhase.BACKWARD`, `RuntimePhase.OPTIMIZER`, or
    `phase=None` OOM results;
-7. before executing subbatches, drop failed full-batch OOM result references to
-   `store` and `loss` so heavyweight intermediates are not kept alive by the
-   retry loop;
+7. before materializing or executing subbatches, drop failed full-batch OOM
+   result references to `store` and `loss` so heavyweight intermediates are not
+   kept alive by the retry loop;
 8. execute split batches in row order;
 9. yield the final OOM `StepResult` when the batch can no longer be split or the
    retry budget is exhausted.

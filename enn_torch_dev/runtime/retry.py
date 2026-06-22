@@ -96,15 +96,16 @@ class RuntimeRetryRunner:
             yield result
             return
 
-        subbatches = tuple(self._split_for_retry(batch))
-        if len(subbatches) < 2:
+        ranges = self._split_ranges(batch.batch_size)
+        if len(ranges) < 2:
             yield result
             return
 
         self._drop_retry_result_references(result)
         del result
 
-        for subbatch in subbatches:
+        for start, end in ranges:
+            subbatch = slice_kvbatch(batch, start, end, cost_hint=None)
             yield from self._run_with_retry(subbatch, retry_count=retry_count + 1)
 
     def _should_retry(self, result: StepResult) -> bool:
@@ -117,10 +118,6 @@ class RuntimeRetryRunner:
 
     def _drop_retry_result_references(self, result: StepResult) -> None:
         """Hook called before retrying so full-batch OOM results can be released."""
-
-    def _split_for_retry(self, batch: KVBatch) -> Iterator[KVBatch]:
-        for start, end in self._split_ranges(batch.batch_size):
-            yield slice_kvbatch(batch, start, end, cost_hint=None)
 
     def _split_ranges(self, batch_size: int) -> tuple[tuple[int, int], ...]:
         target_size = (batch_size + self.policy.split_factor - 1) // self.policy.split_factor

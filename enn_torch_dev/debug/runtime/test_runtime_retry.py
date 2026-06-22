@@ -6,6 +6,7 @@ import pytest
 import torch
 from tensordict import TensorDict
 
+import enn_torch_dev.runtime.retry as retry_module
 from enn_torch_dev.data import KVBatch
 from enn_torch_dev.executor import KVStore
 from enn_torch_dev.runtime import (
@@ -250,7 +251,24 @@ def test_runtime_retry_runner_keeps_valid_split_at_or_above_min_items() -> None:
     assert torch.equal(torch.cat([result.row_ids for result in results]), batch.row_ids)
 
 
-def test_runtime_retry_runner_drops_failed_result_references_before_retry() -> None:
+def test_runtime_retry_runner_drops_failed_result_references_before_retry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[str] = []
+    original_slice_kvbatch = retry_module.slice_kvbatch
+
+    def spy_slice_kvbatch(
+        batch: KVBatch,
+        start: int,
+        end: int,
+        *,
+        cost_hint: object = None,
+    ) -> KVBatch:
+        events.append(f"slice:{start}:{end}")
+        return original_slice_kvbatch(batch, start, end, cost_hint=cost_hint)
+
+    monkeypatch.setattr(retry_module, "slice_kvbatch", spy_slice_kvbatch)
+
     class SpyRetryRunner(RuntimeRetryRunner):
         def __init__(self, step: FakeRuntimeStep) -> None:
             super().__init__(step)
@@ -258,10 +276,12 @@ def test_runtime_retry_runner_drops_failed_result_references_before_retry() -> N
             self.cleanup_saw_heavy_refs: list[tuple[bool, bool]] = []
 
         def _drop_retry_result_references(self, result: StepResult) -> None:
+            events.append("cleanup")
             self.cleanup_call_counts.append(len(self.runtime_step.calls))
             self.cleanup_saw_heavy_refs.append((result.store is not None, result.loss is not None))
 
     def run(batch: KVBatch) -> StepResult:
+        events.append(f"run:{batch.batch_size}")
         if batch.batch_size > 2:
             store = KVStore()
             store.set("heavy", torch.ones(batch.batch_size), origin="test")
@@ -286,6 +306,7 @@ def test_runtime_retry_runner_drops_failed_result_references_before_retry() -> N
     assert runner.cleanup_call_counts == [1]
     assert runner.cleanup_saw_heavy_refs == [(True, True)]
     assert [call.batch_size for call in step.calls] == [4, 2, 2]
+    assert events == ["run:4", "cleanup", "slice:0:2", "run:2", "slice:2:4", "run:2"]
 
 
 @pytest.mark.parametrize(
