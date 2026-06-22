@@ -114,9 +114,10 @@ python -m pytest enn_torch_dev/debug/data -q
 python -m pytest enn_torch_dev/debug -q
 ```
 
-## Next Step
+## Follow-up
 
-The next runtime-facing slice should add an OOM retry runner that uses this
-budget boundary as its deterministic split mechanism. That runner should catch
-OOM-class faults from `RuntimeStep`, split or shrink the failed batch, and retry
-without making `BudgetedBatcher` responsible for model execution.
+`RuntimeRetryRunner` now owns post-execution OOM-class retry using the same
+materialized `KVBatch` slicing semantics as this budget boundary. The next
+runtime-facing slice can add a conservative governor layer that consumes cost,
+resource, and retry observations without folding execution policy into
+`BudgetedBatcher`.
