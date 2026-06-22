@@ -37,6 +37,13 @@ Active configured budget values must be positive when used by the governor. This
 is stricter than the lower-level `BatchBudget` validation because the governor
 needs a positive value to shrink or grow.
 
+When a `ConservativeRuntimeGovernor` is created, the active budget from either
+`budget` or `state.current_budget` must already be inside the configured policy
+bounds. Configured fields below a policy minimum or above a policy maximum are
+rejected at construction time. `None` fields are not validated against bounds and
+are not activated by bounds. This prevents an OOM shrink from increasing a budget
+or a success grow from decreasing one through clamping.
+
 ## Policy Validation
 
 `GovernorPolicy` validates static adjustment parameters when it is created:
@@ -61,21 +68,32 @@ field. The governor does not choose host or device bytes based on resource peaks
 
 ## Decision Rules
 
-`observe_results(results)` consumes an iterable of `StepResult` objects and
-returns a `GovernorDecision`.
+`observe_results(results, *, recovered_oom=False)` consumes an iterable of
+`StepResult` objects and returns a `GovernorDecision`. The method streams the
+iterable once and accumulates only statuses, resource peaks, and small decision
+flags. It does not keep a list or tuple of `StepResult` objects, so `store` and
+`loss` references from results are not preserved in the decision/state records.
+
+`recovered_oom=True` is an explicit signal from an outer retry layer that an
+OOM-class failure was recovered before the governor observed final results. It is
+treated as conservative budget pressure rather than success evidence.
 
 Decision priority is deliberately small and predictable:
 
-1. Empty streams keep the current budget.
+1. Empty streams keep the current budget unless `recovered_oom=True`.
 2. If any result has `StepStatus.OOM_FAULT`, OOM wins and all configured budget
    fields shrink.
-3. Mixed streams containing OOM and success or non-OOM faults still shrink.
-4. If every observed result is `StepStatus.SUCCESS`, the success streak increases
-   by one for the observe call.
-5. The success streak does not increase per successful `StepResult`.
-6. When `grow_after_successes` is reached, all configured budget fields grow and
+3. `recovered_oom=True` also shrinks all configured budget fields, even when all
+   observed statuses are `SUCCESS` or the observed stream is empty.
+4. Mixed streams containing OOM and success or non-OOM faults still shrink.
+5. If every observed result is `StepStatus.SUCCESS` and `recovered_oom=False`,
+   the success streak increases by one for the observe call.
+6. Retry-recovered OOM is not success evidence and does not increase the success
+   streak.
+7. The success streak does not increase per successful `StepResult`.
+8. When `grow_after_successes` is reached, all configured budget fields grow and
    the success streak resets to zero.
-7. Non-OOM faults keep the current budget and reset success/OOM streaks.
+9. Non-OOM faults keep the current budget and reset success/OOM streaks.
 
 ## State and Decision Records
 

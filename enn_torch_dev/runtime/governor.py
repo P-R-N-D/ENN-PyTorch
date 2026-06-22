@@ -54,6 +54,28 @@ def _validate_budget(budget: object, *, label: str) -> BatchBudget:
     return budget
 
 
+def _validate_budget_within_policy_bounds(
+    budget: BatchBudget,
+    policy: GovernorPolicy,
+    *,
+    label: str,
+) -> None:
+    for field_name, (min_field, max_field) in _BOUND_FIELDS.items():
+        value = getattr(budget, field_name)
+        if value is None:
+            continue
+        minimum = getattr(policy, min_field)
+        maximum = getattr(policy, max_field)
+        if minimum is not None and value < minimum:
+            raise ValueError(
+                f"{label}.{field_name} must be >= GovernorPolicy.{min_field}."
+            )
+        if maximum is not None and value > maximum:
+            raise ValueError(
+                f"{label}.{field_name} must be <= GovernorPolicy.{max_field}."
+            )
+
+
 @dataclass(frozen=True, slots=True)
 class GovernorPolicy:
     """Static conservative budget adjustment policy."""
@@ -203,36 +225,72 @@ class ConservativeRuntimeGovernor:
         if state is not None and not isinstance(state, RuntimeGovernorState):
             raise TypeError("ConservativeRuntimeGovernor.state must be a RuntimeGovernorState or None.")
 
-        self.policy = GovernorPolicy() if policy is None else policy
-        self.state = state if state is not None else RuntimeGovernorState(budget)  # type: ignore[arg-type]
+        resolved_policy = GovernorPolicy() if policy is None else policy
+        resolved_state = (
+            state if state is not None else RuntimeGovernorState(budget)  # type: ignore[arg-type]
+        )
+        _validate_budget_within_policy_bounds(
+            resolved_state.current_budget,
+            resolved_policy,
+            label="ConservativeRuntimeGovernor.current_budget",
+        )
+
+        self.policy = resolved_policy
+        self.state = resolved_state
 
     @property
     def current_budget(self) -> BatchBudget:
         return self.state.current_budget
 
-    def observe_results(self, results: Iterable[StepResult]) -> GovernorDecision:
+    def observe_results(
+        self,
+        results: Iterable[StepResult],
+        *,
+        recovered_oom: bool = False,
+    ) -> GovernorDecision:
         if isinstance(results, StepResult):
             raise TypeError("ConservativeRuntimeGovernor.observe_results expects an iterable of StepResult objects.")
-        observed = tuple(results)
-        for result in observed:
+        if not isinstance(recovered_oom, bool):
+            raise TypeError("ConservativeRuntimeGovernor.recovered_oom must be a bool.")
+
+        statuses: list[StepStatus] = []
+        peaks = self._empty_resource_peaks()
+        saw_any_result = False
+        saw_oom = False
+        all_success = True
+
+        for result in results:
             if not isinstance(result, StepResult):
                 raise TypeError("ConservativeRuntimeGovernor.observe_results must receive StepResult objects.")
+            saw_any_result = True
+            status = result.status
+            statuses.append(status)
+            if status is StepStatus.OOM_FAULT:
+                saw_oom = True
+            if status is not StepStatus.SUCCESS:
+                all_success = False
+            self._update_resource_peaks(peaks, result.resource_samples)
+        if saw_any_result:
+            del result
 
-        statuses = tuple(result.status for result in observed)
-        peaks = self._resource_peaks(observed)
         previous_budget = self.state.current_budget
         next_budget = previous_budget
         consecutive_successes = self.state.consecutive_successes
         consecutive_ooms = self.state.consecutive_ooms
 
-        if not observed:
-            reason = "no results observed; keeping current budget"
-        elif any(status is StepStatus.OOM_FAULT for status in statuses):
+        if saw_oom or recovered_oom:
             next_budget = self._adjust_budget(previous_budget, mode="shrink")
             consecutive_successes = 0
             consecutive_ooms += 1
-            reason = "OOM fault observed; shrinking configured budget fields"
-        elif all(status is StepStatus.SUCCESS for status in statuses):
+            if saw_oom:
+                reason = "OOM fault observed; shrinking configured budget fields"
+                if recovered_oom:
+                    reason += "; retry-recovered OOM signal also observed"
+            else:
+                reason = "retry-recovered OOM observed; shrinking configured budget fields"
+        elif not saw_any_result:
+            reason = "no results observed; keeping current budget"
+        elif all_success:
             consecutive_ooms = 0
             consecutive_successes += 1
             if consecutive_successes >= self.policy.grow_after_successes:
@@ -251,7 +309,7 @@ class ConservativeRuntimeGovernor:
             previous_budget=previous_budget,
             next_budget=next_budget,
             reason=reason,
-            statuses=statuses,
+            statuses=tuple(statuses),
             consecutive_successes=consecutive_successes,
             consecutive_ooms=consecutive_ooms,
             peak_cpu_rss_bytes=peaks["peak_cpu_rss_bytes"],
@@ -296,39 +354,43 @@ class ConservativeRuntimeGovernor:
         return value
 
     @staticmethod
-    def _resource_peaks(results: tuple[StepResult, ...]) -> dict[str, int | None]:
-        peaks: dict[str, int | None] = {
+    def _empty_resource_peaks() -> dict[str, int | None]:
+        return {
             "peak_cpu_rss_bytes": None,
             "peak_cuda_allocated_bytes": None,
             "peak_cuda_reserved_bytes": None,
             "peak_cuda_max_allocated_bytes": None,
             "peak_cuda_max_reserved_bytes": None,
         }
-        for result in results:
-            for sample in result.resource_samples:
-                if not isinstance(sample, ResourceSample):
-                    raise TypeError("StepResult.resource_samples must contain ResourceSample objects.")
-                peaks["peak_cpu_rss_bytes"] = _peak(
-                    peaks["peak_cpu_rss_bytes"],
-                    sample.cpu_rss_bytes,
-                )
-                peaks["peak_cuda_allocated_bytes"] = _peak(
-                    peaks["peak_cuda_allocated_bytes"],
-                    sample.cuda_allocated_bytes,
-                )
-                peaks["peak_cuda_reserved_bytes"] = _peak(
-                    peaks["peak_cuda_reserved_bytes"],
-                    sample.cuda_reserved_bytes,
-                )
-                peaks["peak_cuda_max_allocated_bytes"] = _peak(
-                    peaks["peak_cuda_max_allocated_bytes"],
-                    sample.cuda_max_allocated_bytes,
-                )
-                peaks["peak_cuda_max_reserved_bytes"] = _peak(
-                    peaks["peak_cuda_max_reserved_bytes"],
-                    sample.cuda_max_reserved_bytes,
-                )
-        return peaks
+
+    @staticmethod
+    def _update_resource_peaks(
+        peaks: dict[str, int | None],
+        samples: Iterable[ResourceSample],
+    ) -> None:
+        for sample in samples:
+            if not isinstance(sample, ResourceSample):
+                raise TypeError("StepResult.resource_samples must contain ResourceSample objects.")
+            peaks["peak_cpu_rss_bytes"] = _peak(
+                peaks["peak_cpu_rss_bytes"],
+                sample.cpu_rss_bytes,
+            )
+            peaks["peak_cuda_allocated_bytes"] = _peak(
+                peaks["peak_cuda_allocated_bytes"],
+                sample.cuda_allocated_bytes,
+            )
+            peaks["peak_cuda_reserved_bytes"] = _peak(
+                peaks["peak_cuda_reserved_bytes"],
+                sample.cuda_reserved_bytes,
+            )
+            peaks["peak_cuda_max_allocated_bytes"] = _peak(
+                peaks["peak_cuda_max_allocated_bytes"],
+                sample.cuda_max_allocated_bytes,
+            )
+            peaks["peak_cuda_max_reserved_bytes"] = _peak(
+                peaks["peak_cuda_max_reserved_bytes"],
+                sample.cuda_max_reserved_bytes,
+            )
 
     @staticmethod
     def _append_peak_reason(reason: str, peaks: dict[str, int | None]) -> str:

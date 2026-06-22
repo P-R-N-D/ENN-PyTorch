@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import FrozenInstanceError
+from dataclasses import FrozenInstanceError, fields
 
 import pytest
 import torch
@@ -20,14 +20,22 @@ def _result(
     status: StepStatus = StepStatus.SUCCESS,
     *,
     samples: tuple[ResourceSample, ...] = (),
+    loss: torch.Tensor | None = None,
+    store: object | None = None,
 ) -> StepResult:
     return StepResult(
         status=status,
         phase=None,
         batch_size=1,
         row_ids=torch.arange(1),
+        loss=loss,
+        store=store,  # type: ignore[arg-type]
         resource_samples=samples,
     )
+
+
+def _field_values(instance: object) -> list[object]:
+    return [getattr(instance, field.name) for field in fields(instance)]
 
 
 def test_empty_result_stream_keeps_budget() -> None:
@@ -209,6 +217,138 @@ def test_resource_sample_peaks_are_recorded_in_decision_and_reason() -> None:
     assert decision.peak_cuda_max_reserved_bytes == 51
     assert "resource peaks" in decision.reason
     assert "peak_cpu_rss_bytes=11" in decision.reason
+
+
+def test_observe_results_consumes_lazy_stream_without_storing_results() -> None:
+    events: list[str] = []
+    yielded: list[StepResult] = []
+
+    def stream():
+        for index, status in enumerate((StepStatus.SUCCESS, StepStatus.DATA_FAULT)):
+            events.append(f"yield-{index}")
+            result = _result(status)
+            yielded.append(result)
+            yield result
+            events.append(f"after-{index}")
+
+    governor = ConservativeRuntimeGovernor(BatchBudget(max_items=8))
+
+    decision = governor.observe_results(stream())
+
+    assert events == ["yield-0", "after-0", "yield-1", "after-1"]
+    assert decision.statuses == (StepStatus.SUCCESS, StepStatus.DATA_FAULT)
+    assert all(value not in yielded for value in _field_values(decision))
+    assert all(value not in yielded for value in _field_values(governor.state))
+    assert governor.state.last_decision == decision
+
+
+def test_decision_and_state_do_not_store_step_result_store_or_loss_references() -> None:
+    loss = torch.tensor(1.0)
+    store = object()
+    result = _result(loss=loss, store=store)
+    governor = ConservativeRuntimeGovernor(BatchBudget(max_items=8))
+
+    decision = governor.observe_results([result])
+
+    decision_values = _field_values(decision)
+    state_values = _field_values(governor.state)
+    assert all(value is not result for value in decision_values)
+    assert all(value is not result for value in state_values)
+    assert all(value is not loss for value in decision_values)
+    assert all(value is not loss for value in state_values)
+    assert all(value is not store for value in decision_values)
+    assert all(value is not store for value in state_values)
+
+
+def test_governor_rejects_initial_budget_below_policy_min_bound() -> None:
+    with pytest.raises(ValueError):
+        ConservativeRuntimeGovernor(
+            BatchBudget(max_items=2),
+            policy=GovernorPolicy(min_items=4),
+        )
+
+
+def test_governor_rejects_initial_budget_above_policy_max_bound() -> None:
+    with pytest.raises(ValueError):
+        ConservativeRuntimeGovernor(
+            BatchBudget(max_items=20),
+            policy=GovernorPolicy(max_items=16),
+        )
+
+
+def test_governor_rejects_state_budget_outside_policy_bounds() -> None:
+    state = RuntimeGovernorState(BatchBudget(max_items=2))
+
+    with pytest.raises(ValueError):
+        ConservativeRuntimeGovernor(
+            state=state,
+            policy=GovernorPolicy(min_items=4),
+        )
+
+
+def test_none_budget_fields_skip_policy_bounds_validation() -> None:
+    governor = ConservativeRuntimeGovernor(
+        BatchBudget(max_items=8),
+        policy=GovernorPolicy(min_host_bytes=10, max_device_bytes=20),
+    )
+
+    assert governor.current_budget == BatchBudget(max_items=8)
+
+
+def test_recovered_oom_success_results_shrink_without_success_streak() -> None:
+    governor = ConservativeRuntimeGovernor(
+        BatchBudget(max_items=8),
+        policy=GovernorPolicy(shrink_factor=0.5, grow_after_successes=1),
+    )
+
+    decision = governor.observe_results([_result()], recovered_oom=True)
+
+    assert decision.next_budget == BatchBudget(max_items=4)
+    assert decision.statuses == (StepStatus.SUCCESS,)
+    assert decision.consecutive_successes == 0
+    assert decision.consecutive_ooms == 1
+    assert "retry-recovered OOM observed" in decision.reason
+
+
+def test_recovered_oom_empty_results_shrink() -> None:
+    governor = ConservativeRuntimeGovernor(
+        BatchBudget(max_items=8),
+        policy=GovernorPolicy(shrink_factor=0.5),
+    )
+
+    decision = governor.observe_results([], recovered_oom=True)
+
+    assert decision.next_budget == BatchBudget(max_items=4)
+    assert decision.statuses == ()
+    assert decision.consecutive_successes == 0
+    assert decision.consecutive_ooms == 1
+    assert "retry-recovered OOM observed" in decision.reason
+
+
+def test_recovered_oom_must_be_bool() -> None:
+    governor = ConservativeRuntimeGovernor(BatchBudget(max_items=8))
+
+    with pytest.raises(TypeError):
+        governor.observe_results([], recovered_oom=1)  # type: ignore[arg-type]
+
+
+def test_actual_oom_with_recovered_oom_signal_shrinks_and_counts_oom() -> None:
+    governor = ConservativeRuntimeGovernor(
+        BatchBudget(max_items=8),
+        policy=GovernorPolicy(shrink_factor=0.5),
+    )
+
+    decision = governor.observe_results(
+        [_result(StepStatus.OOM_FAULT)],
+        recovered_oom=True,
+    )
+
+    assert decision.next_budget == BatchBudget(max_items=4)
+    assert decision.statuses == (StepStatus.OOM_FAULT,)
+    assert decision.consecutive_successes == 0
+    assert decision.consecutive_ooms == 1
+    assert "OOM fault observed" in decision.reason
+    assert "retry-recovered OOM signal also observed" in decision.reason
 
 
 @pytest.mark.parametrize("shrink_factor", [0, 1, -0.1, float("inf"), float("nan"), True])
