@@ -80,6 +80,13 @@ Do not use this class as an unbounded production streaming runner. A future
 streaming orchestration slice can avoid pass-level materialization while still
 surfacing recovered-OOM signals.
 
+## Relationship to Summary
+
+`docs/dev_runtime_summary.md` describes a lightweight inspection layer for
+finished `RuntimePassResult` objects. The summary layer turns finite pass results
+and governor decisions into compact records and stable debug text without running
+models, retrying batches, changing budgets, or persisting logs.
+
 ## Out of Scope
 
 - AutoGovernor full implementation.
