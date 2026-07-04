@@ -18,6 +18,7 @@ from .governor import (
     RuntimeGovernorState,
 )
 from .loader import PlainLoader, SPDLLoader
+from .orchestration import ConservativeRuntimeOrchestrator, RuntimePassResult
 from .resources import ResourceMonitor
 from .retry import RetryPolicy, RuntimeRetryRunner
 from .step import RuntimeStep
@@ -28,6 +29,7 @@ __all__ = [
     "BudgetedBatcher",
     "DataCost",
     "ConservativeRuntimeGovernor",
+    "ConservativeRuntimeOrchestrator",
     "DataCostProbe",
     "ModelFootprint",
     "ModelCost",
@@ -41,6 +43,7 @@ __all__ = [
     "ResourceSample",
     "RetryPolicy",
     "RuntimeGovernorState",
+    "RuntimePassResult",
     "RuntimePhase",
     "RuntimeStep",
     "RuntimeRetryRunner",
