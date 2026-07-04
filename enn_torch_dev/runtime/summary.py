@@ -56,7 +56,7 @@ def summarize_runtime_pass(pass_result: RuntimePassResult) -> RuntimePassSummary
         statuses.append(status)
         status_counts[status] += 1
         total_batch_size += int(result.batch_size)
-        total_rows += int(result.row_ids.numel())
+        total_rows += int(result.batch_size)
 
     status_counts_view: Mapping[StepStatus, int] = MappingProxyType(dict(status_counts))
     return RuntimePassSummary(

@@ -36,7 +36,8 @@ The stable `enn_torch` namespace does not expose this development summary API.
 - total result count;
 - yielded statuses and status counts;
 - total `StepResult.batch_size` across the pass;
-- total yielded row identity count from `StepResult.row_ids`;
+- total yielded row count based on the pass result batch dimension, using the sum of
+  `StepResult.batch_size` rather than `StepResult.row_ids.numel()`;
 - whether the pass reported `recovered_oom`;
 - whether the yielded results include `StepStatus.OOM_FAULT`;
 - previous and next governor budgets;

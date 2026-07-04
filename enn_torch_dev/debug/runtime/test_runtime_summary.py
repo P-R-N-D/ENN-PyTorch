@@ -109,8 +109,22 @@ def test_summarize_runtime_pass_counts_successes_and_rows() -> None:
     assert summary.statuses == (StepStatus.SUCCESS, StepStatus.SUCCESS)
     assert dict(summary.status_counts) == {StepStatus.SUCCESS: 2}
     assert summary.total_batch_size == 5
-    assert summary.total_rows == 7
+    assert summary.total_rows == 5
     assert summary.saw_oom is False
+
+
+def test_summarize_runtime_pass_counts_rows_by_batch_size_for_multidimensional_row_ids() -> None:
+    result = StepResult(
+        status=StepStatus.SUCCESS,
+        phase=None,
+        batch_size=2,
+        row_ids=torch.arange(4).reshape(2, 2),
+    )
+
+    summary = summarize_runtime_pass(_pass_result((result,)))
+
+    assert summary.total_batch_size == 2
+    assert summary.total_rows == 2
 
 
 def test_summarize_runtime_pass_counts_mixed_statuses_and_oom() -> None:
