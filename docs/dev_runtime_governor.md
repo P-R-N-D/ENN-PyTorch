@@ -126,6 +126,13 @@ record and reason text:
 These peaks are observational only in this slice. They do not drive field
 selection, learned tuning, or feedback-loop policy changes.
 
+## Relationship to Orchestration
+
+A finite pass-level orchestration helper can feed `GovernorDecision.next_budget`
+back into `BudgetedBatcher` on a later pass. That orchestration boundary is
+described in `docs/dev_runtime_orchestration.md`. The governor itself remains an
+observation/decision object and does not run batches, retry, or execute models.
+
 ## Out of Scope
 
 - Full AutoGovernor behavior.
