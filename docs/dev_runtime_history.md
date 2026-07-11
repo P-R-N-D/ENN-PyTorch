@@ -68,6 +68,13 @@ the original `RuntimePassResult` or `StepResult` objects. Since
 `RuntimePassSummary` is lightweight, the history does not retain `StepResult`,
 `loss`, or `store` references through that append path.
 
+## Relationship to Session
+
+`docs/dev_runtime_session.md` describes a bounded lazy coordinator that appends
+one `RuntimePassSummary` after each completed pass. The session reuses the
+history's required `max_records` bound and does not replace or bypass its
+retention policy.
+
 ## Out of Scope
 
 - Running `RuntimeStep`.

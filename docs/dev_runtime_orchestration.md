@@ -87,6 +87,13 @@ finished `RuntimePassResult` objects. The summary layer turns finite pass result
 and governor decisions into compact records and stable debug text without running
 models, retrying batches, changing budgets, or persisting logs.
 
+## Relationship to Session
+
+`docs/dev_runtime_session.md` describes a bounded lazy coordinator for multiple
+finite pass sources. The session calls `run_pass(...)` once per yielded record
+and leaves per-pass materialization, retry, and governor behavior inside the
+orchestrator.
+
 ## Out of Scope
 
 - AutoGovernor full implementation.
