@@ -28,12 +28,13 @@ class RuntimeHistorySummary:
 class RuntimePassHistory:
     """Keep finite RuntimePassSummary records in memory for inspection."""
 
-    def __init__(self, *, max_records: int | None = None) -> None:
-        if max_records is not None:
-            if not isinstance(max_records, int) or isinstance(max_records, bool):
-                raise TypeError("RuntimePassHistory.max_records must be an integer or None.")
-            if max_records <= 0:
-                raise ValueError("RuntimePassHistory.max_records must be positive when set.")
+    def __init__(
+        self, *, max_records: int
+    ) -> None:
+        if not isinstance(max_records, int) or isinstance(max_records, bool):
+            raise TypeError("RuntimePassHistory.max_records must be an integer.")
+        if max_records <= 0:
+            raise ValueError("RuntimePassHistory.max_records must be positive.")
         self.max_records = max_records
         self._records: list[RuntimePassSummary] = []
 
@@ -90,8 +91,6 @@ class RuntimePassHistory:
         )
 
     def _trim_records(self) -> None:
-        if self.max_records is None:
-            return
         overflow = len(self._records) - self.max_records
         if overflow > 0:
             del self._records[:overflow]

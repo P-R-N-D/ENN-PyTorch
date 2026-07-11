@@ -31,10 +31,11 @@ The stable `enn_torch` namespace does not expose this development history API.
 
 ## Contract
 
-`RuntimePassHistory` is a small mutable in-memory container. It accepts an
-optional positive `max_records` bound. When the bound is set, appending a new
-summary trims the oldest records so only the latest `max_records` summaries are
-retained.
+`RuntimePassHistory` is a small mutable in-memory container with bounded
+retention. It requires `max_records` as a positive integer; `None`, booleans,
+non-integers, and non-positive integers are rejected. Appending a new summary
+trims the oldest records first so only the latest `max_records` summaries are
+retained. Unbounded retention is not supported.
 
 The history accepts two append paths:
 
@@ -73,7 +74,7 @@ the original `RuntimePassResult` or `StepResult` objects. Since
 - Retrying or splitting batches.
 - Budget shrink/grow decisions.
 - Persistent logging, JSONL, CSV, or dashboard export.
-- Unbounded streaming summarization.
+- Unbounded retention or streaming summarization.
 - AutoGovernor behavior.
 - Learned or model-specific tuning.
 - ResourceMonitor feedback loops.

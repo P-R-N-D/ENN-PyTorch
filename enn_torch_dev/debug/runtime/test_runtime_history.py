@@ -95,7 +95,7 @@ def _field_values(instance: object) -> list[object]:
 
 
 def test_empty_history_summary() -> None:
-    history = RuntimePassHistory()
+    history = RuntimePassHistory(max_records=10)
 
     summary = history.summarize()
 
@@ -113,7 +113,7 @@ def test_empty_history_summary() -> None:
 
 
 def test_append_summary_updates_history_totals() -> None:
-    history = RuntimePassHistory()
+    history = RuntimePassHistory(max_records=10)
     first = _summary(StepStatus.SUCCESS, batch_size=2)
 
     aggregate = history.append_summary(first)
@@ -128,7 +128,7 @@ def test_append_summary_updates_history_totals() -> None:
 
 
 def test_append_pass_result_summarizes_without_storing_step_results() -> None:
-    history = RuntimePassHistory()
+    history = RuntimePassHistory(max_records=10)
     pass_result = _pass_result((_result(batch_size=3),))
 
     aggregate = history.append_pass_result(pass_result)
@@ -139,7 +139,7 @@ def test_append_pass_result_summarizes_without_storing_step_results() -> None:
 
 
 def test_history_aggregates_multiple_status_counts() -> None:
-    history = RuntimePassHistory()
+    history = RuntimePassHistory(max_records=10)
     history.append_summary(_summary(StepStatus.SUCCESS, StepStatus.DATA_FAULT))
     aggregate = history.append_summary(
         _summary(StepStatus.SUCCESS, StepStatus.OOM_FAULT, budget_changed=True)
@@ -157,7 +157,7 @@ def test_history_aggregates_multiple_status_counts() -> None:
 
 
 def test_history_counts_recovered_oom_passes_separately_from_yielded_ooms() -> None:
-    history = RuntimePassHistory()
+    history = RuntimePassHistory(max_records=10)
     history.append_summary(_summary(StepStatus.SUCCESS, recovered_oom=True))
     aggregate = history.append_summary(_summary(StepStatus.OOM_FAULT))
 
@@ -170,7 +170,7 @@ def test_history_counts_recovered_oom_passes_separately_from_yielded_ooms() -> N
 
 
 def test_history_tracks_latest_summary() -> None:
-    history = RuntimePassHistory()
+    history = RuntimePassHistory(max_records=10)
     first = _summary(StepStatus.SUCCESS)
     second = _summary(StepStatus.OOM_FAULT, budget_changed=True)
 
@@ -200,15 +200,33 @@ def test_history_respects_max_records() -> None:
     }
 
 
+def test_history_has_no_unbounded_retention_path() -> None:
+    history = RuntimePassHistory(max_records=1)
+    first = _summary(StepStatus.SUCCESS)
+    second = _summary(StepStatus.DATA_FAULT)
+
+    history.append_summary(first)
+    history.append_summary(second)
+
+    assert history.max_records == 1
+    assert history.records == (second,)
+
+
 def test_history_rejects_invalid_arguments() -> None:
+    with pytest.raises(TypeError):
+        RuntimePassHistory()
+    with pytest.raises(TypeError, match="max_records"):
+        RuntimePassHistory(max_records=None)  # type: ignore[arg-type]
     with pytest.raises(TypeError, match="max_records"):
         RuntimePassHistory(max_records=True)  # type: ignore[arg-type]
     with pytest.raises(TypeError, match="max_records"):
         RuntimePassHistory(max_records="2")  # type: ignore[arg-type]
     with pytest.raises(ValueError, match="max_records"):
         RuntimePassHistory(max_records=0)
+    with pytest.raises(ValueError, match="max_records"):
+        RuntimePassHistory(max_records=-1)
 
-    history = RuntimePassHistory()
+    history = RuntimePassHistory(max_records=10)
     with pytest.raises(TypeError, match="append_summary"):
         history.append_summary(object())  # type: ignore[arg-type]
     with pytest.raises(TypeError, match="append_pass_result"):
@@ -220,7 +238,7 @@ def test_history_does_not_store_stepresult_loss_or_store_references() -> None:
     store = object()
     result = _result(loss=loss, store=store)
     pass_result = _pass_result((result,))
-    history = RuntimePassHistory()
+    history = RuntimePassHistory(max_records=10)
 
     aggregate = history.append_pass_result(pass_result)
     stored_summary = history.records[0]
@@ -232,7 +250,7 @@ def test_history_does_not_store_stepresult_loss_or_store_references() -> None:
 
 
 def test_records_property_returns_snapshot() -> None:
-    history = RuntimePassHistory()
+    history = RuntimePassHistory(max_records=10)
     first = _summary(StepStatus.SUCCESS)
     history.append_summary(first)
 
@@ -244,7 +262,7 @@ def test_records_property_returns_snapshot() -> None:
 
 
 def test_format_runtime_history_summary_is_stable_text() -> None:
-    history = RuntimePassHistory()
+    history = RuntimePassHistory(max_records=10)
     history.append_summary(_summary(StepStatus.SUCCESS, recovered_oom=True))
     aggregate = history.append_summary(_summary(StepStatus.OOM_FAULT, budget_changed=True))
 
@@ -262,7 +280,7 @@ def test_format_runtime_history_summary_is_stable_text() -> None:
 
 
 def test_format_runtime_history_summary_handles_empty_history() -> None:
-    text = format_runtime_history_summary(RuntimePassHistory().summarize())
+    text = format_runtime_history_summary(RuntimePassHistory(max_records=10).summarize())
 
     assert "statuses=none" in text
     assert "latest_budget_changed=False" in text
