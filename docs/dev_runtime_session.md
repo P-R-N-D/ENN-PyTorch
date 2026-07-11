@@ -84,7 +84,14 @@ Retry and OOM behavior remain owned by `RuntimeRetryRunner` and
 
 The session does not materialize all session records and does not retain previous
 `RuntimeSessionRecord` or `RuntimePassResult` objects internally. The currently
-yielded record may contain the finite pass result for caller inspection.
+yielded record may contain the finite pass result for caller inspection, and the
+caller may keep that record for as long as needed.
+
+When the generator resumes after a yield, it releases the previous pass's
+`source`, `RuntimePassResult`, `RuntimePassSummary`, and
+`RuntimeHistorySummary` locals before consuming the next outer source. The
+session frame therefore does not keep a previous pass's `RuntimePassResult`,
+`StepResult.store`, or `loss` alive into the next pass execution window.
 
 Longer-lived retention remains limited to lightweight `RuntimePassSummary`
 objects inside the provided bounded `RuntimePassHistory`.

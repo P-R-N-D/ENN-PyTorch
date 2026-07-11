@@ -77,9 +77,15 @@ class ConservativeRuntimeSession:
             pass_result = self.orchestrator.run_pass(source)
             pass_summary = summarize_runtime_pass(pass_result)
             history_summary = self.history.append_summary(pass_summary)
-            yield RuntimeSessionRecord(
-                pass_index=pass_index,
-                pass_result=pass_result,
-                pass_summary=pass_summary,
-                history_summary=history_summary,
-            )
+            try:
+                yield RuntimeSessionRecord(
+                    pass_index=pass_index,
+                    pass_result=pass_result,
+                    pass_summary=pass_summary,
+                    history_summary=history_summary,
+                )
+            finally:
+                del source
+                del pass_result
+                del pass_summary
+                del history_summary

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import gc
+import weakref
 from collections.abc import Callable
 
 import pytest
@@ -7,6 +9,7 @@ import torch
 from tensordict import TensorDict
 
 from enn_torch_dev.data import KVBatch
+from enn_torch_dev.executor import KVStore
 from enn_torch_dev.runtime import (
     BatchBudget,
     ConservativeRuntimeGovernor,
@@ -39,6 +42,10 @@ def _batch(num_rows: int = 1, *, offset: int = 0) -> KVBatch:
         schema_id="runtime.session",
         shard_id=3,
     )
+
+
+class Payload:
+    pass
 
 
 class FakeRuntimeStep:
@@ -237,6 +244,60 @@ def test_session_does_not_store_yielded_pass_result() -> None:
     assert all(
         summary is not record.pass_result for summary in session.history.records
     )
+
+
+def test_generator_frame_releases_previous_pass_payload_before_next_source() -> None:
+    payload_ref: weakref.ReferenceType[Payload] | None = None
+    release_checked = False
+
+    def run(batch: KVBatch, call_index: int) -> StepResult:
+        nonlocal payload_ref
+        if call_index == 0:
+            payload = Payload()
+            payload_ref = weakref.ref(payload)
+            store = KVStore({"payload": payload})
+            del payload
+            return StepResult(
+                status=StepStatus.SUCCESS,
+                phase=None,
+                batch_size=batch.batch_size,
+                row_ids=batch.row_ids.detach().cpu().clone(),
+                store=store,
+            )
+        return StepResult(
+            status=StepStatus.SUCCESS,
+            phase=None,
+            batch_size=batch.batch_size,
+            row_ids=batch.row_ids.detach().cpu().clone(),
+        )
+
+    def sources():
+        nonlocal release_checked
+        yield [_batch(1, offset=0)]
+        gc.collect()
+        assert payload_ref is not None
+        assert payload_ref() is None
+        release_checked = True
+        yield [_batch(1, offset=10)]
+
+    step = FakeRuntimeStep(run)
+    _, session = _build_session(step=step, max_passes=2, max_records=2)
+    records = session.run_passes(sources())
+
+    first = next(records)
+    assert payload_ref is not None
+    assert payload_ref() is not None
+
+    del first
+    gc.collect()
+
+    second = next(records)
+
+    assert release_checked
+    assert second.pass_index == 1
+    assert len(step.calls) == 2
+    assert payload_ref() is None
+    assert all(not hasattr(summary, "store") for summary in session.history.records)
 
 
 def test_session_rejects_invalid_constructor_arguments() -> None:
