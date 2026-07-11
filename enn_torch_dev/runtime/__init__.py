@@ -17,6 +17,11 @@ from .governor import (
     GovernorPolicy,
     RuntimeGovernorState,
 )
+from .history import (
+    RuntimeHistorySummary,
+    RuntimePassHistory,
+    format_runtime_history_summary,
+)
 from .loader import PlainLoader, SPDLLoader
 from .orchestration import ConservativeRuntimeOrchestrator, RuntimePassResult
 from .resources import ResourceMonitor
@@ -48,6 +53,8 @@ __all__ = [
     "ResourceSample",
     "RetryPolicy",
     "RuntimeGovernorState",
+    "RuntimeHistorySummary",
+    "RuntimePassHistory",
     "RuntimePassResult",
     "RuntimePassSummary",
     "RuntimePhase",
@@ -57,6 +64,7 @@ __all__ = [
     "StepResult",
     "StepStatus",
     "TensorCost",
+    "format_runtime_history_summary",
     "format_runtime_pass_summary",
     "summarize_runtime_pass",
 ]
