@@ -26,6 +26,7 @@ from .loader import PlainLoader, SPDLLoader
 from .orchestration import ConservativeRuntimeOrchestrator, RuntimePassResult
 from .resources import ResourceMonitor
 from .retry import RetryPolicy, RuntimeRetryRunner
+from .session import ConservativeRuntimeSession, RuntimeSessionRecord
 from .step import RuntimeStep
 from .summary import (
     RuntimePassSummary,
@@ -40,6 +41,7 @@ __all__ = [
     "DataCost",
     "ConservativeRuntimeGovernor",
     "ConservativeRuntimeOrchestrator",
+    "ConservativeRuntimeSession",
     "DataCostProbe",
     "ModelFootprint",
     "ModelCost",
@@ -57,6 +59,7 @@ __all__ = [
     "RuntimePassHistory",
     "RuntimePassResult",
     "RuntimePassSummary",
+    "RuntimeSessionRecord",
     "RuntimePhase",
     "RuntimeStep",
     "RuntimeRetryRunner",
