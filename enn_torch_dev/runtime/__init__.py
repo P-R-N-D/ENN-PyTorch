@@ -27,6 +27,7 @@ from .orchestration import ConservativeRuntimeOrchestrator, RuntimePassResult
 from .resources import ResourceMonitor
 from .retry import RetryPolicy, RuntimeRetryRunner
 from .session import ConservativeRuntimeSession, RuntimeSessionRecord
+from .source_factory import RuntimePassSourceFactory
 from .step import RuntimeStep
 from .summary import (
     RuntimePassSummary,
@@ -59,6 +60,7 @@ __all__ = [
     "RuntimePassHistory",
     "RuntimePassResult",
     "RuntimePassSummary",
+    "RuntimePassSourceFactory",
     "RuntimeSessionRecord",
     "RuntimePhase",
     "RuntimeStep",
