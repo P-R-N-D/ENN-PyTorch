@@ -60,6 +60,12 @@ The orchestrator owns finite pass execution and may materialize
 `RuntimePassResult.results`. The summary layer only inspects that finished result.
 It does not change orchestration state or feed decisions back into the governor.
 
+## Relationship to History
+
+A later history layer may accumulate `RuntimePassSummary` records in memory for
+inspection across finite passes. The summary layer remains a single-pass
+inspection record and does not own retention policy, persistence, or export.
+
 ## Out of Scope
 
 - Running `RuntimeStep`.
