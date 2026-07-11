@@ -17,6 +17,7 @@ finite KVBatch pass source
   -> RuntimePassSummary
   -> RuntimePassHistory
   -> ConservativeRuntimeSession
+  -> optional RuntimePassSourceFactory for fresh per-pass sources
 ```
 
 `ConservativeRuntimeSession` connects existing components across multiple finite
@@ -70,6 +71,29 @@ for record in session.run_passes(pass_sources):
     print(record.pass_index, record.pass_summary)
 ```
 
+## Factory composition
+
+Use a `RuntimePassSourceFactory` when each pass needs a newly constructed
+one-shot loader or generator:
+
+```python
+from enn_torch_dev.runtime import RuntimePassSourceFactory
+
+
+class PassFactory:
+    def create_pass_source(self, pass_index: int):
+        return build_finite_pass_source(pass_index)
+
+
+for record in session.run_factory(PassFactory()):
+    print(record.pass_index, record.pass_summary)
+```
+
+`run_factory(...)` is lazy and uses the same `max_passes` bound as
+`run_passes(...)`. It calls the factory at most once per yielded record and does
+not call it for an extra pass after the limit. Factory exceptions propagate, and
+a pass whose source was not created is not appended to history.
+
 ## Source contract
 
 `pass_sources` is an outer iterable of inner pass sources.
@@ -79,8 +103,9 @@ for record in session.run_passes(pass_sources):
 - The session does not fetch an extra outer source after reaching `max_passes`.
 - Each `next()` call on the session iterator executes at most one finite pass.
 
-The session does not recreate or replay a source. Callers that require replay
-must construct a new finite source explicitly.
+`run_passes(...)` does not recreate or replay a source. `run_factory(...)` asks
+caller-defined code to construct a fresh finite source for each pass, but it does
+not cache sources or replay a consumed iterator.
 
 ## OOM and budget behavior
 
@@ -125,7 +150,7 @@ It does not provide:
 - persistent logging, JSONL, or CSV export;
 - dashboards or telemetry backends;
 - checkpoint/resume;
-- automatic source replay;
+- automatic source replay or source caching;
 - distributed execution or aggregation;
 - AutoGovernor or learned tuning;
 - ResourceMonitor feedback-loop tuning;
@@ -137,6 +162,7 @@ unbounded production streaming runner.
 ## Validation
 
 ```bash
+python -m pytest enn_torch_dev/debug/runtime/test_runtime_source_factory.py -q
 python -m pytest enn_torch_dev/debug/runtime/test_runtime_integration.py -q
 python -m pytest enn_torch_dev/debug/runtime -q
 python -m pytest enn_torch_dev/debug -q

@@ -45,7 +45,7 @@ integers are rejected. The session therefore has an explicit upper bound even
 when the outer pass-source iterable is longer or unbounded.
 
 The session reuses the provided history. It does not clear existing retained
-summaries when a new `run_passes(...)` call begins.
+summaries when a new `run_passes(...)` or `run_factory(...)` call begins.
 
 ## Lazy Pass Execution
 
@@ -62,12 +62,24 @@ The session stops when either:
 The implementation does not fetch one extra outer source after the pass limit is
 reached.
 
+`run_factory(source_factory)` provides the same lazy, bounded execution contract
+while asking a `RuntimePassSourceFactory` to create one fresh finite source for
+each pass index. The factory is not called until the returned iterator advances,
+and it is not called after `max_passes` is reached.
+
 Each `RuntimeSessionRecord` contains:
 
 - `pass_index`, starting at zero for each `run_passes(...)` invocation;
 - the current `RuntimePassResult`;
 - the derived `RuntimePassSummary`;
 - the current bounded `RuntimeHistorySummary`.
+
+## Relationship to Source Factory
+
+`docs/dev_runtime_source_factory.md` describes the source-construction protocol
+used by `run_factory(...)`. The factory owns fresh source creation; the session
+continues to own bounded iteration, pass execution, summary creation, and history
+append. It does not cache or replay created sources.
 
 ## Error and Fault Semantics
 
@@ -101,7 +113,7 @@ objects inside the provided bounded `RuntimePassHistory`.
 - Persistent logging or JSONL/CSV export.
 - Dashboards or telemetry backends.
 - Checkpoint/resume.
-- Source recreation or replay.
+- Automatic source replay or caching of consumed sources.
 - Exception suppression or automatic continuation after Python exceptions.
 - Distributed execution or aggregation.
 - AutoGovernor behavior.
@@ -113,6 +125,7 @@ objects inside the provided bounded `RuntimePassHistory`.
 ## Test Commands
 
 ```bash
+python -m pytest enn_torch_dev/debug/runtime/test_runtime_source_factory.py -q
 python -m pytest enn_torch_dev/debug/runtime/test_runtime_session.py -q
 python -m pytest enn_torch_dev/debug/runtime/test_runtime_history.py -q
 python -m pytest enn_torch_dev/debug/runtime/test_runtime_summary.py -q

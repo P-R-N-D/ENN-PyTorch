@@ -7,6 +7,7 @@ from enn_torch_dev.data import KVBatch
 
 from .history import RuntimeHistorySummary, RuntimePassHistory
 from .orchestration import ConservativeRuntimeOrchestrator, RuntimePassResult
+from .source_factory import RuntimePassSourceFactory
 from .summary import RuntimePassSummary, summarize_runtime_pass
 
 
@@ -73,6 +74,46 @@ class ConservativeRuntimeSession:
                 source = next(pass_sources)
             except StopIteration:
                 return
+
+            pass_result = self.orchestrator.run_pass(source)
+            pass_summary = summarize_runtime_pass(pass_result)
+            history_summary = self.history.append_summary(pass_summary)
+            try:
+                yield RuntimeSessionRecord(
+                    pass_index=pass_index,
+                    pass_result=pass_result,
+                    pass_summary=pass_summary,
+                    history_summary=history_summary,
+                )
+            finally:
+                del source
+                del pass_result
+                del pass_summary
+                del history_summary
+
+
+    def run_factory(
+        self,
+        source_factory: RuntimePassSourceFactory,
+    ) -> Iterator[RuntimeSessionRecord]:
+        if not isinstance(source_factory, RuntimePassSourceFactory):
+            raise TypeError(
+                "ConservativeRuntimeSession.source_factory must provide "
+                "create_pass_source(pass_index)."
+            )
+        return self._run_factory(source_factory)
+
+    def _run_factory(
+        self,
+        source_factory: RuntimePassSourceFactory,
+    ) -> Iterator[RuntimeSessionRecord]:
+        for pass_index in range(self.max_passes):
+            source = source_factory.create_pass_source(pass_index)
+            if isinstance(source, KVBatch) or not isinstance(source, Iterable):
+                raise TypeError(
+                    "RuntimePassSourceFactory.create_pass_source must return an "
+                    "iterable of KVBatch."
+                )
 
             pass_result = self.orchestrator.run_pass(source)
             pass_summary = summarize_runtime_pass(pass_result)

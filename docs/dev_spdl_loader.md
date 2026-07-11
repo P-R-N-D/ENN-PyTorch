@@ -37,7 +37,9 @@ spawn workers, transfer tensors to devices, or choose batch sizes.
 the source is a one-shot iterator or generator, it is consumed after one full
 pass and the same loader instance will not replay batches for another epoch.
 Callers that need epoch-level replay should provide a re-iterable source, build
-a new loader/source per epoch, or introduce a future source-factory layer.
+a new loader/source per epoch, or use `RuntimePassSourceFactory` with
+`ConservativeRuntimeSession.run_factory(...)` to construct a fresh loader for
+each bounded pass.
 
 ## Cost Hint
 

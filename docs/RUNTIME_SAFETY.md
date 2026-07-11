@@ -24,6 +24,8 @@ Use this document before running code that can allocate accelerator memory, writ
 
 - Use finite inner `KVBatch` pass sources and a positive `max_passes` session bound.
 - Use a positive `RuntimePassHistory.max_records` bound; do not add unbounded in-memory history.
+- A `RuntimePassSourceFactory` must create a fresh finite source per call; do not cache or silently replay consumed iterators inside the session.
+- Keep factory creation lazy and bounded by `ConservativeRuntimeSession.max_passes`; factory exceptions must remain visible to the caller.
 - Consume session records incrementally. Avoid collecting long sessions into a list outside small synthetic tests.
 - Keep baseline integration tests CPU-only with small synthetic tensors.
 - Treat retry-recovered OOM as a budget signal, not proof that an unrestricted workload is safe.
