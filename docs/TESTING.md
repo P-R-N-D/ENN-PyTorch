@@ -22,6 +22,7 @@ Report outcomes distinctly:
 | `enn_torch_dev/executor/**` | `python -m pytest enn_torch_dev/debug/executor -q` | `enn_torch_dev/debug/executor` |
 | `enn_torch_dev/nn/**` | `python -m pytest enn_torch_dev/debug/nn -q` | `enn_torch_dev/debug/nn` |
 | `enn_torch_dev/runtime/**` | `python -m pytest enn_torch_dev/debug/runtime -q` | `enn_torch_dev/debug/runtime` |
+| Runtime resource pressure | `python -m pytest enn_torch_dev/debug/runtime/test_runtime_pressure.py -q` | `enn_torch_dev/debug/runtime/test_runtime_pressure.py` |
 | Runtime pass source factory | `python -m pytest enn_torch_dev/debug/runtime/test_runtime_source_factory.py -q` | `enn_torch_dev/debug/runtime/test_runtime_source_factory.py` |
 | Development runtime end-to-end integration | `python -m pytest enn_torch_dev/debug/runtime/test_runtime_integration.py -q` | `enn_torch_dev/debug/runtime/test_runtime_integration.py` |
 | Public executor exports | `python -m pytest enn_torch_dev/debug/executor/test_public_api_exports.py -q` | `enn_torch_dev/debug/executor/test_public_api_exports.py` |
@@ -45,6 +46,7 @@ These commands correspond to existing paths in the repository:
 python -m pytest enn_torch_dev/debug/data -q
 python -m pytest enn_torch_dev/debug/executor -q
 python -m pytest enn_torch_dev/debug/nn -q
+python -m pytest enn_torch_dev/debug/runtime/test_runtime_pressure.py -q
 python -m pytest enn_torch_dev/debug/runtime/test_runtime_source_factory.py -q
 python -m pytest enn_torch_dev/debug/runtime/test_runtime_integration.py -q
 python -m pytest enn_torch_dev/debug/runtime -q

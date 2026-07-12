@@ -7,6 +7,7 @@ from pathlib import Path
 import torch
 
 from .faults import ResourceSample, RuntimePhase
+from .pressure import ResourceCapacity
 
 
 def _phase_name(phase: RuntimePhase | str) -> str:
@@ -17,6 +18,17 @@ def _phase_name(phase: RuntimePhase | str) -> str:
     if not phase:
         raise ValueError("resource sample phase must be non-empty.")
     return phase
+
+
+def _read_cpu_total_bytes() -> int | None:
+    try:
+        physical_pages = int(os.sysconf("SC_PHYS_PAGES"))
+        page_size = int(os.sysconf("SC_PAGE_SIZE"))
+    except Exception:
+        return None
+    if physical_pages <= 0 or page_size <= 0:
+        return None
+    return physical_pages * page_size
 
 
 def _read_cpu_rss_bytes() -> int | None:
@@ -52,6 +64,27 @@ class ResourceMonitor:
             return int(torch.cuda.current_device())
         except Exception:
             return None
+
+    def capacity(self) -> ResourceCapacity:
+        cpu_total_bytes = _read_cpu_total_bytes()
+        device_index = self._device_index()
+        if device_index is None:
+            return ResourceCapacity(cpu_total_bytes=cpu_total_bytes)
+
+        try:
+            total_memory = int(
+                torch.cuda.get_device_properties(device_index).total_memory
+            )
+        except Exception:
+            return ResourceCapacity(cpu_total_bytes=cpu_total_bytes)
+        if total_memory <= 0:
+            return ResourceCapacity(cpu_total_bytes=cpu_total_bytes)
+
+        return ResourceCapacity(
+            cpu_total_bytes=cpu_total_bytes,
+            cuda_total_bytes=total_memory,
+            cuda_device_index=device_index,
+        )
 
     def reset_peak_memory_stats(self) -> None:
         device_index = self._device_index()

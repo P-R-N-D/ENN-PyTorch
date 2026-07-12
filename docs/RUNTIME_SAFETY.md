@@ -29,6 +29,9 @@ Use this document before running code that can allocate accelerator memory, writ
 - Consume session records incrementally. Avoid collecting long sessions into a list outside small synthetic tests.
 - Keep baseline integration tests CPU-only with small synthetic tensors.
 - Treat retry-recovered OOM as a budget signal, not proof that an unrestricted workload is safe.
+- Treat missing capacity or observation values as unknown, not zero utilization.
+- Do not clamp pressure ratios to `1.0`; ratios above one must remain visible for diagnosis.
+- Do not feed pressure summaries into governor decisions without a separately reviewed opt-in policy.
 - Do not add persistent logs, checkpoints, exports, source replay, distributed workers, or automatic tuning to the bounded development workflow without a separately reviewed safety contract.
 - Confirm the stable `enn_torch` namespace is unchanged when adding development runtime helpers.
 

@@ -87,6 +87,15 @@ not expose the current process RSS through `/proc/self/statm`, the value is
 CUDA fields are safe on CPU-only machines. If CUDA is unavailable, CUDA-specific
 memory fields are `None`.
 
+`ResourceMonitor.capacity()` returns a `ResourceCapacity` snapshot with total
+physical CPU memory when `os.sysconf(...)` exposes it and total CUDA device memory
+when `torch.cuda.get_device_properties(...)` succeeds. Capacity lookup failures
+are represented as `None`; they are not execution faults.
+
+Capacity and usage samples remain separate records. The pure
+`assess_resource_pressure(...)` helper described in
+`docs/dev_runtime_pressure.md` combines them without changing governor policy.
+
 ## RuntimeStep Integration
 
 `RuntimeStep` accepts an optional `resource_monitor`:
@@ -125,6 +134,7 @@ returned `StepResult`.
 - SPDL integration.
 - DataCostProbe.
 - ModelCostProbe.
+- Automatic governor changes based on pressure.
 - AutoGovernor.
 - Telemetry JSON writer.
 - `run_profile.json`.
@@ -136,6 +146,7 @@ returned `StepResult`.
 ```bash
 python -m pytest enn_torch_dev/debug/runtime/test_model_footprint.py -q
 python -m pytest enn_torch_dev/debug/runtime/test_resource_monitor.py -q
+python -m pytest enn_torch_dev/debug/runtime/test_runtime_pressure.py -q
 python -m pytest enn_torch_dev/debug/runtime/test_runtime_step_resources.py -q
 python -m pytest enn_torch_dev/debug/runtime -q
 python -m pytest enn_torch_dev/debug -q

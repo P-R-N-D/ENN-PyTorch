@@ -24,6 +24,11 @@ from .history import (
 )
 from .loader import PlainLoader, SPDLLoader
 from .orchestration import ConservativeRuntimeOrchestrator, RuntimePassResult
+from .pressure import (
+    ResourceCapacity,
+    ResourcePressureSummary,
+    assess_resource_pressure,
+)
 from .resources import ResourceMonitor
 from .retry import RetryPolicy, RuntimeRetryRunner
 from .session import ConservativeRuntimeSession, RuntimeSessionRecord
@@ -51,8 +56,10 @@ __all__ = [
     "GovernorPolicy",
     "OptimizerFootprint",
     "PlainLoader",
+    "ResourceCapacity",
     "ResourceMonitor",
     "ResourceDelta",
+    "ResourcePressureSummary",
     "ResourceSample",
     "RetryPolicy",
     "RuntimeGovernorState",
@@ -70,6 +77,7 @@ __all__ = [
     "StepStatus",
     "TensorCost",
     "format_runtime_history_summary",
+    "assess_resource_pressure",
     "format_runtime_pass_summary",
     "summarize_runtime_pass",
 ]
