@@ -16,6 +16,7 @@ from enn_torch_dev.runtime import (
     ConservativeRuntimeSession,
     RuntimePassHistory,
     RuntimePassSourceFactory,
+    RuntimeSessionRecord,
     StepResult,
     StepStatus,
 )
@@ -56,6 +57,16 @@ class FakeRuntimeStep:
         )
 
 
+class RaisingRuntimeStep:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def run(self, batch: KVBatch) -> StepResult:
+        self.calls += 1
+        del batch
+        raise RuntimeError("pass execution failed")
+
+
 def _build_session(
     *,
     max_passes: int = 3,
@@ -71,6 +82,33 @@ def _build_session(
         max_passes=max_passes,
     )
     return step, session
+
+
+def _record_signature(record: RuntimeSessionRecord) -> tuple[object, ...]:
+    return (
+        record.pass_index,
+        record.pass_summary.total_results,
+        record.pass_summary.statuses,
+        dict(record.pass_summary.status_counts),
+        record.pass_summary.total_batch_size,
+        record.pass_summary.total_rows,
+        record.pass_summary.recovered_oom,
+        record.pass_summary.previous_budget,
+        record.pass_summary.next_budget,
+        record.pass_summary.budget_changed,
+        record.pass_summary.decision_reason,
+        record.pass_summary.consecutive_successes,
+        record.pass_summary.consecutive_ooms,
+        record.history_summary.total_passes,
+        record.history_summary.total_results,
+        record.history_summary.total_batch_size,
+        record.history_summary.total_rows,
+        dict(record.history_summary.status_counts),
+        record.history_summary.recovered_oom_passes,
+        record.history_summary.oom_passes,
+        record.history_summary.budget_changed_passes,
+        record.history_summary.latest_summary == record.pass_summary,
+    )
 
 
 class RecordingFactory:
@@ -205,6 +243,53 @@ def test_run_factory_rejects_invalid_created_source(source: object) -> None:
         next(records)
 
     assert session.history.records == ()
+
+
+def test_run_passes_and_run_factory_share_pass_execution_contract() -> None:
+    _, passes_session = _build_session(max_passes=2, max_records=2)
+    _, factory_session = _build_session(max_passes=2, max_records=2)
+    factory = RecordingFactory()
+
+    pass_records = list(
+        passes_session.run_passes(
+            [
+                [_batch(1, offset=0)],
+                [_batch(1, offset=10)],
+            ]
+        )
+    )
+    factory_records = list(factory_session.run_factory(factory))
+
+    assert [_record_signature(record) for record in pass_records] == [
+        _record_signature(record) for record in factory_records
+    ]
+    assert passes_session.history.records == tuple(
+        record.pass_summary for record in pass_records
+    )
+    assert factory_session.history.records == tuple(
+        record.pass_summary for record in factory_records
+    )
+
+
+def test_run_factory_propagates_pass_execution_exception_without_history_update() -> None:
+    step = RaisingRuntimeStep()
+    governor = ConservativeRuntimeGovernor(BatchBudget(max_items=2))
+    orchestrator = ConservativeRuntimeOrchestrator(step, governor)
+    history = RuntimePassHistory(max_records=2)
+    session = ConservativeRuntimeSession(
+        orchestrator,
+        history,
+        max_passes=1,
+    )
+    factory = RecordingFactory()
+    records = session.run_factory(factory)
+
+    with pytest.raises(RuntimeError, match="pass execution failed"):
+        next(records)
+
+    assert factory.calls == [0]
+    assert step.calls == 1
+    assert history.records == ()
 
 
 def test_run_factory_rejects_invalid_factory() -> None:
