@@ -65,6 +65,21 @@ class ConservativeRuntimeSession:
             )
         return self._run_passes(iter(pass_sources))
 
+    def _execute_pass(
+        self,
+        pass_index: int,
+        source: Iterable[KVBatch],
+    ) -> RuntimeSessionRecord:
+        pass_result = self.orchestrator.run_pass(source)
+        pass_summary = summarize_runtime_pass(pass_result)
+        history_summary = self.history.append_summary(pass_summary)
+        return RuntimeSessionRecord(
+            pass_index=pass_index,
+            pass_result=pass_result,
+            pass_summary=pass_summary,
+            history_summary=history_summary,
+        )
+
     def _run_passes(
         self,
         pass_sources: Iterator[Iterable[KVBatch]],
@@ -75,22 +90,12 @@ class ConservativeRuntimeSession:
             except StopIteration:
                 return
 
-            pass_result = self.orchestrator.run_pass(source)
-            pass_summary = summarize_runtime_pass(pass_result)
-            history_summary = self.history.append_summary(pass_summary)
+            record = self._execute_pass(pass_index, source)
             try:
-                yield RuntimeSessionRecord(
-                    pass_index=pass_index,
-                    pass_result=pass_result,
-                    pass_summary=pass_summary,
-                    history_summary=history_summary,
-                )
+                yield record
             finally:
                 del source
-                del pass_result
-                del pass_summary
-                del history_summary
-
+                del record
 
     def run_factory(
         self,
@@ -115,18 +120,9 @@ class ConservativeRuntimeSession:
                     "iterable of KVBatch."
                 )
 
-            pass_result = self.orchestrator.run_pass(source)
-            pass_summary = summarize_runtime_pass(pass_result)
-            history_summary = self.history.append_summary(pass_summary)
+            record = self._execute_pass(pass_index, source)
             try:
-                yield RuntimeSessionRecord(
-                    pass_index=pass_index,
-                    pass_result=pass_result,
-                    pass_summary=pass_summary,
-                    history_summary=history_summary,
-                )
+                yield record
             finally:
                 del source
-                del pass_result
-                del pass_summary
-                del history_summary
+                del record
