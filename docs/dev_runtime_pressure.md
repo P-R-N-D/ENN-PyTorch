@@ -50,15 +50,20 @@ neither is known, the effective CPU capacity is `None`.
 `ResourceMonitor.capacity()` uses:
 
 - `SC_PHYS_PAGES * SC_PAGE_SIZE` for physical CPU memory;
-- cgroup v2 `memory.max` when the process belongs to a unified hierarchy;
-- cgroup v1 `memory.limit_in_bytes` when the process belongs to a memory
-  controller hierarchy;
+- cgroup v2 `memory.max` candidates from the process cgroup leaf through
+  the unified hierarchy root;
+- cgroup v1 `memory.stat` `hierarchical_memory_limit` when available,
+  otherwise `memory.limit_in_bytes` candidates from the process memory
+  controller leaf through the v1 memory hierarchy root;
 - `torch.cuda.get_device_properties(index).total_memory` for CUDA capacity.
 
 The monitor resolves nested process cgroup paths from `/proc/self/cgroup`.
-`memory.max=max`, invalid/non-positive limits, and cgroup v1 unlimited sentinel
-values are treated as no configured limit. Missing files and lookup failures
-return `None`; they do not become runtime faults.
+When both cgroup v2 and v1 memory memberships are present, both hierarchies are
+evaluated independently and the smallest finite candidate is used as
+`cpu_limit_bytes`. `memory.max=max`, invalid/non-positive limits, and cgroup v1
+unlimited sentinel values are ignored as individual candidates while parent or
+other-hierarchy discovery continues. Missing files and lookup failures return
+`None`; they do not become runtime faults.
 
 ## Pressure Contract
 

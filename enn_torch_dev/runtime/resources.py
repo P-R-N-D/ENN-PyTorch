@@ -83,59 +83,90 @@ def _read_cgroup_limit_file(
     path: Path,
     *,
     version: int,
-) -> tuple[bool, int | None]:
+) -> int | None:
     try:
         value = path.read_text(encoding="utf-8")
     except (OSError, UnicodeError):
-        return False, None
-    return True, _parse_cgroup_limit(value, version=version)
+        return None
+    return _parse_cgroup_limit(value, version=version)
+
+
+def _relative_path_hierarchy(relative: Path) -> tuple[Path, ...]:
+    paths = [relative]
+    paths.extend(parent for parent in relative.parents if parent != Path(".."))
+    return tuple(paths)
+
+
+def _read_cgroup_v2_hierarchy_limits(relative_text: str | None) -> tuple[int, ...]:
+    if relative_text is None:
+        relative = Path(".")
+    else:
+        relative = _safe_relative_cgroup_path(relative_text)
+        if relative is None:
+            return ()
+
+    limits: list[int] = []
+    for path in _relative_path_hierarchy(relative):
+        limit = _read_cgroup_limit_file(
+            _CGROUP_V2_ROOT / path / "memory.max",
+            version=2,
+        )
+        if limit is not None:
+            limits.append(limit)
+    return tuple(limits)
+
+
+def _read_v1_hierarchical_memory_limit(relative: Path) -> int | None:
+    stat_path = _CGROUP_V1_MEMORY_ROOT / relative / "memory.stat"
+    try:
+        lines = stat_path.read_text(encoding="utf-8").splitlines()
+    except (OSError, UnicodeError):
+        return None
+
+    for line in lines:
+        key, _, value = line.partition(" ")
+        if key == "hierarchical_memory_limit":
+            return _parse_cgroup_limit(value, version=1)
+    return None
+
+
+def _read_cgroup_v1_hierarchy_limits(relative_text: str | None) -> tuple[int, ...]:
+    if relative_text is None:
+        relative = Path(".")
+    else:
+        relative = _safe_relative_cgroup_path(relative_text)
+        if relative is None:
+            return ()
+
+    hierarchical_limit = _read_v1_hierarchical_memory_limit(relative)
+    if hierarchical_limit is not None:
+        return (hierarchical_limit,)
+
+    limits: list[int] = []
+    for path in _relative_path_hierarchy(relative):
+        limit = _read_cgroup_limit_file(
+            _CGROUP_V1_MEMORY_ROOT / path / "memory.limit_in_bytes",
+            version=1,
+        )
+        if limit is not None:
+            limits.append(limit)
+    return tuple(limits)
 
 
 def _read_cgroup_memory_limit_bytes() -> int | None:
     v2_relative, v1_relative = _read_cgroup_membership()
 
+    limits: list[int] = []
     if v2_relative is not None:
-        relative = _safe_relative_cgroup_path(v2_relative)
-        if relative is None:
-            return None
-        found, limit = _read_cgroup_limit_file(
-            _CGROUP_V2_ROOT / relative / "memory.max",
-            version=2,
-        )
-        if not found:
-            found, limit = _read_cgroup_limit_file(
-                _CGROUP_V2_ROOT / "memory.max",
-                version=2,
-            )
-        return limit if found else None
-
+        limits.extend(_read_cgroup_v2_hierarchy_limits(v2_relative))
     if v1_relative is not None:
-        relative = _safe_relative_cgroup_path(v1_relative)
-        if relative is None:
-            return None
-        found, limit = _read_cgroup_limit_file(
-            _CGROUP_V1_MEMORY_ROOT / relative / "memory.limit_in_bytes",
-            version=1,
-        )
-        if not found:
-            found, limit = _read_cgroup_limit_file(
-                _CGROUP_V1_MEMORY_ROOT / "memory.limit_in_bytes",
-                version=1,
-            )
-        return limit if found else None
+        limits.extend(_read_cgroup_v1_hierarchy_limits(v1_relative))
 
-    found, limit = _read_cgroup_limit_file(
-        _CGROUP_V2_ROOT / "memory.max",
-        version=2,
-    )
-    if found:
-        return limit
+    if v2_relative is None and v1_relative is None:
+        limits.extend(_read_cgroup_v2_hierarchy_limits(None))
+        limits.extend(_read_cgroup_v1_hierarchy_limits(None))
 
-    found, limit = _read_cgroup_limit_file(
-        _CGROUP_V1_MEMORY_ROOT / "memory.limit_in_bytes",
-        version=1,
-    )
-    return limit if found else None
+    return min(limits) if limits else None
 
 
 def _read_cpu_rss_bytes() -> int | None:

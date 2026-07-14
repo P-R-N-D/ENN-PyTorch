@@ -90,13 +90,16 @@ memory fields are `None`.
 `ResourceMonitor.capacity()` returns a `ResourceCapacity` snapshot with:
 
 - total physical CPU memory when `os.sysconf(...)` exposes it;
-- the current process cgroup v2 or v1 memory limit when available;
+- the current process hierarchy-effective cgroup v2 and/or v1 memory limit when
+  available;
 - total CUDA device memory when `torch.cuda.get_device_properties(...)` succeeds.
 
-The effective CPU capacity is the smaller known value between physical memory
-and the cgroup limit. This prevents containerized processes from normalizing RSS
-against a larger host capacity. Capacity lookup failures are represented as
-`None`; they are not execution faults.
+The cgroup limit is the smallest finite candidate discovered across applicable
+v2 and v1 memory hierarchies, including parent cgroups. The effective CPU
+capacity is the smaller known value between physical memory and that cgroup
+limit. This prevents containerized processes from normalizing RSS against a
+larger host capacity. Capacity lookup failures are represented as `None`; they
+are not execution faults.
 
 Capacity and usage samples remain separate records. The pure
 `assess_resource_pressure(...)` helper described in
