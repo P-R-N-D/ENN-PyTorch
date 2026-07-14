@@ -52,6 +52,7 @@ class ResourceCapacity:
     cpu_total_bytes: int | None = None
     cuda_total_bytes: int | None = None
     cuda_device_index: int | None = None
+    cpu_limit_bytes: int | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(
@@ -78,11 +79,30 @@ class ResourceCapacity:
                 label="ResourceCapacity.cuda_device_index",
             ),
         )
+        object.__setattr__(
+            self,
+            "cpu_limit_bytes",
+            _validate_optional_positive_int(
+                self.cpu_limit_bytes,
+                label="ResourceCapacity.cpu_limit_bytes",
+            ),
+        )
         if (self.cuda_total_bytes is None) != (self.cuda_device_index is None):
             raise ValueError(
                 "ResourceCapacity.cuda_total_bytes and cuda_device_index must "
                 "either both be configured or both be None."
             )
+
+    @property
+    def effective_cpu_bytes(self) -> int | None:
+        """Return the lowest known physical or cgroup CPU memory capacity."""
+
+        known = tuple(
+            value
+            for value in (self.cpu_total_bytes, self.cpu_limit_bytes)
+            if value is not None
+        )
+        return min(known) if known else None
 
 
 @dataclass(frozen=True, slots=True)
@@ -143,9 +163,7 @@ def assess_resource_pressure(
             "assess_resource_pressure expects an iterable of ResourceSample objects."
         )
     if not isinstance(capacity, ResourceCapacity):
-        raise TypeError(
-            "assess_resource_pressure capacity must be a ResourceCapacity."
-        )
+        raise TypeError("assess_resource_pressure capacity must be a ResourceCapacity.")
 
     peaks: dict[str, float | None] = {
         "peak_cpu_rss_ratio": None,
@@ -165,7 +183,7 @@ def assess_resource_pressure(
         peaks["peak_cpu_rss_ratio"] = _peak_ratio(
             peaks["peak_cpu_rss_ratio"],
             sample.cpu_rss_bytes,
-            capacity.cpu_total_bytes,
+            capacity.effective_cpu_bytes,
             label="ResourceSample.cpu_rss_bytes",
         )
 

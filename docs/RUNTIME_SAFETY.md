@@ -30,6 +30,7 @@ Use this document before running code that can allocate accelerator memory, writ
 - Keep baseline integration tests CPU-only with small synthetic tensors.
 - Treat retry-recovered OOM as a budget signal, not proof that an unrestricted workload is safe.
 - Treat missing capacity or observation values as unknown, not zero utilization.
+- Normalize CPU RSS against the smallest known physical or cgroup capacity; do not assume host physical memory is the process limit in containers.
 - Do not clamp pressure ratios to `1.0`; ratios above one must remain visible for diagnosis.
 - Do not feed pressure summaries into governor decisions without a separately reviewed opt-in policy.
 - Do not add persistent logs, checkpoints, exports, source replay, distributed workers, or automatic tuning to the bounded development workflow without a separately reviewed safety contract.

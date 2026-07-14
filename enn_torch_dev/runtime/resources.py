@@ -9,6 +9,11 @@ import torch
 from .faults import ResourceSample, RuntimePhase
 from .pressure import ResourceCapacity
 
+_PROC_SELF_CGROUP = Path("/proc/self/cgroup")
+_CGROUP_V2_ROOT = Path("/sys/fs/cgroup")
+_CGROUP_V1_MEMORY_ROOT = Path("/sys/fs/cgroup/memory")
+_CGROUP_V1_UNLIMITED_THRESHOLD = 1 << 60
+
 
 def _phase_name(phase: RuntimePhase | str) -> str:
     if isinstance(phase, RuntimePhase):
@@ -29,6 +34,108 @@ def _read_cpu_total_bytes() -> int | None:
     if physical_pages <= 0 or page_size <= 0:
         return None
     return physical_pages * page_size
+
+
+def _safe_relative_cgroup_path(value: str) -> Path | None:
+    parts = tuple(part for part in value.strip().split("/") if part)
+    if any(part in {".", ".."} for part in parts):
+        return None
+    return Path(*parts)
+
+
+def _read_cgroup_membership() -> tuple[str | None, str | None]:
+    try:
+        lines = _PROC_SELF_CGROUP.read_text(encoding="utf-8").splitlines()
+    except (OSError, UnicodeError):
+        return None, None
+
+    v2_path: str | None = None
+    v1_memory_path: str | None = None
+    for line in lines:
+        parts = line.split(":", 2)
+        if len(parts) != 3:
+            continue
+        _, controller_text, relative_path = parts
+        if controller_text == "":
+            v2_path = relative_path
+            continue
+        if "memory" in controller_text.split(","):
+            v1_memory_path = relative_path
+    return v2_path, v1_memory_path
+
+
+def _parse_cgroup_limit(value: str, *, version: int) -> int | None:
+    stripped = value.strip()
+    if not stripped or stripped == "max":
+        return None
+    try:
+        limit = int(stripped)
+    except ValueError:
+        return None
+    if limit <= 0:
+        return None
+    if version == 1 and limit >= _CGROUP_V1_UNLIMITED_THRESHOLD:
+        return None
+    return limit
+
+
+def _read_cgroup_limit_file(
+    path: Path,
+    *,
+    version: int,
+) -> tuple[bool, int | None]:
+    try:
+        value = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeError):
+        return False, None
+    return True, _parse_cgroup_limit(value, version=version)
+
+
+def _read_cgroup_memory_limit_bytes() -> int | None:
+    v2_relative, v1_relative = _read_cgroup_membership()
+
+    if v2_relative is not None:
+        relative = _safe_relative_cgroup_path(v2_relative)
+        if relative is None:
+            return None
+        found, limit = _read_cgroup_limit_file(
+            _CGROUP_V2_ROOT / relative / "memory.max",
+            version=2,
+        )
+        if not found:
+            found, limit = _read_cgroup_limit_file(
+                _CGROUP_V2_ROOT / "memory.max",
+                version=2,
+            )
+        return limit if found else None
+
+    if v1_relative is not None:
+        relative = _safe_relative_cgroup_path(v1_relative)
+        if relative is None:
+            return None
+        found, limit = _read_cgroup_limit_file(
+            _CGROUP_V1_MEMORY_ROOT / relative / "memory.limit_in_bytes",
+            version=1,
+        )
+        if not found:
+            found, limit = _read_cgroup_limit_file(
+                _CGROUP_V1_MEMORY_ROOT / "memory.limit_in_bytes",
+                version=1,
+            )
+        return limit if found else None
+
+    found, limit = _read_cgroup_limit_file(
+        _CGROUP_V2_ROOT / "memory.max",
+        version=2,
+    )
+    if found:
+        return limit
+
+    found, limit = _read_cgroup_limit_file(
+        _CGROUP_V1_MEMORY_ROOT / "memory.limit_in_bytes",
+        version=1,
+    )
+    return limit if found else None
 
 
 def _read_cpu_rss_bytes() -> int | None:
@@ -67,21 +174,32 @@ class ResourceMonitor:
 
     def capacity(self) -> ResourceCapacity:
         cpu_total_bytes = _read_cpu_total_bytes()
+        cpu_limit_bytes = _read_cgroup_memory_limit_bytes()
         device_index = self._device_index()
         if device_index is None:
-            return ResourceCapacity(cpu_total_bytes=cpu_total_bytes)
+            return ResourceCapacity(
+                cpu_total_bytes=cpu_total_bytes,
+                cpu_limit_bytes=cpu_limit_bytes,
+            )
 
         try:
             total_memory = int(
                 torch.cuda.get_device_properties(device_index).total_memory
             )
         except Exception:
-            return ResourceCapacity(cpu_total_bytes=cpu_total_bytes)
+            return ResourceCapacity(
+                cpu_total_bytes=cpu_total_bytes,
+                cpu_limit_bytes=cpu_limit_bytes,
+            )
         if total_memory <= 0:
-            return ResourceCapacity(cpu_total_bytes=cpu_total_bytes)
+            return ResourceCapacity(
+                cpu_total_bytes=cpu_total_bytes,
+                cpu_limit_bytes=cpu_limit_bytes,
+            )
 
         return ResourceCapacity(
             cpu_total_bytes=cpu_total_bytes,
+            cpu_limit_bytes=cpu_limit_bytes,
             cuda_total_bytes=total_memory,
             cuda_device_index=device_index,
         )

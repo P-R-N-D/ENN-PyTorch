@@ -1,11 +1,41 @@
 from __future__ import annotations
 
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
 import enn_torch_dev.runtime.resources as resources_module
 from enn_torch_dev.runtime import ResourceCapacity, ResourceMonitor, RuntimePhase
+
+
+def _disable_cgroup(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        resources_module,
+        "_read_cgroup_memory_limit_bytes",
+        lambda: None,
+    )
+
+
+def _configure_cgroup_paths(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    membership: str,
+) -> tuple[Path, Path]:
+    proc_self_cgroup = tmp_path / "self.cgroup"
+    proc_self_cgroup.write_text(membership, encoding="utf-8")
+    cgroup_v2_root = tmp_path / "cgroup-v2"
+    cgroup_v1_memory_root = tmp_path / "cgroup-v1-memory"
+    cgroup_v2_root.mkdir()
+    cgroup_v1_memory_root.mkdir()
+    monkeypatch.setattr(resources_module, "_PROC_SELF_CGROUP", proc_self_cgroup)
+    monkeypatch.setattr(resources_module, "_CGROUP_V2_ROOT", cgroup_v2_root)
+    monkeypatch.setattr(
+        resources_module,
+        "_CGROUP_V1_MEMORY_ROOT",
+        cgroup_v1_memory_root,
+    )
+    return cgroup_v2_root, cgroup_v1_memory_root
 
 
 def test_resource_monitor_creates_cpu_safe_sample() -> None:
@@ -51,6 +81,7 @@ def test_resource_monitor_rejects_bool_cuda_device() -> None:
 
 
 def test_resource_monitor_capacity_is_cpu_safe(monkeypatch: pytest.MonkeyPatch) -> None:
+    _disable_cgroup(monkeypatch)
     monkeypatch.setattr(
         resources_module.os,
         "sysconf",
@@ -69,6 +100,8 @@ def test_resource_monitor_capacity_is_cpu_safe(monkeypatch: pytest.MonkeyPatch) 
 def test_resource_monitor_capacity_falls_back_when_cpu_lookup_fails(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    _disable_cgroup(monkeypatch)
+
     def raise_lookup_error(name: str) -> int:
         del name
         raise RuntimeError("sysconf unavailable")
@@ -82,6 +115,7 @@ def test_resource_monitor_capacity_falls_back_when_cpu_lookup_fails(
 def test_resource_monitor_capacity_rejects_invalid_cpu_values(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    _disable_cgroup(monkeypatch)
     monkeypatch.setattr(resources_module.os, "sysconf", lambda name: -1)
     monkeypatch.setattr(resources_module.torch.cuda, "is_available", lambda: False)
 
@@ -91,6 +125,7 @@ def test_resource_monitor_capacity_rejects_invalid_cpu_values(
 def test_resource_monitor_capacity_reads_cuda_total(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    _disable_cgroup(monkeypatch)
     monkeypatch.setattr(
         resources_module.os,
         "sysconf",
@@ -119,6 +154,7 @@ def test_resource_monitor_capacity_reads_cuda_total(
 def test_resource_monitor_capacity_falls_back_when_cuda_lookup_fails(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    _disable_cgroup(monkeypatch)
     monkeypatch.setattr(
         resources_module.os,
         "sysconf",
@@ -140,6 +176,154 @@ def test_resource_monitor_capacity_falls_back_when_cuda_lookup_fails(
         raise_lookup_error,
     )
 
-    assert ResourceMonitor().capacity() == ResourceCapacity(
-        cpu_total_bytes=204_800
+    assert ResourceMonitor().capacity() == ResourceCapacity(cpu_total_bytes=204_800)
+
+
+def test_resource_monitor_capacity_reads_nested_cgroup_v2_limit(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    cgroup_v2_root, _ = _configure_cgroup_paths(
+        monkeypatch, tmp_path, "0::/workloads/demo\n"
     )
+    limit_path = cgroup_v2_root / "workloads" / "demo" / "memory.max"
+    limit_path.parent.mkdir(parents=True)
+    limit_path.write_text("4096\n", encoding="utf-8")
+    monkeypatch.setattr(
+        resources_module.os,
+        "sysconf",
+        lambda name: {"SC_PHYS_PAGES": 4, "SC_PAGE_SIZE": 4096}[name],
+    )
+    monkeypatch.setattr(resources_module.torch.cuda, "is_available", lambda: False)
+    capacity = ResourceMonitor().capacity()
+    assert capacity.cpu_total_bytes == 16_384
+    assert capacity.cpu_limit_bytes == 4_096
+    assert capacity.effective_cpu_bytes == 4_096
+
+
+def test_resource_monitor_capacity_uses_cgroup_limit_when_physical_is_unknown(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    cgroup_v2_root, _ = _configure_cgroup_paths(
+        monkeypatch, tmp_path, "0::/workloads/demo\n"
+    )
+    limit_path = cgroup_v2_root / "workloads" / "demo" / "memory.max"
+    limit_path.parent.mkdir(parents=True)
+    limit_path.write_text("4096\n", encoding="utf-8")
+
+    def raise_lookup_error(name: str) -> int:
+        del name
+        raise RuntimeError("sysconf unavailable")
+
+    monkeypatch.setattr(resources_module.os, "sysconf", raise_lookup_error)
+    monkeypatch.setattr(resources_module.torch.cuda, "is_available", lambda: False)
+    capacity = ResourceMonitor().capacity()
+    assert capacity.cpu_total_bytes is None
+    assert capacity.cpu_limit_bytes == 4_096
+    assert capacity.effective_cpu_bytes == 4_096
+
+
+def test_resource_monitor_capacity_treats_cgroup_v2_max_as_unlimited(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    cgroup_v2_root, _ = _configure_cgroup_paths(
+        monkeypatch, tmp_path, "0::/workloads/demo\n"
+    )
+    limit_path = cgroup_v2_root / "workloads" / "demo" / "memory.max"
+    limit_path.parent.mkdir(parents=True)
+    limit_path.write_text("max\n", encoding="utf-8")
+    monkeypatch.setattr(
+        resources_module.os,
+        "sysconf",
+        lambda name: {"SC_PHYS_PAGES": 4, "SC_PAGE_SIZE": 4096}[name],
+    )
+    monkeypatch.setattr(resources_module.torch.cuda, "is_available", lambda: False)
+    capacity = ResourceMonitor().capacity()
+    assert capacity.cpu_limit_bytes is None
+    assert capacity.effective_cpu_bytes == 16_384
+
+
+@pytest.mark.parametrize("value", ["invalid\n", "0\n", "-1\n"])
+def test_resource_monitor_capacity_ignores_invalid_cgroup_v2_limits(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    value: str,
+) -> None:
+    cgroup_v2_root, _ = _configure_cgroup_paths(
+        monkeypatch, tmp_path, "0::/workloads/demo\n"
+    )
+    limit_path = cgroup_v2_root / "workloads" / "demo" / "memory.max"
+    limit_path.parent.mkdir(parents=True)
+    limit_path.write_text(value, encoding="utf-8")
+    monkeypatch.setattr(
+        resources_module.os,
+        "sysconf",
+        lambda name: {"SC_PHYS_PAGES": 4, "SC_PAGE_SIZE": 4096}[name],
+    )
+    monkeypatch.setattr(resources_module.torch.cuda, "is_available", lambda: False)
+    capacity = ResourceMonitor().capacity()
+    assert capacity.cpu_limit_bytes is None
+    assert capacity.effective_cpu_bytes == 16_384
+
+
+def test_resource_monitor_capacity_reads_nested_cgroup_v1_limit(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _, cgroup_v1_root = _configure_cgroup_paths(
+        monkeypatch, tmp_path, "5:cpu,memory:/containers/demo\n"
+    )
+    limit_path = cgroup_v1_root / "containers" / "demo" / "memory.limit_in_bytes"
+    limit_path.parent.mkdir(parents=True)
+    limit_path.write_text("8192\n", encoding="utf-8")
+    monkeypatch.setattr(
+        resources_module.os,
+        "sysconf",
+        lambda name: {"SC_PHYS_PAGES": 2, "SC_PAGE_SIZE": 4096}[name],
+    )
+    monkeypatch.setattr(resources_module.torch.cuda, "is_available", lambda: False)
+    capacity = ResourceMonitor().capacity()
+    assert capacity.cpu_total_bytes == 8_192
+    assert capacity.cpu_limit_bytes == 8_192
+    assert capacity.effective_cpu_bytes == 8_192
+
+
+@pytest.mark.parametrize("value", ["invalid\n", "0\n", "-1\n", f"{1 << 62}\n"])
+def test_resource_monitor_capacity_ignores_invalid_or_unlimited_v1_limits(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    value: str,
+) -> None:
+    _, cgroup_v1_root = _configure_cgroup_paths(
+        monkeypatch, tmp_path, "5:memory:/containers/demo\n"
+    )
+    limit_path = cgroup_v1_root / "containers" / "demo" / "memory.limit_in_bytes"
+    limit_path.parent.mkdir(parents=True)
+    limit_path.write_text(value, encoding="utf-8")
+    monkeypatch.setattr(
+        resources_module.os,
+        "sysconf",
+        lambda name: {"SC_PHYS_PAGES": 4, "SC_PAGE_SIZE": 4096}[name],
+    )
+    monkeypatch.setattr(resources_module.torch.cuda, "is_available", lambda: False)
+    capacity = ResourceMonitor().capacity()
+    assert capacity.cpu_limit_bytes is None
+    assert capacity.effective_cpu_bytes == 16_384
+
+
+def test_resource_monitor_capacity_handles_missing_cgroup_files(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _configure_cgroup_paths(monkeypatch, tmp_path, "0::/missing\n")
+    monkeypatch.setattr(
+        resources_module.os,
+        "sysconf",
+        lambda name: {"SC_PHYS_PAGES": 4, "SC_PAGE_SIZE": 4096}[name],
+    )
+    monkeypatch.setattr(resources_module.torch.cuda, "is_available", lambda: False)
+    capacity = ResourceMonitor().capacity()
+    assert capacity.cpu_limit_bytes is None
+    assert capacity.effective_cpu_bytes == 16_384

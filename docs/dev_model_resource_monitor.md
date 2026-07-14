@@ -87,10 +87,16 @@ not expose the current process RSS through `/proc/self/statm`, the value is
 CUDA fields are safe on CPU-only machines. If CUDA is unavailable, CUDA-specific
 memory fields are `None`.
 
-`ResourceMonitor.capacity()` returns a `ResourceCapacity` snapshot with total
-physical CPU memory when `os.sysconf(...)` exposes it and total CUDA device memory
-when `torch.cuda.get_device_properties(...)` succeeds. Capacity lookup failures
-are represented as `None`; they are not execution faults.
+`ResourceMonitor.capacity()` returns a `ResourceCapacity` snapshot with:
+
+- total physical CPU memory when `os.sysconf(...)` exposes it;
+- the current process cgroup v2 or v1 memory limit when available;
+- total CUDA device memory when `torch.cuda.get_device_properties(...)` succeeds.
+
+The effective CPU capacity is the smaller known value between physical memory
+and the cgroup limit. This prevents containerized processes from normalizing RSS
+against a larger host capacity. Capacity lookup failures are represented as
+`None`; they are not execution faults.
 
 Capacity and usage samples remain separate records. The pure
 `assess_resource_pressure(...)` helper described in
@@ -139,6 +145,8 @@ returned `StepResult`.
 - Telemetry JSON writer.
 - `run_profile.json`.
 - GPU-specific presets.
+- Windows Job Object memory limits.
+- Slurm memory-limit discovery.
 - T4/L40S/B200/GB10 hardcoding.
 
 ## Test Commands

@@ -36,19 +36,29 @@ The stable `enn_torch` namespace is unchanged.
 `ResourceCapacity` records:
 
 - total physical CPU memory bytes when available;
+- cgroup CPU memory limit bytes when available;
 - total CUDA device memory bytes when available;
 - the CUDA device index associated with that capacity.
 
 Capacity values are `None` or positive integers. CUDA total bytes and device
 index must either both be configured or both be `None`.
 
+`ResourceCapacity.effective_cpu_bytes` is the smaller of the known physical CPU
+capacity and cgroup memory limit. If only one is known, that value is used. If
+neither is known, the effective CPU capacity is `None`.
+
 `ResourceMonitor.capacity()` uses:
 
 - `SC_PHYS_PAGES * SC_PAGE_SIZE` for physical CPU memory;
+- cgroup v2 `memory.max` when the process belongs to a unified hierarchy;
+- cgroup v1 `memory.limit_in_bytes` when the process belongs to a memory
+  controller hierarchy;
 - `torch.cuda.get_device_properties(index).total_memory` for CUDA capacity.
 
-Lookup failures return `None` for the unavailable capacity. They do not become
-runtime faults.
+The monitor resolves nested process cgroup paths from `/proc/self/cgroup`.
+`memory.max=max`, invalid/non-positive limits, and cgroup v1 unlimited sentinel
+values are treated as no configured limit. Missing files and lookup failures
+return `None`; they do not become runtime faults.
 
 ## Pressure Contract
 
@@ -64,8 +74,12 @@ once and returns peak ratios for:
 Each ratio is:
 
 ```text
-observed bytes / total capacity bytes
+CPU: observed RSS bytes / effective CPU capacity bytes
+CUDA: observed bytes / CUDA total capacity bytes
 ```
+
+CPU pressure uses `effective_cpu_bytes`, so a container limit smaller than host
+physical memory becomes the denominator. CUDA pressure semantics are unchanged.
 
 Missing capacity or observation values produce `None`, not zero. Ratios are not
 clamped to `1.0`; values above one remain visible so inconsistent measurements
@@ -119,6 +133,9 @@ reviewed integration.
 - Persistent telemetry or dashboards.
 - Checkpoint/resume.
 - Distributed aggregation.
+- Windows Job Object or non-cgroup container limits.
+- Slurm memory-limit discovery.
+- Kubernetes API integration.
 - Hardware presets or model-specific tuning.
 
 ## Test Commands
