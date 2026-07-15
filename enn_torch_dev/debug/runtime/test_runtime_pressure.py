@@ -34,6 +34,62 @@ def _sample(
     )
 
 
+def test_resource_capacity_preserves_existing_positional_field_order() -> None:
+    capacity = ResourceCapacity(100, 200, 0)
+
+    assert capacity.cpu_total_bytes == 100
+    assert capacity.cuda_total_bytes == 200
+    assert capacity.cuda_device_index == 0
+    assert capacity.cpu_limit_bytes is None
+
+
+def test_resource_capacity_uses_lowest_known_cpu_capacity() -> None:
+    assert (
+        ResourceCapacity(
+            cpu_total_bytes=16_000,
+            cpu_limit_bytes=4_000,
+        ).effective_cpu_bytes
+        == 4_000
+    )
+    assert (
+        ResourceCapacity(
+            cpu_total_bytes=16_000,
+            cpu_limit_bytes=32_000,
+        ).effective_cpu_bytes
+        == 16_000
+    )
+    assert (
+        ResourceCapacity(
+            cpu_limit_bytes=4_000,
+        ).effective_cpu_bytes
+        == 4_000
+    )
+    assert ResourceCapacity().effective_cpu_bytes is None
+
+
+def test_assess_resource_pressure_uses_effective_cpu_capacity() -> None:
+    capacity = ResourceCapacity(
+        cpu_total_bytes=16_000,
+        cpu_limit_bytes=8_000,
+        cuda_total_bytes=2_000,
+        cuda_device_index=0,
+    )
+
+    summary = assess_resource_pressure(
+        [
+            _sample(
+                cpu_rss_bytes=4_000,
+                cuda_device_index=0,
+                cuda_allocated_bytes=500,
+            )
+        ],
+        capacity,
+    )
+
+    assert summary.peak_cpu_rss_ratio == pytest.approx(0.5)
+    assert summary.peak_cuda_allocated_ratio == pytest.approx(0.25)
+
+
 def test_assess_resource_pressure_calculates_cpu_and_cuda_ratios() -> None:
     capacity = ResourceCapacity(
         cpu_total_bytes=1_000,
@@ -165,6 +221,8 @@ def test_assess_resource_pressure_consumes_samples_once() -> None:
     [
         ({"cpu_total_bytes": True}, TypeError),
         ({"cpu_total_bytes": 0}, ValueError),
+        ({"cpu_limit_bytes": True}, TypeError),
+        ({"cpu_limit_bytes": 0}, ValueError),
         ({"cuda_total_bytes": 100}, ValueError),
         ({"cuda_device_index": 0}, ValueError),
         (
