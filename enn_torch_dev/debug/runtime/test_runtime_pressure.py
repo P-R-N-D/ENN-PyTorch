@@ -245,6 +245,17 @@ def test_resource_pressure_summary_rejects_invalid_ratios(value: object) -> None
         ResourcePressureSummary(peak_cpu_rss_ratio=value)  # type: ignore[arg-type]
 
 
+def test_resource_pressure_summary_reports_max_observed_ratio() -> None:
+    summary = ResourcePressureSummary(
+        peak_cpu_rss_ratio=0.25,
+        peak_cuda_allocated_ratio=0.75,
+        peak_cuda_reserved_ratio=0.5,
+    )
+
+    assert summary.max_observed_ratio == pytest.approx(0.75)
+    assert ResourcePressureSummary().max_observed_ratio is None
+
+
 def test_assess_resource_pressure_rejects_invalid_inputs() -> None:
     sample = _sample(cpu_rss_bytes=1)
 

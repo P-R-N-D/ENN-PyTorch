@@ -132,6 +132,23 @@ class ResourcePressureSummary:
                 ),
             )
 
+    @property
+    def max_observed_ratio(self) -> float | None:
+        """Return the highest known pressure ratio, or None if all are unknown."""
+
+        known = tuple(
+            value
+            for value in (
+                self.peak_cpu_rss_ratio,
+                self.peak_cuda_allocated_ratio,
+                self.peak_cuda_reserved_ratio,
+                self.peak_cuda_max_allocated_ratio,
+                self.peak_cuda_max_reserved_ratio,
+            )
+            if value is not None
+        )
+        return max(known) if known else None
+
 
 def _peak_ratio(
     current: float | None,

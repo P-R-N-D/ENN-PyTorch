@@ -55,6 +55,7 @@ or a success grow from decreasing one through clamping.
   `min_device_bytes`, and `max_device_bytes` must be `None` or positive
   integers.
 - For each field family, `min_*` must not exceed `max_*`.
+- `max_pressure_ratio_for_growth` is optional; when configured it must be finite and satisfy `0 < value <= 1`.
 
 ## Adjustment Rules
 
@@ -68,7 +69,7 @@ field. The governor does not choose host or device bytes based on resource peaks
 
 ## Decision Rules
 
-`observe_results(results, *, recovered_oom=False)` consumes an iterable of
+`observe_results(results, *, recovered_oom=False, pressure_summary=None)` consumes an iterable of
 `StepResult` objects and returns a `GovernorDecision`. The method streams the
 iterable once and accumulates only statuses, resource peaks, and small decision
 flags. It does not keep a list or tuple of `StepResult` objects, so `store` and
@@ -87,13 +88,21 @@ Decision priority is deliberately small and predictable:
    observed statuses are `SUCCESS` or the observed stream is empty.
 4. Mixed streams containing OOM and success or non-OOM faults still shrink.
 5. If every observed result is `StepStatus.SUCCESS` and `recovered_oom=False`,
-   the success streak increases by one for the observe call.
-6. Retry-recovered OOM is not success evidence and does not increase the success
+   an optional pressure growth guard is evaluated before success evidence is
+   accumulated.
+6. With `max_pressure_ratio_for_growth=None`, pressure does not change the existing
+   success-growth behavior.
+7. With the guard enabled, a missing pressure summary, an all-unknown summary, or
+   `pressure_summary.max_observed_ratio >= max_pressure_ratio_for_growth` keeps the
+   budget and resets the success streak to zero.
+8. A known maximum pressure ratio below the configured limit allows the success
+   streak to increase by one for the observe call.
+9. Retry-recovered OOM is not success evidence and does not increase the success
    streak.
-7. The success streak does not increase per successful `StepResult`.
-8. When `grow_after_successes` is reached, all configured budget fields grow and
-   the success streak resets to zero.
-9. Non-OOM faults keep the current budget and reset success/OOM streaks.
+10. The success streak does not increase per successful `StepResult`.
+11. When `grow_after_successes` is reached, all configured budget fields grow and
+    the success streak resets to zero.
+12. Non-OOM faults keep the current budget and reset success/OOM streaks.
 
 ## State and Decision Records
 
@@ -109,8 +118,8 @@ Decision priority is deliberately small and predictable:
 that was passed in from outside.
 
 `GovernorDecision` records the previous and next budget, reason text, observed
-statuses, updated streak counters, and resource peaks observed in the result
-stream.
+statuses, updated streak counters, resource peaks, the supplied pressure summary,
+and whether pressure suppressed success growth.
 
 ## Resource Samples
 
@@ -123,22 +132,27 @@ record and reason text:
 - `peak_cuda_max_allocated_bytes`
 - `peak_cuda_max_reserved_bytes`
 
-These peaks are observational only in this slice. They do not drive field
-selection, learned tuning, or feedback-loop policy changes.
+Raw byte peaks remain observational. A separately supplied
+`ResourcePressureSummary` may only suppress success-driven growth when the opt-in
+policy limit is configured. Pressure never causes an automatic shrink in this
+slice.
 
 ## Relationship to Orchestration
 
 A finite pass-level orchestration helper can feed `GovernorDecision.next_budget`
 back into `BudgetedBatcher` on a later pass. That orchestration boundary is
 described in `docs/dev_runtime_orchestration.md`. The governor itself remains an
-observation/decision object and does not run batches, retry, or execute models.
+observation/decision object and does not run batches, retry, execute models, or
+construct a pressure summary. Automatic orchestration of capacity sampling and
+pressure assessment remains a separate integration step.
 
 ## Out of Scope
 
 - Full AutoGovernor behavior.
 - Learned or model-specific tuning.
 - Persistent calibration caches or history databases.
-- `ResourceMonitor` feedback-loop tuning.
+- Pressure-triggered budget shrink or field-specific tuning.
+- Automatic pressure-summary construction inside the governor or orchestrator.
 - `ModelCostProbe`-driven policy changes.
 - SPDL queue-depth tuning.
 - Device transfer.

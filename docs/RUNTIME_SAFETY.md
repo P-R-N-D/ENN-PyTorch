@@ -32,7 +32,7 @@ Use this document before running code that can allocate accelerator memory, writ
 - Treat missing capacity or observation values as unknown, not zero utilization.
 - Normalize CPU RSS against the smallest known physical or hierarchy-effective cgroup capacity; do not assume host physical memory or a leaf cgroup file is the process limit in containers.
 - Do not clamp pressure ratios to `1.0`; ratios above one must remain visible for diagnosis.
-- Do not feed pressure summaries into governor decisions without a separately reviewed opt-in policy.
+- Feed pressure summaries into governor decisions only through the explicit opt-in growth guard; missing or high pressure may suppress growth but must not directly shrink a budget.
 - Do not add persistent logs, checkpoints, exports, source replay, distributed workers, or automatic tuning to the bounded development workflow without a separately reviewed safety contract.
 - Confirm the stable `enn_torch` namespace is unchanged when adding development runtime helpers.
 

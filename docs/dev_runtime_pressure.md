@@ -18,8 +18,9 @@ Iterable[ResourceSample] + ResourceCapacity
   -> ResourcePressureSummary
 ```
 
-The pressure layer observes and summarizes. It does not modify
-`GovernorPolicy`, choose a `BatchBudget`, retry work, or execute a model.
+The assessment layer observes and summarizes. It does not choose a `BatchBudget`,
+retry work, or execute a model. A separate opt-in governor policy may consume the
+summary only to suppress success-driven budget growth.
 
 ## Public Objects
 
@@ -96,7 +97,25 @@ capacity device indices must match. Device-mismatched samples are rejected
 instead of being silently combined.
 
 The function returns only scalar ratios and does not retain the input sample
-objects.
+objects. `ResourcePressureSummary.max_observed_ratio` returns the highest known
+ratio, or `None` when every ratio is unknown.
+
+## Optional Governor Growth Guard
+
+`GovernorPolicy.max_pressure_ratio_for_growth` is `None` by default, preserving
+the existing governor behavior. When configured, callers may pass a
+`ResourcePressureSummary` to `ConservativeRuntimeGovernor.observe_results(...)`.
+
+- A known maximum ratio below the configured limit allows normal success-streak
+  accumulation and growth.
+- A ratio equal to or above the limit suppresses growth and resets the success
+  streak.
+- A missing summary or an all-unknown summary also suppresses growth.
+- OOM and retry-recovered OOM retain priority and continue to shrink the budget.
+- Pressure never directly shrinks a budget in this slice.
+
+The governor does not build the summary itself. Automatic collection and
+orchestrator wiring remain separate work.
 
 ## Example
 
@@ -115,24 +134,25 @@ print(pressure.peak_cuda_reserved_ratio)
 
 ## Safety Boundary
 
-Pressure summaries are observational. A high ratio does not automatically:
+Pressure summaries are observational unless an explicit governor growth guard is
+configured. Even with that guard, a high or unavailable ratio does not:
 
 - shrink a runtime budget;
-- suppress growth;
 - trigger retry;
 - reserve memory;
 - move tensors;
 - change precision;
 - stop a session.
 
-Any governor feedback based on pressure requires a separate opt-in policy and
-reviewed integration.
+The only supported feedback in this slice is opt-in suppression of
+success-driven growth. Automatic pressure production and orchestration remain
+separate reviewed integration work.
 
 ## Out of Scope
 
-- Governor decision changes.
-- Pressure thresholds.
-- Automatic budget shrink or growth suppression.
+- Pressure-triggered budget shrink.
+- Automatic capacity sampling or pressure-summary construction in the governor.
+- Automatic orchestrator-to-governor pressure wiring.
 - Real-time free-memory reservation.
 - Memory admission control.
 - Persistent telemetry or dashboards.

@@ -7,6 +7,7 @@ from numbers import Real
 
 from .batching import BatchBudget
 from .faults import ResourceSample, StepResult, StepStatus
+from .pressure import ResourcePressureSummary
 
 
 _BUDGET_FIELDS = ("max_items", "max_host_bytes", "max_device_bytes")
@@ -42,6 +43,25 @@ def _validate_optional_positive_int(value: object, *, label: str) -> int | None:
     if value is None:
         return None
     return _validate_positive_int(value, label=label)
+
+
+def _validate_optional_growth_pressure_ratio(value: object) -> float | None:
+    if value is None:
+        return None
+    if not isinstance(value, Real) or isinstance(value, bool):
+        raise TypeError(
+            "GovernorPolicy.max_pressure_ratio_for_growth must be a finite number or None."
+        )
+    ratio = float(value)
+    if not math.isfinite(ratio):
+        raise ValueError(
+            "GovernorPolicy.max_pressure_ratio_for_growth must be finite."
+        )
+    if ratio <= 0.0 or ratio > 1.0:
+        raise ValueError(
+            "GovernorPolicy.max_pressure_ratio_for_growth must satisfy 0 < value <= 1."
+        )
+    return ratio
 
 
 def _validate_budget(budget: object, *, label: str) -> BatchBudget:
@@ -89,6 +109,7 @@ class GovernorPolicy:
     max_host_bytes: int | None = None
     min_device_bytes: int | None = None
     max_device_bytes: int | None = None
+    max_pressure_ratio_for_growth: float | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(
@@ -130,6 +151,13 @@ class GovernorPolicy:
                     label=f"GovernorPolicy.{field_name}",
                 ),
             )
+        object.__setattr__(
+            self,
+            "max_pressure_ratio_for_growth",
+            _validate_optional_growth_pressure_ratio(
+                self.max_pressure_ratio_for_growth
+            ),
+        )
         self._validate_bounds("items", self.min_items, self.max_items)
         self._validate_bounds("host_bytes", self.min_host_bytes, self.max_host_bytes)
         self._validate_bounds("device_bytes", self.min_device_bytes, self.max_device_bytes)
@@ -155,6 +183,8 @@ class GovernorDecision:
     peak_cuda_reserved_bytes: int | None = None
     peak_cuda_max_allocated_bytes: int | None = None
     peak_cuda_max_reserved_bytes: int | None = None
+    pressure_summary: ResourcePressureSummary | None = None
+    growth_suppressed_by_pressure: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -247,11 +277,19 @@ class ConservativeRuntimeGovernor:
         results: Iterable[StepResult],
         *,
         recovered_oom: bool = False,
+        pressure_summary: ResourcePressureSummary | None = None,
     ) -> GovernorDecision:
         if isinstance(results, StepResult):
             raise TypeError("ConservativeRuntimeGovernor.observe_results expects an iterable of StepResult objects.")
         if not isinstance(recovered_oom, bool):
             raise TypeError("ConservativeRuntimeGovernor.recovered_oom must be a bool.")
+        if pressure_summary is not None and not isinstance(
+            pressure_summary, ResourcePressureSummary
+        ):
+            raise TypeError(
+                "ConservativeRuntimeGovernor.pressure_summary must be a "
+                "ResourcePressureSummary or None."
+            )
 
         statuses: list[StepStatus] = []
         peaks = self._empty_resource_peaks()
@@ -277,6 +315,7 @@ class ConservativeRuntimeGovernor:
         next_budget = previous_budget
         consecutive_successes = self.state.consecutive_successes
         consecutive_ooms = self.state.consecutive_ooms
+        growth_suppressed_by_pressure = False
 
         if saw_oom or recovered_oom:
             next_budget = self._adjust_budget(previous_budget, mode="shrink")
@@ -292,13 +331,19 @@ class ConservativeRuntimeGovernor:
             reason = "no results observed; keeping current budget"
         elif all_success:
             consecutive_ooms = 0
-            consecutive_successes += 1
-            if consecutive_successes >= self.policy.grow_after_successes:
-                next_budget = self._adjust_budget(previous_budget, mode="grow")
+            pressure_reason = self._growth_pressure_guard_reason(pressure_summary)
+            if pressure_reason is not None:
                 consecutive_successes = 0
-                reason = "success threshold reached; growing configured budget fields"
+                growth_suppressed_by_pressure = True
+                reason = pressure_reason
             else:
-                reason = "success observed below growth threshold; keeping current budget"
+                consecutive_successes += 1
+                if consecutive_successes >= self.policy.grow_after_successes:
+                    next_budget = self._adjust_budget(previous_budget, mode="grow")
+                    consecutive_successes = 0
+                    reason = "success threshold reached; growing configured budget fields"
+                else:
+                    reason = "success observed below growth threshold; keeping current budget"
         else:
             consecutive_successes = 0
             consecutive_ooms = 0
@@ -317,6 +362,8 @@ class ConservativeRuntimeGovernor:
             peak_cuda_reserved_bytes=peaks["peak_cuda_reserved_bytes"],
             peak_cuda_max_allocated_bytes=peaks["peak_cuda_max_allocated_bytes"],
             peak_cuda_max_reserved_bytes=peaks["peak_cuda_max_reserved_bytes"],
+            pressure_summary=pressure_summary,
+            growth_suppressed_by_pressure=growth_suppressed_by_pressure,
         )
         self.state = RuntimeGovernorState(
             current_budget=next_budget,
@@ -325,6 +372,27 @@ class ConservativeRuntimeGovernor:
             last_decision=decision,
         )
         return decision
+
+    def _growth_pressure_guard_reason(
+        self,
+        pressure_summary: ResourcePressureSummary | None,
+    ) -> str | None:
+        threshold = self.policy.max_pressure_ratio_for_growth
+        if threshold is None:
+            return None
+        if pressure_summary is None or pressure_summary.max_observed_ratio is None:
+            return (
+                "success observed but resource pressure is unavailable; "
+                "suppressing budget growth"
+            )
+        max_ratio = pressure_summary.max_observed_ratio
+        assert max_ratio is not None
+        if max_ratio >= threshold:
+            return (
+                f"resource pressure {max_ratio:.6g} reached growth limit "
+                f"{threshold:.6g}; suppressing budget growth"
+            )
+        return None
 
     def _adjust_budget(self, budget: BatchBudget, *, mode: str) -> BatchBudget:
         values: dict[str, int | None] = {}
