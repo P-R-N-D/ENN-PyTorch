@@ -8,7 +8,9 @@ import torch
 from enn_torch_dev.runtime import (
     BatchBudget,
     ConservativeRuntimeGovernor,
+    GovernorDecision,
     GovernorPolicy,
+    ResourcePressureSummary,
     ResourceSample,
     RuntimeGovernorState,
     StepResult,
@@ -76,6 +78,30 @@ def test_success_streak_counts_observe_calls_not_result_count() -> None:
     assert decision.consecutive_successes == 1
 
 
+def test_governor_policy_preserves_existing_positional_field_order() -> None:
+    policy = GovernorPolicy(0.5, 2.0, 3, 1, 8, 10, 100, 20, 200)
+
+    assert policy.max_device_bytes == 200
+    assert policy.max_pressure_ratio_for_growth is None
+
+
+def test_pressure_guard_is_opt_in_and_default_growth_is_unchanged() -> None:
+    pressure = ResourcePressureSummary(peak_cpu_rss_ratio=1.0)
+    governor = ConservativeRuntimeGovernor(
+        BatchBudget(max_items=8),
+        policy=GovernorPolicy(grow_after_successes=1),
+    )
+
+    decision = governor.observe_results(
+        [_result()],
+        pressure_summary=pressure,
+    )
+
+    assert decision.next_budget == BatchBudget(max_items=16)
+    assert decision.pressure_summary == pressure
+    assert decision.growth_suppressed_by_pressure is False
+
+
 def test_consecutive_successes_grow_budget_and_reset_streak() -> None:
     governor = ConservativeRuntimeGovernor(
         BatchBudget(max_items=8, max_host_bytes=100),
@@ -88,6 +114,120 @@ def test_consecutive_successes_grow_budget_and_reset_streak() -> None:
     assert decision.next_budget == BatchBudget(max_items=12, max_host_bytes=150)
     assert decision.consecutive_successes == 0
     assert governor.current_budget == decision.next_budget
+
+
+def test_pressure_below_limit_allows_success_growth() -> None:
+    governor = ConservativeRuntimeGovernor(
+        BatchBudget(max_items=8),
+        policy=GovernorPolicy(
+            grow_after_successes=1,
+            max_pressure_ratio_for_growth=0.8,
+        ),
+    )
+    pressure = ResourcePressureSummary(peak_cpu_rss_ratio=0.79)
+
+    decision = governor.observe_results(
+        [_result()],
+        pressure_summary=pressure,
+    )
+
+    assert decision.next_budget == BatchBudget(max_items=16)
+    assert decision.consecutive_successes == 0
+    assert decision.pressure_summary == pressure
+    assert decision.growth_suppressed_by_pressure is False
+
+
+@pytest.mark.parametrize("ratio", [0.8, 0.9, 1.2])
+def test_pressure_at_or_above_limit_suppresses_growth(ratio: float) -> None:
+    governor = ConservativeRuntimeGovernor(
+        BatchBudget(max_items=8),
+        policy=GovernorPolicy(
+            grow_after_successes=1,
+            max_pressure_ratio_for_growth=0.8,
+        ),
+    )
+    pressure = ResourcePressureSummary(peak_cuda_reserved_ratio=ratio)
+
+    decision = governor.observe_results(
+        [_result()],
+        pressure_summary=pressure,
+    )
+
+    assert decision.next_budget == BatchBudget(max_items=8)
+    assert decision.consecutive_successes == 0
+    assert decision.pressure_summary == pressure
+    assert decision.growth_suppressed_by_pressure is True
+    assert "reached growth limit" in decision.reason
+
+
+@pytest.mark.parametrize(
+    "pressure",
+    [None, ResourcePressureSummary()],
+)
+def test_missing_pressure_suppresses_growth_when_guard_is_enabled(
+    pressure: ResourcePressureSummary | None,
+) -> None:
+    governor = ConservativeRuntimeGovernor(
+        BatchBudget(max_items=8),
+        policy=GovernorPolicy(
+            grow_after_successes=1,
+            max_pressure_ratio_for_growth=0.8,
+        ),
+    )
+
+    decision = governor.observe_results(
+        [_result()],
+        pressure_summary=pressure,
+    )
+
+    assert decision.next_budget == BatchBudget(max_items=8)
+    assert decision.consecutive_successes == 0
+    assert decision.growth_suppressed_by_pressure is True
+    assert "pressure is unavailable" in decision.reason
+
+
+def test_pressure_guard_uses_highest_known_ratio() -> None:
+    governor = ConservativeRuntimeGovernor(
+        BatchBudget(max_items=8),
+        policy=GovernorPolicy(
+            grow_after_successes=1,
+            max_pressure_ratio_for_growth=0.8,
+        ),
+    )
+    pressure = ResourcePressureSummary(
+        peak_cpu_rss_ratio=0.2,
+        peak_cuda_allocated_ratio=0.81,
+    )
+
+    decision = governor.observe_results(
+        [_result()],
+        pressure_summary=pressure,
+    )
+
+    assert decision.next_budget == BatchBudget(max_items=8)
+    assert decision.growth_suppressed_by_pressure is True
+
+
+def test_pressure_suppression_resets_existing_success_streak() -> None:
+    governor = ConservativeRuntimeGovernor(
+        state=RuntimeGovernorState(
+            current_budget=BatchBudget(max_items=8),
+            consecutive_successes=2,
+        ),
+        policy=GovernorPolicy(
+            grow_after_successes=3,
+            max_pressure_ratio_for_growth=0.8,
+        ),
+    )
+
+    decision = governor.observe_results(
+        [_result()],
+        pressure_summary=ResourcePressureSummary(peak_cpu_rss_ratio=0.8),
+    )
+
+    assert decision.next_budget == BatchBudget(max_items=8)
+    assert decision.consecutive_successes == 0
+    assert decision.growth_suppressed_by_pressure is True
 
 
 def test_oom_shrinks_all_configured_fields() -> None:
@@ -171,6 +311,26 @@ def test_mixed_results_prioritize_oom_shrink() -> None:
     assert decision.consecutive_ooms == 1
 
 
+def test_oom_has_priority_over_pressure_guard() -> None:
+    governor = ConservativeRuntimeGovernor(
+        BatchBudget(max_items=8),
+        policy=GovernorPolicy(
+            shrink_factor=0.5,
+            max_pressure_ratio_for_growth=0.8,
+        ),
+    )
+    pressure = ResourcePressureSummary(peak_cpu_rss_ratio=1.0)
+
+    decision = governor.observe_results(
+        [_result(StepStatus.OOM_FAULT)],
+        pressure_summary=pressure,
+    )
+
+    assert decision.next_budget == BatchBudget(max_items=4)
+    assert decision.pressure_summary == pressure
+    assert decision.growth_suppressed_by_pressure is False
+
+
 def test_non_oom_fault_keeps_budget_and_resets_streaks() -> None:
     governor = ConservativeRuntimeGovernor(
         BatchBudget(max_items=10),
@@ -178,11 +338,15 @@ def test_non_oom_fault_keeps_budget_and_resets_streaks() -> None:
     )
     governor.observe_results([_result()])
 
-    decision = governor.observe_results([_result(StepStatus.RUNTIME_FAULT)])
+    decision = governor.observe_results(
+        [_result(StepStatus.RUNTIME_FAULT)],
+        pressure_summary=ResourcePressureSummary(peak_cpu_rss_ratio=1.0),
+    )
 
     assert decision.next_budget == BatchBudget(max_items=10)
     assert decision.consecutive_successes == 0
     assert decision.consecutive_ooms == 0
+    assert decision.growth_suppressed_by_pressure is False
 
 
 def test_resource_sample_peaks_are_recorded_in_decision_and_reason() -> None:
@@ -301,12 +465,19 @@ def test_recovered_oom_success_results_shrink_without_success_streak() -> None:
         policy=GovernorPolicy(shrink_factor=0.5, grow_after_successes=1),
     )
 
-    decision = governor.observe_results([_result()], recovered_oom=True)
+    pressure = ResourcePressureSummary(peak_cpu_rss_ratio=1.0)
+    decision = governor.observe_results(
+        [_result()],
+        recovered_oom=True,
+        pressure_summary=pressure,
+    )
 
     assert decision.next_budget == BatchBudget(max_items=4)
     assert decision.statuses == (StepStatus.SUCCESS,)
     assert decision.consecutive_successes == 0
     assert decision.consecutive_ooms == 1
+    assert decision.pressure_summary == pressure
+    assert decision.growth_suppressed_by_pressure is False
     assert "retry-recovered OOM observed" in decision.reason
 
 
@@ -371,6 +542,15 @@ def test_invalid_policy_grow_after_successes_is_rejected(
         GovernorPolicy(grow_after_successes=grow_after_successes)  # type: ignore[arg-type]
 
 
+@pytest.mark.parametrize(
+    "ratio",
+    [0, -0.1, 1.1, float("inf"), float("nan"), True, "0.8"],
+)
+def test_invalid_growth_pressure_ratio_is_rejected(ratio: object) -> None:
+    with pytest.raises((TypeError, ValueError)):
+        GovernorPolicy(max_pressure_ratio_for_growth=ratio)  # type: ignore[arg-type]
+
+
 @pytest.mark.parametrize("bound", [0, -1, 1.5, True])
 def test_invalid_policy_bounds_are_rejected(bound: object) -> None:
     with pytest.raises((TypeError, ValueError)):
@@ -388,6 +568,33 @@ def test_invalid_policy_bounds_are_rejected(bound: object) -> None:
 def test_invalid_policy_bound_order_is_rejected(kwargs: dict[str, int]) -> None:
     with pytest.raises(ValueError):
         GovernorPolicy(**kwargs)
+
+
+def test_governor_decision_pressure_fields_default_for_existing_construction() -> None:
+    budget = BatchBudget(max_items=8)
+    decision = GovernorDecision(
+        previous_budget=budget,
+        next_budget=budget,
+        reason="test",
+        statuses=(),
+        consecutive_successes=0,
+        consecutive_ooms=0,
+    )
+    state = RuntimeGovernorState(current_budget=budget, last_decision=decision)
+
+    assert decision.pressure_summary is None
+    assert decision.growth_suppressed_by_pressure is False
+    assert state.last_decision == decision
+
+
+def test_invalid_pressure_summary_is_rejected() -> None:
+    governor = ConservativeRuntimeGovernor(BatchBudget(max_items=8))
+
+    with pytest.raises(TypeError, match="pressure_summary"):
+        governor.observe_results(
+            [_result()],
+            pressure_summary=object(),  # type: ignore[arg-type]
+        )
 
 
 def test_invalid_governor_arguments_are_rejected() -> None:
