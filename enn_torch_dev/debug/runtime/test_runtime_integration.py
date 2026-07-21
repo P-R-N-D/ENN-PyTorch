@@ -15,6 +15,8 @@ from enn_torch_dev.runtime import (
     ConservativeRuntimeOrchestrator,
     ConservativeRuntimeSession,
     GovernorPolicy,
+    ResourceCapacity,
+    ResourceSample,
     RetryPolicy,
     RuntimePassHistory,
     RuntimePhase,
@@ -80,6 +82,29 @@ class ThresholdOomRuntimeStep:
             row_ids=batch.row_ids.detach().cpu().clone(),
             error_type=None if status is StepStatus.SUCCESS else "SyntheticOOM",
             error_message=None if status is StepStatus.SUCCESS else "batch too large",
+        )
+
+
+class PressureSequenceRuntimeStep:
+    def __init__(self, cpu_rss_bytes: tuple[int, ...]) -> None:
+        self.cpu_rss_bytes = cpu_rss_bytes
+        self.calls = 0
+
+    def run(self, batch: KVBatch) -> StepResult:
+        cpu_rss_bytes = self.cpu_rss_bytes[self.calls]
+        self.calls += 1
+        return StepResult(
+            status=StepStatus.SUCCESS,
+            phase=None,
+            batch_size=batch.batch_size,
+            row_ids=batch.row_ids.detach().cpu().clone(),
+            resource_samples=(
+                ResourceSample(
+                    timestamp_ns=self.calls,
+                    phase="integration",
+                    cpu_rss_bytes=cpu_rss_bytes,
+                ),
+            ),
         )
 
 
@@ -199,6 +224,53 @@ def test_runtime_session_end_to_end_oom_recovery_budget_history_and_identity() -
         StepStatus.SUCCESS,
         StepStatus.SUCCESS,
     ]
+
+
+def test_runtime_session_uses_orchestrator_pressure_summary_for_growth_guard() -> None:
+    step = PressureSequenceRuntimeStep((50, 90))
+    governor = ConservativeRuntimeGovernor(
+        BatchBudget(max_items=2),
+        policy=GovernorPolicy(
+            grow_factor=2.0,
+            grow_after_successes=1,
+            max_items=8,
+            max_pressure_ratio_for_growth=0.8,
+        ),
+    )
+    orchestrator = ConservativeRuntimeOrchestrator(
+        step,
+        governor,
+        resource_capacity=ResourceCapacity(cpu_total_bytes=100),
+    )
+    history = RuntimePassHistory(max_records=2)
+    session = ConservativeRuntimeSession(
+        orchestrator,
+        history,
+        max_passes=2,
+    )
+
+    records = list(
+        session.run_passes(
+            [
+                [_batch(1, offset=0)],
+                [_batch(1, offset=10)],
+            ]
+        )
+    )
+
+    first, second = records
+    assert first.pass_result.decision.pressure_summary is not None
+    assert first.pass_result.decision.pressure_summary.peak_cpu_rss_ratio == 0.5
+    assert first.pass_result.decision.next_budget == BatchBudget(max_items=4)
+    assert first.pass_result.decision.growth_suppressed_by_pressure is False
+
+    assert second.pass_result.decision.pressure_summary is not None
+    assert second.pass_result.decision.pressure_summary.peak_cpu_rss_ratio == 0.9
+    assert second.pass_result.decision.next_budget == BatchBudget(max_items=4)
+    assert second.pass_result.decision.growth_suppressed_by_pressure is True
+    assert second.pass_result.decision.consecutive_successes == 0
+    assert orchestrator.current_budget == BatchBudget(max_items=4)
+    assert history.records == (first.pass_summary, second.pass_summary)
 
 
 def test_runtime_session_keeps_completed_history_when_later_pass_raises() -> None:

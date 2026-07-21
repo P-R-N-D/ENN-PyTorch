@@ -114,8 +114,10 @@ the existing governor behavior. When configured, callers may pass a
 - OOM and retry-recovered OOM retain priority and continue to shrink the budget.
 - Pressure never directly shrinks a budget in this slice.
 
-The governor does not build the summary itself. Automatic collection and
-orchestrator wiring remain separate work.
+The governor does not build the summary itself. A
+`ConservativeRuntimeOrchestrator` configured with an explicit fixed
+`ResourceCapacity` can assess all raw-attempt samples for a finite pass and pass
+the summary to the governor.
 
 ## Example
 
@@ -145,14 +147,15 @@ configured. Even with that guard, a high or unavailable ratio does not:
 - stop a session.
 
 The only supported feedback in this slice is opt-in suppression of
-success-driven growth. Automatic pressure production and orchestration remain
-separate reviewed integration work.
+success-driven growth. Orchestration may produce the summary only when a caller
+provides an explicit fixed capacity; automatic monitoring and capacity discovery
+remain outside this contract.
 
 ## Out of Scope
 
 - Pressure-triggered budget shrink.
 - Automatic capacity sampling or pressure-summary construction in the governor.
-- Automatic orchestrator-to-governor pressure wiring.
+- Automatic `ResourceMonitor` creation or capacity refresh in orchestration.
 - Real-time free-memory reservation.
 - Memory admission control.
 - Persistent telemetry or dashboards.

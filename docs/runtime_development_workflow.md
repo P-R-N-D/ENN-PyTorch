@@ -12,6 +12,7 @@ the stable `enn_torch` namespace.
 finite KVBatch pass source
   -> BudgetedBatcher
   -> RuntimeRetryRunner
+  -> optional fixed-capacity pressure assessment
   -> ConservativeRuntimeGovernor
   -> ConservativeRuntimeOrchestrator
   -> RuntimePassSummary
@@ -71,6 +72,45 @@ for record in session.run_passes(pass_sources):
     print(record.pass_index, record.pass_summary)
 ```
 
+## Optional pressure-aware composition
+
+The governor pressure guard becomes operational in orchestration only when the
+caller supplies a fixed `ResourceCapacity`:
+
+```python
+from enn_torch_dev.runtime import ResourceCapacity
+
+governor = ConservativeRuntimeGovernor(
+    BatchBudget(max_items=8),
+    policy=GovernorPolicy(
+        grow_after_successes=3,
+        max_pressure_ratio_for_growth=0.8,
+    ),
+)
+
+orchestrator = ConservativeRuntimeOrchestrator(
+    runtime_step,
+    governor,
+    retry_policy=RetryPolicy(max_retry_depth=3, min_items=1, split_factor=2),
+    resource_capacity=ResourceCapacity(
+        cpu_total_bytes=host_physical_bytes,
+        cpu_limit_bytes=cgroup_limit_bytes,
+        cuda_total_bytes=cuda_total_bytes,
+        cuda_device_index=cuda_device_index,
+    ),
+)
+```
+
+The orchestrator includes resource samples from every raw runtime attempt, not
+only the final yielded retry results. The supplied capacity remains fixed for the
+orchestrator instance. Callers that need refreshed capacity must construct or
+replace the orchestrator explicitly; this workflow does not poll capacity between
+passes.
+
+If no capacity is supplied, the orchestrator passes no pressure summary and the
+existing governor contract applies. Pressure may suppress success-driven growth
+when the opt-in guard is enabled, but it does not directly shrink a budget.
+
 ## Factory composition
 
 Use a `RuntimePassSourceFactory` when each pass needs a newly constructed
@@ -118,6 +158,8 @@ The conservative governor then:
 - shrinks configured budget fields after a yielded or retry-recovered OOM;
 - keeps the current budget after non-OOM faults;
 - grows configured fields only after the configured clean-success threshold;
+- optionally suppresses success growth when an explicit pressure summary is
+  missing or reaches the configured growth limit;
 - applies configured minimum and maximum bounds.
 
 The next pass uses the governor's current budget.
@@ -153,7 +195,8 @@ It does not provide:
 - automatic source replay or source caching;
 - distributed execution or aggregation;
 - AutoGovernor or learned tuning;
-- ResourceMonitor feedback-loop tuning;
+- automatic `ResourceMonitor` creation or capacity refresh;
+- pressure-triggered budget shrink or field-specific tuning;
 - stable `enn_torch` API exposure.
 
 Use small synthetic inputs for baseline validation. Do not use this workflow as an
