@@ -1,0 +1,697 @@
+diff --git a/docs/CHANGE_CHECKLIST.md b/docs/CHANGE_CHECKLIST.md
+index 53147af..e32400b 100644
+--- a/docs/CHANGE_CHECKLIST.md
++++ b/docs/CHANGE_CHECKLIST.md
+@@ -16,7 +16,7 @@ Do not defer required documentation updates to a follow-up task. Do not edit unr
+ | data schema and manifest | `enn_torch_dev/data/schema.py`, `manifest.py`, `batch.py`, `staging.py`, `readers.py` | `enn_torch_dev/debug/data -q` | `docs/CURRENT_STATE.md`, `docs/TESTING.md`, `docs/RUNTIME_SAFETY.md` | Breaking staged data compatibility, identity tensor semantics, schema validation changes |
+ | executor graph/node/tile/stream/state | `enn_torch_dev/executor/**` | `enn_torch_dev/debug/executor -q` | `docs/CURRENT_STATE.md`, `docs/TESTING.md`, executor docs if behavior changes | Execution ordering, state routing, public exports, tile/stream terminology |
+ | runtime step, retry, orchestration, session, source factory, and fault classification | `enn_torch_dev/runtime/step.py`, `retry.py`, `orchestration.py`, `session.py`, `source_factory.py`, `faults.py`, loader/runtime integration | `enn_torch_dev/debug/runtime/test_runtime_integration.py -q`; `enn_torch_dev/debug/runtime -q` | `docs/CURRENT_STATE.md`, `docs/TESTING.md`, `docs/RUNTIME_SAFETY.md`, relevant `docs/dev_*.md` | Incorrect success/fault reporting, retry loops, orchestration materialization scope, session over-consumption, factory over-invocation, source caching, exception suppression, recovered-OOM signaling, row-order changes, unverified failure modes, optimizer/loss behavior changes, cross-layer contract drift |
+-| resource monitoring, capacity/pressure assessment, cost/batching, runtime governor, orchestration, pass summaries, pass history, sessions, and source factories | `enn_torch_dev/runtime/cost.py`, `footprint.py`, `resources.py`, `pressure.py`, `batching.py`, `governor.py`, `orchestration.py`, `summary.py`, `history.py`, `session.py`, `source_factory.py` | `enn_torch_dev/debug/runtime/test_runtime_pressure.py -q`; `enn_torch_dev/debug/runtime/test_runtime_integration.py -q`; `enn_torch_dev/debug/runtime -q` | `docs/CURRENT_STATE.md`, `docs/TESTING.md`, `docs/RUNTIME_SAFETY.md`, relevant `docs/dev_*.md` | CPU/CUDA assumptions, cgroup v1/v2 path parsing, hierarchy-effective cgroup limit discovery, physical-vs-effective CPU capacity, capacity lookup fallback, device mismatch, unknown-vs-zero pressure semantics, unclamped ratios, memory accounting semantics, oversized batch behavior, budget shrink/grow bounds, accidental execution/retry coupling, unbounded pass materialization, summary/history retaining `StepResult.store` or `loss` references, unbounded history retention, retention-bound regression, unbounded session execution, session retaining previous pass results, factory returning cached or non-finite sources, unexpected persistent logging, stable namespace leakage, identity/order regression across split and retry paths |
++| resource monitoring, capacity/pressure assessment, cost/batching, runtime governor, orchestration, pass summaries, pass history, sessions, and source factories | `enn_torch_dev/runtime/cost.py`, `footprint.py`, `resources.py`, `pressure.py`, `batching.py`, `governor.py`, `orchestration.py`, `summary.py`, `history.py`, `session.py`, `source_factory.py` | `enn_torch_dev/debug/runtime/test_runtime_pressure.py -q`; `enn_torch_dev/debug/runtime/test_runtime_integration.py -q`; `enn_torch_dev/debug/runtime -q` | `docs/CURRENT_STATE.md`, `docs/TESTING.md`, `docs/RUNTIME_SAFETY.md`, relevant `docs/dev_*.md` | CPU/CUDA assumptions, cgroup v1/v2 path parsing, hierarchy-effective cgroup limit discovery, physical-vs-effective CPU capacity, capacity lookup fallback, device mismatch, unknown-vs-zero pressure semantics, unclamped ratios, pressure-threshold validation, missing-summary growth suppression, OOM priority over pressure, memory accounting semantics, oversized batch behavior, budget shrink/grow bounds, accidental execution/retry coupling, unbounded pass materialization, summary/history retaining `StepResult.store` or `loss` references, unbounded history retention, retention-bound regression, unbounded session execution, session retaining previous pass results, factory returning cached or non-finite sources, unexpected persistent logging, stable namespace leakage, identity/order regression across split and retry paths |
+ | dependency and optional extras | `pyproject.toml`, `requirements.txt`, `requirements-dev.txt` | Targeted import/test for affected dependency; report missing optional packages | `docs/CONTEXT.md`, `docs/TESTING.md`, `docs/RUNTIME_SAFETY.md` | Unrequested dependency changes, optional backend availability, platform markers |
+ | test layout and commands | `enn_torch_dev/debug/**`, pytest paths | New or moved tests themselves | `docs/TESTING.md`, `docs/CONTEXT.md` | Documenting non-existent commands, hiding skipped dependency or CUDA coverage |
+ | runtime safety and artifacts | Runtime IO/export/checkpoint code, staging writers, loaders, notebooks | Targeted tests using temp directories | `docs/RUNTIME_SAFETY.md`, `docs/CONTEXT.md` | Data loss, committed artifacts, secret leakage, long-running validation |
+diff --git a/docs/CURRENT_STATE.md b/docs/CURRENT_STATE.md
+index 36fc1e5..9de251e 100644
+--- a/docs/CURRENT_STATE.md
++++ b/docs/CURRENT_STATE.md
+@@ -19,7 +19,7 @@ Status categories:
+ | `enn_torch_dev/data` | ACTIVE DEVELOPMENT | Development namespace for `DataSchema`, `FieldSpec`, `KeyMapping`, `KVBatch`, `BatchCost`, manifests, TensorDict staging/reading, and SPDL tensor adapter boundaries. |
+ | `enn_torch_dev/executor` | ACTIVE DEVELOPMENT | Development namespace for `KVStore`, node/subgraph/graph execution, plans, runners, model specs, graph/model/branch builders, tile, stream, global-local, and state routing. |
+ | `enn_torch_dev/nn` | ACTIVE DEVELOPMENT | Development namespace for blocks, attention, fusion, layers, recurrent components, and related types. |
+-| `enn_torch_dev/runtime` | ACTIVE DEVELOPMENT | Development namespace for loaders, runtime steps, fault/status records, model/resource cost probes, model/optimizer footprint, resource monitoring, resource capacity and pressure assessment, budgeted batching, OOM-class runtime retry, conservative StepResult-observing budget governance, finite pass-level runtime orchestration, runtime pass summary inspection, in-memory runtime pass history inspection, bounded lazy multi-pass runtime sessions, fresh per-pass source factories, and end-to-end integration coverage for retry, budget transitions, history retention, identity order, and API boundaries. |
++| `enn_torch_dev/runtime` | ACTIVE DEVELOPMENT | Development namespace for loaders, runtime steps, fault/status records, model/resource cost probes, model/optimizer footprint, resource monitoring, resource capacity and pressure assessment, budgeted batching, OOM-class runtime retry, conservative StepResult-observing budget governance with an opt-in pressure guard for success growth, finite pass-level runtime orchestration, runtime pass summary inspection, in-memory runtime pass history inspection, bounded lazy multi-pass runtime sessions, fresh per-pass source factories, and end-to-end integration coverage for retry, budget transitions, history retention, identity order, and API boundaries. |
+ | `enn_torch_dev/debug` | CURRENT | Pytest debug suite for development data, executor, nn, and runtime areas. Do not add agent instruction Markdown files here. |
+ | Existing `docs/dev_*.md` | HISTORICAL | Implementation-slice design records for `enn_torch_dev`. Their `Next Step`, `Follow-up`, and `Out of Scope` sections are not current task instructions or confirmed roadmap items. |
+ | Runtime development workflow | CURRENT | `docs/runtime_development_workflow.md` documents the supported bounded single-node composition and its safety boundaries. |
+diff --git a/docs/RUNTIME_SAFETY.md b/docs/RUNTIME_SAFETY.md
+index 4081a40..b4e021e 100644
+--- a/docs/RUNTIME_SAFETY.md
++++ b/docs/RUNTIME_SAFETY.md
+@@ -32,7 +32,7 @@ Use this document before running code that can allocate accelerator memory, writ
+ - Treat missing capacity or observation values as unknown, not zero utilization.
+ - Normalize CPU RSS against the smallest known physical or hierarchy-effective cgroup capacity; do not assume host physical memory or a leaf cgroup file is the process limit in containers.
+ - Do not clamp pressure ratios to `1.0`; ratios above one must remain visible for diagnosis.
+-- Do not feed pressure summaries into governor decisions without a separately reviewed opt-in policy.
++- Feed pressure summaries into governor decisions only through the explicit opt-in growth guard; missing or high pressure may suppress growth but must not directly shrink a budget.
+ - Do not add persistent logs, checkpoints, exports, source replay, distributed workers, or automatic tuning to the bounded development workflow without a separately reviewed safety contract.
+ - Confirm the stable `enn_torch` namespace is unchanged when adding development runtime helpers.
+ 
+diff --git a/docs/dev_runtime_governor.md b/docs/dev_runtime_governor.md
+index 8140966..a613d3d 100644
+--- a/docs/dev_runtime_governor.md
++++ b/docs/dev_runtime_governor.md
+@@ -55,6 +55,7 @@ or a success grow from decreasing one through clamping.
+   `min_device_bytes`, and `max_device_bytes` must be `None` or positive
+   integers.
+ - For each field family, `min_*` must not exceed `max_*`.
++- `max_pressure_ratio_for_growth` is optional; when configured it must be finite and satisfy `0 < value <= 1`.
+ 
+ ## Adjustment Rules
+ 
+@@ -68,7 +69,7 @@ field. The governor does not choose host or device bytes based on resource peaks
+ 
+ ## Decision Rules
+ 
+-`observe_results(results, *, recovered_oom=False)` consumes an iterable of
++`observe_results(results, *, recovered_oom=False, pressure_summary=None)` consumes an iterable of
+ `StepResult` objects and returns a `GovernorDecision`. The method streams the
+ iterable once and accumulates only statuses, resource peaks, and small decision
+ flags. It does not keep a list or tuple of `StepResult` objects, so `store` and
+@@ -87,13 +88,21 @@ Decision priority is deliberately small and predictable:
+    observed statuses are `SUCCESS` or the observed stream is empty.
+ 4. Mixed streams containing OOM and success or non-OOM faults still shrink.
+ 5. If every observed result is `StepStatus.SUCCESS` and `recovered_oom=False`,
+-   the success streak increases by one for the observe call.
+-6. Retry-recovered OOM is not success evidence and does not increase the success
++   an optional pressure growth guard is evaluated before success evidence is
++   accumulated.
++6. With `max_pressure_ratio_for_growth=None`, pressure does not change the existing
++   success-growth behavior.
++7. With the guard enabled, a missing pressure summary, an all-unknown summary, or
++   `pressure_summary.max_observed_ratio >= max_pressure_ratio_for_growth` keeps the
++   budget and resets the success streak to zero.
++8. A known maximum pressure ratio below the configured limit allows the success
++   streak to increase by one for the observe call.
++9. Retry-recovered OOM is not success evidence and does not increase the success
+    streak.
+-7. The success streak does not increase per successful `StepResult`.
+-8. When `grow_after_successes` is reached, all configured budget fields grow and
+-   the success streak resets to zero.
+-9. Non-OOM faults keep the current budget and reset success/OOM streaks.
++10. The success streak does not increase per successful `StepResult`.
++11. When `grow_after_successes` is reached, all configured budget fields grow and
++    the success streak resets to zero.
++12. Non-OOM faults keep the current budget and reset success/OOM streaks.
+ 
+ ## State and Decision Records
+ 
+@@ -109,8 +118,8 @@ Decision priority is deliberately small and predictable:
+ that was passed in from outside.
+ 
+ `GovernorDecision` records the previous and next budget, reason text, observed
+-statuses, updated streak counters, and resource peaks observed in the result
+-stream.
++statuses, updated streak counters, resource peaks, the supplied pressure summary,
++and whether pressure suppressed success growth.
+ 
+ ## Resource Samples
+ 
+@@ -123,22 +132,27 @@ record and reason text:
+ - `peak_cuda_max_allocated_bytes`
+ - `peak_cuda_max_reserved_bytes`
+ 
+-These peaks are observational only in this slice. They do not drive field
+-selection, learned tuning, or feedback-loop policy changes.
++Raw byte peaks remain observational. A separately supplied
++`ResourcePressureSummary` may only suppress success-driven growth when the opt-in
++policy limit is configured. Pressure never causes an automatic shrink in this
++slice.
+ 
+ ## Relationship to Orchestration
+ 
+ A finite pass-level orchestration helper can feed `GovernorDecision.next_budget`
+ back into `BudgetedBatcher` on a later pass. That orchestration boundary is
+ described in `docs/dev_runtime_orchestration.md`. The governor itself remains an
+-observation/decision object and does not run batches, retry, or execute models.
++observation/decision object and does not run batches, retry, execute models, or
++construct a pressure summary. Automatic orchestration of capacity sampling and
++pressure assessment remains a separate integration step.
+ 
+ ## Out of Scope
+ 
+ - Full AutoGovernor behavior.
+ - Learned or model-specific tuning.
+ - Persistent calibration caches or history databases.
+-- `ResourceMonitor` feedback-loop tuning.
++- Pressure-triggered budget shrink or field-specific tuning.
++- Automatic pressure-summary construction inside the governor or orchestrator.
+ - `ModelCostProbe`-driven policy changes.
+ - SPDL queue-depth tuning.
+ - Device transfer.
+diff --git a/docs/dev_runtime_pressure.md b/docs/dev_runtime_pressure.md
+index ea19b60..43f0b37 100644
+--- a/docs/dev_runtime_pressure.md
++++ b/docs/dev_runtime_pressure.md
+@@ -18,8 +18,9 @@ Iterable[ResourceSample] + ResourceCapacity
+   -> ResourcePressureSummary
+ ```
+ 
+-The pressure layer observes and summarizes. It does not modify
+-`GovernorPolicy`, choose a `BatchBudget`, retry work, or execute a model.
++The assessment layer observes and summarizes. It does not choose a `BatchBudget`,
++retry work, or execute a model. A separate opt-in governor policy may consume the
++summary only to suppress success-driven budget growth.
+ 
+ ## Public Objects
+ 
+@@ -96,7 +97,25 @@ capacity device indices must match. Device-mismatched samples are rejected
+ instead of being silently combined.
+ 
+ The function returns only scalar ratios and does not retain the input sample
+-objects.
++objects. `ResourcePressureSummary.max_observed_ratio` returns the highest known
++ratio, or `None` when every ratio is unknown.
++
++## Optional Governor Growth Guard
++
++`GovernorPolicy.max_pressure_ratio_for_growth` is `None` by default, preserving
++the existing governor behavior. When configured, callers may pass a
++`ResourcePressureSummary` to `ConservativeRuntimeGovernor.observe_results(...)`.
++
++- A known maximum ratio below the configured limit allows normal success-streak
++  accumulation and growth.
++- A ratio equal to or above the limit suppresses growth and resets the success
++  streak.
++- A missing summary or an all-unknown summary also suppresses growth.
++- OOM and retry-recovered OOM retain priority and continue to shrink the budget.
++- Pressure never directly shrinks a budget in this slice.
++
++The governor does not build the summary itself. Automatic collection and
++orchestrator wiring remain separate work.
+ 
+ ## Example
+ 
+@@ -115,24 +134,25 @@ print(pressure.peak_cuda_reserved_ratio)
+ 
+ ## Safety Boundary
+ 
+-Pressure summaries are observational. A high ratio does not automatically:
++Pressure summaries are observational unless an explicit governor growth guard is
++configured. Even with that guard, a high or unavailable ratio does not:
+ 
+ - shrink a runtime budget;
+-- suppress growth;
+ - trigger retry;
+ - reserve memory;
+ - move tensors;
+ - change precision;
+ - stop a session.
+ 
+-Any governor feedback based on pressure requires a separate opt-in policy and
+-reviewed integration.
++The only supported feedback in this slice is opt-in suppression of
++success-driven growth. Automatic pressure production and orchestration remain
++separate reviewed integration work.
+ 
+ ## Out of Scope
+ 
+-- Governor decision changes.
+-- Pressure thresholds.
+-- Automatic budget shrink or growth suppression.
++- Pressure-triggered budget shrink.
++- Automatic capacity sampling or pressure-summary construction in the governor.
++- Automatic orchestrator-to-governor pressure wiring.
+ - Real-time free-memory reservation.
+ - Memory admission control.
+ - Persistent telemetry or dashboards.
+diff --git a/enn_torch_dev/debug/runtime/test_runtime_governor.py b/enn_torch_dev/debug/runtime/test_runtime_governor.py
+index 536ffb8..eef9b8d 100644
+--- a/enn_torch_dev/debug/runtime/test_runtime_governor.py
++++ b/enn_torch_dev/debug/runtime/test_runtime_governor.py
+@@ -8,7 +8,9 @@ import torch
+ from enn_torch_dev.runtime import (
+     BatchBudget,
+     ConservativeRuntimeGovernor,
++    GovernorDecision,
+     GovernorPolicy,
++    ResourcePressureSummary,
+     ResourceSample,
+     RuntimeGovernorState,
+     StepResult,
+@@ -76,6 +78,30 @@ def test_success_streak_counts_observe_calls_not_result_count() -> None:
+     assert decision.consecutive_successes == 1
+ 
+ 
++def test_governor_policy_preserves_existing_positional_field_order() -> None:
++    policy = GovernorPolicy(0.5, 2.0, 3, 1, 8, 10, 100, 20, 200)
++
++    assert policy.max_device_bytes == 200
++    assert policy.max_pressure_ratio_for_growth is None
++
++
++def test_pressure_guard_is_opt_in_and_default_growth_is_unchanged() -> None:
++    pressure = ResourcePressureSummary(peak_cpu_rss_ratio=1.0)
++    governor = ConservativeRuntimeGovernor(
++        BatchBudget(max_items=8),
++        policy=GovernorPolicy(grow_after_successes=1),
++    )
++
++    decision = governor.observe_results(
++        [_result()],
++        pressure_summary=pressure,
++    )
++
++    assert decision.next_budget == BatchBudget(max_items=16)
++    assert decision.pressure_summary == pressure
++    assert decision.growth_suppressed_by_pressure is False
++
++
+ def test_consecutive_successes_grow_budget_and_reset_streak() -> None:
+     governor = ConservativeRuntimeGovernor(
+         BatchBudget(max_items=8, max_host_bytes=100),
+@@ -90,6 +116,120 @@ def test_consecutive_successes_grow_budget_and_reset_streak() -> None:
+     assert governor.current_budget == decision.next_budget
+ 
+ 
++def test_pressure_below_limit_allows_success_growth() -> None:
++    governor = ConservativeRuntimeGovernor(
++        BatchBudget(max_items=8),
++        policy=GovernorPolicy(
++            grow_after_successes=1,
++            max_pressure_ratio_for_growth=0.8,
++        ),
++    )
++    pressure = ResourcePressureSummary(peak_cpu_rss_ratio=0.79)
++
++    decision = governor.observe_results(
++        [_result()],
++        pressure_summary=pressure,
++    )
++
++    assert decision.next_budget == BatchBudget(max_items=16)
++    assert decision.consecutive_successes == 0
++    assert decision.pressure_summary == pressure
++    assert decision.growth_suppressed_by_pressure is False
++
++
++@pytest.mark.parametrize("ratio", [0.8, 0.9, 1.2])
++def test_pressure_at_or_above_limit_suppresses_growth(ratio: float) -> None:
++    governor = ConservativeRuntimeGovernor(
++        BatchBudget(max_items=8),
++        policy=GovernorPolicy(
++            grow_after_successes=1,
++            max_pressure_ratio_for_growth=0.8,
++        ),
++    )
++    pressure = ResourcePressureSummary(peak_cuda_reserved_ratio=ratio)
++
++    decision = governor.observe_results(
++        [_result()],
++        pressure_summary=pressure,
++    )
++
++    assert decision.next_budget == BatchBudget(max_items=8)
++    assert decision.consecutive_successes == 0
++    assert decision.pressure_summary == pressure
++    assert decision.growth_suppressed_by_pressure is True
++    assert "reached growth limit" in decision.reason
++
++
++@pytest.mark.parametrize(
++    "pressure",
++    [None, ResourcePressureSummary()],
++)
++def test_missing_pressure_suppresses_growth_when_guard_is_enabled(
++    pressure: ResourcePressureSummary | None,
++) -> None:
++    governor = ConservativeRuntimeGovernor(
++        BatchBudget(max_items=8),
++        policy=GovernorPolicy(
++            grow_after_successes=1,
++            max_pressure_ratio_for_growth=0.8,
++        ),
++    )
++
++    decision = governor.observe_results(
++        [_result()],
++        pressure_summary=pressure,
++    )
++
++    assert decision.next_budget == BatchBudget(max_items=8)
++    assert decision.consecutive_successes == 0
++    assert decision.growth_suppressed_by_pressure is True
++    assert "pressure is unavailable" in decision.reason
++
++
++def test_pressure_guard_uses_highest_known_ratio() -> None:
++    governor = ConservativeRuntimeGovernor(
++        BatchBudget(max_items=8),
++        policy=GovernorPolicy(
++            grow_after_successes=1,
++            max_pressure_ratio_for_growth=0.8,
++        ),
++    )
++    pressure = ResourcePressureSummary(
++        peak_cpu_rss_ratio=0.2,
++        peak_cuda_allocated_ratio=0.81,
++    )
++
++    decision = governor.observe_results(
++        [_result()],
++        pressure_summary=pressure,
++    )
++
++    assert decision.next_budget == BatchBudget(max_items=8)
++    assert decision.growth_suppressed_by_pressure is True
++
++
++def test_pressure_suppression_resets_existing_success_streak() -> None:
++    governor = ConservativeRuntimeGovernor(
++        state=RuntimeGovernorState(
++            current_budget=BatchBudget(max_items=8),
++            consecutive_successes=2,
++        ),
++        policy=GovernorPolicy(
++            grow_after_successes=3,
++            max_pressure_ratio_for_growth=0.8,
++        ),
++    )
++
++    decision = governor.observe_results(
++        [_result()],
++        pressure_summary=ResourcePressureSummary(peak_cpu_rss_ratio=0.8),
++    )
++
++    assert decision.next_budget == BatchBudget(max_items=8)
++    assert decision.consecutive_successes == 0
++    assert decision.growth_suppressed_by_pressure is True
++
++
+ def test_oom_shrinks_all_configured_fields() -> None:
+     governor = ConservativeRuntimeGovernor(
+         BatchBudget(max_items=9, max_host_bytes=101, max_device_bytes=201),
+@@ -171,6 +311,26 @@ def test_mixed_results_prioritize_oom_shrink() -> None:
+     assert decision.consecutive_ooms == 1
+ 
+ 
++def test_oom_has_priority_over_pressure_guard() -> None:
++    governor = ConservativeRuntimeGovernor(
++        BatchBudget(max_items=8),
++        policy=GovernorPolicy(
++            shrink_factor=0.5,
++            max_pressure_ratio_for_growth=0.8,
++        ),
++    )
++    pressure = ResourcePressureSummary(peak_cpu_rss_ratio=1.0)
++
++    decision = governor.observe_results(
++        [_result(StepStatus.OOM_FAULT)],
++        pressure_summary=pressure,
++    )
++
++    assert decision.next_budget == BatchBudget(max_items=4)
++    assert decision.pressure_summary == pressure
++    assert decision.growth_suppressed_by_pressure is False
++
++
+ def test_non_oom_fault_keeps_budget_and_resets_streaks() -> None:
+     governor = ConservativeRuntimeGovernor(
+         BatchBudget(max_items=10),
+@@ -178,11 +338,15 @@ def test_non_oom_fault_keeps_budget_and_resets_streaks() -> None:
+     )
+     governor.observe_results([_result()])
+ 
+-    decision = governor.observe_results([_result(StepStatus.RUNTIME_FAULT)])
++    decision = governor.observe_results(
++        [_result(StepStatus.RUNTIME_FAULT)],
++        pressure_summary=ResourcePressureSummary(peak_cpu_rss_ratio=1.0),
++    )
+ 
+     assert decision.next_budget == BatchBudget(max_items=10)
+     assert decision.consecutive_successes == 0
+     assert decision.consecutive_ooms == 0
++    assert decision.growth_suppressed_by_pressure is False
+ 
+ 
+ def test_resource_sample_peaks_are_recorded_in_decision_and_reason() -> None:
+@@ -301,12 +465,19 @@ def test_recovered_oom_success_results_shrink_without_success_streak() -> None:
+         policy=GovernorPolicy(shrink_factor=0.5, grow_after_successes=1),
+     )
+ 
+-    decision = governor.observe_results([_result()], recovered_oom=True)
++    pressure = ResourcePressureSummary(peak_cpu_rss_ratio=1.0)
++    decision = governor.observe_results(
++        [_result()],
++        recovered_oom=True,
++        pressure_summary=pressure,
++    )
+ 
+     assert decision.next_budget == BatchBudget(max_items=4)
+     assert decision.statuses == (StepStatus.SUCCESS,)
+     assert decision.consecutive_successes == 0
+     assert decision.consecutive_ooms == 1
++    assert decision.pressure_summary == pressure
++    assert decision.growth_suppressed_by_pressure is False
+     assert "retry-recovered OOM observed" in decision.reason
+ 
+ 
+@@ -371,6 +542,15 @@ def test_invalid_policy_grow_after_successes_is_rejected(
+         GovernorPolicy(grow_after_successes=grow_after_successes)  # type: ignore[arg-type]
+ 
+ 
++@pytest.mark.parametrize(
++    "ratio",
++    [0, -0.1, 1.1, float("inf"), float("nan"), True, "0.8"],
++)
++def test_invalid_growth_pressure_ratio_is_rejected(ratio: object) -> None:
++    with pytest.raises((TypeError, ValueError)):
++        GovernorPolicy(max_pressure_ratio_for_growth=ratio)  # type: ignore[arg-type]
++
++
+ @pytest.mark.parametrize("bound", [0, -1, 1.5, True])
+ def test_invalid_policy_bounds_are_rejected(bound: object) -> None:
+     with pytest.raises((TypeError, ValueError)):
+@@ -390,6 +570,33 @@ def test_invalid_policy_bound_order_is_rejected(kwargs: dict[str, int]) -> None:
+         GovernorPolicy(**kwargs)
+ 
+ 
++def test_governor_decision_pressure_fields_default_for_existing_construction() -> None:
++    budget = BatchBudget(max_items=8)
++    decision = GovernorDecision(
++        previous_budget=budget,
++        next_budget=budget,
++        reason="test",
++        statuses=(),
++        consecutive_successes=0,
++        consecutive_ooms=0,
++    )
++    state = RuntimeGovernorState(current_budget=budget, last_decision=decision)
++
++    assert decision.pressure_summary is None
++    assert decision.growth_suppressed_by_pressure is False
++    assert state.last_decision == decision
++
++
++def test_invalid_pressure_summary_is_rejected() -> None:
++    governor = ConservativeRuntimeGovernor(BatchBudget(max_items=8))
++
++    with pytest.raises(TypeError, match="pressure_summary"):
++        governor.observe_results(
++            [_result()],
++            pressure_summary=object(),  # type: ignore[arg-type]
++        )
++
++
+ def test_invalid_governor_arguments_are_rejected() -> None:
+     budget = BatchBudget(max_items=1)
+     state = RuntimeGovernorState(budget)
+diff --git a/enn_torch_dev/debug/runtime/test_runtime_pressure.py b/enn_torch_dev/debug/runtime/test_runtime_pressure.py
+index a3a712d..e95d400 100644
+--- a/enn_torch_dev/debug/runtime/test_runtime_pressure.py
++++ b/enn_torch_dev/debug/runtime/test_runtime_pressure.py
+@@ -245,6 +245,17 @@ def test_resource_pressure_summary_rejects_invalid_ratios(value: object) -> None
+         ResourcePressureSummary(peak_cpu_rss_ratio=value)  # type: ignore[arg-type]
+ 
+ 
++def test_resource_pressure_summary_reports_max_observed_ratio() -> None:
++    summary = ResourcePressureSummary(
++        peak_cpu_rss_ratio=0.25,
++        peak_cuda_allocated_ratio=0.75,
++        peak_cuda_reserved_ratio=0.5,
++    )
++
++    assert summary.max_observed_ratio == pytest.approx(0.75)
++    assert ResourcePressureSummary().max_observed_ratio is None
++
++
+ def test_assess_resource_pressure_rejects_invalid_inputs() -> None:
+     sample = _sample(cpu_rss_bytes=1)
+ 
+diff --git a/enn_torch_dev/runtime/governor.py b/enn_torch_dev/runtime/governor.py
+index b220d89..60cc5bf 100644
+--- a/enn_torch_dev/runtime/governor.py
++++ b/enn_torch_dev/runtime/governor.py
+@@ -7,6 +7,7 @@ from numbers import Real
+ 
+ from .batching import BatchBudget
+ from .faults import ResourceSample, StepResult, StepStatus
++from .pressure import ResourcePressureSummary
+ 
+ 
+ _BUDGET_FIELDS = ("max_items", "max_host_bytes", "max_device_bytes")
+@@ -44,6 +45,25 @@ def _validate_optional_positive_int(value: object, *, label: str) -> int | None:
+     return _validate_positive_int(value, label=label)
+ 
+ 
++def _validate_optional_growth_pressure_ratio(value: object) -> float | None:
++    if value is None:
++        return None
++    if not isinstance(value, Real) or isinstance(value, bool):
++        raise TypeError(
++            "GovernorPolicy.max_pressure_ratio_for_growth must be a finite number or None."
++        )
++    ratio = float(value)
++    if not math.isfinite(ratio):
++        raise ValueError(
++            "GovernorPolicy.max_pressure_ratio_for_growth must be finite."
++        )
++    if ratio <= 0.0 or ratio > 1.0:
++        raise ValueError(
++            "GovernorPolicy.max_pressure_ratio_for_growth must satisfy 0 < value <= 1."
++        )
++    return ratio
++
++
+ def _validate_budget(budget: object, *, label: str) -> BatchBudget:
+     if not isinstance(budget, BatchBudget):
+         raise TypeError(f"{label} must be a BatchBudget.")
+@@ -89,6 +109,7 @@ class GovernorPolicy:
+     max_host_bytes: int | None = None
+     min_device_bytes: int | None = None
+     max_device_bytes: int | None = None
++    max_pressure_ratio_for_growth: float | None = None
+ 
+     def __post_init__(self) -> None:
+         object.__setattr__(
+@@ -130,6 +151,13 @@ class GovernorPolicy:
+                     label=f"GovernorPolicy.{field_name}",
+                 ),
+             )
++        object.__setattr__(
++            self,
++            "max_pressure_ratio_for_growth",
++            _validate_optional_growth_pressure_ratio(
++                self.max_pressure_ratio_for_growth
++            ),
++        )
+         self._validate_bounds("items", self.min_items, self.max_items)
+         self._validate_bounds("host_bytes", self.min_host_bytes, self.max_host_bytes)
+         self._validate_bounds("device_bytes", self.min_device_bytes, self.max_device_bytes)
+@@ -155,6 +183,8 @@ class GovernorDecision:
+     peak_cuda_reserved_bytes: int | None = None
+     peak_cuda_max_allocated_bytes: int | None = None
+     peak_cuda_max_reserved_bytes: int | None = None
++    pressure_summary: ResourcePressureSummary | None = None
++    growth_suppressed_by_pressure: bool = False
+ 
+ 
+ @dataclass(frozen=True, slots=True)
+@@ -247,11 +277,19 @@ class ConservativeRuntimeGovernor:
+         results: Iterable[StepResult],
+         *,
+         recovered_oom: bool = False,
++        pressure_summary: ResourcePressureSummary | None = None,
+     ) -> GovernorDecision:
+         if isinstance(results, StepResult):
+             raise TypeError("ConservativeRuntimeGovernor.observe_results expects an iterable of StepResult objects.")
+         if not isinstance(recovered_oom, bool):
+             raise TypeError("ConservativeRuntimeGovernor.recovered_oom must be a bool.")
++        if pressure_summary is not None and not isinstance(
++            pressure_summary, ResourcePressureSummary
++        ):
++            raise TypeError(
++                "ConservativeRuntimeGovernor.pressure_summary must be a "
++                "ResourcePressureSummary or None."
++            )
+ 
+         statuses: list[StepStatus] = []
+         peaks = self._empty_resource_peaks()
+@@ -277,6 +315,7 @@ class ConservativeRuntimeGovernor:
+         next_budget = previous_budget
+         consecutive_successes = self.state.consecutive_successes
+         consecutive_ooms = self.state.consecutive_ooms
++        growth_suppressed_by_pressure = False
+ 
+         if saw_oom or recovered_oom:
+             next_budget = self._adjust_budget(previous_budget, mode="shrink")
+@@ -292,13 +331,19 @@ class ConservativeRuntimeGovernor:
+             reason = "no results observed; keeping current budget"
+         elif all_success:
+             consecutive_ooms = 0
+-            consecutive_successes += 1
+-            if consecutive_successes >= self.policy.grow_after_successes:
+-                next_budget = self._adjust_budget(previous_budget, mode="grow")
++            pressure_reason = self._growth_pressure_guard_reason(pressure_summary)
++            if pressure_reason is not None:
+                 consecutive_successes = 0
+-                reason = "success threshold reached; growing configured budget fields"
++                growth_suppressed_by_pressure = True
++                reason = pressure_reason
+             else:
+-                reason = "success observed below growth threshold; keeping current budget"
++                consecutive_successes += 1
++                if consecutive_successes >= self.policy.grow_after_successes:
++                    next_budget = self._adjust_budget(previous_budget, mode="grow")
++                    consecutive_successes = 0
++                    reason = "success threshold reached; growing configured budget fields"
++                else:
++                    reason = "success observed below growth threshold; keeping current budget"
+         else:
+             consecutive_successes = 0
+             consecutive_ooms = 0
+@@ -317,6 +362,8 @@ class ConservativeRuntimeGovernor:
+             peak_cuda_reserved_bytes=peaks["peak_cuda_reserved_bytes"],
+             peak_cuda_max_allocated_bytes=peaks["peak_cuda_max_allocated_bytes"],
+             peak_cuda_max_reserved_bytes=peaks["peak_cuda_max_reserved_bytes"],
++            pressure_summary=pressure_summary,
++            growth_suppressed_by_pressure=growth_suppressed_by_pressure,
+         )
+         self.state = RuntimeGovernorState(
+             current_budget=next_budget,
+@@ -326,6 +373,27 @@ class ConservativeRuntimeGovernor:
+         )
+         return decision
+ 
++    def _growth_pressure_guard_reason(
++        self,
++        pressure_summary: ResourcePressureSummary | None,
++    ) -> str | None:
++        threshold = self.policy.max_pressure_ratio_for_growth
++        if threshold is None:
++            return None
++        if pressure_summary is None or pressure_summary.max_observed_ratio is None:
++            return (
++                "success observed but resource pressure is unavailable; "
++                "suppressing budget growth"
++            )
++        max_ratio = pressure_summary.max_observed_ratio
++        assert max_ratio is not None
++        if max_ratio >= threshold:
++            return (
++                f"resource pressure {max_ratio:.6g} reached growth limit "
++                f"{threshold:.6g}; suppressing budget growth"
++            )
++        return None
++
+     def _adjust_budget(self, budget: BatchBudget, *, mode: str) -> BatchBudget:
+         values: dict[str, int | None] = {}
+         for field_name in _BUDGET_FIELDS:
+diff --git a/enn_torch_dev/runtime/pressure.py b/enn_torch_dev/runtime/pressure.py
+index d3afa1b..26bc6fc 100644
+--- a/enn_torch_dev/runtime/pressure.py
++++ b/enn_torch_dev/runtime/pressure.py
+@@ -132,6 +132,23 @@ class ResourcePressureSummary:
+                 ),
+             )
+ 
++    @property
++    def max_observed_ratio(self) -> float | None:
++        """Return the highest known pressure ratio, or None if all are unknown."""
++
++        known = tuple(
++            value
++            for value in (
++                self.peak_cpu_rss_ratio,
++                self.peak_cuda_allocated_ratio,
++                self.peak_cuda_reserved_ratio,
++                self.peak_cuda_max_allocated_ratio,
++                self.peak_cuda_max_reserved_ratio,
++            )
++            if value is not None
++        )
++        return max(known) if known else None
++
+ 
+ def _peak_ratio(
+     current: float | None,
