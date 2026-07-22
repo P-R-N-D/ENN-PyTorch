@@ -23,18 +23,25 @@ class RuntimePassResult:
 
 
 class _OomTrackingRuntimeStep:
-    def __init__(self, runtime_step: RuntimeStepProtocol) -> None:
+    def __init__(
+        self,
+        runtime_step: RuntimeStepProtocol,
+        *,
+        collect_resource_samples: bool = False,
+    ) -> None:
         if not isinstance(runtime_step, RuntimeStepProtocol):
             raise TypeError("runtime_step must provide run(KVBatch).")
         self.runtime_step = runtime_step
         self.optimizer = getattr(runtime_step, "optimizer", None)
         self.saw_oom = False
+        self.collect_resource_samples = collect_resource_samples
         self.resource_samples: list[ResourceSample] = []
 
     def run(self, batch: KVBatch) -> StepResult:
         result = self.runtime_step.run(batch)
         if isinstance(result, StepResult):
-            self.resource_samples.extend(result.resource_samples)
+            if self.collect_resource_samples:
+                self.resource_samples.extend(result.resource_samples)
             if result.status is StepStatus.OOM_FAULT:
                 self.saw_oom = True
         return result
@@ -110,7 +117,10 @@ class ConservativeRuntimeOrchestrator:
                 "ConservativeRuntimeOrchestrator.run_pass expects an iterable of KVBatch."
             )
 
-        tracking_step = _OomTrackingRuntimeStep(self.runtime_step)
+        tracking_step = _OomTrackingRuntimeStep(
+            self.runtime_step,
+            collect_resource_samples=self.resource_capacity is not None,
+        )
         budgeted = BudgetedBatcher(
             source,
             self.governor.current_budget,

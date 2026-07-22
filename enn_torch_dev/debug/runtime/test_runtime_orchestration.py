@@ -6,6 +6,7 @@ import pytest
 import torch
 from tensordict import TensorDict
 
+import enn_torch_dev.runtime.orchestration as orchestration_module
 from enn_torch_dev.data import KVBatch
 from enn_torch_dev.runtime import (
     BatchBudget,
@@ -116,6 +117,42 @@ def test_orchestrator_runs_budget_retry_and_governor_for_one_pass() -> None:
     assert orchestrator.current_budget == BatchBudget(max_items=4)
     assert orchestrator.last_decision == pass_result.decision
     assert pass_result.decision.pressure_summary is None
+
+
+def test_oom_tracking_step_does_not_collect_samples_when_disabled() -> None:
+    step = FakeRuntimeStep(
+        lambda batch: _result(batch, samples=(_sample(cpu_rss_bytes=50),))
+    )
+    tracker = orchestration_module._OomTrackingRuntimeStep(
+        step,
+        collect_resource_samples=False,
+    )
+
+    result = tracker.run(_batch(1))
+
+    assert isinstance(result, StepResult)
+    assert tracker.resource_samples == []
+    assert tracker.saw_oom is False
+
+
+def test_oom_tracking_step_tracks_oom_when_sample_collection_is_disabled() -> None:
+    step = FakeRuntimeStep(
+        lambda batch: _result(
+            batch,
+            StepStatus.OOM_FAULT,
+            phase=RuntimePhase.FORWARD,
+            samples=(_sample(cpu_rss_bytes=90),),
+        )
+    )
+    tracker = orchestration_module._OomTrackingRuntimeStep(
+        step,
+        collect_resource_samples=False,
+    )
+
+    tracker.run(_batch(1))
+
+    assert tracker.resource_samples == []
+    assert tracker.saw_oom is True
 
 
 def test_orchestrator_uses_fixed_capacity_to_allow_low_pressure_growth() -> None:
