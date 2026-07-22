@@ -7,8 +7,9 @@ from enn_torch_dev.data import KVBatch
 
 from .batching import BatchBudget, BudgetedBatcher
 from .cost import DataCostProbe
-from .faults import StepResult, StepStatus
+from .faults import ResourceSample, StepResult, StepStatus
 from .governor import ConservativeRuntimeGovernor, GovernorDecision
+from .pressure import ResourceCapacity, assess_resource_pressure
 from .retry import RetryPolicy, RuntimeRetryRunner, RuntimeStepProtocol
 
 
@@ -22,17 +23,27 @@ class RuntimePassResult:
 
 
 class _OomTrackingRuntimeStep:
-    def __init__(self, runtime_step: RuntimeStepProtocol) -> None:
+    def __init__(
+        self,
+        runtime_step: RuntimeStepProtocol,
+        *,
+        collect_resource_samples: bool = False,
+    ) -> None:
         if not isinstance(runtime_step, RuntimeStepProtocol):
             raise TypeError("runtime_step must provide run(KVBatch).")
         self.runtime_step = runtime_step
         self.optimizer = getattr(runtime_step, "optimizer", None)
         self.saw_oom = False
+        self.collect_resource_samples = collect_resource_samples
+        self.resource_samples: list[ResourceSample] = []
 
     def run(self, batch: KVBatch) -> StepResult:
         result = self.runtime_step.run(batch)
-        if isinstance(result, StepResult) and result.status is StepStatus.OOM_FAULT:
-            self.saw_oom = True
+        if isinstance(result, StepResult):
+            if self.collect_resource_samples:
+                self.resource_samples.extend(result.resource_samples)
+            if result.status is StepStatus.OOM_FAULT:
+                self.saw_oom = True
         return result
 
 
@@ -46,6 +57,7 @@ class ConservativeRuntimeOrchestrator:
         *,
         retry_policy: RetryPolicy | None = None,
         cost_probe: DataCostProbe | None = None,
+        resource_capacity: ResourceCapacity | None = None,
         split_oversized: bool = True,
         min_items: int = 1,
     ) -> None:
@@ -65,6 +77,13 @@ class ConservativeRuntimeOrchestrator:
             raise TypeError(
                 "ConservativeRuntimeOrchestrator.cost_probe must be a DataCostProbe or None."
             )
+        if resource_capacity is not None and not isinstance(
+            resource_capacity, ResourceCapacity
+        ):
+            raise TypeError(
+                "ConservativeRuntimeOrchestrator.resource_capacity must be a "
+                "ResourceCapacity or None."
+            )
         if not isinstance(split_oversized, bool):
             raise TypeError("ConservativeRuntimeOrchestrator.split_oversized must be a bool.")
         if not isinstance(min_items, int) or isinstance(min_items, bool):
@@ -76,6 +95,7 @@ class ConservativeRuntimeOrchestrator:
         self.governor = governor
         self.retry_policy = retry_policy
         self.cost_probe = cost_probe
+        self.resource_capacity = resource_capacity
         self.split_oversized = split_oversized
         self.min_items = min_items
 
@@ -97,7 +117,10 @@ class ConservativeRuntimeOrchestrator:
                 "ConservativeRuntimeOrchestrator.run_pass expects an iterable of KVBatch."
             )
 
-        tracking_step = _OomTrackingRuntimeStep(self.runtime_step)
+        tracking_step = _OomTrackingRuntimeStep(
+            self.runtime_step,
+            collect_resource_samples=self.resource_capacity is not None,
+        )
         budgeted = BudgetedBatcher(
             source,
             self.governor.current_budget,
@@ -109,7 +132,19 @@ class ConservativeRuntimeOrchestrator:
         results = tuple(retry_runner.run_stream(budgeted))
         yielded_oom = any(result.status is StepStatus.OOM_FAULT for result in results)
         recovered_oom = tracking_step.saw_oom and not yielded_oom
-        decision = self.governor.observe_results(results, recovered_oom=recovered_oom)
+        pressure_summary = (
+            assess_resource_pressure(
+                tracking_step.resource_samples,
+                self.resource_capacity,
+            )
+            if self.resource_capacity is not None
+            else None
+        )
+        decision = self.governor.observe_results(
+            results,
+            recovered_oom=recovered_oom,
+            pressure_summary=pressure_summary,
+        )
         return RuntimePassResult(
             results=results,
             decision=decision,

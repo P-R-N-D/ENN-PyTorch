@@ -141,10 +141,11 @@ slice.
 
 A finite pass-level orchestration helper can feed `GovernorDecision.next_budget`
 back into `BudgetedBatcher` on a later pass. That orchestration boundary is
-described in `docs/dev_runtime_orchestration.md`. The governor itself remains an
-observation/decision object and does not run batches, retry, execute models, or
-construct a pressure summary. Automatic orchestration of capacity sampling and
-pressure assessment remains a separate integration step.
+described in `docs/dev_runtime_orchestration.md`. When callers explicitly
+configure a fixed `ResourceCapacity`, the orchestrator can assess all raw-attempt
+resource samples and supply the resulting summary to the governor. The governor
+itself remains an observation/decision object and does not run batches, retry,
+execute models, discover capacity, or construct a pressure summary.
 
 ## Out of Scope
 
@@ -152,7 +153,8 @@ pressure assessment remains a separate integration step.
 - Learned or model-specific tuning.
 - Persistent calibration caches or history databases.
 - Pressure-triggered budget shrink or field-specific tuning.
-- Automatic pressure-summary construction inside the governor or orchestrator.
+- Automatic pressure-summary construction inside the governor.
+- Automatic capacity discovery or refresh inside the orchestrator.
 - `ModelCostProbe`-driven policy changes.
 - SPDL queue-depth tuning.
 - Device transfer.

@@ -14,6 +14,8 @@ KVBatch source
   -> BudgetedBatcher(current_budget)
   -> RuntimeRetryRunner
   -> StepResult stream
+  -> optional ResourceCapacity + all raw-attempt ResourceSample records
+  -> assess_resource_pressure(...)
   -> ConservativeRuntimeGovernor.observe_results(...)
   -> GovernorDecision.next_budget
 ```
@@ -40,6 +42,7 @@ The stable `enn_torch` namespace does not expose this development orchestrator.
 - a `ConservativeRuntimeGovernor` holding the active budget;
 - optional `RetryPolicy` for `RuntimeRetryRunner`;
 - optional `DataCostProbe` passed through to `BudgetedBatcher`;
+- optional fixed `ResourceCapacity` used to assess one pass of resource samples;
 - `split_oversized` and `min_items` values passed through to `BudgetedBatcher`.
 
 `run_pass(source)` accepts a finite iterable of `KVBatch` objects and returns a
@@ -70,11 +73,38 @@ ConservativeRuntimeGovernor.observe_results(results, recovered_oom=True)
 This keeps retry-recovered OOM pressure visible to the governor while preserving
 `RuntimeRetryRunner`'s side-effect-safe retry boundary.
 
+## Pressure Summary Wiring
+
+When `resource_capacity` is configured, the same wrapper records
+`ResourceSample` objects from every raw runtime-step result, including OOM results
+that are consumed internally by retry and do not appear in the final yielded
+`results` tuple. After the finite retry stream completes, the orchestrator calls:
+
+```python
+pressure_summary = assess_resource_pressure(raw_attempt_samples, resource_capacity)
+
+decision = governor.observe_results(
+    results,
+    recovered_oom=recovered_oom,
+    pressure_summary=pressure_summary,
+)
+```
+
+This is an explicit fixed-capacity integration. The orchestrator does not create
+a `ResourceMonitor`, discover capacity, or refresh capacity between passes. When
+`resource_capacity` is `None`, no pressure summary is constructed and the
+previous orchestration behavior is preserved.
+
+A CUDA sample/capacity device mismatch remains an error from
+`assess_resource_pressure(...)`; the orchestrator does not hide it or update the
+governor state after that failed assessment.
+
 ## Materialization Boundary
 
 `RuntimePassResult.results` is a tuple. This is intentional for this finite
 pass-level helper so callers can inspect the pass outcome together with the
-budget decision.
+budget decision. The raw-attempt sample list is pass-local and is reduced to the
+scalar-only `ResourcePressureSummary` stored in `GovernorDecision`.
 
 Do not use this class as an unbounded production streaming runner. A future
 streaming orchestration slice can avoid pass-level materialization while still
@@ -100,7 +130,8 @@ orchestrator.
 - Learned or model-specific tuning.
 - Persistent calibration caches or history databases.
 - Unbounded production streaming orchestration.
-- ResourceMonitor feedback-loop tuning.
+- Automatic `ResourceMonitor` creation or capacity refresh.
+- Pressure-triggered budget shrink or field-specific tuning.
 - SPDL queue-depth tuning.
 - Device transfer.
 - AMP or precision fallback.
