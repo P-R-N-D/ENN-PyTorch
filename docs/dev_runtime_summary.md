@@ -44,15 +44,20 @@ The stable `enn_torch` namespace does not expose this development summary API.
 - whether the budget changed;
 - governor decision reason;
 - governor success/OOM streak counters;
-- resource peak values copied from `GovernorDecision`.
+- resource peak values copied from `GovernorDecision`;
+- the optional scalar-only `ResourcePressureSummary` copied from the decision;
+- whether pressure suppressed success-driven budget growth.
 
 `summarize_runtime_pass(pass_result)` accepts only a finite `RuntimePassResult`.
 It scans the pass result tuple and stores only lightweight summary fields. It does
-not retain `StepResult` objects, `store`, or `loss` references.
+not retain `StepResult` objects, raw `ResourceSample` objects, `store`, or `loss`
+references. A copied `ResourcePressureSummary` contains scalar ratios only.
 
 `format_runtime_pass_summary(summary)` returns stable human-readable text for a
-`RuntimePassSummary`. The formatter is intended for debug output and PR/report
-inspection, not for a stable machine interchange format.
+`RuntimePassSummary`. The formatter includes whether pressure was assessed, the
+maximum known pressure ratio (or `unknown`), and whether pressure suppressed
+growth. It is intended for debug output and PR/report inspection, not for a
+stable machine interchange format.
 
 ## Relationship to Orchestration
 

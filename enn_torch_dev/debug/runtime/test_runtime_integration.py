@@ -263,12 +263,24 @@ def test_runtime_session_uses_orchestrator_pressure_summary_for_growth_guard() -
     assert first.pass_result.decision.pressure_summary.peak_cpu_rss_ratio == 0.5
     assert first.pass_result.decision.next_budget == BatchBudget(max_items=4)
     assert first.pass_result.decision.growth_suppressed_by_pressure is False
+    assert first.pass_summary.pressure_summary is not None
+    assert first.pass_summary.pressure_summary.peak_cpu_rss_ratio == 0.5
+    assert first.pass_summary.growth_suppressed_by_pressure is False
+    assert first.history_summary.pressure_assessed_passes == 1
+    assert first.history_summary.pressure_growth_suppressed_passes == 0
+    assert first.history_summary.peak_observed_pressure_ratio == 0.5
 
     assert second.pass_result.decision.pressure_summary is not None
     assert second.pass_result.decision.pressure_summary.peak_cpu_rss_ratio == 0.9
     assert second.pass_result.decision.next_budget == BatchBudget(max_items=4)
     assert second.pass_result.decision.growth_suppressed_by_pressure is True
     assert second.pass_result.decision.consecutive_successes == 0
+    assert second.pass_summary.pressure_summary is not None
+    assert second.pass_summary.pressure_summary.peak_cpu_rss_ratio == 0.9
+    assert second.pass_summary.growth_suppressed_by_pressure is True
+    assert second.history_summary.pressure_assessed_passes == 2
+    assert second.history_summary.pressure_growth_suppressed_passes == 1
+    assert second.history_summary.peak_observed_pressure_ratio == 0.9
     assert orchestrator.current_budget == BatchBudget(max_items=4)
     assert history.records == (first.pass_summary, second.pass_summary)
 

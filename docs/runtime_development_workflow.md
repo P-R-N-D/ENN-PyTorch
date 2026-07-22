@@ -172,7 +172,10 @@ caller inspection. The caller controls how long that record remains alive.
 The session itself does not retain prior pass results after the generator resumes.
 Longer-lived in-memory retention is limited to lightweight `RuntimePassSummary`
 objects in `RuntimePassHistory`, which requires a positive `max_records` bound.
-History aggregates describe only the currently retained summary window.
+Pass summaries expose scalar pressure ratios and growth-suppression decisions;
+history aggregates pressure-assessed and pressure-suppressed pass counts plus the
+highest known ratio only within the currently retained summary window. Raw
+`ResourceSample` records are not retained by summary or history.
 
 ## Fault and exception semantics
 

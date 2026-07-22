@@ -9,6 +9,7 @@ from .batching import BatchBudget
 from .faults import StepResult, StepStatus
 from .governor import GovernorDecision
 from .orchestration import RuntimePassResult
+from .pressure import ResourcePressureSummary
 
 
 @dataclass(frozen=True, slots=True)
@@ -33,6 +34,8 @@ class RuntimePassSummary:
     peak_cuda_reserved_bytes: int | None = None
     peak_cuda_max_allocated_bytes: int | None = None
     peak_cuda_max_reserved_bytes: int | None = None
+    pressure_summary: ResourcePressureSummary | None = None
+    growth_suppressed_by_pressure: bool = False
 
 
 def summarize_runtime_pass(pass_result: RuntimePassResult) -> RuntimePassSummary:
@@ -78,6 +81,8 @@ def summarize_runtime_pass(pass_result: RuntimePassResult) -> RuntimePassSummary
         peak_cuda_reserved_bytes=decision.peak_cuda_reserved_bytes,
         peak_cuda_max_allocated_bytes=decision.peak_cuda_max_allocated_bytes,
         peak_cuda_max_reserved_bytes=decision.peak_cuda_max_reserved_bytes,
+        pressure_summary=decision.pressure_summary,
+        growth_suppressed_by_pressure=decision.growth_suppressed_by_pressure,
     )
 
 
@@ -88,6 +93,12 @@ def format_runtime_pass_summary(summary: RuntimePassSummary) -> str:
         raise TypeError("format_runtime_pass_summary expects a RuntimePassSummary.")
 
     status_text = _format_status_counts(summary.status_counts)
+    pressure_summary = summary.pressure_summary
+    max_pressure_ratio = (
+        pressure_summary.max_observed_ratio
+        if pressure_summary is not None
+        else None
+    )
     return "\n".join(
         (
             "Runtime pass summary",
@@ -102,9 +113,16 @@ def format_runtime_pass_summary(summary: RuntimePassSummary) -> str:
             f"next_budget={summary.next_budget!r}",
             f"consecutive_successes={summary.consecutive_successes}",
             f"consecutive_ooms={summary.consecutive_ooms}",
+            f"pressure_assessed={pressure_summary is not None}",
+            f"max_pressure_ratio={_format_optional_ratio(max_pressure_ratio)}",
+            f"growth_suppressed_by_pressure={summary.growth_suppressed_by_pressure}",
             f"decision_reason={summary.decision_reason}",
         )
     )
+
+
+def _format_optional_ratio(value: float | None) -> str:
+    return "unknown" if value is None else f"{value:.6g}"
 
 
 def _format_status_counts(status_counts: Mapping[StepStatus, int]) -> str:

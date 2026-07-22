@@ -8,12 +8,16 @@ import torch
 from enn_torch_dev.runtime import (
     BatchBudget,
     GovernorDecision,
+    ResourceCapacity,
+    ResourcePressureSummary,
+    ResourceSample,
     RuntimeHistorySummary,
     RuntimePassHistory,
     RuntimePassResult,
     RuntimePassSummary,
     StepResult,
     StepStatus,
+    assess_resource_pressure,
     format_runtime_history_summary,
     summarize_runtime_pass,
 )
@@ -27,6 +31,8 @@ def _decision(
     statuses: tuple[StepStatus, ...] = (),
     consecutive_successes: int = 0,
     consecutive_ooms: int = 0,
+    pressure_summary: ResourcePressureSummary | None = None,
+    growth_suppressed_by_pressure: bool = False,
 ) -> GovernorDecision:
     previous = previous_budget or BatchBudget(max_items=4)
     return GovernorDecision(
@@ -36,6 +42,8 @@ def _decision(
         statuses=statuses,
         consecutive_successes=consecutive_successes,
         consecutive_ooms=consecutive_ooms,
+        pressure_summary=pressure_summary,
+        growth_suppressed_by_pressure=growth_suppressed_by_pressure,
     )
 
 
@@ -75,6 +83,8 @@ def _summary(
     batch_size: int = 1,
     recovered_oom: bool = False,
     budget_changed: bool = False,
+    pressure_summary: ResourcePressureSummary | None = None,
+    growth_suppressed_by_pressure: bool = False,
 ) -> RuntimePassSummary:
     results = tuple(_result(status, batch_size=batch_size) for status in statuses)
     previous = BatchBudget(max_items=4)
@@ -84,6 +94,8 @@ def _summary(
         next_budget=next_budget,
         statuses=statuses,
         consecutive_ooms=1 if StepStatus.OOM_FAULT in statuses else 0,
+        pressure_summary=pressure_summary,
+        growth_suppressed_by_pressure=growth_suppressed_by_pressure,
     )
     return summarize_runtime_pass(
         _pass_result(results, decision=decision, recovered_oom=recovered_oom)
@@ -92,6 +104,16 @@ def _summary(
 
 def _field_values(instance: object) -> list[object]:
     return [getattr(instance, field.name) for field in fields(instance)]
+
+
+def test_runtime_history_summary_appends_pressure_fields_for_compatibility() -> None:
+    field_names = [field.name for field in fields(RuntimeHistorySummary)]
+
+    assert field_names[-3:] == [
+        "pressure_assessed_passes",
+        "pressure_growth_suppressed_passes",
+        "peak_observed_pressure_ratio",
+    ]
 
 
 def test_empty_history_summary() -> None:
@@ -108,6 +130,9 @@ def test_empty_history_summary() -> None:
     assert summary.recovered_oom_passes == 0
     assert summary.oom_passes == 0
     assert summary.budget_changed_passes == 0
+    assert summary.pressure_assessed_passes == 0
+    assert summary.pressure_growth_suppressed_passes == 0
+    assert summary.peak_observed_pressure_ratio is None
     assert summary.latest_summary is None
     assert history.records == ()
 
@@ -167,6 +192,62 @@ def test_history_counts_recovered_oom_passes_separately_from_yielded_ooms() -> N
         StepStatus.SUCCESS: 1,
         StepStatus.OOM_FAULT: 1,
     }
+
+
+def test_history_aggregates_pressure_feedback() -> None:
+    history = RuntimePassHistory(max_records=10)
+    history.append_summary(_summary(StepStatus.SUCCESS))
+    history.append_summary(
+        _summary(
+            StepStatus.SUCCESS,
+            pressure_summary=ResourcePressureSummary(),
+        )
+    )
+    history.append_summary(
+        _summary(
+            StepStatus.SUCCESS,
+            pressure_summary=ResourcePressureSummary(peak_cpu_rss_ratio=0.5),
+        )
+    )
+    aggregate = history.append_summary(
+        _summary(
+            StepStatus.SUCCESS,
+            pressure_summary=ResourcePressureSummary(
+                peak_cuda_reserved_ratio=0.9
+            ),
+            growth_suppressed_by_pressure=True,
+        )
+    )
+
+    assert aggregate.pressure_assessed_passes == 3
+    assert aggregate.pressure_growth_suppressed_passes == 1
+    assert aggregate.peak_observed_pressure_ratio == pytest.approx(0.9)
+
+
+def test_history_pressure_aggregation_respects_retained_window() -> None:
+    history = RuntimePassHistory(max_records=2)
+    first = _summary(
+        StepStatus.SUCCESS,
+        pressure_summary=ResourcePressureSummary(peak_cpu_rss_ratio=0.95),
+        growth_suppressed_by_pressure=True,
+    )
+    second = _summary(
+        StepStatus.SUCCESS,
+        pressure_summary=ResourcePressureSummary(peak_cpu_rss_ratio=0.4),
+    )
+    third = _summary(
+        StepStatus.SUCCESS,
+        pressure_summary=ResourcePressureSummary(),
+    )
+
+    history.append_summary(first)
+    history.append_summary(second)
+    aggregate = history.append_summary(third)
+
+    assert history.records == (second, third)
+    assert aggregate.pressure_assessed_passes == 2
+    assert aggregate.pressure_growth_suppressed_passes == 0
+    assert aggregate.peak_observed_pressure_ratio == pytest.approx(0.4)
 
 
 def test_history_tracks_latest_summary() -> None:
@@ -233,11 +314,23 @@ def test_history_rejects_invalid_arguments() -> None:
         history.append_pass_result(object())  # type: ignore[arg-type]
 
 
-def test_history_does_not_store_stepresult_loss_or_store_references() -> None:
+def test_history_does_not_store_raw_runtime_references() -> None:
     loss = torch.tensor(1.0)
     store = object()
     result = _result(loss=loss, store=store)
-    pass_result = _pass_result((result,))
+    sample = ResourceSample(
+        timestamp_ns=1,
+        phase="history-test",
+        cpu_rss_bytes=50,
+    )
+    pressure = assess_resource_pressure(
+        (sample,),
+        ResourceCapacity(cpu_total_bytes=100),
+    )
+    pass_result = _pass_result(
+        (result,),
+        decision=_decision(pressure_summary=pressure),
+    )
     history = RuntimePassHistory(max_records=10)
 
     aggregate = history.append_pass_result(pass_result)
@@ -247,6 +340,7 @@ def test_history_does_not_store_stepresult_loss_or_store_references() -> None:
     assert all(value is not result for value in values)
     assert all(value is not loss for value in values)
     assert all(value is not store for value in values)
+    assert all(value is not sample for value in values)
 
 
 def test_records_property_returns_snapshot() -> None:
@@ -263,8 +357,23 @@ def test_records_property_returns_snapshot() -> None:
 
 def test_format_runtime_history_summary_is_stable_text() -> None:
     history = RuntimePassHistory(max_records=10)
-    history.append_summary(_summary(StepStatus.SUCCESS, recovered_oom=True))
-    aggregate = history.append_summary(_summary(StepStatus.OOM_FAULT, budget_changed=True))
+    history.append_summary(
+        _summary(
+            StepStatus.SUCCESS,
+            recovered_oom=True,
+            pressure_summary=ResourcePressureSummary(peak_cpu_rss_ratio=0.5),
+        )
+    )
+    aggregate = history.append_summary(
+        _summary(
+            StepStatus.OOM_FAULT,
+            budget_changed=True,
+            pressure_summary=ResourcePressureSummary(
+                peak_cuda_reserved_ratio=0.9
+            ),
+            growth_suppressed_by_pressure=True,
+        )
+    )
 
     text = format_runtime_history_summary(aggregate)
 
@@ -276,7 +385,13 @@ def test_format_runtime_history_summary_is_stable_text() -> None:
     assert "recovered_oom_passes=1" in text
     assert "oom_passes=1" in text
     assert "budget_changed_passes=1" in text
+    assert "pressure_assessed_passes=2" in text
+    assert "pressure_growth_suppressed_passes=1" in text
+    assert "peak_observed_pressure_ratio=0.9" in text
     assert "latest_budget_changed=True" in text
+    assert "latest_pressure_assessed=True" in text
+    assert "latest_max_pressure_ratio=0.9" in text
+    assert "latest_growth_suppressed_by_pressure=True" in text
 
 
 def test_format_runtime_history_summary_handles_empty_history() -> None:
@@ -285,6 +400,11 @@ def test_format_runtime_history_summary_handles_empty_history() -> None:
     assert "statuses=none" in text
     assert "latest_budget_changed=False" in text
     assert "latest_recovered_oom=False" in text
+    assert "pressure_assessed_passes=0" in text
+    assert "peak_observed_pressure_ratio=unknown" in text
+    assert "latest_pressure_assessed=False" in text
+    assert "latest_max_pressure_ratio=unknown" in text
+    assert "latest_growth_suppressed_by_pressure=False" in text
 
 
 def test_format_runtime_history_summary_rejects_invalid_argument() -> None:
