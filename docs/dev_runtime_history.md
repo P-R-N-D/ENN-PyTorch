@@ -56,17 +56,23 @@ is not a live mutable view of the history internals.
 - recovered-OOM pass count;
 - yielded-OOM pass count;
 - budget-changed pass count;
+- pressure-assessed pass count;
+- pressure-growth-suppressed pass count;
+- highest known pressure ratio across retained summaries;
 - latest retained `RuntimePassSummary`, or `None` for an empty history.
 
 `format_runtime_history_summary(summary)` returns stable human-readable text for
-runtime history inspection. It is not a stable machine interchange format.
+runtime history inspection, including retained-window pressure counts, peak
+ratio, and latest-pass pressure state. It is not a stable machine interchange
+format.
 
 ## Reference Safety
 
 `RuntimePassHistory.append_pass_result(...)` stores a `RuntimePassSummary`, not
 the original `RuntimePassResult` or `StepResult` objects. Since
 `RuntimePassSummary` is lightweight, the history does not retain `StepResult`,
-`loss`, or `store` references through that append path.
+raw `ResourceSample`, `loss`, or `store` references through that append path.
+Pressure aggregation uses only scalar ratios from each retained summary.
 
 ## Relationship to Session
 

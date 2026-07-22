@@ -23,6 +23,9 @@ class RuntimeHistorySummary:
     oom_passes: int
     budget_changed_passes: int
     latest_summary: RuntimePassSummary | None = None
+    pressure_assessed_passes: int = 0
+    pressure_growth_suppressed_passes: int = 0
+    peak_observed_pressure_ratio: float | None = None
 
 
 class RuntimePassHistory:
@@ -62,6 +65,9 @@ class RuntimePassHistory:
         recovered_oom_passes = 0
         oom_passes = 0
         budget_changed_passes = 0
+        pressure_assessed_passes = 0
+        pressure_growth_suppressed_passes = 0
+        peak_observed_pressure_ratio: float | None = None
 
         for summary in self._records:
             total_results += summary.total_results
@@ -75,6 +81,18 @@ class RuntimePassHistory:
                 oom_passes += 1
             if summary.budget_changed:
                 budget_changed_passes += 1
+            pressure_summary = summary.pressure_summary
+            if pressure_summary is not None:
+                pressure_assessed_passes += 1
+                candidate_ratio = pressure_summary.max_observed_ratio
+                if candidate_ratio is not None:
+                    peak_observed_pressure_ratio = (
+                        candidate_ratio
+                        if peak_observed_pressure_ratio is None
+                        else max(peak_observed_pressure_ratio, candidate_ratio)
+                    )
+            if summary.growth_suppressed_by_pressure:
+                pressure_growth_suppressed_passes += 1
 
         latest_summary = self._records[-1] if self._records else None
         status_counts_view: Mapping[StepStatus, int] = MappingProxyType(dict(status_counts))
@@ -88,6 +106,9 @@ class RuntimePassHistory:
             oom_passes=oom_passes,
             budget_changed_passes=budget_changed_passes,
             latest_summary=latest_summary,
+            pressure_assessed_passes=pressure_assessed_passes,
+            pressure_growth_suppressed_passes=pressure_growth_suppressed_passes,
+            peak_observed_pressure_ratio=peak_observed_pressure_ratio,
         )
 
     def _trim_records(self) -> None:
@@ -105,6 +126,15 @@ def format_runtime_history_summary(summary: RuntimeHistorySummary) -> str:
     latest = summary.latest_summary
     latest_budget_changed = latest.budget_changed if latest is not None else False
     latest_recovered_oom = latest.recovered_oom if latest is not None else False
+    latest_pressure_summary = latest.pressure_summary if latest is not None else None
+    latest_max_pressure_ratio = (
+        latest_pressure_summary.max_observed_ratio
+        if latest_pressure_summary is not None
+        else None
+    )
+    latest_growth_suppressed = (
+        latest.growth_suppressed_by_pressure if latest is not None else False
+    )
     return "\n".join(
         (
             "Runtime history summary",
@@ -116,10 +146,20 @@ def format_runtime_history_summary(summary: RuntimeHistorySummary) -> str:
             f"recovered_oom_passes={summary.recovered_oom_passes}",
             f"oom_passes={summary.oom_passes}",
             f"budget_changed_passes={summary.budget_changed_passes}",
+            f"pressure_assessed_passes={summary.pressure_assessed_passes}",
+            f"pressure_growth_suppressed_passes={summary.pressure_growth_suppressed_passes}",
+            f"peak_observed_pressure_ratio={_format_optional_ratio(summary.peak_observed_pressure_ratio)}",
             f"latest_budget_changed={latest_budget_changed}",
             f"latest_recovered_oom={latest_recovered_oom}",
+            f"latest_pressure_assessed={latest_pressure_summary is not None}",
+            f"latest_max_pressure_ratio={_format_optional_ratio(latest_max_pressure_ratio)}",
+            f"latest_growth_suppressed_by_pressure={latest_growth_suppressed}",
         )
     )
+
+
+def _format_optional_ratio(value: float | None) -> str:
+    return "unknown" if value is None else f"{value:.6g}"
 
 
 def _format_status_counts(status_counts: Mapping[StepStatus, int]) -> str:

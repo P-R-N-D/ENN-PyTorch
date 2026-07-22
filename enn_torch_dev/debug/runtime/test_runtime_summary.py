@@ -8,10 +8,14 @@ import torch
 from enn_torch_dev.runtime import (
     BatchBudget,
     GovernorDecision,
+    ResourceCapacity,
+    ResourcePressureSummary,
+    ResourceSample,
     RuntimePassResult,
     RuntimePassSummary,
     StepResult,
     StepStatus,
+    assess_resource_pressure,
     format_runtime_pass_summary,
     summarize_runtime_pass,
 )
@@ -44,6 +48,8 @@ def _decision(
     statuses: tuple[StepStatus, ...] = (),
     consecutive_successes: int = 0,
     consecutive_ooms: int = 0,
+    pressure_summary: ResourcePressureSummary | None = None,
+    growth_suppressed_by_pressure: bool = False,
 ) -> GovernorDecision:
     previous = previous_budget or BatchBudget(max_items=4)
     return GovernorDecision(
@@ -58,6 +64,8 @@ def _decision(
         peak_cuda_reserved_bytes=33,
         peak_cuda_max_allocated_bytes=44,
         peak_cuda_max_reserved_bytes=55,
+        pressure_summary=pressure_summary,
+        growth_suppressed_by_pressure=growth_suppressed_by_pressure,
     )
 
 
@@ -176,17 +184,64 @@ def test_summarize_runtime_pass_detects_budget_change_and_decision_metadata() ->
     assert summary.peak_cuda_max_reserved_bytes == 55
 
 
-def test_summarize_runtime_pass_does_not_store_stepresult_loss_or_store() -> None:
+def test_runtime_pass_summary_appends_pressure_fields_for_compatibility() -> None:
+    field_names = [field.name for field in fields(RuntimePassSummary)]
+
+    assert field_names[-2:] == [
+        "pressure_summary",
+        "growth_suppressed_by_pressure",
+    ]
+
+
+def test_summarize_runtime_pass_copies_pressure_feedback() -> None:
+    pressure = ResourcePressureSummary(
+        peak_cpu_rss_ratio=0.5,
+        peak_cuda_reserved_ratio=0.9,
+    )
+    decision = _decision(
+        pressure_summary=pressure,
+        growth_suppressed_by_pressure=True,
+    )
+
+    summary = summarize_runtime_pass(_pass_result((_result(),), decision=decision))
+
+    assert summary.pressure_summary == pressure
+    assert summary.pressure_summary.max_observed_ratio == pytest.approx(0.9)
+    assert summary.growth_suppressed_by_pressure is True
+
+
+def test_summarize_runtime_pass_preserves_assessed_unknown_pressure() -> None:
+    decision = _decision(pressure_summary=ResourcePressureSummary())
+
+    summary = summarize_runtime_pass(_pass_result((_result(),), decision=decision))
+
+    assert summary.pressure_summary == ResourcePressureSummary()
+    assert summary.pressure_summary.max_observed_ratio is None
+    assert summary.growth_suppressed_by_pressure is False
+
+
+def test_summarize_runtime_pass_does_not_store_raw_runtime_references() -> None:
     loss = torch.tensor(1.0)
     store = object()
     result = _result(loss=loss, store=store)
+    sample = ResourceSample(
+        timestamp_ns=1,
+        phase="summary-test",
+        cpu_rss_bytes=50,
+    )
+    pressure = assess_resource_pressure(
+        (sample,),
+        ResourceCapacity(cpu_total_bytes=100),
+    )
+    decision = _decision(pressure_summary=pressure)
 
-    summary = summarize_runtime_pass(_pass_result((result,)))
+    summary = summarize_runtime_pass(_pass_result((result,), decision=decision))
     values = _field_values(summary)
 
     assert all(value is not result for value in values)
     assert all(value is not loss for value in values)
     assert all(value is not store for value in values)
+    assert all(value is not sample for value in values)
 
 
 def test_format_runtime_pass_summary_is_stable_text() -> None:
@@ -215,6 +270,41 @@ def test_format_runtime_pass_summary_is_stable_text() -> None:
     assert "budget_changed=True" in text
     assert "consecutive_ooms=1" in text
     assert "decision_reason=retry-recovered OOM observed" in text
+
+
+def test_format_runtime_pass_summary_reports_pressure_feedback() -> None:
+    pressure = ResourcePressureSummary(peak_cpu_rss_ratio=0.9)
+    decision = _decision(
+        pressure_summary=pressure,
+        growth_suppressed_by_pressure=True,
+    )
+
+    text = format_runtime_pass_summary(
+        summarize_runtime_pass(_pass_result((_result(),), decision=decision))
+    )
+
+    assert "pressure_assessed=True" in text
+    assert "max_pressure_ratio=0.9" in text
+    assert "growth_suppressed_by_pressure=True" in text
+
+
+def test_format_runtime_pass_summary_distinguishes_unknown_and_unassessed_pressure() -> None:
+    assessed_text = format_runtime_pass_summary(
+        summarize_runtime_pass(
+            _pass_result(
+                (_result(),),
+                decision=_decision(pressure_summary=ResourcePressureSummary()),
+            )
+        )
+    )
+    unassessed_text = format_runtime_pass_summary(
+        summarize_runtime_pass(_pass_result((_result(),)))
+    )
+
+    assert "pressure_assessed=True" in assessed_text
+    assert "max_pressure_ratio=unknown" in assessed_text
+    assert "pressure_assessed=False" in unassessed_text
+    assert "max_pressure_ratio=unknown" in unassessed_text
 
 
 def test_format_runtime_pass_summary_handles_no_statuses() -> None:
