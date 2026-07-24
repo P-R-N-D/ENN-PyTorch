@@ -1,0 +1,909 @@
+diff --git a/enn_torch_dev/runtime/__init__.py b/enn_torch_dev/runtime/__init__.py
+--- a/enn_torch_dev/runtime/__init__.py
++++ b/enn_torch_dev/runtime/__init__.py
+@@ -1,6 +1,7 @@
+ from __future__ import annotations
+ 
+ from .batching import BatchBudget, BatchBudgetExceeded, BudgetedBatcher
++from .capacity_provider import ResourceCapacityProvider
+ from .cost import (
+     DataCost,
+     DataCostProbe,
+@@ -57,6 +58,7 @@
+     "OptimizerFootprint",
+     "PlainLoader",
+     "ResourceCapacity",
++    "ResourceCapacityProvider",
+     "ResourceMonitor",
+     "ResourceDelta",
+     "ResourcePressureSummary",
+diff --git a/enn_torch_dev/runtime/orchestration.py b/enn_torch_dev/runtime/orchestration.py
+--- a/enn_torch_dev/runtime/orchestration.py
++++ b/enn_torch_dev/runtime/orchestration.py
+@@ -6,6 +6,7 @@
+ from enn_torch_dev.data import KVBatch
+ 
+ from .batching import BatchBudget, BudgetedBatcher
++from .capacity_provider import ResourceCapacityProvider
+ from .cost import DataCostProbe
+ from .faults import ResourceSample, StepResult, StepStatus
+ from .governor import ConservativeRuntimeGovernor, GovernorDecision
+@@ -20,6 +21,7 @@
+     results: tuple[StepResult, ...]
+     decision: GovernorDecision
+     recovered_oom: bool = False
++    resource_capacity: ResourceCapacity | None = None
+ 
+ 
+ class _OomTrackingRuntimeStep:
+@@ -58,6 +60,7 @@
+         retry_policy: RetryPolicy | None = None,
+         cost_probe: DataCostProbe | None = None,
+         resource_capacity: ResourceCapacity | None = None,
++        resource_capacity_provider: ResourceCapacityProvider | None = None,
+         split_oversized: bool = True,
+         min_items: int = 1,
+     ) -> None:
+@@ -84,6 +87,18 @@
+                 "ConservativeRuntimeOrchestrator.resource_capacity must be a "
+                 "ResourceCapacity or None."
+             )
++        if resource_capacity_provider is not None and not isinstance(
++            resource_capacity_provider, ResourceCapacityProvider
++        ):
++            raise TypeError(
++                "ConservativeRuntimeOrchestrator.resource_capacity_provider must be a "
++                "ResourceCapacityProvider or None."
++            )
++        if resource_capacity is not None and resource_capacity_provider is not None:
++            raise ValueError(
++                "ConservativeRuntimeOrchestrator.resource_capacity and "
++                "resource_capacity_provider are mutually exclusive."
++            )
+         if not isinstance(split_oversized, bool):
+             raise TypeError("ConservativeRuntimeOrchestrator.split_oversized must be a bool.")
+         if not isinstance(min_items, int) or isinstance(min_items, bool):
+@@ -96,8 +111,20 @@
+         self.retry_policy = retry_policy
+         self.cost_probe = cost_probe
+         self.resource_capacity = resource_capacity
++        self.resource_capacity_provider = resource_capacity_provider
+         self.split_oversized = split_oversized
+         self.min_items = min_items
++
++    def _resolve_resource_capacity(self) -> ResourceCapacity | None:
++        provider = self.resource_capacity_provider
++        if provider is None:
++            return self.resource_capacity
++        capacity = provider.capacity()
++        if not isinstance(capacity, ResourceCapacity):
++            raise TypeError(
++                "ResourceCapacityProvider.capacity() must return a ResourceCapacity."
++            )
++        return capacity
+ 
+     @property
+     def current_budget(self) -> BatchBudget:
+@@ -117,9 +144,10 @@
+                 "ConservativeRuntimeOrchestrator.run_pass expects an iterable of KVBatch."
+             )
+ 
++        resolved_capacity = self._resolve_resource_capacity()
+         tracking_step = _OomTrackingRuntimeStep(
+             self.runtime_step,
+-            collect_resource_samples=self.resource_capacity is not None,
++            collect_resource_samples=resolved_capacity is not None,
+         )
+         budgeted = BudgetedBatcher(
+             source,
+@@ -135,9 +163,9 @@
+         pressure_summary = (
+             assess_resource_pressure(
+                 tracking_step.resource_samples,
+-                self.resource_capacity,
++                resolved_capacity,
+             )
+-            if self.resource_capacity is not None
++            if resolved_capacity is not None
+             else None
+         )
+         decision = self.governor.observe_results(
+@@ -149,4 +177,5 @@
+             results=results,
+             decision=decision,
+             recovered_oom=recovered_oom,
++            resource_capacity=resolved_capacity,
+         )
+diff --git a/enn_torch_dev/runtime/summary.py b/enn_torch_dev/runtime/summary.py
+--- a/enn_torch_dev/runtime/summary.py
++++ b/enn_torch_dev/runtime/summary.py
+@@ -9,7 +9,7 @@
+ from .faults import StepResult, StepStatus
+ from .governor import GovernorDecision
+ from .orchestration import RuntimePassResult
+-from .pressure import ResourcePressureSummary
++from .pressure import ResourceCapacity, ResourcePressureSummary
+ 
+ 
+ @dataclass(frozen=True, slots=True)
+@@ -36,6 +36,7 @@
+     peak_cuda_max_reserved_bytes: int | None = None
+     pressure_summary: ResourcePressureSummary | None = None
+     growth_suppressed_by_pressure: bool = False
++    resource_capacity: ResourceCapacity | None = None
+ 
+ 
+ def summarize_runtime_pass(pass_result: RuntimePassResult) -> RuntimePassSummary:
+@@ -83,6 +84,7 @@
+         peak_cuda_max_reserved_bytes=decision.peak_cuda_max_reserved_bytes,
+         pressure_summary=decision.pressure_summary,
+         growth_suppressed_by_pressure=decision.growth_suppressed_by_pressure,
++        resource_capacity=pass_result.resource_capacity,
+     )
+ 
+ 
+@@ -113,6 +115,7 @@
+             f"next_budget={summary.next_budget!r}",
+             f"consecutive_successes={summary.consecutive_successes}",
+             f"consecutive_ooms={summary.consecutive_ooms}",
++            f"resource_capacity={summary.resource_capacity!r}",
+             f"pressure_assessed={pressure_summary is not None}",
+             f"max_pressure_ratio={_format_optional_ratio(max_pressure_ratio)}",
+             f"growth_suppressed_by_pressure={summary.growth_suppressed_by_pressure}",
+diff --git a/enn_torch_dev/runtime/capacity_provider.py b/enn_torch_dev/runtime/capacity_provider.py
+new file mode 100644
+--- /dev/null
++++ b/enn_torch_dev/runtime/capacity_provider.py
+@@ -0,0 +1,13 @@
++from __future__ import annotations
++
++from typing import Protocol, runtime_checkable
++
++from .pressure import ResourceCapacity
++
++
++@runtime_checkable
++class ResourceCapacityProvider(Protocol):
++    """Resolve the resource capacity to use for one runtime pass."""
++
++    def capacity(self) -> ResourceCapacity:
++        ...
+diff --git a/enn_torch_dev/debug/runtime/test_runtime_capacity_provider.py b/enn_torch_dev/debug/runtime/test_runtime_capacity_provider.py
+new file mode 100644
+--- /dev/null
++++ b/enn_torch_dev/debug/runtime/test_runtime_capacity_provider.py
+@@ -0,0 +1,357 @@
++from __future__ import annotations
++
++from collections.abc import Callable, Iterator
++from dataclasses import fields
++
++import pytest
++import torch
++from tensordict import TensorDict
++
++import enn_torch
++import enn_torch_dev.runtime as runtime_api
++from enn_torch_dev.data import KVBatch
++from enn_torch_dev.runtime import (
++    BatchBudget,
++    ConservativeRuntimeGovernor,
++    ConservativeRuntimeOrchestrator,
++    ConservativeRuntimeSession,
++    GovernorPolicy,
++    ResourceCapacity,
++    ResourceCapacityProvider,
++    ResourceMonitor,
++    ResourceSample,
++    RetryPolicy,
++    RuntimePassHistory,
++    RuntimePassResult,
++    RuntimePassSummary,
++    RuntimePhase,
++    StepResult,
++    StepStatus,
++    format_runtime_pass_summary,
++    summarize_runtime_pass,
++)
++
++
++def _batch(num_rows: int = 1, *, offset: int = 0) -> KVBatch:
++    td = TensorDict(
++        {
++            "features": torch.arange(
++                offset,
++                offset + num_rows * 2,
++                dtype=torch.float32,
++            ).reshape(num_rows, 2),
++        },
++        batch_size=(num_rows,),
++    )
++    return KVBatch(
++        td=td,
++        row_ids=torch.arange(offset, offset + num_rows),
++        source_ids=torch.arange(100 + offset, 100 + offset + num_rows),
++        sample_ids=torch.arange(200 + offset, 200 + offset + num_rows),
++        schema_id="runtime.capacity-provider",
++        shard_id=13,
++    )
++
++
++def _sampled_result(
++    batch: KVBatch,
++    *,
++    cpu_rss_bytes: int,
++    status: StepStatus = StepStatus.SUCCESS,
++) -> StepResult:
++    return StepResult(
++        status=status,
++        phase=RuntimePhase.FORWARD if status is StepStatus.OOM_FAULT else None,
++        batch_size=batch.batch_size,
++        row_ids=batch.row_ids.detach().cpu().clone(),
++        error_type=None if status is StepStatus.SUCCESS else "SyntheticOOM",
++        error_message=None if status is StepStatus.SUCCESS else "batch too large",
++        resource_samples=(
++            ResourceSample(
++                timestamp_ns=1,
++                phase="capacity-provider-test",
++                cpu_rss_bytes=cpu_rss_bytes,
++            ),
++        ),
++    )
++
++
++class FakeRuntimeStep:
++    def __init__(self, fn: Callable[[KVBatch], StepResult]) -> None:
++        self.fn = fn
++        self.calls: list[KVBatch] = []
++
++    def run(self, batch: KVBatch) -> StepResult:
++        self.calls.append(batch)
++        return self.fn(batch)
++
++
++class SequenceCapacityProvider:
++    def __init__(self, capacities: tuple[ResourceCapacity, ...]) -> None:
++        self.capacities = capacities
++        self.calls = 0
++
++    def capacity(self) -> ResourceCapacity:
++        capacity = self.capacities[self.calls]
++        self.calls += 1
++        return capacity
++
++
++class RaisingCapacityProvider:
++    def __init__(self) -> None:
++        self.calls = 0
++
++    def capacity(self) -> ResourceCapacity:
++        self.calls += 1
++        raise RuntimeError("capacity lookup failed")
++
++
++class InvalidCapacityProvider:
++    def __init__(self) -> None:
++        self.calls = 0
++
++    def capacity(self) -> ResourceCapacity:
++        self.calls += 1
++        return object()  # type: ignore[return-value]
++
++
++class TrackingSource:
++    def __init__(self, batch: KVBatch) -> None:
++        self.batch = batch
++        self.iterated = False
++
++    def __iter__(self) -> Iterator[KVBatch]:
++        self.iterated = True
++        yield self.batch
++
++
++def test_resource_monitor_satisfies_capacity_provider_protocol() -> None:
++    assert isinstance(ResourceMonitor(), ResourceCapacityProvider)
++    assert isinstance(
++        SequenceCapacityProvider((ResourceCapacity(cpu_total_bytes=100),)),
++        ResourceCapacityProvider,
++    )
++
++
++def test_capacity_provider_and_provenance_fields_are_appended_for_compatibility() -> None:
++    assert [field.name for field in fields(RuntimePassResult)][-1] == "resource_capacity"
++    assert [field.name for field in fields(RuntimePassSummary)][-1] == "resource_capacity"
++
++
++def test_no_capacity_path_preserves_none_provenance() -> None:
++    step = FakeRuntimeStep(
++        lambda batch: _sampled_result(batch, cpu_rss_bytes=50)
++    )
++    governor = ConservativeRuntimeGovernor(BatchBudget(max_items=2))
++    orchestrator = ConservativeRuntimeOrchestrator(step, governor)
++
++    pass_result = orchestrator.run_pass([_batch()])
++
++    assert pass_result.resource_capacity is None
++    assert pass_result.decision.pressure_summary is None
++    assert summarize_runtime_pass(pass_result).resource_capacity is None
++
++
++def test_fixed_capacity_path_records_pass_and_summary_provenance() -> None:
++    capacity = ResourceCapacity(cpu_total_bytes=100, cpu_limit_bytes=80)
++    step = FakeRuntimeStep(
++        lambda batch: _sampled_result(batch, cpu_rss_bytes=40)
++    )
++    governor = ConservativeRuntimeGovernor(
++        BatchBudget(max_items=2),
++        policy=GovernorPolicy(
++            grow_after_successes=1,
++            max_pressure_ratio_for_growth=0.8,
++        ),
++    )
++    orchestrator = ConservativeRuntimeOrchestrator(
++        step,
++        governor,
++        resource_capacity=capacity,
++    )
++
++    pass_result = orchestrator.run_pass([_batch()])
++    summary = summarize_runtime_pass(pass_result)
++
++    assert pass_result.resource_capacity == capacity
++    assert pass_result.decision.pressure_summary is not None
++    assert pass_result.decision.pressure_summary.peak_cpu_rss_ratio == 0.5
++    assert summary.resource_capacity == capacity
++    assert f"resource_capacity={capacity!r}" in format_runtime_pass_summary(summary)
++
++
++def test_provider_resolves_once_per_pass_and_refreshes_between_passes() -> None:
++    first_capacity = ResourceCapacity(cpu_total_bytes=100)
++    second_capacity = ResourceCapacity(cpu_total_bytes=200)
++    provider = SequenceCapacityProvider((first_capacity, second_capacity))
++    step = FakeRuntimeStep(
++        lambda batch: _sampled_result(batch, cpu_rss_bytes=50)
++    )
++    governor = ConservativeRuntimeGovernor(
++        BatchBudget(max_items=2),
++        policy=GovernorPolicy(
++            grow_after_successes=10,
++            max_pressure_ratio_for_growth=0.8,
++        ),
++    )
++    orchestrator = ConservativeRuntimeOrchestrator(
++        step,
++        governor,
++        resource_capacity_provider=provider,
++    )
++
++    first = orchestrator.run_pass([_batch(offset=0)])
++    second = orchestrator.run_pass([_batch(offset=10)])
++
++    assert provider.calls == 2
++    assert first.resource_capacity == first_capacity
++    assert second.resource_capacity == second_capacity
++    assert first.decision.pressure_summary is not None
++    assert second.decision.pressure_summary is not None
++    assert first.decision.pressure_summary.peak_cpu_rss_ratio == 0.5
++    assert second.decision.pressure_summary.peak_cpu_rss_ratio == 0.25
++
++
++def test_provider_is_called_once_for_retry_and_split_attempts() -> None:
++    provider = SequenceCapacityProvider((ResourceCapacity(cpu_total_bytes=100),))
++
++    def run(batch: KVBatch) -> StepResult:
++        if batch.batch_size > 2:
++            return _sampled_result(
++                batch,
++                cpu_rss_bytes=90,
++                status=StepStatus.OOM_FAULT,
++            )
++        return _sampled_result(batch, cpu_rss_bytes=20)
++
++    step = FakeRuntimeStep(run)
++    governor = ConservativeRuntimeGovernor(
++        BatchBudget(max_items=4),
++        policy=GovernorPolicy(shrink_factor=0.5),
++    )
++    orchestrator = ConservativeRuntimeOrchestrator(
++        step,
++        governor,
++        retry_policy=RetryPolicy(max_retry_depth=2, split_factor=2),
++        resource_capacity_provider=provider,
++    )
++
++    pass_result = orchestrator.run_pass([_batch(4)])
++
++    assert provider.calls == 1
++    assert [call.batch_size for call in step.calls] == [4, 2, 2]
++    assert pass_result.recovered_oom is True
++    assert pass_result.resource_capacity == ResourceCapacity(cpu_total_bytes=100)
++    assert pass_result.decision.pressure_summary is not None
++    assert pass_result.decision.pressure_summary.peak_cpu_rss_ratio == 0.9
++
++
++@pytest.mark.parametrize(
++    ("provider", "error_type", "message"),
++    [
++        (RaisingCapacityProvider(), RuntimeError, "capacity lookup failed"),
++        (InvalidCapacityProvider(), TypeError, "must return a ResourceCapacity"),
++    ],
++)
++def test_provider_failures_precede_source_consumption_and_governor_update(
++    provider: ResourceCapacityProvider,
++    error_type: type[Exception],
++    message: str,
++) -> None:
++    source = TrackingSource(_batch())
++    step = FakeRuntimeStep(
++        lambda batch: _sampled_result(batch, cpu_rss_bytes=50)
++    )
++    governor = ConservativeRuntimeGovernor(BatchBudget(max_items=2))
++    orchestrator = ConservativeRuntimeOrchestrator(
++        step,
++        governor,
++        resource_capacity_provider=provider,
++    )
++
++    with pytest.raises(error_type, match=message):
++        orchestrator.run_pass(source)
++
++    assert source.iterated is False
++    assert step.calls == []
++    assert governor.current_budget == BatchBudget(max_items=2)
++    assert governor.state.last_decision is None
++
++
++def test_orchestrator_rejects_invalid_or_conflicting_provider_configuration() -> None:
++    step = FakeRuntimeStep(
++        lambda batch: _sampled_result(batch, cpu_rss_bytes=50)
++    )
++    governor = ConservativeRuntimeGovernor(BatchBudget(max_items=2))
++
++    with pytest.raises(TypeError, match="resource_capacity_provider"):
++        ConservativeRuntimeOrchestrator(
++            step,
++            governor,
++            resource_capacity_provider=object(),  # type: ignore[arg-type]
++        )
++    with pytest.raises(ValueError, match="mutually exclusive"):
++        ConservativeRuntimeOrchestrator(
++            step,
++            governor,
++            resource_capacity=ResourceCapacity(cpu_total_bytes=100),
++            resource_capacity_provider=SequenceCapacityProvider(
++                (ResourceCapacity(cpu_total_bytes=100),)
++            ),
++        )
++
++
++def test_session_records_provider_capacity_per_pass() -> None:
++    first_capacity = ResourceCapacity(cpu_total_bytes=100)
++    second_capacity = ResourceCapacity(cpu_total_bytes=50)
++    provider = SequenceCapacityProvider((first_capacity, second_capacity))
++    step = FakeRuntimeStep(
++        lambda batch: _sampled_result(batch, cpu_rss_bytes=50)
++    )
++    governor = ConservativeRuntimeGovernor(
++        BatchBudget(max_items=2),
++        policy=GovernorPolicy(
++            grow_factor=2.0,
++            grow_after_successes=1,
++            max_items=8,
++            max_pressure_ratio_for_growth=0.8,
++        ),
++    )
++    orchestrator = ConservativeRuntimeOrchestrator(
++        step,
++        governor,
++        resource_capacity_provider=provider,
++    )
++    history = RuntimePassHistory(max_records=2)
++    session = ConservativeRuntimeSession(
++        orchestrator,
++        history,
++        max_passes=2,
++    )
++
++    first, second = list(
++        session.run_passes(
++            [
++                [_batch(offset=0)],
++                [_batch(offset=10)],
++            ]
++        )
++    )
++
++    assert provider.calls == 2
++    assert first.pass_result.resource_capacity == first_capacity
++    assert first.pass_summary.resource_capacity == first_capacity
++    assert first.pass_result.decision.next_budget == BatchBudget(max_items=4)
++    assert second.pass_result.resource_capacity == second_capacity
++    assert second.pass_summary.resource_capacity == second_capacity
++    assert second.pass_result.decision.next_budget == BatchBudget(max_items=4)
++    assert second.pass_result.decision.growth_suppressed_by_pressure is True
++    assert history.records == (first.pass_summary, second.pass_summary)
++
++
++def test_capacity_provider_is_dev_only_public_api() -> None:
++    assert "ResourceCapacityProvider" in runtime_api.__all__
++    assert runtime_api.ResourceCapacityProvider is ResourceCapacityProvider
++    assert "ResourceCapacityProvider" not in enn_torch.__all__
++    with pytest.raises(AttributeError):
++        getattr(enn_torch, "ResourceCapacityProvider")
+diff --git a/enn_torch_dev/debug/runtime/test_runtime_summary.py b/enn_torch_dev/debug/runtime/test_runtime_summary.py
+--- a/enn_torch_dev/debug/runtime/test_runtime_summary.py
++++ b/enn_torch_dev/debug/runtime/test_runtime_summary.py
+@@ -186,12 +186,13 @@ def test_summarize_runtime_pass_detects_budget_change_and_decision_metadata() ->
+     assert summary.peak_cuda_max_reserved_bytes == 55
+ 
+ 
+-def test_runtime_pass_summary_appends_pressure_fields_for_compatibility() -> None:
++def test_runtime_pass_summary_appends_feedback_and_capacity_fields_for_compatibility() -> None:
+     field_names = [field.name for field in fields(RuntimePassSummary)]
+ 
+-    assert field_names[-2:] == [
++    assert field_names[-3:] == [
+         "pressure_summary",
+         "growth_suppressed_by_pressure",
++        "resource_capacity",
+     ]
+ 
+ 
+diff --git a/docs/dev_runtime_orchestration.md b/docs/dev_runtime_orchestration.md
+--- a/docs/dev_runtime_orchestration.md
++++ b/docs/dev_runtime_orchestration.md
+@@ -14,7 +14,8 @@
+   -> BudgetedBatcher(current_budget)
+   -> RuntimeRetryRunner
+   -> StepResult stream
+-  -> optional ResourceCapacity + all raw-attempt ResourceSample records
++  -> optional fixed or pass-scoped ResourceCapacity
++  -> all raw-attempt ResourceSample records
+   -> assess_resource_pressure(...)
+   -> ConservativeRuntimeGovernor.observe_results(...)
+   -> GovernorDecision.next_budget
+@@ -29,6 +30,7 @@
+ 
+ `enn_torch_dev.runtime` exports:
+ 
++- `ResourceCapacityProvider`
+ - `RuntimePassResult`
+ - `ConservativeRuntimeOrchestrator`
+ 
+@@ -42,7 +44,8 @@
+ - a `ConservativeRuntimeGovernor` holding the active budget;
+ - optional `RetryPolicy` for `RuntimeRetryRunner`;
+ - optional `DataCostProbe` passed through to `BudgetedBatcher`;
+-- optional fixed `ResourceCapacity` used to assess one pass of resource samples;
++- optional fixed `ResourceCapacity` used to assess resource samples;
++- optional `ResourceCapacityProvider` resolved exactly once at each pass start;
+ - `split_oversized` and `min_items` values passed through to `BudgetedBatcher`.
+ 
+ `run_pass(source)` accepts a finite iterable of `KVBatch` objects and returns a
+@@ -51,7 +54,8 @@
+ - `results`: the finite tuple of yielded `StepResult` records;
+ - `decision`: the `GovernorDecision` produced after observing the pass results;
+ - `recovered_oom`: whether an internal OOM was observed by the retry runner but
+-  the final yielded results did not include an OOM result.
++  the final yielded results did not include an OOM result;
++- `resource_capacity`: the fixed or provider-resolved capacity used for that pass.
+ 
+ `current_budget` and `last_decision` proxy the governor's current state.
+ 
+@@ -73,15 +77,22 @@
+ This keeps retry-recovered OOM pressure visible to the governor while preserving
+ `RuntimeRetryRunner`'s side-effect-safe retry boundary.
+ 
+-## Pressure Summary Wiring
++## Capacity Resolution and Pressure Summary Wiring
+ 
+-When `resource_capacity` is configured, the same wrapper records
++`resource_capacity` and `resource_capacity_provider` are mutually exclusive.
++A provider is called exactly once after source type validation and before the
++source is consumed. The returned `ResourceCapacity` remains fixed for that
++entire pass, including all retry and split attempts. Provider exceptions and
++invalid return types propagate without source consumption or governor updates.
++
++When a fixed or provider-resolved capacity is available, the same wrapper records
+ `ResourceSample` objects from every raw runtime-step result, including OOM results
+ that are consumed internally by retry and do not appear in the final yielded
+ `results` tuple. After the finite retry stream completes, the orchestrator calls:
+ 
+ ```python
+-pressure_summary = assess_resource_pressure(raw_attempt_samples, resource_capacity)
++resolved_capacity = fixed_capacity_or_provider_capacity
++pressure_summary = assess_resource_pressure(raw_attempt_samples, resolved_capacity)
+ 
+ decision = governor.observe_results(
+     results,
+@@ -90,10 +101,10 @@
+ )
+ ```
+ 
+-This is an explicit fixed-capacity integration. The orchestrator does not create
+-a `ResourceMonitor`, discover capacity, or refresh capacity between passes. When
+-`resource_capacity` is `None`, no pressure summary is constructed and the
+-previous orchestration behavior is preserved.
++The orchestrator does not create a `ResourceMonitor`. A caller may explicitly
++supply an existing `ResourceMonitor` as the provider because it already exposes
++`capacity()`. Without fixed capacity or a provider, no pressure summary is
++constructed and the previous orchestration behavior is preserved.
+ 
+ A CUDA sample/capacity device mismatch remains an error from
+ `assess_resource_pressure(...)`; the orchestrator does not hide it or update the
+@@ -104,7 +115,8 @@
+ `RuntimePassResult.results` is a tuple. This is intentional for this finite
+ pass-level helper so callers can inspect the pass outcome together with the
+ budget decision. The raw-attempt sample list is pass-local and is reduced to the
+-scalar-only `ResourcePressureSummary` stored in `GovernorDecision`.
++scalar-only `ResourcePressureSummary` stored in `GovernorDecision`. The resolved
++`ResourceCapacity` is also a scalar-only frozen record stored as pass provenance.
+ 
+ Do not use this class as an unbounded production streaming runner. A future
+ streaming orchestration slice can avoid pass-level materialization while still
+@@ -130,7 +142,8 @@
+ - Learned or model-specific tuning.
+ - Persistent calibration caches or history databases.
+ - Unbounded production streaming orchestration.
+-- Automatic `ResourceMonitor` creation or capacity refresh.
++- Automatic `ResourceMonitor` creation.
++- Mid-pass capacity refresh or free-memory admission control.
+ - Pressure-triggered budget shrink or field-specific tuning.
+ - SPDL queue-depth tuning.
+ - Device transfer.
+@@ -142,6 +155,7 @@
+ ## Test Commands
+ 
+ ```bash
++python -m pytest enn_torch_dev/debug/runtime/test_runtime_capacity_provider.py -q
+ python -m pytest enn_torch_dev/debug/runtime/test_runtime_orchestration.py -q
+ python -m pytest enn_torch_dev/debug/runtime/test_runtime_governor.py -q
+ python -m pytest enn_torch_dev/debug/runtime/test_runtime_retry.py -q
+diff --git a/docs/dev_runtime_summary.md b/docs/dev_runtime_summary.md
+--- a/docs/dev_runtime_summary.md
++++ b/docs/dev_runtime_summary.md
+@@ -46,17 +46,19 @@
+ - governor success/OOM streak counters;
+ - resource peak values copied from `GovernorDecision`;
+ - the optional scalar-only `ResourcePressureSummary` copied from the decision;
+-- whether pressure suppressed success-driven budget growth.
++- whether pressure suppressed success-driven budget growth;
++- the scalar-only `ResourceCapacity` used to normalize that pass, when available.
+ 
+ `summarize_runtime_pass(pass_result)` accepts only a finite `RuntimePassResult`.
+ It scans the pass result tuple and stores only lightweight summary fields. It does
+ not retain `StepResult` objects, raw `ResourceSample` objects, `store`, or `loss`
+-references. A copied `ResourcePressureSummary` contains scalar ratios only.
++references. Copied `ResourcePressureSummary` and `ResourceCapacity` records contain
++scalar values only.
+ 
+ `format_runtime_pass_summary(summary)` returns stable human-readable text for a
+ `RuntimePassSummary`. The formatter includes whether pressure was assessed, the
+-maximum known pressure ratio (or `unknown`), and whether pressure suppressed
+-growth. It is intended for debug output and PR/report inspection, not for a
++maximum known pressure ratio (or `unknown`), whether pressure suppressed growth,
++and the resolved capacity provenance. It is intended for debug output and PR/report inspection, not for a
+ stable machine interchange format.
+ 
+ ## Relationship to Orchestration
+@@ -87,6 +89,7 @@
+ ## Test Commands
+ 
+ ```bash
++python -m pytest enn_torch_dev/debug/runtime/test_runtime_capacity_provider.py -q
+ python -m pytest enn_torch_dev/debug/runtime/test_runtime_summary.py -q
+ python -m pytest enn_torch_dev/debug/runtime/test_runtime_orchestration.py -q
+ python -m pytest enn_torch_dev/debug/runtime/test_runtime_governor.py -q
+diff --git a/docs/runtime_development_workflow.md b/docs/runtime_development_workflow.md
+--- a/docs/runtime_development_workflow.md
++++ b/docs/runtime_development_workflow.md
+@@ -12,7 +12,7 @@
+ finite KVBatch pass source
+   -> BudgetedBatcher
+   -> RuntimeRetryRunner
+-  -> optional fixed-capacity pressure assessment
++  -> optional fixed or pass-scoped capacity pressure assessment
+   -> ConservativeRuntimeGovernor
+   -> ConservativeRuntimeOrchestrator
+   -> RuntimePassSummary
+@@ -74,11 +74,13 @@
+ 
+ ## Optional pressure-aware composition
+ 
+-The governor pressure guard becomes operational in orchestration only when the
+-caller supplies a fixed `ResourceCapacity`:
++The governor pressure guard becomes operational when the caller supplies either
++a fixed `ResourceCapacity` or a pass-scoped `ResourceCapacityProvider`.
++`ResourceMonitor` already implements the provider contract, so one monitor can
++produce both runtime samples and pass-start capacity snapshots:
+ 
+ ```python
+-from enn_torch_dev.runtime import ResourceCapacity
++from enn_torch_dev.runtime import ResourceMonitor, RuntimeStep
+ 
+ governor = ConservativeRuntimeGovernor(
+     BatchBudget(max_items=8),
+@@ -88,27 +90,24 @@
+     ),
+ )
+ 
++monitor = ResourceMonitor(cuda_device=0)
++runtime_step = RuntimeStep(..., resource_monitor=monitor)
++
+ orchestrator = ConservativeRuntimeOrchestrator(
+     runtime_step,
+     governor,
+     retry_policy=RetryPolicy(max_retry_depth=3, min_items=1, split_factor=2),
+-    resource_capacity=ResourceCapacity(
+-        cpu_total_bytes=host_physical_bytes,
+-        cpu_limit_bytes=cgroup_limit_bytes,
+-        cuda_total_bytes=cuda_total_bytes,
+-        cuda_device_index=cuda_device_index,
+-    ),
+-)
+-```
+-
+-The orchestrator includes resource samples from every raw runtime attempt, not
+-only the final yielded retry results. The supplied capacity remains fixed for the
+-orchestrator instance. Callers that need refreshed capacity must construct or
+-replace the orchestrator explicitly; this workflow does not poll capacity between
+-passes.
+-
+-If no capacity is supplied, the orchestrator passes no pressure summary and the
+-existing governor contract applies. Pressure may suppress success-driven growth
++    resource_capacity_provider=monitor,
++)
++```
++
++The provider is called exactly once at each pass start, before the pass source is
++consumed. Its result remains fixed for that pass, including retry and split
++attempts. A caller may still use `resource_capacity=...` for a fixed snapshot, but
++fixed capacity and a provider cannot be configured together.
++
++If neither fixed capacity nor a provider is supplied, the orchestrator passes no
++pressure summary and the existing governor contract applies. Pressure may suppress
+ when the opt-in guard is enabled, but it does not directly shrink a budget.
+ 
+ ## Factory composition
+@@ -174,7 +173,8 @@
+ objects in `RuntimePassHistory`, which requires a positive `max_records` bound.
+ Pass summaries expose scalar pressure ratios and growth-suppression decisions;
+ history aggregates pressure-assessed and pressure-suppressed pass counts plus the
+-highest known ratio only within the currently retained summary window. Raw
++highest known ratio only within the currently retained summary window. Each pass
++summary also records the scalar capacity used for normalization. Raw
+ `ResourceSample` records are not retained by summary or history.
+ 
+ ## Fault and exception semantics
+@@ -182,7 +182,8 @@
+ A `StepStatus` fault is a completed runtime result. It does not automatically stop
+ the session. The governor observes it according to its documented policy.
+ 
+-Python exceptions from source iteration or pass execution are not suppressed.
++Provider, source-iteration, and pass-execution exceptions are not suppressed. A
++provider failure occurs before source consumption and before governor updates.
+ The failing pass is not added to history when execution or summary construction
+ fails before history append. Previously completed history records remain intact.
+ 
+@@ -198,7 +199,8 @@
+ - automatic source replay or source caching;
+ - distributed execution or aggregation;
+ - AutoGovernor or learned tuning;
+-- automatic `ResourceMonitor` creation or capacity refresh;
++- automatic `ResourceMonitor` creation;
++- mid-pass capacity refresh or free-memory admission control;
+ - pressure-triggered budget shrink or field-specific tuning;
+ - stable `enn_torch` API exposure.
+ 
+@@ -208,6 +210,7 @@
+ ## Validation
+ 
+ ```bash
++python -m pytest enn_torch_dev/debug/runtime/test_runtime_capacity_provider.py -q
+ python -m pytest enn_torch_dev/debug/runtime/test_runtime_source_factory.py -q
+ python -m pytest enn_torch_dev/debug/runtime/test_runtime_integration.py -q
+ python -m pytest enn_torch_dev/debug/runtime -q
+diff --git a/docs/CURRENT_STATE.md b/docs/CURRENT_STATE.md
+--- a/docs/CURRENT_STATE.md
++++ b/docs/CURRENT_STATE.md
+@@ -19,7 +19,7 @@
+ | `enn_torch_dev/data` | ACTIVE DEVELOPMENT | Development namespace for `DataSchema`, `FieldSpec`, `KeyMapping`, `KVBatch`, `BatchCost`, manifests, TensorDict staging/reading, and SPDL tensor adapter boundaries. |
+ | `enn_torch_dev/executor` | ACTIVE DEVELOPMENT | Development namespace for `KVStore`, node/subgraph/graph execution, plans, runners, model specs, graph/model/branch builders, tile, stream, global-local, and state routing. |
+ | `enn_torch_dev/nn` | ACTIVE DEVELOPMENT | Development namespace for blocks, attention, fusion, layers, recurrent components, and related types. |
+-| `enn_torch_dev/runtime` | ACTIVE DEVELOPMENT | Development namespace for loaders, runtime steps, fault/status records, model/resource cost probes, model/optimizer footprint, resource monitoring, resource capacity and pressure assessment, budgeted batching, OOM-class runtime retry, conservative StepResult-observing budget governance with an opt-in pressure guard for success growth, finite pass-level runtime orchestration with explicit fixed-capacity assessment of all raw-attempt resource samples, runtime pass summary inspection with pressure-feedback visibility, bounded in-memory runtime history aggregation of pressure assessment and growth suppression, bounded lazy multi-pass runtime sessions, fresh per-pass source factories, and end-to-end integration coverage for retry, budget transitions, history retention, identity order, and API boundaries. |
++| `enn_torch_dev/runtime` | ACTIVE DEVELOPMENT | Development namespace for loaders, runtime steps, fault/status records, model/resource cost probes, model/optimizer footprint, resource monitoring, resource capacity and pressure assessment, budgeted batching, OOM-class runtime retry, conservative StepResult-observing budget governance with an opt-in pressure guard for success growth, finite pass-level runtime orchestration with fixed or pass-scoped provider capacity assessment of all raw-attempt resource samples and per-pass capacity provenance, runtime pass summary inspection with pressure-feedback visibility, bounded in-memory runtime history aggregation of pressure assessment and growth suppression, bounded lazy multi-pass runtime sessions, fresh per-pass source factories, and end-to-end integration coverage for retry, budget transitions, history retention, identity order, and API boundaries. |
+ | `enn_torch_dev/debug` | CURRENT | Pytest debug suite for development data, executor, nn, and runtime areas. Do not add agent instruction Markdown files here. |
+ | Existing `docs/dev_*.md` | HISTORICAL | Implementation-slice design records for `enn_torch_dev`. Their `Next Step`, `Follow-up`, and `Out of Scope` sections are not current task instructions or confirmed roadmap items. |
+ | Runtime development workflow | CURRENT | `docs/runtime_development_workflow.md` documents the supported bounded single-node composition and its safety boundaries. |
+diff --git a/docs/RUNTIME_SAFETY.md b/docs/RUNTIME_SAFETY.md
+--- a/docs/RUNTIME_SAFETY.md
++++ b/docs/RUNTIME_SAFETY.md
+@@ -33,7 +33,9 @@
+ - Normalize CPU RSS against the smallest known physical or hierarchy-effective cgroup capacity; do not assume host physical memory or a leaf cgroup file is the process limit in containers.
+ - Do not clamp pressure ratios to `1.0`; ratios above one must remain visible for diagnosis.
+ - Feed pressure summaries into governor decisions only through the explicit opt-in growth guard; missing or high pressure may suppress growth but must not directly shrink a budget.
+-- When orchestration is given a fixed `ResourceCapacity`, include samples from retry-consumed attempts as well as final results; do not hide CUDA device mismatches or refresh capacity implicitly between passes.
++- When orchestration is given fixed or provider-resolved `ResourceCapacity`, include samples from retry-consumed attempts as well as final results.
++- Resolve a `ResourceCapacityProvider` exactly once before consuming each pass source; provider failures and invalid return types must remain visible and must not update governor state.
++- Keep the resolved capacity fixed within a pass; do not hide CUDA device mismatches or refresh capacity during retry/split execution.
+ - Do not add persistent logs, checkpoints, exports, source replay, distributed workers, or automatic tuning to the bounded development workflow without a separately reviewed safety contract.
+ - Confirm the stable `enn_torch` namespace is unchanged when adding development runtime helpers.
+ 
+diff --git a/docs/CHANGE_CHECKLIST.md b/docs/CHANGE_CHECKLIST.md
+--- a/docs/CHANGE_CHECKLIST.md
++++ b/docs/CHANGE_CHECKLIST.md
+@@ -16,7 +16,7 @@
+ | data schema and manifest | `enn_torch_dev/data/schema.py`, `manifest.py`, `batch.py`, `staging.py`, `readers.py` | `enn_torch_dev/debug/data -q` | `docs/CURRENT_STATE.md`, `docs/TESTING.md`, `docs/RUNTIME_SAFETY.md` | Breaking staged data compatibility, identity tensor semantics, schema validation changes |
+ | executor graph/node/tile/stream/state | `enn_torch_dev/executor/**` | `enn_torch_dev/debug/executor -q` | `docs/CURRENT_STATE.md`, `docs/TESTING.md`, executor docs if behavior changes | Execution ordering, state routing, public exports, tile/stream terminology |
+ | runtime step, retry, orchestration, session, source factory, and fault classification | `enn_torch_dev/runtime/step.py`, `retry.py`, `orchestration.py`, `session.py`, `source_factory.py`, `faults.py`, loader/runtime integration | `enn_torch_dev/debug/runtime/test_runtime_integration.py -q`; `enn_torch_dev/debug/runtime -q` | `docs/CURRENT_STATE.md`, `docs/TESTING.md`, `docs/RUNTIME_SAFETY.md`, relevant `docs/dev_*.md` | Incorrect success/fault reporting, retry loops, orchestration materialization scope, session over-consumption, factory over-invocation, source caching, exception suppression, recovered-OOM signaling, row-order changes, unverified failure modes, optimizer/loss behavior changes, cross-layer contract drift |
+-| resource monitoring, capacity/pressure assessment, cost/batching, runtime governor, orchestration, pass summaries, pass history, sessions, and source factories | `enn_torch_dev/runtime/cost.py`, `footprint.py`, `resources.py`, `pressure.py`, `batching.py`, `governor.py`, `orchestration.py`, `summary.py`, `history.py`, `session.py`, `source_factory.py` | `enn_torch_dev/debug/runtime/test_runtime_pressure.py -q`; `enn_torch_dev/debug/runtime/test_runtime_integration.py -q`; `enn_torch_dev/debug/runtime -q` | `docs/CURRENT_STATE.md`, `docs/TESTING.md`, `docs/RUNTIME_SAFETY.md`, relevant `docs/dev_*.md` | CPU/CUDA assumptions, cgroup v1/v2 path parsing, hierarchy-effective cgroup limit discovery, physical-vs-effective CPU capacity, capacity lookup fallback, device mismatch, unknown-vs-zero pressure semantics, unclamped ratios, pressure-threshold validation, missing-summary growth suppression, OOM priority over pressure, explicit-capacity orchestration wiring, retry-attempt sample inclusion, CUDA capacity/sample mismatch propagation, memory accounting semantics, oversized batch behavior, budget shrink/grow bounds, accidental execution/retry coupling, unbounded pass materialization, summary/history retaining `StepResult`, raw `ResourceSample`, `store`, or `loss` references, pressure summary field-order compatibility, retained-window pressure aggregation drift, unbounded history retention, retention-bound regression, unbounded session execution, session retaining previous pass results, factory returning cached or non-finite sources, unexpected persistent logging, stable namespace leakage, identity/order regression across split and retry paths |
++| resource monitoring, capacity/pressure assessment, cost/batching, runtime governor, orchestration, pass summaries, pass history, sessions, and source factories | `enn_torch_dev/runtime/cost.py`, `footprint.py`, `resources.py`, `capacity_provider.py`, `pressure.py`, `batching.py`, `governor.py`, `orchestration.py`, `summary.py`, `history.py`, `session.py`, `source_factory.py` | `enn_torch_dev/debug/runtime/test_runtime_pressure.py -q`; `enn_torch_dev/debug/runtime/test_runtime_integration.py -q`; `enn_torch_dev/debug/runtime -q` | `docs/CURRENT_STATE.md`, `docs/TESTING.md`, `docs/RUNTIME_SAFETY.md`, relevant `docs/dev_*.md` | CPU/CUDA assumptions, cgroup v1/v2 path parsing, hierarchy-effective cgroup limit discovery, physical-vs-effective CPU capacity, capacity lookup fallback, device mismatch, unknown-vs-zero pressure semantics, unclamped ratios, pressure-threshold validation, missing-summary growth suppression, OOM priority over pressure, fixed/provider capacity mutual exclusion, pass-start provider call count, provider failure before source consumption, invalid provider returns, per-pass capacity provenance, retry-attempt sample inclusion, CUDA capacity/sample mismatch propagation, memory accounting semantics, oversized batch behavior, budget shrink/grow bounds, accidental execution/retry coupling, unbounded pass materialization, summary/history retaining `StepResult`, raw `ResourceSample`, `store`, or `loss` references, pressure summary field-order compatibility, retained-window pressure aggregation drift, unbounded history retention, retention-bound regression, unbounded session execution, session retaining previous pass results, factory returning cached or non-finite sources, unexpected persistent logging, stable namespace leakage, identity/order regression across split and retry paths |
+ | dependency and optional extras | `pyproject.toml`, `requirements.txt`, `requirements-dev.txt` | Targeted import/test for affected dependency; report missing optional packages | `docs/CONTEXT.md`, `docs/TESTING.md`, `docs/RUNTIME_SAFETY.md` | Unrequested dependency changes, optional backend availability, platform markers |
+ | test layout and commands | `enn_torch_dev/debug/**`, pytest paths | New or moved tests themselves | `docs/TESTING.md`, `docs/CONTEXT.md` | Documenting non-existent commands, hiding skipped dependency or CUDA coverage |
+ | runtime safety and artifacts | Runtime IO/export/checkpoint code, staging writers, loaders, notebooks | Targeted tests using temp directories | `docs/RUNTIME_SAFETY.md`, `docs/CONTEXT.md` | Data loss, committed artifacts, secret leakage, long-running validation |
+diff --git a/docs/dev_runtime_capacity_provider.md b/docs/dev_runtime_capacity_provider.md
+new file mode 100644
+--- /dev/null
++++ b/docs/dev_runtime_capacity_provider.md
+@@ -0,0 +1,61 @@
++# Runtime Resource Capacity Provider
++
++`ResourceCapacityProvider` is the active-development protocol used to resolve one
++`ResourceCapacity` snapshot at the start of a finite runtime pass.
++
++## Public Object
++
++`enn_torch_dev.runtime` exports `ResourceCapacityProvider`. The stable
++`enn_torch` namespace does not expose it.
++
++## Contract
++
++A provider implements:
++
++```python
++class ResourceCapacityProvider(Protocol):
++    def capacity(self) -> ResourceCapacity:
++        ...
++```
++
++`ConservativeRuntimeOrchestrator` accepts either:
++
++- `resource_capacity=<fixed snapshot>`; or
++- `resource_capacity_provider=<provider>`.
++
++The two options are mutually exclusive. When a provider is configured:
++
++1. `capacity()` is called exactly once for each `run_pass(...)` call;
++2. the call occurs after source type validation but before source consumption;
++3. the returned capacity remains fixed for every batch, retry, and split attempt
++   within that pass;
++4. the resolved capacity is recorded in `RuntimePassResult` and
++   `RuntimePassSummary` as scalar provenance;
++5. provider exceptions and invalid return types propagate without updating the
++   governor or consuming the pass source.
++
++`ResourceMonitor` already provides a compatible `capacity()` method and therefore
++satisfies this protocol without an adapter.
++
++## Safety Boundary
++
++The provider contract does not:
++
++- create a `ResourceMonitor` automatically;
++- refresh capacity during a pass;
++- inspect real-time free memory;
++- reserve memory or perform admission control;
++- trigger pressure-based budget shrink;
++- persist telemetry.
++
++## Test Commands
++
++```bash
++python -m pytest enn_torch_dev/debug/runtime/test_runtime_capacity_provider.py -q
++python -m pytest enn_torch_dev/debug/runtime/test_runtime_orchestration.py -q
++python -m pytest enn_torch_dev/debug/runtime/test_runtime_summary.py -q
++python -m pytest enn_torch_dev/debug/runtime/test_runtime_integration.py -q
++python -m pytest enn_torch_dev/debug/runtime -q
++python -m pytest enn_torch_dev/debug -q
++git diff --check
++```
