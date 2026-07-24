@@ -93,8 +93,9 @@ Decision priority is deliberately small and predictable:
 5. If every observed result is `StepStatus.SUCCESS` and `recovered_oom=False`,
    an optional sustained-pressure shrink guard is evaluated before success evidence is
    accumulated.
-6. With `max_pressure_ratio_for_growth=None`, pressure does not change the existing
-   success-growth behavior.
+6. When both `max_pressure_ratio_for_growth` and
+   `min_pressure_ratio_for_shrink` are `None`, pressure does not change the
+   existing success-growth behavior.
 7. With the guard enabled, a missing pressure summary, an all-unknown summary, or
    `pressure_summary.max_observed_ratio >= max_pressure_ratio_for_growth` keeps the
    budget and resets the success streak to zero.
