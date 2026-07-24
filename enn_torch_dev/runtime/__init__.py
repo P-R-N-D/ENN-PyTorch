@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from .batching import BatchBudget, BatchBudgetExceeded, BudgetedBatcher
+from .capacity_provider import ResourceCapacityProvider
 from .cost import (
     DataCost,
     DataCostProbe,
@@ -57,6 +58,7 @@ __all__ = [
     "OptimizerFootprint",
     "PlainLoader",
     "ResourceCapacity",
+    "ResourceCapacityProvider",
     "ResourceMonitor",
     "ResourceDelta",
     "ResourcePressureSummary",

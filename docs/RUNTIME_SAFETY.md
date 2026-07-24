@@ -33,7 +33,9 @@ Use this document before running code that can allocate accelerator memory, writ
 - Normalize CPU RSS against the smallest known physical or hierarchy-effective cgroup capacity; do not assume host physical memory or a leaf cgroup file is the process limit in containers.
 - Do not clamp pressure ratios to `1.0`; ratios above one must remain visible for diagnosis.
 - Feed pressure summaries into governor decisions only through the explicit opt-in growth guard; missing or high pressure may suppress growth but must not directly shrink a budget.
-- When orchestration is given a fixed `ResourceCapacity`, include samples from retry-consumed attempts as well as final results; do not hide CUDA device mismatches or refresh capacity implicitly between passes.
+- When orchestration is given fixed or provider-resolved `ResourceCapacity`, include samples from retry-consumed attempts as well as final results.
+- Resolve a `ResourceCapacityProvider` exactly once before consuming each pass source; provider failures and invalid return types must remain visible and must not update governor state.
+- Keep the resolved capacity fixed within a pass; do not hide CUDA device mismatches or refresh capacity during retry/split execution.
 - Do not add persistent logs, checkpoints, exports, source replay, distributed workers, or automatic tuning to the bounded development workflow without a separately reviewed safety contract.
 - Confirm the stable `enn_torch` namespace is unchanged when adding development runtime helpers.
 
