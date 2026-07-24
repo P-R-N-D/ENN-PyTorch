@@ -108,7 +108,8 @@ fixed capacity and a provider cannot be configured together.
 
 If neither fixed capacity nor a provider is supplied, the orchestrator passes no
 pressure summary and the existing governor contract applies. Pressure may suppress
-when the opt-in guard is enabled, but it does not directly shrink a budget.
+success-driven growth when the opt-in guard is enabled, but it does not directly
+shrink a budget.
 
 ## Factory composition
 
