@@ -582,6 +582,14 @@ class ConservativeRuntimeGovernor:
                             + "no matching byte budget or max_items fallback is configured"
                         )
                 else:
+                    high_dimensions = tuple(
+                        dimension
+                        for dimension, pressure_high in (
+                            ("cpu", cpu_pressure_high),
+                            ("cuda", cuda_pressure_high),
+                        )
+                        if pressure_high
+                    )
                     progress_parts: list[str] = []
                     if cpu_shrink_limit is not None:
                         cpu_ratio = pressure_summary.peak_cpu_rss_ratio
@@ -604,7 +612,8 @@ class ConservativeRuntimeGovernor:
                             f"(limit={cuda_shrink_limit:.6g}, ratio={cuda_ratio_text})"
                         )
                     reason = (
-                        "resource pressure reached configured dimension shrink limits; "
+                        "resource pressure reached configured shrink limit for dimensions: "
+                        f"{', '.join(high_dimensions)}; "
                         f"pressure streaks {', '.join(progress_parts)}; "
                         "suppressing budget growth"
                     )
