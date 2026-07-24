@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from enn_torch_dev.data import KVBatch
 
 from .batching import BatchBudget, BudgetedBatcher
+from .capacity_provider import ResourceCapacityProvider
 from .cost import DataCostProbe
 from .faults import ResourceSample, StepResult, StepStatus
 from .governor import ConservativeRuntimeGovernor, GovernorDecision
@@ -20,6 +21,7 @@ class RuntimePassResult:
     results: tuple[StepResult, ...]
     decision: GovernorDecision
     recovered_oom: bool = False
+    resource_capacity: ResourceCapacity | None = None
 
 
 class _OomTrackingRuntimeStep:
@@ -58,6 +60,7 @@ class ConservativeRuntimeOrchestrator:
         retry_policy: RetryPolicy | None = None,
         cost_probe: DataCostProbe | None = None,
         resource_capacity: ResourceCapacity | None = None,
+        resource_capacity_provider: ResourceCapacityProvider | None = None,
         split_oversized: bool = True,
         min_items: int = 1,
     ) -> None:
@@ -84,6 +87,18 @@ class ConservativeRuntimeOrchestrator:
                 "ConservativeRuntimeOrchestrator.resource_capacity must be a "
                 "ResourceCapacity or None."
             )
+        if resource_capacity_provider is not None and not isinstance(
+            resource_capacity_provider, ResourceCapacityProvider
+        ):
+            raise TypeError(
+                "ConservativeRuntimeOrchestrator.resource_capacity_provider must be a "
+                "ResourceCapacityProvider or None."
+            )
+        if resource_capacity is not None and resource_capacity_provider is not None:
+            raise ValueError(
+                "ConservativeRuntimeOrchestrator.resource_capacity and "
+                "resource_capacity_provider are mutually exclusive."
+            )
         if not isinstance(split_oversized, bool):
             raise TypeError("ConservativeRuntimeOrchestrator.split_oversized must be a bool.")
         if not isinstance(min_items, int) or isinstance(min_items, bool):
@@ -96,8 +111,20 @@ class ConservativeRuntimeOrchestrator:
         self.retry_policy = retry_policy
         self.cost_probe = cost_probe
         self.resource_capacity = resource_capacity
+        self.resource_capacity_provider = resource_capacity_provider
         self.split_oversized = split_oversized
         self.min_items = min_items
+
+    def _resolve_resource_capacity(self) -> ResourceCapacity | None:
+        provider = self.resource_capacity_provider
+        if provider is None:
+            return self.resource_capacity
+        capacity = provider.capacity()
+        if not isinstance(capacity, ResourceCapacity):
+            raise TypeError(
+                "ResourceCapacityProvider.capacity() must return a ResourceCapacity."
+            )
+        return capacity
 
     @property
     def current_budget(self) -> BatchBudget:
@@ -117,9 +144,10 @@ class ConservativeRuntimeOrchestrator:
                 "ConservativeRuntimeOrchestrator.run_pass expects an iterable of KVBatch."
             )
 
+        resolved_capacity = self._resolve_resource_capacity()
         tracking_step = _OomTrackingRuntimeStep(
             self.runtime_step,
-            collect_resource_samples=self.resource_capacity is not None,
+            collect_resource_samples=resolved_capacity is not None,
         )
         budgeted = BudgetedBatcher(
             source,
@@ -135,9 +163,9 @@ class ConservativeRuntimeOrchestrator:
         pressure_summary = (
             assess_resource_pressure(
                 tracking_step.resource_samples,
-                self.resource_capacity,
+                resolved_capacity,
             )
-            if self.resource_capacity is not None
+            if resolved_capacity is not None
             else None
         )
         decision = self.governor.observe_results(
@@ -149,4 +177,5 @@ class ConservativeRuntimeOrchestrator:
             results=results,
             decision=decision,
             recovered_oom=recovered_oom,
+            resource_capacity=resolved_capacity,
         )

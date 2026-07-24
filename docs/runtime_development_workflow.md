@@ -12,7 +12,7 @@ the stable `enn_torch` namespace.
 finite KVBatch pass source
   -> BudgetedBatcher
   -> RuntimeRetryRunner
-  -> optional fixed-capacity pressure assessment
+  -> optional fixed or pass-scoped capacity pressure assessment
   -> ConservativeRuntimeGovernor
   -> ConservativeRuntimeOrchestrator
   -> RuntimePassSummary
@@ -74,11 +74,13 @@ for record in session.run_passes(pass_sources):
 
 ## Optional pressure-aware composition
 
-The governor pressure guard becomes operational in orchestration only when the
-caller supplies a fixed `ResourceCapacity`:
+The governor pressure guard becomes operational when the caller supplies either
+a fixed `ResourceCapacity` or a pass-scoped `ResourceCapacityProvider`.
+`ResourceMonitor` already implements the provider contract, so one monitor can
+produce both runtime samples and pass-start capacity snapshots:
 
 ```python
-from enn_torch_dev.runtime import ResourceCapacity
+from enn_torch_dev.runtime import ResourceMonitor, RuntimeStep
 
 governor = ConservativeRuntimeGovernor(
     BatchBudget(max_items=8),
@@ -88,27 +90,24 @@ governor = ConservativeRuntimeGovernor(
     ),
 )
 
+monitor = ResourceMonitor(cuda_device=0)
+runtime_step = RuntimeStep(..., resource_monitor=monitor)
+
 orchestrator = ConservativeRuntimeOrchestrator(
     runtime_step,
     governor,
     retry_policy=RetryPolicy(max_retry_depth=3, min_items=1, split_factor=2),
-    resource_capacity=ResourceCapacity(
-        cpu_total_bytes=host_physical_bytes,
-        cpu_limit_bytes=cgroup_limit_bytes,
-        cuda_total_bytes=cuda_total_bytes,
-        cuda_device_index=cuda_device_index,
-    ),
+    resource_capacity_provider=monitor,
 )
 ```
 
-The orchestrator includes resource samples from every raw runtime attempt, not
-only the final yielded retry results. The supplied capacity remains fixed for the
-orchestrator instance. Callers that need refreshed capacity must construct or
-replace the orchestrator explicitly; this workflow does not poll capacity between
-passes.
+The provider is called exactly once at each pass start, before the pass source is
+consumed. Its result remains fixed for that pass, including retry and split
+attempts. A caller may still use `resource_capacity=...` for a fixed snapshot, but
+fixed capacity and a provider cannot be configured together.
 
-If no capacity is supplied, the orchestrator passes no pressure summary and the
-existing governor contract applies. Pressure may suppress success-driven growth
+If neither fixed capacity nor a provider is supplied, the orchestrator passes no
+pressure summary and the existing governor contract applies. Pressure may suppress
 when the opt-in guard is enabled, but it does not directly shrink a budget.
 
 ## Factory composition
@@ -174,7 +173,8 @@ Longer-lived in-memory retention is limited to lightweight `RuntimePassSummary`
 objects in `RuntimePassHistory`, which requires a positive `max_records` bound.
 Pass summaries expose scalar pressure ratios and growth-suppression decisions;
 history aggregates pressure-assessed and pressure-suppressed pass counts plus the
-highest known ratio only within the currently retained summary window. Raw
+highest known ratio only within the currently retained summary window. Each pass
+summary also records the scalar capacity used for normalization. Raw
 `ResourceSample` records are not retained by summary or history.
 
 ## Fault and exception semantics
@@ -182,7 +182,8 @@ highest known ratio only within the currently retained summary window. Raw
 A `StepStatus` fault is a completed runtime result. It does not automatically stop
 the session. The governor observes it according to its documented policy.
 
-Python exceptions from source iteration or pass execution are not suppressed.
+Provider, source-iteration, and pass-execution exceptions are not suppressed. A
+provider failure occurs before source consumption and before governor updates.
 The failing pass is not added to history when execution or summary construction
 fails before history append. Previously completed history records remain intact.
 
@@ -198,7 +199,8 @@ It does not provide:
 - automatic source replay or source caching;
 - distributed execution or aggregation;
 - AutoGovernor or learned tuning;
-- automatic `ResourceMonitor` creation or capacity refresh;
+- automatic `ResourceMonitor` creation;
+- mid-pass capacity refresh or free-memory admission control;
 - pressure-triggered budget shrink or field-specific tuning;
 - stable `enn_torch` API exposure.
 
@@ -208,6 +210,7 @@ unbounded production streaming runner.
 ## Validation
 
 ```bash
+python -m pytest enn_torch_dev/debug/runtime/test_runtime_capacity_provider.py -q
 python -m pytest enn_torch_dev/debug/runtime/test_runtime_source_factory.py -q
 python -m pytest enn_torch_dev/debug/runtime/test_runtime_integration.py -q
 python -m pytest enn_torch_dev/debug/runtime -q

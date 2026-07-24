@@ -9,7 +9,7 @@ from .batching import BatchBudget
 from .faults import StepResult, StepStatus
 from .governor import GovernorDecision
 from .orchestration import RuntimePassResult
-from .pressure import ResourcePressureSummary
+from .pressure import ResourceCapacity, ResourcePressureSummary
 
 
 @dataclass(frozen=True, slots=True)
@@ -36,6 +36,7 @@ class RuntimePassSummary:
     peak_cuda_max_reserved_bytes: int | None = None
     pressure_summary: ResourcePressureSummary | None = None
     growth_suppressed_by_pressure: bool = False
+    resource_capacity: ResourceCapacity | None = None
 
 
 def summarize_runtime_pass(pass_result: RuntimePassResult) -> RuntimePassSummary:
@@ -83,6 +84,7 @@ def summarize_runtime_pass(pass_result: RuntimePassResult) -> RuntimePassSummary
         peak_cuda_max_reserved_bytes=decision.peak_cuda_max_reserved_bytes,
         pressure_summary=decision.pressure_summary,
         growth_suppressed_by_pressure=decision.growth_suppressed_by_pressure,
+        resource_capacity=pass_result.resource_capacity,
     )
 
 
@@ -113,6 +115,7 @@ def format_runtime_pass_summary(summary: RuntimePassSummary) -> str:
             f"next_budget={summary.next_budget!r}",
             f"consecutive_successes={summary.consecutive_successes}",
             f"consecutive_ooms={summary.consecutive_ooms}",
+            f"resource_capacity={summary.resource_capacity!r}",
             f"pressure_assessed={pressure_summary is not None}",
             f"max_pressure_ratio={_format_optional_ratio(max_pressure_ratio)}",
             f"growth_suppressed_by_pressure={summary.growth_suppressed_by_pressure}",

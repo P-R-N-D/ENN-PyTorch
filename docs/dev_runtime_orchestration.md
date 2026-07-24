@@ -14,7 +14,8 @@ KVBatch source
   -> BudgetedBatcher(current_budget)
   -> RuntimeRetryRunner
   -> StepResult stream
-  -> optional ResourceCapacity + all raw-attempt ResourceSample records
+  -> optional fixed or pass-scoped ResourceCapacity
+  -> all raw-attempt ResourceSample records
   -> assess_resource_pressure(...)
   -> ConservativeRuntimeGovernor.observe_results(...)
   -> GovernorDecision.next_budget
@@ -29,6 +30,7 @@ next pass.
 
 `enn_torch_dev.runtime` exports:
 
+- `ResourceCapacityProvider`
 - `RuntimePassResult`
 - `ConservativeRuntimeOrchestrator`
 
@@ -42,7 +44,8 @@ The stable `enn_torch` namespace does not expose this development orchestrator.
 - a `ConservativeRuntimeGovernor` holding the active budget;
 - optional `RetryPolicy` for `RuntimeRetryRunner`;
 - optional `DataCostProbe` passed through to `BudgetedBatcher`;
-- optional fixed `ResourceCapacity` used to assess one pass of resource samples;
+- optional fixed `ResourceCapacity` used to assess resource samples;
+- optional `ResourceCapacityProvider` resolved exactly once at each pass start;
 - `split_oversized` and `min_items` values passed through to `BudgetedBatcher`.
 
 `run_pass(source)` accepts a finite iterable of `KVBatch` objects and returns a
@@ -51,7 +54,8 @@ The stable `enn_torch` namespace does not expose this development orchestrator.
 - `results`: the finite tuple of yielded `StepResult` records;
 - `decision`: the `GovernorDecision` produced after observing the pass results;
 - `recovered_oom`: whether an internal OOM was observed by the retry runner but
-  the final yielded results did not include an OOM result.
+  the final yielded results did not include an OOM result;
+- `resource_capacity`: the fixed or provider-resolved capacity used for that pass.
 
 `current_budget` and `last_decision` proxy the governor's current state.
 
@@ -73,15 +77,22 @@ ConservativeRuntimeGovernor.observe_results(results, recovered_oom=True)
 This keeps retry-recovered OOM pressure visible to the governor while preserving
 `RuntimeRetryRunner`'s side-effect-safe retry boundary.
 
-## Pressure Summary Wiring
+## Capacity Resolution and Pressure Summary Wiring
 
-When `resource_capacity` is configured, the same wrapper records
+`resource_capacity` and `resource_capacity_provider` are mutually exclusive.
+A provider is called exactly once after source type validation and before the
+source is consumed. The returned `ResourceCapacity` remains fixed for that
+entire pass, including all retry and split attempts. Provider exceptions and
+invalid return types propagate without source consumption or governor updates.
+
+When a fixed or provider-resolved capacity is available, the same wrapper records
 `ResourceSample` objects from every raw runtime-step result, including OOM results
 that are consumed internally by retry and do not appear in the final yielded
 `results` tuple. After the finite retry stream completes, the orchestrator calls:
 
 ```python
-pressure_summary = assess_resource_pressure(raw_attempt_samples, resource_capacity)
+resolved_capacity = fixed_capacity_or_provider_capacity
+pressure_summary = assess_resource_pressure(raw_attempt_samples, resolved_capacity)
 
 decision = governor.observe_results(
     results,
@@ -90,10 +101,10 @@ decision = governor.observe_results(
 )
 ```
 
-This is an explicit fixed-capacity integration. The orchestrator does not create
-a `ResourceMonitor`, discover capacity, or refresh capacity between passes. When
-`resource_capacity` is `None`, no pressure summary is constructed and the
-previous orchestration behavior is preserved.
+The orchestrator does not create a `ResourceMonitor`. A caller may explicitly
+supply an existing `ResourceMonitor` as the provider because it already exposes
+`capacity()`. Without fixed capacity or a provider, no pressure summary is
+constructed and the previous orchestration behavior is preserved.
 
 A CUDA sample/capacity device mismatch remains an error from
 `assess_resource_pressure(...)`; the orchestrator does not hide it or update the
@@ -104,7 +115,8 @@ governor state after that failed assessment.
 `RuntimePassResult.results` is a tuple. This is intentional for this finite
 pass-level helper so callers can inspect the pass outcome together with the
 budget decision. The raw-attempt sample list is pass-local and is reduced to the
-scalar-only `ResourcePressureSummary` stored in `GovernorDecision`.
+scalar-only `ResourcePressureSummary` stored in `GovernorDecision`. The resolved
+`ResourceCapacity` is also a scalar-only frozen record stored as pass provenance.
 
 Do not use this class as an unbounded production streaming runner. A future
 streaming orchestration slice can avoid pass-level materialization while still
@@ -130,7 +142,8 @@ orchestrator.
 - Learned or model-specific tuning.
 - Persistent calibration caches or history databases.
 - Unbounded production streaming orchestration.
-- Automatic `ResourceMonitor` creation or capacity refresh.
+- Automatic `ResourceMonitor` creation.
+- Mid-pass capacity refresh or free-memory admission control.
 - Pressure-triggered budget shrink or field-specific tuning.
 - SPDL queue-depth tuning.
 - Device transfer.
@@ -142,6 +155,7 @@ orchestrator.
 ## Test Commands
 
 ```bash
+python -m pytest enn_torch_dev/debug/runtime/test_runtime_capacity_provider.py -q
 python -m pytest enn_torch_dev/debug/runtime/test_runtime_orchestration.py -q
 python -m pytest enn_torch_dev/debug/runtime/test_runtime_governor.py -q
 python -m pytest enn_torch_dev/debug/runtime/test_runtime_retry.py -q

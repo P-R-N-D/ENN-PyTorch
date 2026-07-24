@@ -184,12 +184,13 @@ def test_summarize_runtime_pass_detects_budget_change_and_decision_metadata() ->
     assert summary.peak_cuda_max_reserved_bytes == 55
 
 
-def test_runtime_pass_summary_appends_pressure_fields_for_compatibility() -> None:
+def test_runtime_pass_summary_appends_feedback_and_capacity_fields_for_compatibility() -> None:
     field_names = [field.name for field in fields(RuntimePassSummary)]
 
-    assert field_names[-2:] == [
+    assert field_names[-3:] == [
         "pressure_summary",
         "growth_suppressed_by_pressure",
+        "resource_capacity",
     ]
 
 
