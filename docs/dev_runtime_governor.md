@@ -102,13 +102,17 @@ Decision priority is deliberately small and predictable:
 8. A known maximum pressure ratio below the configured limit allows the success
    streak to increase by one for the observe call.
 9. With `min_pressure_ratio_for_shrink` configured, a known maximum ratio at or
-   above that threshold increments a high-pressure streak, suppresses growth, and
-   shrinks the next budget only when `shrink_after_pressure_passes` is reached.
+   above that threshold increments only the matching CPU or CUDA pressure streak,
+   suppresses growth, and shrinks the next budget only when that dimension reaches
+   `shrink_after_pressure_passes`.
    CPU pressure selects `max_host_bytes`; any CUDA allocated/reserved/max ratio
    selects `max_device_bytes`. If no matching byte budget is configured,
    `max_items` is the fallback. When at least one matching byte budget is
-   configured, `max_items` remains unchanged. Low, unavailable, empty, or faulted
-   passes reset this streak.
+   configured, `max_items` remains unchanged. A low or unknown observation resets
+   only that dimension's streak; a fully unavailable summary, empty pass, fault,
+   yielded OOM, or retry-recovered OOM resets both dimension streaks.
+   A dimension that reaches the threshold resets after its shrink decision without
+   clearing the other dimension's incomplete streak.
 10. Retry-recovered OOM is not success evidence and does not increase the success
    streak.
 11. The success streak does not increase per successful `StepResult`.
@@ -125,6 +129,8 @@ Decision priority is deliberately small and predictable:
 - `consecutive_ooms`
 - `last_decision`
 - `consecutive_high_pressure_passes`
+- `consecutive_cpu_pressure_passes`
+- `consecutive_cuda_pressure_passes`
 
 `ConservativeRuntimeGovernor` replaces its state with a new
 `RuntimeGovernorState` after each observation. It does not mutate a state object
@@ -134,7 +140,15 @@ that was passed in from outside.
 statuses, updated streak counters, resource peaks, the supplied pressure summary,
 whether pressure suppressed success growth, whether sustained pressure actually
 changed the next budget, and the ordered tuple of budget fields whose values
-actually changed because of pressure.
+actually changed because of pressure. `consecutive_high_pressure_passes` remains a
+compatibility aggregate equal to the maximum of the CPU and CUDA streaks in every
+new decision and state.
+
+For compatibility with state constructed before dimension-specific streak fields
+existed, a positive legacy `consecutive_high_pressure_passes` value is inherited by
+the currently high dimension or dimensions only when both new streak fields are
+zero. After the next observation, the governor emits explicit CPU/CUDA streaks and
+recomputes the compatibility aggregate.
 
 ## Resource Samples
 
@@ -158,6 +172,10 @@ byte budget, while every CUDA pressure ratio maps to the device byte budget.
 `max_items` is used only when none of the pressured dimensions has a configured
 matching byte budget. OOM and retry-recovered OOM continue to shrink every
 configured budget field and do not populate the pressure-specific field tuple.
+CPU and CUDA persistence are tracked independently, so alternating CPU-only and
+CUDA-only high-pressure passes cannot combine into a sustained-pressure shrink.
+When both dimensions are continuously high, each can reach the threshold and
+trigger its matching budget adjustment in the same pass.
 
 ## Relationship to Orchestration
 
@@ -174,7 +192,7 @@ execute models, discover capacity, or construct a pressure summary.
 - Full AutoGovernor behavior.
 - Learned or model-specific tuning.
 - Persistent calibration caches or history databases.
-- Per-dimension streak tracking or learned field weights.
+- Per-dimension thresholds, shrink factors, or learned field weights.
 - Automatic pressure-summary construction inside the governor.
 - Automatic capacity discovery or refresh inside the orchestrator.
 - `ModelCostProbe`-driven policy changes.

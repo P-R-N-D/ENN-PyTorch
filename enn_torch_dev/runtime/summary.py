@@ -40,6 +40,8 @@ class RuntimePassSummary:
     consecutive_high_pressure_passes: int = 0
     budget_shrunk_by_pressure: bool = False
     pressure_shrunk_budget_fields: tuple[str, ...] = ()
+    consecutive_cpu_pressure_passes: int = 0
+    consecutive_cuda_pressure_passes: int = 0
 
 
 def summarize_runtime_pass(pass_result: RuntimePassResult) -> RuntimePassSummary:
@@ -91,6 +93,8 @@ def summarize_runtime_pass(pass_result: RuntimePassResult) -> RuntimePassSummary
         consecutive_high_pressure_passes=decision.consecutive_high_pressure_passes,
         budget_shrunk_by_pressure=decision.budget_shrunk_by_pressure,
         pressure_shrunk_budget_fields=decision.pressure_shrunk_budget_fields,
+        consecutive_cpu_pressure_passes=decision.consecutive_cpu_pressure_passes,
+        consecutive_cuda_pressure_passes=decision.consecutive_cuda_pressure_passes,
     )
 
 
@@ -126,6 +130,10 @@ def format_runtime_pass_summary(summary: RuntimePassSummary) -> str:
             f"max_pressure_ratio={_format_optional_ratio(max_pressure_ratio)}",
             f"growth_suppressed_by_pressure={summary.growth_suppressed_by_pressure}",
             f"consecutive_high_pressure_passes={summary.consecutive_high_pressure_passes}",
+            "consecutive_cpu_pressure_passes="
+            f"{summary.consecutive_cpu_pressure_passes}",
+            "consecutive_cuda_pressure_passes="
+            f"{summary.consecutive_cuda_pressure_passes}",
             f"budget_shrunk_by_pressure={summary.budget_shrunk_by_pressure}",
             "pressure_shrunk_budget_fields="
             f"{summary.pressure_shrunk_budget_fields!r}",
