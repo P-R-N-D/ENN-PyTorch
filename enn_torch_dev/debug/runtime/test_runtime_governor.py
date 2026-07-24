@@ -40,6 +40,14 @@ def _field_values(instance: object) -> list[object]:
     return [getattr(instance, field.name) for field in fields(instance)]
 
 
+def _reason_high_dimensions(reason: str) -> str:
+    return (
+        reason
+        .split("configured shrink limit for dimensions: ", 1)[1]
+        .split(";", 1)[0]
+    )
+
+
 def test_empty_result_stream_keeps_budget() -> None:
     budget = BatchBudget(max_items=8)
     governor = ConservativeRuntimeGovernor(budget)
@@ -80,9 +88,20 @@ def test_success_streak_counts_observe_calls_not_result_count() -> None:
 
 def test_governor_policy_preserves_existing_positional_field_order() -> None:
     policy = GovernorPolicy(0.5, 2.0, 3, 1, 8, 10, 100, 20, 200)
+    field_names = [field.name for field in fields(GovernorPolicy)]
 
     assert policy.max_device_bytes == 200
     assert policy.max_pressure_ratio_for_growth is None
+    assert field_names[-4:] == [
+        "min_cpu_pressure_ratio_for_shrink",
+        "min_cuda_pressure_ratio_for_shrink",
+        "cpu_shrink_after_pressure_passes",
+        "cuda_shrink_after_pressure_passes",
+    ]
+    assert policy.min_cpu_pressure_ratio_for_shrink is None
+    assert policy.min_cuda_pressure_ratio_for_shrink is None
+    assert policy.cpu_shrink_after_pressure_passes is None
+    assert policy.cuda_shrink_after_pressure_passes is None
 
 
 def test_governor_decision_appends_pressure_field_selection_for_compatibility() -> None:
@@ -248,6 +267,172 @@ def test_sustained_cpu_and_cuda_pressure_shrink_both_byte_budgets() -> None:
         "max_host_bytes",
         "max_device_bytes",
     )
+
+
+def test_dimension_threshold_override_can_activate_cpu_only() -> None:
+    governor = ConservativeRuntimeGovernor(
+        BatchBudget(max_items=8, max_host_bytes=100, max_device_bytes=200),
+        policy=GovernorPolicy(
+            shrink_factor=0.5,
+            min_cpu_pressure_ratio_for_shrink=0.8,
+            cpu_shrink_after_pressure_passes=1,
+        ),
+    )
+
+    decision = governor.observe_results(
+        [_result()],
+        pressure_summary=ResourcePressureSummary(
+            peak_cpu_rss_ratio=0.85,
+            peak_cuda_reserved_ratio=1.20,
+        ),
+    )
+
+    assert decision.next_budget == BatchBudget(
+        max_items=8,
+        max_host_bytes=50,
+        max_device_bytes=200,
+    )
+    assert decision.consecutive_cpu_pressure_passes == 0
+    assert decision.consecutive_cuda_pressure_passes == 0
+    assert decision.pressure_shrunk_budget_fields == ("max_host_bytes",)
+    assert "triggered policies: cpu(limit=0.8, required=1)" in decision.reason
+    assert "cuda=" not in decision.reason.split("current triggered ratios: ", 1)[1].split(";", 1)[0]
+
+
+def test_dimension_thresholds_and_pass_counts_trigger_independently() -> None:
+    governor = ConservativeRuntimeGovernor(
+        BatchBudget(max_items=8, max_host_bytes=100, max_device_bytes=200),
+        policy=GovernorPolicy(
+            shrink_factor=0.5,
+            min_cpu_pressure_ratio_for_shrink=0.8,
+            min_cuda_pressure_ratio_for_shrink=0.95,
+            cpu_shrink_after_pressure_passes=2,
+            cuda_shrink_after_pressure_passes=3,
+        ),
+    )
+    pressure = ResourcePressureSummary(
+        peak_cpu_rss_ratio=0.85,
+        peak_cuda_reserved_ratio=0.96,
+    )
+
+    first = governor.observe_results([_result()], pressure_summary=pressure)
+    second = governor.observe_results([_result()], pressure_summary=pressure)
+    third = governor.observe_results([_result()], pressure_summary=pressure)
+
+    assert first.next_budget == BatchBudget(
+        max_items=8,
+        max_host_bytes=100,
+        max_device_bytes=200,
+    )
+    assert first.consecutive_cpu_pressure_passes == 1
+    assert first.consecutive_cuda_pressure_passes == 1
+    assert _reason_high_dimensions(first.reason) == "cpu, cuda"
+
+    assert second.next_budget == BatchBudget(
+        max_items=8,
+        max_host_bytes=50,
+        max_device_bytes=200,
+    )
+    assert second.pressure_shrunk_budget_fields == ("max_host_bytes",)
+    assert second.consecutive_cpu_pressure_passes == 0
+    assert second.consecutive_cuda_pressure_passes == 2
+    assert "triggered policies: cpu(limit=0.8, required=2)" in second.reason
+
+    assert third.next_budget == BatchBudget(
+        max_items=8,
+        max_host_bytes=50,
+        max_device_bytes=100,
+    )
+    assert third.pressure_shrunk_budget_fields == ("max_device_bytes",)
+    assert third.consecutive_cpu_pressure_passes == 1
+    assert third.consecutive_cuda_pressure_passes == 0
+    assert "triggered policies: cuda(limit=0.95, required=3)" in third.reason
+
+
+def test_dimension_threshold_override_resets_only_non_high_dimension() -> None:
+    governor = ConservativeRuntimeGovernor(
+        BatchBudget(max_items=8, max_host_bytes=100, max_device_bytes=200),
+        policy=GovernorPolicy(
+            min_cpu_pressure_ratio_for_shrink=0.8,
+            min_cuda_pressure_ratio_for_shrink=0.95,
+            cpu_shrink_after_pressure_passes=2,
+            cuda_shrink_after_pressure_passes=3,
+        ),
+    )
+
+    decision = governor.observe_results(
+        [_result()],
+        pressure_summary=ResourcePressureSummary(
+            peak_cpu_rss_ratio=0.85,
+            peak_cuda_reserved_ratio=0.90,
+        ),
+    )
+
+    assert decision.next_budget == BatchBudget(
+        max_items=8,
+        max_host_bytes=100,
+        max_device_bytes=200,
+    )
+    assert decision.consecutive_cpu_pressure_passes == 1
+    assert decision.consecutive_cuda_pressure_passes == 0
+    assert decision.growth_suppressed_by_pressure is True
+    assert "cpu=1/2 (limit=0.8, ratio=0.85)" in decision.reason
+    assert "cuda=0/3 (limit=0.95, ratio=0.9)" in decision.reason
+    assert _reason_high_dimensions(decision.reason) == "cpu"
+
+
+def test_threshold_override_uses_common_pass_count_fallback() -> None:
+    governor = ConservativeRuntimeGovernor(
+        BatchBudget(max_items=8, max_host_bytes=100, max_device_bytes=200),
+        policy=GovernorPolicy(
+            min_pressure_ratio_for_shrink=0.9,
+            shrink_after_pressure_passes=3,
+            min_cpu_pressure_ratio_for_shrink=0.8,
+        ),
+    )
+
+    decision = governor.observe_results(
+        [_result()],
+        pressure_summary=ResourcePressureSummary(
+            peak_cpu_rss_ratio=0.85,
+            peak_cuda_reserved_ratio=0.85,
+        ),
+    )
+
+    assert decision.consecutive_cpu_pressure_passes == 1
+    assert decision.consecutive_cuda_pressure_passes == 0
+    assert decision.budget_shrunk_by_pressure is False
+    assert "cpu=1/3 (limit=0.8, ratio=0.85)" in decision.reason
+    assert _reason_high_dimensions(decision.reason) == "cpu"
+
+
+def test_pass_count_override_uses_common_threshold_fallback() -> None:
+    governor = ConservativeRuntimeGovernor(
+        BatchBudget(max_items=8, max_host_bytes=100, max_device_bytes=200),
+        policy=GovernorPolicy(
+            min_pressure_ratio_for_shrink=0.9,
+            shrink_after_pressure_passes=3,
+            cuda_shrink_after_pressure_passes=1,
+        ),
+    )
+
+    decision = governor.observe_results(
+        [_result()],
+        pressure_summary=ResourcePressureSummary(
+            peak_cpu_rss_ratio=0.95,
+            peak_cuda_reserved_ratio=0.95,
+        ),
+    )
+
+    assert decision.next_budget == BatchBudget(
+        max_items=8,
+        max_host_bytes=100,
+        max_device_bytes=100,
+    )
+    assert decision.consecutive_cpu_pressure_passes == 1
+    assert decision.consecutive_cuda_pressure_passes == 0
+    assert decision.pressure_shrunk_budget_fields == ("max_device_bytes",)
+    assert "cuda(limit=0.9, required=1)" in decision.reason
 
 
 @pytest.mark.parametrize(
@@ -638,12 +823,62 @@ def test_pressure_shrink_records_only_fields_that_actually_changed() -> None:
         {"min_pressure_ratio_for_shrink": True},
         {"shrink_after_pressure_passes": 0},
         {"shrink_after_pressure_passes": True},
+        {"min_cpu_pressure_ratio_for_shrink": 0},
+        {"min_cpu_pressure_ratio_for_shrink": 1.1},
+        {"min_cpu_pressure_ratio_for_shrink": True},
+        {"min_cuda_pressure_ratio_for_shrink": 0},
+        {"min_cuda_pressure_ratio_for_shrink": 1.1},
+        {"min_cuda_pressure_ratio_for_shrink": True},
+        {"cpu_shrink_after_pressure_passes": 0},
+        {"cpu_shrink_after_pressure_passes": True},
+        {"cuda_shrink_after_pressure_passes": 0},
+        {"cuda_shrink_after_pressure_passes": True},
         {"max_pressure_ratio_for_growth": 0.9, "min_pressure_ratio_for_shrink": 0.8},
+        {
+            "max_pressure_ratio_for_growth": 0.9,
+            "min_cpu_pressure_ratio_for_shrink": 0.8,
+        },
+        {
+            "max_pressure_ratio_for_growth": 0.9,
+            "min_cuda_pressure_ratio_for_shrink": 0.8,
+        },
     ],
 )
 def test_invalid_sustained_pressure_policy_is_rejected(kwargs: dict[str, object]) -> None:
     with pytest.raises((TypeError, ValueError)):
         GovernorPolicy(**kwargs)
+
+
+def test_dimension_overrides_fall_back_to_common_policy_values() -> None:
+    governor = ConservativeRuntimeGovernor(
+        BatchBudget(max_items=8, max_host_bytes=100, max_device_bytes=200),
+        policy=GovernorPolicy(
+            shrink_factor=0.5,
+            min_pressure_ratio_for_shrink=0.9,
+            shrink_after_pressure_passes=2,
+        ),
+    )
+    pressure = ResourcePressureSummary(
+        peak_cpu_rss_ratio=0.95,
+        peak_cuda_reserved_ratio=0.96,
+    )
+
+    first = governor.observe_results([_result()], pressure_summary=pressure)
+    second = governor.observe_results([_result()], pressure_summary=pressure)
+
+    assert first.consecutive_cpu_pressure_passes == 1
+    assert first.consecutive_cuda_pressure_passes == 1
+    assert second.next_budget == BatchBudget(
+        max_items=8,
+        max_host_bytes=50,
+        max_device_bytes=100,
+    )
+    assert second.pressure_shrunk_budget_fields == (
+        "max_host_bytes",
+        "max_device_bytes",
+    )
+    assert "cpu(limit=0.9, required=2)" in second.reason
+    assert "cuda(limit=0.9, required=2)" in second.reason
 
 
 def test_consecutive_successes_grow_budget_and_reset_streak() -> None:

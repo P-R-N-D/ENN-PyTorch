@@ -93,18 +93,24 @@ Decision priority is deliberately small and predictable:
 5. If every observed result is `StepStatus.SUCCESS` and `recovered_oom=False`,
    an optional sustained-pressure shrink guard is evaluated before success evidence is
    accumulated.
-6. When both `max_pressure_ratio_for_growth` and
-   `min_pressure_ratio_for_shrink` are `None`, pressure does not change the
+6. When `max_pressure_ratio_for_growth`, the common shrink threshold, and both
+   dimension-specific shrink thresholds are `None`, pressure does not change the
    existing success-growth behavior.
 7. With the guard enabled, a missing pressure summary, an all-unknown summary, or
    `pressure_summary.max_observed_ratio >= max_pressure_ratio_for_growth` keeps the
    budget and resets the success streak to zero.
 8. A known maximum pressure ratio below the configured limit allows the success
    streak to increase by one for the observe call.
-9. With `min_pressure_ratio_for_shrink` configured, a known maximum ratio at or
-   above that threshold increments only the matching CPU or CUDA pressure streak,
-   suppresses growth, and shrinks the next budget only when that dimension reaches
-   `shrink_after_pressure_passes`.
+9. The CPU and CUDA shrink threshold and required pass count resolve independently.
+   `min_cpu_pressure_ratio_for_shrink` and
+   `min_cuda_pressure_ratio_for_shrink` override the common
+   `min_pressure_ratio_for_shrink` value when configured.
+   `cpu_shrink_after_pressure_passes` and
+   `cuda_shrink_after_pressure_passes` override the common
+   `shrink_after_pressure_passes` value. A dimension with no effective threshold is
+   disabled. A ratio at or above an effective threshold increments only the
+   matching pressure streak, suppresses growth, and shrinks the next budget only
+   when that dimension reaches its effective required pass count.
    CPU pressure selects `max_host_bytes`; any CUDA allocated/reserved/max ratio
    selects `max_device_bytes`. If no matching byte budget is configured,
    `max_items` is the fallback. When at least one matching byte budget is
@@ -171,16 +177,19 @@ higher priority.
 
 Sustained-pressure shrink is dimension-aware. CPU RSS pressure maps to the host
 byte budget, while every CUDA pressure ratio maps to the device byte budget.
-`max_items` is used only when none of the pressured dimensions has a configured
+`max_items` is used only when none of the triggered dimensions has a configured
 matching byte budget. OOM and retry-recovered OOM continue to shrink every
 configured budget field and do not populate the pressure-specific field tuple.
-CPU and CUDA persistence are tracked independently, so alternating CPU-only and
+CPU and CUDA persistence, effective thresholds, and required pass counts are
+resolved independently. An unset dimension override falls back to the common
+policy value; when neither a dimension override nor the common threshold is set,
+that dimension's sustained-pressure shrink is disabled. Alternating CPU-only and
 CUDA-only high-pressure passes cannot combine into a sustained-pressure shrink.
-When both dimensions are continuously high, each can reach the threshold and
-trigger its matching budget adjustment in the same pass.
-Triggered decision reasons report only the current ratios for dimensions that
-reached the threshold; they do not describe the summary-wide maximum ratio as
-having persisted for the full streak.
+When both dimensions are continuously high, each can reach its own threshold and
+required pass count independently.
+Triggered decision reasons report only the current ratios and effective policy
+values for dimensions that reached the threshold; they do not describe the
+summary-wide maximum ratio as having persisted for the full streak.
 
 ## Relationship to Orchestration
 
@@ -197,7 +206,7 @@ execute models, discover capacity, or construct a pressure summary.
 - Full AutoGovernor behavior.
 - Learned or model-specific tuning.
 - Persistent calibration caches or history databases.
-- Per-dimension thresholds, shrink factors, or learned field weights.
+- Per-dimension shrink factors or learned field weights.
 - Automatic pressure-summary construction inside the governor.
 - Automatic capacity discovery or refresh inside the orchestrator.
 - `ModelCostProbe`-driven policy changes.

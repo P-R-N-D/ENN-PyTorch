@@ -302,8 +302,8 @@ def test_runtime_session_shrinks_after_sustained_provider_pressure() -> None:
             shrink_factor=0.5,
             grow_after_successes=1,
             max_pressure_ratio_for_growth=0.8,
-            min_pressure_ratio_for_shrink=0.9,
-            shrink_after_pressure_passes=2,
+            min_cpu_pressure_ratio_for_shrink=0.9,
+            cpu_shrink_after_pressure_passes=2,
         ),
     )
     orchestrator = ConservativeRuntimeOrchestrator(
