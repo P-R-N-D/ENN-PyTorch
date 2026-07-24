@@ -162,10 +162,12 @@ The conservative governor then:
 - optionally suppresses success growth when an explicit pressure summary is
   missing or reaches the configured growth limit;
 - optionally shrinks the next-pass budget only after a configured sustained
-  high-pressure streak, selecting host bytes for CPU pressure and device bytes
-  for CUDA pressure;
+  high-pressure streak, tracking CPU and CUDA persistence independently and
+  selecting host bytes for CPU pressure and device bytes for CUDA pressure;
 - falls back to `max_items` only when no matching pressured byte budget is
   configured;
+- preserves an incomplete streak for one dimension when only the other dimension
+  reaches its shrink threshold;
 - applies configured minimum and maximum bounds.
 
 The next pass uses the governor's current budget.
@@ -209,7 +211,7 @@ It does not provide:
 - AutoGovernor or learned tuning;
 - automatic `ResourceMonitor` creation;
 - mid-pass capacity refresh or free-memory admission control;
-- per-dimension streak tracking or learned field weights;
+- per-dimension thresholds, shrink factors, or learned field weights;
 - stable `enn_torch` API exposure.
 
 Use small synthetic inputs for baseline validation. Do not use this workflow as an

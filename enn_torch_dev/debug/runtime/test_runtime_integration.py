@@ -319,12 +319,17 @@ def test_runtime_session_shrinks_after_sustained_provider_pressure() -> None:
     assert provider.calls == 2
     assert first.pass_result.decision.next_budget == BatchBudget(max_items=8)
     assert first.pass_summary.consecutive_high_pressure_passes == 1
+    assert first.pass_summary.consecutive_cpu_pressure_passes == 1
+    assert first.pass_summary.consecutive_cuda_pressure_passes == 0
     assert first.pass_summary.budget_shrunk_by_pressure is False
     assert second.pass_result.decision.next_budget == BatchBudget(max_items=4)
     assert second.pass_summary.budget_shrunk_by_pressure is True
     assert second.pass_summary.pressure_shrunk_budget_fields == (
         "max_items",
     )
+    assert second.pass_summary.consecutive_cpu_pressure_passes == 0
+    assert second.pass_summary.consecutive_cuda_pressure_passes == 0
+    assert second.pass_summary.consecutive_high_pressure_passes == 0
     assert second.history_summary.pressure_shrink_passes == 1
 
 

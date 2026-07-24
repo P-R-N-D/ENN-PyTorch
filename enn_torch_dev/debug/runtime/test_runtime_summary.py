@@ -53,6 +53,8 @@ def _decision(
     consecutive_high_pressure_passes: int = 0,
     budget_shrunk_by_pressure: bool = False,
     pressure_shrunk_budget_fields: tuple[str, ...] = (),
+    consecutive_cpu_pressure_passes: int = 0,
+    consecutive_cuda_pressure_passes: int = 0,
 ) -> GovernorDecision:
     previous = previous_budget or BatchBudget(max_items=4)
     return GovernorDecision(
@@ -72,6 +74,8 @@ def _decision(
         consecutive_high_pressure_passes=consecutive_high_pressure_passes,
         budget_shrunk_by_pressure=budget_shrunk_by_pressure,
         pressure_shrunk_budget_fields=pressure_shrunk_budget_fields,
+        consecutive_cpu_pressure_passes=consecutive_cpu_pressure_passes,
+        consecutive_cuda_pressure_passes=consecutive_cuda_pressure_passes,
     )
 
 
@@ -125,6 +129,8 @@ def test_summarize_and_format_runtime_pass_pressure_shrink_feedback() -> None:
                 consecutive_high_pressure_passes=1,
                 budget_shrunk_by_pressure=True,
                 pressure_shrunk_budget_fields=("max_host_bytes",),
+                consecutive_cpu_pressure_passes=1,
+                consecutive_cuda_pressure_passes=0,
             ),
         )
     )
@@ -134,7 +140,11 @@ def test_summarize_and_format_runtime_pass_pressure_shrink_feedback() -> None:
     assert summary.consecutive_high_pressure_passes == 1
     assert summary.budget_shrunk_by_pressure is True
     assert summary.pressure_shrunk_budget_fields == ("max_host_bytes",)
+    assert summary.consecutive_cpu_pressure_passes == 1
+    assert summary.consecutive_cuda_pressure_passes == 0
     assert "consecutive_high_pressure_passes=1" in text
+    assert "consecutive_cpu_pressure_passes=1" in text
+    assert "consecutive_cuda_pressure_passes=0" in text
     assert "budget_shrunk_by_pressure=True" in text
     assert "pressure_shrunk_budget_fields=('max_host_bytes',)" in text
 
@@ -217,13 +227,15 @@ def test_summarize_runtime_pass_detects_budget_change_and_decision_metadata() ->
 def test_runtime_pass_summary_appends_feedback_and_capacity_fields_for_compatibility() -> None:
     field_names = [field.name for field in fields(RuntimePassSummary)]
 
-    assert field_names[-6:] == [
+    assert field_names[-8:] == [
         "pressure_summary",
         "growth_suppressed_by_pressure",
         "resource_capacity",
         "consecutive_high_pressure_passes",
         "budget_shrunk_by_pressure",
         "pressure_shrunk_budget_fields",
+        "consecutive_cpu_pressure_passes",
+        "consecutive_cuda_pressure_passes",
     ]
 
 

@@ -217,6 +217,8 @@ class GovernorDecision:
     consecutive_high_pressure_passes: int = 0
     budget_shrunk_by_pressure: bool = False
     pressure_shrunk_budget_fields: tuple[str, ...] = ()
+    consecutive_cpu_pressure_passes: int = 0
+    consecutive_cuda_pressure_passes: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -228,6 +230,8 @@ class RuntimeGovernorState:
     consecutive_ooms: int = 0
     last_decision: GovernorDecision | None = None
     consecutive_high_pressure_passes: int = 0
+    consecutive_cpu_pressure_passes: int = 0
+    consecutive_cuda_pressure_passes: int = 0
 
     def __post_init__(self) -> None:
         _validate_budget(self.current_budget, label="RuntimeGovernorState.current_budget")
@@ -253,6 +257,22 @@ class RuntimeGovernorState:
             _validate_streak(
                 self.consecutive_high_pressure_passes,
                 label="RuntimeGovernorState.consecutive_high_pressure_passes",
+            ),
+        )
+        object.__setattr__(
+            self,
+            "consecutive_cpu_pressure_passes",
+            _validate_streak(
+                self.consecutive_cpu_pressure_passes,
+                label="RuntimeGovernorState.consecutive_cpu_pressure_passes",
+            ),
+        )
+        object.__setattr__(
+            self,
+            "consecutive_cuda_pressure_passes",
+            _validate_streak(
+                self.consecutive_cuda_pressure_passes,
+                label="RuntimeGovernorState.consecutive_cuda_pressure_passes",
             ),
         )
         if self.last_decision is not None and not isinstance(self.last_decision, GovernorDecision):
@@ -356,7 +376,13 @@ class ConservativeRuntimeGovernor:
         next_budget = previous_budget
         consecutive_successes = self.state.consecutive_successes
         consecutive_ooms = self.state.consecutive_ooms
-        consecutive_high_pressure_passes = self.state.consecutive_high_pressure_passes
+        consecutive_cpu_pressure_passes = self.state.consecutive_cpu_pressure_passes
+        consecutive_cuda_pressure_passes = self.state.consecutive_cuda_pressure_passes
+        legacy_is_available = (
+            self.state.consecutive_high_pressure_passes > 0
+            and consecutive_cpu_pressure_passes == 0
+            and consecutive_cuda_pressure_passes == 0
+        )
         growth_suppressed_by_pressure = False
         budget_shrunk_by_pressure = False
         pressure_shrunk_budget_fields: tuple[str, ...] = ()
@@ -365,7 +391,8 @@ class ConservativeRuntimeGovernor:
             next_budget = self._adjust_budget(previous_budget, mode="shrink")
             consecutive_successes = 0
             consecutive_ooms += 1
-            consecutive_high_pressure_passes = 0
+            consecutive_cpu_pressure_passes = 0
+            consecutive_cuda_pressure_passes = 0
             if saw_oom:
                 reason = "OOM fault observed; shrinking configured budget fields"
                 if recovered_oom:
@@ -373,7 +400,8 @@ class ConservativeRuntimeGovernor:
             else:
                 reason = "retry-recovered OOM observed; shrinking configured budget fields"
         elif not saw_any_result:
-            consecutive_high_pressure_passes = 0
+            consecutive_cpu_pressure_passes = 0
+            consecutive_cuda_pressure_passes = 0
             reason = "no results observed; keeping current budget"
         elif all_success:
             consecutive_ooms = 0
@@ -383,57 +411,114 @@ class ConservativeRuntimeGovernor:
                 else None
             )
             shrink_limit = self.policy.min_pressure_ratio_for_shrink
-            if (
-                shrink_limit is not None
-                and max_ratio is not None
-                and max_ratio >= shrink_limit
-            ):
+            cpu_pressure_high = False
+            cuda_pressure_high = False
+            if shrink_limit is not None and pressure_summary is not None:
+                (
+                    cpu_pressure_high,
+                    cuda_pressure_high,
+                ) = self._pressure_dimensions_at_or_above(
+                    pressure_summary,
+                    threshold=shrink_limit,
+                )
+            legacy_high_pressure_streak = (
+                self.state.consecutive_high_pressure_passes
+                if legacy_is_available and cpu_pressure_high != cuda_pressure_high
+                else 0
+            )
+            if shrink_limit is not None and (cpu_pressure_high or cuda_pressure_high):
                 consecutive_successes = 0
-                consecutive_high_pressure_passes += 1
                 growth_suppressed_by_pressure = True
+                if cpu_pressure_high:
+                    cpu_base = (
+                        legacy_high_pressure_streak
+                        if legacy_high_pressure_streak
+                        else consecutive_cpu_pressure_passes
+                    )
+                    consecutive_cpu_pressure_passes = cpu_base + 1
+                else:
+                    consecutive_cpu_pressure_passes = 0
+                if cuda_pressure_high:
+                    cuda_base = (
+                        legacy_high_pressure_streak
+                        if legacy_high_pressure_streak
+                        else consecutive_cuda_pressure_passes
+                    )
+                    consecutive_cuda_pressure_passes = cuda_base + 1
+                else:
+                    consecutive_cuda_pressure_passes = 0
+
                 required = self.policy.shrink_after_pressure_passes
-                if consecutive_high_pressure_passes >= required:
+                cpu_streak_at_observation = consecutive_cpu_pressure_passes
+                cuda_streak_at_observation = consecutive_cuda_pressure_passes
+                cpu_pressure_triggered = cpu_streak_at_observation >= required
+                cuda_pressure_triggered = cuda_streak_at_observation >= required
+                if cpu_pressure_triggered or cuda_pressure_triggered:
                     (
                         next_budget,
                         selected_pressure_fields,
                         pressure_shrunk_budget_fields,
                     ) = self._adjust_budget_for_pressure(
                         previous_budget,
-                        pressure_summary=pressure_summary,
-                        threshold=shrink_limit,
+                        cpu_pressure=cpu_pressure_triggered,
+                        cuda_pressure=cuda_pressure_triggered,
                     )
                     budget_shrunk_by_pressure = bool(pressure_shrunk_budget_fields)
-                    consecutive_high_pressure_passes = 0
+                    triggered_dimensions = tuple(
+                        dimension
+                        for dimension, triggered in (
+                            ("cpu", cpu_pressure_triggered),
+                            ("cuda", cuda_pressure_triggered),
+                        )
+                        if triggered
+                    )
+                    if cpu_pressure_triggered:
+                        consecutive_cpu_pressure_passes = 0
+                    if cuda_pressure_triggered:
+                        consecutive_cuda_pressure_passes = 0
+                    dimension_text = ", ".join(triggered_dimensions)
+                    triggered_ratios: list[str] = []
+                    if cpu_pressure_triggered:
+                        cpu_ratio = pressure_summary.peak_cpu_rss_ratio
+                        assert cpu_ratio is not None
+                        triggered_ratios.append(f"cpu={cpu_ratio:.6g}")
+                    if cuda_pressure_triggered:
+                        cuda_ratio = self._peak_cuda_pressure_ratio(pressure_summary)
+                        assert cuda_ratio is not None
+                        triggered_ratios.append(f"cuda={cuda_ratio:.6g}")
+                    ratio_text = ", ".join(triggered_ratios)
                     if budget_shrunk_by_pressure:
                         field_text = ", ".join(pressure_shrunk_budget_fields)
                         reason = (
-                            f"resource pressure {max_ratio:.6g} remained at or above "
-                            f"shrink limit {shrink_limit:.6g} for {required} passes; "
+                            f"pressure streak reached {required} passes; triggered dimensions: "
+                            f"{dimension_text}; current triggered ratios: {ratio_text}; "
                             f"shrinking pressure-matched budget fields: {field_text}"
                         )
                     elif selected_pressure_fields:
                         field_text = ", ".join(selected_pressure_fields)
                         reason = (
-                            f"resource pressure {max_ratio:.6g} remained at or above "
-                            f"shrink limit {shrink_limit:.6g} for {required} passes; "
+                            f"pressure streak reached {required} passes; triggered dimensions: "
+                            f"{dimension_text}; current triggered ratios: {ratio_text}; "
                             "configured minimum bounds kept pressure-matched budget "
                             f"fields unchanged: {field_text}"
                         )
                     else:
                         reason = (
-                            f"resource pressure {max_ratio:.6g} remained at or above "
-                            f"shrink limit {shrink_limit:.6g} for {required} passes; "
+                            f"pressure streak reached {required} passes; triggered dimensions: "
+                            f"{dimension_text}; current triggered ratios: {ratio_text}; "
                             "no matching byte budget or max_items fallback is configured"
                         )
                 else:
                     reason = (
                         f"resource pressure {max_ratio:.6g} reached shrink limit "
-                        f"{shrink_limit:.6g}; high-pressure streak "
-                        f"{consecutive_high_pressure_passes}/{required}; "
+                        f"{shrink_limit:.6g}; pressure streaks "
+                        f"cpu={consecutive_cpu_pressure_passes}/{required}, "
+                        f"cuda={consecutive_cuda_pressure_passes}/{required}; "
                         "suppressing budget growth"
                     )
             else:
-                consecutive_high_pressure_passes = 0
+                consecutive_cpu_pressure_passes = 0
+                consecutive_cuda_pressure_passes = 0
                 pressure_reason = self._growth_pressure_guard_reason(pressure_summary)
                 if pressure_reason is not None:
                     consecutive_successes = 0
@@ -450,9 +535,14 @@ class ConservativeRuntimeGovernor:
         else:
             consecutive_successes = 0
             consecutive_ooms = 0
-            consecutive_high_pressure_passes = 0
+            consecutive_cpu_pressure_passes = 0
+            consecutive_cuda_pressure_passes = 0
             reason = "non-OOM fault observed; keeping current budget"
 
+        consecutive_high_pressure_passes = max(
+            consecutive_cpu_pressure_passes,
+            consecutive_cuda_pressure_passes,
+        )
         reason = self._append_peak_reason(reason, peaks)
         decision = GovernorDecision(
             previous_budget=previous_budget,
@@ -471,6 +561,8 @@ class ConservativeRuntimeGovernor:
             consecutive_high_pressure_passes=consecutive_high_pressure_passes,
             budget_shrunk_by_pressure=budget_shrunk_by_pressure,
             pressure_shrunk_budget_fields=pressure_shrunk_budget_fields,
+            consecutive_cpu_pressure_passes=consecutive_cpu_pressure_passes,
+            consecutive_cuda_pressure_passes=consecutive_cuda_pressure_passes,
         )
         self.state = RuntimeGovernorState(
             current_budget=next_budget,
@@ -478,6 +570,8 @@ class ConservativeRuntimeGovernor:
             consecutive_ooms=consecutive_ooms,
             last_decision=decision,
             consecutive_high_pressure_passes=consecutive_high_pressure_passes,
+            consecutive_cpu_pressure_passes=consecutive_cpu_pressure_passes,
+            consecutive_cuda_pressure_passes=consecutive_cuda_pressure_passes,
         )
         return decision
 
@@ -502,17 +596,54 @@ class ConservativeRuntimeGovernor:
             )
         return None
 
+    @staticmethod
+    def _pressure_dimensions_at_or_above(
+        pressure_summary: ResourcePressureSummary,
+        *,
+        threshold: float,
+    ) -> tuple[bool, bool]:
+        cpu_pressure = (
+            pressure_summary.peak_cpu_rss_ratio is not None
+            and pressure_summary.peak_cpu_rss_ratio >= threshold
+        )
+        cuda_pressure = any(
+            value is not None and value >= threshold
+            for value in (
+                pressure_summary.peak_cuda_allocated_ratio,
+                pressure_summary.peak_cuda_reserved_ratio,
+                pressure_summary.peak_cuda_max_allocated_ratio,
+                pressure_summary.peak_cuda_max_reserved_ratio,
+            )
+        )
+        return cpu_pressure, cuda_pressure
+
+    @staticmethod
+    def _peak_cuda_pressure_ratio(
+        pressure_summary: ResourcePressureSummary,
+    ) -> float | None:
+        known_ratios = tuple(
+            value
+            for value in (
+                pressure_summary.peak_cuda_allocated_ratio,
+                pressure_summary.peak_cuda_reserved_ratio,
+                pressure_summary.peak_cuda_max_allocated_ratio,
+                pressure_summary.peak_cuda_max_reserved_ratio,
+            )
+            if value is not None
+        )
+        return max(known_ratios) if known_ratios else None
+
     def _adjust_budget_for_pressure(
         self,
         budget: BatchBudget,
         *,
-        pressure_summary: ResourcePressureSummary,
-        threshold: float,
+        cpu_pressure: bool,
+        cuda_pressure: bool,
     ) -> tuple[BatchBudget, tuple[str, ...], tuple[str, ...]]:
         selected_fields = self._pressure_budget_fields(
             budget,
-            pressure_summary=pressure_summary,
-            threshold=threshold,
+            cpu_pressure=cpu_pressure,
+            cuda_pressure=cuda_pressure,
         )
         values: dict[str, int | None] = {
             field_name: getattr(budget, field_name)
@@ -534,31 +665,17 @@ class ConservativeRuntimeGovernor:
     def _pressure_budget_fields(
         budget: BatchBudget,
         *,
-        pressure_summary: ResourcePressureSummary,
-        threshold: float,
+        cpu_pressure: bool,
+        cuda_pressure: bool,
     ) -> tuple[str, ...]:
-        cpu_high = (
-            pressure_summary.peak_cpu_rss_ratio is not None
-            and pressure_summary.peak_cpu_rss_ratio >= threshold
-        )
-        cuda_high = any(
-            value is not None and value >= threshold
-            for value in (
-                pressure_summary.peak_cuda_allocated_ratio,
-                pressure_summary.peak_cuda_reserved_ratio,
-                pressure_summary.peak_cuda_max_allocated_ratio,
-                pressure_summary.peak_cuda_max_reserved_ratio,
-            )
-        )
-
         selected_fields: list[str] = []
-        if cpu_high and budget.max_host_bytes is not None:
+        if cpu_pressure and budget.max_host_bytes is not None:
             selected_fields.append("max_host_bytes")
-        if cuda_high and budget.max_device_bytes is not None:
+        if cuda_pressure and budget.max_device_bytes is not None:
             selected_fields.append("max_device_bytes")
         if (
             not selected_fields
-            and (cpu_high or cuda_high)
+            and (cpu_pressure or cuda_pressure)
             and budget.max_items is not None
         ):
             selected_fields.append("max_items")
