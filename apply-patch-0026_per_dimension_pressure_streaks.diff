@@ -1,0 +1,983 @@
+diff --git a/enn_torch_dev/runtime/governor.py b/enn_torch_dev/runtime/governor.py
+--- a/enn_torch_dev/runtime/governor.py
++++ b/enn_torch_dev/runtime/governor.py
+@@ -219,6 +219,8 @@ class GovernorDecision:
+     consecutive_high_pressure_passes: int = 0
+     budget_shrunk_by_pressure: bool = False
+     pressure_shrunk_budget_fields: tuple[str, ...] = ()
++    consecutive_cpu_pressure_passes: int = 0
++    consecutive_cuda_pressure_passes: int = 0
+ 
+ 
+ @dataclass(frozen=True, slots=True)
+@@ -230,6 +232,8 @@ class RuntimeGovernorState:
+     consecutive_ooms: int = 0
+     last_decision: GovernorDecision | None = None
+     consecutive_high_pressure_passes: int = 0
++    consecutive_cpu_pressure_passes: int = 0
++    consecutive_cuda_pressure_passes: int = 0
+ 
+     def __post_init__(self) -> None:
+         _validate_budget(self.current_budget, label="RuntimeGovernorState.current_budget")
+@@ -256,6 +260,22 @@ class RuntimeGovernorState:
+                 label="RuntimeGovernorState.consecutive_high_pressure_passes",
+             ),
+         )
++        object.__setattr__(
++            self,
++            "consecutive_cpu_pressure_passes",
++            _validate_streak(
++                self.consecutive_cpu_pressure_passes,
++                label="RuntimeGovernorState.consecutive_cpu_pressure_passes",
++            ),
++        )
++        object.__setattr__(
++            self,
++            "consecutive_cuda_pressure_passes",
++            _validate_streak(
++                self.consecutive_cuda_pressure_passes,
++                label="RuntimeGovernorState.consecutive_cuda_pressure_passes",
++            ),
++        )
+         if self.last_decision is not None and not isinstance(self.last_decision, GovernorDecision):
+             raise TypeError("RuntimeGovernorState.last_decision must be a GovernorDecision or None.")
+ 
+@@ -358,16 +378,24 @@ class ConservativeRuntimeGovernor:
+         next_budget = previous_budget
+         consecutive_successes = self.state.consecutive_successes
+         consecutive_ooms = self.state.consecutive_ooms
+-        consecutive_high_pressure_passes = self.state.consecutive_high_pressure_passes
++        consecutive_cpu_pressure_passes = self.state.consecutive_cpu_pressure_passes
++        consecutive_cuda_pressure_passes = self.state.consecutive_cuda_pressure_passes
++        legacy_high_pressure_streak = (
++            self.state.consecutive_high_pressure_passes
++            if consecutive_cpu_pressure_passes == 0
++            and consecutive_cuda_pressure_passes == 0
++            else 0
++        )
+         growth_suppressed_by_pressure = False
+         budget_shrunk_by_pressure = False
+         pressure_shrunk_budget_fields: tuple[str, ...] = ()
+ 
+         if saw_oom or recovered_oom:
+             next_budget = self._adjust_budget(previous_budget, mode="shrink")
+             consecutive_successes = 0
+             consecutive_ooms += 1
+-            consecutive_high_pressure_passes = 0
++            consecutive_cpu_pressure_passes = 0
++            consecutive_cuda_pressure_passes = 0
+             if saw_oom:
+                 reason = "OOM fault observed; shrinking configured budget fields"
+                 if recovered_oom:
+@@ -377,7 +405,8 @@ class ConservativeRuntimeGovernor:
+             else:
+                 reason = "retry-recovered OOM observed; shrinking configured budget fields"
+         elif not saw_any_result:
+-            consecutive_high_pressure_passes = 0
++            consecutive_cpu_pressure_passes = 0
++            consecutive_cuda_pressure_passes = 0
+             reason = "no results observed; keeping current budget"
+         elif all_success:
+             consecutive_ooms = 0
+@@ -387,57 +416,102 @@ class ConservativeRuntimeGovernor:
+                 else None
+             )
+             shrink_limit = self.policy.min_pressure_ratio_for_shrink
+-            if (
+-                shrink_limit is not None
+-                and max_ratio is not None
+-                and max_ratio >= shrink_limit
+-            ):
++            cpu_pressure_high = False
++            cuda_pressure_high = False
++            if shrink_limit is not None and pressure_summary is not None:
++                (
++                    cpu_pressure_high,
++                    cuda_pressure_high,
++                ) = self._pressure_dimensions_at_or_above(
++                    pressure_summary,
++                    threshold=shrink_limit,
++                )
++            if shrink_limit is not None and (cpu_pressure_high or cuda_pressure_high):
+                 consecutive_successes = 0
+-                consecutive_high_pressure_passes += 1
+                 growth_suppressed_by_pressure = True
++                if cpu_pressure_high:
++                    cpu_base = (
++                        legacy_high_pressure_streak
++                        if legacy_high_pressure_streak
++                        else consecutive_cpu_pressure_passes
++                    )
++                    consecutive_cpu_pressure_passes = cpu_base + 1
++                else:
++                    consecutive_cpu_pressure_passes = 0
++                if cuda_pressure_high:
++                    cuda_base = (
++                        legacy_high_pressure_streak
++                        if legacy_high_pressure_streak
++                        else consecutive_cuda_pressure_passes
++                    )
++                    consecutive_cuda_pressure_passes = cuda_base + 1
++                else:
++                    consecutive_cuda_pressure_passes = 0
++
+                 required = self.policy.shrink_after_pressure_passes
+-                if consecutive_high_pressure_passes >= required:
++                cpu_streak_at_observation = consecutive_cpu_pressure_passes
++                cuda_streak_at_observation = consecutive_cuda_pressure_passes
++                cpu_pressure_triggered = cpu_streak_at_observation >= required
++                cuda_pressure_triggered = cuda_streak_at_observation >= required
++                if cpu_pressure_triggered or cuda_pressure_triggered:
+                     (
+                         next_budget,
+                         selected_pressure_fields,
+                         pressure_shrunk_budget_fields,
+                     ) = self._adjust_budget_for_pressure(
+                         previous_budget,
+-                        pressure_summary=pressure_summary,
+-                        threshold=shrink_limit,
++                        cpu_pressure=cpu_pressure_triggered,
++                        cuda_pressure=cuda_pressure_triggered,
+                     )
+                     budget_shrunk_by_pressure = bool(pressure_shrunk_budget_fields)
+-                    consecutive_high_pressure_passes = 0
++                    triggered_dimensions = tuple(
++                        dimension
++                        for dimension, triggered in (
++                            ("cpu", cpu_pressure_triggered),
++                            ("cuda", cuda_pressure_triggered),
++                        )
++                        if triggered
++                    )
++                    if cpu_pressure_triggered:
++                        consecutive_cpu_pressure_passes = 0
++                    if cuda_pressure_triggered:
++                        consecutive_cuda_pressure_passes = 0
++                    dimension_text = ", ".join(triggered_dimensions)
+                     if budget_shrunk_by_pressure:
+                         field_text = ", ".join(pressure_shrunk_budget_fields)
+                         reason = (
+                             f"resource pressure {max_ratio:.6g} remained at or above "
+                             f"shrink limit {shrink_limit:.6g} for {required} passes; "
++                            f"triggered dimensions: {dimension_text}; "
+                             f"shrinking pressure-matched budget fields: {field_text}"
+                         )
+                     elif selected_pressure_fields:
+                         field_text = ", ".join(selected_pressure_fields)
+                         reason = (
+                             f"resource pressure {max_ratio:.6g} remained at or above "
+                             f"shrink limit {shrink_limit:.6g} for {required} passes; "
++                            f"triggered dimensions: {dimension_text}; "
+                             "configured minimum bounds kept pressure-matched budget "
+                             f"fields unchanged: {field_text}"
+                         )
+                     else:
+                         reason = (
+                             f"resource pressure {max_ratio:.6g} remained at or above "
+                             f"shrink limit {shrink_limit:.6g} for {required} passes; "
++                            f"triggered dimensions: {dimension_text}; "
+                             "no matching byte budget or max_items fallback is configured"
+                         )
+                 else:
+                     reason = (
+                         f"resource pressure {max_ratio:.6g} reached shrink limit "
+-                        f"{shrink_limit:.6g}; high-pressure streak "
+-                        f"{consecutive_high_pressure_passes}/{required}; "
++                        f"{shrink_limit:.6g}; pressure streaks "
++                        f"cpu={consecutive_cpu_pressure_passes}/{required}, "
++                        f"cuda={consecutive_cuda_pressure_passes}/{required}; "
+                         "suppressing budget growth"
+                     )
+             else:
+-                consecutive_high_pressure_passes = 0
++                consecutive_cpu_pressure_passes = 0
++                consecutive_cuda_pressure_passes = 0
+                 pressure_reason = self._growth_pressure_guard_reason(pressure_summary)
+                 if pressure_reason is not None:
+                     consecutive_successes = 0
+@@ -475,9 +549,14 @@ class ConservativeRuntimeGovernor:
+         else:
+             consecutive_successes = 0
+             consecutive_ooms = 0
+-            consecutive_high_pressure_passes = 0
++            consecutive_cpu_pressure_passes = 0
++            consecutive_cuda_pressure_passes = 0
+             reason = "non-OOM fault observed; keeping current budget"
+ 
++        consecutive_high_pressure_passes = max(
++            consecutive_cpu_pressure_passes,
++            consecutive_cuda_pressure_passes,
++        )
+         reason = self._append_peak_reason(reason, peaks)
+         decision = GovernorDecision(
+             previous_budget=previous_budget,
+@@ -498,6 +577,8 @@ class ConservativeRuntimeGovernor:
+             consecutive_high_pressure_passes=consecutive_high_pressure_passes,
+             budget_shrunk_by_pressure=budget_shrunk_by_pressure,
+             pressure_shrunk_budget_fields=pressure_shrunk_budget_fields,
++            consecutive_cpu_pressure_passes=consecutive_cpu_pressure_passes,
++            consecutive_cuda_pressure_passes=consecutive_cuda_pressure_passes,
+         )
+         self.state = RuntimeGovernorState(
+             current_budget=next_budget,
+@@ -505,6 +586,8 @@ class ConservativeRuntimeGovernor:
+             consecutive_ooms=consecutive_ooms,
+             last_decision=decision,
+             consecutive_high_pressure_passes=consecutive_high_pressure_passes,
++            consecutive_cpu_pressure_passes=consecutive_cpu_pressure_passes,
++            consecutive_cuda_pressure_passes=consecutive_cuda_pressure_passes,
+         )
+         return decision
+ 
+@@ -530,16 +613,37 @@ class ConservativeRuntimeGovernor:
+         return None
+ 
++    @staticmethod
++    def _pressure_dimensions_at_or_above(
++        pressure_summary: ResourcePressureSummary,
++        *,
++        threshold: float,
++    ) -> tuple[bool, bool]:
++        cpu_pressure = (
++            pressure_summary.peak_cpu_rss_ratio is not None
++            and pressure_summary.peak_cpu_rss_ratio >= threshold
++        )
++        cuda_pressure = any(
++            value is not None and value >= threshold
++            for value in (
++                pressure_summary.peak_cuda_allocated_ratio,
++                pressure_summary.peak_cuda_reserved_ratio,
++                pressure_summary.peak_cuda_max_allocated_ratio,
++                pressure_summary.peak_cuda_max_reserved_ratio,
++            )
++        )
++        return cpu_pressure, cuda_pressure
++
+     def _adjust_budget_for_pressure(
+         self,
+         budget: BatchBudget,
+         *,
+-        pressure_summary: ResourcePressureSummary,
+-        threshold: float,
++        cpu_pressure: bool,
++        cuda_pressure: bool,
+     ) -> tuple[BatchBudget, tuple[str, ...], tuple[str, ...]]:
+         selected_fields = self._pressure_budget_fields(
+             budget,
+-            pressure_summary=pressure_summary,
+-            threshold=threshold,
++            cpu_pressure=cpu_pressure,
++            cuda_pressure=cuda_pressure,
+         )
+         values: dict[str, int | None] = {
+             field_name: getattr(budget, field_name)
+@@ -566,31 +670,17 @@ class ConservativeRuntimeGovernor:
+         budget: BatchBudget,
+         *,
+-        pressure_summary: ResourcePressureSummary,
+-        threshold: float,
++        cpu_pressure: bool,
++        cuda_pressure: bool,
+     ) -> tuple[str, ...]:
+-        cpu_high = (
+-            pressure_summary.peak_cpu_rss_ratio is not None
+-            and pressure_summary.peak_cpu_rss_ratio >= threshold
+-        )
+-        cuda_high = any(
+-            value is not None and value >= threshold
+-            for value in (
+-                pressure_summary.peak_cuda_allocated_ratio,
+-                pressure_summary.peak_cuda_reserved_ratio,
+-                pressure_summary.peak_cuda_max_allocated_ratio,
+-                pressure_summary.peak_cuda_max_reserved_ratio,
+-            )
+-        )
+-
+         selected_fields: list[str] = []
+-        if cpu_high and budget.max_host_bytes is not None:
++        if cpu_pressure and budget.max_host_bytes is not None:
+             selected_fields.append("max_host_bytes")
+-        if cuda_high and budget.max_device_bytes is not None:
++        if cuda_pressure and budget.max_device_bytes is not None:
+             selected_fields.append("max_device_bytes")
+         if (
+             not selected_fields
+-            and (cpu_high or cuda_high)
++            and (cpu_pressure or cuda_pressure)
+             and budget.max_items is not None
+         ):
+             selected_fields.append("max_items")
+         return tuple(selected_fields)
+diff --git a/enn_torch_dev/runtime/summary.py b/enn_torch_dev/runtime/summary.py
+--- a/enn_torch_dev/runtime/summary.py
++++ b/enn_torch_dev/runtime/summary.py
+@@ -42,6 +42,8 @@ class RuntimePassSummary:
+     consecutive_high_pressure_passes: int = 0
+     budget_shrunk_by_pressure: bool = False
+     pressure_shrunk_budget_fields: tuple[str, ...] = ()
++    consecutive_cpu_pressure_passes: int = 0
++    consecutive_cuda_pressure_passes: int = 0
+ 
+ 
+ def summarize_runtime_pass(pass_result: RuntimePassResult) -> RuntimePassSummary:
+@@ -93,6 +95,8 @@ def summarize_runtime_pass(pass_result: RuntimePassResult) -> RuntimePassSummary:
+         consecutive_high_pressure_passes=decision.consecutive_high_pressure_passes,
+         budget_shrunk_by_pressure=decision.budget_shrunk_by_pressure,
+         pressure_shrunk_budget_fields=decision.pressure_shrunk_budget_fields,
++        consecutive_cpu_pressure_passes=decision.consecutive_cpu_pressure_passes,
++        consecutive_cuda_pressure_passes=decision.consecutive_cuda_pressure_passes,
+     )
+ 
+ 
+@@ -128,6 +132,10 @@ def format_runtime_pass_summary(summary: RuntimePassSummary) -> str:
+             f"max_pressure_ratio={_format_optional_ratio(max_pressure_ratio)}",
+             f"growth_suppressed_by_pressure={summary.growth_suppressed_by_pressure}",
+             f"consecutive_high_pressure_passes={summary.consecutive_high_pressure_passes}",
++            "consecutive_cpu_pressure_passes="
++            f"{summary.consecutive_cpu_pressure_passes}",
++            "consecutive_cuda_pressure_passes="
++            f"{summary.consecutive_cuda_pressure_passes}",
+             f"budget_shrunk_by_pressure={summary.budget_shrunk_by_pressure}",
+             "pressure_shrunk_budget_fields="
+             f"{summary.pressure_shrunk_budget_fields!r}",
+diff --git a/enn_torch_dev/debug/runtime/test_runtime_governor.py b/enn_torch_dev/debug/runtime/test_runtime_governor.py
+--- a/enn_torch_dev/debug/runtime/test_runtime_governor.py
++++ b/enn_torch_dev/debug/runtime/test_runtime_governor.py
+@@ -88,12 +88,20 @@ def test_governor_policy_preserves_existing_positional_field_order() -> None:
+ 
+ 
+ def test_governor_decision_appends_pressure_field_selection_for_compatibility() -> None:
+-    field_names = [field.name for field in fields(GovernorDecision)]
++    decision_field_names = [field.name for field in fields(GovernorDecision)]
++    state_field_names = [field.name for field in fields(RuntimeGovernorState)]
+ 
+-    assert field_names[-3:] == [
++    assert decision_field_names[-5:] == [
+         "consecutive_high_pressure_passes",
+         "budget_shrunk_by_pressure",
+         "pressure_shrunk_budget_fields",
++        "consecutive_cpu_pressure_passes",
++        "consecutive_cuda_pressure_passes",
++    ]
++    assert state_field_names[-3:] == [
++        "consecutive_high_pressure_passes",
++        "consecutive_cpu_pressure_passes",
++        "consecutive_cuda_pressure_passes",
+     ]
+ 
+ 
+@@ -168,6 +176,322 @@ def test_sustained_cpu_and_cuda_pressure_shrink_both_byte_budgets() -> None:
+         "max_device_bytes",
+     )
+ 
++
++@pytest.mark.parametrize(
++    (
++        "pressure",
++        "expected_budget",
++        "expected_field",
++        "first_cpu_streak",
++        "first_cuda_streak",
++    ),
++    [
++        (
++            ResourcePressureSummary(peak_cpu_rss_ratio=0.95),
++            BatchBudget(max_items=8, max_host_bytes=50, max_device_bytes=200),
++            "max_host_bytes",
++            1,
++            0,
++        ),
++        (
++            ResourcePressureSummary(peak_cuda_reserved_ratio=0.95),
++            BatchBudget(max_items=8, max_host_bytes=100, max_device_bytes=100),
++            "max_device_bytes",
++            0,
++            1,
++        ),
++    ],
++)
++def test_each_pressure_dimension_reaches_threshold_independently(
++    pressure: ResourcePressureSummary,
++    expected_budget: BatchBudget,
++    expected_field: str,
++    first_cpu_streak: int,
++    first_cuda_streak: int,
++) -> None:
++    initial_budget = BatchBudget(
++        max_items=8,
++        max_host_bytes=100,
++        max_device_bytes=200,
++    )
++    governor = ConservativeRuntimeGovernor(
++        initial_budget,
++        policy=GovernorPolicy(
++            shrink_factor=0.5,
++            min_pressure_ratio_for_shrink=0.9,
++            shrink_after_pressure_passes=2,
++        ),
++    )
++
++    first = governor.observe_results([_result()], pressure_summary=pressure)
++    second = governor.observe_results([_result()], pressure_summary=pressure)
++
++    assert first.next_budget == initial_budget
++    assert first.consecutive_cpu_pressure_passes == first_cpu_streak
++    assert first.consecutive_cuda_pressure_passes == first_cuda_streak
++    assert first.consecutive_high_pressure_passes == 1
++    assert second.next_budget == expected_budget
++    assert second.pressure_shrunk_budget_fields == (expected_field,)
++    assert second.consecutive_cpu_pressure_passes == 0
++    assert second.consecutive_cuda_pressure_passes == 0
++    assert second.consecutive_high_pressure_passes == 0
++
++
++@pytest.mark.parametrize(
++    ("first_pressure", "second_pressure", "expected_cpu", "expected_cuda"),
++    [
++        (
++            ResourcePressureSummary(peak_cpu_rss_ratio=0.95),
++            ResourcePressureSummary(peak_cuda_reserved_ratio=0.95),
++            0,
++            1,
++        ),
++        (
++            ResourcePressureSummary(peak_cuda_reserved_ratio=0.95),
++            ResourcePressureSummary(peak_cpu_rss_ratio=0.95),
++            1,
++            0,
++        ),
++    ],
++)
++def test_alternating_pressure_dimensions_do_not_share_sustained_streak(
++    first_pressure: ResourcePressureSummary,
++    second_pressure: ResourcePressureSummary,
++    expected_cpu: int,
++    expected_cuda: int,
++) -> None:
++    budget = BatchBudget(max_items=8, max_host_bytes=100, max_device_bytes=200)
++    governor = ConservativeRuntimeGovernor(
++        budget,
++        policy=GovernorPolicy(
++            shrink_factor=0.5,
++            min_pressure_ratio_for_shrink=0.9,
++            shrink_after_pressure_passes=2,
++        ),
++    )
++
++    first = governor.observe_results([_result()], pressure_summary=first_pressure)
++    second = governor.observe_results([_result()], pressure_summary=second_pressure)
++
++    assert first.next_budget == budget
++    assert first.consecutive_high_pressure_passes == 1
++    assert second.next_budget == budget
++    assert second.budget_shrunk_by_pressure is False
++    assert second.pressure_shrunk_budget_fields == ()
++    assert second.consecutive_cpu_pressure_passes == expected_cpu
++    assert second.consecutive_cuda_pressure_passes == expected_cuda
++    assert second.consecutive_high_pressure_passes == max(expected_cpu, expected_cuda)
++
++
++def test_cpu_and_cuda_pressure_streaks_reach_threshold_together() -> None:
++    budget = BatchBudget(max_items=8, max_host_bytes=100, max_device_bytes=200)
++    governor = ConservativeRuntimeGovernor(
++        budget,
++        policy=GovernorPolicy(
++            shrink_factor=0.5,
++            min_pressure_ratio_for_shrink=0.9,
++            shrink_after_pressure_passes=2,
++        ),
++    )
++    pressure = ResourcePressureSummary(
++        peak_cpu_rss_ratio=0.95,
++        peak_cuda_reserved_ratio=0.96,
++    )
++
++    first = governor.observe_results([_result()], pressure_summary=pressure)
++    second = governor.observe_results([_result()], pressure_summary=pressure)
++
++    assert first.next_budget == budget
++    assert first.consecutive_cpu_pressure_passes == 1
++    assert first.consecutive_cuda_pressure_passes == 1
++    assert first.consecutive_high_pressure_passes == 1
++    assert second.next_budget == BatchBudget(
++        max_items=8,
++        max_host_bytes=50,
++        max_device_bytes=100,
++    )
++    assert second.pressure_shrunk_budget_fields == (
++        "max_host_bytes",
++        "max_device_bytes",
++    )
++    assert second.consecutive_cpu_pressure_passes == 0
++    assert second.consecutive_cuda_pressure_passes == 0
++    assert second.consecutive_high_pressure_passes == 0
++
++
++def test_cpu_trigger_preserves_incomplete_cuda_pressure_streak() -> None:
++    governor = ConservativeRuntimeGovernor(
++        state=RuntimeGovernorState(
++            current_budget=BatchBudget(
++                max_items=8,
++                max_host_bytes=100,
++                max_device_bytes=200,
++            ),
++            consecutive_high_pressure_passes=1,
++            consecutive_cpu_pressure_passes=1,
++        ),
++        policy=GovernorPolicy(
++            shrink_factor=0.5,
++            min_pressure_ratio_for_shrink=0.9,
++            shrink_after_pressure_passes=2,
++        ),
++    )
++
++    decision = governor.observe_results(
++        [_result()],
++        pressure_summary=ResourcePressureSummary(
++            peak_cpu_rss_ratio=0.95,
++            peak_cuda_reserved_ratio=0.95,
++        ),
++    )
++
++    assert decision.next_budget == BatchBudget(
++        max_items=8,
++        max_host_bytes=50,
++        max_device_bytes=200,
++    )
++    assert decision.pressure_shrunk_budget_fields == ("max_host_bytes",)
++    assert decision.consecutive_cpu_pressure_passes == 0
++    assert decision.consecutive_cuda_pressure_passes == 1
++    assert decision.consecutive_high_pressure_passes == 1
++
++
++@pytest.mark.parametrize("cpu_ratio", [None, 0.5])
++def test_unknown_or_low_cpu_pressure_resets_only_cpu_streak(
++    cpu_ratio: float | None,
++) -> None:
++    governor = ConservativeRuntimeGovernor(
++        state=RuntimeGovernorState(
++            current_budget=BatchBudget(max_items=8),
++            consecutive_high_pressure_passes=1,
++            consecutive_cpu_pressure_passes=1,
++            consecutive_cuda_pressure_passes=1,
++        ),
++        policy=GovernorPolicy(
++            min_pressure_ratio_for_shrink=0.9,
++            shrink_after_pressure_passes=3,
++        ),
++    )
++
++    decision = governor.observe_results(
++        [_result()],
++        pressure_summary=ResourcePressureSummary(
++            peak_cpu_rss_ratio=cpu_ratio,
++            peak_cuda_reserved_ratio=0.95,
++        ),
++    )
++
++    assert decision.next_budget == BatchBudget(max_items=8)
++    assert decision.consecutive_cpu_pressure_passes == 0
++    assert decision.consecutive_cuda_pressure_passes == 2
++    assert decision.consecutive_high_pressure_passes == 2
++
++
++@pytest.mark.parametrize("pressure", [None, ResourcePressureSummary()])
++def test_fully_unknown_pressure_resets_both_dimension_streaks(
++    pressure: ResourcePressureSummary | None,
++) -> None:
++    governor = ConservativeRuntimeGovernor(
++        state=RuntimeGovernorState(
++            current_budget=BatchBudget(max_items=8),
++            consecutive_high_pressure_passes=1,
++            consecutive_cpu_pressure_passes=1,
++            consecutive_cuda_pressure_passes=1,
++        ),
++        policy=GovernorPolicy(min_pressure_ratio_for_shrink=0.9),
++    )
++
++    decision = governor.observe_results([_result()], pressure_summary=pressure)
++
++    assert decision.consecutive_cpu_pressure_passes == 0
++    assert decision.consecutive_cuda_pressure_passes == 0
++    assert decision.consecutive_high_pressure_passes == 0
++
++
++def test_legacy_global_pressure_streak_is_inherited_by_current_high_dimension() -> None:
++    governor = ConservativeRuntimeGovernor(
++        state=RuntimeGovernorState(
++            current_budget=BatchBudget(max_items=8, max_host_bytes=100),
++            consecutive_high_pressure_passes=1,
++        ),
++        policy=GovernorPolicy(
++            shrink_factor=0.5,
++            min_pressure_ratio_for_shrink=0.9,
++            shrink_after_pressure_passes=2,
++        ),
++    )
++
++    decision = governor.observe_results(
++        [_result()],
++        pressure_summary=ResourcePressureSummary(peak_cpu_rss_ratio=0.95),
++    )
++
++    assert decision.next_budget == BatchBudget(max_items=8, max_host_bytes=50)
++    assert decision.pressure_shrunk_budget_fields == ("max_host_bytes",)
++    assert decision.consecutive_cpu_pressure_passes == 0
++    assert decision.consecutive_cuda_pressure_passes == 0
++    assert decision.consecutive_high_pressure_passes == 0
++
++
++def test_explicit_dimension_streak_does_not_reuse_legacy_aggregate() -> None:
++    budget = BatchBudget(max_items=8, max_host_bytes=100)
++    governor = ConservativeRuntimeGovernor(
++        state=RuntimeGovernorState(
++            current_budget=budget,
++            consecutive_high_pressure_passes=5,
++            consecutive_cpu_pressure_passes=1,
++        ),
++        policy=GovernorPolicy(
++            min_pressure_ratio_for_shrink=0.9,
++            shrink_after_pressure_passes=3,
++        ),
++    )
++
++    decision = governor.observe_results(
++        [_result()],
++        pressure_summary=ResourcePressureSummary(peak_cpu_rss_ratio=0.95),
++    )
++
++    assert decision.next_budget == budget
++    assert decision.budget_shrunk_by_pressure is False
++    assert decision.consecutive_cpu_pressure_passes == 2
++    assert decision.consecutive_cuda_pressure_passes == 0
++    assert decision.consecutive_high_pressure_passes == 2
++
++
++@pytest.mark.parametrize(
++    "results",
++    [
++        [],
++        [_result(StepStatus.RUNTIME_FAULT)],
++    ],
++)
++def test_empty_or_faulted_pass_resets_both_dimension_streaks(
++    results: list[StepResult],
++) -> None:
++    governor = ConservativeRuntimeGovernor(
++        state=RuntimeGovernorState(
++            current_budget=BatchBudget(max_items=8),
++            consecutive_high_pressure_passes=1,
++            consecutive_cpu_pressure_passes=1,
++            consecutive_cuda_pressure_passes=1,
++        ),
++        policy=GovernorPolicy(min_pressure_ratio_for_shrink=0.9),
++    )
++
++    decision = governor.observe_results(
++        results,
++        pressure_summary=ResourcePressureSummary(
++            peak_cpu_rss_ratio=0.95,
++            peak_cuda_reserved_ratio=0.95,
++        ),
++    )
++
++    assert decision.consecutive_cpu_pressure_passes == 0
++    assert decision.consecutive_cuda_pressure_passes == 0
++    assert decision.consecutive_high_pressure_passes == 0
++
++
+ @pytest.mark.parametrize(
+     "pressure",
+     [
+@@ -626,6 +950,8 @@ def test_oom_signals_reset_sustained_pressure_streak_before_pressure_shrink(
+             current_budget=BatchBudget(max_items=8),
+             consecutive_successes=1,
+             consecutive_high_pressure_passes=1,
++            consecutive_cpu_pressure_passes=1,
++            consecutive_cuda_pressure_passes=1,
+         ),
+         policy=GovernorPolicy(
+             shrink_factor=0.5,
+@@ -648,6 +974,8 @@ def test_oom_signals_reset_sustained_pressure_streak_before_pressure_shrink(
+     assert decision.budget_shrunk_by_pressure is False
+     assert decision.growth_suppressed_by_pressure is False
+     assert decision.pressure_shrunk_budget_fields == ()
++    assert decision.consecutive_cpu_pressure_passes == 0
++    assert decision.consecutive_cuda_pressure_passes == 0
+     assert reason_text in decision.reason
+ 
+ 
+@@ -883,6 +1211,8 @@ def test_governor_decision_pressure_fields_default_for_existing_construction() -> None:
+     assert decision.pressure_summary is None
+     assert decision.growth_suppressed_by_pressure is False
+     assert decision.pressure_shrunk_budget_fields == ()
++    assert decision.consecutive_cpu_pressure_passes == 0
++    assert decision.consecutive_cuda_pressure_passes == 0
+     assert state.last_decision == decision
+ 
+ 
+@@ -922,6 +1252,26 @@ def test_invalid_governor_arguments_are_rejected() -> None:
+         ConservativeRuntimeGovernor(BatchBudget(max_items=0))
+ 
+ 
++@pytest.mark.parametrize(
++    ("field_name", "value"),
++    [
++        ("consecutive_cpu_pressure_passes", -1),
++        ("consecutive_cpu_pressure_passes", True),
++        ("consecutive_cuda_pressure_passes", -1),
++        ("consecutive_cuda_pressure_passes", True),
++    ],
++)
++def test_invalid_dimension_pressure_streaks_are_rejected(
++    field_name: str,
++    value: object,
++) -> None:
++    with pytest.raises((TypeError, ValueError)):
++        RuntimeGovernorState(
++            current_budget=BatchBudget(max_items=8),
++            **{field_name: value},
++        )
++
++
+ def test_explicit_state_is_immutable_and_replaced_after_observe() -> None:
+     original_state = RuntimeGovernorState(
+         current_budget=BatchBudget(max_items=8),
+diff --git a/enn_torch_dev/debug/runtime/test_runtime_summary.py b/enn_torch_dev/debug/runtime/test_runtime_summary.py
+--- a/enn_torch_dev/debug/runtime/test_runtime_summary.py
++++ b/enn_torch_dev/debug/runtime/test_runtime_summary.py
+@@ -55,6 +55,8 @@ def _decision(
+     consecutive_high_pressure_passes: int = 0,
+     budget_shrunk_by_pressure: bool = False,
+     pressure_shrunk_budget_fields: tuple[str, ...] = (),
++    consecutive_cpu_pressure_passes: int = 0,
++    consecutive_cuda_pressure_passes: int = 0,
+ ) -> GovernorDecision:
+     previous = previous_budget or BatchBudget(max_items=4)
+     return GovernorDecision(
+@@ -74,6 +76,8 @@ def _decision(
+         consecutive_high_pressure_passes=consecutive_high_pressure_passes,
+         budget_shrunk_by_pressure=budget_shrunk_by_pressure,
+         pressure_shrunk_budget_fields=pressure_shrunk_budget_fields,
++        consecutive_cpu_pressure_passes=consecutive_cpu_pressure_passes,
++        consecutive_cuda_pressure_passes=consecutive_cuda_pressure_passes,
+     )
+ 
+ 
+@@ -126,6 +130,8 @@ def test_summarize_and_format_runtime_pass_pressure_shrink_feedback() -> None:
+                 consecutive_high_pressure_passes=1,
+                 budget_shrunk_by_pressure=True,
+                 pressure_shrunk_budget_fields=("max_host_bytes",),
++                consecutive_cpu_pressure_passes=1,
++                consecutive_cuda_pressure_passes=0,
+             ),
+         )
+     )
+@@ -136,7 +142,11 @@ def test_summarize_and_format_runtime_pass_pressure_shrink_feedback() -> None:
+     assert summary.consecutive_high_pressure_passes == 1
+     assert summary.budget_shrunk_by_pressure is True
+     assert summary.pressure_shrunk_budget_fields == ("max_host_bytes",)
++    assert summary.consecutive_cpu_pressure_passes == 1
++    assert summary.consecutive_cuda_pressure_passes == 0
+     assert "consecutive_high_pressure_passes=1" in text
++    assert "consecutive_cpu_pressure_passes=1" in text
++    assert "consecutive_cuda_pressure_passes=0" in text
+     assert "budget_shrunk_by_pressure=True" in text
+     assert "pressure_shrunk_budget_fields=('max_host_bytes',)" in text
+ 
+@@ -219,12 +229,14 @@ def test_runtime_pass_summary_appends_feedback_and_capacity_fields_for_compatibility() -> None:
+     field_names = [field.name for field in fields(RuntimePassSummary)]
+ 
+-    assert field_names[-6:] == [
++    assert field_names[-8:] == [
+         "pressure_summary",
+         "growth_suppressed_by_pressure",
+         "resource_capacity",
+         "consecutive_high_pressure_passes",
+         "budget_shrunk_by_pressure",
+         "pressure_shrunk_budget_fields",
++        "consecutive_cpu_pressure_passes",
++        "consecutive_cuda_pressure_passes",
+     ]
+ 
+ 
+diff --git a/enn_torch_dev/debug/runtime/test_runtime_capacity_provider.py b/enn_torch_dev/debug/runtime/test_runtime_capacity_provider.py
+--- a/enn_torch_dev/debug/runtime/test_runtime_capacity_provider.py
++++ b/enn_torch_dev/debug/runtime/test_runtime_capacity_provider.py
+@@ -138,11 +138,13 @@ def test_resource_monitor_satisfies_capacity_provider_protocol() -> None:
+ 
+ def test_capacity_provider_and_provenance_fields_are_appended_for_compatibility() -> None:
+     assert [field.name for field in fields(RuntimePassResult)][-1] == "resource_capacity"
+-    assert [field.name for field in fields(RuntimePassSummary)][-4:] == [
++    assert [field.name for field in fields(RuntimePassSummary)][-6:] == [
+         "resource_capacity",
+         "consecutive_high_pressure_passes",
+         "budget_shrunk_by_pressure",
+         "pressure_shrunk_budget_fields",
++        "consecutive_cpu_pressure_passes",
++        "consecutive_cuda_pressure_passes",
+     ]
+ 
+ 
+diff --git a/enn_torch_dev/debug/runtime/test_runtime_integration.py b/enn_torch_dev/debug/runtime/test_runtime_integration.py
+--- a/enn_torch_dev/debug/runtime/test_runtime_integration.py
++++ b/enn_torch_dev/debug/runtime/test_runtime_integration.py
+@@ -321,12 +321,17 @@ def test_runtime_session_shrinks_after_sustained_provider_pressure() -> None:
+     assert provider.calls == 2
+     assert first.pass_result.decision.next_budget == BatchBudget(max_items=8)
+     assert first.pass_summary.consecutive_high_pressure_passes == 1
++    assert first.pass_summary.consecutive_cpu_pressure_passes == 1
++    assert first.pass_summary.consecutive_cuda_pressure_passes == 0
+     assert first.pass_summary.budget_shrunk_by_pressure is False
+     assert second.pass_result.decision.next_budget == BatchBudget(max_items=4)
+     assert second.pass_summary.budget_shrunk_by_pressure is True
+     assert second.pass_summary.pressure_shrunk_budget_fields == (
+         "max_items",
+     )
++    assert second.pass_summary.consecutive_cpu_pressure_passes == 0
++    assert second.pass_summary.consecutive_cuda_pressure_passes == 0
++    assert second.pass_summary.consecutive_high_pressure_passes == 0
+     assert second.history_summary.pressure_shrink_passes == 1
+ 
+ 
+diff --git a/docs/dev_runtime_governor.md b/docs/dev_runtime_governor.md
+--- a/docs/dev_runtime_governor.md
++++ b/docs/dev_runtime_governor.md
+@@ -102,12 +102,16 @@ Decision priority is deliberately small and predictable:
+ 8. A known maximum pressure ratio below the configured limit allows the success
+    streak to increase by one for the observe call.
+ 9. With `min_pressure_ratio_for_shrink` configured, a known maximum ratio at or
+-   above that threshold increments a high-pressure streak, suppresses growth, and
+-   shrinks the next budget only when `shrink_after_pressure_passes` is reached.
++   above that threshold increments only the matching CPU or CUDA pressure streak,
++   suppresses growth, and shrinks the next budget only when that dimension reaches
++   `shrink_after_pressure_passes`.
+    CPU pressure selects `max_host_bytes`; any CUDA allocated/reserved/max ratio
+    selects `max_device_bytes`. If no matching byte budget is configured,
+    `max_items` is the fallback. When at least one matching byte budget is
+-   configured, `max_items` remains unchanged. Low, unavailable, empty, or faulted
+-   passes reset this streak.
++   configured, `max_items` remains unchanged. A low or unknown observation resets
++   only that dimension's streak; a fully unavailable summary, empty pass, fault,
++   yielded OOM, or retry-recovered OOM resets both dimension streaks.
++   A dimension that reaches the threshold resets after its shrink decision without
++   clearing the other dimension's incomplete streak.
+ 10. Retry-recovered OOM is not success evidence and does not increase the success
+    streak.
+@@ -126,15 +130,25 @@ Decision priority is deliberately small and predictable:
+ - `consecutive_ooms`
+ - `last_decision`
+ - `consecutive_high_pressure_passes`
++- `consecutive_cpu_pressure_passes`
++- `consecutive_cuda_pressure_passes`
+ 
+ `ConservativeRuntimeGovernor` replaces its state with a new
+ `RuntimeGovernorState` after each observation. It does not mutate a state object
+ that was passed in from outside.
+ 
+ `GovernorDecision` records the previous and next budget, reason text, observed
+ statuses, updated streak counters, resource peaks, the supplied pressure summary,
+ whether pressure suppressed success growth, whether sustained pressure actually
+ changed the next budget, and the ordered tuple of budget fields whose values
+-actually changed because of pressure.
++actually changed because of pressure. `consecutive_high_pressure_passes` remains a
++compatibility aggregate equal to the maximum of the CPU and CUDA streaks in every
++new decision and state.
++
++For compatibility with state constructed before dimension-specific streak fields
++existed, a positive legacy `consecutive_high_pressure_passes` value is inherited by
++the currently high dimension or dimensions only when both new streak fields are
++zero. After the next observation, the governor emits explicit CPU/CUDA streaks and
++recomputes the compatibility aggregate.
+ 
+ ## Resource Samples
+@@ -156,7 +170,11 @@ Raw byte peaks remain observational.
+ Sustained-pressure shrink is dimension-aware. CPU RSS pressure maps to the host
+ byte budget, while every CUDA pressure ratio maps to the device byte budget.
+ `max_items` is used only when none of the pressured dimensions has a configured
+ matching byte budget. OOM and retry-recovered OOM continue to shrink every
+ configured budget field and do not populate the pressure-specific field tuple.
++CPU and CUDA persistence are tracked independently, so alternating CPU-only and
++CUDA-only high-pressure passes cannot combine into a sustained-pressure shrink.
++When both dimensions are continuously high, each can reach the threshold and
++trigger its matching budget adjustment in the same pass.
+ 
+ ## Relationship to Orchestration
+@@ -176,6 +194,6 @@ execute models, discover capacity, or construct a pressure summary.
+ - Full AutoGovernor behavior.
+ - Learned or model-specific tuning.
+ - Persistent calibration caches or history databases.
+-- Per-dimension streak tracking or learned field weights.
++- Per-dimension thresholds, shrink factors, or learned field weights.
+ - Automatic pressure-summary construction inside the governor.
+ - Automatic capacity discovery or refresh inside the orchestrator.
+diff --git a/docs/dev_runtime_summary.md b/docs/dev_runtime_summary.md
+--- a/docs/dev_runtime_summary.md
++++ b/docs/dev_runtime_summary.md
+@@ -49,8 +49,9 @@ The stable `enn_torch` namespace does not expose this development summary API.
+ - the optional scalar-only `ResourcePressureSummary` copied from the decision;
+ - whether pressure suppressed success-driven budget growth;
+ - the scalar-only `ResourceCapacity` used to normalize that pass, when available;
+ - the current high-pressure streak and whether sustained pressure actually shrank
+   the next budget;
+-- the ordered tuple of budget fields whose values actually changed due to pressure.
++- the ordered tuple of budget fields whose values actually changed due to pressure;
++- the independent CPU and CUDA pressure streak counters.
+ 
+ `summarize_runtime_pass(pass_result)` accepts only a finite `RuntimePassResult`.
+@@ -65,6 +66,7 @@ It scans the pass result tuple and stores only lightweight summary fields. It does
+ `format_runtime_pass_summary(summary)` returns stable human-readable text for a
+ `RuntimePassSummary`. The formatter includes whether pressure was assessed, the
+ maximum known pressure ratio (or `unknown`), whether pressure suppressed growth,
+-the resolved capacity provenance, and the pressure-adjusted field tuple. It is
++the resolved capacity provenance, the compatibility aggregate, both dimension
++streaks, and the pressure-adjusted field tuple. It is
+ intended for debug output and PR/report inspection, not for a stable machine
+ interchange format.
+diff --git a/docs/runtime_development_workflow.md b/docs/runtime_development_workflow.md
+--- a/docs/runtime_development_workflow.md
++++ b/docs/runtime_development_workflow.md
+@@ -164,8 +164,10 @@ The conservative governor then:
+ - optionally suppresses success growth when an explicit pressure summary is
+   missing or reaches the configured growth limit;
+ - optionally shrinks the next-pass budget only after a configured sustained
+-  high-pressure streak, selecting host bytes for CPU pressure and device bytes
+-  for CUDA pressure;
++  high-pressure streak, tracking CPU and CUDA persistence independently and
++  selecting host bytes for CPU pressure and device bytes for CUDA pressure;
+ - falls back to `max_items` only when no matching pressured byte budget is
+   configured;
++- preserves an incomplete streak for one dimension when only the other dimension
++  reaches its shrink threshold;
+ - applies configured minimum and maximum bounds.
+@@ -211,5 +213,5 @@ It does not provide:
+ - AutoGovernor or learned tuning;
+ - automatic `ResourceMonitor` creation;
+ - mid-pass capacity refresh or free-memory admission control;
+-- per-dimension streak tracking or learned field weights;
++- per-dimension thresholds, shrink factors, or learned field weights;
+ - stable `enn_torch` API exposure.
+diff --git a/docs/CURRENT_STATE.md b/docs/CURRENT_STATE.md
+--- a/docs/CURRENT_STATE.md
++++ b/docs/CURRENT_STATE.md
+@@ -19,1 +19,1 @@ Status categories:
+-| `enn_torch_dev/runtime` | ACTIVE DEVELOPMENT | Development namespace for loaders, runtime steps, fault/status records, model/resource cost probes, model/optimizer footprint, resource monitoring, resource capacity and pressure assessment, budgeted batching, OOM-class runtime retry, conservative StepResult-observing budget governance with opt-in pressure growth suppression and dimension-aware sustained-pressure shrink, finite pass-level runtime orchestration with fixed or pass-scoped provider capacity assessment of all raw-attempt resource samples and per-pass capacity provenance, runtime pass summary inspection with pressure-feedback, pressure-shrink, and adjusted-field visibility, bounded in-memory runtime history aggregation of pressure assessment, growth suppression, and actual pressure shrink, bounded lazy multi-pass runtime sessions, fresh per-pass source factories, and end-to-end integration coverage for retry, budget transitions, history retention, identity order, and API boundaries. |
++| `enn_torch_dev/runtime` | ACTIVE DEVELOPMENT | Development namespace for loaders, runtime steps, fault/status records, model/resource cost probes, model/optimizer footprint, resource monitoring, resource capacity and pressure assessment, budgeted batching, OOM-class runtime retry, conservative StepResult-observing budget governance with opt-in pressure growth suppression and independent CPU/CUDA sustained-pressure streaks driving dimension-aware shrink, finite pass-level runtime orchestration with fixed or pass-scoped provider capacity assessment of all raw-attempt resource samples and per-pass capacity provenance, runtime pass summary inspection with pressure-feedback, pressure-shrink, adjusted-field, and per-dimension streak visibility, bounded in-memory runtime history aggregation of pressure assessment, growth suppression, and actual pressure shrink, bounded lazy multi-pass runtime sessions, fresh per-pass source factories, and end-to-end integration coverage for retry, budget transitions, history retention, identity order, and API boundaries. |
+diff --git a/docs/RUNTIME_SAFETY.md b/docs/RUNTIME_SAFETY.md
+--- a/docs/RUNTIME_SAFETY.md
++++ b/docs/RUNTIME_SAFETY.md
+@@ -34,5 +34,8 @@ Use this document before running code that can allocate accelerator memory, writ
+ - Feed pressure summaries into governor decisions through explicit opt-in policies. Missing or high pressure may suppress growth; pressure may shrink a future budget only when a separately configured sustained-pressure threshold and pass count are both met.
+ - Never let a single non-OOM pressure sample trigger shrink, and keep OOM/recovered-OOM shrink higher priority than pressure streak handling.
+ - Map sustained CPU pressure only to `max_host_bytes` and sustained CUDA pressure only to `max_device_bytes`; use `max_items` only when no matching pressured byte budget is configured.
++- Track CPU and CUDA pressure persistence independently; alternating pressure dimensions must not combine into one sustained streak.
++- Reset only the dimension observed as low or unknown during a successful assessed pass, while preserving the other dimension's incomplete high-pressure streak.
++- Reset both dimension streaks after fully unavailable pressure, empty passes, non-OOM faults, yielded OOM, or retry-recovered OOM.
+ - Record only fields whose values actually changed, and do not label minimum-bound no-ops as pressure shrink.
+ - Keep yielded or retry-recovered OOM behavior unchanged: it shrinks every configured budget field and leaves pressure-specific field metadata empty.
+diff --git a/docs/CHANGE_CHECKLIST.md b/docs/CHANGE_CHECKLIST.md
+--- a/docs/CHANGE_CHECKLIST.md
++++ b/docs/CHANGE_CHECKLIST.md
+@@ -17,1 +17,1 @@ Do not defer required documentation updates to a follow-up task. Do not edit unr
+-| resource monitoring, capacity/pressure assessment, cost/batching, runtime governor, orchestration, pass summaries, pass history, sessions, and source factories | `enn_torch_dev/runtime/cost.py`, `footprint.py`, `resources.py`, `capacity_provider.py`, `pressure.py`, `batching.py`, `governor.py`, `orchestration.py`, `summary.py`, `history.py`, `session.py`, `source_factory.py` | `enn_torch_dev/debug/runtime/test_runtime_pressure.py -q`; `enn_torch_dev/debug/runtime/test_runtime_integration.py -q`; `enn_torch_dev/debug/runtime -q` | `docs/CURRENT_STATE.md`, `docs/TESTING.md`, `docs/RUNTIME_SAFETY.md`, relevant `docs/dev_*.md` | CPU/CUDA assumptions, cgroup v1/v2 path parsing, hierarchy-effective cgroup limit discovery, physical-vs-effective CPU capacity, capacity lookup fallback, device mismatch, unknown-vs-zero pressure semantics, unclamped ratios, pressure-threshold validation, missing-summary growth suppression, OOM priority over pressure, fixed/provider capacity mutual exclusion, pass-start provider call count, provider failure before source consumption, invalid provider returns, per-pass capacity provenance, retry-attempt sample inclusion, CUDA capacity/sample mismatch propagation, memory accounting semantics, oversized batch behavior, budget shrink/grow bounds, dimension-aware pressure-to-budget mapping, max-items fallback drift, actual-vs-attempted adjusted-field reporting, accidental execution/retry coupling, unbounded pass materialization, summary/history retaining `StepResult`, raw `ResourceSample`, `store`, or `loss` references, pressure summary field-order compatibility, sustained-pressure streak reset and priority errors, retained-window pressure shrink aggregation drift, unbounded history retention, retention-bound regression, unbounded session execution, session retaining previous pass results, factory returning cached or non-finite sources, unexpected persistent logging, stable namespace leakage, identity/order regression across split and retry paths |
++| resource monitoring, capacity/pressure assessment, cost/batching, runtime governor, orchestration, pass summaries, pass history, sessions, and source factories | `enn_torch_dev/runtime/cost.py`, `footprint.py`, `resources.py`, `capacity_provider.py`, `pressure.py`, `batching.py`, `governor.py`, `orchestration.py`, `summary.py`, `history.py`, `session.py`, `source_factory.py` | `enn_torch_dev/debug/runtime/test_runtime_pressure.py -q`; `enn_torch_dev/debug/runtime/test_runtime_integration.py -q`; `enn_torch_dev/debug/runtime -q` | `docs/CURRENT_STATE.md`, `docs/TESTING.md`, `docs/RUNTIME_SAFETY.md`, relevant `docs/dev_*.md` | CPU/CUDA assumptions, cgroup v1/v2 path parsing, hierarchy-effective cgroup limit discovery, physical-vs-effective CPU capacity, capacity lookup fallback, device mismatch, unknown-vs-zero pressure semantics, unclamped ratios, pressure-threshold validation, missing-summary growth suppression, OOM priority over pressure, fixed/provider capacity mutual exclusion, pass-start provider call count, provider failure before source consumption, invalid provider returns, per-pass capacity provenance, retry-attempt sample inclusion, CUDA capacity/sample mismatch propagation, memory accounting semantics, oversized batch behavior, budget shrink/grow bounds, dimension-aware pressure-to-budget mapping, cross-dimension streak contamination, legacy aggregate streak compatibility, max-items fallback drift, actual-vs-attempted adjusted-field reporting, accidental execution/retry coupling, unbounded pass materialization, summary/history retaining `StepResult`, raw `ResourceSample`, `store`, or `loss` references, pressure summary field-order compatibility, sustained-pressure streak reset and priority errors, retained-window pressure shrink aggregation drift, unbounded history retention, retention-bound regression, unbounded session execution, session retaining previous pass results, factory returning cached or non-finite sources, unexpected persistent logging, stable namespace leakage, identity/order regression across split and retry paths |
