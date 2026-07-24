@@ -32,7 +32,8 @@ Use this document before running code that can allocate accelerator memory, writ
 - Treat missing capacity or observation values as unknown, not zero utilization.
 - Normalize CPU RSS against the smallest known physical or hierarchy-effective cgroup capacity; do not assume host physical memory or a leaf cgroup file is the process limit in containers.
 - Do not clamp pressure ratios to `1.0`; ratios above one must remain visible for diagnosis.
-- Feed pressure summaries into governor decisions only through the explicit opt-in growth guard; missing or high pressure may suppress growth but must not directly shrink a budget.
+- Feed pressure summaries into governor decisions through explicit opt-in policies. Missing or high pressure may suppress growth; pressure may shrink a future budget only when a separately configured sustained-pressure threshold and pass count are both met.
+- Never let a single non-OOM pressure sample trigger shrink, and keep OOM/recovered-OOM shrink higher priority than pressure streak handling.
 - When orchestration is given fixed or provider-resolved `ResourceCapacity`, include samples from retry-consumed attempts as well as final results.
 - Resolve a `ResourceCapacityProvider` exactly once before consuming each pass source; provider failures and invalid return types must remain visible and must not update governor state.
 - Keep the resolved capacity fixed within a pass; do not hide CUDA device mismatches or refresh capacity during retry/split execution.

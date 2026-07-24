@@ -59,6 +59,7 @@ is not a live mutable view of the history internals.
 - pressure-assessed pass count;
 - pressure-growth-suppressed pass count;
 - highest known pressure ratio across retained summaries;
+- count of retained passes whose budget actually shrank because of sustained pressure;
 - latest retained `RuntimePassSummary`, or `None` for an empty history.
 
 `format_runtime_history_summary(summary)` returns stable human-readable text for

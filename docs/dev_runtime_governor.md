@@ -56,6 +56,9 @@ or a success grow from decreasing one through clamping.
   integers.
 - For each field family, `min_*` must not exceed `max_*`.
 - `max_pressure_ratio_for_growth` is optional; when configured it must be finite and satisfy `0 < value <= 1`.
+- `min_pressure_ratio_for_shrink` is optional; when configured it must be finite and satisfy `0 < value <= 1`.
+- `shrink_after_pressure_passes` must be a positive integer.
+- When both pressure thresholds are configured, the growth threshold must not exceed the shrink threshold.
 
 ## Adjustment Rules
 
@@ -88,7 +91,7 @@ Decision priority is deliberately small and predictable:
    observed statuses are `SUCCESS` or the observed stream is empty.
 4. Mixed streams containing OOM and success or non-OOM faults still shrink.
 5. If every observed result is `StepStatus.SUCCESS` and `recovered_oom=False`,
-   an optional pressure growth guard is evaluated before success evidence is
+   an optional sustained-pressure shrink guard is evaluated before success evidence is
    accumulated.
 6. With `max_pressure_ratio_for_growth=None`, pressure does not change the existing
    success-growth behavior.
@@ -97,12 +100,16 @@ Decision priority is deliberately small and predictable:
    budget and resets the success streak to zero.
 8. A known maximum pressure ratio below the configured limit allows the success
    streak to increase by one for the observe call.
-9. Retry-recovered OOM is not success evidence and does not increase the success
+9. With `min_pressure_ratio_for_shrink` configured, a known maximum ratio at or
+   above that threshold increments a high-pressure streak, suppresses growth, and
+   shrinks the next budget only when `shrink_after_pressure_passes` is reached.
+   Low, unavailable, empty, or faulted passes reset this streak.
+10. Retry-recovered OOM is not success evidence and does not increase the success
    streak.
-10. The success streak does not increase per successful `StepResult`.
-11. When `grow_after_successes` is reached, all configured budget fields grow and
-    the success streak resets to zero.
-12. Non-OOM faults keep the current budget and reset success/OOM streaks.
+11. The success streak does not increase per successful `StepResult`.
+12. When `grow_after_successes` is reached, all configured budget fields grow and
+   the success streak resets to zero.
+13. Non-OOM faults keep the current budget and reset success/OOM/high-pressure streaks.
 
 ## State and Decision Records
 
@@ -112,6 +119,7 @@ Decision priority is deliberately small and predictable:
 - `consecutive_successes`
 - `consecutive_ooms`
 - `last_decision`
+- `consecutive_high_pressure_passes`
 
 `ConservativeRuntimeGovernor` replaces its state with a new
 `RuntimeGovernorState` after each observation. It does not mutate a state object
@@ -119,7 +127,8 @@ that was passed in from outside.
 
 `GovernorDecision` records the previous and next budget, reason text, observed
 statuses, updated streak counters, resource peaks, the supplied pressure summary,
-and whether pressure suppressed success growth.
+whether pressure suppressed success growth, and whether sustained pressure actually
+changed the next budget.
 
 ## Resource Samples
 
@@ -133,9 +142,10 @@ record and reason text:
 - `peak_cuda_max_reserved_bytes`
 
 Raw byte peaks remain observational. A separately supplied
-`ResourcePressureSummary` may only suppress success-driven growth when the opt-in
-policy limit is configured. Pressure never causes an automatic shrink in this
-slice.
+`ResourcePressureSummary` may suppress success-driven growth when the opt-in policy
+limit is configured. It may shrink only a future budget when the separately opt-in
+sustained-pressure threshold and pass count are met; OOM and recovered OOM retain
+higher priority.
 
 ## Relationship to Orchestration
 
@@ -152,7 +162,7 @@ execute models, discover capacity, or construct a pressure summary.
 - Full AutoGovernor behavior.
 - Learned or model-specific tuning.
 - Persistent calibration caches or history databases.
-- Pressure-triggered budget shrink or field-specific tuning.
+- Field-specific tuning.
 - Automatic pressure-summary construction inside the governor.
 - Automatic capacity discovery or refresh inside the orchestrator.
 - `ModelCostProbe`-driven policy changes.

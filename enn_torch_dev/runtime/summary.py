@@ -37,6 +37,8 @@ class RuntimePassSummary:
     pressure_summary: ResourcePressureSummary | None = None
     growth_suppressed_by_pressure: bool = False
     resource_capacity: ResourceCapacity | None = None
+    consecutive_high_pressure_passes: int = 0
+    budget_shrunk_by_pressure: bool = False
 
 
 def summarize_runtime_pass(pass_result: RuntimePassResult) -> RuntimePassSummary:
@@ -85,6 +87,8 @@ def summarize_runtime_pass(pass_result: RuntimePassResult) -> RuntimePassSummary
         pressure_summary=decision.pressure_summary,
         growth_suppressed_by_pressure=decision.growth_suppressed_by_pressure,
         resource_capacity=pass_result.resource_capacity,
+        consecutive_high_pressure_passes=decision.consecutive_high_pressure_passes,
+        budget_shrunk_by_pressure=decision.budget_shrunk_by_pressure,
     )
 
 
@@ -119,6 +123,8 @@ def format_runtime_pass_summary(summary: RuntimePassSummary) -> str:
             f"pressure_assessed={pressure_summary is not None}",
             f"max_pressure_ratio={_format_optional_ratio(max_pressure_ratio)}",
             f"growth_suppressed_by_pressure={summary.growth_suppressed_by_pressure}",
+            f"consecutive_high_pressure_passes={summary.consecutive_high_pressure_passes}",
+            f"budget_shrunk_by_pressure={summary.budget_shrunk_by_pressure}",
             f"decision_reason={summary.decision_reason}",
         )
     )
