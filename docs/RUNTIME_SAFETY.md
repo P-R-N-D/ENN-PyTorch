@@ -32,9 +32,11 @@ Use this document before running code that can allocate accelerator memory, writ
 - Treat missing capacity or observation values as unknown, not zero utilization.
 - Normalize CPU RSS against the smallest known physical or hierarchy-effective cgroup capacity; do not assume host physical memory or a leaf cgroup file is the process limit in containers.
 - Do not clamp pressure ratios to `1.0`; ratios above one must remain visible for diagnosis.
-- Feed pressure summaries into governor decisions through explicit opt-in policies. Missing or high pressure may suppress growth; pressure may shrink a future budget only when a separately configured sustained-pressure threshold and pass count are both met.
+- Feed pressure summaries into governor decisions through explicit opt-in policies. Missing or high pressure may suppress growth; pressure may shrink a future budget only when the effective sustained-pressure threshold and required pass count for that dimension are both met.
+- Dimension-specific shrink thresholds and required pass counts override the common policy independently; unset overrides fall back to the common values, and a dimension with no effective threshold remains disabled.
+- Keep `max_pressure_ratio_for_growth` less than or equal to every active effective CPU/CUDA shrink threshold so growth suppression cannot begin above a shrink trigger.
 - Never let a single non-OOM pressure sample trigger shrink, and keep OOM/recovered-OOM shrink higher priority than pressure streak handling.
-- Map sustained CPU pressure only to `max_host_bytes` and sustained CUDA pressure only to `max_device_bytes`; use `max_items` only when no matching pressured byte budget is configured.
+- Map sustained CPU pressure only to `max_host_bytes` and sustained CUDA pressure only to `max_device_bytes`; use `max_items` only when no matching triggered byte budget is configured.
 - Track CPU and CUDA pressure persistence independently; alternating pressure dimensions must not combine into one sustained streak.
 - Reset only the dimension observed as low or unknown during a successful assessed pass, while preserving the other dimension's incomplete high-pressure streak.
 - Reset both dimension streaks after fully unavailable pressure, empty passes, non-OOM faults, yielded OOM, or retry-recovered OOM.
