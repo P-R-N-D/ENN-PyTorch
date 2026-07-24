@@ -108,8 +108,9 @@ fixed capacity and a provider cannot be configured together.
 
 If neither fixed capacity nor a provider is supplied, the orchestrator passes no
 pressure summary and the existing governor contract applies. Pressure may suppress
-success-driven growth when the opt-in guard is enabled, but it does not directly
-shrink a budget.
+success-driven growth when the opt-in guard is enabled. Separately configured
+sustained high pressure may shrink only the next-pass budget after its configured
+pass count is reached; a single non-OOM pressure sample cannot shrink a budget.
 
 ## Factory composition
 
@@ -160,6 +161,8 @@ The conservative governor then:
 - grows configured fields only after the configured clean-success threshold;
 - optionally suppresses success growth when an explicit pressure summary is
   missing or reaches the configured growth limit;
+- optionally shrinks the next-pass budget only after a configured sustained
+  high-pressure streak;
 - applies configured minimum and maximum bounds.
 
 The next pass uses the governor's current budget.
@@ -172,9 +175,10 @@ caller inspection. The caller controls how long that record remains alive.
 The session itself does not retain prior pass results after the generator resumes.
 Longer-lived in-memory retention is limited to lightweight `RuntimePassSummary`
 objects in `RuntimePassHistory`, which requires a positive `max_records` bound.
-Pass summaries expose scalar pressure ratios and growth-suppression decisions;
-history aggregates pressure-assessed and pressure-suppressed pass counts plus the
-highest known ratio only within the currently retained summary window. Each pass
+Pass summaries expose scalar pressure ratios, growth-suppression decisions, and
+sustained-pressure shrink feedback; history aggregates pressure-assessed,
+pressure-suppressed, and actual pressure-shrink pass counts plus the highest known
+ratio only within the currently retained summary window. Each pass
 summary also records the scalar capacity used for normalization. Raw
 `ResourceSample` records are not retained by summary or history.
 
@@ -202,7 +206,7 @@ It does not provide:
 - AutoGovernor or learned tuning;
 - automatic `ResourceMonitor` creation;
 - mid-pass capacity refresh or free-memory admission control;
-- pressure-triggered budget shrink or field-specific tuning;
+- field-specific tuning;
 - stable `enn_torch` API exposure.
 
 Use small synthetic inputs for baseline validation. Do not use this workflow as an

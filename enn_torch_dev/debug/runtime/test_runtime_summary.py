@@ -50,6 +50,8 @@ def _decision(
     consecutive_ooms: int = 0,
     pressure_summary: ResourcePressureSummary | None = None,
     growth_suppressed_by_pressure: bool = False,
+    consecutive_high_pressure_passes: int = 0,
+    budget_shrunk_by_pressure: bool = False,
 ) -> GovernorDecision:
     previous = previous_budget or BatchBudget(max_items=4)
     return GovernorDecision(
@@ -66,6 +68,8 @@ def _decision(
         peak_cuda_max_reserved_bytes=55,
         pressure_summary=pressure_summary,
         growth_suppressed_by_pressure=growth_suppressed_by_pressure,
+        consecutive_high_pressure_passes=consecutive_high_pressure_passes,
+        budget_shrunk_by_pressure=budget_shrunk_by_pressure,
     )
 
 
@@ -107,6 +111,27 @@ def test_summarize_runtime_pass_handles_empty_result() -> None:
     assert summary.next_budget == decision.next_budget
     assert summary.budget_changed is False
     assert summary.decision_reason == "no results"
+
+
+def test_summarize_and_format_runtime_pass_pressure_shrink_feedback() -> None:
+    summary = summarize_runtime_pass(
+        _pass_result(
+            (_result(),),
+            decision=_decision(
+                pressure_summary=ResourcePressureSummary(peak_cpu_rss_ratio=0.95),
+                growth_suppressed_by_pressure=True,
+                consecutive_high_pressure_passes=1,
+                budget_shrunk_by_pressure=True,
+            ),
+        )
+    )
+
+    text = format_runtime_pass_summary(summary)
+
+    assert summary.consecutive_high_pressure_passes == 1
+    assert summary.budget_shrunk_by_pressure is True
+    assert "consecutive_high_pressure_passes=1" in text
+    assert "budget_shrunk_by_pressure=True" in text
 
 
 def test_summarize_runtime_pass_counts_successes_and_rows() -> None:
@@ -187,10 +212,12 @@ def test_summarize_runtime_pass_detects_budget_change_and_decision_metadata() ->
 def test_runtime_pass_summary_appends_feedback_and_capacity_fields_for_compatibility() -> None:
     field_names = [field.name for field in fields(RuntimePassSummary)]
 
-    assert field_names[-3:] == [
+    assert field_names[-5:] == [
         "pressure_summary",
         "growth_suppressed_by_pressure",
         "resource_capacity",
+        "consecutive_high_pressure_passes",
+        "budget_shrunk_by_pressure",
     ]
 
 

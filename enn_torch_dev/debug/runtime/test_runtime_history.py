@@ -33,6 +33,7 @@ def _decision(
     consecutive_ooms: int = 0,
     pressure_summary: ResourcePressureSummary | None = None,
     growth_suppressed_by_pressure: bool = False,
+    budget_shrunk_by_pressure: bool = False,
 ) -> GovernorDecision:
     previous = previous_budget or BatchBudget(max_items=4)
     return GovernorDecision(
@@ -44,6 +45,7 @@ def _decision(
         consecutive_ooms=consecutive_ooms,
         pressure_summary=pressure_summary,
         growth_suppressed_by_pressure=growth_suppressed_by_pressure,
+        budget_shrunk_by_pressure=budget_shrunk_by_pressure,
     )
 
 
@@ -85,6 +87,7 @@ def _summary(
     budget_changed: bool = False,
     pressure_summary: ResourcePressureSummary | None = None,
     growth_suppressed_by_pressure: bool = False,
+    budget_shrunk_by_pressure: bool = False,
 ) -> RuntimePassSummary:
     results = tuple(_result(status, batch_size=batch_size) for status in statuses)
     previous = BatchBudget(max_items=4)
@@ -96,6 +99,7 @@ def _summary(
         consecutive_ooms=1 if StepStatus.OOM_FAULT in statuses else 0,
         pressure_summary=pressure_summary,
         growth_suppressed_by_pressure=growth_suppressed_by_pressure,
+        budget_shrunk_by_pressure=budget_shrunk_by_pressure,
     )
     return summarize_runtime_pass(
         _pass_result(results, decision=decision, recovered_oom=recovered_oom)
@@ -109,10 +113,11 @@ def _field_values(instance: object) -> list[object]:
 def test_runtime_history_summary_appends_pressure_fields_for_compatibility() -> None:
     field_names = [field.name for field in fields(RuntimeHistorySummary)]
 
-    assert field_names[-3:] == [
+    assert field_names[-4:] == [
         "pressure_assessed_passes",
         "pressure_growth_suppressed_passes",
         "peak_observed_pressure_ratio",
+        "pressure_shrink_passes",
     ]
 
 
@@ -133,8 +138,32 @@ def test_empty_history_summary() -> None:
     assert summary.pressure_assessed_passes == 0
     assert summary.pressure_growth_suppressed_passes == 0
     assert summary.peak_observed_pressure_ratio is None
+    assert summary.pressure_shrink_passes == 0
     assert summary.latest_summary is None
     assert history.records == ()
+
+
+def test_history_counts_actual_pressure_shrink_passes() -> None:
+    history = RuntimePassHistory(max_records=3)
+    history.append_summary(
+        _summary(
+            StepStatus.SUCCESS,
+            pressure_summary=ResourcePressureSummary(peak_cpu_rss_ratio=0.95),
+            growth_suppressed_by_pressure=True,
+        )
+    )
+    aggregate = history.append_summary(
+        _summary(
+            StepStatus.SUCCESS,
+            budget_changed=True,
+            pressure_summary=ResourcePressureSummary(peak_cpu_rss_ratio=0.96),
+            growth_suppressed_by_pressure=True,
+            budget_shrunk_by_pressure=True,
+        )
+    )
+
+    assert aggregate.pressure_shrink_passes == 1
+    assert "pressure_shrink_passes=1" in format_runtime_history_summary(aggregate)
 
 
 def test_append_summary_updates_history_totals() -> None:

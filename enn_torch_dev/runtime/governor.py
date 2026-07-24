@@ -45,22 +45,21 @@ def _validate_optional_positive_int(value: object, *, label: str) -> int | None:
     return _validate_positive_int(value, label=label)
 
 
-def _validate_optional_growth_pressure_ratio(value: object) -> float | None:
+def _validate_optional_pressure_ratio(
+    value: object,
+    *,
+    label: str,
+) -> float | None:
     if value is None:
         return None
+    full_label = f"GovernorPolicy.{label}"
     if not isinstance(value, Real) or isinstance(value, bool):
-        raise TypeError(
-            "GovernorPolicy.max_pressure_ratio_for_growth must be a finite number or None."
-        )
+        raise TypeError(f"{full_label} must be a finite number or None.")
     ratio = float(value)
     if not math.isfinite(ratio):
-        raise ValueError(
-            "GovernorPolicy.max_pressure_ratio_for_growth must be finite."
-        )
+        raise ValueError(f"{full_label} must be finite.")
     if ratio <= 0.0 or ratio > 1.0:
-        raise ValueError(
-            "GovernorPolicy.max_pressure_ratio_for_growth must satisfy 0 < value <= 1."
-        )
+        raise ValueError(f"{full_label} must satisfy 0 < value <= 1.")
     return ratio
 
 
@@ -110,6 +109,8 @@ class GovernorPolicy:
     min_device_bytes: int | None = None
     max_device_bytes: int | None = None
     max_pressure_ratio_for_growth: float | None = None
+    min_pressure_ratio_for_shrink: float | None = None
+    shrink_after_pressure_passes: int = 2
 
     def __post_init__(self) -> None:
         object.__setattr__(
@@ -154,10 +155,38 @@ class GovernorPolicy:
         object.__setattr__(
             self,
             "max_pressure_ratio_for_growth",
-            _validate_optional_growth_pressure_ratio(
-                self.max_pressure_ratio_for_growth
+            _validate_optional_pressure_ratio(
+                self.max_pressure_ratio_for_growth,
+                label="max_pressure_ratio_for_growth",
             ),
         )
+        object.__setattr__(
+            self,
+            "min_pressure_ratio_for_shrink",
+            _validate_optional_pressure_ratio(
+                self.min_pressure_ratio_for_shrink,
+                label="min_pressure_ratio_for_shrink",
+            ),
+        )
+        object.__setattr__(
+            self,
+            "shrink_after_pressure_passes",
+            _validate_positive_int(
+                self.shrink_after_pressure_passes,
+                label="GovernorPolicy.shrink_after_pressure_passes",
+            ),
+        )
+        growth_limit = self.max_pressure_ratio_for_growth
+        shrink_limit = self.min_pressure_ratio_for_shrink
+        if (
+            growth_limit is not None
+            and shrink_limit is not None
+            and growth_limit > shrink_limit
+        ):
+            raise ValueError(
+                "GovernorPolicy.max_pressure_ratio_for_growth must be <= "
+                "min_pressure_ratio_for_shrink."
+            )
         self._validate_bounds("items", self.min_items, self.max_items)
         self._validate_bounds("host_bytes", self.min_host_bytes, self.max_host_bytes)
         self._validate_bounds("device_bytes", self.min_device_bytes, self.max_device_bytes)
@@ -185,6 +214,8 @@ class GovernorDecision:
     peak_cuda_max_reserved_bytes: int | None = None
     pressure_summary: ResourcePressureSummary | None = None
     growth_suppressed_by_pressure: bool = False
+    consecutive_high_pressure_passes: int = 0
+    budget_shrunk_by_pressure: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -195,6 +226,7 @@ class RuntimeGovernorState:
     consecutive_successes: int = 0
     consecutive_ooms: int = 0
     last_decision: GovernorDecision | None = None
+    consecutive_high_pressure_passes: int = 0
 
     def __post_init__(self) -> None:
         _validate_budget(self.current_budget, label="RuntimeGovernorState.current_budget")
@@ -212,6 +244,14 @@ class RuntimeGovernorState:
             _validate_streak(
                 self.consecutive_ooms,
                 label="RuntimeGovernorState.consecutive_ooms",
+            ),
+        )
+        object.__setattr__(
+            self,
+            "consecutive_high_pressure_passes",
+            _validate_streak(
+                self.consecutive_high_pressure_passes,
+                label="RuntimeGovernorState.consecutive_high_pressure_passes",
             ),
         )
         if self.last_decision is not None and not isinstance(self.last_decision, GovernorDecision):
@@ -315,12 +355,15 @@ class ConservativeRuntimeGovernor:
         next_budget = previous_budget
         consecutive_successes = self.state.consecutive_successes
         consecutive_ooms = self.state.consecutive_ooms
+        consecutive_high_pressure_passes = self.state.consecutive_high_pressure_passes
         growth_suppressed_by_pressure = False
+        budget_shrunk_by_pressure = False
 
         if saw_oom or recovered_oom:
             next_budget = self._adjust_budget(previous_budget, mode="shrink")
             consecutive_successes = 0
             consecutive_ooms += 1
+            consecutive_high_pressure_passes = 0
             if saw_oom:
                 reason = "OOM fault observed; shrinking configured budget fields"
                 if recovered_oom:
@@ -328,25 +371,67 @@ class ConservativeRuntimeGovernor:
             else:
                 reason = "retry-recovered OOM observed; shrinking configured budget fields"
         elif not saw_any_result:
+            consecutive_high_pressure_passes = 0
             reason = "no results observed; keeping current budget"
         elif all_success:
             consecutive_ooms = 0
-            pressure_reason = self._growth_pressure_guard_reason(pressure_summary)
-            if pressure_reason is not None:
+            max_ratio = (
+                pressure_summary.max_observed_ratio
+                if pressure_summary is not None
+                else None
+            )
+            shrink_limit = self.policy.min_pressure_ratio_for_shrink
+            if (
+                shrink_limit is not None
+                and max_ratio is not None
+                and max_ratio >= shrink_limit
+            ):
                 consecutive_successes = 0
+                consecutive_high_pressure_passes += 1
                 growth_suppressed_by_pressure = True
-                reason = pressure_reason
-            else:
-                consecutive_successes += 1
-                if consecutive_successes >= self.policy.grow_after_successes:
-                    next_budget = self._adjust_budget(previous_budget, mode="grow")
-                    consecutive_successes = 0
-                    reason = "success threshold reached; growing configured budget fields"
+                required = self.policy.shrink_after_pressure_passes
+                if consecutive_high_pressure_passes >= required:
+                    next_budget = self._adjust_budget(previous_budget, mode="shrink")
+                    budget_shrunk_by_pressure = next_budget != previous_budget
+                    consecutive_high_pressure_passes = 0
+                    if budget_shrunk_by_pressure:
+                        reason = (
+                            f"resource pressure {max_ratio:.6g} remained at or above "
+                            f"shrink limit {shrink_limit:.6g} for {required} passes; "
+                            "shrinking configured budget fields"
+                        )
+                    else:
+                        reason = (
+                            f"resource pressure {max_ratio:.6g} remained at or above "
+                            f"shrink limit {shrink_limit:.6g} for {required} passes; "
+                            "configured minimum bounds kept the budget unchanged"
+                        )
                 else:
-                    reason = "success observed below growth threshold; keeping current budget"
+                    reason = (
+                        f"resource pressure {max_ratio:.6g} reached shrink limit "
+                        f"{shrink_limit:.6g}; high-pressure streak "
+                        f"{consecutive_high_pressure_passes}/{required}; "
+                        "suppressing budget growth"
+                    )
+            else:
+                consecutive_high_pressure_passes = 0
+                pressure_reason = self._growth_pressure_guard_reason(pressure_summary)
+                if pressure_reason is not None:
+                    consecutive_successes = 0
+                    growth_suppressed_by_pressure = True
+                    reason = pressure_reason
+                else:
+                    consecutive_successes += 1
+                    if consecutive_successes >= self.policy.grow_after_successes:
+                        next_budget = self._adjust_budget(previous_budget, mode="grow")
+                        consecutive_successes = 0
+                        reason = "success threshold reached; growing configured budget fields"
+                    else:
+                        reason = "success observed below growth threshold; keeping current budget"
         else:
             consecutive_successes = 0
             consecutive_ooms = 0
+            consecutive_high_pressure_passes = 0
             reason = "non-OOM fault observed; keeping current budget"
 
         reason = self._append_peak_reason(reason, peaks)
@@ -364,12 +449,15 @@ class ConservativeRuntimeGovernor:
             peak_cuda_max_reserved_bytes=peaks["peak_cuda_max_reserved_bytes"],
             pressure_summary=pressure_summary,
             growth_suppressed_by_pressure=growth_suppressed_by_pressure,
+            consecutive_high_pressure_passes=consecutive_high_pressure_passes,
+            budget_shrunk_by_pressure=budget_shrunk_by_pressure,
         )
         self.state = RuntimeGovernorState(
             current_budget=next_budget,
             consecutive_successes=consecutive_successes,
             consecutive_ooms=consecutive_ooms,
             last_decision=decision,
+            consecutive_high_pressure_passes=consecutive_high_pressure_passes,
         )
         return decision
 

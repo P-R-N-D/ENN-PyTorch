@@ -285,6 +285,46 @@ def test_runtime_session_uses_orchestrator_pressure_summary_for_growth_guard() -
     assert history.records == (first.pass_summary, second.pass_summary)
 
 
+def test_runtime_session_shrinks_after_sustained_provider_pressure() -> None:
+    class FixedSequenceCapacityProvider:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def capacity(self) -> ResourceCapacity:
+            self.calls += 1
+            return ResourceCapacity(cpu_total_bytes=100)
+
+    provider = FixedSequenceCapacityProvider()
+    step = PressureSequenceRuntimeStep((95, 96))
+    governor = ConservativeRuntimeGovernor(
+        BatchBudget(max_items=8),
+        policy=GovernorPolicy(
+            shrink_factor=0.5,
+            grow_after_successes=1,
+            max_pressure_ratio_for_growth=0.8,
+            min_pressure_ratio_for_shrink=0.9,
+            shrink_after_pressure_passes=2,
+        ),
+    )
+    orchestrator = ConservativeRuntimeOrchestrator(
+        step, governor, resource_capacity_provider=provider
+    )
+    history = RuntimePassHistory(max_records=2)
+    session = ConservativeRuntimeSession(orchestrator, history, max_passes=2)
+
+    first, second = list(
+        session.run_passes([[_batch(1, offset=0)], [_batch(1, offset=10)]])
+    )
+
+    assert provider.calls == 2
+    assert first.pass_result.decision.next_budget == BatchBudget(max_items=8)
+    assert first.pass_summary.consecutive_high_pressure_passes == 1
+    assert first.pass_summary.budget_shrunk_by_pressure is False
+    assert second.pass_result.decision.next_budget == BatchBudget(max_items=4)
+    assert second.pass_summary.budget_shrunk_by_pressure is True
+    assert second.history_summary.pressure_shrink_passes == 1
+
+
 def test_runtime_session_keeps_completed_history_when_later_pass_raises() -> None:
     step = FaultThenRaiseRuntimeStep()
     governor = ConservativeRuntimeGovernor(BatchBudget(max_items=2))

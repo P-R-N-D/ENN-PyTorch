@@ -102,6 +102,106 @@ def test_pressure_guard_is_opt_in_and_default_growth_is_unchanged() -> None:
     assert decision.growth_suppressed_by_pressure is False
 
 
+def test_sustained_pressure_shrink_is_opt_in() -> None:
+    governor = ConservativeRuntimeGovernor(
+        BatchBudget(max_items=8), policy=GovernorPolicy(grow_after_successes=1)
+    )
+
+    decision = governor.observe_results(
+        [_result()], pressure_summary=ResourcePressureSummary(peak_cpu_rss_ratio=0.95)
+    )
+
+    assert decision.next_budget == BatchBudget(max_items=16)
+    assert decision.consecutive_high_pressure_passes == 0
+    assert decision.budget_shrunk_by_pressure is False
+
+
+def test_sustained_high_pressure_shrinks_after_configured_pass_count() -> None:
+    governor = ConservativeRuntimeGovernor(
+        BatchBudget(max_items=8, max_host_bytes=100, max_device_bytes=200),
+        policy=GovernorPolicy(
+            shrink_factor=0.5,
+            grow_after_successes=1,
+            max_pressure_ratio_for_growth=0.8,
+            min_pressure_ratio_for_shrink=0.9,
+            shrink_after_pressure_passes=2,
+        ),
+    )
+    pressure = ResourcePressureSummary(peak_cuda_reserved_ratio=0.95)
+
+    first = governor.observe_results([_result()], pressure_summary=pressure)
+    second = governor.observe_results([_result()], pressure_summary=pressure)
+
+    assert first.next_budget == BatchBudget(max_items=8, max_host_bytes=100, max_device_bytes=200)
+    assert first.consecutive_high_pressure_passes == 1
+    assert first.growth_suppressed_by_pressure is True
+    assert first.budget_shrunk_by_pressure is False
+    assert second.next_budget == BatchBudget(max_items=4, max_host_bytes=50, max_device_bytes=100)
+    assert second.consecutive_high_pressure_passes == 0
+    assert second.budget_shrunk_by_pressure is True
+
+
+@pytest.mark.parametrize(
+    ("results", "pressure"),
+    [
+        ([_result()], ResourcePressureSummary(peak_cpu_rss_ratio=0.5)),
+        ([_result()], None),
+        ([_result()], ResourcePressureSummary()),
+        ([_result(StepStatus.RUNTIME_FAULT)], ResourcePressureSummary(peak_cpu_rss_ratio=0.95)),
+        ([], ResourcePressureSummary(peak_cpu_rss_ratio=0.95)),
+    ],
+)
+def test_non_high_pressure_observations_reset_pressure_streak(
+    results: list[StepResult], pressure: ResourcePressureSummary | None
+) -> None:
+    governor = ConservativeRuntimeGovernor(
+        state=RuntimeGovernorState(
+            current_budget=BatchBudget(max_items=8), consecutive_high_pressure_passes=1
+        ),
+        policy=GovernorPolicy(min_pressure_ratio_for_shrink=0.9),
+    )
+
+    decision = governor.observe_results(results, pressure_summary=pressure)
+
+    assert decision.consecutive_high_pressure_passes == 0
+
+
+def test_pressure_shrink_respects_minimum_bounds() -> None:
+    governor = ConservativeRuntimeGovernor(
+        BatchBudget(max_items=4),
+        policy=GovernorPolicy(
+            shrink_factor=0.5,
+            min_items=4,
+            min_pressure_ratio_for_shrink=0.9,
+            shrink_after_pressure_passes=1,
+        ),
+    )
+
+    decision = governor.observe_results(
+        [_result()], pressure_summary=ResourcePressureSummary(peak_cpu_rss_ratio=0.95)
+    )
+
+    assert decision.next_budget == BatchBudget(max_items=4)
+    assert decision.budget_shrunk_by_pressure is False
+    assert "minimum bounds" in decision.reason
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"min_pressure_ratio_for_shrink": 0},
+        {"min_pressure_ratio_for_shrink": 1.1},
+        {"min_pressure_ratio_for_shrink": True},
+        {"shrink_after_pressure_passes": 0},
+        {"shrink_after_pressure_passes": True},
+        {"max_pressure_ratio_for_growth": 0.9, "min_pressure_ratio_for_shrink": 0.8},
+    ],
+)
+def test_invalid_sustained_pressure_policy_is_rejected(kwargs: dict[str, object]) -> None:
+    with pytest.raises((TypeError, ValueError)):
+        GovernorPolicy(**kwargs)
+
+
 def test_consecutive_successes_grow_budget_and_reset_streak() -> None:
     governor = ConservativeRuntimeGovernor(
         BatchBudget(max_items=8, max_host_bytes=100),
@@ -329,6 +429,48 @@ def test_oom_has_priority_over_pressure_guard() -> None:
     assert decision.next_budget == BatchBudget(max_items=4)
     assert decision.pressure_summary == pressure
     assert decision.growth_suppressed_by_pressure is False
+
+
+@pytest.mark.parametrize(
+    ("results", "recovered_oom", "reason_text"),
+    [
+        ([_result(StepStatus.OOM_FAULT)], False, "OOM fault observed"),
+        ([_result()], True, "retry-recovered OOM observed"),
+    ],
+)
+def test_oom_signals_reset_sustained_pressure_streak_before_pressure_shrink(
+    results: list[StepResult],
+    recovered_oom: bool,
+    reason_text: str,
+) -> None:
+    governor = ConservativeRuntimeGovernor(
+        state=RuntimeGovernorState(
+            current_budget=BatchBudget(max_items=8),
+            consecutive_successes=1,
+            consecutive_high_pressure_passes=1,
+        ),
+        policy=GovernorPolicy(
+            shrink_factor=0.5,
+            grow_after_successes=2,
+            max_pressure_ratio_for_growth=0.8,
+            min_pressure_ratio_for_shrink=0.9,
+            shrink_after_pressure_passes=2,
+        ),
+    )
+
+    decision = governor.observe_results(
+        results,
+        recovered_oom=recovered_oom,
+        pressure_summary=ResourcePressureSummary(peak_cpu_rss_ratio=0.95),
+    )
+
+    assert decision.next_budget == BatchBudget(max_items=4)
+    assert decision.consecutive_successes == 0
+    assert decision.consecutive_ooms == 1
+    assert decision.consecutive_high_pressure_passes == 0
+    assert decision.budget_shrunk_by_pressure is False
+    assert decision.growth_suppressed_by_pressure is False
+    assert reason_text in decision.reason
 
 
 def test_non_oom_fault_keeps_budget_and_resets_streaks() -> None:

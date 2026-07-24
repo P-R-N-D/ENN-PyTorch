@@ -26,6 +26,7 @@ class RuntimeHistorySummary:
     pressure_assessed_passes: int = 0
     pressure_growth_suppressed_passes: int = 0
     peak_observed_pressure_ratio: float | None = None
+    pressure_shrink_passes: int = 0
 
 
 class RuntimePassHistory:
@@ -68,6 +69,7 @@ class RuntimePassHistory:
         pressure_assessed_passes = 0
         pressure_growth_suppressed_passes = 0
         peak_observed_pressure_ratio: float | None = None
+        pressure_shrink_passes = 0
 
         for summary in self._records:
             total_results += summary.total_results
@@ -93,6 +95,8 @@ class RuntimePassHistory:
                     )
             if summary.growth_suppressed_by_pressure:
                 pressure_growth_suppressed_passes += 1
+            if summary.budget_shrunk_by_pressure:
+                pressure_shrink_passes += 1
 
         latest_summary = self._records[-1] if self._records else None
         status_counts_view: Mapping[StepStatus, int] = MappingProxyType(dict(status_counts))
@@ -109,6 +113,7 @@ class RuntimePassHistory:
             pressure_assessed_passes=pressure_assessed_passes,
             pressure_growth_suppressed_passes=pressure_growth_suppressed_passes,
             peak_observed_pressure_ratio=peak_observed_pressure_ratio,
+            pressure_shrink_passes=pressure_shrink_passes,
         )
 
     def _trim_records(self) -> None:
@@ -149,6 +154,7 @@ def format_runtime_history_summary(summary: RuntimeHistorySummary) -> str:
             f"pressure_assessed_passes={summary.pressure_assessed_passes}",
             f"pressure_growth_suppressed_passes={summary.pressure_growth_suppressed_passes}",
             f"peak_observed_pressure_ratio={_format_optional_ratio(summary.peak_observed_pressure_ratio)}",
+            f"pressure_shrink_passes={summary.pressure_shrink_passes}",
             f"latest_budget_changed={latest_budget_changed}",
             f"latest_recovered_oom={latest_recovered_oom}",
             f"latest_pressure_assessed={latest_pressure_summary is not None}",

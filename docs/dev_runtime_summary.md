@@ -47,7 +47,9 @@ The stable `enn_torch` namespace does not expose this development summary API.
 - resource peak values copied from `GovernorDecision`;
 - the optional scalar-only `ResourcePressureSummary` copied from the decision;
 - whether pressure suppressed success-driven budget growth;
-- the scalar-only `ResourceCapacity` used to normalize that pass, when available.
+- the scalar-only `ResourceCapacity` used to normalize that pass, when available;
+- the current high-pressure streak and whether sustained pressure actually shrank
+  the next budget.
 
 `summarize_runtime_pass(pass_result)` accepts only a finite `RuntimePassResult`.
 It scans the pass result tuple and stores only lightweight summary fields. It does
