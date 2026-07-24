@@ -40,6 +40,14 @@ def _field_values(instance: object) -> list[object]:
     return [getattr(instance, field.name) for field in fields(instance)]
 
 
+def _reason_high_dimensions(reason: str) -> str:
+    return (
+        reason
+        .split("configured shrink limit for dimensions: ", 1)[1]
+        .split(";", 1)[0]
+    )
+
+
 def test_empty_result_stream_keeps_budget() -> None:
     budget = BatchBudget(max_items=8)
     governor = ConservativeRuntimeGovernor(budget)
@@ -318,7 +326,7 @@ def test_dimension_thresholds_and_pass_counts_trigger_independently() -> None:
     )
     assert first.consecutive_cpu_pressure_passes == 1
     assert first.consecutive_cuda_pressure_passes == 1
-    assert "configured shrink limit for dimensions: cpu, cuda" in first.reason
+    assert _reason_high_dimensions(first.reason) == "cpu, cuda"
 
     assert second.next_budget == BatchBudget(
         max_items=8,
@@ -370,7 +378,7 @@ def test_dimension_threshold_override_resets_only_non_high_dimension() -> None:
     assert decision.growth_suppressed_by_pressure is True
     assert "cpu=1/2 (limit=0.8, ratio=0.85)" in decision.reason
     assert "cuda=0/3 (limit=0.95, ratio=0.9)" in decision.reason
-    assert "configured shrink limit for dimensions: cpu" in decision.reason
+    assert _reason_high_dimensions(decision.reason) == "cpu"
 
 
 def test_threshold_override_uses_common_pass_count_fallback() -> None:
@@ -395,7 +403,7 @@ def test_threshold_override_uses_common_pass_count_fallback() -> None:
     assert decision.consecutive_cuda_pressure_passes == 0
     assert decision.budget_shrunk_by_pressure is False
     assert "cpu=1/3 (limit=0.8, ratio=0.85)" in decision.reason
-    assert "configured shrink limit for dimensions: cpu" in decision.reason
+    assert _reason_high_dimensions(decision.reason) == "cpu"
 
 
 def test_pass_count_override_uses_common_threshold_fallback() -> None:
