@@ -85,6 +85,16 @@ def test_governor_policy_preserves_existing_positional_field_order() -> None:
     assert policy.max_pressure_ratio_for_growth is None
 
 
+def test_governor_decision_appends_pressure_field_selection_for_compatibility() -> None:
+    field_names = [field.name for field in fields(GovernorDecision)]
+
+    assert field_names[-3:] == [
+        "consecutive_high_pressure_passes",
+        "budget_shrunk_by_pressure",
+        "pressure_shrunk_budget_fields",
+    ]
+
+
 def test_pressure_guard_is_opt_in_and_default_growth_is_unchanged() -> None:
     pressure = ResourcePressureSummary(peak_cpu_rss_ratio=1.0)
     governor = ConservativeRuntimeGovernor(
@@ -136,9 +146,125 @@ def test_sustained_high_pressure_shrinks_after_configured_pass_count() -> None:
     assert first.consecutive_high_pressure_passes == 1
     assert first.growth_suppressed_by_pressure is True
     assert first.budget_shrunk_by_pressure is False
-    assert second.next_budget == BatchBudget(max_items=4, max_host_bytes=50, max_device_bytes=100)
+    assert second.next_budget == BatchBudget(
+        max_items=8,
+        max_host_bytes=100,
+        max_device_bytes=100,
+    )
     assert second.consecutive_high_pressure_passes == 0
     assert second.budget_shrunk_by_pressure is True
+    assert second.pressure_shrunk_budget_fields == ("max_device_bytes",)
+
+
+def test_sustained_cpu_pressure_shrinks_host_budget_only() -> None:
+    governor = ConservativeRuntimeGovernor(
+        BatchBudget(max_items=8, max_host_bytes=100, max_device_bytes=200),
+        policy=GovernorPolicy(
+            shrink_factor=0.5,
+            min_pressure_ratio_for_shrink=0.9,
+            shrink_after_pressure_passes=1,
+        ),
+    )
+
+    decision = governor.observe_results(
+        [_result()],
+        pressure_summary=ResourcePressureSummary(peak_cpu_rss_ratio=0.95),
+    )
+
+    assert decision.next_budget == BatchBudget(
+        max_items=8,
+        max_host_bytes=50,
+        max_device_bytes=200,
+    )
+    assert decision.pressure_shrunk_budget_fields == ("max_host_bytes",)
+
+
+@pytest.mark.parametrize(
+    "ratio_field",
+    [
+        "peak_cuda_allocated_ratio",
+        "peak_cuda_reserved_ratio",
+        "peak_cuda_max_allocated_ratio",
+        "peak_cuda_max_reserved_ratio",
+    ],
+)
+def test_sustained_cuda_pressure_shrinks_device_budget_only(
+    ratio_field: str,
+) -> None:
+    governor = ConservativeRuntimeGovernor(
+        BatchBudget(max_items=8, max_host_bytes=100, max_device_bytes=200),
+        policy=GovernorPolicy(
+            shrink_factor=0.5,
+            min_pressure_ratio_for_shrink=0.9,
+            shrink_after_pressure_passes=1,
+        ),
+    )
+
+    decision = governor.observe_results(
+        [_result()],
+        pressure_summary=ResourcePressureSummary(**{ratio_field: 0.95}),
+    )
+
+    assert decision.next_budget == BatchBudget(
+        max_items=8,
+        max_host_bytes=100,
+        max_device_bytes=100,
+    )
+    assert decision.pressure_shrunk_budget_fields == ("max_device_bytes",)
+
+
+def test_sustained_cpu_and_cuda_pressure_shrink_both_byte_budgets() -> None:
+    governor = ConservativeRuntimeGovernor(
+        BatchBudget(max_items=8, max_host_bytes=100, max_device_bytes=200),
+        policy=GovernorPolicy(
+            shrink_factor=0.5,
+            min_pressure_ratio_for_shrink=0.9,
+            shrink_after_pressure_passes=1,
+        ),
+    )
+
+    decision = governor.observe_results(
+        [_result()],
+        pressure_summary=ResourcePressureSummary(
+            peak_cpu_rss_ratio=0.95,
+            peak_cuda_reserved_ratio=0.96,
+        ),
+    )
+
+    assert decision.next_budget == BatchBudget(
+        max_items=8,
+        max_host_bytes=50,
+        max_device_bytes=100,
+    )
+    assert decision.pressure_shrunk_budget_fields == (
+        "max_host_bytes",
+        "max_device_bytes",
+    )
+
+
+@pytest.mark.parametrize(
+    "pressure",
+    [
+        ResourcePressureSummary(peak_cpu_rss_ratio=0.95),
+        ResourcePressureSummary(peak_cuda_reserved_ratio=0.95),
+    ],
+)
+def test_sustained_pressure_uses_items_only_without_matching_byte_budget(
+    pressure: ResourcePressureSummary,
+) -> None:
+    governor = ConservativeRuntimeGovernor(
+        BatchBudget(max_items=8),
+        policy=GovernorPolicy(
+            shrink_factor=0.5,
+            min_pressure_ratio_for_shrink=0.9,
+            shrink_after_pressure_passes=1,
+        ),
+    )
+
+    decision = governor.observe_results([_result()], pressure_summary=pressure)
+
+    assert decision.next_budget == BatchBudget(max_items=4)
+    assert decision.pressure_shrunk_budget_fields == ("max_items",)
 
 
 @pytest.mark.parametrize(
@@ -183,7 +309,36 @@ def test_pressure_shrink_respects_minimum_bounds() -> None:
 
     assert decision.next_budget == BatchBudget(max_items=4)
     assert decision.budget_shrunk_by_pressure is False
+    assert decision.pressure_shrunk_budget_fields == ()
     assert "minimum bounds" in decision.reason
+
+
+def test_pressure_shrink_records_only_fields_that_actually_changed() -> None:
+    governor = ConservativeRuntimeGovernor(
+        BatchBudget(max_items=8, max_host_bytes=100, max_device_bytes=200),
+        policy=GovernorPolicy(
+            shrink_factor=0.5,
+            min_host_bytes=100,
+            min_pressure_ratio_for_shrink=0.9,
+            shrink_after_pressure_passes=1,
+        ),
+    )
+
+    decision = governor.observe_results(
+        [_result()],
+        pressure_summary=ResourcePressureSummary(
+            peak_cpu_rss_ratio=0.95,
+            peak_cuda_reserved_ratio=0.95,
+        ),
+    )
+
+    assert decision.next_budget == BatchBudget(
+        max_items=8,
+        max_host_bytes=100,
+        max_device_bytes=100,
+    )
+    assert decision.budget_shrunk_by_pressure is True
+    assert decision.pressure_shrunk_budget_fields == ("max_device_bytes",)
 
 
 @pytest.mark.parametrize(
@@ -345,6 +500,7 @@ def test_oom_shrinks_all_configured_fields() -> None:
     )
     assert decision.consecutive_successes == 0
     assert decision.consecutive_ooms == 1
+    assert decision.pressure_shrunk_budget_fields == ()
 
 
 def test_none_budget_fields_are_not_enabled_by_bounds() -> None:
@@ -470,6 +626,7 @@ def test_oom_signals_reset_sustained_pressure_streak_before_pressure_shrink(
     assert decision.consecutive_high_pressure_passes == 0
     assert decision.budget_shrunk_by_pressure is False
     assert decision.growth_suppressed_by_pressure is False
+    assert decision.pressure_shrunk_budget_fields == ()
     assert reason_text in decision.reason
 
 
@@ -726,6 +883,7 @@ def test_governor_decision_pressure_fields_default_for_existing_construction() -
 
     assert decision.pressure_summary is None
     assert decision.growth_suppressed_by_pressure is False
+    assert decision.pressure_shrunk_budget_fields == ()
     assert state.last_decision == decision
 
 

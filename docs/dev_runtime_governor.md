@@ -104,7 +104,11 @@ Decision priority is deliberately small and predictable:
 9. With `min_pressure_ratio_for_shrink` configured, a known maximum ratio at or
    above that threshold increments a high-pressure streak, suppresses growth, and
    shrinks the next budget only when `shrink_after_pressure_passes` is reached.
-   Low, unavailable, empty, or faulted passes reset this streak.
+   CPU pressure selects `max_host_bytes`; any CUDA allocated/reserved/max ratio
+   selects `max_device_bytes`. If no matching byte budget is configured,
+   `max_items` is the fallback. When at least one matching byte budget is
+   configured, `max_items` remains unchanged. Low, unavailable, empty, or faulted
+   passes reset this streak.
 10. Retry-recovered OOM is not success evidence and does not increase the success
    streak.
 11. The success streak does not increase per successful `StepResult`.
@@ -128,8 +132,9 @@ that was passed in from outside.
 
 `GovernorDecision` records the previous and next budget, reason text, observed
 statuses, updated streak counters, resource peaks, the supplied pressure summary,
-whether pressure suppressed success growth, and whether sustained pressure actually
-changed the next budget.
+whether pressure suppressed success growth, whether sustained pressure actually
+changed the next budget, and the ordered tuple of budget fields whose values
+actually changed because of pressure.
 
 ## Resource Samples
 
@@ -148,6 +153,12 @@ limit is configured. It may shrink only a future budget when the separately opt-
 sustained-pressure threshold and pass count are met; OOM and recovered OOM retain
 higher priority.
 
+Sustained-pressure shrink is dimension-aware. CPU RSS pressure maps to the host
+byte budget, while every CUDA pressure ratio maps to the device byte budget.
+`max_items` is used only when none of the pressured dimensions has a configured
+matching byte budget. OOM and retry-recovered OOM continue to shrink every
+configured budget field and do not populate the pressure-specific field tuple.
+
 ## Relationship to Orchestration
 
 A finite pass-level orchestration helper can feed `GovernorDecision.next_budget`
@@ -163,7 +174,7 @@ execute models, discover capacity, or construct a pressure summary.
 - Full AutoGovernor behavior.
 - Learned or model-specific tuning.
 - Persistent calibration caches or history databases.
-- Field-specific tuning.
+- Per-dimension streak tracking or learned field weights.
 - Automatic pressure-summary construction inside the governor.
 - Automatic capacity discovery or refresh inside the orchestrator.
 - `ModelCostProbe`-driven policy changes.

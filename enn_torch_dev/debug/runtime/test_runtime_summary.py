@@ -52,6 +52,7 @@ def _decision(
     growth_suppressed_by_pressure: bool = False,
     consecutive_high_pressure_passes: int = 0,
     budget_shrunk_by_pressure: bool = False,
+    pressure_shrunk_budget_fields: tuple[str, ...] = (),
 ) -> GovernorDecision:
     previous = previous_budget or BatchBudget(max_items=4)
     return GovernorDecision(
@@ -70,6 +71,7 @@ def _decision(
         growth_suppressed_by_pressure=growth_suppressed_by_pressure,
         consecutive_high_pressure_passes=consecutive_high_pressure_passes,
         budget_shrunk_by_pressure=budget_shrunk_by_pressure,
+        pressure_shrunk_budget_fields=pressure_shrunk_budget_fields,
     )
 
 
@@ -122,6 +124,7 @@ def test_summarize_and_format_runtime_pass_pressure_shrink_feedback() -> None:
                 growth_suppressed_by_pressure=True,
                 consecutive_high_pressure_passes=1,
                 budget_shrunk_by_pressure=True,
+                pressure_shrunk_budget_fields=("max_host_bytes",),
             ),
         )
     )
@@ -130,8 +133,10 @@ def test_summarize_and_format_runtime_pass_pressure_shrink_feedback() -> None:
 
     assert summary.consecutive_high_pressure_passes == 1
     assert summary.budget_shrunk_by_pressure is True
+    assert summary.pressure_shrunk_budget_fields == ("max_host_bytes",)
     assert "consecutive_high_pressure_passes=1" in text
     assert "budget_shrunk_by_pressure=True" in text
+    assert "pressure_shrunk_budget_fields=('max_host_bytes',)" in text
 
 
 def test_summarize_runtime_pass_counts_successes_and_rows() -> None:
@@ -212,12 +217,13 @@ def test_summarize_runtime_pass_detects_budget_change_and_decision_metadata() ->
 def test_runtime_pass_summary_appends_feedback_and_capacity_fields_for_compatibility() -> None:
     field_names = [field.name for field in fields(RuntimePassSummary)]
 
-    assert field_names[-5:] == [
+    assert field_names[-6:] == [
         "pressure_summary",
         "growth_suppressed_by_pressure",
         "resource_capacity",
         "consecutive_high_pressure_passes",
         "budget_shrunk_by_pressure",
+        "pressure_shrunk_budget_fields",
     ]
 
 

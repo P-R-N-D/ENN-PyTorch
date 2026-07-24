@@ -39,6 +39,7 @@ class RuntimePassSummary:
     resource_capacity: ResourceCapacity | None = None
     consecutive_high_pressure_passes: int = 0
     budget_shrunk_by_pressure: bool = False
+    pressure_shrunk_budget_fields: tuple[str, ...] = ()
 
 
 def summarize_runtime_pass(pass_result: RuntimePassResult) -> RuntimePassSummary:
@@ -89,6 +90,7 @@ def summarize_runtime_pass(pass_result: RuntimePassResult) -> RuntimePassSummary
         resource_capacity=pass_result.resource_capacity,
         consecutive_high_pressure_passes=decision.consecutive_high_pressure_passes,
         budget_shrunk_by_pressure=decision.budget_shrunk_by_pressure,
+        pressure_shrunk_budget_fields=decision.pressure_shrunk_budget_fields,
     )
 
 
@@ -125,6 +127,8 @@ def format_runtime_pass_summary(summary: RuntimePassSummary) -> str:
             f"growth_suppressed_by_pressure={summary.growth_suppressed_by_pressure}",
             f"consecutive_high_pressure_passes={summary.consecutive_high_pressure_passes}",
             f"budget_shrunk_by_pressure={summary.budget_shrunk_by_pressure}",
+            "pressure_shrunk_budget_fields="
+            f"{summary.pressure_shrunk_budget_fields!r}",
             f"decision_reason={summary.decision_reason}",
         )
     )
