@@ -267,6 +267,49 @@ def test_sustained_pressure_uses_items_only_without_matching_byte_budget(
     assert decision.pressure_shrunk_budget_fields == ("max_items",)
 
 
+def test_cpu_pressure_uses_items_fallback_with_only_device_budget() -> None:
+    governor = ConservativeRuntimeGovernor(
+        BatchBudget(max_items=8, max_device_bytes=200),
+        policy=GovernorPolicy(
+            shrink_factor=0.5,
+            min_pressure_ratio_for_shrink=0.9,
+            shrink_after_pressure_passes=1,
+        ),
+    )
+
+    decision = governor.observe_results(
+        [_result()],
+        pressure_summary=ResourcePressureSummary(peak_cpu_rss_ratio=0.95),
+    )
+
+    assert decision.next_budget == BatchBudget(max_items=4, max_device_bytes=200)
+    assert decision.budget_shrunk_by_pressure is True
+    assert decision.pressure_shrunk_budget_fields == ("max_items",)
+
+
+def test_matching_host_budget_prevents_items_fallback_for_cuda_pressure() -> None:
+    governor = ConservativeRuntimeGovernor(
+        BatchBudget(max_items=8, max_host_bytes=100),
+        policy=GovernorPolicy(
+            shrink_factor=0.5,
+            min_pressure_ratio_for_shrink=0.9,
+            shrink_after_pressure_passes=1,
+        ),
+    )
+
+    decision = governor.observe_results(
+        [_result()],
+        pressure_summary=ResourcePressureSummary(
+            peak_cpu_rss_ratio=0.95,
+            peak_cuda_reserved_ratio=0.95,
+        ),
+    )
+
+    assert decision.next_budget == BatchBudget(max_items=8, max_host_bytes=50)
+    assert decision.budget_shrunk_by_pressure is True
+    assert decision.pressure_shrunk_budget_fields == ("max_host_bytes",)
+
+
 @pytest.mark.parametrize(
     ("results", "pressure"),
     [
