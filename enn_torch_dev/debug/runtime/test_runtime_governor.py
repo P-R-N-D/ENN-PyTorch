@@ -343,10 +343,32 @@ def test_fully_unknown_pressure_resets_both_dimension_streaks(
     assert decision.consecutive_high_pressure_passes == 0
 
 
-def test_legacy_global_pressure_streak_is_inherited_by_current_high_dimension() -> None:
+@pytest.mark.parametrize(
+    ("budget", "pressure", "expected_budget", "expected_field"),
+    [
+        (
+            BatchBudget(max_items=8, max_host_bytes=100),
+            ResourcePressureSummary(peak_cpu_rss_ratio=0.95),
+            BatchBudget(max_items=8, max_host_bytes=50),
+            "max_host_bytes",
+        ),
+        (
+            BatchBudget(max_items=8, max_device_bytes=200),
+            ResourcePressureSummary(peak_cuda_reserved_ratio=0.95),
+            BatchBudget(max_items=8, max_device_bytes=100),
+            "max_device_bytes",
+        ),
+    ],
+)
+def test_legacy_global_pressure_streak_is_inherited_by_one_high_dimension(
+    budget: BatchBudget,
+    pressure: ResourcePressureSummary,
+    expected_budget: BatchBudget,
+    expected_field: str,
+) -> None:
     governor = ConservativeRuntimeGovernor(
         state=RuntimeGovernorState(
-            current_budget=BatchBudget(max_items=8, max_host_bytes=100),
+            current_budget=budget,
             consecutive_high_pressure_passes=1,
         ),
         policy=GovernorPolicy(
@@ -358,11 +380,88 @@ def test_legacy_global_pressure_streak_is_inherited_by_current_high_dimension() 
 
     decision = governor.observe_results(
         [_result()],
-        pressure_summary=ResourcePressureSummary(peak_cpu_rss_ratio=0.95),
+        pressure_summary=pressure,
     )
 
-    assert decision.next_budget == BatchBudget(max_items=8, max_host_bytes=50)
+    assert decision.next_budget == expected_budget
+    assert decision.pressure_shrunk_budget_fields == (expected_field,)
     assert decision.consecutive_high_pressure_passes == 0
+
+
+def test_ambiguous_legacy_pressure_streak_is_not_inherited_by_both_dimensions() -> None:
+    governor = ConservativeRuntimeGovernor(
+        state=RuntimeGovernorState(
+            current_budget=BatchBudget(
+                max_items=8,
+                max_host_bytes=100,
+                max_device_bytes=200,
+            ),
+            consecutive_high_pressure_passes=1,
+        ),
+        policy=GovernorPolicy(
+            shrink_factor=0.5,
+            min_pressure_ratio_for_shrink=0.9,
+            shrink_after_pressure_passes=2,
+        ),
+    )
+
+    decision = governor.observe_results(
+        [_result()],
+        pressure_summary=ResourcePressureSummary(
+            peak_cpu_rss_ratio=0.95,
+            peak_cuda_reserved_ratio=0.96,
+        ),
+    )
+
+    assert decision.next_budget == BatchBudget(
+        max_items=8,
+        max_host_bytes=100,
+        max_device_bytes=200,
+    )
+    assert decision.consecutive_cpu_pressure_passes == 1
+    assert decision.consecutive_cuda_pressure_passes == 1
+    assert decision.consecutive_high_pressure_passes == 1
+    assert decision.budget_shrunk_by_pressure is False
+    assert decision.pressure_shrunk_budget_fields == ()
+
+
+def test_trigger_reason_reports_only_triggered_dimension_ratios() -> None:
+    governor = ConservativeRuntimeGovernor(
+        state=RuntimeGovernorState(
+            current_budget=BatchBudget(
+                max_items=8,
+                max_host_bytes=100,
+                max_device_bytes=200,
+            ),
+            consecutive_high_pressure_passes=1,
+            consecutive_cpu_pressure_passes=1,
+        ),
+        policy=GovernorPolicy(
+            shrink_factor=0.5,
+            min_pressure_ratio_for_shrink=0.9,
+            shrink_after_pressure_passes=2,
+        ),
+    )
+
+    decision = governor.observe_results(
+        [_result()],
+        pressure_summary=ResourcePressureSummary(
+            peak_cpu_rss_ratio=0.95,
+            peak_cuda_reserved_ratio=1.20,
+        ),
+    )
+
+    assert decision.next_budget == BatchBudget(
+        max_items=8,
+        max_host_bytes=50,
+        max_device_bytes=200,
+    )
+    assert decision.pressure_shrunk_budget_fields == ("max_host_bytes",)
+    assert "triggered dimensions: cpu" in decision.reason
+    assert "cpu=0.95" in decision.reason
+    triggered_ratio_text = decision.reason.split("current triggered ratios: ", 1)[1].split(";", 1)[0]
+    assert "cuda=" not in triggered_ratio_text
+    assert "resource pressure 1.2 remained" not in decision.reason
 
 
 def test_explicit_dimension_streak_does_not_reuse_legacy_aggregate() -> None:

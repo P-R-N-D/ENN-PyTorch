@@ -378,11 +378,10 @@ class ConservativeRuntimeGovernor:
         consecutive_ooms = self.state.consecutive_ooms
         consecutive_cpu_pressure_passes = self.state.consecutive_cpu_pressure_passes
         consecutive_cuda_pressure_passes = self.state.consecutive_cuda_pressure_passes
-        legacy_high_pressure_streak = (
-            self.state.consecutive_high_pressure_passes
-            if consecutive_cpu_pressure_passes == 0
+        legacy_is_available = (
+            self.state.consecutive_high_pressure_passes > 0
+            and consecutive_cpu_pressure_passes == 0
             and consecutive_cuda_pressure_passes == 0
-            else 0
         )
         growth_suppressed_by_pressure = False
         budget_shrunk_by_pressure = False
@@ -422,6 +421,11 @@ class ConservativeRuntimeGovernor:
                     pressure_summary,
                     threshold=shrink_limit,
                 )
+            legacy_high_pressure_streak = (
+                self.state.consecutive_high_pressure_passes
+                if legacy_is_available and cpu_pressure_high != cuda_pressure_high
+                else 0
+            )
             if shrink_limit is not None and (cpu_pressure_high or cuda_pressure_high):
                 consecutive_successes = 0
                 growth_suppressed_by_pressure = True
@@ -473,28 +477,35 @@ class ConservativeRuntimeGovernor:
                     if cuda_pressure_triggered:
                         consecutive_cuda_pressure_passes = 0
                     dimension_text = ", ".join(triggered_dimensions)
+                    triggered_ratios: list[str] = []
+                    if cpu_pressure_triggered:
+                        cpu_ratio = pressure_summary.peak_cpu_rss_ratio
+                        assert cpu_ratio is not None
+                        triggered_ratios.append(f"cpu={cpu_ratio:.6g}")
+                    if cuda_pressure_triggered:
+                        cuda_ratio = self._peak_cuda_pressure_ratio(pressure_summary)
+                        assert cuda_ratio is not None
+                        triggered_ratios.append(f"cuda={cuda_ratio:.6g}")
+                    ratio_text = ", ".join(triggered_ratios)
                     if budget_shrunk_by_pressure:
                         field_text = ", ".join(pressure_shrunk_budget_fields)
                         reason = (
-                            f"resource pressure {max_ratio:.6g} remained at or above "
-                            f"shrink limit {shrink_limit:.6g} for {required} passes; "
-                            f"triggered dimensions: {dimension_text}; "
+                            f"pressure streak reached {required} passes; triggered dimensions: "
+                            f"{dimension_text}; current triggered ratios: {ratio_text}; "
                             f"shrinking pressure-matched budget fields: {field_text}"
                         )
                     elif selected_pressure_fields:
                         field_text = ", ".join(selected_pressure_fields)
                         reason = (
-                            f"resource pressure {max_ratio:.6g} remained at or above "
-                            f"shrink limit {shrink_limit:.6g} for {required} passes; "
-                            f"triggered dimensions: {dimension_text}; "
+                            f"pressure streak reached {required} passes; triggered dimensions: "
+                            f"{dimension_text}; current triggered ratios: {ratio_text}; "
                             "configured minimum bounds kept pressure-matched budget "
                             f"fields unchanged: {field_text}"
                         )
                     else:
                         reason = (
-                            f"resource pressure {max_ratio:.6g} remained at or above "
-                            f"shrink limit {shrink_limit:.6g} for {required} passes; "
-                            f"triggered dimensions: {dimension_text}; "
+                            f"pressure streak reached {required} passes; triggered dimensions: "
+                            f"{dimension_text}; current triggered ratios: {ratio_text}; "
                             "no matching byte budget or max_items fallback is configured"
                         )
                 else:
@@ -605,6 +616,22 @@ class ConservativeRuntimeGovernor:
             )
         )
         return cpu_pressure, cuda_pressure
+
+    @staticmethod
+    def _peak_cuda_pressure_ratio(
+        pressure_summary: ResourcePressureSummary,
+    ) -> float | None:
+        known_ratios = tuple(
+            value
+            for value in (
+                pressure_summary.peak_cuda_allocated_ratio,
+                pressure_summary.peak_cuda_reserved_ratio,
+                pressure_summary.peak_cuda_max_allocated_ratio,
+                pressure_summary.peak_cuda_max_reserved_ratio,
+            )
+            if value is not None
+        )
+        return max(known_ratios) if known_ratios else None
 
     def _adjust_budget_for_pressure(
         self,

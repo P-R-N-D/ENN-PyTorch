@@ -145,10 +145,12 @@ compatibility aggregate equal to the maximum of the CPU and CUDA streaks in ever
 new decision and state.
 
 For compatibility with state constructed before dimension-specific streak fields
-existed, a positive legacy `consecutive_high_pressure_passes` value is inherited by
-the currently high dimension or dimensions only when both new streak fields are
-zero. After the next observation, the governor emits explicit CPU/CUDA streaks and
-recomputes the compatibility aggregate.
+existed, a positive legacy `consecutive_high_pressure_passes` value is inherited
+only when exactly one currently high dimension is observed and both new streak
+fields are zero. When CPU and CUDA are both high, the aggregate cannot identify its
+source dimension, so neither inherits it and both streaks start at one for the
+current pass. After the next observation, the governor emits explicit CPU/CUDA
+streaks and recomputes the compatibility aggregate.
 
 ## Resource Samples
 
@@ -176,6 +178,9 @@ CPU and CUDA persistence are tracked independently, so alternating CPU-only and
 CUDA-only high-pressure passes cannot combine into a sustained-pressure shrink.
 When both dimensions are continuously high, each can reach the threshold and
 trigger its matching budget adjustment in the same pass.
+Triggered decision reasons report only the current ratios for dimensions that
+reached the threshold; they do not describe the summary-wide maximum ratio as
+having persisted for the full streak.
 
 ## Relationship to Orchestration
 
