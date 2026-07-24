@@ -216,6 +216,7 @@ class GovernorDecision:
     growth_suppressed_by_pressure: bool = False
     consecutive_high_pressure_passes: int = 0
     budget_shrunk_by_pressure: bool = False
+    pressure_shrunk_budget_fields: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -358,6 +359,7 @@ class ConservativeRuntimeGovernor:
         consecutive_high_pressure_passes = self.state.consecutive_high_pressure_passes
         growth_suppressed_by_pressure = False
         budget_shrunk_by_pressure = False
+        pressure_shrunk_budget_fields: tuple[str, ...] = ()
 
         if saw_oom or recovered_oom:
             next_budget = self._adjust_budget(previous_budget, mode="shrink")
@@ -391,20 +393,37 @@ class ConservativeRuntimeGovernor:
                 growth_suppressed_by_pressure = True
                 required = self.policy.shrink_after_pressure_passes
                 if consecutive_high_pressure_passes >= required:
-                    next_budget = self._adjust_budget(previous_budget, mode="shrink")
-                    budget_shrunk_by_pressure = next_budget != previous_budget
+                    (
+                        next_budget,
+                        selected_pressure_fields,
+                        pressure_shrunk_budget_fields,
+                    ) = self._adjust_budget_for_pressure(
+                        previous_budget,
+                        pressure_summary=pressure_summary,
+                        threshold=shrink_limit,
+                    )
+                    budget_shrunk_by_pressure = bool(pressure_shrunk_budget_fields)
                     consecutive_high_pressure_passes = 0
                     if budget_shrunk_by_pressure:
+                        field_text = ", ".join(pressure_shrunk_budget_fields)
                         reason = (
                             f"resource pressure {max_ratio:.6g} remained at or above "
                             f"shrink limit {shrink_limit:.6g} for {required} passes; "
-                            "shrinking configured budget fields"
+                            f"shrinking pressure-matched budget fields: {field_text}"
+                        )
+                    elif selected_pressure_fields:
+                        field_text = ", ".join(selected_pressure_fields)
+                        reason = (
+                            f"resource pressure {max_ratio:.6g} remained at or above "
+                            f"shrink limit {shrink_limit:.6g} for {required} passes; "
+                            "configured minimum bounds kept pressure-matched budget "
+                            f"fields unchanged: {field_text}"
                         )
                     else:
                         reason = (
                             f"resource pressure {max_ratio:.6g} remained at or above "
                             f"shrink limit {shrink_limit:.6g} for {required} passes; "
-                            "configured minimum bounds kept the budget unchanged"
+                            "no matching byte budget or max_items fallback is configured"
                         )
                 else:
                     reason = (
@@ -451,6 +470,7 @@ class ConservativeRuntimeGovernor:
             growth_suppressed_by_pressure=growth_suppressed_by_pressure,
             consecutive_high_pressure_passes=consecutive_high_pressure_passes,
             budget_shrunk_by_pressure=budget_shrunk_by_pressure,
+            pressure_shrunk_budget_fields=pressure_shrunk_budget_fields,
         )
         self.state = RuntimeGovernorState(
             current_budget=next_budget,
@@ -481,6 +501,68 @@ class ConservativeRuntimeGovernor:
                 f"{threshold:.6g}; suppressing budget growth"
             )
         return None
+
+    def _adjust_budget_for_pressure(
+        self,
+        budget: BatchBudget,
+        *,
+        pressure_summary: ResourcePressureSummary,
+        threshold: float,
+    ) -> tuple[BatchBudget, tuple[str, ...], tuple[str, ...]]:
+        selected_fields = self._pressure_budget_fields(
+            budget,
+            pressure_summary=pressure_summary,
+            threshold=threshold,
+        )
+        values: dict[str, int | None] = {
+            field_name: getattr(budget, field_name)
+            for field_name in _BUDGET_FIELDS
+        }
+        changed_fields: list[str] = []
+        for field_name in selected_fields:
+            current = values[field_name]
+            assert current is not None
+            adjusted = math.floor(current * self.policy.shrink_factor)
+            adjusted = max(1, adjusted)
+            adjusted = self._clamp(field_name, adjusted)
+            values[field_name] = adjusted
+            if adjusted != current:
+                changed_fields.append(field_name)
+        return BatchBudget(**values), selected_fields, tuple(changed_fields)
+
+    @staticmethod
+    def _pressure_budget_fields(
+        budget: BatchBudget,
+        *,
+        pressure_summary: ResourcePressureSummary,
+        threshold: float,
+    ) -> tuple[str, ...]:
+        cpu_high = (
+            pressure_summary.peak_cpu_rss_ratio is not None
+            and pressure_summary.peak_cpu_rss_ratio >= threshold
+        )
+        cuda_high = any(
+            value is not None and value >= threshold
+            for value in (
+                pressure_summary.peak_cuda_allocated_ratio,
+                pressure_summary.peak_cuda_reserved_ratio,
+                pressure_summary.peak_cuda_max_allocated_ratio,
+                pressure_summary.peak_cuda_max_reserved_ratio,
+            )
+        )
+
+        selected_fields: list[str] = []
+        if cpu_high and budget.max_host_bytes is not None:
+            selected_fields.append("max_host_bytes")
+        if cuda_high and budget.max_device_bytes is not None:
+            selected_fields.append("max_device_bytes")
+        if (
+            not selected_fields
+            and (cpu_high or cuda_high)
+            and budget.max_items is not None
+        ):
+            selected_fields.append("max_items")
+        return tuple(selected_fields)
 
     def _adjust_budget(self, budget: BatchBudget, *, mode: str) -> BatchBudget:
         values: dict[str, int | None] = {}

@@ -34,6 +34,9 @@ Use this document before running code that can allocate accelerator memory, writ
 - Do not clamp pressure ratios to `1.0`; ratios above one must remain visible for diagnosis.
 - Feed pressure summaries into governor decisions through explicit opt-in policies. Missing or high pressure may suppress growth; pressure may shrink a future budget only when a separately configured sustained-pressure threshold and pass count are both met.
 - Never let a single non-OOM pressure sample trigger shrink, and keep OOM/recovered-OOM shrink higher priority than pressure streak handling.
+- Map sustained CPU pressure only to `max_host_bytes` and sustained CUDA pressure only to `max_device_bytes`; use `max_items` only when no matching pressured byte budget is configured.
+- Record only fields whose values actually changed, and do not label minimum-bound no-ops as pressure shrink.
+- Keep yielded or retry-recovered OOM behavior unchanged: it shrinks every configured budget field and leaves pressure-specific field metadata empty.
 - When orchestration is given fixed or provider-resolved `ResourceCapacity`, include samples from retry-consumed attempts as well as final results.
 - Resolve a `ResourceCapacityProvider` exactly once before consuming each pass source; provider failures and invalid return types must remain visible and must not update governor state.
 - Keep the resolved capacity fixed within a pass; do not hide CUDA device mismatches or refresh capacity during retry/split execution.
