@@ -51,7 +51,10 @@ The stable `enn_torch` namespace does not expose this development summary API.
 - the current high-pressure streak and whether sustained pressure actually shrank
   the next budget;
 - the ordered tuple of budget fields whose values actually changed due to pressure;
-- the independent CPU and CUDA pressure streak counters.
+- the independent CPU and CUDA pressure streak counters;
+- the structured high and triggered pressure dimensions;
+- the budget fields selected for pressure adjustment;
+- the ordered `(budget_field, factor)` pairs applied to selected fields.
 
 `summarize_runtime_pass(pass_result)` accepts only a finite `RuntimePassResult`.
 It scans the pass result tuple and stores only lightweight summary fields. It does
@@ -63,7 +66,8 @@ scalar values only.
 `RuntimePassSummary`. The formatter includes whether pressure was assessed, the
 maximum known pressure ratio (or `unknown`), whether pressure suppressed growth,
 the resolved capacity provenance, the compatibility aggregate, both dimension
-streaks, and the pressure-adjusted field tuple. It is
+streaks, structured pressure-decision provenance, and the pressure-adjusted field
+tuple. It is
 intended for debug output and PR/report inspection, not for a stable machine
 interchange format.
 

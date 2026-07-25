@@ -55,6 +55,10 @@ def _decision(
     pressure_shrunk_budget_fields: tuple[str, ...] = (),
     consecutive_cpu_pressure_passes: int = 0,
     consecutive_cuda_pressure_passes: int = 0,
+    pressure_high_dimensions: tuple[str, ...] = (),
+    pressure_triggered_dimensions: tuple[str, ...] = (),
+    pressure_selected_budget_fields: tuple[str, ...] = (),
+    pressure_applied_shrink_factors: tuple[tuple[str, float], ...] = (),
 ) -> GovernorDecision:
     previous = previous_budget or BatchBudget(max_items=4)
     return GovernorDecision(
@@ -76,6 +80,10 @@ def _decision(
         pressure_shrunk_budget_fields=pressure_shrunk_budget_fields,
         consecutive_cpu_pressure_passes=consecutive_cpu_pressure_passes,
         consecutive_cuda_pressure_passes=consecutive_cuda_pressure_passes,
+        pressure_high_dimensions=pressure_high_dimensions,
+        pressure_triggered_dimensions=pressure_triggered_dimensions,
+        pressure_selected_budget_fields=pressure_selected_budget_fields,
+        pressure_applied_shrink_factors=pressure_applied_shrink_factors,
     )
 
 
@@ -131,6 +139,10 @@ def test_summarize_and_format_runtime_pass_pressure_shrink_feedback() -> None:
                 pressure_shrunk_budget_fields=("max_host_bytes",),
                 consecutive_cpu_pressure_passes=1,
                 consecutive_cuda_pressure_passes=0,
+                pressure_high_dimensions=("cpu",),
+                pressure_triggered_dimensions=("cpu",),
+                pressure_selected_budget_fields=("max_host_bytes",),
+                pressure_applied_shrink_factors=(("max_host_bytes", 0.75),),
             ),
         )
     )
@@ -142,9 +154,17 @@ def test_summarize_and_format_runtime_pass_pressure_shrink_feedback() -> None:
     assert summary.pressure_shrunk_budget_fields == ("max_host_bytes",)
     assert summary.consecutive_cpu_pressure_passes == 1
     assert summary.consecutive_cuda_pressure_passes == 0
+    assert summary.pressure_high_dimensions == ("cpu",)
+    assert summary.pressure_triggered_dimensions == ("cpu",)
+    assert summary.pressure_selected_budget_fields == ("max_host_bytes",)
+    assert summary.pressure_applied_shrink_factors == (("max_host_bytes", 0.75),)
     assert "consecutive_high_pressure_passes=1" in text
     assert "consecutive_cpu_pressure_passes=1" in text
     assert "consecutive_cuda_pressure_passes=0" in text
+    assert "pressure_high_dimensions=('cpu',)" in text
+    assert "pressure_triggered_dimensions=('cpu',)" in text
+    assert "pressure_selected_budget_fields=('max_host_bytes',)" in text
+    assert "pressure_applied_shrink_factors=(('max_host_bytes', 0.75),)" in text
     assert "budget_shrunk_by_pressure=True" in text
     assert "pressure_shrunk_budget_fields=('max_host_bytes',)" in text
 
@@ -227,7 +247,7 @@ def test_summarize_runtime_pass_detects_budget_change_and_decision_metadata() ->
 def test_runtime_pass_summary_appends_feedback_and_capacity_fields_for_compatibility() -> None:
     field_names = [field.name for field in fields(RuntimePassSummary)]
 
-    assert field_names[-8:] == [
+    assert field_names[-12:] == [
         "pressure_summary",
         "growth_suppressed_by_pressure",
         "resource_capacity",
@@ -236,6 +256,10 @@ def test_runtime_pass_summary_appends_feedback_and_capacity_fields_for_compatibi
         "pressure_shrunk_budget_fields",
         "consecutive_cpu_pressure_passes",
         "consecutive_cuda_pressure_passes",
+        "pressure_high_dimensions",
+        "pressure_triggered_dimensions",
+        "pressure_selected_budget_fields",
+        "pressure_applied_shrink_factors",
     ]
 
 

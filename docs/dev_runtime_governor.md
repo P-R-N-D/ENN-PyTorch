@@ -153,7 +153,18 @@ whether pressure suppressed success growth, whether sustained pressure actually
 changed the next budget, and the ordered tuple of budget fields whose values
 actually changed because of pressure. `consecutive_high_pressure_passes` remains a
 compatibility aggregate equal to the maximum of the CPU and CUDA streaks in every
-new decision and state.
+new decision and state. Pressure-decision provenance is also available as structured
+immutable tuples rather than requiring callers to parse `reason`:
+
+- `pressure_high_dimensions`: dimensions currently at or above their effective
+  sustained-pressure threshold;
+- `pressure_triggered_dimensions`: dimensions whose streak reached the effective
+  required pass count;
+- `pressure_selected_budget_fields`: budget fields selected for an adjustment
+  attempt, including minimum-bound no-ops;
+- `pressure_applied_shrink_factors`: ordered `(budget_field, factor)` pairs for the
+  selected fields;
+- `pressure_shrunk_budget_fields`: selected fields whose values actually changed.
 
 For compatibility with state constructed before dimension-specific streak fields
 existed, a positive legacy `consecutive_high_pressure_passes` value is inherited
@@ -198,6 +209,12 @@ required pass count independently.
 Triggered decision reasons report only the current ratios, effective threshold
 policies, and effective pressure shrink factors for dimensions that reached the threshold; they do not describe the
 summary-wide maximum ratio as having persisted for the full streak.
+The structured provenance distinguishes current pressure, trigger eligibility,
+attempted adjustment, and actual change. A trigger with no matching byte budget or
+`max_items` fallback has triggered dimensions but empty selected fields and factor
+pairs. A minimum-bound no-op keeps selected fields and factor pairs while leaving
+`pressure_shrunk_budget_fields` empty. OOM and retry-recovered OOM retain their
+generic path and leave all pressure-specific provenance tuples empty.
 
 ## Relationship to Orchestration
 

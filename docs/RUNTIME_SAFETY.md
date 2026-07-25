@@ -41,6 +41,10 @@ Use this document before running code that can allocate accelerator memory, writ
 - Track CPU and CUDA pressure persistence independently; alternating pressure dimensions must not combine into one sustained streak.
 - Reset only the dimension observed as low or unknown during a successful assessed pass, while preserving the other dimension's incomplete high-pressure streak.
 - Reset both dimension streaks after fully unavailable pressure, empty passes, non-OOM faults, yielded OOM, or retry-recovered OOM.
+- Use structured pressure provenance for automation and inspection; do not parse
+  `GovernorDecision.reason` to recover high dimensions, trigger dimensions,
+  selected fields, or applied factors.
+- Keep OOM and retry-recovered OOM pressure-specific provenance tuples empty.
 - Record only fields whose values actually changed, and do not label minimum-bound no-ops as pressure shrink.
 - Keep yielded or retry-recovered OOM behavior unchanged: it uses the common `shrink_factor`, shrinks every configured budget field and leaves pressure-specific field metadata empty.
 - When orchestration is given fixed or provider-resolved `ResourceCapacity`, include samples from retry-consumed attempts as well as final results.

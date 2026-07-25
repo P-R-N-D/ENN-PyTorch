@@ -42,6 +42,10 @@ class RuntimePassSummary:
     pressure_shrunk_budget_fields: tuple[str, ...] = ()
     consecutive_cpu_pressure_passes: int = 0
     consecutive_cuda_pressure_passes: int = 0
+    pressure_high_dimensions: tuple[str, ...] = ()
+    pressure_triggered_dimensions: tuple[str, ...] = ()
+    pressure_selected_budget_fields: tuple[str, ...] = ()
+    pressure_applied_shrink_factors: tuple[tuple[str, float], ...] = ()
 
 
 def summarize_runtime_pass(pass_result: RuntimePassResult) -> RuntimePassSummary:
@@ -95,6 +99,10 @@ def summarize_runtime_pass(pass_result: RuntimePassResult) -> RuntimePassSummary
         pressure_shrunk_budget_fields=decision.pressure_shrunk_budget_fields,
         consecutive_cpu_pressure_passes=decision.consecutive_cpu_pressure_passes,
         consecutive_cuda_pressure_passes=decision.consecutive_cuda_pressure_passes,
+        pressure_high_dimensions=decision.pressure_high_dimensions,
+        pressure_triggered_dimensions=decision.pressure_triggered_dimensions,
+        pressure_selected_budget_fields=decision.pressure_selected_budget_fields,
+        pressure_applied_shrink_factors=decision.pressure_applied_shrink_factors,
     )
 
 
@@ -134,6 +142,13 @@ def format_runtime_pass_summary(summary: RuntimePassSummary) -> str:
             f"{summary.consecutive_cpu_pressure_passes}",
             "consecutive_cuda_pressure_passes="
             f"{summary.consecutive_cuda_pressure_passes}",
+            f"pressure_high_dimensions={summary.pressure_high_dimensions!r}",
+            "pressure_triggered_dimensions="
+            f"{summary.pressure_triggered_dimensions!r}",
+            "pressure_selected_budget_fields="
+            f"{summary.pressure_selected_budget_fields!r}",
+            "pressure_applied_shrink_factors="
+            f"{summary.pressure_applied_shrink_factors!r}",
             f"budget_shrunk_by_pressure={summary.budget_shrunk_by_pressure}",
             "pressure_shrunk_budget_fields="
             f"{summary.pressure_shrunk_budget_fields!r}",

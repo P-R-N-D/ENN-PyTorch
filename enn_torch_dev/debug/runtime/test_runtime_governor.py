@@ -112,12 +112,16 @@ def test_governor_decision_appends_pressure_field_selection_for_compatibility() 
     decision_field_names = [field.name for field in fields(GovernorDecision)]
     state_field_names = [field.name for field in fields(RuntimeGovernorState)]
 
-    assert decision_field_names[-5:] == [
+    assert decision_field_names[-9:] == [
         "consecutive_high_pressure_passes",
         "budget_shrunk_by_pressure",
         "pressure_shrunk_budget_fields",
         "consecutive_cpu_pressure_passes",
         "consecutive_cuda_pressure_passes",
+        "pressure_high_dimensions",
+        "pressure_triggered_dimensions",
+        "pressure_selected_budget_fields",
+        "pressure_applied_shrink_factors",
     ]
     assert state_field_names[-3:] == [
         "consecutive_high_pressure_passes",
@@ -360,6 +364,14 @@ def test_cpu_and_cuda_pressure_factors_apply_independently() -> None:
     assert decision.pressure_shrunk_budget_fields == (
         "max_host_bytes", "max_device_bytes"
     )
+    assert decision.pressure_high_dimensions == ("cpu", "cuda")
+    assert decision.pressure_triggered_dimensions == ("cpu", "cuda")
+    assert decision.pressure_selected_budget_fields == (
+        "max_host_bytes", "max_device_bytes"
+    )
+    assert decision.pressure_applied_shrink_factors == (
+        ("max_host_bytes", 0.75), ("max_device_bytes", 0.4)
+    )
     assert "triggered shrink factors: cpu=0.75, cuda=0.4" in decision.reason
 
 
@@ -421,6 +433,10 @@ def test_dimension_thresholds_and_pass_counts_trigger_independently() -> None:
     assert first.consecutive_cpu_pressure_passes == 1
     assert first.consecutive_cuda_pressure_passes == 1
     assert _reason_high_dimensions(first.reason) == "cpu, cuda"
+    assert first.pressure_high_dimensions == ("cpu", "cuda")
+    assert first.pressure_triggered_dimensions == ()
+    assert first.pressure_selected_budget_fields == ()
+    assert first.pressure_applied_shrink_factors == ()
 
     assert second.next_budget == BatchBudget(
         max_items=8,
@@ -431,6 +447,10 @@ def test_dimension_thresholds_and_pass_counts_trigger_independently() -> None:
     assert second.consecutive_cpu_pressure_passes == 0
     assert second.consecutive_cuda_pressure_passes == 2
     assert "triggered policies: cpu(limit=0.8, required=2)" in second.reason
+    assert second.pressure_high_dimensions == ("cpu", "cuda")
+    assert second.pressure_triggered_dimensions == ("cpu",)
+    assert second.pressure_selected_budget_fields == ("max_host_bytes",)
+    assert second.pressure_applied_shrink_factors == (("max_host_bytes", 0.5),)
 
     assert third.next_budget == BatchBudget(
         max_items=8,
@@ -441,6 +461,10 @@ def test_dimension_thresholds_and_pass_counts_trigger_independently() -> None:
     assert third.consecutive_cpu_pressure_passes == 1
     assert third.consecutive_cuda_pressure_passes == 0
     assert "triggered policies: cuda(limit=0.95, required=3)" in third.reason
+    assert third.pressure_high_dimensions == ("cpu", "cuda")
+    assert third.pressure_triggered_dimensions == ("cuda",)
+    assert third.pressure_selected_budget_fields == ("max_device_bytes",)
+    assert third.pressure_applied_shrink_factors == (("max_device_bytes", 0.5),)
 
 
 def test_dimension_threshold_override_resets_only_non_high_dimension() -> None:
@@ -839,6 +863,34 @@ def test_dual_pressure_uses_stronger_factor_for_shared_items_fallback() -> None:
 
     assert decision.next_budget == BatchBudget(max_items=4)
     assert decision.pressure_shrunk_budget_fields == ("max_items",)
+    assert decision.pressure_high_dimensions == ("cpu", "cuda")
+    assert decision.pressure_triggered_dimensions == ("cpu", "cuda")
+    assert decision.pressure_selected_budget_fields == ("max_items",)
+    assert decision.pressure_applied_shrink_factors == (("max_items", 0.4),)
+
+
+def test_trigger_without_matching_budget_records_dimensions_but_no_field_metadata() -> None:
+    governor = ConservativeRuntimeGovernor(
+        BatchBudget(max_device_bytes=200),
+        policy=GovernorPolicy(
+            min_cpu_pressure_ratio_for_shrink=0.9,
+            cpu_shrink_after_pressure_passes=1,
+        ),
+    )
+
+    decision = governor.observe_results(
+        [_result()],
+        pressure_summary=ResourcePressureSummary(peak_cpu_rss_ratio=0.95),
+    )
+
+    assert decision.next_budget == BatchBudget(max_device_bytes=200)
+    assert decision.pressure_high_dimensions == ("cpu",)
+    assert decision.pressure_triggered_dimensions == ("cpu",)
+    assert decision.pressure_selected_budget_fields == ()
+    assert decision.pressure_applied_shrink_factors == ()
+    assert decision.pressure_shrunk_budget_fields == ()
+    assert decision.budget_shrunk_by_pressure is False
+    assert "no matching byte budget" in decision.reason
 
 
 def test_cpu_pressure_uses_items_fallback_with_only_device_budget() -> None:
@@ -957,6 +1009,14 @@ def test_pressure_shrink_records_only_fields_that_actually_changed() -> None:
     )
     assert decision.budget_shrunk_by_pressure is True
     assert decision.pressure_shrunk_budget_fields == ("max_device_bytes",)
+    assert decision.pressure_high_dimensions == ("cpu", "cuda")
+    assert decision.pressure_triggered_dimensions == ("cpu", "cuda")
+    assert decision.pressure_selected_budget_fields == (
+        "max_host_bytes", "max_device_bytes"
+    )
+    assert decision.pressure_applied_shrink_factors == (
+        ("max_host_bytes", 0.75), ("max_device_bytes", 0.5)
+    )
 
 
 @pytest.mark.parametrize(
@@ -1199,6 +1259,10 @@ def test_oom_uses_common_shrink_factor_not_pressure_overrides() -> None:
         max_items=5, max_host_bytes=50, max_device_bytes=100
     )
     assert decision.pressure_shrunk_budget_fields == ()
+    assert decision.pressure_high_dimensions == ()
+    assert decision.pressure_triggered_dimensions == ()
+    assert decision.pressure_selected_budget_fields == ()
+    assert decision.pressure_applied_shrink_factors == ()
     assert "triggered shrink factors" not in decision.reason
 
     recovered_governor = ConservativeRuntimeGovernor(
@@ -1213,6 +1277,10 @@ def test_oom_uses_common_shrink_factor_not_pressure_overrides() -> None:
         max_items=5, max_host_bytes=50, max_device_bytes=100
     )
     assert recovered_decision.pressure_shrunk_budget_fields == ()
+    assert recovered_decision.pressure_high_dimensions == ()
+    assert recovered_decision.pressure_triggered_dimensions == ()
+    assert recovered_decision.pressure_selected_budget_fields == ()
+    assert recovered_decision.pressure_applied_shrink_factors == ()
     assert "triggered shrink factors" not in recovered_decision.reason
 
 

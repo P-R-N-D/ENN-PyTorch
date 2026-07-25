@@ -186,7 +186,10 @@ The session itself does not retain prior pass results after the generator resume
 Longer-lived in-memory retention is limited to lightweight `RuntimePassSummary`
 objects in `RuntimePassHistory`, which requires a positive `max_records` bound.
 Pass summaries expose scalar pressure ratios, growth-suppression decisions, and
-sustained-pressure shrink feedback; history aggregates pressure-assessed,
+sustained-pressure shrink feedback. They also expose structured high/triggered
+dimensions, selected adjustment fields, field-level applied factors, and actual
+changed fields without requiring `decision_reason` parsing. History aggregation is
+unchanged and continues to aggregate pressure-assessed,
 pressure-suppressed, and actual pressure-shrink pass counts plus the highest known
 ratio only within the currently retained summary window. Each pass
 summary also records the scalar capacity used for normalization. Raw

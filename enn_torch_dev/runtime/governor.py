@@ -285,6 +285,10 @@ class GovernorDecision:
     pressure_shrunk_budget_fields: tuple[str, ...] = ()
     consecutive_cpu_pressure_passes: int = 0
     consecutive_cuda_pressure_passes: int = 0
+    pressure_high_dimensions: tuple[str, ...] = ()
+    pressure_triggered_dimensions: tuple[str, ...] = ()
+    pressure_selected_budget_fields: tuple[str, ...] = ()
+    pressure_applied_shrink_factors: tuple[tuple[str, float], ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -452,6 +456,10 @@ class ConservativeRuntimeGovernor:
         growth_suppressed_by_pressure = False
         budget_shrunk_by_pressure = False
         pressure_shrunk_budget_fields: tuple[str, ...] = ()
+        pressure_high_dimensions: tuple[str, ...] = ()
+        pressure_triggered_dimensions: tuple[str, ...] = ()
+        pressure_selected_budget_fields: tuple[str, ...] = ()
+        pressure_applied_shrink_factors: tuple[tuple[str, float], ...] = ()
 
         if saw_oom or recovered_oom:
             next_budget = self._adjust_budget(previous_budget, mode="shrink")
@@ -512,6 +520,14 @@ class ConservativeRuntimeGovernor:
                     cpu_threshold=cpu_shrink_limit,
                     cuda_threshold=cuda_shrink_limit,
                 )
+            pressure_high_dimensions = tuple(
+                dimension
+                for dimension, pressure_high in (
+                    ("cpu", cpu_pressure_high),
+                    ("cuda", cuda_pressure_high),
+                )
+                if pressure_high
+            )
             legacy_high_pressure_streak = (
                 self.state.consecutive_high_pressure_passes
                 if legacy_is_available and cpu_pressure_high != cuda_pressure_high
@@ -550,7 +566,8 @@ class ConservativeRuntimeGovernor:
                 if cpu_pressure_triggered or cuda_pressure_triggered:
                     (
                         next_budget,
-                        selected_pressure_fields,
+                        pressure_selected_budget_fields,
+                        pressure_applied_shrink_factors,
                         pressure_shrunk_budget_fields,
                     ) = self._adjust_budget_for_pressure(
                         previous_budget,
@@ -560,7 +577,7 @@ class ConservativeRuntimeGovernor:
                         cuda_shrink_factor=cuda_pressure_shrink_factor,
                     )
                     budget_shrunk_by_pressure = bool(pressure_shrunk_budget_fields)
-                    triggered_dimensions = tuple(
+                    pressure_triggered_dimensions = tuple(
                         dimension
                         for dimension, triggered in (
                             ("cpu", cpu_pressure_triggered),
@@ -572,7 +589,7 @@ class ConservativeRuntimeGovernor:
                         consecutive_cpu_pressure_passes = 0
                     if cuda_pressure_triggered:
                         consecutive_cuda_pressure_passes = 0
-                    dimension_text = ", ".join(triggered_dimensions)
+                    dimension_text = ", ".join(pressure_triggered_dimensions)
                     triggered_ratios: list[str] = []
                     triggered_policies: list[str] = []
                     triggered_factors: list[str] = []
@@ -610,8 +627,8 @@ class ConservativeRuntimeGovernor:
                             reason_prefix
                             + f"shrinking pressure-matched budget fields: {field_text}"
                         )
-                    elif selected_pressure_fields:
-                        field_text = ", ".join(selected_pressure_fields)
+                    elif pressure_selected_budget_fields:
+                        field_text = ", ".join(pressure_selected_budget_fields)
                         reason = (
                             reason_prefix
                             + "configured minimum bounds kept pressure-matched budget "
@@ -623,14 +640,6 @@ class ConservativeRuntimeGovernor:
                             + "no matching byte budget or max_items fallback is configured"
                         )
                 else:
-                    high_dimensions = tuple(
-                        dimension
-                        for dimension, pressure_high in (
-                            ("cpu", cpu_pressure_high),
-                            ("cuda", cuda_pressure_high),
-                        )
-                        if pressure_high
-                    )
                     progress_parts: list[str] = []
                     if cpu_shrink_limit is not None:
                         cpu_ratio = pressure_summary.peak_cpu_rss_ratio
@@ -654,7 +663,7 @@ class ConservativeRuntimeGovernor:
                         )
                     reason = (
                         "resource pressure reached configured shrink limit for dimensions: "
-                        f"{', '.join(high_dimensions)}; "
+                        f"{', '.join(pressure_high_dimensions)}; "
                         f"pressure streaks {', '.join(progress_parts)}; "
                         "suppressing budget growth"
                     )
@@ -705,6 +714,10 @@ class ConservativeRuntimeGovernor:
             pressure_shrunk_budget_fields=pressure_shrunk_budget_fields,
             consecutive_cpu_pressure_passes=consecutive_cpu_pressure_passes,
             consecutive_cuda_pressure_passes=consecutive_cuda_pressure_passes,
+            pressure_high_dimensions=pressure_high_dimensions,
+            pressure_triggered_dimensions=pressure_triggered_dimensions,
+            pressure_selected_budget_fields=pressure_selected_budget_fields,
+            pressure_applied_shrink_factors=pressure_applied_shrink_factors,
         )
         self.state = RuntimeGovernorState(
             current_budget=next_budget,
@@ -788,7 +801,12 @@ class ConservativeRuntimeGovernor:
         cuda_pressure: bool,
         cpu_shrink_factor: float,
         cuda_shrink_factor: float,
-    ) -> tuple[BatchBudget, tuple[str, ...], tuple[str, ...]]:
+    ) -> tuple[
+        BatchBudget,
+        tuple[str, ...],
+        tuple[tuple[str, float], ...],
+        tuple[str, ...],
+    ]:
         selected_fields = self._pressure_budget_fields(
             budget,
             cpu_pressure=cpu_pressure,
@@ -799,6 +817,7 @@ class ConservativeRuntimeGovernor:
             for field_name in _BUDGET_FIELDS
         }
         changed_fields: list[str] = []
+        applied_factors: list[tuple[str, float]] = []
         for field_name in selected_fields:
             current = values[field_name]
             assert current is not None
@@ -815,13 +834,19 @@ class ConservativeRuntimeGovernor:
                     )
                     if triggered
                 )
+            applied_factors.append((field_name, factor))
             adjusted = math.floor(current * factor)
             adjusted = max(1, adjusted)
             adjusted = self._clamp(field_name, adjusted)
             values[field_name] = adjusted
             if adjusted != current:
                 changed_fields.append(field_name)
-        return BatchBudget(**values), selected_fields, tuple(changed_fields)
+        return (
+            BatchBudget(**values),
+            selected_fields,
+            tuple(applied_factors),
+            tuple(changed_fields),
+        )
 
     @staticmethod
     def _pressure_budget_fields(
