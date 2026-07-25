@@ -27,6 +27,16 @@ class RuntimeHistorySummary:
     pressure_growth_suppressed_passes: int = 0
     peak_observed_pressure_ratio: float | None = None
     pressure_shrink_passes: int = 0
+    cpu_pressure_high_passes: int = 0
+    cuda_pressure_high_passes: int = 0
+    cpu_pressure_trigger_passes: int = 0
+    cuda_pressure_trigger_passes: int = 0
+    pressure_adjustment_attempt_passes: int = 0
+    pressure_adjustment_noop_passes: int = 0
+    pressure_trigger_without_budget_passes: int = 0
+    host_budget_pressure_shrink_passes: int = 0
+    device_budget_pressure_shrink_passes: int = 0
+    items_pressure_fallback_shrink_passes: int = 0
 
 
 class RuntimePassHistory:
@@ -70,6 +80,16 @@ class RuntimePassHistory:
         pressure_growth_suppressed_passes = 0
         peak_observed_pressure_ratio: float | None = None
         pressure_shrink_passes = 0
+        cpu_pressure_high_passes = 0
+        cuda_pressure_high_passes = 0
+        cpu_pressure_trigger_passes = 0
+        cuda_pressure_trigger_passes = 0
+        pressure_adjustment_attempt_passes = 0
+        pressure_adjustment_noop_passes = 0
+        pressure_trigger_without_budget_passes = 0
+        host_budget_pressure_shrink_passes = 0
+        device_budget_pressure_shrink_passes = 0
+        items_pressure_fallback_shrink_passes = 0
 
         for summary in self._records:
             total_results += summary.total_results
@@ -98,6 +118,34 @@ class RuntimePassHistory:
             if summary.budget_shrunk_by_pressure:
                 pressure_shrink_passes += 1
 
+            high_dimensions = summary.pressure_high_dimensions
+            if "cpu" in high_dimensions:
+                cpu_pressure_high_passes += 1
+            if "cuda" in high_dimensions:
+                cuda_pressure_high_passes += 1
+
+            triggered_dimensions = summary.pressure_triggered_dimensions
+            if "cpu" in triggered_dimensions:
+                cpu_pressure_trigger_passes += 1
+            if "cuda" in triggered_dimensions:
+                cuda_pressure_trigger_passes += 1
+
+            selected_fields = summary.pressure_selected_budget_fields
+            shrunk_fields = summary.pressure_shrunk_budget_fields
+            if selected_fields:
+                pressure_adjustment_attempt_passes += 1
+                if not shrunk_fields:
+                    pressure_adjustment_noop_passes += 1
+            elif triggered_dimensions:
+                pressure_trigger_without_budget_passes += 1
+
+            if "max_host_bytes" in shrunk_fields:
+                host_budget_pressure_shrink_passes += 1
+            if "max_device_bytes" in shrunk_fields:
+                device_budget_pressure_shrink_passes += 1
+            if "max_items" in shrunk_fields:
+                items_pressure_fallback_shrink_passes += 1
+
         latest_summary = self._records[-1] if self._records else None
         status_counts_view: Mapping[StepStatus, int] = MappingProxyType(dict(status_counts))
         return RuntimeHistorySummary(
@@ -114,6 +162,16 @@ class RuntimePassHistory:
             pressure_growth_suppressed_passes=pressure_growth_suppressed_passes,
             peak_observed_pressure_ratio=peak_observed_pressure_ratio,
             pressure_shrink_passes=pressure_shrink_passes,
+            cpu_pressure_high_passes=cpu_pressure_high_passes,
+            cuda_pressure_high_passes=cuda_pressure_high_passes,
+            cpu_pressure_trigger_passes=cpu_pressure_trigger_passes,
+            cuda_pressure_trigger_passes=cuda_pressure_trigger_passes,
+            pressure_adjustment_attempt_passes=pressure_adjustment_attempt_passes,
+            pressure_adjustment_noop_passes=pressure_adjustment_noop_passes,
+            pressure_trigger_without_budget_passes=pressure_trigger_without_budget_passes,
+            host_budget_pressure_shrink_passes=host_budget_pressure_shrink_passes,
+            device_budget_pressure_shrink_passes=device_budget_pressure_shrink_passes,
+            items_pressure_fallback_shrink_passes=items_pressure_fallback_shrink_passes,
         )
 
     def _trim_records(self) -> None:
@@ -155,6 +213,22 @@ def format_runtime_history_summary(summary: RuntimeHistorySummary) -> str:
             f"pressure_growth_suppressed_passes={summary.pressure_growth_suppressed_passes}",
             f"peak_observed_pressure_ratio={_format_optional_ratio(summary.peak_observed_pressure_ratio)}",
             f"pressure_shrink_passes={summary.pressure_shrink_passes}",
+            f"cpu_pressure_high_passes={summary.cpu_pressure_high_passes}",
+            f"cuda_pressure_high_passes={summary.cuda_pressure_high_passes}",
+            f"cpu_pressure_trigger_passes={summary.cpu_pressure_trigger_passes}",
+            f"cuda_pressure_trigger_passes={summary.cuda_pressure_trigger_passes}",
+            "pressure_adjustment_attempt_passes="
+            f"{summary.pressure_adjustment_attempt_passes}",
+            "pressure_adjustment_noop_passes="
+            f"{summary.pressure_adjustment_noop_passes}",
+            "pressure_trigger_without_budget_passes="
+            f"{summary.pressure_trigger_without_budget_passes}",
+            "host_budget_pressure_shrink_passes="
+            f"{summary.host_budget_pressure_shrink_passes}",
+            "device_budget_pressure_shrink_passes="
+            f"{summary.device_budget_pressure_shrink_passes}",
+            "items_pressure_fallback_shrink_passes="
+            f"{summary.items_pressure_fallback_shrink_passes}",
             f"latest_budget_changed={latest_budget_changed}",
             f"latest_recovered_oom={latest_recovered_oom}",
             f"latest_pressure_assessed={latest_pressure_summary is not None}",

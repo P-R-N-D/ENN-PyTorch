@@ -327,6 +327,12 @@ def test_runtime_session_shrinks_after_sustained_provider_pressure() -> None:
     assert first.pass_summary.pressure_triggered_dimensions == ()
     assert first.pass_summary.pressure_selected_budget_fields == ()
     assert first.pass_summary.pressure_applied_shrink_factors == ()
+    assert first.history_summary.cpu_pressure_high_passes == 1
+    assert first.history_summary.cuda_pressure_high_passes == 0
+    assert first.history_summary.cpu_pressure_trigger_passes == 0
+    assert first.history_summary.cuda_pressure_trigger_passes == 0
+    assert first.history_summary.pressure_adjustment_attempt_passes == 0
+    assert first.history_summary.items_pressure_fallback_shrink_passes == 0
     assert second.pass_result.decision.next_budget == BatchBudget(max_items=6)
     assert second.pass_summary.budget_shrunk_by_pressure is True
     assert second.pass_summary.pressure_shrunk_budget_fields == (
@@ -342,6 +348,16 @@ def test_runtime_session_shrinks_after_sustained_provider_pressure() -> None:
     assert second.pass_summary.consecutive_cuda_pressure_passes == 0
     assert second.pass_summary.consecutive_high_pressure_passes == 0
     assert second.history_summary.pressure_shrink_passes == 1
+    assert second.history_summary.cpu_pressure_high_passes == 2
+    assert second.history_summary.cuda_pressure_high_passes == 0
+    assert second.history_summary.cpu_pressure_trigger_passes == 1
+    assert second.history_summary.cuda_pressure_trigger_passes == 0
+    assert second.history_summary.pressure_adjustment_attempt_passes == 1
+    assert second.history_summary.pressure_adjustment_noop_passes == 0
+    assert second.history_summary.pressure_trigger_without_budget_passes == 0
+    assert second.history_summary.host_budget_pressure_shrink_passes == 0
+    assert second.history_summary.device_budget_pressure_shrink_passes == 0
+    assert second.history_summary.items_pressure_fallback_shrink_passes == 1
 
 
 def test_runtime_session_keeps_completed_history_when_later_pass_raises() -> None:

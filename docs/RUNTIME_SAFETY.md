@@ -45,6 +45,13 @@ Use this document before running code that can allocate accelerator memory, writ
   `GovernorDecision.reason` to recover high dimensions, trigger dimensions,
   selected fields, or applied factors.
 - Keep OOM and retry-recovered OOM pressure-specific provenance tuples empty.
+- Recompute history provenance counters only from the currently retained
+  `RuntimePassSummary` window; trimming must remove every contribution from the
+  discarded summary.
+- Count dimension high/trigger events per dimension but count adjustment attempts,
+  full no-ops, and triggers without budgets at most once per pass. A partial
+  adjustment is not a full no-op. Do not infer structured provenance from
+  pressure ratios or OOM status when the provenance tuples are empty.
 - Record only fields whose values actually changed, and do not label minimum-bound no-ops as pressure shrink.
 - Keep yielded or retry-recovered OOM behavior unchanged: it uses the common `shrink_factor`, shrinks every configured budget field and leaves pressure-specific field metadata empty.
 - When orchestration is given fixed or provider-resolved `ResourceCapacity`, include samples from retry-consumed attempts as well as final results.
