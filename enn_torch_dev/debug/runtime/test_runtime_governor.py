@@ -92,16 +92,20 @@ def test_governor_policy_preserves_existing_positional_field_order() -> None:
 
     assert policy.max_device_bytes == 200
     assert policy.max_pressure_ratio_for_growth is None
-    assert field_names[-4:] == [
+    assert field_names[-6:] == [
         "min_cpu_pressure_ratio_for_shrink",
         "min_cuda_pressure_ratio_for_shrink",
         "cpu_shrink_after_pressure_passes",
         "cuda_shrink_after_pressure_passes",
+        "cpu_pressure_shrink_factor",
+        "cuda_pressure_shrink_factor",
     ]
     assert policy.min_cpu_pressure_ratio_for_shrink is None
     assert policy.min_cuda_pressure_ratio_for_shrink is None
     assert policy.cpu_shrink_after_pressure_passes is None
     assert policy.cuda_shrink_after_pressure_passes is None
+    assert policy.cpu_pressure_shrink_factor is None
+    assert policy.cuda_pressure_shrink_factor is None
 
 
 def test_governor_decision_appends_pressure_field_selection_for_compatibility() -> None:
@@ -267,6 +271,96 @@ def test_sustained_cpu_and_cuda_pressure_shrink_both_byte_budgets() -> None:
         "max_host_bytes",
         "max_device_bytes",
     )
+
+
+def test_pressure_shrink_factors_fall_back_to_common_factor() -> None:
+    governor = ConservativeRuntimeGovernor(
+        BatchBudget(max_items=8, max_host_bytes=100, max_device_bytes=200),
+        policy=GovernorPolicy(
+            shrink_factor=0.6,
+            min_pressure_ratio_for_shrink=0.9,
+            shrink_after_pressure_passes=1,
+        ),
+    )
+
+    decision = governor.observe_results(
+        [_result()],
+        pressure_summary=ResourcePressureSummary(
+            peak_cpu_rss_ratio=0.95,
+            peak_cuda_reserved_ratio=0.96,
+        ),
+    )
+
+    assert decision.next_budget == BatchBudget(
+        max_items=8, max_host_bytes=60, max_device_bytes=120
+    )
+    assert "triggered shrink factors: cpu=0.6, cuda=0.6" in decision.reason
+
+
+@pytest.mark.parametrize(
+    ("pressure", "policy_kwargs", "expected_budget", "factor_text"),
+    [
+        (
+            ResourcePressureSummary(peak_cpu_rss_ratio=0.95),
+            {"cpu_pressure_shrink_factor": 0.75},
+            BatchBudget(max_items=8, max_host_bytes=75, max_device_bytes=200),
+            "cpu=0.75",
+        ),
+        (
+            ResourcePressureSummary(peak_cuda_reserved_ratio=0.95),
+            {"cuda_pressure_shrink_factor": 0.4},
+            BatchBudget(max_items=8, max_host_bytes=100, max_device_bytes=80),
+            "cuda=0.4",
+        ),
+    ],
+)
+def test_dimension_pressure_factor_applies_to_matching_byte_budget(
+    pressure: ResourcePressureSummary,
+    policy_kwargs: dict[str, float],
+    expected_budget: BatchBudget,
+    factor_text: str,
+) -> None:
+    governor = ConservativeRuntimeGovernor(
+        BatchBudget(max_items=8, max_host_bytes=100, max_device_bytes=200),
+        policy=GovernorPolicy(
+            shrink_factor=0.5,
+            min_pressure_ratio_for_shrink=0.9,
+            shrink_after_pressure_passes=1,
+            **policy_kwargs,
+        ),
+    )
+
+    decision = governor.observe_results([_result()], pressure_summary=pressure)
+
+    assert decision.next_budget == expected_budget
+    assert f"triggered shrink factors: {factor_text}" in decision.reason
+
+
+def test_cpu_and_cuda_pressure_factors_apply_independently() -> None:
+    governor = ConservativeRuntimeGovernor(
+        BatchBudget(max_items=8, max_host_bytes=100, max_device_bytes=200),
+        policy=GovernorPolicy(
+            cpu_pressure_shrink_factor=0.75,
+            cuda_pressure_shrink_factor=0.4,
+            min_pressure_ratio_for_shrink=0.9,
+            shrink_after_pressure_passes=1,
+        ),
+    )
+
+    decision = governor.observe_results(
+        [_result()],
+        pressure_summary=ResourcePressureSummary(
+            peak_cpu_rss_ratio=0.95, peak_cuda_reserved_ratio=0.96
+        ),
+    )
+
+    assert decision.next_budget == BatchBudget(
+        max_items=8, max_host_bytes=75, max_device_bytes=80
+    )
+    assert decision.pressure_shrunk_budget_fields == (
+        "max_host_bytes", "max_device_bytes"
+    )
+    assert "triggered shrink factors: cpu=0.75, cuda=0.4" in decision.reason
 
 
 def test_dimension_threshold_override_can_activate_cpu_only() -> None:
@@ -698,6 +792,55 @@ def test_sustained_pressure_uses_items_only_without_matching_byte_budget(
     assert decision.pressure_shrunk_budget_fields == ("max_items",)
 
 
+@pytest.mark.parametrize(
+    ("pressure", "policy_kwargs", "expected_items"),
+    [
+        (ResourcePressureSummary(peak_cpu_rss_ratio=0.95), {"cpu_pressure_shrink_factor": 0.75}, 6),
+        (ResourcePressureSummary(peak_cuda_reserved_ratio=0.95), {"cuda_pressure_shrink_factor": 0.4}, 3),
+    ],
+)
+def test_dimension_pressure_factor_applies_to_items_fallback(
+    pressure: ResourcePressureSummary,
+    policy_kwargs: dict[str, float],
+    expected_items: int,
+) -> None:
+    governor = ConservativeRuntimeGovernor(
+        BatchBudget(max_items=8),
+        policy=GovernorPolicy(
+            min_pressure_ratio_for_shrink=0.9,
+            shrink_after_pressure_passes=1,
+            **policy_kwargs,
+        ),
+    )
+
+    decision = governor.observe_results([_result()], pressure_summary=pressure)
+
+    assert decision.next_budget == BatchBudget(max_items=expected_items)
+    assert decision.pressure_shrunk_budget_fields == ("max_items",)
+
+
+def test_dual_pressure_uses_stronger_factor_for_shared_items_fallback() -> None:
+    governor = ConservativeRuntimeGovernor(
+        BatchBudget(max_items=10),
+        policy=GovernorPolicy(
+            cpu_pressure_shrink_factor=0.75,
+            cuda_pressure_shrink_factor=0.4,
+            min_pressure_ratio_for_shrink=0.9,
+            shrink_after_pressure_passes=1,
+        ),
+    )
+
+    decision = governor.observe_results(
+        [_result()],
+        pressure_summary=ResourcePressureSummary(
+            peak_cpu_rss_ratio=0.95, peak_cuda_reserved_ratio=0.96
+        ),
+    )
+
+    assert decision.next_budget == BatchBudget(max_items=4)
+    assert decision.pressure_shrunk_budget_fields == ("max_items",)
+
+
 def test_cpu_pressure_uses_items_fallback_with_only_device_budget() -> None:
     governor = ConservativeRuntimeGovernor(
         BatchBudget(max_items=8, max_device_bytes=200),
@@ -792,6 +935,7 @@ def test_pressure_shrink_records_only_fields_that_actually_changed() -> None:
         BatchBudget(max_items=8, max_host_bytes=100, max_device_bytes=200),
         policy=GovernorPolicy(
             shrink_factor=0.5,
+            cpu_pressure_shrink_factor=0.75,
             min_host_bytes=100,
             min_pressure_ratio_for_shrink=0.9,
             shrink_after_pressure_passes=1,
@@ -833,6 +977,18 @@ def test_pressure_shrink_records_only_fields_that_actually_changed() -> None:
         {"cpu_shrink_after_pressure_passes": True},
         {"cuda_shrink_after_pressure_passes": 0},
         {"cuda_shrink_after_pressure_passes": True},
+        {"cpu_pressure_shrink_factor": 0},
+        {"cpu_pressure_shrink_factor": 1},
+        {"cpu_pressure_shrink_factor": 1.1},
+        {"cpu_pressure_shrink_factor": True},
+        {"cpu_pressure_shrink_factor": float("nan")},
+        {"cpu_pressure_shrink_factor": float("inf")},
+        {"cuda_pressure_shrink_factor": 0},
+        {"cuda_pressure_shrink_factor": 1},
+        {"cuda_pressure_shrink_factor": 1.1},
+        {"cuda_pressure_shrink_factor": True},
+        {"cuda_pressure_shrink_factor": float("nan")},
+        {"cuda_pressure_shrink_factor": float("inf")},
         {"max_pressure_ratio_for_growth": 0.9, "min_pressure_ratio_for_shrink": 0.8},
         {
             "max_pressure_ratio_for_growth": 0.9,
@@ -1025,6 +1181,39 @@ def test_oom_shrinks_all_configured_fields() -> None:
     assert decision.consecutive_successes == 0
     assert decision.consecutive_ooms == 1
     assert decision.pressure_shrunk_budget_fields == ()
+
+
+def test_oom_uses_common_shrink_factor_not_pressure_overrides() -> None:
+    governor = ConservativeRuntimeGovernor(
+        BatchBudget(max_items=10, max_host_bytes=100, max_device_bytes=200),
+        policy=GovernorPolicy(
+            shrink_factor=0.5,
+            cpu_pressure_shrink_factor=0.75,
+            cuda_pressure_shrink_factor=0.4,
+        ),
+    )
+
+    decision = governor.observe_results([_result(StepStatus.OOM_FAULT)])
+
+    assert decision.next_budget == BatchBudget(
+        max_items=5, max_host_bytes=50, max_device_bytes=100
+    )
+    assert decision.pressure_shrunk_budget_fields == ()
+    assert "triggered shrink factors" not in decision.reason
+
+    recovered_governor = ConservativeRuntimeGovernor(
+        BatchBudget(max_items=10, max_host_bytes=100, max_device_bytes=200),
+        policy=governor.policy,
+    )
+    recovered_decision = recovered_governor.observe_results(
+        [_result()], recovered_oom=True
+    )
+
+    assert recovered_decision.next_budget == BatchBudget(
+        max_items=5, max_host_bytes=50, max_device_bytes=100
+    )
+    assert recovered_decision.pressure_shrunk_budget_fields == ()
+    assert "triggered shrink factors" not in recovered_decision.reason
 
 
 def test_none_budget_fields_are_not_enabled_by_bounds() -> None:

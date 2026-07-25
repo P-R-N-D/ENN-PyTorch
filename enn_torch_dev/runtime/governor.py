@@ -45,6 +45,16 @@ def _validate_optional_positive_int(value: object, *, label: str) -> int | None:
     return _validate_positive_int(value, label=label)
 
 
+def _validate_optional_shrink_factor(
+    value: object,
+    *,
+    label: str,
+) -> float | None:
+    if value is None:
+        return None
+    return _validate_factor(value, label=label, lower=0.0, upper=1.0)
+
+
 def _validate_optional_pressure_ratio(
     value: object,
     *,
@@ -115,6 +125,8 @@ class GovernorPolicy:
     min_cuda_pressure_ratio_for_shrink: float | None = None
     cpu_shrink_after_pressure_passes: int | None = None
     cuda_shrink_after_pressure_passes: int | None = None
+    cpu_pressure_shrink_factor: float | None = None
+    cuda_pressure_shrink_factor: float | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(
@@ -202,6 +214,18 @@ class GovernorPolicy:
                 _validate_optional_positive_int(
                     getattr(self, field_name),
                     label=f"GovernorPolicy.{field_name}",
+                ),
+            )
+        for field_name in (
+            "cpu_pressure_shrink_factor",
+            "cuda_pressure_shrink_factor",
+        ):
+            object.__setattr__(
+                self,
+                field_name,
+                _validate_optional_shrink_factor(
+                    getattr(self, field_name),
+                    label=field_name,
                 ),
             )
         growth_limit = self.max_pressure_ratio_for_growth
@@ -467,6 +491,16 @@ class ConservativeRuntimeGovernor:
                 if self.policy.cuda_shrink_after_pressure_passes is not None
                 else self.policy.shrink_after_pressure_passes
             )
+            cpu_pressure_shrink_factor = (
+                self.policy.cpu_pressure_shrink_factor
+                if self.policy.cpu_pressure_shrink_factor is not None
+                else self.policy.shrink_factor
+            )
+            cuda_pressure_shrink_factor = (
+                self.policy.cuda_pressure_shrink_factor
+                if self.policy.cuda_pressure_shrink_factor is not None
+                else self.policy.shrink_factor
+            )
             cpu_pressure_high = False
             cuda_pressure_high = False
             if pressure_summary is not None:
@@ -522,6 +556,8 @@ class ConservativeRuntimeGovernor:
                         previous_budget,
                         cpu_pressure=cpu_pressure_triggered,
                         cuda_pressure=cuda_pressure_triggered,
+                        cpu_shrink_factor=cpu_pressure_shrink_factor,
+                        cuda_shrink_factor=cuda_pressure_shrink_factor,
                     )
                     budget_shrunk_by_pressure = bool(pressure_shrunk_budget_fields)
                     triggered_dimensions = tuple(
@@ -539,6 +575,7 @@ class ConservativeRuntimeGovernor:
                     dimension_text = ", ".join(triggered_dimensions)
                     triggered_ratios: list[str] = []
                     triggered_policies: list[str] = []
+                    triggered_factors: list[str] = []
                     if cpu_pressure_triggered:
                         cpu_ratio = pressure_summary.peak_cpu_rss_ratio
                         assert cpu_ratio is not None
@@ -547,6 +584,7 @@ class ConservativeRuntimeGovernor:
                         triggered_policies.append(
                             f"cpu(limit={cpu_shrink_limit:.6g}, required={cpu_required})"
                         )
+                        triggered_factors.append(f"cpu={cpu_pressure_shrink_factor:.6g}")
                     if cuda_pressure_triggered:
                         cuda_ratio = self._peak_cuda_pressure_ratio(pressure_summary)
                         assert cuda_ratio is not None
@@ -555,12 +593,15 @@ class ConservativeRuntimeGovernor:
                         triggered_policies.append(
                             f"cuda(limit={cuda_shrink_limit:.6g}, required={cuda_required})"
                         )
+                        triggered_factors.append(f"cuda={cuda_pressure_shrink_factor:.6g}")
                     ratio_text = ", ".join(triggered_ratios)
                     policy_text = ", ".join(triggered_policies)
+                    factor_text = ", ".join(triggered_factors)
                     reason_prefix = (
                         "pressure streak threshold reached; "
                         f"triggered dimensions: {dimension_text}; "
                         f"triggered policies: {policy_text}; "
+                        f"triggered shrink factors: {factor_text}; "
                         f"current triggered ratios: {ratio_text}; "
                     )
                     if budget_shrunk_by_pressure:
@@ -745,6 +786,8 @@ class ConservativeRuntimeGovernor:
         *,
         cpu_pressure: bool,
         cuda_pressure: bool,
+        cpu_shrink_factor: float,
+        cuda_shrink_factor: float,
     ) -> tuple[BatchBudget, tuple[str, ...], tuple[str, ...]]:
         selected_fields = self._pressure_budget_fields(
             budget,
@@ -759,7 +802,20 @@ class ConservativeRuntimeGovernor:
         for field_name in selected_fields:
             current = values[field_name]
             assert current is not None
-            adjusted = math.floor(current * self.policy.shrink_factor)
+            if field_name == "max_host_bytes":
+                factor = cpu_shrink_factor
+            elif field_name == "max_device_bytes":
+                factor = cuda_shrink_factor
+            else:
+                factor = min(
+                    factor
+                    for factor, triggered in (
+                        (cpu_shrink_factor, cpu_pressure),
+                        (cuda_shrink_factor, cuda_pressure),
+                    )
+                    if triggered
+                )
+            adjusted = math.floor(current * factor)
             adjusted = max(1, adjusted)
             adjusted = self._clamp(field_name, adjusted)
             values[field_name] = adjusted

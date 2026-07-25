@@ -164,10 +164,13 @@ The conservative governor then:
 - optionally shrinks the next-pass budget only after a configured sustained
   high-pressure streak, tracking CPU and CUDA persistence independently and
   selecting host bytes for CPU pressure and device bytes for CUDA pressure;
-- allows CPU and CUDA shrink thresholds and required pass counts to override the
-  common sustained-pressure policy independently;
+- allows CPU and CUDA shrink thresholds, required pass counts, and sustained-
+  pressure shrink factors to override the common policy independently;
+- applies each dimension's effective factor to its matching byte budget;
 - falls back to `max_items` only when no matching triggered byte budget is
-  configured;
+  configured, using the triggered dimension's factor or the smaller factor when
+  both dimensions share the fallback;
+- keeps yielded and retry-recovered OOM shrink on the common `shrink_factor`;
 - preserves an incomplete streak for one dimension when only the other dimension
   reaches its effective shrink threshold and required pass count;
 - applies configured minimum and maximum bounds.
@@ -213,7 +216,7 @@ It does not provide:
 - AutoGovernor or learned tuning;
 - automatic `ResourceMonitor` creation;
 - mid-pass capacity refresh or free-memory admission control;
-- per-dimension shrink factors or learned field weights;
+- learned field weights;
 - stable `enn_torch` API exposure.
 
 Use small synthetic inputs for baseline validation. Do not use this workflow as an
