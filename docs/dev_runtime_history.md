@@ -90,7 +90,10 @@ provenance from pressure ratios or OOM status when provenance tuples are empty.
 the original `RuntimePassResult` or `StepResult` objects. Since
 `RuntimePassSummary` is lightweight, the history does not retain `StepResult`,
 raw `ResourceSample`, `loss`, or `store` references through that append path.
-Pressure aggregation uses only scalar ratios from each retained summary.
+Pressure aggregation uses only scalar ratios and immutable structured provenance
+from each retained summary. That provenance includes high and triggered
+dimensions, selected budget fields, and fields that actually shrank; it does not
+require retaining any additional raw runtime objects.
 
 ## Relationship to Session
 

@@ -310,6 +310,38 @@ def test_history_does_not_infer_pressure_provenance_from_oom_passes() -> None:
     assert aggregate.device_budget_pressure_shrink_passes == 0
     assert aggregate.items_pressure_fallback_shrink_passes == 0
 
+
+def test_history_does_not_count_partial_adjustment_as_full_noop() -> None:
+    history = RuntimePassHistory(max_records=1)
+
+    aggregate = history.append_summary(
+        _summary(
+            StepStatus.SUCCESS,
+            budget_changed=True,
+            budget_shrunk_by_pressure=True,
+            pressure_high_dimensions=("cpu", "cuda"),
+            pressure_triggered_dimensions=("cpu", "cuda"),
+            pressure_selected_budget_fields=(
+                "max_host_bytes",
+                "max_device_bytes",
+            ),
+            pressure_shrunk_budget_fields=("max_device_bytes",),
+            pressure_applied_shrink_factors=(
+                ("max_host_bytes", 0.75),
+                ("max_device_bytes", 0.4),
+            ),
+        )
+    )
+
+    assert aggregate.pressure_adjustment_attempt_passes == 1
+    assert aggregate.pressure_adjustment_noop_passes == 0
+    assert aggregate.host_budget_pressure_shrink_passes == 0
+    assert aggregate.device_budget_pressure_shrink_passes == 1
+    assert aggregate.cpu_pressure_trigger_passes == 1
+    assert aggregate.cuda_pressure_trigger_passes == 1
+    assert aggregate.pressure_shrink_passes == 1
+
+
 def test_append_summary_updates_history_totals() -> None:
     history = RuntimePassHistory(max_records=10)
     first = _summary(StepStatus.SUCCESS, batch_size=2)
