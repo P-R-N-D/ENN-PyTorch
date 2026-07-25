@@ -49,6 +49,7 @@ or a success grow from decreasing one through clamping.
 `GovernorPolicy` validates static adjustment parameters when it is created:
 
 - `shrink_factor` must be finite and satisfy `0 < shrink_factor < 1`.
+- `cpu_pressure_shrink_factor` and `cuda_pressure_shrink_factor` must be `None` or finite and satisfy `0 < value < 1`; unset overrides fall back to `shrink_factor`.
 - `grow_factor` must be finite and satisfy `grow_factor > 1`.
 - `grow_after_successes` must be a positive integer.
 - `min_items`, `max_items`, `min_host_bytes`, `max_host_bytes`,
@@ -107,14 +108,18 @@ Decision priority is deliberately small and predictable:
    `min_pressure_ratio_for_shrink` value when configured.
    `cpu_shrink_after_pressure_passes` and
    `cuda_shrink_after_pressure_passes` override the common
-   `shrink_after_pressure_passes` value. A dimension with no effective threshold is
-   disabled. A ratio at or above an effective threshold increments only the
+   `shrink_after_pressure_passes` value.
+   `cpu_pressure_shrink_factor` and `cuda_pressure_shrink_factor` override the
+   common `shrink_factor` only for sustained-pressure adjustments. A dimension
+   with no effective threshold is disabled. A ratio at or above an effective threshold increments only the
    matching pressure streak, suppresses growth, and shrinks the next budget only
    when that dimension reaches its effective required pass count.
    CPU pressure selects `max_host_bytes`; any CUDA allocated/reserved/max ratio
-   selects `max_device_bytes`. If no matching byte budget is configured,
-   `max_items` is the fallback. When at least one matching byte budget is
-   configured, `max_items` remains unchanged. A low or unknown observation resets
+   selects `max_device_bytes`. Each matching byte budget uses its dimension's
+   effective shrink factor. If no matching byte budget is configured, `max_items`
+   is the fallback and uses the triggered dimension's factor; when both dimensions
+   trigger the shared fallback, the smaller factor is used. When at least one
+   matching byte budget is configured, `max_items` remains unchanged. A low or unknown observation resets
    only that dimension's streak; a fully unavailable summary, empty pass, fault,
    yielded OOM, or retry-recovered OOM resets both dimension streaks.
    A dimension that reaches the threshold resets after its shrink decision without
@@ -180,15 +185,18 @@ byte budget, while every CUDA pressure ratio maps to the device byte budget.
 `max_items` is used only when none of the triggered dimensions has a configured
 matching byte budget. OOM and retry-recovered OOM continue to shrink every
 configured budget field and do not populate the pressure-specific field tuple.
-CPU and CUDA persistence, effective thresholds, and required pass counts are
+OOM paths always use the common `shrink_factor`; pressure-specific overrides apply
+only to sustained-pressure decisions.
+CPU and CUDA persistence, effective thresholds, required pass counts, and
+pressure shrink factors are
 resolved independently. An unset dimension override falls back to the common
 policy value; when neither a dimension override nor the common threshold is set,
 that dimension's sustained-pressure shrink is disabled. Alternating CPU-only and
 CUDA-only high-pressure passes cannot combine into a sustained-pressure shrink.
 When both dimensions are continuously high, each can reach its own threshold and
 required pass count independently.
-Triggered decision reasons report only the current ratios and effective policy
-values for dimensions that reached the threshold; they do not describe the
+Triggered decision reasons report only the current ratios, effective threshold
+policies, and effective pressure shrink factors for dimensions that reached the threshold; they do not describe the
 summary-wide maximum ratio as having persisted for the full streak.
 
 ## Relationship to Orchestration
@@ -206,7 +214,7 @@ execute models, discover capacity, or construct a pressure summary.
 - Full AutoGovernor behavior.
 - Learned or model-specific tuning.
 - Persistent calibration caches or history databases.
-- Per-dimension shrink factors or learned field weights.
+- Learned field weights.
 - Automatic pressure-summary construction inside the governor.
 - Automatic capacity discovery or refresh inside the orchestrator.
 - `ModelCostProbe`-driven policy changes.

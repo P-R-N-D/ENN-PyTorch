@@ -300,6 +300,7 @@ def test_runtime_session_shrinks_after_sustained_provider_pressure() -> None:
         BatchBudget(max_items=8),
         policy=GovernorPolicy(
             shrink_factor=0.5,
+            cpu_pressure_shrink_factor=0.75,
             grow_after_successes=1,
             max_pressure_ratio_for_growth=0.8,
             min_cpu_pressure_ratio_for_shrink=0.9,
@@ -322,7 +323,7 @@ def test_runtime_session_shrinks_after_sustained_provider_pressure() -> None:
     assert first.pass_summary.consecutive_cpu_pressure_passes == 1
     assert first.pass_summary.consecutive_cuda_pressure_passes == 0
     assert first.pass_summary.budget_shrunk_by_pressure is False
-    assert second.pass_result.decision.next_budget == BatchBudget(max_items=4)
+    assert second.pass_result.decision.next_budget == BatchBudget(max_items=6)
     assert second.pass_summary.budget_shrunk_by_pressure is True
     assert second.pass_summary.pressure_shrunk_budget_fields == (
         "max_items",
