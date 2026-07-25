@@ -34,6 +34,11 @@ def _decision(
     pressure_summary: ResourcePressureSummary | None = None,
     growth_suppressed_by_pressure: bool = False,
     budget_shrunk_by_pressure: bool = False,
+    pressure_shrunk_budget_fields: tuple[str, ...] = (),
+    pressure_high_dimensions: tuple[str, ...] = (),
+    pressure_triggered_dimensions: tuple[str, ...] = (),
+    pressure_selected_budget_fields: tuple[str, ...] = (),
+    pressure_applied_shrink_factors: tuple[tuple[str, float], ...] = (),
 ) -> GovernorDecision:
     previous = previous_budget or BatchBudget(max_items=4)
     return GovernorDecision(
@@ -46,6 +51,11 @@ def _decision(
         pressure_summary=pressure_summary,
         growth_suppressed_by_pressure=growth_suppressed_by_pressure,
         budget_shrunk_by_pressure=budget_shrunk_by_pressure,
+        pressure_shrunk_budget_fields=pressure_shrunk_budget_fields,
+        pressure_high_dimensions=pressure_high_dimensions,
+        pressure_triggered_dimensions=pressure_triggered_dimensions,
+        pressure_selected_budget_fields=pressure_selected_budget_fields,
+        pressure_applied_shrink_factors=pressure_applied_shrink_factors,
     )
 
 
@@ -88,6 +98,11 @@ def _summary(
     pressure_summary: ResourcePressureSummary | None = None,
     growth_suppressed_by_pressure: bool = False,
     budget_shrunk_by_pressure: bool = False,
+    pressure_shrunk_budget_fields: tuple[str, ...] = (),
+    pressure_high_dimensions: tuple[str, ...] = (),
+    pressure_triggered_dimensions: tuple[str, ...] = (),
+    pressure_selected_budget_fields: tuple[str, ...] = (),
+    pressure_applied_shrink_factors: tuple[tuple[str, float], ...] = (),
 ) -> RuntimePassSummary:
     results = tuple(_result(status, batch_size=batch_size) for status in statuses)
     previous = BatchBudget(max_items=4)
@@ -100,6 +115,11 @@ def _summary(
         pressure_summary=pressure_summary,
         growth_suppressed_by_pressure=growth_suppressed_by_pressure,
         budget_shrunk_by_pressure=budget_shrunk_by_pressure,
+        pressure_shrunk_budget_fields=pressure_shrunk_budget_fields,
+        pressure_high_dimensions=pressure_high_dimensions,
+        pressure_triggered_dimensions=pressure_triggered_dimensions,
+        pressure_selected_budget_fields=pressure_selected_budget_fields,
+        pressure_applied_shrink_factors=pressure_applied_shrink_factors,
     )
     return summarize_runtime_pass(
         _pass_result(results, decision=decision, recovered_oom=recovered_oom)
@@ -113,11 +133,21 @@ def _field_values(instance: object) -> list[object]:
 def test_runtime_history_summary_appends_pressure_fields_for_compatibility() -> None:
     field_names = [field.name for field in fields(RuntimeHistorySummary)]
 
-    assert field_names[-4:] == [
+    assert field_names[-14:] == [
         "pressure_assessed_passes",
         "pressure_growth_suppressed_passes",
         "peak_observed_pressure_ratio",
         "pressure_shrink_passes",
+        "cpu_pressure_high_passes",
+        "cuda_pressure_high_passes",
+        "cpu_pressure_trigger_passes",
+        "cuda_pressure_trigger_passes",
+        "pressure_adjustment_attempt_passes",
+        "pressure_adjustment_noop_passes",
+        "pressure_trigger_without_budget_passes",
+        "host_budget_pressure_shrink_passes",
+        "device_budget_pressure_shrink_passes",
+        "items_pressure_fallback_shrink_passes",
     ]
 
 
@@ -139,6 +169,16 @@ def test_empty_history_summary() -> None:
     assert summary.pressure_growth_suppressed_passes == 0
     assert summary.peak_observed_pressure_ratio is None
     assert summary.pressure_shrink_passes == 0
+    assert summary.cpu_pressure_high_passes == 0
+    assert summary.cuda_pressure_high_passes == 0
+    assert summary.cpu_pressure_trigger_passes == 0
+    assert summary.cuda_pressure_trigger_passes == 0
+    assert summary.pressure_adjustment_attempt_passes == 0
+    assert summary.pressure_adjustment_noop_passes == 0
+    assert summary.pressure_trigger_without_budget_passes == 0
+    assert summary.host_budget_pressure_shrink_passes == 0
+    assert summary.device_budget_pressure_shrink_passes == 0
+    assert summary.items_pressure_fallback_shrink_passes == 0
     assert summary.latest_summary is None
     assert history.records == ()
 
@@ -166,6 +206,110 @@ def test_history_counts_actual_pressure_shrink_passes() -> None:
     assert "pressure_shrink_passes=1" in format_runtime_history_summary(aggregate)
 
 
+def test_history_aggregates_structured_pressure_provenance() -> None:
+    history = RuntimePassHistory(max_records=10)
+    history.append_summary(_summary(StepStatus.SUCCESS, pressure_high_dimensions=("cpu",)))
+    history.append_summary(
+        _summary(
+            StepStatus.SUCCESS,
+            pressure_high_dimensions=("cuda",),
+            pressure_triggered_dimensions=("cuda",),
+        )
+    )
+    history.append_summary(
+        _summary(
+            StepStatus.SUCCESS,
+            pressure_high_dimensions=("cpu",),
+            pressure_triggered_dimensions=("cpu",),
+            pressure_selected_budget_fields=("max_host_bytes",),
+            pressure_applied_shrink_factors=(("max_host_bytes", 0.75),),
+        )
+    )
+    history.append_summary(
+        _summary(
+            StepStatus.SUCCESS,
+            budget_changed=True,
+            budget_shrunk_by_pressure=True,
+            pressure_shrunk_budget_fields=("max_host_bytes", "max_device_bytes"),
+            pressure_high_dimensions=("cpu", "cuda"),
+            pressure_triggered_dimensions=("cpu", "cuda"),
+            pressure_selected_budget_fields=("max_host_bytes", "max_device_bytes"),
+            pressure_applied_shrink_factors=(
+                ("max_host_bytes", 0.75),
+                ("max_device_bytes", 0.4),
+            ),
+        )
+    )
+    aggregate = history.append_summary(
+        _summary(
+            StepStatus.SUCCESS,
+            budget_changed=True,
+            budget_shrunk_by_pressure=True,
+            pressure_shrunk_budget_fields=("max_items",),
+            pressure_high_dimensions=("cpu", "cuda"),
+            pressure_triggered_dimensions=("cpu", "cuda"),
+            pressure_selected_budget_fields=("max_items",),
+            pressure_applied_shrink_factors=(("max_items", 0.4),),
+        )
+    )
+
+    assert aggregate.cpu_pressure_high_passes == 4
+    assert aggregate.cuda_pressure_high_passes == 3
+    assert aggregate.cpu_pressure_trigger_passes == 3
+    assert aggregate.cuda_pressure_trigger_passes == 3
+    assert aggregate.pressure_adjustment_attempt_passes == 3
+    assert aggregate.pressure_adjustment_noop_passes == 1
+    assert aggregate.pressure_trigger_without_budget_passes == 1
+    assert aggregate.host_budget_pressure_shrink_passes == 1
+    assert aggregate.device_budget_pressure_shrink_passes == 1
+    assert aggregate.items_pressure_fallback_shrink_passes == 1
+    assert aggregate.pressure_shrink_passes == 2
+
+    text = format_runtime_history_summary(aggregate)
+    for expected in (
+        "cpu_pressure_high_passes=4",
+        "cuda_pressure_high_passes=3",
+        "cpu_pressure_trigger_passes=3",
+        "cuda_pressure_trigger_passes=3",
+        "pressure_adjustment_attempt_passes=3",
+        "pressure_adjustment_noop_passes=1",
+        "pressure_trigger_without_budget_passes=1",
+        "host_budget_pressure_shrink_passes=1",
+        "device_budget_pressure_shrink_passes=1",
+        "items_pressure_fallback_shrink_passes=1",
+    ):
+        assert expected in text
+
+
+def test_history_does_not_infer_pressure_provenance_from_oom_passes() -> None:
+    history = RuntimePassHistory(max_records=2)
+    history.append_summary(
+        _summary(
+            StepStatus.OOM_FAULT,
+            budget_changed=True,
+            pressure_summary=ResourcePressureSummary(peak_cpu_rss_ratio=1.1),
+        )
+    )
+    aggregate = history.append_summary(
+        _summary(
+            StepStatus.SUCCESS,
+            recovered_oom=True,
+            budget_changed=True,
+            pressure_summary=ResourcePressureSummary(peak_cuda_reserved_ratio=1.2),
+        )
+    )
+
+    assert aggregate.cpu_pressure_high_passes == 0
+    assert aggregate.cuda_pressure_high_passes == 0
+    assert aggregate.cpu_pressure_trigger_passes == 0
+    assert aggregate.cuda_pressure_trigger_passes == 0
+    assert aggregate.pressure_adjustment_attempt_passes == 0
+    assert aggregate.pressure_adjustment_noop_passes == 0
+    assert aggregate.pressure_trigger_without_budget_passes == 0
+    assert aggregate.host_budget_pressure_shrink_passes == 0
+    assert aggregate.device_budget_pressure_shrink_passes == 0
+    assert aggregate.items_pressure_fallback_shrink_passes == 0
+
 def test_append_summary_updates_history_totals() -> None:
     history = RuntimePassHistory(max_records=10)
     first = _summary(StepStatus.SUCCESS, batch_size=2)
@@ -190,7 +334,6 @@ def test_append_pass_result_summarizes_without_storing_step_results() -> None:
     assert aggregate.total_passes == 1
     assert aggregate.total_batch_size == 3
     assert history.records == (summarize_runtime_pass(pass_result),)
-
 
 def test_history_aggregates_multiple_status_counts() -> None:
     history = RuntimePassHistory(max_records=10)
@@ -221,7 +364,6 @@ def test_history_counts_recovered_oom_passes_separately_from_yielded_ooms() -> N
         StepStatus.SUCCESS: 1,
         StepStatus.OOM_FAULT: 1,
     }
-
 
 def test_history_aggregates_pressure_feedback() -> None:
     history = RuntimePassHistory(max_records=10)
@@ -278,6 +420,53 @@ def test_history_pressure_aggregation_respects_retained_window() -> None:
     assert aggregate.pressure_growth_suppressed_passes == 0
     assert aggregate.peak_observed_pressure_ratio == pytest.approx(0.4)
 
+
+def test_history_structured_provenance_respects_retained_window() -> None:
+    history = RuntimePassHistory(max_records=2)
+    first = _summary(
+        StepStatus.SUCCESS,
+        budget_changed=True,
+        budget_shrunk_by_pressure=True,
+        pressure_shrunk_budget_fields=("max_host_bytes",),
+        pressure_high_dimensions=("cpu",),
+        pressure_triggered_dimensions=("cpu",),
+        pressure_selected_budget_fields=("max_host_bytes",),
+        pressure_applied_shrink_factors=(("max_host_bytes", 0.75),),
+    )
+    second = _summary(
+        StepStatus.SUCCESS,
+        pressure_high_dimensions=("cuda",),
+        pressure_triggered_dimensions=("cuda",),
+        pressure_selected_budget_fields=("max_device_bytes",),
+        pressure_applied_shrink_factors=(("max_device_bytes", 0.4),),
+    )
+    third = _summary(
+        StepStatus.SUCCESS,
+        budget_changed=True,
+        budget_shrunk_by_pressure=True,
+        pressure_shrunk_budget_fields=("max_items",),
+        pressure_high_dimensions=("cpu", "cuda"),
+        pressure_triggered_dimensions=("cpu", "cuda"),
+        pressure_selected_budget_fields=("max_items",),
+        pressure_applied_shrink_factors=(("max_items", 0.4),),
+    )
+
+    history.append_summary(first)
+    history.append_summary(second)
+    aggregate = history.append_summary(third)
+
+    assert history.records == (second, third)
+    assert aggregate.cpu_pressure_high_passes == 1
+    assert aggregate.cuda_pressure_high_passes == 2
+    assert aggregate.cpu_pressure_trigger_passes == 1
+    assert aggregate.cuda_pressure_trigger_passes == 2
+    assert aggregate.pressure_adjustment_attempt_passes == 2
+    assert aggregate.pressure_adjustment_noop_passes == 1
+    assert aggregate.pressure_trigger_without_budget_passes == 0
+    assert aggregate.host_budget_pressure_shrink_passes == 0
+    assert aggregate.device_budget_pressure_shrink_passes == 0
+    assert aggregate.items_pressure_fallback_shrink_passes == 1
+    assert aggregate.pressure_shrink_passes == 1
 
 def test_history_tracks_latest_summary() -> None:
     history = RuntimePassHistory(max_records=10)

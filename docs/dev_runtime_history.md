@@ -60,12 +60,29 @@ is not a live mutable view of the history internals.
 - pressure-growth-suppressed pass count;
 - highest known pressure ratio across retained summaries;
 - count of retained passes whose budget actually shrank because of sustained pressure;
+- CPU and CUDA high-pressure pass counts;
+- CPU and CUDA trigger pass counts;
+- pressure adjustment-attempt pass count, including minimum-bound no-ops;
+- full pressure adjustment no-op pass count;
+- trigger-without-matching-budget pass count;
+- actual host-byte, device-byte, and `max_items` fallback shrink pass counts;
 - latest retained `RuntimePassSummary`, or `None` for an empty history.
 
 `format_runtime_history_summary(summary)` returns stable human-readable text for
-runtime history inspection, including retained-window pressure counts, peak
-ratio, and latest-pass pressure state. It is not a stable machine interchange
-format.
+runtime history inspection, including retained-window pressure counts,
+dimension-specific high/trigger counts, attempted/no-op adjustment counts,
+field-specific actual shrink counts, peak ratio, and latest-pass pressure state.
+It is not a stable machine interchange format.
+
+Every aggregate is recomputed only from the currently retained summaries. When
+`max_records` trimming removes an older summary, that summary no longer
+contributes to any dimension, attempt, no-op, trigger-without-budget, or
+field-specific shrink counter. A pass can increment both CPU and CUDA dimension
+counters, but each pass increments the adjustment-attempt, full-no-op, and
+trigger-without-budget counters at most once. A selected pass with no actually
+changed field is a full adjustment no-op; a pass with at least one changed
+selected field is not counted as a no-op. History does not infer structured
+provenance from pressure ratios or OOM status when provenance tuples are empty.
 
 ## Reference Safety
 

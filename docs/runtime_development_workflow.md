@@ -188,10 +188,15 @@ objects in `RuntimePassHistory`, which requires a positive `max_records` bound.
 Pass summaries expose scalar pressure ratios, growth-suppression decisions, and
 sustained-pressure shrink feedback. They also expose structured high/triggered
 dimensions, selected adjustment fields, field-level applied factors, and actual
-changed fields without requiring `decision_reason` parsing. History aggregation is
-unchanged and continues to aggregate pressure-assessed,
-pressure-suppressed, and actual pressure-shrink pass counts plus the highest known
-ratio only within the currently retained summary window. Each pass
+changed fields without requiring `decision_reason` parsing. History aggregation
+uses that structured provenance to count retained CPU/CUDA high and trigger
+passes, adjustment attempts, full no-ops, triggers without matching budgets, and
+actual host/device/items shrink passes. CPU and CUDA can each contribute for one
+pass, while attempt/no-op/trigger-without-budget counts increment at most once per
+pass; a partial change is not a full no-op. Existing pressure-assessed,
+pressure-suppressed, actual pressure-shrink, and peak-ratio aggregates remain. All
+counts are recomputed only within the currently retained summary window, and OOM
+status or ratios never substitute for empty structured provenance. Each pass
 summary also records the scalar capacity used for normalization. Raw
 `ResourceSample` records are not retained by summary or history.
 
