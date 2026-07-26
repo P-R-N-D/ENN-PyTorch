@@ -32,6 +32,7 @@ def test_model_footprint_counts_parameters_and_bytes() -> None:
     assert footprint.total_model_bytes == 8 * 4
     assert footprint.parameters_by_dtype == {"float32": 8}
     assert footprint.bytes_by_dtype == {"float32": 8 * 4}
+    assert footprint.bytes_by_device == {"cpu": 8 * 4}
 
 
 def test_model_footprint_includes_buffers() -> None:
@@ -44,6 +45,7 @@ def test_model_footprint_includes_buffers() -> None:
     assert footprint.buffer_bytes == 4 * 4
     assert footprint.total_model_bytes == (8 + 4) * 4
     assert footprint.buffers_by_dtype == {"float32": 4}
+    assert footprint.bytes_by_device == {"cpu": (8 + 4) * 4}
 
 
 def test_model_footprint_separates_trainable_and_frozen_parameters() -> None:
@@ -104,6 +106,7 @@ def test_optimizer_footprint_handles_empty_state() -> None:
     assert footprint.param_group_count == 1
     assert footprint.state_tensor_count == 0
     assert footprint.state_bytes == 0
+    assert footprint.bytes_by_device == {}
 
 
 def test_optimizer_footprint_counts_state_after_step() -> None:
@@ -120,6 +123,7 @@ def test_optimizer_footprint_counts_state_after_step() -> None:
     assert footprint.state_tensor_count > 0
     assert footprint.state_bytes > 0
     assert footprint.bytes_by_dtype
+    assert footprint.bytes_by_device == {"cpu": footprint.state_bytes}
 
 
 def test_footprint_rejects_invalid_inputs() -> None:
@@ -184,6 +188,7 @@ def test_optimizer_footprint_counts_nested_state_tensors() -> None:
     assert footprint.state_bytes == (2 * 4) + (3 * 8)
     assert footprint.bytes_by_dtype == {"float32": 2 * 4, "float64": 3 * 8}
     assert footprint.tensors_by_dtype == {"float32": 1, "float64": 1}
+    assert footprint.bytes_by_device == {"cpu": footprint.state_bytes}
 
 
 def test_optimizer_footprint_counts_aliased_state_storage_once() -> None:
@@ -202,3 +207,4 @@ def test_optimizer_footprint_counts_aliased_state_storage_once() -> None:
     assert footprint.state_bytes == 4 * 4
     assert footprint.bytes_by_dtype == {"float32": 4 * 4}
     assert footprint.tensors_by_dtype == {"float32": 1}
+    assert footprint.bytes_by_device == {"cpu": footprint.state_bytes}

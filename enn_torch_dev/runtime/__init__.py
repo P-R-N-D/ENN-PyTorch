@@ -1,6 +1,12 @@
 from __future__ import annotations
 
 from .batching import BatchBudget, BatchBudgetExceeded, BudgetedBatcher
+from .budget_recommendation import (
+    BatchBudgetRecommendation,
+    BatchBudgetRecommendationError,
+    InitialBatchBudgetPolicy,
+    recommend_initial_batch_budget,
+)
 from .capacity_provider import ResourceCapacityProvider
 from .cost import (
     DataCost,
@@ -44,6 +50,8 @@ from .summary import (
 __all__ = [
     "BatchBudget",
     "BatchBudgetExceeded",
+    "BatchBudgetRecommendation",
+    "BatchBudgetRecommendationError",
     "BudgetedBatcher",
     "DataCost",
     "ConservativeRuntimeGovernor",
@@ -55,6 +63,7 @@ __all__ = [
     "ModelCostProbe",
     "GovernorDecision",
     "GovernorPolicy",
+    "InitialBatchBudgetPolicy",
     "OptimizerFootprint",
     "PlainLoader",
     "ResourceCapacity",
@@ -79,6 +88,7 @@ __all__ = [
     "StepStatus",
     "TensorCost",
     "format_runtime_history_summary",
+    "recommend_initial_batch_budget",
     "assess_resource_pressure",
     "format_runtime_pass_summary",
     "summarize_runtime_pass",

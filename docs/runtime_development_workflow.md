@@ -9,6 +9,8 @@ the stable `enn_torch` namespace.
 ## Supported flow
 
 ```text
+static footprints + reference BatchCost + ResourceCapacity
+  -> optional recommend_initial_batch_budget
 finite KVBatch pass source
   -> BudgetedBatcher
   -> RuntimeRetryRunner
@@ -71,6 +73,43 @@ session = ConservativeRuntimeSession(
 for record in session.run_passes(pass_sources):
     print(record.pass_index, record.pass_summary)
 ```
+
+## Optional initial budget recommendation
+
+Use `recommend_initial_batch_budget(...)` when the first governor budget should be
+derived from known static facts instead of supplied manually:
+
+```python
+from enn_torch_dev.runtime import (
+    InitialBatchBudgetPolicy,
+    ModelFootprint,
+    OptimizerFootprint,
+    ResourceCapacity,
+    recommend_initial_batch_budget,
+)
+
+recommendation = recommend_initial_batch_budget(
+    ResourceCapacity(cpu_total_bytes=host_bytes),
+    reference_batch_cost,
+    model_footprint=ModelFootprint.from_module(model),
+    optimizer_footprint=OptimizerFootprint.from_optimizer(optimizer),
+    policy=InitialBatchBudgetPolicy(
+        max_items=32,
+        fallback_max_items=1,
+    ),
+)
+
+governor = ConservativeRuntimeGovernor(recommendation.recommended_budget)
+```
+
+The helper is deterministic and side-effect free. It does not execute the model,
+consume a source, mutate governor or history state, or decide whether a pass is
+admissible. Model and optimizer footprints retain device-resolved byte maps so
+CPU and the configured CUDA device are accounted independently. Unknown capacity
+or cost remains unknown; an explicit `fallback_max_items` is required when a
+finite limit cannot otherwise be derived. See
+[`dev_initial_batch_budget.md`](dev_initial_batch_budget.md) for formulas and
+boundaries.
 
 ## Optional pressure-aware composition
 
@@ -224,6 +263,7 @@ It does not provide:
 - AutoGovernor or learned tuning;
 - automatic `ResourceMonitor` creation;
 - mid-pass capacity refresh or free-memory admission control;
+- proof that an initial recommendation is safe for unobserved activation or allocator costs;
 - learned field weights;
 - stable `enn_torch` API exposure.
 

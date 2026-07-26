@@ -394,13 +394,17 @@ def test_runtime_session_keeps_completed_history_when_later_pass_raises() -> Non
 
 def test_runtime_development_api_is_exported_without_stable_namespace_leak() -> None:
     development_names = {
+        "BatchBudgetRecommendation",
+        "BatchBudgetRecommendationError",
         "ConservativeRuntimeGovernor",
         "ConservativeRuntimeOrchestrator",
         "ConservativeRuntimeSession",
+        "InitialBatchBudgetPolicy",
         "RuntimePassHistory",
         "RuntimePassResult",
         "RuntimePassSummary",
         "RuntimeSessionRecord",
+        "recommend_initial_batch_budget",
         "summarize_runtime_pass",
     }
 

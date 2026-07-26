@@ -80,6 +80,7 @@ class ModelFootprint:
     bytes_by_dtype: dict[str, int] = field(default_factory=dict)
     parameters_by_dtype: dict[str, int] = field(default_factory=dict)
     buffers_by_dtype: dict[str, int] = field(default_factory=dict)
+    bytes_by_device: dict[str, int] = field(default_factory=dict)
 
     @classmethod
     def from_module(cls, module: nn.Module) -> "ModelFootprint":
@@ -95,6 +96,7 @@ class ModelFootprint:
         bytes_by_dtype: dict[str, int] = {}
         parameters_by_dtype: dict[str, int] = {}
         buffers_by_dtype: dict[str, int] = {}
+        bytes_by_device: dict[str, int] = {}
 
         for _name, parameter in _unique_named_tensors(
             module.named_parameters(recurse=True)
@@ -106,6 +108,7 @@ class ModelFootprint:
             parameter_bytes += nbytes
             _add_count(parameters_by_dtype, dtype_key, count)
             _add_count(bytes_by_dtype, dtype_key, nbytes)
+            _add_count(bytes_by_device, str(parameter.device), nbytes)
             if parameter.requires_grad:
                 trainable_parameter_count += count
                 trainable_parameter_bytes += nbytes
@@ -118,6 +121,7 @@ class ModelFootprint:
             buffer_bytes += nbytes
             _add_count(buffers_by_dtype, dtype_key, count)
             _add_count(bytes_by_dtype, dtype_key, nbytes)
+            _add_count(bytes_by_device, str(buffer.device), nbytes)
 
         return cls(
             parameter_count=parameter_count,
@@ -130,6 +134,7 @@ class ModelFootprint:
             bytes_by_dtype=dict(sorted(bytes_by_dtype.items())),
             parameters_by_dtype=dict(sorted(parameters_by_dtype.items())),
             buffers_by_dtype=dict(sorted(buffers_by_dtype.items())),
+            bytes_by_device=dict(sorted(bytes_by_device.items())),
         )
 
 
@@ -140,6 +145,7 @@ class OptimizerFootprint:
     param_group_count: int
     bytes_by_dtype: dict[str, int] = field(default_factory=dict)
     tensors_by_dtype: dict[str, int] = field(default_factory=dict)
+    bytes_by_device: dict[str, int] = field(default_factory=dict)
 
     @classmethod
     def from_optimizer(cls, optimizer: torch.optim.Optimizer) -> "OptimizerFootprint":
@@ -152,6 +158,7 @@ class OptimizerFootprint:
         state_bytes = 0
         bytes_by_dtype: dict[str, int] = {}
         tensors_by_dtype: dict[str, int] = {}
+        bytes_by_device: dict[str, int] = {}
         seen_tensors: set[tuple[str, int] | tuple[str, int, int]] = set()
         seen_containers: set[int] = set()
 
@@ -167,6 +174,7 @@ class OptimizerFootprint:
                 state_bytes += nbytes
                 _add_count(bytes_by_dtype, dtype_key, nbytes)
                 _add_count(tensors_by_dtype, dtype_key, 1)
+                _add_count(bytes_by_device, str(value.device), nbytes)
 
         return cls(
             state_tensor_count=state_tensor_count,
@@ -174,4 +182,5 @@ class OptimizerFootprint:
             param_group_count=len(optimizer.param_groups),
             bytes_by_dtype=dict(sorted(bytes_by_dtype.items())),
             tensors_by_dtype=dict(sorted(tensors_by_dtype.items())),
+            bytes_by_device=dict(sorted(bytes_by_device.items())),
         )
