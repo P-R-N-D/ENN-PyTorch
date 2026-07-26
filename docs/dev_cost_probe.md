@@ -99,10 +99,16 @@ Recorded values include:
 - total CUDA reserved delta;
 - total CUDA max allocated delta;
 - total CUDA max reserved delta;
-- per-phase resource deltas.
+- per-phase resource deltas;
+- one concrete `cuda_device_index` only when every CUDA-bearing sample provides
+  the same bool-excluding, non-negative integer device index.
 
 If a field is unavailable in either endpoint sample, the corresponding delta is
-`None`.
+`None`. CUDA deltas are computed only when both endpoints provide the same
+concrete device index; `None == None` is not treated as a device match. If any
+CUDA-bearing sample has a missing or invalid index, or samples identify different
+devices, `ModelCost.cuda_device_index` is `None`. The probe never substitutes the
+current CUDA device for missing or invalid provenance.
 
 ## Out of Scope
 
@@ -132,7 +138,7 @@ python -m pytest enn_torch_dev/debug -q
 
 ## Follow-up
 
-`BudgetedBatcher` now consumes `BatchCost` and `DataCostProbe` observations as a
-static budget gate over `KVBatch` streams. The next runtime-facing slice should
-add an OOM retry runner that can use budgeted splitting and `RuntimeStep` fault
-classification without moving execution policy into the cost probe layer.
+`ObservedCostCalibrator` now consumes completed `ModelCost` records and reduces
+successful observations to a bounded per-item envelope without retaining raw
+`StepResult` or `ResourceSample` objects. Persistent calibration caches and
+automatic admission remain outside the cost probe layer.

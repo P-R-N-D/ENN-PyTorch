@@ -93,8 +93,8 @@ reserve, and known static tensor footprints have been removed.
 The static recommendation does not estimate unobserved activations, allocator
 fragmentation, framework overhead, asynchronous transfer buffers, or future
 optimizer state that has not yet been materialized. It is not proof that a pass
-is admissible. A separate pre-pass admission boundary and observed-cost
-calibration remain outside this slice.
+is admissible. Bounded observed-cost calibration is available separately through
+`ObservedCostCalibrator`; pre-pass admission remains outside this slice.
 
 ## Validation
 
