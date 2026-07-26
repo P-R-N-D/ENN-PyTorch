@@ -47,9 +47,11 @@ Do not defer required documentation updates to a follow-up task. Do not edit unr
 - Confirm blocked attempts do not call the runtime step, do not become a
   `StepStatus`, and do not update governor state. Document that earlier candidates
   in the same pass may already have executed before a later block.
-- Confirm optimizer passthrough preserves retry restrictions, completed pass
-  results retain only immutable assessments, and stable `enn_torch` exports remain
-  unchanged.
+- Confirm optimizer passthrough preserves retry restrictions and completed
+  `RuntimePassResult.admission_assessments` retains only immutable assessments.
+  Separately confirm that a block exception's custom payload stores only its
+  assessment; do not confuse this with the exception traceback's transitive frame
+  references. Confirm stable `enn_torch` exports remain unchanged.
 
 ## Required final-report result
 

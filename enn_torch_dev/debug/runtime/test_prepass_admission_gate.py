@@ -166,9 +166,8 @@ def test_gate_admits_and_samples_exactly_once() -> None:
     assert provider.calls == ["before_admission"]
 
 
-def test_gate_rejects_without_retaining_raw_sample() -> None:
-    sample = _sample(cpu=90)
-    provider = SequenceSampleProvider((sample,))
+def test_gate_block_exception_custom_payload_contains_only_assessment() -> None:
+    provider = SequenceSampleProvider((_sample(cpu=90),))
     gate = PrePassAdmissionGate(
         ResourceCapacity(cpu_total_bytes=100),
         _profile(cpu=1),
@@ -181,7 +180,6 @@ def test_gate_rejects_without_retaining_raw_sample() -> None:
     blocked = exc_info.value
     assert blocked.assessment.status is PrePassAdmissionStatus.REJECT
     assert set(vars(blocked)) == {"assessment"}
-    assert all(value is not sample for value in vars(blocked).values())
     assert not hasattr(gate, "baseline_sample")
 
 

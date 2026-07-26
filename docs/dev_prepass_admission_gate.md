@@ -64,11 +64,19 @@ REJECT                -> raise PrePassAdmissionBlocked
 
 `AdmissionUnknownAction.ALLOW` never overrides `REJECT`. The default is `BLOCK`.
 
-`PrePassAdmissionBlocked` retains only the immutable
-`PrePassAdmissionAssessment`. It does not retain the candidate `KVBatch`, the
-baseline `ResourceSample`, row tensors, source iterators, stores, losses, or model
-objects. Admission blocking is not represented as `StepStatus` because no runtime
-step completed.
+`PrePassAdmissionBlocked` stores only the immutable
+`PrePassAdmissionAssessment` in its custom payload and custom attributes. As with
+ordinary Python exceptions, however, its `__traceback__` may reference execution
+frames whose local variables include the candidate `KVBatch`, baseline
+`ResourceSample`, source, or runtime wrappers. The exception object's transitive
+object graph is therefore not limited to the assessment. Admission blocking is
+not represented as `StepStatus` because no runtime step completed.
+
+Callers that need long-lived diagnostics should store `exc.assessment` separately
+and use a lightweight standard-library traceback representation when textual
+traceback details are required. They should not cache the exception object or its
+traceback for long periods, especially in memory-sensitive runtimes. The gate does
+not clear tracebacks or provide transactional rollback.
 
 ## Orchestration placement
 
