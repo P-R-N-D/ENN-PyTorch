@@ -1,0 +1,1293 @@
+diff --git a/docs/CHANGE_CHECKLIST.md b/docs/CHANGE_CHECKLIST.md
+index 0d05a6c..40243ed 100644
+--- a/docs/CHANGE_CHECKLIST.md
++++ b/docs/CHANGE_CHECKLIST.md
+@@ -16,7 +16,7 @@ Do not defer required documentation updates to a follow-up task. Do not edit unr
+ | data schema and manifest | `enn_torch_dev/data/schema.py`, `manifest.py`, `batch.py`, `staging.py`, `readers.py` | `enn_torch_dev/debug/data -q` | `docs/CURRENT_STATE.md`, `docs/TESTING.md`, `docs/RUNTIME_SAFETY.md` | Breaking staged data compatibility, identity tensor semantics, schema validation changes |
+ | executor graph/node/tile/stream/state | `enn_torch_dev/executor/**` | `enn_torch_dev/debug/executor -q` | `docs/CURRENT_STATE.md`, `docs/TESTING.md`, executor docs if behavior changes | Execution ordering, state routing, public exports, tile/stream terminology |
+ | runtime step, retry, orchestration, session, source factory, and fault classification | `enn_torch_dev/runtime/step.py`, `retry.py`, `orchestration.py`, `session.py`, `source_factory.py`, `faults.py`, loader/runtime integration | `enn_torch_dev/debug/runtime/test_runtime_integration.py -q`; `enn_torch_dev/debug/runtime -q` | `docs/CURRENT_STATE.md`, `docs/TESTING.md`, `docs/RUNTIME_SAFETY.md`, relevant `docs/dev_*.md` | Incorrect success/fault reporting, retry loops, orchestration materialization scope, session over-consumption, factory over-invocation, source caching, exception suppression, recovered-OOM signaling, row-order changes, unverified failure modes, optimizer/loss behavior changes, cross-layer contract drift |
+-| resource monitoring, capacity/pressure assessment, cost/batching, runtime governor, orchestration, pass summaries, pass history, sessions, and source factories | `enn_torch_dev/runtime/cost.py`, `footprint.py`, `resources.py`, `capacity_provider.py`, `pressure.py`, `budget_recommendation.py`, `batching.py`, `governor.py`, `orchestration.py`, `summary.py`, `history.py`, `session.py`, `source_factory.py` | `enn_torch_dev/debug/runtime/test_budget_recommendation.py -q`; `enn_torch_dev/debug/runtime/test_runtime_pressure.py -q`; `enn_torch_dev/debug/runtime/test_runtime_integration.py -q`; `enn_torch_dev/debug/runtime -q` | `docs/CURRENT_STATE.md`, `docs/TESTING.md`, `docs/RUNTIME_SAFETY.md`, relevant `docs/dev_*.md` | CPU/CUDA assumptions, cgroup v1/v2 path parsing, hierarchy-effective cgroup limit discovery, physical-vs-effective CPU capacity, capacity lookup fallback, device mismatch, unknown-vs-zero pressure semantics, unclamped ratios, common-vs-dimension pressure-threshold fallback, per-dimension required-pass validation, common-vs-dimension pressure-factor fallback, shared max-items fallback factor selection, growth-limit ordering against every active effective shrink threshold, missing-summary growth suppression, OOM priority over pressure, fixed/provider capacity mutual exclusion, pass-start provider call count, provider failure before source consumption, invalid provider returns, per-pass capacity provenance, retry-attempt sample inclusion, CUDA capacity/sample mismatch propagation, memory accounting semantics, footprint device-provenance drift, unknown-vs-zero recommendation cost semantics, unsafe upward min-item clamping, fallback recommendation drift, reserve/utilization ordering, oversized batch behavior, budget shrink/grow bounds, dimension-aware pressure-to-budget mapping, structured high/trigger/selection/factor provenance drift, cross-dimension streak contamination, legacy aggregate streak compatibility, max-items fallback drift, actual-vs-attempted adjusted-field reporting, accidental execution/retry coupling, unbounded pass materialization, summary/history retaining `StepResult`, raw `ResourceSample`, `store`, or `loss` references, pressure summary field-order compatibility, sustained-pressure streak reset and priority errors, retained-window dimension/attempt/no-op/field-shrink aggregation drift, retained-window pressure shrink aggregation drift, unbounded history retention, retention-bound regression, unbounded session execution, session retaining previous pass results, factory returning cached or non-finite sources, unexpected persistent logging, stable namespace leakage, identity/order regression across split and retry paths |
++| resource monitoring, capacity/pressure assessment, cost/batching, runtime governor, orchestration, pass summaries, pass history, sessions, and source factories | `enn_torch_dev/runtime/cost.py`, `footprint.py`, `resources.py`, `capacity_provider.py`, `pressure.py`, `budget_recommendation.py`, `calibration.py`, `batching.py`, `governor.py`, `orchestration.py`, `summary.py`, `history.py`, `session.py`, `source_factory.py` | `enn_torch_dev/debug/runtime/test_budget_recommendation.py -q`; `enn_torch_dev/debug/runtime/test_observed_cost_calibration.py -q`; `enn_torch_dev/debug/runtime/test_runtime_pressure.py -q`; `enn_torch_dev/debug/runtime/test_runtime_integration.py -q`; `enn_torch_dev/debug/runtime -q` | `docs/CURRENT_STATE.md`, `docs/TESTING.md`, `docs/RUNTIME_SAFETY.md`, relevant `docs/dev_*.md` | CPU/CUDA assumptions, cgroup v1/v2 path parsing, hierarchy-effective cgroup limit discovery, physical-vs-effective CPU capacity, capacity lookup fallback, device mismatch, unknown-vs-zero pressure semantics, unclamped ratios, common-vs-dimension pressure-threshold fallback, per-dimension required-pass validation, common-vs-dimension pressure-factor fallback, shared max-items fallback factor selection, growth-limit ordering against every active effective shrink threshold, missing-summary growth suppression, OOM priority over pressure, fixed/provider capacity mutual exclusion, pass-start provider call count, provider failure before source consumption, invalid provider returns, per-pass capacity provenance, retry-attempt sample inclusion, CUDA capacity/sample mismatch propagation, memory accounting semantics, footprint device-provenance drift, ModelCost CUDA-provenance drift, unknown-vs-zero observed-cost semantics, negative-delta handling, fault-sample contamination, cross-device calibration contamination, unbounded phase-pair retention, raw observation retention, unknown-vs-zero recommendation cost semantics, unsafe upward min-item clamping, fallback recommendation drift, reserve/utilization ordering, oversized batch behavior, budget shrink/grow bounds, dimension-aware pressure-to-budget mapping, structured high/trigger/selection/factor provenance drift, cross-dimension streak contamination, legacy aggregate streak compatibility, max-items fallback drift, actual-vs-attempted adjusted-field reporting, accidental execution/retry coupling, unbounded pass materialization, summary/history retaining `StepResult`, raw `ResourceSample`, `store`, or `loss` references, pressure summary field-order compatibility, sustained-pressure streak reset and priority errors, retained-window dimension/attempt/no-op/field-shrink aggregation drift, retained-window pressure shrink aggregation drift, unbounded history retention, retention-bound regression, unbounded session execution, session retaining previous pass results, factory returning cached or non-finite sources, unexpected persistent logging, stable namespace leakage, identity/order regression across split and retry paths |
+ | dependency and optional extras | `pyproject.toml`, `requirements.txt`, `requirements-dev.txt` | Targeted import/test for affected dependency; report missing optional packages | `docs/CONTEXT.md`, `docs/TESTING.md`, `docs/RUNTIME_SAFETY.md` | Unrequested dependency changes, optional backend availability, platform markers |
+ | test layout and commands | `enn_torch_dev/debug/**`, pytest paths | New or moved tests themselves | `docs/TESTING.md`, `docs/CONTEXT.md` | Documenting non-existent commands, hiding skipped dependency or CUDA coverage |
+ | runtime safety and artifacts | Runtime IO/export/checkpoint code, staging writers, loaders, notebooks | Targeted tests using temp directories | `docs/RUNTIME_SAFETY.md`, `docs/CONTEXT.md` | Data loss, committed artifacts, secret leakage, long-running validation |
+diff --git a/docs/CURRENT_STATE.md b/docs/CURRENT_STATE.md
+index d79b9b3..232e626 100644
+--- a/docs/CURRENT_STATE.md
++++ b/docs/CURRENT_STATE.md
+@@ -19,7 +19,7 @@ Status categories:
+ | `enn_torch_dev/data` | ACTIVE DEVELOPMENT | Development namespace for `DataSchema`, `FieldSpec`, `KeyMapping`, `KVBatch`, `BatchCost`, manifests, TensorDict staging/reading, and SPDL tensor adapter boundaries. |
+ | `enn_torch_dev/executor` | ACTIVE DEVELOPMENT | Development namespace for `KVStore`, node/subgraph/graph execution, plans, runners, model specs, graph/model/branch builders, tile, stream, global-local, and state routing. |
+ | `enn_torch_dev/nn` | ACTIVE DEVELOPMENT | Development namespace for blocks, attention, fusion, layers, recurrent components, and related types. |
+-| `enn_torch_dev/runtime` | ACTIVE DEVELOPMENT | Development namespace for loaders, runtime steps, fault/status records, model/resource cost probes, device-resolved model/optimizer footprint, resource monitoring, resource capacity and pressure assessment, pure initial batch-budget recommendation, budgeted batching, OOM-class runtime retry, conservative StepResult-observing budget governance with opt-in pressure growth suppression, independent CPU/CUDA sustained-pressure streaks, per-dimension threshold/pass-count/factor overrides, and structured high/trigger/selection/factor provenance driving dimension-aware shrink, finite pass-level runtime orchestration with fixed or pass-scoped provider capacity assessment of all raw-attempt resource samples and per-pass capacity provenance, runtime pass summary inspection with pressure-feedback, structured provenance, pressure-shrink, adjusted-field, and per-dimension streak visibility, bounded in-memory runtime history aggregation of pressure assessment, growth suppression, structured CPU/CUDA high/trigger provenance, adjustment attempts/no-ops, and field-specific actual pressure shrink, bounded lazy multi-pass runtime sessions, fresh per-pass source factories, and end-to-end integration coverage for retry, budget transitions, history retention, identity order, and API boundaries. |
++| `enn_torch_dev/runtime` | ACTIVE DEVELOPMENT | Development namespace for loaders, runtime steps, fault/status records, model/resource cost probes, bounded observed-cost calibration, device-resolved model/optimizer footprint, resource monitoring, resource capacity and pressure assessment, pure initial batch-budget recommendation, budgeted batching, OOM-class runtime retry, conservative StepResult-observing budget governance with opt-in pressure growth suppression, independent CPU/CUDA sustained-pressure streaks, per-dimension threshold/pass-count/factor overrides, and structured high/trigger/selection/factor provenance driving dimension-aware shrink, finite pass-level runtime orchestration with fixed or pass-scoped provider capacity assessment of all raw-attempt resource samples and per-pass capacity provenance, runtime pass summary inspection with pressure-feedback, structured provenance, pressure-shrink, adjusted-field, and per-dimension streak visibility, bounded in-memory runtime history aggregation of pressure assessment, growth suppression, structured CPU/CUDA high/trigger provenance, adjustment attempts/no-ops, and field-specific actual pressure shrink, bounded lazy multi-pass runtime sessions, fresh per-pass source factories, and end-to-end integration coverage for retry, budget transitions, history retention, identity order, and API boundaries. |
+ | `enn_torch_dev/debug` | CURRENT | Pytest debug suite for development data, executor, nn, and runtime areas. Do not add agent instruction Markdown files here. |
+ | Existing `docs/dev_*.md` | HISTORICAL | Implementation-slice design records for `enn_torch_dev`. Their `Next Step`, `Follow-up`, and `Out of Scope` sections are not current task instructions or confirmed roadmap items. |
+ | Runtime development workflow | CURRENT | `docs/runtime_development_workflow.md` documents the supported bounded single-node composition and its safety boundaries. |
+@@ -29,4 +29,4 @@ Status categories:
+ 
+ ## Planned items noted in design records
+ 
+-Existing development design records mention future concepts such as ingestion plugins, SPDL pipeline construction, dynamic batching, OOM recovery, AutoGovernor, calibration cache, sharding, distributed resume. Treat these as **PLANNED** only when explicitly requested or implemented; otherwise do not describe them as current functionality.
++Existing development design records mention future concepts such as ingestion plugins, SPDL pipeline construction, dynamic batching, OOM recovery, AutoGovernor, persistent calibration cache, sharding, distributed resume. Treat these as **PLANNED** only when explicitly requested or implemented; otherwise do not describe them as current functionality.
+diff --git a/docs/RUNTIME_SAFETY.md b/docs/RUNTIME_SAFETY.md
+index f3a34fd..f860c67 100644
+--- a/docs/RUNTIME_SAFETY.md
++++ b/docs/RUNTIME_SAFETY.md
+@@ -37,6 +37,10 @@ Use this document before running code that can allocate accelerator memory, writ
+ - Use ceiling division for reference per-item costs, never clamp an insufficient computed limit upward to `min_items`, and require an explicit `fallback_max_items` when a relevant dimension remains unknown.
+ - Preserve the original capacity, reference batch cost, resolved policy, and normalized reference device provenance in the recommendation so its static calculation can be audited.
+ - Treat a recommended initial budget as a conservative starting point, not proof that unobserved activations, allocator overhead, or the next pass are admissible.
++- Calibrate only completed `ModelCost` records; the calibrator must not execute a model, consume a source, mutate governor/history state, or retain `StepResult`, `ResourceSample`, tensor, store, or loss objects.
++- Use only successful positive-batch observations for numeric calibration. Count fault and zero-batch observations separately, clamp negative deltas to zero, and preserve unknown values instead of fabricating costs.
++- Keep one observed-cost profile bound to at most one concrete CUDA device and cap retained phase-pair accumulators with `max_phase_pairs`; do not merge mismatched devices or grow calibration state without a bound.
++- Treat observed-cost envelopes as prior execution evidence, not admission proof or permission to bypass retry, pressure, or capacity checks.
+ - Normalize CPU RSS against the smallest known physical or hierarchy-effective cgroup capacity; do not assume host physical memory or a leaf cgroup file is the process limit in containers.
+ - Do not clamp pressure ratios to `1.0`; ratios above one must remain visible for diagnosis.
+ - Feed pressure summaries into governor decisions through explicit opt-in policies. Missing or high pressure may suppress growth; pressure may shrink a future budget only when the effective sustained-pressure threshold and required pass count for that dimension are both met.
+diff --git a/docs/TESTING.md b/docs/TESTING.md
+index 1cb6278..0ca0cfe 100644
+--- a/docs/TESTING.md
++++ b/docs/TESTING.md
+@@ -22,6 +22,7 @@ Report outcomes distinctly:
+ | `enn_torch_dev/executor/**` | `python -m pytest enn_torch_dev/debug/executor -q` | `enn_torch_dev/debug/executor` |
+ | `enn_torch_dev/nn/**` | `python -m pytest enn_torch_dev/debug/nn -q` | `enn_torch_dev/debug/nn` |
+ | `enn_torch_dev/runtime/**` | `python -m pytest enn_torch_dev/debug/runtime -q` | `enn_torch_dev/debug/runtime` |
++| Observed runtime-cost calibration | `python -m pytest enn_torch_dev/debug/runtime/test_observed_cost_calibration.py -q` | `enn_torch_dev/debug/runtime/test_observed_cost_calibration.py` |
+ | Initial runtime batch-budget recommendation | `python -m pytest enn_torch_dev/debug/runtime/test_budget_recommendation.py -q` | `enn_torch_dev/debug/runtime/test_budget_recommendation.py` |
+ | Runtime resource pressure | `python -m pytest enn_torch_dev/debug/runtime/test_runtime_pressure.py -q` | `enn_torch_dev/debug/runtime/test_runtime_pressure.py` |
+ | Runtime pass source factory | `python -m pytest enn_torch_dev/debug/runtime/test_runtime_source_factory.py -q` | `enn_torch_dev/debug/runtime/test_runtime_source_factory.py` |
+@@ -47,6 +48,7 @@ These commands correspond to existing paths in the repository:
+ python -m pytest enn_torch_dev/debug/data -q
+ python -m pytest enn_torch_dev/debug/executor -q
+ python -m pytest enn_torch_dev/debug/nn -q
++python -m pytest enn_torch_dev/debug/runtime/test_observed_cost_calibration.py -q
+ python -m pytest enn_torch_dev/debug/runtime/test_budget_recommendation.py -q
+ python -m pytest enn_torch_dev/debug/runtime/test_runtime_pressure.py -q
+ python -m pytest enn_torch_dev/debug/runtime/test_runtime_source_factory.py -q
+diff --git a/docs/dev_cost_probe.md b/docs/dev_cost_probe.md
+index 0053f3a..69b7349 100644
+--- a/docs/dev_cost_probe.md
++++ b/docs/dev_cost_probe.md
+@@ -99,10 +99,12 @@ Recorded values include:
+ - total CUDA reserved delta;
+ - total CUDA max allocated delta;
+ - total CUDA max reserved delta;
+-- per-phase resource deltas.
++- per-phase resource deltas;
++- one concrete `cuda_device_index` when all CUDA-bearing samples identify the same device.
+ 
+ If a field is unavailable in either endpoint sample, the corresponding delta is
+-`None`.
++`None`. If CUDA-bearing samples identify different devices, CUDA deltas that cross
++devices remain unknown and `ModelCost.cuda_device_index` is `None`.
+ 
+ ## Out of Scope
+ 
+@@ -132,7 +134,7 @@ python -m pytest enn_torch_dev/debug -q
+ 
+ ## Follow-up
+ 
+-`BudgetedBatcher` now consumes `BatchCost` and `DataCostProbe` observations as a
+-static budget gate over `KVBatch` streams. The next runtime-facing slice should
+-add an OOM retry runner that can use budgeted splitting and `RuntimeStep` fault
+-classification without moving execution policy into the cost probe layer.
++`ObservedCostCalibrator` now consumes completed `ModelCost` records and reduces
++successful observations to a bounded per-item envelope without retaining raw
++`StepResult` or `ResourceSample` objects. Persistent calibration caches and
++automatic admission remain outside the cost probe layer.
+diff --git a/docs/dev_initial_batch_budget.md b/docs/dev_initial_batch_budget.md
+index ea31bdc..ed5cc6b 100644
+--- a/docs/dev_initial_batch_budget.md
++++ b/docs/dev_initial_batch_budget.md
+@@ -93,8 +93,8 @@ reserve, and known static tensor footprints have been removed.
+ The static recommendation does not estimate unobserved activations, allocator
+ fragmentation, framework overhead, asynchronous transfer buffers, or future
+ optimizer state that has not yet been materialized. It is not proof that a pass
+-is admissible. A separate pre-pass admission boundary and observed-cost
+-calibration remain outside this slice.
++is admissible. Bounded observed-cost calibration is available separately through
++`ObservedCostCalibrator`; pre-pass admission remains outside this slice.
+ 
+ ## Validation
+ 
+diff --git a/docs/dev_observed_cost_calibration.md b/docs/dev_observed_cost_calibration.md
+new file mode 100644
+index 0000000..9596e3a
+--- /dev/null
++++ b/docs/dev_observed_cost_calibration.md
+@@ -0,0 +1,100 @@
++# Development Observed Cost Calibration
++
++This document describes the development-only observed runtime-cost calibration
++boundary under `enn_torch_dev.runtime`.
++
++## Goal
++
++The initial batch-budget recommender uses static capacity, batch cost, and fixed
++model/optimizer footprints. It intentionally cannot account for execution-time
++activation growth, allocator reservation behavior, or phase-specific peaks.
++
++This slice turns already observed `ModelCost` records into one bounded,
++deterministic cost envelope:
++
++```text
++StepResult.resource_samples
++  -> ModelCostProbe
++  -> ModelCost
++  -> ObservedCostCalibrator.observe(...)
++  -> ObservedCostProfile
++```
++
++The calibrator does not execute a model or consume a source. Callers decide when
++to probe a completed `StepResult` and submit its `ModelCost`.
++
++## Accepted observations
++
++Only `StepStatus.SUCCESS` observations contribute numeric values. OOM,
++non-finite, data, and runtime faults are ignored and counted by status for
++diagnostics. A successful observation with `batch_size == 0` is ignored because
++no per-item cost can be derived. Negative batch sizes and inconsistent
++`batch_size` / `row_count` values are rejected.
++
++For each available byte delta:
++
++```text
++normalized delta = max(observed delta, 0)
++bytes per item = ceil(normalized delta / batch_size)
++profile envelope = max(bytes per item over accepted samples)
++```
++
++Negative deltas are clamped to zero rather than treated as memory credits. The
++metric profile records unknown, observed-zero, and negative-clamped counts
++separately, so `None` remains distinguishable from a known zero envelope.
++
++## CUDA provenance
++
++`ModelCost` retains an append-only `cuda_device_index` resolved by
++`ModelCostProbe` when all CUDA-bearing resource samples identify one device.
++Known CUDA total or phase metrics require this concrete provenance.
++
++One `ObservedCostCalibrator` profile may contain CUDA observations from only one
++device. `ObservedCostCalibrationPolicy.expected_cuda_device_index` can bind the
++profile to a specific device before the first observation. Missing or mismatched
++CUDA provenance is rejected; observations are never assigned to a device by
++assumption.
++
++## Bounded state
++
++The calibrator stores only scalar counters, maxima, device provenance, and one
++accumulator per distinct adjacent phase pair. It does not retain `ModelCost`,
++`StepResult`, `ResourceSample`, tensors, stores, or losses.
++
++`ObservedCostCalibrationPolicy.max_phase_pairs` bounds the number of retained
++phase-pair accumulators. An observation that would exceed that bound is rejected
++before its numeric values are applied.
++
++## Result contract
++
++`ObservedCostProfile` includes:
++
++- the applied calibration policy;
++- total, successful, ignored, and rejected observation counts;
++- ignored fault counts and zero-batch count;
++- observed batch-size range;
++- concrete CUDA device provenance when CUDA metrics were accepted;
++- total CPU RSS and CUDA allocated/reserved/peak per-item envelopes;
++- per-phase metric envelopes in deterministic phase-pair order;
++- known, unknown, observed-zero, and negative-clamped counts for every metric.
++
++`profile()` raises until `min_successful_samples` has been reached.
++
++## Safety boundary
++
++This profile is evidence from previous executions, not proof that a future pass
++is admissible. It does not account for workload distribution shifts, new graph
++paths, external allocations, concurrent CUDA activity, or capacity changes.
++Pre-pass admission, automatic governor wiring, persistence, learned tuning, and
++multi-device profile merging remain outside this slice.
++
++## Validation
++
++```bash
++python -m pytest enn_torch_dev/debug/runtime/test_observed_cost_calibration.py -q
++python -m pytest enn_torch_dev/debug/runtime/test_model_cost_probe.py -q
++python -m pytest enn_torch_dev/debug/runtime/test_runtime_integration.py -q
++python -m pytest enn_torch_dev/debug/runtime -q
++python -m pytest enn_torch_dev/debug -q
++git diff --check
++```
+diff --git a/enn_torch_dev/debug/runtime/test_model_cost_probe.py b/enn_torch_dev/debug/runtime/test_model_cost_probe.py
+index cd171fa..de38bd3 100644
+--- a/enn_torch_dev/debug/runtime/test_model_cost_probe.py
++++ b/enn_torch_dev/debug/runtime/test_model_cost_probe.py
+@@ -71,6 +71,7 @@ def test_model_cost_probe_computes_phase_deltas() -> None:
+     assert cost.phase_deltas[0].end_phase == "after_to_store"
+     assert cost.phase_deltas[0].cpu_rss_delta_bytes == 60
+     assert cost.phase_deltas[1].cuda_allocated_delta_bytes == 40
++    assert cost.cuda_device_index == 0
+ 
+ 
+ def test_model_cost_probe_skips_cuda_delta_across_devices() -> None:
+@@ -106,6 +107,7 @@ def test_model_cost_probe_skips_cuda_delta_across_devices() -> None:
+     assert cost.total_cuda_max_reserved_delta_bytes is None
+     assert cost.phase_deltas[0].cpu_rss_delta_bytes == 50
+     assert cost.phase_deltas[0].cuda_allocated_delta_bytes is None
++    assert cost.cuda_device_index is None
+ 
+ 
+ def test_model_cost_probe_row_count_uses_batch_size_for_multidimensional_row_ids() -> None:
+@@ -139,6 +141,25 @@ def test_model_cost_probe_handles_cuda_none_fields() -> None:
+     assert cost.total_cpu_rss_delta_bytes == 30
+     assert cost.total_cuda_allocated_delta_bytes is None
+     assert cost.phase_deltas[0].cuda_allocated_delta_bytes is None
++    assert cost.cuda_device_index is None
++
++
++def test_model_cost_probe_uses_cuda_device_from_cuda_bearing_samples_only() -> None:
++    result = _result(
++        (
++            _sample("before_step", cpu=100, device_index=1),
++            _sample(
++                "after_forward",
++                cpu=130,
++                allocated=20,
++                reserved=30,
++                device_index=0,
++            ),
++        )
++    )
++
++    cost = ModelCostProbe().estimate_step(result)
++    assert cost.cuda_device_index == 0
+ 
+ 
+ def test_model_cost_probe_handles_forward_only_samples() -> None:
+diff --git a/enn_torch_dev/debug/runtime/test_observed_cost_calibration.py b/enn_torch_dev/debug/runtime/test_observed_cost_calibration.py
+new file mode 100644
+index 0000000..edb82ec
+--- /dev/null
++++ b/enn_torch_dev/debug/runtime/test_observed_cost_calibration.py
+@@ -0,0 +1,274 @@
++from __future__ import annotations
++
++import pytest
++
++from enn_torch_dev.runtime import (
++    ModelCost,
++    ObservedCostCalibrationError,
++    ObservedCostCalibrationPolicy,
++    ObservedCostCalibrator,
++    ResourceDelta,
++    StepStatus,
++)
++
++
++def _cost(
++    *,
++    status: StepStatus = StepStatus.SUCCESS,
++    batch_size: int = 2,
++    cpu: int | None = None,
++    allocated: int | None = None,
++    reserved: int | None = None,
++    max_allocated: int | None = None,
++    max_reserved: int | None = None,
++    device_index: int | None = None,
++    phases: tuple[ResourceDelta, ...] = (),
++    row_count: int | None = None,
++) -> ModelCost:
++    return ModelCost(
++        status=status,
++        batch_size=batch_size,
++        row_count=batch_size if row_count is None else row_count,
++        total_cpu_rss_delta_bytes=cpu,
++        total_cuda_allocated_delta_bytes=allocated,
++        total_cuda_reserved_delta_bytes=reserved,
++        total_cuda_max_allocated_delta_bytes=max_allocated,
++        total_cuda_max_reserved_delta_bytes=max_reserved,
++        phase_deltas=phases,
++        cuda_device_index=device_index,
++    )
++
++
++def test_calibrator_builds_conservative_ceiling_divided_envelope() -> None:
++    calibrator = ObservedCostCalibrator()
++
++    assert calibrator.observe(_cost(batch_size=2, cpu=5, allocated=9, device_index=0))
++    assert calibrator.observe(_cost(batch_size=3, cpu=10, allocated=12, device_index=0))
++
++    profile = calibrator.profile()
++    assert profile.successful_samples == 2
++    assert profile.min_batch_size == 2
++    assert profile.max_batch_size == 3
++    assert profile.cuda_device_index == 0
++    assert profile.cpu_rss.max_bytes_per_item == 4
++    assert profile.cuda_allocated.max_bytes_per_item == 5
++
++
++def test_calibrator_distinguishes_unknown_from_observed_zero() -> None:
++    calibrator = ObservedCostCalibrator()
++    calibrator.observe(_cost(cpu=None))
++    calibrator.observe(_cost(cpu=0))
++
++    metric = calibrator.profile().cpu_rss
++    assert metric.max_bytes_per_item == 0
++    assert metric.known_samples == 1
++    assert metric.unknown_samples == 1
++    assert metric.zero_samples == 1
++    assert metric.negative_deltas_clamped == 0
++
++
++def test_calibrator_clamps_negative_delta_to_zero_without_counting_observed_zero() -> None:
++    calibrator = ObservedCostCalibrator()
++    calibrator.observe(_cost(cpu=-7))
++
++    metric = calibrator.profile().cpu_rss
++    assert metric.max_bytes_per_item == 0
++    assert metric.known_samples == 1
++    assert metric.zero_samples == 0
++    assert metric.negative_deltas_clamped == 1
++
++
++@pytest.mark.parametrize(
++    "status",
++    [
++        StepStatus.OOM_FAULT,
++        StepStatus.NONFINITE_FAULT,
++        StepStatus.DATA_FAULT,
++        StepStatus.RUNTIME_FAULT,
++    ],
++)
++def test_calibrator_ignores_fault_costs_and_records_status(status: StepStatus) -> None:
++    calibrator = ObservedCostCalibrator()
++    assert calibrator.observe(_cost(status=status, cpu=100)) is False
++    calibrator.observe(_cost(cpu=10))
++
++    profile = calibrator.profile()
++    assert profile.total_observations == 2
++    assert profile.successful_samples == 1
++    assert profile.ignored_samples == 1
++    assert profile.ignored_by_status == ((status.value, 1),)
++    assert profile.cpu_rss.max_bytes_per_item == 5
++
++
++def test_calibrator_ignores_zero_batch_success() -> None:
++    calibrator = ObservedCostCalibrator()
++    assert calibrator.observe(_cost(batch_size=0, cpu=10)) is False
++    calibrator.observe(_cost(batch_size=1, cpu=3))
++
++    profile = calibrator.profile()
++    assert profile.ignored_zero_batch_samples == 1
++    assert profile.ignored_samples == 1
++    assert profile.min_batch_size == 1
++
++
++def test_calibrator_requires_configured_success_floor() -> None:
++    calibrator = ObservedCostCalibrator(
++        ObservedCostCalibrationPolicy(min_successful_samples=2)
++    )
++    calibrator.observe(_cost(cpu=1))
++
++    with pytest.raises(ObservedCostCalibrationError, match="not enough"):
++        calibrator.profile()
++
++
++def test_calibrator_rejects_cuda_metrics_without_device_provenance() -> None:
++    calibrator = ObservedCostCalibrator()
++    with pytest.raises(ObservedCostCalibrationError, match="device index"):
++        calibrator.observe(_cost(allocated=10))
++
++
++def test_calibrator_rejects_cuda_device_mismatch_without_partial_acceptance() -> None:
++    calibrator = ObservedCostCalibrator()
++    calibrator.observe(_cost(allocated=8, device_index=0))
++
++    with pytest.raises(ObservedCostCalibrationError, match="different devices"):
++        calibrator.observe(_cost(allocated=20, device_index=1))
++
++    profile = calibrator.profile()
++    assert profile.total_observations == 2
++    assert profile.successful_samples == 1
++    assert profile.rejected_samples == 1
++    assert profile.cuda_device_index == 0
++    assert profile.cuda_allocated.max_bytes_per_item == 4
++
++
++def test_calibrator_enforces_expected_cuda_device() -> None:
++    calibrator = ObservedCostCalibrator(
++        ObservedCostCalibrationPolicy(expected_cuda_device_index=1)
++    )
++    with pytest.raises(ObservedCostCalibrationError, match="policy device"):
++        calibrator.observe(_cost(allocated=4, device_index=0))
++
++
++def test_calibrator_aggregates_phase_envelopes_deterministically() -> None:
++    phases_a = (
++        ResourceDelta(
++            "before_step",
++            "after_forward",
++            cpu_rss_delta_bytes=5,
++            cuda_allocated_delta_bytes=7,
++        ),
++    )
++    phases_b = (
++        ResourceDelta(
++            "before_step",
++            "after_forward",
++            cpu_rss_delta_bytes=10,
++            cuda_allocated_delta_bytes=8,
++        ),
++    )
++    calibrator = ObservedCostCalibrator()
++    calibrator.observe(_cost(batch_size=2, device_index=0, phases=phases_a))
++    calibrator.observe(_cost(batch_size=4, device_index=0, phases=phases_b))
++
++    profile = calibrator.profile()
++    assert len(profile.phase_costs) == 1
++    phase = profile.phase_costs[0]
++    assert (phase.start_phase, phase.end_phase) == (
++        "before_step",
++        "after_forward",
++    )
++    assert phase.cpu_rss.max_bytes_per_item == 3
++    assert phase.cuda_allocated.max_bytes_per_item == 4
++
++
++def test_calibrator_rejects_phase_pair_growth_above_bound() -> None:
++    calibrator = ObservedCostCalibrator(
++        ObservedCostCalibrationPolicy(max_phase_pairs=1)
++    )
++    calibrator.observe(
++        _cost(
++            phases=(ResourceDelta("before", "middle", cpu_rss_delta_bytes=1),),
++        )
++    )
++
++    with pytest.raises(ObservedCostCalibrationError, match="max_phase_pairs"):
++        calibrator.observe(
++            _cost(
++                phases=(ResourceDelta("middle", "after", cpu_rss_delta_bytes=2),),
++            )
++        )
++
++    assert len(calibrator.profile().phase_costs) == 1
++
++
++def test_calibrator_rejects_duplicate_phase_pairs_in_one_observation() -> None:
++    calibrator = ObservedCostCalibrator()
++    repeated = ResourceDelta("before", "after", cpu_rss_delta_bytes=1)
++    with pytest.raises(ObservedCostCalibrationError, match="repeat"):
++        calibrator.observe(_cost(phases=(repeated, repeated)))
++
++
++def test_calibrator_rejects_invalid_phase_names() -> None:
++    calibrator = ObservedCostCalibrator()
++    with pytest.raises(ValueError, match="normalized"):
++        calibrator.observe(
++            _cost(phases=(ResourceDelta(" before", "after", cpu_rss_delta_bytes=1),))
++        )
++
++
++def test_calibrator_rejects_row_count_mismatch() -> None:
++    calibrator = ObservedCostCalibrator()
++    with pytest.raises(ObservedCostCalibrationError, match="must match"):
++        calibrator.observe(_cost(batch_size=2, row_count=3, cpu=1))
++
++
++def test_calibrator_does_not_retain_raw_model_cost_objects() -> None:
++    calibrator = ObservedCostCalibrator()
++    cost = _cost(cpu=4)
++    calibrator.observe(cost)
++
++    assert not hasattr(calibrator, "__dict__")
++    assert not hasattr(calibrator, "_costs")
++    assert calibrator.profile().cpu_rss.max_bytes_per_item == 2
++
++
++def test_calibration_is_deterministic_for_the_same_observation_order() -> None:
++    costs = (
++        _cost(batch_size=3, cpu=7),
++        _cost(batch_size=2, cpu=8),
++        _cost(status=StepStatus.DATA_FAULT, cpu=100),
++    )
++    first = ObservedCostCalibrator()
++    second = ObservedCostCalibrator()
++    for cost in costs:
++        first.observe(cost)
++        second.observe(cost)
++
++    assert first.profile() == second.profile()
++
++
++@pytest.mark.parametrize(
++    ("kwargs", "error_type", "message"),
++    [
++        ({"min_successful_samples": True}, TypeError, "min_successful_samples"),
++        ({"min_successful_samples": 0}, ValueError, "min_successful_samples"),
++        ({"max_phase_pairs": 0}, ValueError, "max_phase_pairs"),
++        ({"expected_cuda_device_index": True}, TypeError, "expected_cuda_device_index"),
++        ({"expected_cuda_device_index": -1}, ValueError, "expected_cuda_device_index"),
++    ],
++)
++def test_calibration_policy_rejects_invalid_values(
++    kwargs: dict[str, object],
++    error_type: type[Exception],
++    message: str,
++) -> None:
++    with pytest.raises(error_type, match=message):
++        ObservedCostCalibrationPolicy(**kwargs)  # type: ignore[arg-type]
++
++
++def test_calibrator_rejects_invalid_inputs() -> None:
++    with pytest.raises(TypeError, match="policy"):
++        ObservedCostCalibrator(object())  # type: ignore[arg-type]
++    with pytest.raises(TypeError, match="ModelCost"):
++        ObservedCostCalibrator().observe(object())  # type: ignore[arg-type]
+diff --git a/enn_torch_dev/runtime/__init__.py b/enn_torch_dev/runtime/__init__.py
+index 58ef406..6fb0c94 100644
+--- a/enn_torch_dev/runtime/__init__.py
++++ b/enn_torch_dev/runtime/__init__.py
+@@ -7,6 +7,14 @@ from .budget_recommendation import (
+     InitialBatchBudgetPolicy,
+     recommend_initial_batch_budget,
+ )
++from .calibration import (
++    ObservedCostCalibrationError,
++    ObservedCostCalibrationPolicy,
++    ObservedCostCalibrator,
++    ObservedCostMetricProfile,
++    ObservedCostProfile,
++    ObservedPhaseCostProfile,
++)
+ from .capacity_provider import ResourceCapacityProvider
+ from .cost import (
+     DataCost,
+@@ -64,6 +72,12 @@ __all__ = [
+     "GovernorDecision",
+     "GovernorPolicy",
+     "InitialBatchBudgetPolicy",
++    "ObservedCostCalibrationError",
++    "ObservedCostCalibrationPolicy",
++    "ObservedCostCalibrator",
++    "ObservedCostMetricProfile",
++    "ObservedCostProfile",
++    "ObservedPhaseCostProfile",
+     "OptimizerFootprint",
+     "PlainLoader",
+     "ResourceCapacity",
+diff --git a/enn_torch_dev/runtime/calibration.py b/enn_torch_dev/runtime/calibration.py
+new file mode 100644
+index 0000000..fd9b0a0
+--- /dev/null
++++ b/enn_torch_dev/runtime/calibration.py
+@@ -0,0 +1,563 @@
++from __future__ import annotations
++
++from dataclasses import dataclass
++
++from .cost import ModelCost, ResourceDelta
++from .faults import StepStatus
++
++
++def _validate_positive_int(value: object, *, label: str) -> int:
++    if not isinstance(value, int) or isinstance(value, bool):
++        raise TypeError(f"{label} must be an integer.")
++    if value <= 0:
++        raise ValueError(f"{label} must be positive.")
++    return value
++
++
++def _validate_optional_device_index(value: object, *, label: str) -> int | None:
++    if value is None:
++        return None
++    if not isinstance(value, int) or isinstance(value, bool):
++        raise TypeError(f"{label} must be an integer or None.")
++    if value < 0:
++        raise ValueError(f"{label} must be non-negative.")
++    return value
++
++
++def _validate_delta(value: object, *, label: str) -> int | None:
++    if value is None:
++        return None
++    if not isinstance(value, int) or isinstance(value, bool):
++        raise TypeError(f"{label} must be an integer or None.")
++    return value
++
++
++def _validate_phase_name(value: object, *, label: str) -> str:
++    if not isinstance(value, str):
++        raise TypeError(f"{label} must be a string.")
++    if not value or value != value.strip():
++        raise ValueError(f"{label} must be a non-empty normalized string.")
++    return value
++
++
++def _ceil_div(value: int, divisor: int) -> int:
++    return (value + divisor - 1) // divisor
++
++
++@dataclass(frozen=True, slots=True)
++class ObservedCostCalibrationPolicy:
++    """Bounds and device expectations for deterministic observed-cost calibration."""
++
++    min_successful_samples: int = 1
++    max_phase_pairs: int = 32
++    expected_cuda_device_index: int | None = None
++
++    def __post_init__(self) -> None:
++        object.__setattr__(
++            self,
++            "min_successful_samples",
++            _validate_positive_int(
++                self.min_successful_samples,
++                label="ObservedCostCalibrationPolicy.min_successful_samples",
++            ),
++        )
++        object.__setattr__(
++            self,
++            "max_phase_pairs",
++            _validate_positive_int(
++                self.max_phase_pairs,
++                label="ObservedCostCalibrationPolicy.max_phase_pairs",
++            ),
++        )
++        object.__setattr__(
++            self,
++            "expected_cuda_device_index",
++            _validate_optional_device_index(
++                self.expected_cuda_device_index,
++                label="ObservedCostCalibrationPolicy.expected_cuda_device_index",
++            ),
++        )
++
++
++class ObservedCostCalibrationError(RuntimeError):
++    """Raised when an observation cannot safely join one calibration profile."""
++
++    def __init__(
++        self,
++        reason: str,
++        *,
++        dimensions: tuple[str, ...] = (),
++    ) -> None:
++        self.reason = reason
++        self.dimensions = dimensions
++        suffix = f" dimensions={dimensions!r}" if dimensions else ""
++        super().__init__(f"Observed cost calibration failed: {reason}.{suffix}")
++
++
++@dataclass(frozen=True, slots=True)
++class ObservedCostMetricProfile:
++    """One scalar metric's conservative per-item envelope and observation counts."""
++
++    max_bytes_per_item: int | None
++    known_samples: int
++    unknown_samples: int
++    zero_samples: int
++    negative_deltas_clamped: int
++
++
++@dataclass(frozen=True, slots=True)
++class ObservedPhaseCostProfile:
++    """Conservative metric envelopes for one adjacent runtime phase pair."""
++
++    start_phase: str
++    end_phase: str
++    cpu_rss: ObservedCostMetricProfile
++    cuda_allocated: ObservedCostMetricProfile
++    cuda_reserved: ObservedCostMetricProfile
++    cuda_max_allocated: ObservedCostMetricProfile
++    cuda_max_reserved: ObservedCostMetricProfile
++
++
++@dataclass(frozen=True, slots=True)
++class ObservedCostProfile:
++    """Bounded aggregate profile derived from accepted successful observations."""
++
++    policy: ObservedCostCalibrationPolicy
++    total_observations: int
++    successful_samples: int
++    ignored_samples: int
++    rejected_samples: int
++    ignored_zero_batch_samples: int
++    ignored_by_status: tuple[tuple[str, int], ...]
++    min_batch_size: int
++    max_batch_size: int
++    cuda_device_index: int | None
++    cpu_rss: ObservedCostMetricProfile
++    cuda_allocated: ObservedCostMetricProfile
++    cuda_reserved: ObservedCostMetricProfile
++    cuda_max_allocated: ObservedCostMetricProfile
++    cuda_max_reserved: ObservedCostMetricProfile
++    phase_costs: tuple[ObservedPhaseCostProfile, ...]
++
++
++class _MetricAccumulator:
++    __slots__ = (
++        "max_bytes_per_item",
++        "known_samples",
++        "unknown_samples",
++        "zero_samples",
++        "negative_deltas_clamped",
++    )
++
++    def __init__(self) -> None:
++        self.max_bytes_per_item: int | None = None
++        self.known_samples = 0
++        self.unknown_samples = 0
++        self.zero_samples = 0
++        self.negative_deltas_clamped = 0
++
++    def observe(self, value: int | None, *, batch_size: int) -> None:
++        if value is None:
++            self.unknown_samples += 1
++            return
++
++        self.known_samples += 1
++        normalized = value
++        if value < 0:
++            normalized = 0
++            self.negative_deltas_clamped += 1
++        elif value == 0:
++            self.zero_samples += 1
++
++        per_item = _ceil_div(normalized, batch_size)
++        if self.max_bytes_per_item is None or per_item > self.max_bytes_per_item:
++            self.max_bytes_per_item = per_item
++
++    def profile(self) -> ObservedCostMetricProfile:
++        return ObservedCostMetricProfile(
++            max_bytes_per_item=self.max_bytes_per_item,
++            known_samples=self.known_samples,
++            unknown_samples=self.unknown_samples,
++            zero_samples=self.zero_samples,
++            negative_deltas_clamped=self.negative_deltas_clamped,
++        )
++
++
++class _PhaseAccumulator:
++    __slots__ = (
++        "start_phase",
++        "end_phase",
++        "cpu_rss",
++        "cuda_allocated",
++        "cuda_reserved",
++        "cuda_max_allocated",
++        "cuda_max_reserved",
++    )
++
++    def __init__(self, start_phase: str, end_phase: str) -> None:
++        self.start_phase = start_phase
++        self.end_phase = end_phase
++        self.cpu_rss = _MetricAccumulator()
++        self.cuda_allocated = _MetricAccumulator()
++        self.cuda_reserved = _MetricAccumulator()
++        self.cuda_max_allocated = _MetricAccumulator()
++        self.cuda_max_reserved = _MetricAccumulator()
++
++    def observe(self, delta: ResourceDelta, *, batch_size: int) -> None:
++        self.cpu_rss.observe(delta.cpu_rss_delta_bytes, batch_size=batch_size)
++        self.cuda_allocated.observe(
++            delta.cuda_allocated_delta_bytes,
++            batch_size=batch_size,
++        )
++        self.cuda_reserved.observe(
++            delta.cuda_reserved_delta_bytes,
++            batch_size=batch_size,
++        )
++        self.cuda_max_allocated.observe(
++            delta.cuda_max_allocated_delta_bytes,
++            batch_size=batch_size,
++        )
++        self.cuda_max_reserved.observe(
++            delta.cuda_max_reserved_delta_bytes,
++            batch_size=batch_size,
++        )
++
++    def profile(self) -> ObservedPhaseCostProfile:
++        return ObservedPhaseCostProfile(
++            start_phase=self.start_phase,
++            end_phase=self.end_phase,
++            cpu_rss=self.cpu_rss.profile(),
++            cuda_allocated=self.cuda_allocated.profile(),
++            cuda_reserved=self.cuda_reserved.profile(),
++            cuda_max_allocated=self.cuda_max_allocated.profile(),
++            cuda_max_reserved=self.cuda_max_reserved.profile(),
++        )
++
++
++@dataclass(frozen=True, slots=True)
++class _NormalizedObservation:
++    batch_size: int
++    cuda_device_index: int | None
++    total_metrics: tuple[int | None, int | None, int | None, int | None, int | None]
++    phase_deltas: tuple[ResourceDelta, ...]
++
++
++class ObservedCostCalibrator:
++    """Aggregate successful ``ModelCost`` values without retaining raw observations."""
++
++    __slots__ = (
++        "policy",
++        "_total_observations",
++        "_successful_samples",
++        "_ignored_zero_batch_samples",
++        "_ignored_by_status",
++        "_min_batch_size",
++        "_max_batch_size",
++        "_cuda_device_index",
++        "_cpu_rss",
++        "_cuda_allocated",
++        "_cuda_reserved",
++        "_cuda_max_allocated",
++        "_cuda_max_reserved",
++        "_phase_costs",
++    )
++
++    def __init__(self, policy: ObservedCostCalibrationPolicy | None = None) -> None:
++        if policy is None:
++            policy = ObservedCostCalibrationPolicy()
++        elif not isinstance(policy, ObservedCostCalibrationPolicy):
++            raise TypeError(
++                "ObservedCostCalibrator.policy must be an "
++                "ObservedCostCalibrationPolicy or None."
++            )
++
++        self.policy = policy
++        self._total_observations = 0
++        self._successful_samples = 0
++        self._ignored_zero_batch_samples = 0
++        self._ignored_by_status: dict[str, int] = {}
++        self._min_batch_size: int | None = None
++        self._max_batch_size: int | None = None
++        self._cuda_device_index: int | None = None
++        self._cpu_rss = _MetricAccumulator()
++        self._cuda_allocated = _MetricAccumulator()
++        self._cuda_reserved = _MetricAccumulator()
++        self._cuda_max_allocated = _MetricAccumulator()
++        self._cuda_max_reserved = _MetricAccumulator()
++        self._phase_costs: dict[tuple[str, str], _PhaseAccumulator] = {}
++
++    def observe(self, cost: ModelCost) -> bool:
++        """Observe one cost; return ``True`` only when it contributes to the profile."""
++
++        if not isinstance(cost, ModelCost):
++            raise TypeError("ObservedCostCalibrator.observe expects a ModelCost.")
++        if not isinstance(cost.status, StepStatus):
++            raise TypeError("ModelCost.status must be a StepStatus.")
++
++        self._total_observations += 1
++        if cost.status is not StepStatus.SUCCESS:
++            key = cost.status.value
++            self._ignored_by_status[key] = self._ignored_by_status.get(key, 0) + 1
++            return False
++
++        observation = self._normalize_success(cost)
++        if observation is None:
++            self._ignored_zero_batch_samples += 1
++            return False
++
++        self._apply(observation)
++        return True
++
++    def profile(self) -> ObservedCostProfile:
++        """Return an immutable snapshot once the configured sample floor is met."""
++
++        if self._successful_samples < self.policy.min_successful_samples:
++            raise ObservedCostCalibrationError(
++                "not enough successful samples to build a profile",
++                dimensions=("samples",),
++            )
++        assert self._min_batch_size is not None
++        assert self._max_batch_size is not None
++
++        ignored_by_status = tuple(sorted(self._ignored_by_status.items()))
++        ignored_samples = self._ignored_zero_batch_samples + sum(
++            count for _status, count in ignored_by_status
++        )
++        phase_costs = tuple(
++            self._phase_costs[key].profile()
++            for key in sorted(self._phase_costs)
++        )
++        return ObservedCostProfile(
++            policy=self.policy,
++            total_observations=self._total_observations,
++            successful_samples=self._successful_samples,
++            ignored_samples=ignored_samples,
++            rejected_samples=(
++                self._total_observations
++                - self._successful_samples
++                - ignored_samples
++            ),
++            ignored_zero_batch_samples=self._ignored_zero_batch_samples,
++            ignored_by_status=ignored_by_status,
++            min_batch_size=self._min_batch_size,
++            max_batch_size=self._max_batch_size,
++            cuda_device_index=self._cuda_device_index,
++            cpu_rss=self._cpu_rss.profile(),
++            cuda_allocated=self._cuda_allocated.profile(),
++            cuda_reserved=self._cuda_reserved.profile(),
++            cuda_max_allocated=self._cuda_max_allocated.profile(),
++            cuda_max_reserved=self._cuda_max_reserved.profile(),
++            phase_costs=phase_costs,
++        )
++
++    def _normalize_success(self, cost: ModelCost) -> _NormalizedObservation | None:
++        batch_size = self._validate_non_negative_model_int(
++            cost.batch_size,
++            label="ModelCost.batch_size",
++        )
++        row_count = self._validate_non_negative_model_int(
++            cost.row_count,
++            label="ModelCost.row_count",
++        )
++        if batch_size != row_count:
++            raise ObservedCostCalibrationError(
++                "ModelCost.batch_size and row_count must match",
++                dimensions=("items",),
++            )
++        if batch_size == 0:
++            return None
++
++        total_metrics = (
++            _validate_delta(
++                cost.total_cpu_rss_delta_bytes,
++                label="ModelCost.total_cpu_rss_delta_bytes",
++            ),
++            _validate_delta(
++                cost.total_cuda_allocated_delta_bytes,
++                label="ModelCost.total_cuda_allocated_delta_bytes",
++            ),
++            _validate_delta(
++                cost.total_cuda_reserved_delta_bytes,
++                label="ModelCost.total_cuda_reserved_delta_bytes",
++            ),
++            _validate_delta(
++                cost.total_cuda_max_allocated_delta_bytes,
++                label="ModelCost.total_cuda_max_allocated_delta_bytes",
++            ),
++            _validate_delta(
++                cost.total_cuda_max_reserved_delta_bytes,
++                label="ModelCost.total_cuda_max_reserved_delta_bytes",
++            ),
++        )
++
++        phase_deltas: list[ResourceDelta] = []
++        seen_phase_pairs: set[tuple[str, str]] = set()
++        for index, delta in enumerate(cost.phase_deltas):
++            if not isinstance(delta, ResourceDelta):
++                raise TypeError(f"ModelCost.phase_deltas[{index}] must be a ResourceDelta.")
++            start_phase = _validate_phase_name(
++                delta.start_phase,
++                label=f"ModelCost.phase_deltas[{index}].start_phase",
++            )
++            end_phase = _validate_phase_name(
++                delta.end_phase,
++                label=f"ModelCost.phase_deltas[{index}].end_phase",
++            )
++            phase_pair = (start_phase, end_phase)
++            if phase_pair in seen_phase_pairs:
++                raise ObservedCostCalibrationError(
++                    "one ModelCost cannot repeat an adjacent phase pair",
++                    dimensions=("phases",),
++                )
++            seen_phase_pairs.add(phase_pair)
++            phase_deltas.append(
++                ResourceDelta(
++                    start_phase=start_phase,
++                    end_phase=end_phase,
++                    cpu_rss_delta_bytes=_validate_delta(
++                        delta.cpu_rss_delta_bytes,
++                        label=f"ModelCost.phase_deltas[{index}].cpu_rss_delta_bytes",
++                    ),
++                    cuda_allocated_delta_bytes=_validate_delta(
++                        delta.cuda_allocated_delta_bytes,
++                        label=(
++                            f"ModelCost.phase_deltas[{index}]."
++                            "cuda_allocated_delta_bytes"
++                        ),
++                    ),
++                    cuda_reserved_delta_bytes=_validate_delta(
++                        delta.cuda_reserved_delta_bytes,
++                        label=(
++                            f"ModelCost.phase_deltas[{index}]."
++                            "cuda_reserved_delta_bytes"
++                        ),
++                    ),
++                    cuda_max_allocated_delta_bytes=_validate_delta(
++                        delta.cuda_max_allocated_delta_bytes,
++                        label=(
++                            f"ModelCost.phase_deltas[{index}]."
++                            "cuda_max_allocated_delta_bytes"
++                        ),
++                    ),
++                    cuda_max_reserved_delta_bytes=_validate_delta(
++                        delta.cuda_max_reserved_delta_bytes,
++                        label=(
++                            f"ModelCost.phase_deltas[{index}]."
++                            "cuda_max_reserved_delta_bytes"
++                        ),
++                    ),
++                )
++            )
++
++        new_phase_pairs = {
++            (delta.start_phase, delta.end_phase)
++            for delta in phase_deltas
++            if (delta.start_phase, delta.end_phase) not in self._phase_costs
++        }
++        if len(self._phase_costs) + len(new_phase_pairs) > self.policy.max_phase_pairs:
++            raise ObservedCostCalibrationError(
++                "observation would exceed max_phase_pairs",
++                dimensions=("phases",),
++            )
++
++        cuda_device_index = _validate_optional_device_index(
++            cost.cuda_device_index,
++            label="ModelCost.cuda_device_index",
++        )
++        has_cuda_metrics = any(value is not None for value in total_metrics[1:]) or any(
++            self._phase_has_cuda_metrics(delta) for delta in phase_deltas
++        )
++        if has_cuda_metrics and cuda_device_index is None:
++            raise ObservedCostCalibrationError(
++                "known CUDA metrics require a concrete CUDA device index",
++                dimensions=("cuda",),
++            )
++        if cuda_device_index is not None:
++            expected = self.policy.expected_cuda_device_index
++            if expected is not None and cuda_device_index != expected:
++                raise ObservedCostCalibrationError(
++                    "CUDA observation does not match the policy device",
++                    dimensions=(f"cuda:{cuda_device_index}",),
++                )
++            if (
++                self._cuda_device_index is not None
++                and cuda_device_index != self._cuda_device_index
++            ):
++                raise ObservedCostCalibrationError(
++                    "CUDA observations from different devices cannot share one profile",
++                    dimensions=(
++                        f"cuda:{self._cuda_device_index}",
++                        f"cuda:{cuda_device_index}",
++                    ),
++                )
++
++        return _NormalizedObservation(
++            batch_size=batch_size,
++            cuda_device_index=cuda_device_index if has_cuda_metrics else None,
++            total_metrics=total_metrics,
++            phase_deltas=tuple(phase_deltas),
++        )
++
++    def _apply(self, observation: _NormalizedObservation) -> None:
++        batch_size = observation.batch_size
++        (
++            cpu_rss,
++            cuda_allocated,
++            cuda_reserved,
++            cuda_max_allocated,
++            cuda_max_reserved,
++        ) = observation.total_metrics
++
++        self._cpu_rss.observe(cpu_rss, batch_size=batch_size)
++        self._cuda_allocated.observe(cuda_allocated, batch_size=batch_size)
++        self._cuda_reserved.observe(cuda_reserved, batch_size=batch_size)
++        self._cuda_max_allocated.observe(
++            cuda_max_allocated,
++            batch_size=batch_size,
++        )
++        self._cuda_max_reserved.observe(
++            cuda_max_reserved,
++            batch_size=batch_size,
++        )
++
++        for delta in observation.phase_deltas:
++            key = (delta.start_phase, delta.end_phase)
++            accumulator = self._phase_costs.get(key)
++            if accumulator is None:
++                accumulator = _PhaseAccumulator(*key)
++                self._phase_costs[key] = accumulator
++            accumulator.observe(delta, batch_size=batch_size)
++
++        self._successful_samples += 1
++        self._min_batch_size = (
++            batch_size
++            if self._min_batch_size is None
++            else min(self._min_batch_size, batch_size)
++        )
++        self._max_batch_size = (
++            batch_size
++            if self._max_batch_size is None
++            else max(self._max_batch_size, batch_size)
++        )
++        if observation.cuda_device_index is not None:
++            self._cuda_device_index = observation.cuda_device_index
++
++    @staticmethod
++    def _validate_non_negative_model_int(value: object, *, label: str) -> int:
++        if not isinstance(value, int) or isinstance(value, bool):
++            raise TypeError(f"{label} must be an integer.")
++        if value < 0:
++            raise ValueError(f"{label} must be non-negative.")
++        return value
++
++    @staticmethod
++    def _phase_has_cuda_metrics(delta: ResourceDelta) -> bool:
++        return any(
++            value is not None
++            for value in (
++                delta.cuda_allocated_delta_bytes,
++                delta.cuda_reserved_delta_bytes,
++                delta.cuda_max_allocated_delta_bytes,
++                delta.cuda_max_reserved_delta_bytes,
++            )
++        )
+diff --git a/enn_torch_dev/runtime/cost.py b/enn_torch_dev/runtime/cost.py
+index d9c1d9a..33da0d9 100644
+--- a/enn_torch_dev/runtime/cost.py
++++ b/enn_torch_dev/runtime/cost.py
+@@ -196,6 +196,7 @@ class ModelCost:
+     total_cuda_max_allocated_delta_bytes: int | None
+     total_cuda_max_reserved_delta_bytes: int | None
+     phase_deltas: tuple[ResourceDelta, ...]
++    cuda_device_index: int | None = None
+ 
+ 
+ class ModelCostProbe:
+@@ -205,6 +206,7 @@ class ModelCostProbe:
+         if not isinstance(result, StepResult):
+             raise TypeError("ModelCostProbe.estimate_step expects a StepResult.")
+         samples = tuple(result.resource_samples)
++        cuda_device_index = self._cuda_device_index(samples)
+         phase_deltas = tuple(
+             self._delta_pair(start, end)
+             for start, end in zip(samples, samples[1:])
+@@ -228,8 +230,29 @@ class ModelCostProbe:
+                 None if total is None else total.cuda_max_reserved_delta_bytes
+             ),
+             phase_deltas=phase_deltas,
++            cuda_device_index=cuda_device_index,
+         )
+ 
++    @staticmethod
++    def _cuda_device_index(samples: tuple[ResourceSample, ...]) -> int | None:
++        indices = {
++            sample.cuda_device_index
++            for sample in samples
++            if sample.cuda_device_index is not None
++            and any(
++                value is not None
++                for value in (
++                    sample.cuda_allocated_bytes,
++                    sample.cuda_reserved_bytes,
++                    sample.cuda_max_allocated_bytes,
++                    sample.cuda_max_reserved_bytes,
++                )
++            )
++        }
++        if len(indices) != 1:
++            return None
++        return next(iter(indices))
++
+     @staticmethod
+     def _delta_pair(start: ResourceSample, end: ResourceSample) -> ResourceDelta:
+         same_cuda_device = start.cuda_device_index == end.cuda_device_index
+diff --git a/enn_torch_dev/debug/runtime/test_runtime_integration.py b/enn_torch_dev/debug/runtime/test_runtime_integration.py
+--- a/enn_torch_dev/debug/runtime/test_runtime_integration.py
++++ b/enn_torch_dev/debug/runtime/test_runtime_integration.py
+@@ -398,11 +398,17 @@ def test_runtime_development_api_is_exported_without_stable_namespace_leak() -> None:
+         "ConservativeRuntimeOrchestrator",
+         "ConservativeRuntimeSession",
+         "InitialBatchBudgetPolicy",
++        "ObservedCostCalibrationError",
++        "ObservedCostCalibrationPolicy",
++        "ObservedCostCalibrator",
++        "ObservedCostMetricProfile",
++        "ObservedCostProfile",
++        "ObservedPhaseCostProfile",
+         "RuntimePassHistory",
+         "RuntimePassResult",
+         "RuntimePassSummary",
+         "RuntimeSessionRecord",
+         "recommend_initial_batch_budget",
+         "summarize_runtime_pass",
+     }
+ 
+diff --git a/docs/runtime_development_workflow.md b/docs/runtime_development_workflow.md
+--- a/docs/runtime_development_workflow.md
++++ b/docs/runtime_development_workflow.md
+@@ -22,6 +22,10 @@ finite KVBatch pass source
+   -> RuntimePassHistory
+   -> ConservativeRuntimeSession
+   -> optional RuntimePassSourceFactory for fresh per-pass sources
++
++completed StepResult.resource_samples
++  -> optional ModelCostProbe
++  -> optional ObservedCostCalibrator -> ObservedCostProfile
+ ```
+ 
+ `ConservativeRuntimeSession` connects existing components across multiple finite
+@@ -125,6 +129,53 @@ required when a finite limit cannot otherwise be derived. See
+ [`dev_initial_batch_budget.md`](dev_initial_batch_budget.md) for formulas and
+ boundaries.
+ 
++## Optional observed-cost calibration
++
++Use `ObservedCostCalibrator` when completed runtime observations should be reduced
++to a bounded per-item cost envelope for later inspection or a separately reviewed
++admission layer:
++
++```python
++from enn_torch_dev.runtime import (
++    ModelCostProbe,
++    ObservedCostCalibrationPolicy,
++    ObservedCostCalibrator,
++)
++
++cost_probe = ModelCostProbe()
++calibrator = ObservedCostCalibrator(
++    ObservedCostCalibrationPolicy(
++        min_successful_samples=3,
++        max_phase_pairs=16,
++        expected_cuda_device_index=0,
++    )
++)
++
++for pass_result in completed_pass_results:
++    for step_result in pass_result.results:
++        calibrator.observe(cost_probe.estimate_step(step_result))
++
++observed_profile = calibrator.profile()
++```
++
++Only successful positive-batch observations contribute numeric values. Faults and
++zero-batch successes are counted but ignored. Available deltas are converted to
++per-item costs with ceiling division, negative deltas are clamped to zero, and
++the maximum value observed for each total and adjacent-phase metric is retained.
++Unknown values remain distinct from observed zero.
++
++One profile accepts CUDA metrics from only one concrete device. The policy may
++bind that device before the first observation. Phase-pair state is bounded by
++`max_phase_pairs`. The calibrator retains scalar accumulators and phase names,
++not raw `ModelCost`, `StepResult`, `ResourceSample`, tensor, store, or loss
++objects.
++
++Calibration is explicit and side-effect free. It does not execute the model,
++consume a source, mutate a governor, persist a profile, or decide whether a future
++pass is admissible. See
++[`dev_observed_cost_calibration.md`](dev_observed_cost_calibration.md) for the
++full contract.
++
+ ## Optional pressure-aware composition
+ 
+ The governor pressure guard becomes operational when the caller supplies either
+@@ -275,5 +326,7 @@ It does not provide:
+ - automatic `ResourceMonitor` creation;
+ - mid-pass capacity refresh or free-memory admission control;
+ - proof that an initial recommendation is safe for unobserved activation or allocator costs;
++- persistent observed-cost profile storage;
++- automatic use of an `ObservedCostProfile` for admission or governor updates;
+ - learned field weights;
+ - stable `enn_torch` API exposure.
