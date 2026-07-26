@@ -134,7 +134,10 @@ def test_resource_monitor_satisfies_capacity_provider_protocol() -> None:
 
 
 def test_capacity_provider_and_provenance_fields_are_appended_for_compatibility() -> None:
-    assert [field.name for field in fields(RuntimePassResult)][-1] == "resource_capacity"
+    assert [field.name for field in fields(RuntimePassResult)][-2:] == [
+        "resource_capacity",
+        "admission_assessments",
+    ]
     assert [field.name for field in fields(RuntimePassSummary)][-10:] == [
         "resource_capacity",
         "consecutive_high_pressure_passes",

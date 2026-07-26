@@ -394,6 +394,7 @@ def test_runtime_session_keeps_completed_history_when_later_pass_raises() -> Non
 
 def test_runtime_development_api_is_exported_without_stable_namespace_leak() -> None:
     development_names = {
+        "AdmissionUnknownAction",
         "BatchBudgetRecommendation",
         "BatchBudgetRecommendationError",
         "ConservativeRuntimeGovernor",
@@ -407,10 +408,13 @@ def test_runtime_development_api_is_exported_without_stable_namespace_leak() -> 
         "ObservedCostProfile",
         "ObservedPhaseCostProfile",
         "PrePassAdmissionAssessment",
+        "PrePassAdmissionBlocked",
         "PrePassAdmissionDimension",
         "PrePassAdmissionError",
+        "PrePassAdmissionGate",
         "PrePassAdmissionPolicy",
         "PrePassAdmissionStatus",
+        "ResourceSampleProvider",
         "RuntimePassHistory",
         "RuntimePassResult",
         "RuntimePassSummary",

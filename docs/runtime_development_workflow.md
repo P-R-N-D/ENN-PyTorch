@@ -14,6 +14,8 @@ static footprints + reference BatchCost + ResourceCapacity
 finite KVBatch pass source
   -> BudgetedBatcher
   -> RuntimeRetryRunner
+  -> optional per-attempt PrePassAdmissionGate
+  -> configured RuntimeStep
   -> optional fixed or pass-scoped capacity pressure assessment
   -> ConservativeRuntimeGovernor
   -> ConservativeRuntimeOrchestrator
@@ -211,6 +213,53 @@ unknown. CUDA-bearing capacity, baseline, and profile provenance must identify t
 same concrete device. See
 [`dev_prepass_admission.md`](dev_prepass_admission.md) for formulas and boundaries.
 
+## Optional pre-pass admission gate
+
+Use the gate only when a completed observed profile should be enforced immediately
+before every runtime execution attempt:
+
+```python
+from enn_torch_dev.runtime import (
+    AdmissionUnknownAction,
+    ConservativeRuntimeOrchestrator,
+    PrePassAdmissionPolicy,
+    ResourceMonitor,
+)
+
+monitor = ResourceMonitor(cuda_device=0)
+orchestrator = ConservativeRuntimeOrchestrator(
+    runtime_step,
+    governor,
+    retry_policy=retry_policy,
+    resource_capacity_provider=monitor,
+    admission_profile=observed_profile,
+    admission_sample_provider=monitor,
+    admission_policy=PrePassAdmissionPolicy(min_profile_samples=3),
+    admission_unknown_action=AdmissionUnknownAction.BLOCK,
+)
+```
+
+The gate is disabled unless `admission_profile` is configured. When enabled, it
+requires an admission sample provider and either fixed or provider-backed
+capacity. Capacity is resolved once before the pass source is consumed and stays
+fixed for that pass. The sample provider is called once with
+`"before_admission"` immediately before each original or OOM retry-split attempt.
+
+`REJECT` always raises `PrePassAdmissionBlocked`. `UNKNOWN` also blocks by default;
+`AdmissionUnknownAction.ALLOW` permits only unknown assessments and never permits
+a rejection. The exception retains the immutable assessment but not the batch,
+baseline sample, source, tensor, store, or loss. Admission blocking is not a
+`StepStatus` because no runtime step completed.
+
+A completed `RuntimePassResult` records attempt-ordered
+`admission_assessments`. Retry-consumed OOM attempts may therefore make this tuple
+longer than the final result tuple. If a later candidate blocks, earlier
+candidates in the same pass may already have executed, but no pass result is
+created and the governor is not updated. The gate does not automatically split,
+skip, replay, or tune the blocked candidate. See
+[`dev_prepass_admission_gate.md`](dev_prepass_admission_gate.md) for the full
+contract.
+
 ## Optional pressure-aware composition
 
 The governor pressure guard becomes operational when the caller supplies either
@@ -293,6 +342,11 @@ not cache sources or replay a consumed iterator.
 `ConservativeRuntimeOrchestrator` reports a retry-recovered OOM to the governor
 even when the final yielded results are successful.
 
+When the opt-in admission gate is enabled, the original attempt and every retry
+subbatch are sampled and assessed independently before execution. The admission
+wrapper forwards the configured runtime step's optimizer attribute so the
+existing training-time retry restriction is unchanged.
+
 The conservative governor then:
 
 - shrinks configured budget fields after a yielded or retry-recovered OOM;
@@ -349,6 +403,11 @@ provider failure occurs before source consumption and before governor updates.
 The failing pass is not added to history when execution or summary construction
 fails before history append. Previously completed history records remain intact.
 
+`PrePassAdmissionBlocked` is an execution-gate exception rather than a completed
+runtime result. The blocked candidate is not executed, later candidates are not
+consumed, and the governor is not updated. Candidates completed earlier in the
+same pass are not rolled back and no partial `RuntimePassResult` is returned.
+
 ## Safety boundary
 
 This workflow is intended for bounded, single-node development execution.
@@ -362,10 +421,10 @@ It does not provide:
 - distributed execution or aggregation;
 - AutoGovernor or learned tuning;
 - automatic `ResourceMonitor` creation;
-- mid-pass capacity refresh or free-memory admission control;
+- mid-pass capacity refresh;
 - proof that an initial recommendation is safe for unobserved activation or allocator costs;
 - persistent observed-cost profile storage;
-- automatic enforcement of a `PrePassAdmissionAssessment`;
+- automatic admission-driven split, skip, replay, or rollback;
 - automatic use of an `ObservedCostProfile` for governor updates;
 - learned field weights;
 - stable `enn_torch` API exposure.
@@ -376,6 +435,7 @@ unbounded production streaming runner.
 ## Validation
 
 ```bash
+python -m pytest enn_torch_dev/debug/runtime/test_prepass_admission_gate.py -q
 python -m pytest enn_torch_dev/debug/runtime/test_runtime_capacity_provider.py -q
 python -m pytest enn_torch_dev/debug/runtime/test_runtime_source_factory.py -q
 python -m pytest enn_torch_dev/debug/runtime/test_runtime_integration.py -q

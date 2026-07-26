@@ -139,11 +139,15 @@ unknown case.
 
 ## Safety boundary
 
-This assessment is a pure calculation, not an execution gate. It does not prove
-that unobserved graph paths, allocator fragmentation, concurrent allocations, or
-workload distribution shifts are safe. Orchestrator wiring, fail-open/fail-closed
-handling, automatic split/skip behavior, persistence, multi-GPU, and distributed
-admission remain outside this slice.
+This assessment remains a pure calculation and never blocks execution by itself.
+The separate opt-in `PrePassAdmissionGate` may enforce one assessment immediately
+before each orchestrated execution attempt, including OOM retry subbatches, while
+leaving this assessor unchanged. Gate enforcement still does not prove that
+unobserved graph paths, allocator fragmentation, concurrent allocations, or
+workload distribution shifts are safe. Automatic admission-driven split/skip,
+persistence, multi-GPU, and distributed admission remain outside this slice. See
+[`dev_prepass_admission_gate.md`](dev_prepass_admission_gate.md) for the enforcement
+contract.
 
 ## Validation
 
