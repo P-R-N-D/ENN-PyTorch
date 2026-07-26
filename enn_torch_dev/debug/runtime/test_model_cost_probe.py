@@ -49,6 +49,20 @@ def _result(samples: tuple[ResourceSample, ...]) -> StepResult:
     )
 
 
+def _cuda_sample(phase: str, *, device_index: object) -> ResourceSample:
+    return ResourceSample(
+        timestamp_ns=1,
+        phase=phase,
+        cpu_rss_bytes=100,
+        cuda_available=True,
+        cuda_device_index=device_index,  # type: ignore[arg-type]
+        cuda_allocated_bytes=10,
+        cuda_reserved_bytes=20,
+        cuda_max_allocated_bytes=30,
+        cuda_max_reserved_bytes=40,
+    )
+
+
 def test_model_cost_probe_computes_phase_deltas() -> None:
     result = _result(
         (
@@ -160,6 +174,86 @@ def test_model_cost_probe_uses_cuda_device_from_cuda_bearing_samples_only() -> N
 
     cost = ModelCostProbe().estimate_step(result)
     assert cost.cuda_device_index == 0
+
+
+def test_model_cost_probe_rejects_missing_cuda_provenance_between_matching_devices() -> None:
+    result = _result(
+        (
+            _cuda_sample("before_step", device_index=0),
+            _cuda_sample("after_to_store", device_index=None),
+            _cuda_sample("after_forward", device_index=0),
+        )
+    )
+
+    assert ModelCostProbe().estimate_step(result).cuda_device_index is None
+
+
+@pytest.mark.parametrize(
+    ("start_index", "end_index"),
+    [(None, None), (0, None), (None, 0)],
+)
+def test_model_cost_probe_requires_concrete_device_for_cuda_deltas(
+    start_index: int | None,
+    end_index: int | None,
+) -> None:
+    cost = ModelCostProbe().estimate_step(
+        _result(
+            (
+                _cuda_sample("before_step", device_index=start_index),
+                _cuda_sample("after_forward", device_index=end_index),
+            )
+        )
+    )
+
+    assert cost.cuda_device_index is None
+    assert cost.total_cuda_allocated_delta_bytes is None
+    assert cost.total_cuda_reserved_delta_bytes is None
+    assert cost.total_cuda_max_allocated_delta_bytes is None
+    assert cost.total_cuda_max_reserved_delta_bytes is None
+    phase = cost.phase_deltas[0]
+    assert phase.cuda_allocated_delta_bytes is None
+    assert phase.cuda_reserved_delta_bytes is None
+    assert phase.cuda_max_allocated_delta_bytes is None
+    assert phase.cuda_max_reserved_delta_bytes is None
+
+
+@pytest.mark.parametrize("device_index", [True, False, -1, 1.5, "0"])
+def test_model_cost_probe_rejects_invalid_cuda_device_indices(
+    device_index: object,
+) -> None:
+    cost = ModelCostProbe().estimate_step(
+        _result(
+            (
+                _cuda_sample("before_step", device_index=device_index),
+                _cuda_sample("after_forward", device_index=device_index),
+            )
+        )
+    )
+
+    assert cost.cuda_device_index is None
+    assert cost.total_cuda_allocated_delta_bytes is None
+
+
+def test_model_cost_probe_preserves_concrete_device_cuda_deltas() -> None:
+    start = _cuda_sample("before_step", device_index=0)
+    end = ResourceSample(
+        timestamp_ns=2,
+        phase="after_forward",
+        cpu_rss_bytes=150,
+        cuda_available=True,
+        cuda_device_index=0,
+        cuda_allocated_bytes=70,
+        cuda_reserved_bytes=90,
+        cuda_max_allocated_bytes=110,
+        cuda_max_reserved_bytes=130,
+    )
+
+    cost = ModelCostProbe().estimate_step(_result((start, end)))
+    assert cost.cuda_device_index == 0
+    assert cost.total_cuda_allocated_delta_bytes == 60
+    assert cost.total_cuda_reserved_delta_bytes == 70
+    assert cost.total_cuda_max_allocated_delta_bytes == 80
+    assert cost.total_cuda_max_reserved_delta_bytes == 90
 
 
 def test_model_cost_probe_handles_forward_only_samples() -> None:

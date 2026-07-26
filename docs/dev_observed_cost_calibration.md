@@ -46,8 +46,12 @@ separately, so `None` remains distinguishable from a known zero envelope.
 ## CUDA provenance
 
 `ModelCost` retains an append-only `cuda_device_index` resolved by
-`ModelCostProbe` when all CUDA-bearing resource samples identify one device.
-Known CUDA total or phase metrics require this concrete provenance.
+`ModelCostProbe` only when every CUDA-bearing resource sample supplies the same
+bool-excluding, non-negative integer index. Any missing or invalid index leaves
+the model cost unbound. CUDA deltas likewise require both endpoints to supply
+the same concrete index; `None == None` is not a device match, and the current
+CUDA device is never inferred. Known CUDA total or phase metrics require this
+concrete provenance.
 
 One `ObservedCostCalibrator` profile may contain CUDA observations from only one
 device. `ObservedCostCalibrationPolicy.expected_cuda_device_index` can bind the

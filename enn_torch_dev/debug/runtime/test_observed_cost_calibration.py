@@ -1,13 +1,17 @@
 from __future__ import annotations
 
 import pytest
+import torch
 
 from enn_torch_dev.runtime import (
     ModelCost,
+    ModelCostProbe,
     ObservedCostCalibrationError,
     ObservedCostCalibrationPolicy,
     ObservedCostCalibrator,
     ResourceDelta,
+    ResourceSample,
+    StepResult,
     StepStatus,
 )
 
@@ -125,6 +129,55 @@ def test_calibrator_rejects_cuda_metrics_without_device_provenance() -> None:
     calibrator = ObservedCostCalibrator()
     with pytest.raises(ObservedCostCalibrationError, match="device index"):
         calibrator.observe(_cost(allocated=10))
+
+
+def test_probe_missing_cuda_provenance_is_rejected_without_partial_calibration() -> None:
+    calibrator = ObservedCostCalibrator()
+    calibrator.observe(
+        _cost(
+            cpu=4,
+            phases=(ResourceDelta("accepted", "phase", cpu_rss_delta_bytes=2),),
+        )
+    )
+    samples = tuple(
+        ResourceSample(
+            timestamp_ns=index,
+            phase=phase,
+            cpu_rss_bytes=100 + index,
+            cuda_available=True,
+            cuda_device_index=device_index,
+            cuda_allocated_bytes=10 + index,
+            cuda_reserved_bytes=20 + index,
+            cuda_max_allocated_bytes=30 + index,
+            cuda_max_reserved_bytes=40 + index,
+        )
+        for index, (phase, device_index) in enumerate(
+            (("before_step", 0), ("missing_device", None), ("after_forward", 0))
+        )
+    )
+    cost = ModelCostProbe().estimate_step(
+        StepResult(
+            status=StepStatus.SUCCESS,
+            phase=None,
+            batch_size=2,
+            row_ids=torch.tensor([0, 1]),
+            resource_samples=samples,
+        )
+    )
+
+    assert cost.cuda_device_index is None
+    assert cost.total_cuda_allocated_delta_bytes == 2
+    with pytest.raises(ObservedCostCalibrationError, match="device index"):
+        calibrator.observe(cost)
+
+    profile = calibrator.profile()
+    assert profile.total_observations == 2
+    assert profile.successful_samples == 1
+    assert profile.rejected_samples == 1
+    assert profile.cpu_rss.max_bytes_per_item == 2
+    assert [(phase.start_phase, phase.end_phase) for phase in profile.phase_costs] == [
+        ("accepted", "phase")
+    ]
 
 
 def test_calibrator_rejects_cuda_device_mismatch_without_partial_acceptance() -> None:

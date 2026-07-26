@@ -235,11 +235,9 @@ class ModelCostProbe:
 
     @staticmethod
     def _cuda_device_index(samples: tuple[ResourceSample, ...]) -> int | None:
-        indices = {
-            sample.cuda_device_index
-            for sample in samples
-            if sample.cuda_device_index is not None
-            and any(
+        indices: set[int] = set()
+        for sample in samples:
+            if not any(
                 value is not None
                 for value in (
                     sample.cuda_allocated_bytes,
@@ -247,15 +245,24 @@ class ModelCostProbe:
                     sample.cuda_max_allocated_bytes,
                     sample.cuda_max_reserved_bytes,
                 )
-            )
-        }
+            ):
+                continue
+            if not ModelCostProbe._is_concrete_cuda_device_index(
+                sample.cuda_device_index
+            ):
+                return None
+            indices.add(sample.cuda_device_index)
         if len(indices) != 1:
             return None
         return next(iter(indices))
 
     @staticmethod
     def _delta_pair(start: ResourceSample, end: ResourceSample) -> ResourceDelta:
-        same_cuda_device = start.cuda_device_index == end.cuda_device_index
+        same_cuda_device = (
+            ModelCostProbe._is_concrete_cuda_device_index(start.cuda_device_index)
+            and ModelCostProbe._is_concrete_cuda_device_index(end.cuda_device_index)
+            and start.cuda_device_index == end.cuda_device_index
+        )
         return ResourceDelta(
             start_phase=start.phase,
             end_phase=end.phase,
@@ -287,3 +294,7 @@ class ModelCostProbe:
                 else None
             ),
         )
+
+    @staticmethod
+    def _is_concrete_cuda_device_index(value: object) -> bool:
+        return isinstance(value, int) and not isinstance(value, bool) and value >= 0

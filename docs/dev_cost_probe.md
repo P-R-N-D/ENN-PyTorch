@@ -100,11 +100,15 @@ Recorded values include:
 - total CUDA max allocated delta;
 - total CUDA max reserved delta;
 - per-phase resource deltas;
-- one concrete `cuda_device_index` when all CUDA-bearing samples identify the same device.
+- one concrete `cuda_device_index` only when every CUDA-bearing sample provides
+  the same bool-excluding, non-negative integer device index.
 
 If a field is unavailable in either endpoint sample, the corresponding delta is
-`None`. If CUDA-bearing samples identify different devices, CUDA deltas that cross
-devices remain unknown and `ModelCost.cuda_device_index` is `None`.
+`None`. CUDA deltas are computed only when both endpoints provide the same
+concrete device index; `None == None` is not treated as a device match. If any
+CUDA-bearing sample has a missing or invalid index, or samples identify different
+devices, `ModelCost.cuda_device_index` is `None`. The probe never substitutes the
+current CUDA device for missing or invalid provenance.
 
 ## Out of Scope
 

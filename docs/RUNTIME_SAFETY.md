@@ -40,6 +40,7 @@ Use this document before running code that can allocate accelerator memory, writ
 - Calibrate only completed `ModelCost` records; the calibrator must not execute a model, consume a source, mutate governor/history state, or retain `StepResult`, `ResourceSample`, tensor, store, or loss objects.
 - Use only successful positive-batch observations for numeric calibration. Count fault and zero-batch observations separately, clamp negative deltas to zero, and preserve unknown values instead of fabricating costs.
 - Keep one observed-cost profile bound to at most one concrete CUDA device and cap retained phase-pair accumulators with `max_phase_pairs`; do not merge mismatched devices or grow calibration state without a bound.
+- Resolve `ModelCost` CUDA provenance only when every CUDA-bearing sample has the same bool-excluding, non-negative integer index, and compute CUDA deltas only between endpoints with that same concrete index; never treat `None == None` as a device match or infer the current CUDA device for missing or invalid provenance.
 - Treat observed-cost envelopes as prior execution evidence, not admission proof or permission to bypass retry, pressure, or capacity checks.
 - Normalize CPU RSS against the smallest known physical or hierarchy-effective cgroup capacity; do not assume host physical memory or a leaf cgroup file is the process limit in containers.
 - Do not clamp pressure ratios to `1.0`; ratios above one must remain visible for diagnosis.
