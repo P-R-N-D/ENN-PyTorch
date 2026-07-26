@@ -32,7 +32,10 @@ Use this document before running code that can allocate accelerator memory, writ
 - Treat missing capacity or observation values as unknown, not zero utilization.
 - Keep initial batch-budget recommendation pure: it must not execute a model, consume a source, mutate governor/history state, or admit a pass.
 - Require device-resolved model and optimizer footprint provenance; do not guess whether non-zero static tensor bytes belong to CPU or CUDA.
+- Require positive reference device cost to be explicitly bound to the matching `cuda:<index>` capacity; never apply aggregate non-CPU bytes to an arbitrary CUDA device, and reject unsupported, bare, mismatched, or multiple non-zero device provenance.
+- Treat a zero total byte cost as known and non-limiting even when the reference item count is missing or zero, while preserving positive totals with unknown item count as unknown per-item cost.
 - Use ceiling division for reference per-item costs, never clamp an insufficient computed limit upward to `min_items`, and require an explicit `fallback_max_items` when a relevant dimension remains unknown.
+- Preserve the original capacity, reference batch cost, resolved policy, and normalized reference device provenance in the recommendation so its static calculation can be audited.
 - Treat a recommended initial budget as a conservative starting point, not proof that unobserved activations, allocator overhead, or the next pass are admissible.
 - Normalize CPU RSS against the smallest known physical or hierarchy-effective cgroup capacity; do not assume host physical memory or a leaf cgroup file is the process limit in containers.
 - Do not clamp pressure ratios to `1.0`; ratios above one must remain visible for diagnosis.

@@ -89,8 +89,15 @@ from enn_torch_dev.runtime import (
 )
 
 recommendation = recommend_initial_batch_budget(
-    ResourceCapacity(cpu_total_bytes=host_bytes),
+    ResourceCapacity(
+        cpu_total_bytes=host_bytes,
+        cuda_total_bytes=device_bytes,
+        cuda_device_index=0,
+    ),
     reference_batch_cost,
+    reference_device_bytes_by_device={
+        "cuda:0": reference_batch_cost.device_bytes or 0,
+    },
     model_footprint=ModelFootprint.from_module(model),
     optimizer_footprint=OptimizerFootprint.from_optimizer(optimizer),
     policy=InitialBatchBudgetPolicy(
@@ -105,9 +112,14 @@ governor = ConservativeRuntimeGovernor(recommendation.recommended_budget)
 The helper is deterministic and side-effect free. It does not execute the model,
 consume a source, mutate governor or history state, or decide whether a pass is
 admissible. Model and optimizer footprints retain device-resolved byte maps so
-CPU and the configured CUDA device are accounted independently. Unknown capacity
-or cost remains unknown; an explicit `fallback_max_items` is required when a
-finite limit cannot otherwise be derived. See
+CPU and the configured CUDA device are accounted independently. Positive
+reference device bytes likewise require an explicit mapping to the matching
+`cuda:<index>`; aggregate non-CPU cost is not assigned to an arbitrary CUDA
+capacity. Zero byte totals remain non-limiting without an item count. The result
+preserves the original capacity, reference cost, resolved policy, and normalized
+reference device mapping for audit and reproduction. Unknown capacity or
+positive per-item cost remains unknown; an explicit `fallback_max_items` is
+required when a finite limit cannot otherwise be derived. See
 [`dev_initial_batch_budget.md`](dev_initial_batch_budget.md) for formulas and
 boundaries.
 

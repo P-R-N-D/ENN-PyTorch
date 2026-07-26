@@ -11,7 +11,7 @@ session begins:
 ```text
 ResourceCapacity
 + model and optimizer tensor footprints by device
-+ reference BatchCost
++ reference BatchCost and explicit device-byte provenance
 + explicit utilization, reserve, and item limits
   -> recommend_initial_batch_budget(...)
   -> BatchBudgetRecommendation
@@ -24,7 +24,14 @@ calibration data.
 ## Device provenance
 
 `ModelFootprint` and `OptimizerFootprint` retain append-only `bytes_by_device`
-maps. The recommender uses only:
+maps. The reference batch's aggregate `BatchCost.device_bytes` is accompanied by
+the separate `reference_device_bytes_by_device` recommender input. The mapping
+must sum exactly to the aggregate and bind every non-zero byte to the configured
+`cuda:<index>` capacity. Bare `cuda`, a different CUDA index, MPS, XPU, and
+multiple non-zero devices are rejected; aggregate non-CPU bytes are never
+assigned to an arbitrary CUDA capacity.
+
+The recommender uses only:
 
 - `cpu` bytes against `ResourceCapacity.effective_cpu_bytes`;
 - `cuda` or the matching `cuda:<index>` bytes against the configured CUDA
@@ -56,21 +63,27 @@ item limit = floor(usable bytes / bytes per item)
 The final item recommendation is the minimum of all known CPU, CUDA, and policy
 limits. A limit below `min_items` is an error; it is never clamped upward.
 
-`None` means unknown and is never treated as zero. A zero byte cost is explicitly
-non-limiting. Unknown dimensions require `fallback_max_items`; otherwise the
-helper raises `BatchBudgetRecommendationError`.
+`None` means unknown and is never treated as zero. A zero total byte cost is
+explicitly non-limiting even when the reference item count is `None` or zero.
+Positive totals with an unavailable item count have unknown per-item cost.
+Unknown dimensions require `fallback_max_items`; otherwise the helper raises
+`BatchBudgetRecommendationError`.
 
 ## Result contract
 
 `BatchBudgetRecommendation` includes:
 
 - the recommended `BatchBudget`;
+- the original `ResourceCapacity`, reference `BatchCost`, and resolved policy;
+- sorted immutable reference device-byte provenance;
 - limiting dimensions;
 - capacity, fixed-footprint, usable-byte, per-item, and item-limit values;
 - whether fallback was used;
 - deterministic warning strings.
 
-The returned byte budgets represent variable batch headroom after utilization,
+The preserved inputs make utilization, reserve, original totals, and physical or
+cgroup CPU-capacity provenance auditable from the result. The returned byte
+budgets represent variable batch headroom after utilization,
 reserve, and known static tensor footprints have been removed.
 
 ## Known limits

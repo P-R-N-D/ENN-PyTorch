@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from numbers import Real
 
 from enn_torch_dev.data import BatchCost
@@ -165,6 +165,10 @@ class BatchBudgetRecommendation:
     device_items_limit: int | None
     fallback_used: bool = False
     warnings: tuple[str, ...] = ()
+    capacity: ResourceCapacity = field(default_factory=ResourceCapacity)
+    reference_batch_cost: BatchCost = field(default_factory=BatchCost)
+    policy: InitialBatchBudgetPolicy = field(default_factory=InitialBatchBudgetPolicy)
+    reference_device_bytes_by_device: tuple[tuple[str, int], ...] = ()
 
 
 def _validated_device_bytes(
@@ -264,11 +268,75 @@ def _fixed_bytes_by_capacity(
 
 
 def _bytes_per_item(total_bytes: int | None, num_items: int | None) -> int | None:
-    if total_bytes is None or num_items is None or num_items <= 0:
+    if total_bytes is None:
         return None
     if total_bytes == 0:
         return 0
+    if num_items is None or num_items <= 0:
+        return None
     return _ceil_div(total_bytes, num_items)
+
+
+def _validated_reference_device_bytes(
+    values: Mapping[str, int] | None,
+    *,
+    batch_cost: BatchCost,
+    capacity: ResourceCapacity,
+) -> tuple[tuple[str, int], ...]:
+    label = "reference_device_bytes_by_device"
+    if values is None:
+        normalized: dict[str, int] = {}
+    elif not isinstance(values, Mapping):
+        raise TypeError(f"{label} must be a mapping or None.")
+    else:
+        normalized = {}
+        for device, nbytes in values.items():
+            if not isinstance(device, str):
+                raise TypeError(f"{label} keys must be strings.")
+            if not device or device != device.strip():
+                raise ValueError(f"{label} keys must be non-empty normalized strings.")
+            normalized[device] = _validate_non_negative_int(
+                nbytes,
+                label=f"{label}[{device!r}]",
+            )
+
+    expected_total = batch_cost.device_bytes
+    provenance_total = sum(normalized.values())
+    if expected_total is None:
+        if provenance_total > 0:
+            raise BatchBudgetRecommendationError(
+                "reference device byte provenance is non-zero but "
+                "BatchCost.device_bytes is unknown",
+                dimensions=("device",),
+            )
+    elif expected_total > 0 and not normalized:
+        raise BatchBudgetRecommendationError(
+            "positive BatchCost.device_bytes requires device provenance",
+            dimensions=("device",),
+        )
+    elif provenance_total != expected_total:
+        raise BatchBudgetRecommendationError(
+            "reference device byte provenance does not match BatchCost.device_bytes",
+            dimensions=("device",),
+        )
+
+    non_zero_devices = tuple(
+        sorted(device for device, nbytes in normalized.items() if nbytes > 0)
+    )
+    if expected_total is not None and expected_total > 0:
+        if capacity.cuda_device_index is None:
+            raise BatchBudgetRecommendationError(
+                "device memory demand is known but CUDA capacity is unavailable",
+                dimensions=("device",),
+            )
+        target = f"cuda:{capacity.cuda_device_index}"
+        if non_zero_devices != (target,):
+            raise BatchBudgetRecommendationError(
+                "reference device bytes are not bound exclusively to the "
+                "configured CUDA device",
+                dimensions=non_zero_devices,
+            )
+    return tuple(sorted(normalized.items()))
 
 
 def _usable_bytes(
@@ -290,6 +358,7 @@ def recommend_initial_batch_budget(
     model_footprint: ModelFootprint | None = None,
     optimizer_footprint: OptimizerFootprint | None = None,
     policy: InitialBatchBudgetPolicy | None = None,
+    reference_device_bytes_by_device: Mapping[str, int] | None = None,
 ) -> BatchBudgetRecommendation:
     """Return a deterministic, side-effect-free initial ``BatchBudget`` recommendation."""
 
@@ -308,6 +377,12 @@ def recommend_initial_batch_budget(
         policy = InitialBatchBudgetPolicy()
     elif not isinstance(policy, InitialBatchBudgetPolicy):
         raise TypeError("policy must be an InitialBatchBudgetPolicy or None.")
+
+    normalized_reference_device_bytes = _validated_reference_device_bytes(
+        reference_device_bytes_by_device,
+        batch_cost=batch_cost,
+        capacity=capacity,
+    )
 
     reference_num_items = batch_cost.num_items
     if reference_num_items is not None:
@@ -460,4 +535,8 @@ def recommend_initial_batch_budget(
         device_items_limit=device_items_limit,
         fallback_used=fallback_used,
         warnings=tuple(warnings),
+        capacity=capacity,
+        reference_batch_cost=batch_cost,
+        policy=policy,
+        reference_device_bytes_by_device=normalized_reference_device_bytes,
     )

@@ -93,6 +93,7 @@ def test_recommendation_keeps_cpu_and_cuda_limits_independent() -> None:
             cuda_device_index=0,
         ),
         BatchCost(host_bytes=100, device_bytes=200, num_items=2),
+        reference_device_bytes_by_device={"cuda:0": 200},
         model_footprint=_model_footprint(cuda_bytes=200),
         optimizer_footprint=_optimizer_footprint(cuda_bytes=100),
         policy=InitialBatchBudgetPolicy(
@@ -113,6 +114,127 @@ def test_recommendation_keeps_cpu_and_cuda_limits_independent() -> None:
         max_device_bytes=700,
         max_items=7,
     )
+
+
+def test_recommendation_preserves_inputs_and_is_deterministic() -> None:
+    capacity = ResourceCapacity(
+        cpu_total_bytes=10_000,
+        cpu_limit_bytes=8_000,
+        cuda_total_bytes=2_000,
+        cuda_device_index=0,
+    )
+    cost = BatchCost(host_bytes=200, device_bytes=100, num_items=2)
+    policy = InitialBatchBudgetPolicy(
+        host_utilization_ratio=0.75,
+        device_utilization_ratio=0.5,
+        host_reserve_bytes=100,
+        device_reserve_bytes=50,
+        max_items=4,
+    )
+    kwargs = {
+        "reference_device_bytes_by_device": {"cuda:0": 100, "cuda:1": 0},
+        "policy": policy,
+    }
+
+    first = recommend_initial_batch_budget(capacity, cost, **kwargs)
+    second = recommend_initial_batch_budget(capacity, cost, **kwargs)
+
+    assert first == second
+    assert first.capacity is capacity
+    assert first.reference_batch_cost is cost
+    assert first.policy is policy
+    assert first.reference_device_bytes_by_device == (
+        ("cuda:0", 100),
+        ("cuda:1", 0),
+    )
+
+
+@pytest.mark.parametrize("device", ["cuda:1", "cuda", "mps", "xpu:0"])
+def test_recommendation_rejects_reference_cost_on_unrepresented_device(
+    device: str,
+) -> None:
+    with pytest.raises(
+        BatchBudgetRecommendationError,
+        match="configured CUDA device",
+    ):
+        recommend_initial_batch_budget(
+            ResourceCapacity(cuda_total_bytes=1_000, cuda_device_index=0),
+            BatchCost(host_bytes=0, device_bytes=10, num_items=1),
+            reference_device_bytes_by_device={device: 10},
+            policy=InitialBatchBudgetPolicy(max_items=1),
+        )
+
+
+def test_recommendation_rejects_reference_cost_on_multiple_devices() -> None:
+    with pytest.raises(
+        BatchBudgetRecommendationError,
+        match="configured CUDA device",
+    ):
+        recommend_initial_batch_budget(
+            ResourceCapacity(cuda_total_bytes=1_000, cuda_device_index=0),
+            BatchCost(host_bytes=0, device_bytes=10, num_items=1),
+            reference_device_bytes_by_device={"cuda:0": 5, "cuda:1": 5},
+            policy=InitialBatchBudgetPolicy(max_items=1),
+        )
+
+
+def test_recommendation_rejects_reference_device_provenance_total_mismatch() -> None:
+    with pytest.raises(BatchBudgetRecommendationError, match="does not match"):
+        recommend_initial_batch_budget(
+            ResourceCapacity(cuda_total_bytes=1_000, cuda_device_index=0),
+            BatchCost(host_bytes=0, device_bytes=10, num_items=1),
+            reference_device_bytes_by_device={"cuda:0": 9},
+            policy=InitialBatchBudgetPolicy(max_items=1),
+        )
+
+
+def test_recommendation_requires_positive_reference_device_provenance() -> None:
+    with pytest.raises(
+        BatchBudgetRecommendationError,
+        match="requires device provenance",
+    ):
+        recommend_initial_batch_budget(
+            ResourceCapacity(cuda_total_bytes=1_000, cuda_device_index=0),
+            BatchCost(host_bytes=0, device_bytes=10, num_items=1),
+            policy=InitialBatchBudgetPolicy(max_items=1),
+        )
+
+
+@pytest.mark.parametrize("device_bytes", [None, 0])
+def test_recommendation_rejects_nonzero_provenance_without_device_cost(
+    device_bytes: int | None,
+) -> None:
+    with pytest.raises(BatchBudgetRecommendationError, match="device"):
+        recommend_initial_batch_budget(
+            ResourceCapacity(cuda_total_bytes=1_000, cuda_device_index=0),
+            BatchCost(host_bytes=0, device_bytes=device_bytes, num_items=1),
+            reference_device_bytes_by_device={"cuda:0": 1},
+            policy=InitialBatchBudgetPolicy(max_items=1),
+        )
+
+
+@pytest.mark.parametrize(
+    ("provenance", "error_type", "message"),
+    [
+        ({"": 0}, ValueError, "normalized"),
+        ({" cuda:0": 0}, ValueError, "normalized"),
+        ({1: 0}, TypeError, "keys"),
+        ({"cuda:0": True}, TypeError, "integer"),
+        ({"cuda:0": -1}, ValueError, "non-negative"),
+    ],
+)
+def test_recommendation_rejects_invalid_reference_device_provenance(
+    provenance: dict[object, object],
+    error_type: type[Exception],
+    message: str,
+) -> None:
+    with pytest.raises(error_type, match=message):
+        recommend_initial_batch_budget(
+            ResourceCapacity(cpu_total_bytes=1_000),
+            BatchCost(host_bytes=0, device_bytes=0, num_items=1),
+            reference_device_bytes_by_device=provenance,  # type: ignore[arg-type]
+            policy=InitialBatchBudgetPolicy(max_items=1),
+        )
 
 
 def test_recommendation_applies_reserve_and_utilization_before_item_limit() -> None:
@@ -149,15 +271,20 @@ def test_recommendation_uses_conservative_ceiling_per_item_cost() -> None:
     assert recommendation.recommended_budget.max_items == 2
 
 
-def test_recommendation_treats_zero_cost_as_non_limiting() -> None:
+@pytest.mark.parametrize("num_items", [None, 0, 4])
+def test_recommendation_treats_zero_cost_as_non_limiting(
+    num_items: int | None,
+) -> None:
     recommendation = recommend_initial_batch_budget(
         ResourceCapacity(cpu_total_bytes=1_000),
-        BatchCost(host_bytes=0, device_bytes=0, num_items=4),
+        BatchCost(host_bytes=0, device_bytes=0, num_items=num_items),
         policy=InitialBatchBudgetPolicy(max_items=3),
     )
 
     assert recommendation.host_items_limit is None
     assert recommendation.device_items_limit is None
+    assert recommendation.fallback_used is False
+    assert recommendation.warnings == ()
     assert recommendation.limiting_dimensions == ("policy_max_items",)
     assert recommendation.recommended_budget.max_items == 3
 
@@ -219,6 +346,7 @@ def test_recommendation_rejects_cuda_demand_without_cuda_capacity() -> None:
         recommend_initial_batch_budget(
             ResourceCapacity(cpu_total_bytes=1_000),
             BatchCost(host_bytes=0, device_bytes=10, num_items=1),
+            reference_device_bytes_by_device={"cuda:0": 10},
             policy=InitialBatchBudgetPolicy(max_items=1),
         )
 
@@ -231,6 +359,7 @@ def test_recommendation_rejects_cuda_demand_with_unknown_item_count(
         recommend_initial_batch_budget(
             ResourceCapacity(cpu_total_bytes=1_000),
             BatchCost(host_bytes=0, device_bytes=10, num_items=num_items),
+            reference_device_bytes_by_device={"cuda:0": 10},
             policy=InitialBatchBudgetPolicy(fallback_max_items=1),
         )
 
@@ -259,6 +388,7 @@ def test_recommendation_rejects_footprint_on_different_cuda_device() -> None:
                 cuda_device_index=0,
             ),
             BatchCost(host_bytes=0, device_bytes=10, num_items=1),
+            reference_device_bytes_by_device={"cuda:0": 10},
             model_footprint=_model_footprint(
                 cuda_bytes=10,
                 cuda_device_index=1,
