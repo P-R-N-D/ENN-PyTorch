@@ -24,6 +24,16 @@ Do not defer required documentation updates to a follow-up task. Do not edit unr
 | documentation-only changes | Changed Markdown files | `git diff --check`; link/path review | Affected docs only | Churn, stale instructions, treating plans as implementation |
 | Notion reference alignment | Repository docs that mention external Notion context | No Notion edits; verify against current repository implementation and tests | `docs/CONTEXT.md`, `docs/CURRENT_STATE.md` | Treating Notion as implementation source of truth, classifying external reference material as historical implementation, presenting unapproved roadmap as current state |
 
+## Pre-pass admission assessment changes
+
+- Check `enn_torch_dev/runtime/admission.py` and
+  `enn_torch_dev/debug/runtime/test_prepass_admission.py`.
+- Verify unknown-vs-zero semantics, current-vs-peak CUDA baseline handling,
+  `REJECT` precedence over `UNKNOWN`, concrete CUDA provenance agreement, and
+  finite known item-limit calculation.
+- Confirm the assessor remains pure and is not wired into batching, retry,
+  governor, orchestration, source consumption, or model execution.
+
 ## Required final-report result
 
 Every final report must include exactly one of:

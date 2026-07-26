@@ -25,6 +25,7 @@ finite KVBatch pass source
 completed StepResult.resource_samples
   -> optional ModelCostProbe
   -> optional ObservedCostCalibrator -> ObservedCostProfile
+  -> optional assess_prepass_admission with current ResourceSample
 ```
 
 `ConservativeRuntimeSession` connects existing components across multiple finite
@@ -173,6 +174,42 @@ consume a source, mutate a governor, persist a profile, or decide whether a futu
 pass is admissible. See
 [`dev_observed_cost_calibration.md`](dev_observed_cost_calibration.md) for the
 full contract.
+
+## Optional pre-pass admission assessment
+
+Use `assess_prepass_admission(...)` to compare one candidate batch size against
+an execution-immediate resource baseline and an observed per-item cost profile:
+
+```python
+from enn_torch_dev.runtime import (
+    PrePassAdmissionPolicy,
+    PrePassAdmissionStatus,
+    assess_prepass_admission,
+)
+
+assessment = assess_prepass_admission(
+    capacity,
+    monitor.sample("before_admission"),
+    observed_profile,
+    batch_size=candidate_batch_size,
+    policy=PrePassAdmissionPolicy(
+        host_utilization_ratio=0.9,
+        device_utilization_ratio=0.9,
+        min_profile_samples=3,
+    ),
+)
+
+if assessment.status is PrePassAdmissionStatus.REJECT:
+    inspect(assessment.rejected_dimensions)
+```
+
+The assessor returns `ADMIT`, `REJECT`, or `UNKNOWN`; it does not execute or
+block the candidate. CPU RSS and CUDA allocated/reserved projections are reported
+separately, with `REJECT` taking precedence over `UNKNOWN`. Known zero cost is
+non-limiting, while missing capacity, current usage, or per-item cost remains
+unknown. CUDA-bearing capacity, baseline, and profile provenance must identify the
+same concrete device. See
+[`dev_prepass_admission.md`](dev_prepass_admission.md) for formulas and boundaries.
 
 ## Optional pressure-aware composition
 
@@ -328,7 +365,8 @@ It does not provide:
 - mid-pass capacity refresh or free-memory admission control;
 - proof that an initial recommendation is safe for unobserved activation or allocator costs;
 - persistent observed-cost profile storage;
-- automatic use of an `ObservedCostProfile` for admission or governor updates;
+- automatic enforcement of a `PrePassAdmissionAssessment`;
+- automatic use of an `ObservedCostProfile` for governor updates;
 - learned field weights;
 - stable `enn_torch` API exposure.
 

@@ -22,7 +22,9 @@ Report outcomes distinctly:
 | `enn_torch_dev/executor/**` | `python -m pytest enn_torch_dev/debug/executor -q` | `enn_torch_dev/debug/executor` |
 | `enn_torch_dev/nn/**` | `python -m pytest enn_torch_dev/debug/nn -q` | `enn_torch_dev/debug/nn` |
 | `enn_torch_dev/runtime/**` | `python -m pytest enn_torch_dev/debug/runtime -q` | `enn_torch_dev/debug/runtime` |
-| Observed runtime-cost calibration | `python -m pytest enn_torch_dev/debug/runtime/test_observed_cost_calibration.py -q` | `enn_torch_dev/debug/runtime/test_observed_cost_calibration.py` |
+| Pre-pass admission assessment | `python -m pytest enn_torch_dev/debug/runtime/test_prepass_admission.py -q` | `enn_torch_dev/debug/runtime/test_prepass_admission.py` |
+| Observed runtime-cost calibration | `python -m pytest enn_torch_dev/debug/runtime/test_prepass_admission.py -q
+python -m pytest enn_torch_dev/debug/runtime/test_observed_cost_calibration.py -q` | `enn_torch_dev/debug/runtime/test_observed_cost_calibration.py` |
 | Initial runtime batch-budget recommendation | `python -m pytest enn_torch_dev/debug/runtime/test_budget_recommendation.py -q` | `enn_torch_dev/debug/runtime/test_budget_recommendation.py` |
 | Runtime resource pressure | `python -m pytest enn_torch_dev/debug/runtime/test_runtime_pressure.py -q` | `enn_torch_dev/debug/runtime/test_runtime_pressure.py` |
 | Runtime pass source factory | `python -m pytest enn_torch_dev/debug/runtime/test_runtime_source_factory.py -q` | `enn_torch_dev/debug/runtime/test_runtime_source_factory.py` |

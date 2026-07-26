@@ -19,7 +19,9 @@ ResourceCapacity
 
 It is a pure recommendation boundary. It does not execute a model, consume a
 source, mutate governor or history state, admit a pass, retry a batch, or persist
-calibration data.
+calibration data. Observed-cost calibration and pure pre-pass admission assessment
+are separate development helpers; this recommender invokes neither and does not
+decide whether a candidate may execute.
 
 ## Device provenance
 

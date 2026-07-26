@@ -42,6 +42,11 @@ Use this document before running code that can allocate accelerator memory, writ
 - Keep one observed-cost profile bound to at most one concrete CUDA device and cap retained phase-pair accumulators with `max_phase_pairs`; do not merge mismatched devices or grow calibration state without a bound.
 - Resolve `ModelCost` CUDA provenance only when every CUDA-bearing sample has the same bool-excluding, non-negative integer index, and compute CUDA deltas only between endpoints with that same concrete index; never treat `None == None` as a device match or infer the current CUDA device for missing or invalid provenance.
 - Treat observed-cost envelopes as prior execution evidence, not admission proof or permission to bypass retry, pressure, or capacity checks.
+- Keep pre-pass admission assessment pure: it may combine one fixed `ResourceCapacity`, one execution-immediate `ResourceSample`, one `ObservedCostProfile`, and a candidate batch size, but it must not consume a source, execute a model, split or skip a batch, invoke retry, or mutate runtime state.
+- Preserve `REJECT`, `UNKNOWN`, and `ADMIT` as distinct outcomes with `REJECT` precedence; never treat missing capacity, baseline usage, profile evidence, or profile sample floor as a known zero.
+- Require matching concrete CUDA provenance across capacity, every CUDA-bearing baseline value, and every known CUDA profile envelope; do not infer the current device or merge devices.
+- Use current CUDA allocated/reserved values as baselines and the larger known direct/peak calibrated delta as the per-item increment; do not add historical baseline max counters as current usage.
+- Treat a pre-pass assessment as structured evidence only until a separately reviewed opt-in execution gate defines fail-open/fail-closed and split/skip behavior.
 - Normalize CPU RSS against the smallest known physical or hierarchy-effective cgroup capacity; do not assume host physical memory or a leaf cgroup file is the process limit in containers.
 - Do not clamp pressure ratios to `1.0`; ratios above one must remain visible for diagnosis.
 - Feed pressure summaries into governor decisions through explicit opt-in policies. Missing or high pressure may suppress growth; pressure may shrink a future budget only when the effective sustained-pressure threshold and required pass count for that dimension are both met.
