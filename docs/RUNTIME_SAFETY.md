@@ -46,6 +46,7 @@ Use this document before running code that can allocate accelerator memory, writ
 - Preserve `REJECT`, `UNKNOWN`, and `ADMIT` as distinct outcomes with `REJECT` precedence; never treat missing capacity, baseline usage, profile evidence, or profile sample floor as a known zero.
 - Require matching concrete CUDA provenance across capacity, every CUDA-bearing baseline value, and every known CUDA profile envelope; do not infer the current device or merge devices.
 - Use current CUDA allocated/reserved values as baselines and the larger known direct/peak calibrated delta as the per-item increment; do not add historical baseline max counters as current usage.
+- Treat known phase-profile CUDA metrics as CUDA relevance and provenance evidence, but never add them to total projection costs; keep an applicable dimension `UNKNOWN` when its current usage or total increment is missing rather than treating phase-only evidence as non-applicable.
 - Treat a pre-pass assessment as structured evidence only until a separately reviewed opt-in execution gate defines fail-open/fail-closed and split/skip behavior.
 - Normalize CPU RSS against the smallest known physical or hierarchy-effective cgroup capacity; do not assume host physical memory or a leaf cgroup file is the process limit in containers.
 - Do not clamp pressure ratios to `1.0`; ratios above one must remain visible for diagnosis.

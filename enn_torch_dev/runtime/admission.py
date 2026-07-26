@@ -5,7 +5,11 @@ from dataclasses import dataclass
 from enum import Enum
 from numbers import Real
 
-from .calibration import ObservedCostMetricProfile, ObservedCostProfile
+from .calibration import (
+    ObservedCostMetricProfile,
+    ObservedCostProfile,
+    ObservedPhaseCostProfile,
+)
 from .faults import ResourceSample
 from .pressure import ResourceCapacity
 
@@ -180,6 +184,28 @@ def _metric_max_bytes_per_item(
 def _max_known(*values: int | None) -> int | None:
     known = tuple(value for value in values if value is not None)
     return max(known) if known else None
+
+
+def _phase_profiles_have_cuda_evidence(
+    phase_costs: tuple[ObservedPhaseCostProfile, ...],
+) -> bool:
+    has_cuda_evidence = False
+    for index, phase_profile in enumerate(phase_costs):
+        label = f"ObservedCostProfile.phase_costs[{index}]"
+        if not isinstance(phase_profile, ObservedPhaseCostProfile):
+            raise TypeError(f"{label} must be an ObservedPhaseCostProfile.")
+        for metric_name in (
+            "cuda_allocated",
+            "cuda_reserved",
+            "cuda_max_allocated",
+            "cuda_max_reserved",
+        ):
+            value = _metric_max_bytes_per_item(
+                getattr(phase_profile, metric_name),
+                label=f"{label}.{metric_name}",
+            )
+            has_cuda_evidence = has_cuda_evidence or value is not None
+    return has_cuda_evidence
 
 
 def _usable_bytes(capacity: int, ratio: float, reserve: int) -> int:
@@ -363,14 +389,20 @@ def assess_prepass_admission(
             cuda_max_reserved_current,
         )
     )
-    profile_has_cuda_metrics = any(
+    profile_has_total_cuda_metrics = any(
         value is not None
         for value in (
             cuda_allocated_increment,
             cuda_reserved_increment,
         )
     )
-    cuda_applicable = sample_has_cuda_values or profile_has_cuda_metrics
+    profile_has_phase_cuda_metrics = _phase_profiles_have_cuda_evidence(
+        observed_profile.phase_costs
+    )
+    profile_has_cuda_evidence = (
+        profile_has_total_cuda_metrics or profile_has_phase_cuda_metrics
+    )
+    cuda_applicable = sample_has_cuda_values or profile_has_cuda_evidence
 
     cuda_device_index: int | None = None
     if cuda_applicable:
@@ -381,7 +413,7 @@ def assess_prepass_admission(
             )
         cuda_device_index = capacity.cuda_device_index
 
-        if profile_has_cuda_metrics:
+        if profile_has_cuda_evidence:
             profile_index = observed_profile.cuda_device_index
             if not _is_concrete_cuda_device_index(profile_index):
                 raise PrePassAdmissionError(

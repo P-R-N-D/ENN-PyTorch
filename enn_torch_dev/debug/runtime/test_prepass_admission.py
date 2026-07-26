@@ -8,6 +8,7 @@ from enn_torch_dev.runtime import (
     ObservedCostCalibrationPolicy,
     ObservedCostMetricProfile,
     ObservedCostProfile,
+    ObservedPhaseCostProfile,
     PrePassAdmissionError,
     PrePassAdmissionPolicy,
     PrePassAdmissionStatus,
@@ -36,6 +37,7 @@ def _profile(
     max_reserved: int | None = None,
     samples: int = 3,
     device_index: int | None = None,
+    phase_costs: tuple[ObservedPhaseCostProfile, ...] = (),
 ) -> ObservedCostProfile:
     return ObservedCostProfile(
         policy=ObservedCostCalibrationPolicy(),
@@ -53,7 +55,19 @@ def _profile(
         cuda_reserved=_metric(reserved),
         cuda_max_allocated=_metric(max_allocated),
         cuda_max_reserved=_metric(max_reserved),
-        phase_costs=(),
+        phase_costs=phase_costs,
+    )
+
+
+def _phase_profile(*, allocated: int | None = None) -> ObservedPhaseCostProfile:
+    return ObservedPhaseCostProfile(
+        start_phase="before_step",
+        end_phase="after_step",
+        cpu_rss=_metric(None),
+        cuda_allocated=_metric(allocated),
+        cuda_reserved=_metric(None),
+        cuda_max_allocated=_metric(None),
+        cuda_max_reserved=_metric(None),
     )
 
 
@@ -293,6 +307,93 @@ def test_profile_cuda_metrics_require_device_index() -> None:
             ),
             _sample(cpu=100, allocated=100, device_index=0),
             _profile(cpu=0, allocated=10, device_index=None),
+            batch_size=1,
+        )
+
+
+def test_phase_only_cuda_evidence_makes_cuda_dimensions_unknown() -> None:
+    result = assess_prepass_admission(
+        ResourceCapacity(
+            cpu_total_bytes=2_000,
+            cuda_total_bytes=1_000,
+            cuda_device_index=0,
+        ),
+        _sample(cpu=100, device_index=0),
+        _profile(
+            cpu=0,
+            device_index=0,
+            phase_costs=(_phase_profile(allocated=10),),
+        ),
+        batch_size=1,
+    )
+
+    assert _dimension(result, "cuda_allocated").applicable
+    assert _dimension(result, "cuda_reserved").applicable
+    assert result.status is PrePassAdmissionStatus.UNKNOWN
+    assert not result.admitted
+    assert result.unknown_dimensions == ("cuda_allocated", "cuda_reserved")
+
+
+def test_phase_only_cuda_evidence_without_capacity_is_rejected() -> None:
+    with pytest.raises(PrePassAdmissionError, match="require CUDA capacity"):
+        assess_prepass_admission(
+            ResourceCapacity(cpu_total_bytes=2_000),
+            _sample(cpu=100, device_index=0),
+            _profile(
+                cpu=0,
+                device_index=0,
+                phase_costs=(_phase_profile(allocated=10),),
+            ),
+            batch_size=1,
+        )
+
+
+@pytest.mark.parametrize("profile_index", [None, 1])
+def test_phase_only_cuda_evidence_requires_matching_profile_index(
+    profile_index: int | None,
+) -> None:
+    with pytest.raises(PrePassAdmissionError, match="profile|does not match capacity"):
+        assess_prepass_admission(
+            ResourceCapacity(
+                cpu_total_bytes=2_000,
+                cuda_total_bytes=1_000,
+                cuda_device_index=0,
+            ),
+            _sample(cpu=100, device_index=0),
+            _profile(
+                cpu=0,
+                device_index=profile_index,
+                phase_costs=(_phase_profile(allocated=10),),
+            ),
+            batch_size=1,
+        )
+
+
+def test_invalid_phase_profile_type_is_rejected() -> None:
+    profile = replace(_profile(), phase_costs=(object(),))
+    with pytest.raises(TypeError, match="ObservedPhaseCostProfile"):
+        assess_prepass_admission(
+            ResourceCapacity(cpu_total_bytes=1_000),
+            _sample(),
+            profile,
+            batch_size=1,
+        )
+
+
+def test_negative_phase_cuda_metric_is_rejected() -> None:
+    phase_profile = replace(
+        _phase_profile(),
+        cuda_allocated=_metric(-1),
+    )
+    with pytest.raises(ValueError, match="max_bytes_per_item"):
+        assess_prepass_admission(
+            ResourceCapacity(
+                cpu_total_bytes=2_000,
+                cuda_total_bytes=1_000,
+                cuda_device_index=0,
+            ),
+            _sample(cpu=100, device_index=0),
+            _profile(device_index=0, phase_costs=(phase_profile,)),
             batch_size=1,
         )
 

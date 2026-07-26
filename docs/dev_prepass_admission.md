@@ -76,6 +76,12 @@ Baseline `cuda_max_*` values are not added to the projection because they may
 contain a prior peak. They are used only to identify whether the baseline sample
 is CUDA-bearing and therefore requires concrete device provenance.
 
+Known CUDA metrics in a phase profile also establish that CUDA is relevant and
+therefore trigger CUDA capacity and provenance validation. Phase metrics are not
+summed or otherwise used as total projection increments. If the current CUDA
+usage or total CUDA increment remains unknown, the applicable CUDA dimension is
+`UNKNOWN`; phase-only evidence is never downgraded to non-applicable `ADMIT`.
+
 ## Status rules
 
 Each applicable dimension is assessed independently in deterministic order:
