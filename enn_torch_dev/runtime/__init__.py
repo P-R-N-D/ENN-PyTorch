@@ -1,5 +1,13 @@
 from __future__ import annotations
 
+from .admission import (
+    PrePassAdmissionAssessment,
+    PrePassAdmissionDimension,
+    PrePassAdmissionError,
+    PrePassAdmissionPolicy,
+    PrePassAdmissionStatus,
+    assess_prepass_admission,
+)
 from .batching import BatchBudget, BatchBudgetExceeded, BudgetedBatcher
 from .budget_recommendation import (
     BatchBudgetRecommendation,
@@ -78,6 +86,11 @@ __all__ = [
     "ObservedCostMetricProfile",
     "ObservedCostProfile",
     "ObservedPhaseCostProfile",
+    "PrePassAdmissionAssessment",
+    "PrePassAdmissionDimension",
+    "PrePassAdmissionError",
+    "PrePassAdmissionPolicy",
+    "PrePassAdmissionStatus",
     "OptimizerFootprint",
     "PlainLoader",
     "ResourceCapacity",
@@ -103,6 +116,7 @@ __all__ = [
     "TensorCost",
     "format_runtime_history_summary",
     "recommend_initial_batch_budget",
+    "assess_prepass_admission",
     "assess_resource_pressure",
     "format_runtime_pass_summary",
     "summarize_runtime_pass",

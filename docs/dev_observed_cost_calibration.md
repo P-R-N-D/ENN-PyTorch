@@ -89,8 +89,10 @@ before its numeric values are applied.
 This profile is evidence from previous executions, not proof that a future pass
 is admissible. It does not account for workload distribution shifts, new graph
 paths, external allocations, concurrent CUDA activity, or capacity changes.
-Pre-pass admission, automatic governor wiring, persistence, learned tuning, and
-multi-device profile merging remain outside this slice.
+The pure `assess_prepass_admission(...)` helper may consume a completed profile,
+but the calibrator itself does not perform admission. Automatic admission-gate
+wiring, persistence, learned tuning, and multi-device profile merging remain
+outside this slice.
 
 ## Validation
 

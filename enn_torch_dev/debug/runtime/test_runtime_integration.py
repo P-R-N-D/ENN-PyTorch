@@ -406,11 +406,17 @@ def test_runtime_development_api_is_exported_without_stable_namespace_leak() -> 
         "ObservedCostMetricProfile",
         "ObservedCostProfile",
         "ObservedPhaseCostProfile",
+        "PrePassAdmissionAssessment",
+        "PrePassAdmissionDimension",
+        "PrePassAdmissionError",
+        "PrePassAdmissionPolicy",
+        "PrePassAdmissionStatus",
         "RuntimePassHistory",
         "RuntimePassResult",
         "RuntimePassSummary",
         "RuntimeSessionRecord",
         "recommend_initial_batch_budget",
+        "assess_prepass_admission",
         "summarize_runtime_pass",
     }
 

@@ -22,6 +22,7 @@ Report outcomes distinctly:
 | `enn_torch_dev/executor/**` | `python -m pytest enn_torch_dev/debug/executor -q` | `enn_torch_dev/debug/executor` |
 | `enn_torch_dev/nn/**` | `python -m pytest enn_torch_dev/debug/nn -q` | `enn_torch_dev/debug/nn` |
 | `enn_torch_dev/runtime/**` | `python -m pytest enn_torch_dev/debug/runtime -q` | `enn_torch_dev/debug/runtime` |
+| Pre-pass admission assessment | `python -m pytest enn_torch_dev/debug/runtime/test_prepass_admission.py -q` | `enn_torch_dev/debug/runtime/test_prepass_admission.py` |
 | Observed runtime-cost calibration | `python -m pytest enn_torch_dev/debug/runtime/test_observed_cost_calibration.py -q` | `enn_torch_dev/debug/runtime/test_observed_cost_calibration.py` |
 | Initial runtime batch-budget recommendation | `python -m pytest enn_torch_dev/debug/runtime/test_budget_recommendation.py -q` | `enn_torch_dev/debug/runtime/test_budget_recommendation.py` |
 | Runtime resource pressure | `python -m pytest enn_torch_dev/debug/runtime/test_runtime_pressure.py -q` | `enn_torch_dev/debug/runtime/test_runtime_pressure.py` |
@@ -48,6 +49,7 @@ These commands correspond to existing paths in the repository:
 python -m pytest enn_torch_dev/debug/data -q
 python -m pytest enn_torch_dev/debug/executor -q
 python -m pytest enn_torch_dev/debug/nn -q
+python -m pytest enn_torch_dev/debug/runtime/test_prepass_admission.py -q
 python -m pytest enn_torch_dev/debug/runtime/test_observed_cost_calibration.py -q
 python -m pytest enn_torch_dev/debug/runtime/test_budget_recommendation.py -q
 python -m pytest enn_torch_dev/debug/runtime/test_runtime_pressure.py -q
