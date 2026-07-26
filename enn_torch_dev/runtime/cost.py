@@ -196,6 +196,7 @@ class ModelCost:
     total_cuda_max_allocated_delta_bytes: int | None
     total_cuda_max_reserved_delta_bytes: int | None
     phase_deltas: tuple[ResourceDelta, ...]
+    cuda_device_index: int | None = None
 
 
 class ModelCostProbe:
@@ -205,6 +206,7 @@ class ModelCostProbe:
         if not isinstance(result, StepResult):
             raise TypeError("ModelCostProbe.estimate_step expects a StepResult.")
         samples = tuple(result.resource_samples)
+        cuda_device_index = self._cuda_device_index(samples)
         phase_deltas = tuple(
             self._delta_pair(start, end)
             for start, end in zip(samples, samples[1:])
@@ -228,7 +230,28 @@ class ModelCostProbe:
                 None if total is None else total.cuda_max_reserved_delta_bytes
             ),
             phase_deltas=phase_deltas,
+            cuda_device_index=cuda_device_index,
         )
+
+    @staticmethod
+    def _cuda_device_index(samples: tuple[ResourceSample, ...]) -> int | None:
+        indices = {
+            sample.cuda_device_index
+            for sample in samples
+            if sample.cuda_device_index is not None
+            and any(
+                value is not None
+                for value in (
+                    sample.cuda_allocated_bytes,
+                    sample.cuda_reserved_bytes,
+                    sample.cuda_max_allocated_bytes,
+                    sample.cuda_max_reserved_bytes,
+                )
+            )
+        }
+        if len(indices) != 1:
+            return None
+        return next(iter(indices))
 
     @staticmethod
     def _delta_pair(start: ResourceSample, end: ResourceSample) -> ResourceDelta:

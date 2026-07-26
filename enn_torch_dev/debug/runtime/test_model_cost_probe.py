@@ -71,6 +71,7 @@ def test_model_cost_probe_computes_phase_deltas() -> None:
     assert cost.phase_deltas[0].end_phase == "after_to_store"
     assert cost.phase_deltas[0].cpu_rss_delta_bytes == 60
     assert cost.phase_deltas[1].cuda_allocated_delta_bytes == 40
+    assert cost.cuda_device_index == 0
 
 
 def test_model_cost_probe_skips_cuda_delta_across_devices() -> None:
@@ -106,6 +107,7 @@ def test_model_cost_probe_skips_cuda_delta_across_devices() -> None:
     assert cost.total_cuda_max_reserved_delta_bytes is None
     assert cost.phase_deltas[0].cpu_rss_delta_bytes == 50
     assert cost.phase_deltas[0].cuda_allocated_delta_bytes is None
+    assert cost.cuda_device_index is None
 
 
 def test_model_cost_probe_row_count_uses_batch_size_for_multidimensional_row_ids() -> None:
@@ -139,6 +141,25 @@ def test_model_cost_probe_handles_cuda_none_fields() -> None:
     assert cost.total_cpu_rss_delta_bytes == 30
     assert cost.total_cuda_allocated_delta_bytes is None
     assert cost.phase_deltas[0].cuda_allocated_delta_bytes is None
+    assert cost.cuda_device_index is None
+
+
+def test_model_cost_probe_uses_cuda_device_from_cuda_bearing_samples_only() -> None:
+    result = _result(
+        (
+            _sample("before_step", cpu=100, device_index=1),
+            _sample(
+                "after_forward",
+                cpu=130,
+                allocated=20,
+                reserved=30,
+                device_index=0,
+            ),
+        )
+    )
+
+    cost = ModelCostProbe().estimate_step(result)
+    assert cost.cuda_device_index == 0
 
 
 def test_model_cost_probe_handles_forward_only_samples() -> None:

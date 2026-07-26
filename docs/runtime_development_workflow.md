@@ -21,6 +21,10 @@ finite KVBatch pass source
   -> RuntimePassHistory
   -> ConservativeRuntimeSession
   -> optional RuntimePassSourceFactory for fresh per-pass sources
+
+completed StepResult.resource_samples
+  -> optional ModelCostProbe
+  -> optional ObservedCostCalibrator -> ObservedCostProfile
 ```
 
 `ConservativeRuntimeSession` connects existing components across multiple finite
@@ -122,6 +126,53 @@ positive per-item cost remains unknown; an explicit `fallback_max_items` is
 required when a finite limit cannot otherwise be derived. See
 [`dev_initial_batch_budget.md`](dev_initial_batch_budget.md) for formulas and
 boundaries.
+
+## Optional observed-cost calibration
+
+Use `ObservedCostCalibrator` when completed runtime observations should be reduced
+to a bounded per-item cost envelope for later inspection or a separately reviewed
+admission layer:
+
+```python
+from enn_torch_dev.runtime import (
+    ModelCostProbe,
+    ObservedCostCalibrationPolicy,
+    ObservedCostCalibrator,
+)
+
+cost_probe = ModelCostProbe()
+calibrator = ObservedCostCalibrator(
+    ObservedCostCalibrationPolicy(
+        min_successful_samples=3,
+        max_phase_pairs=16,
+        expected_cuda_device_index=0,
+    )
+)
+
+for pass_result in completed_pass_results:
+    for step_result in pass_result.results:
+        calibrator.observe(cost_probe.estimate_step(step_result))
+
+observed_profile = calibrator.profile()
+```
+
+Only successful positive-batch observations contribute numeric values. Faults and
+zero-batch successes are counted but ignored. Available deltas are converted to
+per-item costs with ceiling division, negative deltas are clamped to zero, and
+the maximum value observed for each total and adjacent-phase metric is retained.
+Unknown values remain distinct from observed zero.
+
+One profile accepts CUDA metrics from only one concrete device. The policy may
+bind that device before the first observation. Phase-pair state is bounded by
+`max_phase_pairs`. The calibrator retains scalar accumulators and phase names,
+not raw `ModelCost`, `StepResult`, `ResourceSample`, tensor, store, or loss
+objects.
+
+Calibration is explicit and side-effect free. It does not execute the model,
+consume a source, mutate a governor, persist a profile, or decide whether a future
+pass is admissible. See
+[`dev_observed_cost_calibration.md`](dev_observed_cost_calibration.md) for the
+full contract.
 
 ## Optional pressure-aware composition
 
@@ -276,6 +327,8 @@ It does not provide:
 - automatic `ResourceMonitor` creation;
 - mid-pass capacity refresh or free-memory admission control;
 - proof that an initial recommendation is safe for unobserved activation or allocator costs;
+- persistent observed-cost profile storage;
+- automatic use of an `ObservedCostProfile` for admission or governor updates;
 - learned field weights;
 - stable `enn_torch` API exposure.
 

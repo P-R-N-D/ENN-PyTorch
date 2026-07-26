@@ -37,6 +37,10 @@ Use this document before running code that can allocate accelerator memory, writ
 - Use ceiling division for reference per-item costs, never clamp an insufficient computed limit upward to `min_items`, and require an explicit `fallback_max_items` when a relevant dimension remains unknown.
 - Preserve the original capacity, reference batch cost, resolved policy, and normalized reference device provenance in the recommendation so its static calculation can be audited.
 - Treat a recommended initial budget as a conservative starting point, not proof that unobserved activations, allocator overhead, or the next pass are admissible.
+- Calibrate only completed `ModelCost` records; the calibrator must not execute a model, consume a source, mutate governor/history state, or retain `StepResult`, `ResourceSample`, tensor, store, or loss objects.
+- Use only successful positive-batch observations for numeric calibration. Count fault and zero-batch observations separately, clamp negative deltas to zero, and preserve unknown values instead of fabricating costs.
+- Keep one observed-cost profile bound to at most one concrete CUDA device and cap retained phase-pair accumulators with `max_phase_pairs`; do not merge mismatched devices or grow calibration state without a bound.
+- Treat observed-cost envelopes as prior execution evidence, not admission proof or permission to bypass retry, pressure, or capacity checks.
 - Normalize CPU RSS against the smallest known physical or hierarchy-effective cgroup capacity; do not assume host physical memory or a leaf cgroup file is the process limit in containers.
 - Do not clamp pressure ratios to `1.0`; ratios above one must remain visible for diagnosis.
 - Feed pressure summaries into governor decisions through explicit opt-in policies. Missing or high pressure may suppress growth; pressure may shrink a future budget only when the effective sustained-pressure threshold and required pass count for that dimension are both met.
