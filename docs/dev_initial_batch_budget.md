@@ -31,15 +31,17 @@ must sum exactly to the aggregate and bind every non-zero byte to the configured
 multiple non-zero devices are rejected; aggregate non-CPU bytes are never
 assigned to an arbitrary CUDA capacity.
 
-The recommender uses only:
+The recommender applies the same concrete-device rule to reference costs and
+static footprints. It uses only:
 
 - `cpu` bytes against `ResourceCapacity.effective_cpu_bytes`;
-- `cuda` or the matching `cuda:<index>` bytes against the configured CUDA
-  capacity.
+- the exact matching `cuda:<index>` bytes against the configured CUDA capacity.
 
-Non-zero footprint bytes on unsupported or different CUDA devices are rejected.
-A manually constructed non-empty footprint without device provenance is also
-rejected rather than assigned to CPU or CUDA by assumption.
+Bare `cuda` footprint keys are rejected because they do not identify an index;
+they are never assigned to the currently configured CUDA device. Non-zero
+footprint bytes on unsupported or different CUDA devices are also rejected. A
+manually constructed non-empty footprint without device provenance is rejected
+rather than assigned to CPU or CUDA by assumption.
 
 ## Calculation
 

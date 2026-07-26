@@ -236,7 +236,6 @@ def _fixed_bytes_by_capacity(
     if capacity.cuda_device_index is not None:
         target = f"cuda:{capacity.cuda_device_index}"
         device_bytes += combined.pop(target, 0)
-        device_bytes += combined.pop("cuda", 0)
     else:
         cuda_devices = tuple(
             sorted(

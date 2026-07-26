@@ -19,6 +19,7 @@ def _model_footprint(
     cpu_bytes: int = 0,
     cuda_bytes: int = 0,
     cuda_device_index: int = 0,
+    cuda_device_name: str | None = None,
     include_device_provenance: bool = True,
 ) -> ModelFootprint:
     total = cpu_bytes + cuda_bytes
@@ -27,7 +28,8 @@ def _model_footprint(
         if cpu_bytes:
             bytes_by_device["cpu"] = cpu_bytes
         if cuda_bytes:
-            bytes_by_device[f"cuda:{cuda_device_index}"] = cuda_bytes
+            device = cuda_device_name or f"cuda:{cuda_device_index}"
+            bytes_by_device[device] = cuda_bytes
     return ModelFootprint(
         parameter_count=0,
         trainable_parameter_count=0,
@@ -45,13 +47,15 @@ def _optimizer_footprint(
     cpu_bytes: int = 0,
     cuda_bytes: int = 0,
     cuda_device_index: int = 0,
+    cuda_device_name: str | None = None,
 ) -> OptimizerFootprint:
     total = cpu_bytes + cuda_bytes
     bytes_by_device: dict[str, int] = {}
     if cpu_bytes:
         bytes_by_device["cpu"] = cpu_bytes
     if cuda_bytes:
-        bytes_by_device[f"cuda:{cuda_device_index}"] = cuda_bytes
+        device = cuda_device_name or f"cuda:{cuda_device_index}"
+        bytes_by_device[device] = cuda_bytes
     return OptimizerFootprint(
         state_tensor_count=0,
         state_bytes=total,
@@ -390,6 +394,56 @@ def test_recommendation_rejects_footprint_on_different_cuda_device() -> None:
             BatchCost(host_bytes=0, device_bytes=10, num_items=1),
             reference_device_bytes_by_device={"cuda:0": 10},
             model_footprint=_model_footprint(
+                cuda_bytes=10,
+                cuda_device_index=1,
+            ),
+            policy=InitialBatchBudgetPolicy(max_items=1),
+        )
+
+
+@pytest.mark.parametrize("footprint_kind", ["model", "optimizer", "combined"])
+def test_recommendation_rejects_bare_cuda_footprint(
+    footprint_kind: str,
+) -> None:
+    model_footprint = None
+    optimizer_footprint = None
+    if footprint_kind in ("model", "combined"):
+        model_footprint = _model_footprint(
+            cuda_bytes=10,
+            cuda_device_name="cuda" if footprint_kind == "model" else None,
+        )
+    if footprint_kind in ("optimizer", "combined"):
+        optimizer_footprint = _optimizer_footprint(
+            cuda_bytes=10,
+            cuda_device_name="cuda",
+        )
+
+    with pytest.raises(BatchBudgetRecommendationError, match="not represented") as exc_info:
+        recommend_initial_batch_budget(
+            ResourceCapacity(
+                cpu_total_bytes=1_000,
+                cuda_total_bytes=1_000,
+                cuda_device_index=0,
+            ),
+            BatchCost(host_bytes=0, device_bytes=0, num_items=1),
+            model_footprint=model_footprint,
+            optimizer_footprint=optimizer_footprint,
+            policy=InitialBatchBudgetPolicy(max_items=1),
+        )
+
+    assert exc_info.value.dimensions == ("cuda",)
+
+
+def test_recommendation_rejects_optimizer_footprint_on_different_cuda_device() -> None:
+    with pytest.raises(BatchBudgetRecommendationError, match="not represented"):
+        recommend_initial_batch_budget(
+            ResourceCapacity(
+                cpu_total_bytes=1_000,
+                cuda_total_bytes=1_000,
+                cuda_device_index=0,
+            ),
+            BatchCost(host_bytes=0, device_bytes=0, num_items=1),
+            optimizer_footprint=_optimizer_footprint(
                 cuda_bytes=10,
                 cuda_device_index=1,
             ),

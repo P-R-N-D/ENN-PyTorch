@@ -52,7 +52,9 @@ Recorded values include:
 Shared parameter or buffer objects are counted once. `bytes_by_device` preserves
 the provenance needed to account CPU and a configured CUDA index independently;
 it must not be interpreted as an aggregate that can be assigned to any CUDA
-device.
+device. Non-zero host bytes use the exact `cpu` key, and non-zero CUDA bytes use
+an indexed key such as `cuda:0`. Bare `cuda` is not concrete provenance and the
+budget recommender rejects it instead of assigning it to the current device.
 
 ## OptimizerFootprint
 
@@ -71,7 +73,8 @@ Recorded values include:
 - dtype-grouped state tensor and byte counts.
 
 The optimizer device map follows the same concrete-device provenance contract as
-the model footprint.
+the model footprint: `cpu` and exact `cuda:<index>` keys are accepted, while bare
+`cuda` is not implicitly normalized or assigned.
 
 ## ResourceMonitor
 
