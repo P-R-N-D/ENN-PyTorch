@@ -355,6 +355,7 @@ def recommend_initial_batch_budget(
         )
     if capacity.cuda_total_bytes is None and (
         device_fixed_bytes > 0
+        or (batch_cost.device_bytes is not None and batch_cost.device_bytes > 0)
         or (device_bytes_per_item is not None and device_bytes_per_item > 0)
     ):
         raise BatchBudgetRecommendationError(

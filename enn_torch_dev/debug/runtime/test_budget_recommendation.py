@@ -223,6 +223,20 @@ def test_recommendation_rejects_cuda_demand_without_cuda_capacity() -> None:
         )
 
 
+@pytest.mark.parametrize("num_items", [None, 0])
+def test_recommendation_rejects_cuda_demand_with_unknown_item_count(
+    num_items: int | None,
+) -> None:
+    with pytest.raises(BatchBudgetRecommendationError, match="CUDA capacity") as exc_info:
+        recommend_initial_batch_budget(
+            ResourceCapacity(cpu_total_bytes=1_000),
+            BatchCost(host_bytes=0, device_bytes=10, num_items=num_items),
+            policy=InitialBatchBudgetPolicy(fallback_max_items=1),
+        )
+
+    assert exc_info.value.dimensions == ("device",)
+
+
 def test_recommendation_rejects_footprint_without_device_provenance() -> None:
     with pytest.raises(BatchBudgetRecommendationError, match="device provenance"):
         recommend_initial_batch_budget(
