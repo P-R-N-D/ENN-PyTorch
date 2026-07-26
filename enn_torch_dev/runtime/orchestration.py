@@ -5,7 +5,14 @@ from dataclasses import dataclass
 
 from enn_torch_dev.data import KVBatch
 
+from .admission import PrePassAdmissionAssessment, PrePassAdmissionPolicy
+from .admission_gate import (
+    AdmissionUnknownAction,
+    PrePassAdmissionGate,
+    ResourceSampleProvider,
+)
 from .batching import BatchBudget, BudgetedBatcher
+from .calibration import ObservedCostProfile
 from .capacity_provider import ResourceCapacityProvider
 from .cost import DataCostProbe
 from .faults import ResourceSample, StepResult, StepStatus
@@ -22,6 +29,7 @@ class RuntimePassResult:
     decision: GovernorDecision
     recovered_oom: bool = False
     resource_capacity: ResourceCapacity | None = None
+    admission_assessments: tuple[PrePassAdmissionAssessment, ...] = ()
 
 
 class _OomTrackingRuntimeStep:
@@ -49,6 +57,27 @@ class _OomTrackingRuntimeStep:
         return result
 
 
+class _AdmissionRuntimeStep:
+    def __init__(
+        self,
+        runtime_step: RuntimeStepProtocol,
+        gate: PrePassAdmissionGate,
+    ) -> None:
+        if not isinstance(runtime_step, RuntimeStepProtocol):
+            raise TypeError("runtime_step must provide run(KVBatch).")
+        if not isinstance(gate, PrePassAdmissionGate):
+            raise TypeError("gate must be a PrePassAdmissionGate.")
+        self.runtime_step = runtime_step
+        self.gate = gate
+        self.optimizer = getattr(runtime_step, "optimizer", None)
+        self.assessments: list[PrePassAdmissionAssessment] = []
+
+    def run(self, batch: KVBatch) -> StepResult:
+        assessment = self.gate.check(batch.batch_size)
+        self.assessments.append(assessment)
+        return self.runtime_step.run(batch)
+
+
 class ConservativeRuntimeOrchestrator:
     """Wire budget, retry, and governor components for one finite runtime pass."""
 
@@ -61,6 +90,12 @@ class ConservativeRuntimeOrchestrator:
         cost_probe: DataCostProbe | None = None,
         resource_capacity: ResourceCapacity | None = None,
         resource_capacity_provider: ResourceCapacityProvider | None = None,
+        admission_profile: ObservedCostProfile | None = None,
+        admission_sample_provider: ResourceSampleProvider | None = None,
+        admission_policy: PrePassAdmissionPolicy | None = None,
+        admission_unknown_action: AdmissionUnknownAction = (
+            AdmissionUnknownAction.BLOCK
+        ),
         split_oversized: bool = True,
         min_items: int = 1,
     ) -> None:
@@ -99,6 +134,51 @@ class ConservativeRuntimeOrchestrator:
                 "ConservativeRuntimeOrchestrator.resource_capacity and "
                 "resource_capacity_provider are mutually exclusive."
             )
+        if admission_profile is not None and not isinstance(
+            admission_profile, ObservedCostProfile
+        ):
+            raise TypeError(
+                "ConservativeRuntimeOrchestrator.admission_profile must be an "
+                "ObservedCostProfile or None."
+            )
+        if admission_sample_provider is not None and not isinstance(
+            admission_sample_provider, ResourceSampleProvider
+        ):
+            raise TypeError(
+                "ConservativeRuntimeOrchestrator.admission_sample_provider must "
+                "provide sample(str) -> ResourceSample or be None."
+            )
+        if admission_policy is not None and not isinstance(
+            admission_policy, PrePassAdmissionPolicy
+        ):
+            raise TypeError(
+                "ConservativeRuntimeOrchestrator.admission_policy must be a "
+                "PrePassAdmissionPolicy or None."
+            )
+        if not isinstance(admission_unknown_action, AdmissionUnknownAction):
+            raise TypeError(
+                "ConservativeRuntimeOrchestrator.admission_unknown_action must be "
+                "an AdmissionUnknownAction."
+            )
+        if admission_profile is None:
+            if admission_sample_provider is not None or admission_policy is not None:
+                raise ValueError(
+                    "Admission sample provider and policy require admission_profile."
+                )
+            if admission_unknown_action is not AdmissionUnknownAction.BLOCK:
+                raise ValueError(
+                    "Non-default admission_unknown_action requires admission_profile."
+                )
+        else:
+            if admission_sample_provider is None:
+                raise ValueError(
+                    "admission_profile requires admission_sample_provider."
+                )
+            if resource_capacity is None and resource_capacity_provider is None:
+                raise ValueError(
+                    "admission_profile requires resource_capacity or "
+                    "resource_capacity_provider."
+                )
         if not isinstance(split_oversized, bool):
             raise TypeError("ConservativeRuntimeOrchestrator.split_oversized must be a bool.")
         if not isinstance(min_items, int) or isinstance(min_items, bool):
@@ -112,6 +192,10 @@ class ConservativeRuntimeOrchestrator:
         self.cost_probe = cost_probe
         self.resource_capacity = resource_capacity
         self.resource_capacity_provider = resource_capacity_provider
+        self.admission_profile = admission_profile
+        self.admission_sample_provider = admission_sample_provider
+        self.admission_policy = admission_policy
+        self.admission_unknown_action = admission_unknown_action
         self.split_oversized = split_oversized
         self.min_items = min_items
 
@@ -149,6 +233,21 @@ class ConservativeRuntimeOrchestrator:
             self.runtime_step,
             collect_resource_samples=resolved_capacity is not None,
         )
+        attempt_step: RuntimeStepProtocol = tracking_step
+        admission_step: _AdmissionRuntimeStep | None = None
+        if self.admission_profile is not None:
+            assert resolved_capacity is not None
+            assert self.admission_sample_provider is not None
+            gate = PrePassAdmissionGate(
+                resolved_capacity,
+                self.admission_profile,
+                self.admission_sample_provider,
+                policy=self.admission_policy,
+                unknown_action=self.admission_unknown_action,
+            )
+            admission_step = _AdmissionRuntimeStep(tracking_step, gate)
+            attempt_step = admission_step
+
         budgeted = BudgetedBatcher(
             source,
             self.governor.current_budget,
@@ -156,7 +255,7 @@ class ConservativeRuntimeOrchestrator:
             split_oversized=self.split_oversized,
             min_items=self.min_items,
         )
-        retry_runner = RuntimeRetryRunner(tracking_step, policy=self.retry_policy)
+        retry_runner = RuntimeRetryRunner(attempt_step, policy=self.retry_policy)
         results = tuple(retry_runner.run_stream(budgeted))
         yielded_oom = any(result.status is StepStatus.OOM_FAULT for result in results)
         recovered_oom = tracking_step.saw_oom and not yielded_oom
@@ -178,4 +277,9 @@ class ConservativeRuntimeOrchestrator:
             decision=decision,
             recovered_oom=recovered_oom,
             resource_capacity=resolved_capacity,
+            admission_assessments=(
+                ()
+                if admission_step is None
+                else tuple(admission_step.assessments)
+            ),
         )

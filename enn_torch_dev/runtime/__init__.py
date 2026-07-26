@@ -8,6 +8,12 @@ from .admission import (
     PrePassAdmissionStatus,
     assess_prepass_admission,
 )
+from .admission_gate import (
+    AdmissionUnknownAction,
+    PrePassAdmissionBlocked,
+    PrePassAdmissionGate,
+    ResourceSampleProvider,
+)
 from .batching import BatchBudget, BatchBudgetExceeded, BudgetedBatcher
 from .budget_recommendation import (
     BatchBudgetRecommendation,
@@ -64,6 +70,7 @@ from .summary import (
 )
 
 __all__ = [
+    "AdmissionUnknownAction",
     "BatchBudget",
     "BatchBudgetExceeded",
     "BatchBudgetRecommendation",
@@ -87,8 +94,10 @@ __all__ = [
     "ObservedCostProfile",
     "ObservedPhaseCostProfile",
     "PrePassAdmissionAssessment",
+    "PrePassAdmissionBlocked",
     "PrePassAdmissionDimension",
     "PrePassAdmissionError",
+    "PrePassAdmissionGate",
     "PrePassAdmissionPolicy",
     "PrePassAdmissionStatus",
     "OptimizerFootprint",
@@ -99,6 +108,7 @@ __all__ = [
     "ResourceDelta",
     "ResourcePressureSummary",
     "ResourceSample",
+    "ResourceSampleProvider",
     "RetryPolicy",
     "RuntimeGovernorState",
     "RuntimeHistorySummary",

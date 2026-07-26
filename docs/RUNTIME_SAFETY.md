@@ -48,6 +48,12 @@ Use this document before running code that can allocate accelerator memory, writ
 - Use current CUDA allocated/reserved values as baselines and the larger known direct/peak calibrated delta as the per-item increment; do not add historical baseline max counters as current usage.
 - Treat known phase-profile CUDA metrics as CUDA relevance and provenance evidence, but never add them to total projection costs; keep an applicable dimension `UNKNOWN` when its current usage or total increment is missing rather than treating phase-only evidence as non-applicable.
 - Treat a pre-pass assessment as structured evidence only until a separately reviewed opt-in execution gate defines fail-open/fail-closed and split/skip behavior.
+- Keep admission enforcement explicitly opt-in. Resolve capacity once per pass, then sample and assess immediately before every original or retry-split execution attempt.
+- Always block `REJECT`. Block `UNKNOWN` by default; allow it only through an explicit `AdmissionUnknownAction.ALLOW` configuration. Never allow that option to override `REJECT`.
+- Represent an admission block with `PrePassAdmissionBlocked`, not a synthetic `StepStatus`; the exception may retain only the immutable assessment, not the batch, baseline sample, source, tensor, store, or loss.
+- Preserve retry safety by passing the wrapped runtime step optimizer through the admission wrapper so training-time OOM retry restrictions remain unchanged.
+- A blocked pass must not update governor state or produce a `RuntimePassResult`. Earlier candidates from the same pass may already have executed before a later candidate blocks; do not claim rollback or atomic pass execution.
+- Do not automatically split, skip, replay, or tune a blocked candidate in the admission-gate slice. Those behaviors require a separate reviewed policy.
 - Normalize CPU RSS against the smallest known physical or hierarchy-effective cgroup capacity; do not assume host physical memory or a leaf cgroup file is the process limit in containers.
 - Do not clamp pressure ratios to `1.0`; ratios above one must remain visible for diagnosis.
 - Feed pressure summaries into governor decisions through explicit opt-in policies. Missing or high pressure may suppress growth; pressure may shrink a future budget only when the effective sustained-pressure threshold and required pass count for that dimension are both met.

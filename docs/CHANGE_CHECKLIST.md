@@ -34,6 +34,23 @@ Do not defer required documentation updates to a follow-up task. Do not edit unr
 - Confirm the assessor remains pure and is not wired into batching, retry,
   governor, orchestration, source consumption, or model execution.
 
+## Pre-pass admission gate changes
+
+- Check `enn_torch_dev/runtime/admission_gate.py`, the admission wrapper in
+  `enn_torch_dev/runtime/orchestration.py`, and
+  `enn_torch_dev/debug/runtime/test_prepass_admission_gate.py`.
+- Verify `REJECT` always blocks, `UNKNOWN` blocks by default, and explicit allow
+  applies only to `UNKNOWN`.
+- Verify the gate samples once per original or retry execution attempt, while a
+  capacity provider remains pass-scoped and is called once before source
+  consumption.
+- Confirm blocked attempts do not call the runtime step, do not become a
+  `StepStatus`, and do not update governor state. Document that earlier candidates
+  in the same pass may already have executed before a later block.
+- Confirm optimizer passthrough preserves retry restrictions, completed pass
+  results retain only immutable assessments, and stable `enn_torch` exports remain
+  unchanged.
+
 ## Required final-report result
 
 Every final report must include exactly one of:
