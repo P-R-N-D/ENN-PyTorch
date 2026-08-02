@@ -15,6 +15,7 @@ finite KVBatch pass source
   -> BudgetedBatcher
   -> RuntimeRetryRunner
   -> optional per-attempt PrePassAdmissionGate
+  -> optional bounded reject split and child reassessment
   -> configured RuntimeStep
   -> optional fixed or pass-scoped capacity pressure assessment
   -> ConservativeRuntimeGovernor
@@ -220,6 +221,7 @@ before every runtime execution attempt:
 
 ```python
 from enn_torch_dev.runtime import (
+    AdmissionSplitPolicy,
     AdmissionUnknownAction,
     ConservativeRuntimeOrchestrator,
     PrePassAdmissionPolicy,
@@ -236,29 +238,38 @@ orchestrator = ConservativeRuntimeOrchestrator(
     admission_sample_provider=monitor,
     admission_policy=PrePassAdmissionPolicy(min_profile_samples=3),
     admission_unknown_action=AdmissionUnknownAction.BLOCK,
+    admission_split_policy=AdmissionSplitPolicy(
+        max_split_depth=3,
+        min_items=1,
+        max_split_parts=16,
+    ),
 )
 ```
 
 The gate is disabled unless `admission_profile` is configured. When enabled, it
 requires an admission sample provider and either fixed or provider-backed
 capacity. Capacity is resolved once before the pass source is consumed and stays
-fixed for that pass. The sample provider is called once with
-`"before_admission"` immediately before each original or OOM retry-split attempt.
+fixed for that pass. The sample provider is called once with `"before_admission"` before every
+original, admission child, or OOM retry-split candidate assessment.
 
 `REJECT` always raises `PrePassAdmissionBlocked`. `UNKNOWN` also blocks by default;
 `AdmissionUnknownAction.ALLOW` permits only unknown assessments and never permits
-a rejection. The exception retains the immutable assessment but not the batch,
-baseline sample, source, tensor, store, or loss. Admission blocking is not a
-`StepStatus` because no runtime step completed.
+a rejection. The exception custom payload stores the immutable assessment, while
+its ordinary Python traceback may still reference frame-local runtime objects.
+Admission blocking is not a `StepStatus` because no runtime step completed.
 
 A completed `RuntimePassResult` records attempt-ordered
 `admission_assessments`. Retry-consumed OOM attempts may therefore make this tuple
 longer than the final result tuple. If a later candidate blocks, earlier
 candidates in the same pass may already have executed, but no pass result is
-created and the governor is not updated. The gate does not automatically split,
-skip, replay, or tune the blocked candidate. See
-[`dev_prepass_admission_gate.md`](dev_prepass_admission_gate.md) for the full
-contract.
+created and the governor is not updated. When `admission_split_policy` is
+configured, only a `REJECT` with a positive smaller `max_admissible_items` may be
+recovered by bounded identity-preserving split and fresh child assessments.
+`UNKNOWN`, invalid limits, exhausted depth, or excessive parts remain terminal.
+Recovery applies only to the orchestrator wrapper's private pre-execution request;
+a public `PrePassAdmissionBlocked` from a generic runtime step is terminal.
+See [`dev_prepass_admission_gate.md`](dev_prepass_admission_gate.md) and
+[`dev_prepass_admission_split.md`](dev_prepass_admission_split.md).
 
 ## Optional pressure-aware composition
 
@@ -345,7 +356,10 @@ even when the final yielded results are successful.
 When the opt-in admission gate is enabled, the original attempt and every retry
 subbatch are sampled and assessed independently before execution. The admission
 wrapper forwards the configured runtime step's optimizer attribute so the
-existing training-time retry restriction is unchanged.
+existing training-time retry restriction is unchanged. Admission split depth and
+OOM retry depth are independent: on the trusted admission-wrapper path, splitting
+is pre-execution and may run with an optimizer, while post-execution OOM retry keeps its existing restriction.
+Recovered admission rejection does not directly affect governor feedback.
 
 The conservative governor then:
 
@@ -424,7 +438,8 @@ It does not provide:
 - mid-pass capacity refresh;
 - proof that an initial recommendation is safe for unobserved activation or allocator costs;
 - persistent observed-cost profile storage;
-- automatic admission-driven split, skip, replay, or rollback;
+- admission-driven skip, replay, rollback, or heuristic split sizes;
+- admission-based governor, summary, or history feedback;
 - automatic use of an `ObservedCostProfile` for governor updates;
 - learned field weights;
 - stable `enn_torch` API exposure.
@@ -436,6 +451,7 @@ unbounded production streaming runner.
 
 ```bash
 python -m pytest enn_torch_dev/debug/runtime/test_prepass_admission_gate.py -q
+python -m pytest enn_torch_dev/debug/runtime/test_prepass_admission_split.py -q
 python -m pytest enn_torch_dev/debug/runtime/test_runtime_capacity_provider.py -q
 python -m pytest enn_torch_dev/debug/runtime/test_runtime_source_factory.py -q
 python -m pytest enn_torch_dev/debug/runtime/test_runtime_integration.py -q

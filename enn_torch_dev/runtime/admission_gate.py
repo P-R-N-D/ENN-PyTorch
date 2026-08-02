@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from enum import Enum
 from typing import Protocol, runtime_checkable
 
@@ -29,6 +30,37 @@ class AdmissionUnknownAction(Enum):
     ALLOW = "allow"
 
 
+@dataclass(frozen=True, slots=True)
+class AdmissionSplitPolicy:
+    """Bound recursive admission-driven splitting for rejected candidates."""
+
+    max_split_depth: int = 3
+    min_items: int = 1
+    max_split_parts: int = 16
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.max_split_depth, int) or isinstance(
+            self.max_split_depth, bool
+        ):
+            raise TypeError("AdmissionSplitPolicy.max_split_depth must be an integer.")
+        if self.max_split_depth < 0:
+            raise ValueError(
+                "AdmissionSplitPolicy.max_split_depth must be non-negative."
+            )
+        if not isinstance(self.min_items, int) or isinstance(self.min_items, bool):
+            raise TypeError("AdmissionSplitPolicy.min_items must be an integer.")
+        if self.min_items <= 0:
+            raise ValueError("AdmissionSplitPolicy.min_items must be positive.")
+        if not isinstance(self.max_split_parts, int) or isinstance(
+            self.max_split_parts, bool
+        ):
+            raise TypeError("AdmissionSplitPolicy.max_split_parts must be an integer.")
+        if self.max_split_parts < 2:
+            raise ValueError(
+                "AdmissionSplitPolicy.max_split_parts must be at least 2."
+            )
+
+
 class PrePassAdmissionBlocked(RuntimeError):
     """Raised when an opt-in admission gate blocks one execution attempt."""
 
@@ -45,6 +77,16 @@ class PrePassAdmissionBlocked(RuntimeError):
             f"rejected_dimensions={assessment.rejected_dimensions!r}, "
             f"unknown_dimensions={assessment.unknown_dimensions!r}."
         )
+
+
+class _AdmissionSplitRequest(RuntimeError):
+    """Private trusted request emitted only at the admission preflight boundary."""
+
+    def __init__(self, blocked: PrePassAdmissionBlocked) -> None:
+        if not isinstance(blocked, PrePassAdmissionBlocked):
+            raise TypeError("blocked must be a PrePassAdmissionBlocked.")
+        super().__init__("trusted pre-pass admission split request")
+        self.blocked = blocked
 
 
 class PrePassAdmissionGate:

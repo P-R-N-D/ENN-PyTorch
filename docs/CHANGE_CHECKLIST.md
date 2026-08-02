@@ -53,6 +53,31 @@ Do not defer required documentation updates to a follow-up task. Do not edit unr
   assessment; do not confuse this with the exception traceback's transitive frame
   references. Confirm stable `enn_torch` exports remain unchanged.
 
+## Bounded admission split recovery changes
+
+- Check `AdmissionSplitPolicy`, `RuntimeRetryRunner` admission exception handling,
+  the orchestration wrapper assessment order, and
+  `test_prepass_admission_split.py`.
+- Confirm only the orchestrator's private admission-aware pre-execution request can
+  trigger recovery. A generic runtime step's public `PrePassAdmissionBlocked` must
+  remain terminal, with and without an `optimizer` attribute, to prevent duplicate
+  side effects.
+- Split only `REJECT` with a matching candidate batch size and a positive finite
+  `max_admissible_items` smaller than the current batch. Never split `UNKNOWN`,
+  zero/unknown limits, or malformed/mismatched assessments.
+- Verify every child is between `min_items` and the assessed target, part count and
+  recursive depth are bounded, and identity/order are preserved.
+- Keep admission split depth independent from OOM retry depth. Admission splitting
+  may precede execution with an optimizer, while existing optimizer-based OOM retry
+  restrictions must remain unchanged.
+- Record the rejected parent before child assessments in completed recovered pass
+  results. Terminal blocks must not update governor state or return partial pass
+  results. Recovered rejection must not create governor, summary, or history
+  feedback in this slice.
+- Confirm internal recovered block tracebacks are cleared before recursion, while
+  terminal block traceback behavior and the documented custom-payload contract are
+  unchanged.
+
 ## Required final-report result
 
 Every final report must include exactly one of:

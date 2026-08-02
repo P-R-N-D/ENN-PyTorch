@@ -21,8 +21,9 @@ pass-scoped ResourceCapacity
   -> REJECT: always block
 ```
 
-The gate does not choose a smaller batch, skip a candidate, replay a source,
-change a governor, update calibration, or persist state.
+The gate itself does not choose a smaller batch, skip a candidate, replay a
+source, change a governor, update calibration, or persist state. A separately
+configured bounded split policy may recover a rejected candidate outside the gate.
 
 ## Public development API
 
@@ -30,6 +31,7 @@ The gate slice adds the following under `enn_torch_dev.runtime`:
 
 - `ResourceSampleProvider`;
 - `AdmissionUnknownAction`;
+- `AdmissionSplitPolicy`;
 - `PrePassAdmissionBlocked`;
 - `PrePassAdmissionGate`.
 
@@ -98,8 +100,8 @@ existing training-time retry restrictions remain unchanged.
 
 The orchestrator resolves fixed or provider-backed `ResourceCapacity` once before
 the pass source is consumed. That capacity remains fixed for every split and retry
-attempt in the pass. The sample provider is called once immediately before each
-actual execution attempt.
+attempt in the pass. The sample provider is called once immediately before each candidate assessment,
+including rejected parents and every recursively produced child.
 
 ## Configuration
 
@@ -114,10 +116,41 @@ When enabled, the caller must also supply:
 Optional configuration includes:
 
 - `admission_policy`;
-- `admission_unknown_action`, defaulting to `AdmissionUnknownAction.BLOCK`.
+- `admission_unknown_action`, defaulting to `AdmissionUnknownAction.BLOCK`;
+- `admission_split_policy`, disabled by default.
 
 Admission-only options without a profile are rejected instead of being silently
 ignored. Existing fixed-capacity/provider mutual exclusion remains unchanged.
+
+## Optional bounded reject recovery
+
+`AdmissionSplitPolicy` allows `RuntimeRetryRunner` to recover only a trusted
+private request created by the orchestrator admission wrapper when its gate blocks
+before configured-step execution. A public `PrePassAdmissionBlocked` raised by a
+generic runtime step is terminal and is not proof of preflight provenance. An
+eligible request contains a `REJECT` whose assessment supplies a positive finite `max_admissible_items` below
+the current batch size. `UNKNOWN` is never split. The policy bounds:
+
+- recursive admission split depth;
+- minimum child item count;
+- maximum child parts produced by one rejected parent.
+
+The split target comes directly from `assessment.max_admissible_items`; the runner
+does not guess a half size or reuse the OOM `split_factor`. It computes the minimum
+part count needed to keep every child at or below the target, then distributes rows
+as evenly as possible. Recovery is refused unless every child is at least
+`min_items` and no larger than the assessed target.
+
+Admission depth and OOM retry depth are independent. On the trusted wrapper path,
+admission splitting occurs before model execution and remains available when the wrapped step has an
+optimizer. OOM retry still follows its existing phase and optimizer restrictions.
+A recoverable private request and its underlying block have their tracebacks
+cleared before child recursion; terminal blocks keep their normal traceback and propagate.
+
+Recovered admission rejection does not create a fault result or directly change
+the governor. The governor observes only the final `StepResult` objects. Skip,
+source replay, rollback, and admission-based budget feedback remain outside this
+slice. See [`dev_prepass_admission_split.md`](dev_prepass_admission_split.md).
 
 ## Pass result and failure semantics
 
@@ -125,10 +158,10 @@ A successfully completed `RuntimePassResult` appends
 `admission_assessments`, ordered by execution attempt. The tuple is empty when the
 gate is disabled.
 
-The assessment count may exceed the final `StepResult` count. An original batch
-may be admitted, execute with an OOM result that is discarded by retry, and then
-produce multiple admitted subbatches. All original and retry assessments remain
-visible in the completed pass result.
+The assessment count may exceed the final `StepResult` count. A rejected parent
+may be recorded before admitted split children, or an admitted original batch may
+execute with an OOM result that is discarded by retry. All parent, child, original,
+and retry assessments remain visible in a completed recovered pass result.
 
 When the gate blocks:
 
@@ -146,8 +179,8 @@ bounded stop policy, not transactional pass execution.
 
 This slice does not provide:
 
-- admission-driven batch splitting;
-- skip-and-continue behavior;
+- skip-and-continue behavior or skipped-row records;
+- heuristic splitting that ignores `max_admissible_items`;
 - source replay or rollback;
 - automatic profile refresh or persistence;
 - admission-driven governor changes;
@@ -160,6 +193,7 @@ This slice does not provide:
 
 ```bash
 python -m pytest enn_torch_dev/debug/runtime/test_prepass_admission_gate.py -q
+python -m pytest enn_torch_dev/debug/runtime/test_prepass_admission_split.py -q
 python -m pytest enn_torch_dev/debug/runtime/test_prepass_admission.py -q
 python -m pytest enn_torch_dev/debug/runtime/test_runtime_orchestration.py -q
 python -m pytest enn_torch_dev/debug/runtime/test_runtime_integration.py -q

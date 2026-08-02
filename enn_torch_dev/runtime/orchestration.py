@@ -7,9 +7,12 @@ from enn_torch_dev.data import KVBatch
 
 from .admission import PrePassAdmissionAssessment, PrePassAdmissionPolicy
 from .admission_gate import (
+    AdmissionSplitPolicy,
     AdmissionUnknownAction,
+    PrePassAdmissionBlocked,
     PrePassAdmissionGate,
     ResourceSampleProvider,
+    _AdmissionSplitRequest,
 )
 from .batching import BatchBudget, BudgetedBatcher
 from .calibration import ObservedCostProfile
@@ -62,6 +65,8 @@ class _AdmissionRuntimeStep:
         self,
         runtime_step: RuntimeStepProtocol,
         gate: PrePassAdmissionGate,
+        *,
+        split_recovery: bool = False,
     ) -> None:
         if not isinstance(runtime_step, RuntimeStepProtocol):
             raise TypeError("runtime_step must provide run(KVBatch).")
@@ -69,11 +74,18 @@ class _AdmissionRuntimeStep:
             raise TypeError("gate must be a PrePassAdmissionGate.")
         self.runtime_step = runtime_step
         self.gate = gate
+        self.split_recovery = split_recovery
         self.optimizer = getattr(runtime_step, "optimizer", None)
         self.assessments: list[PrePassAdmissionAssessment] = []
 
     def run(self, batch: KVBatch) -> StepResult:
-        assessment = self.gate.check(batch.batch_size)
+        try:
+            assessment = self.gate.check(batch.batch_size)
+        except PrePassAdmissionBlocked as blocked:
+            self.assessments.append(blocked.assessment)
+            if self.split_recovery:
+                raise _AdmissionSplitRequest(blocked) from None
+            raise
         self.assessments.append(assessment)
         return self.runtime_step.run(batch)
 
@@ -96,6 +108,7 @@ class ConservativeRuntimeOrchestrator:
         admission_unknown_action: AdmissionUnknownAction = (
             AdmissionUnknownAction.BLOCK
         ),
+        admission_split_policy: AdmissionSplitPolicy | None = None,
         split_oversized: bool = True,
         min_items: int = 1,
     ) -> None:
@@ -155,15 +168,26 @@ class ConservativeRuntimeOrchestrator:
                 "ConservativeRuntimeOrchestrator.admission_policy must be a "
                 "PrePassAdmissionPolicy or None."
             )
+        if admission_split_policy is not None and not isinstance(
+            admission_split_policy, AdmissionSplitPolicy
+        ):
+            raise TypeError(
+                "ConservativeRuntimeOrchestrator.admission_split_policy must be an "
+                "AdmissionSplitPolicy or None."
+            )
         if not isinstance(admission_unknown_action, AdmissionUnknownAction):
             raise TypeError(
                 "ConservativeRuntimeOrchestrator.admission_unknown_action must be "
                 "an AdmissionUnknownAction."
             )
         if admission_profile is None:
-            if admission_sample_provider is not None or admission_policy is not None:
+            if (
+                admission_sample_provider is not None
+                or admission_policy is not None
+                or admission_split_policy is not None
+            ):
                 raise ValueError(
-                    "Admission sample provider and policy require admission_profile."
+                    "Admission-only options require admission_profile."
                 )
             if admission_unknown_action is not AdmissionUnknownAction.BLOCK:
                 raise ValueError(
@@ -196,6 +220,7 @@ class ConservativeRuntimeOrchestrator:
         self.admission_sample_provider = admission_sample_provider
         self.admission_policy = admission_policy
         self.admission_unknown_action = admission_unknown_action
+        self.admission_split_policy = admission_split_policy
         self.split_oversized = split_oversized
         self.min_items = min_items
 
@@ -245,7 +270,11 @@ class ConservativeRuntimeOrchestrator:
                 policy=self.admission_policy,
                 unknown_action=self.admission_unknown_action,
             )
-            admission_step = _AdmissionRuntimeStep(tracking_step, gate)
+            admission_step = _AdmissionRuntimeStep(
+                tracking_step,
+                gate,
+                split_recovery=self.admission_split_policy is not None,
+            )
             attempt_step = admission_step
 
         budgeted = BudgetedBatcher(
@@ -255,7 +284,11 @@ class ConservativeRuntimeOrchestrator:
             split_oversized=self.split_oversized,
             min_items=self.min_items,
         )
-        retry_runner = RuntimeRetryRunner(attempt_step, policy=self.retry_policy)
+        retry_runner = RuntimeRetryRunner(
+            attempt_step,
+            policy=self.retry_policy,
+            admission_split_policy=self.admission_split_policy,
+        )
         results = tuple(retry_runner.run_stream(budgeted))
         yielded_oom = any(result.status is StepStatus.OOM_FAULT for result in results)
         recovered_oom = tracking_step.saw_oom and not yielded_oom
