@@ -18,6 +18,12 @@ candidate KVBatch
   -> admitted children execute
 ```
 
+Recovery is trusted only when the orchestrator's admission-aware wrapper creates
+a private split request immediately after its gate blocks and before the configured
+runtime step runs. A generic runtime step's public `PrePassAdmissionBlocked` is
+terminal, even when `AdmissionSplitPolicy` is configured; the runner never infers
+trusted preflight provenance from an arbitrary public exception.
+
 The runner does not skip rows, invent a split factor, replay the source, roll back
 previous work, update calibration, or persist recovery state.
 
@@ -106,9 +112,10 @@ occurred. An OOM split does not consume admission depth. Therefore:
 - an OOM retry subbatch may itself be admission-split before execution;
 - each recursively produced candidate is reassessed with a fresh resource sample.
 
-Admission splitting occurs before execution and is allowed when the wrapped step
-has an optimizer. Existing OOM retry remains disabled for optimizer-backed steps
-because that restriction concerns side effects after execution begins.
+On the trusted wrapper path, admission splitting occurs before configured-step
+execution and is allowed when the wrapped step has an optimizer. Existing OOM
+retry remains disabled for optimizer-backed steps because that restriction
+concerns side effects after execution begins.
 
 ## Assessment order and exception retention
 
@@ -121,14 +128,17 @@ ADMIT child 1
 ADMIT child 2
 ```
 
-A recovered internal `PrePassAdmissionBlocked` is consumed by the retry runner.
-Its assessment is already recorded by the wrapper, and its traceback is cleared
-before child recursion so the recovered exception does not continue retaining the
-parent execution frames. This is an internal cleanup only; it does not change the
+A recovered private split request and its underlying block are consumed by the
+retry runner. The assessment is already recorded by the wrapper, and both
+tracebacks are cleared before child recursion so the recovered exception does not
+continue retaining the parent execution frames. This is an internal cleanup only;
+it does not change the
 documented behavior of terminal block exceptions.
 
 If recovery is impossible or a child is terminally blocked, the block propagates,
 no `RuntimePassResult` is created for that pass, and the governor is not updated.
+Public blocks raised directly by generic runtime steps always follow this terminal
+path and retain their assessment.
 Earlier candidates from the same pass may already have executed and are not rolled
 back.
 

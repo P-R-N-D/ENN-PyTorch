@@ -7,7 +7,10 @@ from typing import Protocol, runtime_checkable
 from enn_torch_dev.data import KVBatch
 
 from .admission import PrePassAdmissionAssessment, PrePassAdmissionStatus
-from .admission_gate import AdmissionSplitPolicy, PrePassAdmissionBlocked
+from .admission_gate import (
+    AdmissionSplitPolicy,
+    _AdmissionSplitRequest,
+)
 from .batching import slice_kvbatch
 from .faults import RuntimePhase, StepResult, StepStatus
 
@@ -107,14 +110,16 @@ class RuntimeRetryRunner:
         result: object | None = None
         try:
             result = self.runtime_step.run(batch)
-        except PrePassAdmissionBlocked as blocked:
+        except _AdmissionSplitRequest as request:
+            blocked = request.blocked
             admission_ranges = self._admission_split_ranges(
                 batch.batch_size,
                 blocked.assessment,
                 admission_split_depth=admission_split_depth,
             )
             if len(admission_ranges) < 2:
-                raise
+                raise blocked.with_traceback(blocked.__traceback__) from None
+            request.__traceback__ = None
             blocked.__traceback__ = None
 
         if admission_ranges:

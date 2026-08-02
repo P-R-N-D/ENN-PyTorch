@@ -12,6 +12,7 @@ from .admission_gate import (
     PrePassAdmissionBlocked,
     PrePassAdmissionGate,
     ResourceSampleProvider,
+    _AdmissionSplitRequest,
 )
 from .batching import BatchBudget, BudgetedBatcher
 from .calibration import ObservedCostProfile
@@ -64,6 +65,8 @@ class _AdmissionRuntimeStep:
         self,
         runtime_step: RuntimeStepProtocol,
         gate: PrePassAdmissionGate,
+        *,
+        split_recovery: bool = False,
     ) -> None:
         if not isinstance(runtime_step, RuntimeStepProtocol):
             raise TypeError("runtime_step must provide run(KVBatch).")
@@ -71,6 +74,7 @@ class _AdmissionRuntimeStep:
             raise TypeError("gate must be a PrePassAdmissionGate.")
         self.runtime_step = runtime_step
         self.gate = gate
+        self.split_recovery = split_recovery
         self.optimizer = getattr(runtime_step, "optimizer", None)
         self.assessments: list[PrePassAdmissionAssessment] = []
 
@@ -79,6 +83,8 @@ class _AdmissionRuntimeStep:
             assessment = self.gate.check(batch.batch_size)
         except PrePassAdmissionBlocked as blocked:
             self.assessments.append(blocked.assessment)
+            if self.split_recovery:
+                raise _AdmissionSplitRequest(blocked) from None
             raise
         self.assessments.append(assessment)
         return self.runtime_step.run(batch)
@@ -264,7 +270,11 @@ class ConservativeRuntimeOrchestrator:
                 policy=self.admission_policy,
                 unknown_action=self.admission_unknown_action,
             )
-            admission_step = _AdmissionRuntimeStep(tracking_step, gate)
+            admission_step = _AdmissionRuntimeStep(
+                tracking_step,
+                gate,
+                split_recovery=self.admission_split_policy is not None,
+            )
             attempt_step = admission_step
 
         budgeted = BudgetedBatcher(

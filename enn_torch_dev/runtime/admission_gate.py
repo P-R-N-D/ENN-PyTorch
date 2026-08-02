@@ -79,6 +79,16 @@ class PrePassAdmissionBlocked(RuntimeError):
         )
 
 
+class _AdmissionSplitRequest(RuntimeError):
+    """Private trusted request emitted only at the admission preflight boundary."""
+
+    def __init__(self, blocked: PrePassAdmissionBlocked) -> None:
+        if not isinstance(blocked, PrePassAdmissionBlocked):
+            raise TypeError("blocked must be a PrePassAdmissionBlocked.")
+        super().__init__("trusted pre-pass admission split request")
+        self.blocked = blocked
+
+
 class PrePassAdmissionGate:
     """Sample, assess, and optionally block one candidate execution attempt."""
 

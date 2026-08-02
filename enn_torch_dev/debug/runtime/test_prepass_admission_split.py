@@ -31,6 +31,7 @@ from enn_torch_dev.runtime import (
     StepResult,
     StepStatus,
 )
+from enn_torch_dev.runtime.admission_gate import _AdmissionSplitRequest
 
 
 def _batch(num_rows: int, *, offset: int = 0) -> KVBatch:
@@ -112,7 +113,7 @@ class SyntheticAdmissionStep:
         if isinstance(outcome, PrePassAdmissionAssessment):
             blocked = PrePassAdmissionBlocked(outcome)
             self.blocked.append(blocked)
-            raise blocked
+            raise _AdmissionSplitRequest(blocked) from None
         return outcome
 
 
@@ -203,6 +204,34 @@ def test_reject_remains_terminal_without_split_policy() -> None:
         list(RuntimeRetryRunner(step).run_batch(_batch(4)))
 
     assert [batch.batch_size for batch in step.calls] == [4]
+
+
+@pytest.mark.parametrize("optimizer", [None, object()])
+def test_generic_runtime_step_public_block_is_never_admission_split(
+    optimizer: object | None,
+) -> None:
+    effects: list[int] = []
+
+    class SideEffectingStep:
+        def __init__(self) -> None:
+            self.optimizer = optimizer
+
+        def run(self, batch: KVBatch) -> StepResult:
+            effects.append(batch.batch_size)
+            raise PrePassAdmissionBlocked(
+                _assessment(batch.batch_size, max_admissible_items=2)
+            )
+
+    runner = RuntimeRetryRunner(
+        SideEffectingStep(),
+        admission_split_policy=AdmissionSplitPolicy(),
+    )
+
+    with pytest.raises(PrePassAdmissionBlocked) as exc_info:
+        list(runner.run_batch(_batch(4)))
+
+    assert exc_info.value.assessment.max_admissible_items == 2
+    assert effects == [4]
 
 
 def test_reject_splits_to_assessment_limit_with_balanced_parts() -> None:

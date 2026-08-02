@@ -266,6 +266,8 @@ created and the governor is not updated. When `admission_split_policy` is
 configured, only a `REJECT` with a positive smaller `max_admissible_items` may be
 recovered by bounded identity-preserving split and fresh child assessments.
 `UNKNOWN`, invalid limits, exhausted depth, or excessive parts remain terminal.
+Recovery applies only to the orchestrator wrapper's private pre-execution request;
+a public `PrePassAdmissionBlocked` from a generic runtime step is terminal.
 See [`dev_prepass_admission_gate.md`](dev_prepass_admission_gate.md) and
 [`dev_prepass_admission_split.md`](dev_prepass_admission_split.md).
 
@@ -355,8 +357,8 @@ When the opt-in admission gate is enabled, the original attempt and every retry
 subbatch are sampled and assessed independently before execution. The admission
 wrapper forwards the configured runtime step's optimizer attribute so the
 existing training-time retry restriction is unchanged. Admission split depth and
-OOM retry depth are independent: admission splitting is pre-execution and may run
-with an optimizer, while post-execution OOM retry keeps its existing restriction.
+OOM retry depth are independent: on the trusted admission-wrapper path, splitting
+is pre-execution and may run with an optimizer, while post-execution OOM retry keeps its existing restriction.
 Recovered admission rejection does not directly affect governor feedback.
 
 The conservative governor then:

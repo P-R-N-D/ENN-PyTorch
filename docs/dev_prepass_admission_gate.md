@@ -124,8 +124,11 @@ ignored. Existing fixed-capacity/provider mutual exclusion remains unchanged.
 
 ## Optional bounded reject recovery
 
-`AdmissionSplitPolicy` allows `RuntimeRetryRunner` to recover only a blocked
-`REJECT` whose assessment supplies a positive finite `max_admissible_items` below
+`AdmissionSplitPolicy` allows `RuntimeRetryRunner` to recover only a trusted
+private request created by the orchestrator admission wrapper when its gate blocks
+before configured-step execution. A public `PrePassAdmissionBlocked` raised by a
+generic runtime step is terminal and is not proof of preflight provenance. An
+eligible request contains a `REJECT` whose assessment supplies a positive finite `max_admissible_items` below
 the current batch size. `UNKNOWN` is never split. The policy bounds:
 
 - recursive admission split depth;
@@ -138,11 +141,11 @@ part count needed to keep every child at or below the target, then distributes r
 as evenly as possible. Recovery is refused unless every child is at least
 `min_items` and no larger than the assessed target.
 
-Admission depth and OOM retry depth are independent. Admission splitting occurs
-before model execution and remains available when the wrapped step has an
+Admission depth and OOM retry depth are independent. On the trusted wrapper path,
+admission splitting occurs before model execution and remains available when the wrapped step has an
 optimizer. OOM retry still follows its existing phase and optimizer restrictions.
-A recoverable internal `PrePassAdmissionBlocked` has its traceback cleared before
-child recursion; terminal blocks keep their normal traceback and propagate.
+A recoverable private request and its underlying block have their tracebacks
+cleared before child recursion; terminal blocks keep their normal traceback and propagate.
 
 Recovered admission rejection does not create a fault result or directly change
 the governor. The governor observes only the final `StepResult` objects. Skip,

@@ -58,6 +58,10 @@ Do not defer required documentation updates to a follow-up task. Do not edit unr
 - Check `AdmissionSplitPolicy`, `RuntimeRetryRunner` admission exception handling,
   the orchestration wrapper assessment order, and
   `test_prepass_admission_split.py`.
+- Confirm only the orchestrator's private admission-aware pre-execution request can
+  trigger recovery. A generic runtime step's public `PrePassAdmissionBlocked` must
+  remain terminal, with and without an `optimizer` attribute, to prevent duplicate
+  side effects.
 - Split only `REJECT` with a matching candidate batch size and a positive finite
   `max_admissible_items` smaller than the current batch. Never split `UNKNOWN`,
   zero/unknown limits, or malformed/mismatched assessments.
