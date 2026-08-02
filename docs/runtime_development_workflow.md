@@ -407,6 +407,13 @@ status or ratios never substitute for empty structured provenance. Each pass
 summary also records the scalar capacity used for normalization. Raw
 `ResourceSample` records are not retained by summary or history.
 
+Completed-pass admission assessments are reduced to scalar summary provenance:
+total assessments, admitted assessments, recovered rejects, explicitly allowed
+unknowns, a recovery flag, and the minimum recovered item limit. History aggregates
+those fields only inside its retained window. Summary and history do not retain raw
+admission assessments, dimensions, warnings, exceptions, batches, samples, or
+sources, and admission provenance does not change governor behavior in this slice.
+
 ## Fault and exception semantics
 
 A `StepStatus` fault is a completed runtime result. It does not automatically stop
@@ -439,7 +446,8 @@ It does not provide:
 - proof that an initial recommendation is safe for unobserved activation or allocator costs;
 - persistent observed-cost profile storage;
 - admission-driven skip, replay, rollback, or heuristic split sizes;
-- admission-based governor, summary, or history feedback;
+- admission-based governor feedback or next-pass budget changes;
+- raw admission assessment retention or persistent admission telemetry export;
 - automatic use of an `ObservedCostProfile` for governor updates;
 - learned field weights;
 - stable `enn_torch` API exposure.
@@ -450,6 +458,7 @@ unbounded production streaming runner.
 ## Validation
 
 ```bash
+python -m pytest enn_torch_dev/debug/runtime/test_admission_observability.py -q
 python -m pytest enn_torch_dev/debug/runtime/test_prepass_admission_gate.py -q
 python -m pytest enn_torch_dev/debug/runtime/test_prepass_admission_split.py -q
 python -m pytest enn_torch_dev/debug/runtime/test_runtime_capacity_provider.py -q

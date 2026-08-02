@@ -72,11 +72,28 @@ Do not defer required documentation updates to a follow-up task. Do not edit unr
   restrictions must remain unchanged.
 - Record the rejected parent before child assessments in completed recovered pass
   results. Terminal blocks must not update governor state or return partial pass
-  results. Recovered rejection must not create governor, summary, or history
-  feedback in this slice.
+  results. Recovered rejection must not create governor feedback; summary and
+  history may retain only bounded scalar admission provenance.
 - Confirm internal recovered block tracebacks are cleared before recursion, while
   terminal block traceback behavior and the documented custom-payload contract are
   unchanged.
+
+## Admission summary and history observability changes
+
+- Check `summary.py`, `history.py`, and `test_admission_observability.py`.
+- Count completed-pass `ADMIT`, recovered `REJECT`, and explicitly allowed
+  `UNKNOWN` assessments separately. A terminal block must not create a summary or
+  history record.
+- Require completed-pass rejects to carry a bool-excluding positive reducing
+  `max_admissible_items`; reject malformed manually constructed pass results.
+- Keep summary fields append-only and scalar. Do not retain raw assessment,
+  dimension, warning, exception, batch, source, sample, tensor, store, or loss
+  objects.
+- Recompute history counts and the minimum recovered item limit only from the
+  currently retained window; trimming must remove every discarded contribution.
+- Confirm admission provenance does not alter governor decisions, pressure/OOM
+  counters, orchestration, retry, gate, or session execution behavior.
+- Confirm stable `enn_torch` exports remain unchanged.
 
 ## Required final-report result
 

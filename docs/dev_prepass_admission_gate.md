@@ -184,7 +184,8 @@ This slice does not provide:
 - source replay or rollback;
 - automatic profile refresh or persistence;
 - admission-driven governor changes;
-- summary/history aggregation of admission outcomes;
+- raw admission assessment retention or persistent summary/history telemetry
+  export;
 - per-dimension unknown policies;
 - multi-GPU or distributed admission;
 - stable `enn_torch` exposure.
@@ -192,6 +193,7 @@ This slice does not provide:
 ## Validation
 
 ```bash
+python -m pytest enn_torch_dev/debug/runtime/test_admission_observability.py -q
 python -m pytest enn_torch_dev/debug/runtime/test_prepass_admission_gate.py -q
 python -m pytest enn_torch_dev/debug/runtime/test_prepass_admission_split.py -q
 python -m pytest enn_torch_dev/debug/runtime/test_prepass_admission.py -q

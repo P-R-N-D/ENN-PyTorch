@@ -37,6 +37,13 @@ class RuntimeHistorySummary:
     host_budget_pressure_shrink_passes: int = 0
     device_budget_pressure_shrink_passes: int = 0
     items_pressure_fallback_shrink_passes: int = 0
+    admission_assessed_passes: int = 0
+    admission_recovery_passes: int = 0
+    admission_total_assessments: int = 0
+    admission_admit_assessments: int = 0
+    admission_recovered_rejects: int = 0
+    admission_allowed_unknowns: int = 0
+    minimum_recovered_admissible_items: int | None = None
 
 
 class RuntimePassHistory:
@@ -90,6 +97,13 @@ class RuntimePassHistory:
         host_budget_pressure_shrink_passes = 0
         device_budget_pressure_shrink_passes = 0
         items_pressure_fallback_shrink_passes = 0
+        admission_assessed_passes = 0
+        admission_recovery_passes = 0
+        admission_total_assessments = 0
+        admission_admit_assessments = 0
+        admission_recovered_rejects = 0
+        admission_allowed_unknowns = 0
+        minimum_recovered_admissible_items: int | None = None
 
         for summary in self._records:
             total_results += summary.total_results
@@ -146,6 +160,22 @@ class RuntimePassHistory:
             if "max_items" in shrunk_fields:
                 items_pressure_fallback_shrink_passes += 1
 
+            if summary.admission_assessment_count > 0:
+                admission_assessed_passes += 1
+            if summary.admission_recovery_occurred:
+                admission_recovery_passes += 1
+            admission_total_assessments += summary.admission_assessment_count
+            admission_admit_assessments += summary.admission_admit_assessment_count
+            admission_recovered_rejects += summary.admission_recovered_reject_count
+            admission_allowed_unknowns += summary.admission_allowed_unknown_count
+            candidate_limit = summary.minimum_recovered_admissible_items
+            if candidate_limit is not None:
+                minimum_recovered_admissible_items = (
+                    candidate_limit
+                    if minimum_recovered_admissible_items is None
+                    else min(minimum_recovered_admissible_items, candidate_limit)
+                )
+
         latest_summary = self._records[-1] if self._records else None
         status_counts_view: Mapping[StepStatus, int] = MappingProxyType(dict(status_counts))
         return RuntimeHistorySummary(
@@ -172,6 +202,13 @@ class RuntimePassHistory:
             host_budget_pressure_shrink_passes=host_budget_pressure_shrink_passes,
             device_budget_pressure_shrink_passes=device_budget_pressure_shrink_passes,
             items_pressure_fallback_shrink_passes=items_pressure_fallback_shrink_passes,
+            admission_assessed_passes=admission_assessed_passes,
+            admission_recovery_passes=admission_recovery_passes,
+            admission_total_assessments=admission_total_assessments,
+            admission_admit_assessments=admission_admit_assessments,
+            admission_recovered_rejects=admission_recovered_rejects,
+            admission_allowed_unknowns=admission_allowed_unknowns,
+            minimum_recovered_admissible_items=minimum_recovered_admissible_items,
         )
 
     def _trim_records(self) -> None:
@@ -198,6 +235,12 @@ def format_runtime_history_summary(summary: RuntimeHistorySummary) -> str:
     latest_growth_suppressed = (
         latest.growth_suppressed_by_pressure if latest is not None else False
     )
+    latest_admission_recovery_occurred = (
+        latest.admission_recovery_occurred if latest is not None else False
+    )
+    latest_admission_recovered_reject_count = (
+        latest.admission_recovered_reject_count if latest is not None else 0
+    )
     return "\n".join(
         (
             "Runtime history summary",
@@ -209,6 +252,14 @@ def format_runtime_history_summary(summary: RuntimeHistorySummary) -> str:
             f"recovered_oom_passes={summary.recovered_oom_passes}",
             f"oom_passes={summary.oom_passes}",
             f"budget_changed_passes={summary.budget_changed_passes}",
+            f"admission_assessed_passes={summary.admission_assessed_passes}",
+            f"admission_recovery_passes={summary.admission_recovery_passes}",
+            f"admission_total_assessments={summary.admission_total_assessments}",
+            f"admission_admit_assessments={summary.admission_admit_assessments}",
+            f"admission_recovered_rejects={summary.admission_recovered_rejects}",
+            f"admission_allowed_unknowns={summary.admission_allowed_unknowns}",
+            "minimum_recovered_admissible_items="
+            f"{_format_optional_int(summary.minimum_recovered_admissible_items)}",
             f"pressure_assessed_passes={summary.pressure_assessed_passes}",
             f"pressure_growth_suppressed_passes={summary.pressure_growth_suppressed_passes}",
             f"peak_observed_pressure_ratio={_format_optional_ratio(summary.peak_observed_pressure_ratio)}",
@@ -231,6 +282,10 @@ def format_runtime_history_summary(summary: RuntimeHistorySummary) -> str:
             f"{summary.items_pressure_fallback_shrink_passes}",
             f"latest_budget_changed={latest_budget_changed}",
             f"latest_recovered_oom={latest_recovered_oom}",
+            "latest_admission_recovery_occurred="
+            f"{latest_admission_recovery_occurred}",
+            "latest_admission_recovered_reject_count="
+            f"{latest_admission_recovered_reject_count}",
             f"latest_pressure_assessed={latest_pressure_summary is not None}",
             f"latest_max_pressure_ratio={_format_optional_ratio(latest_max_pressure_ratio)}",
             f"latest_growth_suppressed_by_pressure={latest_growth_suppressed}",
@@ -240,6 +295,10 @@ def format_runtime_history_summary(summary: RuntimeHistorySummary) -> str:
 
 def _format_optional_ratio(value: float | None) -> str:
     return "unknown" if value is None else f"{value:.6g}"
+
+
+def _format_optional_int(value: int | None) -> str:
+    return "unknown" if value is None else str(value)
 
 
 def _format_status_counts(status_counts: Mapping[StepStatus, int]) -> str:

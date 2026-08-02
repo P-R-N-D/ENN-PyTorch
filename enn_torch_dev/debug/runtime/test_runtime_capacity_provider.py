@@ -138,7 +138,7 @@ def test_capacity_provider_and_provenance_fields_are_appended_for_compatibility(
         "resource_capacity",
         "admission_assessments",
     ]
-    assert [field.name for field in fields(RuntimePassSummary)][-10:] == [
+    assert [field.name for field in fields(RuntimePassSummary)][-16:] == [
         "resource_capacity",
         "consecutive_high_pressure_passes",
         "budget_shrunk_by_pressure",
@@ -149,6 +149,12 @@ def test_capacity_provider_and_provenance_fields_are_appended_for_compatibility(
         "pressure_triggered_dimensions",
         "pressure_selected_budget_fields",
         "pressure_applied_shrink_factors",
+        "admission_assessment_count",
+        "admission_admit_assessment_count",
+        "admission_recovered_reject_count",
+        "admission_allowed_unknown_count",
+        "admission_recovery_occurred",
+        "minimum_recovered_admissible_items",
     ]
 
 
