@@ -90,16 +90,14 @@ admission contributions disappear from the aggregate.
 
 ## Governor boundary
 
-Admission observability is evidence only. This slice does not:
+Admission observability remains lightweight evidence. An optional governor growth
+guard may consume the minimum recovered item limit to reset clean-success growth,
+but it does not retain raw assessments or reinterpret recovery as `StepStatus` or
+OOM.
 
-- shrink a budget after a recovered rejection;
-- suppress success-driven growth;
-- cap the next pass `max_items`;
-- create a new governor streak or decision reason;
-- reinterpret recovered rejection as `StepStatus` or OOM.
-
-The governor continues to observe only final `StepResult` objects plus existing
-OOM and pressure signals.
+The guard does not directly cap or shrink `max_items`, create an admission streak,
+or override OOM and pressure decisions. See
+[`dev_admission_governor_growth_guard.md`](dev_admission_governor_growth_guard.md).
 
 ## Failure boundary
 

@@ -44,6 +44,7 @@ class RuntimeHistorySummary:
     admission_recovered_rejects: int = 0
     admission_allowed_unknowns: int = 0
     minimum_recovered_admissible_items: int | None = None
+    admission_growth_suppressed_passes: int = 0
 
 
 class RuntimePassHistory:
@@ -104,6 +105,7 @@ class RuntimePassHistory:
         admission_recovered_rejects = 0
         admission_allowed_unknowns = 0
         minimum_recovered_admissible_items: int | None = None
+        admission_growth_suppressed_passes = 0
 
         for summary in self._records:
             total_results += summary.total_results
@@ -175,6 +177,8 @@ class RuntimePassHistory:
                     if minimum_recovered_admissible_items is None
                     else min(minimum_recovered_admissible_items, candidate_limit)
                 )
+            if summary.growth_suppressed_by_admission_recovery:
+                admission_growth_suppressed_passes += 1
 
         latest_summary = self._records[-1] if self._records else None
         status_counts_view: Mapping[StepStatus, int] = MappingProxyType(dict(status_counts))
@@ -209,6 +213,7 @@ class RuntimePassHistory:
             admission_recovered_rejects=admission_recovered_rejects,
             admission_allowed_unknowns=admission_allowed_unknowns,
             minimum_recovered_admissible_items=minimum_recovered_admissible_items,
+            admission_growth_suppressed_passes=admission_growth_suppressed_passes,
         )
 
     def _trim_records(self) -> None:
@@ -241,6 +246,16 @@ def format_runtime_history_summary(summary: RuntimeHistorySummary) -> str:
     latest_admission_recovered_reject_count = (
         latest.admission_recovered_reject_count if latest is not None else 0
     )
+    latest_growth_suppressed_by_admission_recovery = (
+        latest.growth_suppressed_by_admission_recovery
+        if latest is not None
+        else False
+    )
+    latest_governor_admission_recovery_max_items = (
+        latest.governor_admission_recovery_max_items
+        if latest is not None
+        else None
+    )
     return "\n".join(
         (
             "Runtime history summary",
@@ -260,6 +275,8 @@ def format_runtime_history_summary(summary: RuntimeHistorySummary) -> str:
             f"admission_allowed_unknowns={summary.admission_allowed_unknowns}",
             "minimum_recovered_admissible_items="
             f"{_format_optional_int(summary.minimum_recovered_admissible_items)}",
+            "admission_growth_suppressed_passes="
+            f"{summary.admission_growth_suppressed_passes}",
             f"pressure_assessed_passes={summary.pressure_assessed_passes}",
             f"pressure_growth_suppressed_passes={summary.pressure_growth_suppressed_passes}",
             f"peak_observed_pressure_ratio={_format_optional_ratio(summary.peak_observed_pressure_ratio)}",
@@ -286,6 +303,10 @@ def format_runtime_history_summary(summary: RuntimeHistorySummary) -> str:
             f"{latest_admission_recovery_occurred}",
             "latest_admission_recovered_reject_count="
             f"{latest_admission_recovered_reject_count}",
+            "latest_growth_suppressed_by_admission_recovery="
+            f"{latest_growth_suppressed_by_admission_recovery}",
+            "latest_governor_admission_recovery_max_items="
+            f"{_format_optional_int(latest_governor_admission_recovery_max_items)}",
             f"latest_pressure_assessed={latest_pressure_summary is not None}",
             f"latest_max_pressure_ratio={_format_optional_ratio(latest_max_pressure_ratio)}",
             f"latest_growth_suppressed_by_pressure={latest_growth_suppressed}",

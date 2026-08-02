@@ -91,9 +91,22 @@ Do not defer required documentation updates to a follow-up task. Do not edit unr
   objects.
 - Recompute history counts and the minimum recovered item limit only from the
   currently retained window; trimming must remove every discarded contribution.
-- Confirm admission provenance does not alter governor decisions, pressure/OOM
-  counters, orchestration, retry, gate, or session execution behavior.
+- Confirm scalar admission provenance remains reference-safe and retained-window bounded.
 - Confirm stable `enn_torch` exports remain unchanged.
+
+## Admission recovery governor growth guard changes
+
+- Check `GovernorPolicy`, `GovernorDecision`, `observe_results(...)`, orchestration
+  limit extraction, and `test_admission_growth_guard.py`.
+- Keep the guard opt-in and validate a bool policy plus a positive non-bool integer
+  recovery limit.
+- Ensure yielded and retry-recovered OOM retain priority. Preserve pressure streaks,
+  selected fields, factors, and actual pressure shrink.
+- On an otherwise successful recovered pass, reset the success streak and cancel
+  only success-driven growth. Do not directly cap or create `max_items`.
+- Copy decision provenance into pass summaries and count actual suppression only
+  inside the retained history window.
+- Confirm terminal admission blocks still bypass governor, summary, and history.
 
 ## Required final-report result
 

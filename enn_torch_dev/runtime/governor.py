@@ -127,6 +127,7 @@ class GovernorPolicy:
     cuda_shrink_after_pressure_passes: int | None = None
     cpu_pressure_shrink_factor: float | None = None
     cuda_pressure_shrink_factor: float | None = None
+    suppress_growth_after_admission_recovery: bool = False
 
     def __post_init__(self) -> None:
         object.__setattr__(
@@ -256,6 +257,10 @@ class GovernorPolicy:
         self._validate_bounds("items", self.min_items, self.max_items)
         self._validate_bounds("host_bytes", self.min_host_bytes, self.max_host_bytes)
         self._validate_bounds("device_bytes", self.min_device_bytes, self.max_device_bytes)
+        if not isinstance(self.suppress_growth_after_admission_recovery, bool):
+            raise TypeError(
+                "GovernorPolicy.suppress_growth_after_admission_recovery must be a bool."
+            )
 
     @staticmethod
     def _validate_bounds(label: str, minimum: int | None, maximum: int | None) -> None:
@@ -289,6 +294,8 @@ class GovernorDecision:
     pressure_triggered_dimensions: tuple[str, ...] = ()
     pressure_selected_budget_fields: tuple[str, ...] = ()
     pressure_applied_shrink_factors: tuple[tuple[str, float], ...] = ()
+    admission_recovery_max_items: int | None = None
+    growth_suppressed_by_admission_recovery: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -409,6 +416,7 @@ class ConservativeRuntimeGovernor:
         *,
         recovered_oom: bool = False,
         pressure_summary: ResourcePressureSummary | None = None,
+        admission_recovery_max_items: int | None = None,
     ) -> GovernorDecision:
         if isinstance(results, StepResult):
             raise TypeError("ConservativeRuntimeGovernor.observe_results expects an iterable of StepResult objects.")
@@ -421,6 +429,10 @@ class ConservativeRuntimeGovernor:
                 "ConservativeRuntimeGovernor.pressure_summary must be a "
                 "ResourcePressureSummary or None."
             )
+        admission_recovery_max_items = _validate_optional_positive_int(
+            admission_recovery_max_items,
+            label="ConservativeRuntimeGovernor.admission_recovery_max_items",
+        )
 
         statuses: list[StepStatus] = []
         peaks = self._empty_resource_peaks()
@@ -460,6 +472,7 @@ class ConservativeRuntimeGovernor:
         pressure_triggered_dimensions: tuple[str, ...] = ()
         pressure_selected_budget_fields: tuple[str, ...] = ()
         pressure_applied_shrink_factors: tuple[tuple[str, float], ...] = ()
+        growth_suppressed_by_admission_recovery = False
 
         if saw_oom or recovered_oom:
             next_budget = self._adjust_budget(previous_budget, mode="shrink")
@@ -690,6 +703,27 @@ class ConservativeRuntimeGovernor:
             consecutive_cuda_pressure_passes = 0
             reason = "non-OOM fault observed; keeping current budget"
 
+        if (
+            saw_any_result
+            and all_success
+            and not saw_oom
+            and not recovered_oom
+            and self.policy.suppress_growth_after_admission_recovery
+            and admission_recovery_max_items is not None
+        ):
+            growth_suppressed_by_admission_recovery = True
+            consecutive_successes = 0
+            admission_reason = (
+                "success observed after admission recovery; "
+                "suppressing success-streak growth; "
+                f"recovered max-items limit={admission_recovery_max_items}"
+            )
+            if next_budget != previous_budget and not budget_shrunk_by_pressure:
+                next_budget = previous_budget
+                reason = admission_reason
+            else:
+                reason = f"{reason}; {admission_reason}"
+
         consecutive_high_pressure_passes = max(
             consecutive_cpu_pressure_passes,
             consecutive_cuda_pressure_passes,
@@ -718,6 +752,10 @@ class ConservativeRuntimeGovernor:
             pressure_triggered_dimensions=pressure_triggered_dimensions,
             pressure_selected_budget_fields=pressure_selected_budget_fields,
             pressure_applied_shrink_factors=pressure_applied_shrink_factors,
+            admission_recovery_max_items=admission_recovery_max_items,
+            growth_suppressed_by_admission_recovery=(
+                growth_suppressed_by_admission_recovery
+            ),
         )
         self.state = RuntimeGovernorState(
             current_budget=next_budget,

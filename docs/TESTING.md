@@ -26,6 +26,7 @@ Report outcomes distinctly:
 | Opt-in pre-pass admission gate | `python -m pytest enn_torch_dev/debug/runtime/test_prepass_admission_gate.py -q` | `enn_torch_dev/debug/runtime/test_prepass_admission_gate.py` |
 | Bounded admission reject splitting | `python -m pytest enn_torch_dev/debug/runtime/test_prepass_admission_split.py -q` | `enn_torch_dev/debug/runtime/test_prepass_admission_split.py` |
 | Admission summary/history observability | `python -m pytest enn_torch_dev/debug/runtime/test_admission_observability.py -q` | `enn_torch_dev/debug/runtime/test_admission_observability.py` |
+| Admission recovery governor growth guard | `python -m pytest enn_torch_dev/debug/runtime/test_admission_growth_guard.py -q` | `enn_torch_dev/debug/runtime/test_admission_growth_guard.py` |
 | Observed runtime-cost calibration | `python -m pytest enn_torch_dev/debug/runtime/test_observed_cost_calibration.py -q` | `enn_torch_dev/debug/runtime/test_observed_cost_calibration.py` |
 | Initial runtime batch-budget recommendation | `python -m pytest enn_torch_dev/debug/runtime/test_budget_recommendation.py -q` | `enn_torch_dev/debug/runtime/test_budget_recommendation.py` |
 | Runtime resource pressure | `python -m pytest enn_torch_dev/debug/runtime/test_runtime_pressure.py -q` | `enn_torch_dev/debug/runtime/test_runtime_pressure.py` |
@@ -56,6 +57,7 @@ python -m pytest enn_torch_dev/debug/runtime/test_prepass_admission.py -q
 python -m pytest enn_torch_dev/debug/runtime/test_prepass_admission_gate.py -q
 python -m pytest enn_torch_dev/debug/runtime/test_prepass_admission_split.py -q
 python -m pytest enn_torch_dev/debug/runtime/test_admission_observability.py -q
+python -m pytest enn_torch_dev/debug/runtime/test_admission_growth_guard.py -q
 python -m pytest enn_torch_dev/debug/runtime/test_observed_cost_calibration.py -q
 python -m pytest enn_torch_dev/debug/runtime/test_budget_recommendation.py -q
 python -m pytest enn_torch_dev/debug/runtime/test_runtime_pressure.py -q

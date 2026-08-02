@@ -92,13 +92,14 @@ def test_governor_policy_preserves_existing_positional_field_order() -> None:
 
     assert policy.max_device_bytes == 200
     assert policy.max_pressure_ratio_for_growth is None
-    assert field_names[-6:] == [
+    assert field_names[-7:] == [
         "min_cpu_pressure_ratio_for_shrink",
         "min_cuda_pressure_ratio_for_shrink",
         "cpu_shrink_after_pressure_passes",
         "cuda_shrink_after_pressure_passes",
         "cpu_pressure_shrink_factor",
         "cuda_pressure_shrink_factor",
+        "suppress_growth_after_admission_recovery",
     ]
     assert policy.min_cpu_pressure_ratio_for_shrink is None
     assert policy.min_cuda_pressure_ratio_for_shrink is None
@@ -112,7 +113,7 @@ def test_governor_decision_appends_pressure_field_selection_for_compatibility() 
     decision_field_names = [field.name for field in fields(GovernorDecision)]
     state_field_names = [field.name for field in fields(RuntimeGovernorState)]
 
-    assert decision_field_names[-9:] == [
+    assert decision_field_names[-11:] == [
         "consecutive_high_pressure_passes",
         "budget_shrunk_by_pressure",
         "pressure_shrunk_budget_fields",
@@ -122,6 +123,8 @@ def test_governor_decision_appends_pressure_field_selection_for_compatibility() 
         "pressure_triggered_dimensions",
         "pressure_selected_budget_fields",
         "pressure_applied_shrink_factors",
+        "admission_recovery_max_items",
+        "growth_suppressed_by_admission_recovery",
     ]
     assert state_field_names[-3:] == [
         "consecutive_high_pressure_passes",

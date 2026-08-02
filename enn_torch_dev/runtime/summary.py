@@ -53,6 +53,8 @@ class RuntimePassSummary:
     admission_allowed_unknown_count: int = 0
     admission_recovery_occurred: bool = False
     minimum_recovered_admissible_items: int | None = None
+    growth_suppressed_by_admission_recovery: bool = False
+    governor_admission_recovery_max_items: int | None = None
 
 
 def summarize_runtime_pass(pass_result: RuntimePassResult) -> RuntimePassSummary:
@@ -159,6 +161,12 @@ def summarize_runtime_pass(pass_result: RuntimePassResult) -> RuntimePassSummary
             if recovered_admissible_items
             else None
         ),
+        growth_suppressed_by_admission_recovery=(
+            decision.growth_suppressed_by_admission_recovery
+        ),
+        governor_admission_recovery_max_items=(
+            decision.admission_recovery_max_items
+        ),
     )
 
 
@@ -194,6 +202,10 @@ def format_runtime_pass_summary(summary: RuntimePassSummary) -> str:
             f"admission_recovery_occurred={summary.admission_recovery_occurred}",
             "minimum_recovered_admissible_items="
             f"{_format_optional_int(summary.minimum_recovered_admissible_items)}",
+            "growth_suppressed_by_admission_recovery="
+            f"{summary.growth_suppressed_by_admission_recovery}",
+            "governor_admission_recovery_max_items="
+            f"{_format_optional_int(summary.governor_admission_recovery_max_items)}",
             f"budget_changed={summary.budget_changed}",
             f"previous_budget={summary.previous_budget!r}",
             f"next_budget={summary.next_budget!r}",

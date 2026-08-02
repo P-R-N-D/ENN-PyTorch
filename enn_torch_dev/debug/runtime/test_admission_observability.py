@@ -201,20 +201,22 @@ def _recovered_orchestrator(
 def test_runtime_pass_summary_appends_admission_fields_for_compatibility() -> None:
     field_names = [field.name for field in fields(RuntimePassSummary)]
 
-    assert field_names[-6:] == [
+    assert field_names[-8:] == [
         "admission_assessment_count",
         "admission_admit_assessment_count",
         "admission_recovered_reject_count",
         "admission_allowed_unknown_count",
         "admission_recovery_occurred",
         "minimum_recovered_admissible_items",
+        "growth_suppressed_by_admission_recovery",
+        "governor_admission_recovery_max_items",
     ]
 
 
 def test_runtime_history_summary_appends_admission_fields_for_compatibility() -> None:
     field_names = [field.name for field in fields(RuntimeHistorySummary)]
 
-    assert field_names[-7:] == [
+    assert field_names[-8:] == [
         "admission_assessed_passes",
         "admission_recovery_passes",
         "admission_total_assessments",
@@ -222,6 +224,7 @@ def test_runtime_history_summary_appends_admission_fields_for_compatibility() ->
         "admission_recovered_rejects",
         "admission_allowed_unknowns",
         "minimum_recovered_admissible_items",
+        "admission_growth_suppressed_passes",
     ]
 
 

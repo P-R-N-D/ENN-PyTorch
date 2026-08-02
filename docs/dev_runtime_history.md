@@ -70,6 +70,7 @@ is not a live mutable view of the history internals.
 - total retained admission assessments;
 - retained admitted, recovered-reject, and allowed-unknown assessment counts;
 - the smallest recovered admissible item limit in the retained window;
+- count of retained passes whose governor growth was suppressed by admission recovery;
 - latest retained `RuntimePassSummary`, or `None` for an empty history.
 
 `format_runtime_history_summary(summary)` returns stable human-readable text for
