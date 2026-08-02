@@ -9,6 +9,7 @@ from .admission import (
     assess_prepass_admission,
 )
 from .admission_gate import (
+    AdmissionSplitPolicy,
     AdmissionUnknownAction,
     PrePassAdmissionBlocked,
     PrePassAdmissionGate,
@@ -70,6 +71,7 @@ from .summary import (
 )
 
 __all__ = [
+    "AdmissionSplitPolicy",
     "AdmissionUnknownAction",
     "BatchBudget",
     "BatchBudgetExceeded",

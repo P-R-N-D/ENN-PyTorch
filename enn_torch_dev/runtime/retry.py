@@ -6,6 +6,8 @@ from typing import Protocol, runtime_checkable
 
 from enn_torch_dev.data import KVBatch
 
+from .admission import PrePassAdmissionAssessment, PrePassAdmissionStatus
+from .admission_gate import AdmissionSplitPolicy, PrePassAdmissionBlocked
 from .batching import slice_kvbatch
 from .faults import RuntimePhase, StepResult, StepStatus
 
@@ -53,20 +55,29 @@ class RetryPolicy:
 
 
 class RuntimeRetryRunner:
-    """Run RuntimeStep over KVBatch streams with side-effect-safe OOM-class retry."""
+    """Run batches with bounded admission recovery and side-effect-safe OOM retry."""
 
     def __init__(
         self,
         runtime_step: RuntimeStepProtocol,
         *,
         policy: RetryPolicy | None = None,
+        admission_split_policy: AdmissionSplitPolicy | None = None,
     ) -> None:
         if not isinstance(runtime_step, RuntimeStepProtocol):
             raise TypeError("RuntimeRetryRunner.runtime_step must provide run(KVBatch).")
         if policy is not None and not isinstance(policy, RetryPolicy):
             raise TypeError("RuntimeRetryRunner.policy must be a RetryPolicy or None.")
+        if admission_split_policy is not None and not isinstance(
+            admission_split_policy, AdmissionSplitPolicy
+        ):
+            raise TypeError(
+                "RuntimeRetryRunner.admission_split_policy must be an "
+                "AdmissionSplitPolicy or None."
+            )
         self.runtime_step = runtime_step
         self.policy = policy or RetryPolicy()
+        self.admission_split_policy = admission_split_policy
 
     def run_stream(self, source: Iterable[KVBatch]) -> Iterator[StepResult]:
         if isinstance(source, KVBatch):
@@ -79,10 +90,43 @@ class RuntimeRetryRunner:
     def run_batch(self, batch: KVBatch) -> Iterator[StepResult]:
         if not isinstance(batch, KVBatch):
             raise TypeError("RuntimeRetryRunner.run_batch expects a KVBatch.")
-        yield from self._run_with_retry(batch, retry_count=0)
+        yield from self._run_with_retry(
+            batch,
+            retry_count=0,
+            admission_split_depth=0,
+        )
 
-    def _run_with_retry(self, batch: KVBatch, *, retry_count: int) -> Iterator[StepResult]:
-        result = self.runtime_step.run(batch)
+    def _run_with_retry(
+        self,
+        batch: KVBatch,
+        *,
+        retry_count: int,
+        admission_split_depth: int,
+    ) -> Iterator[StepResult]:
+        admission_ranges: tuple[tuple[int, int], ...] = ()
+        result: object | None = None
+        try:
+            result = self.runtime_step.run(batch)
+        except PrePassAdmissionBlocked as blocked:
+            admission_ranges = self._admission_split_ranges(
+                batch.batch_size,
+                blocked.assessment,
+                admission_split_depth=admission_split_depth,
+            )
+            if len(admission_ranges) < 2:
+                raise
+            blocked.__traceback__ = None
+
+        if admission_ranges:
+            for start, end in admission_ranges:
+                subbatch = slice_kvbatch(batch, start, end, cost_hint=None)
+                yield from self._run_with_retry(
+                    subbatch,
+                    retry_count=retry_count,
+                    admission_split_depth=admission_split_depth + 1,
+                )
+            return
+
         if not isinstance(result, StepResult):
             raise TypeError("RuntimeStep.run must return a StepResult.")
 
@@ -106,7 +150,11 @@ class RuntimeRetryRunner:
 
         for start, end in ranges:
             subbatch = slice_kvbatch(batch, start, end, cost_hint=None)
-            yield from self._run_with_retry(subbatch, retry_count=retry_count + 1)
+            yield from self._run_with_retry(
+                subbatch,
+                retry_count=retry_count + 1,
+                admission_split_depth=admission_split_depth,
+            )
 
     def _should_retry(self, result: StepResult) -> bool:
         return (
@@ -118,6 +166,58 @@ class RuntimeRetryRunner:
 
     def _drop_retry_result_references(self, result: StepResult) -> None:
         """Hook called before retrying so full-batch OOM results can be released."""
+
+    def _admission_split_ranges(
+        self,
+        batch_size: int,
+        assessment: PrePassAdmissionAssessment,
+        *,
+        admission_split_depth: int,
+    ) -> tuple[tuple[int, int], ...]:
+        policy = self.admission_split_policy
+        if policy is None:
+            return ()
+        if assessment.status is not PrePassAdmissionStatus.REJECT:
+            return ()
+        if assessment.batch_size != batch_size:
+            return ()
+        if admission_split_depth >= policy.max_split_depth:
+            return ()
+
+        target_size = assessment.max_admissible_items
+        if (
+            not isinstance(target_size, int)
+            or isinstance(target_size, bool)
+            or target_size <= 0
+            or target_size >= batch_size
+            or target_size < policy.min_items
+        ):
+            return ()
+
+        part_count = (batch_size + target_size - 1) // target_size
+        if part_count < 2 or part_count > policy.max_split_parts:
+            return ()
+        if batch_size < part_count * policy.min_items:
+            return ()
+
+        base_size, larger_parts = divmod(batch_size, part_count)
+        sizes = tuple(
+            base_size + (1 if index < larger_parts else 0)
+            for index in range(part_count)
+        )
+        if any(
+            size < policy.min_items or size > target_size
+            for size in sizes
+        ):
+            return ()
+
+        ranges: list[tuple[int, int]] = []
+        start = 0
+        for size in sizes:
+            end = start + size
+            ranges.append((start, end))
+            start = end
+        return tuple(ranges)
 
     def _split_ranges(self, batch_size: int) -> tuple[tuple[int, int], ...]:
         target_size = (batch_size + self.policy.split_factor - 1) // self.policy.split_factor
