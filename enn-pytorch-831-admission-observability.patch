@@ -1,0 +1,1121 @@
+diff --git a/enn_torch_dev/runtime/summary.py b/enn_torch_dev/runtime/summary.py
+--- a/enn_torch_dev/runtime/summary.py
++++ b/enn_torch_dev/runtime/summary.py
+@@ -5,6 +5,7 @@ from collections.abc import Mapping
+ from dataclasses import dataclass
+ from types import MappingProxyType
+ 
++from .admission import PrePassAdmissionAssessment, PrePassAdmissionStatus
+ from .batching import BatchBudget
+ from .faults import StepResult, StepStatus
+ from .governor import GovernorDecision
+@@ -46,6 +47,12 @@ class RuntimePassSummary:
+     pressure_triggered_dimensions: tuple[str, ...] = ()
+     pressure_selected_budget_fields: tuple[str, ...] = ()
+     pressure_applied_shrink_factors: tuple[tuple[str, float], ...] = ()
++    admission_assessment_count: int = 0
++    admission_admit_assessment_count: int = 0
++    admission_recovered_reject_count: int = 0
++    admission_allowed_unknown_count: int = 0
++    admission_recovery_occurred: bool = False
++    minimum_recovered_admissible_items: int | None = None
+ 
+ 
+ def summarize_runtime_pass(pass_result: RuntimePassResult) -> RuntimePassSummary:
+@@ -71,6 +78,45 @@ def summarize_runtime_pass(pass_result: RuntimePassResult) -> RuntimePassSummary
+         total_batch_size += int(result.batch_size)
+         total_rows += int(result.batch_size)
+ 
++    admission_admit_assessment_count = 0
++    admission_recovered_reject_count = 0
++    admission_allowed_unknown_count = 0
++    recovered_admissible_items: list[int] = []
++
++    for assessment in pass_result.admission_assessments:
++        if not isinstance(assessment, PrePassAdmissionAssessment):
++            raise TypeError(
++                "RuntimePassResult.admission_assessments must contain "
++                "PrePassAdmissionAssessment objects."
++            )
++        if assessment.status is PrePassAdmissionStatus.ADMIT:
++            admission_admit_assessment_count += 1
++        elif assessment.status is PrePassAdmissionStatus.UNKNOWN:
++            admission_allowed_unknown_count += 1
++        elif assessment.status is PrePassAdmissionStatus.REJECT:
++            target = assessment.max_admissible_items
++            batch_size = assessment.batch_size
++            if (
++                not isinstance(batch_size, int)
++                or isinstance(batch_size, bool)
++                or batch_size <= 0
++                or not isinstance(target, int)
++                or isinstance(target, bool)
++                or target <= 0
++                or target >= batch_size
++            ):
++                raise ValueError(
++                    "Completed RuntimePassResult REJECT assessments must describe "
++                    "a positive reducing max_admissible_items recovery target."
++                )
++            admission_recovered_reject_count += 1
++            recovered_admissible_items.append(target)
++        else:
++            raise TypeError(
++                "PrePassAdmissionAssessment.status must be a "
++                "PrePassAdmissionStatus."
++            )
++
+     status_counts_view: Mapping[StepStatus, int] = MappingProxyType(dict(status_counts))
+     return RuntimePassSummary(
+         total_results=len(statuses),
+@@ -103,6 +149,16 @@ def summarize_runtime_pass(pass_result: RuntimePassResult) -> RuntimePassSummary
+         pressure_triggered_dimensions=decision.pressure_triggered_dimensions,
+         pressure_selected_budget_fields=decision.pressure_selected_budget_fields,
+         pressure_applied_shrink_factors=decision.pressure_applied_shrink_factors,
++        admission_assessment_count=len(pass_result.admission_assessments),
++        admission_admit_assessment_count=admission_admit_assessment_count,
++        admission_recovered_reject_count=admission_recovered_reject_count,
++        admission_allowed_unknown_count=admission_allowed_unknown_count,
++        admission_recovery_occurred=admission_recovered_reject_count > 0,
++        minimum_recovered_admissible_items=(
++            min(recovered_admissible_items)
++            if recovered_admissible_items
++            else None
++        ),
+     )
+ 
+ 
+@@ -128,6 +184,16 @@ def format_runtime_pass_summary(summary: RuntimePassSummary) -> str:
+             f"statuses={status_text}",
+             f"recovered_oom={summary.recovered_oom}",
+             f"saw_oom={summary.saw_oom}",
++            f"admission_assessment_count={summary.admission_assessment_count}",
++            "admission_admit_assessment_count="
++            f"{summary.admission_admit_assessment_count}",
++            "admission_recovered_reject_count="
++            f"{summary.admission_recovered_reject_count}",
++            "admission_allowed_unknown_count="
++            f"{summary.admission_allowed_unknown_count}",
++            f"admission_recovery_occurred={summary.admission_recovery_occurred}",
++            "minimum_recovered_admissible_items="
++            f"{_format_optional_int(summary.minimum_recovered_admissible_items)}",
+             f"budget_changed={summary.budget_changed}",
+             f"previous_budget={summary.previous_budget!r}",
+             f"next_budget={summary.next_budget!r}",
+@@ -161,6 +227,10 @@ def _format_optional_ratio(value: float | None) -> str:
+     return "unknown" if value is None else f"{value:.6g}"
+ 
+ 
++def _format_optional_int(value: int | None) -> str:
++    return "unknown" if value is None else str(value)
++
++
+ def _format_status_counts(status_counts: Mapping[StepStatus, int]) -> str:
+     parts = [
+         f"{status.value}={status_counts[status]}"
+diff --git a/enn_torch_dev/runtime/history.py b/enn_torch_dev/runtime/history.py
+--- a/enn_torch_dev/runtime/history.py
++++ b/enn_torch_dev/runtime/history.py
+@@ -37,6 +37,13 @@ class RuntimeHistorySummary:
+     host_budget_pressure_shrink_passes: int = 0
+     device_budget_pressure_shrink_passes: int = 0
+     items_pressure_fallback_shrink_passes: int = 0
++    admission_assessed_passes: int = 0
++    admission_recovery_passes: int = 0
++    admission_total_assessments: int = 0
++    admission_admit_assessments: int = 0
++    admission_recovered_rejects: int = 0
++    admission_allowed_unknowns: int = 0
++    minimum_recovered_admissible_items: int | None = None
+ 
+ 
+ class RuntimePassHistory:
+@@ -90,6 +97,13 @@ class RuntimePassHistory:
+         host_budget_pressure_shrink_passes = 0
+         device_budget_pressure_shrink_passes = 0
+         items_pressure_fallback_shrink_passes = 0
++        admission_assessed_passes = 0
++        admission_recovery_passes = 0
++        admission_total_assessments = 0
++        admission_admit_assessments = 0
++        admission_recovered_rejects = 0
++        admission_allowed_unknowns = 0
++        minimum_recovered_admissible_items: int | None = None
+ 
+         for summary in self._records:
+             total_results += summary.total_results
+@@ -146,6 +160,21 @@ class RuntimePassHistory:
+             if "max_items" in shrunk_fields:
+                 items_pressure_fallback_shrink_passes += 1
+ 
++            if summary.admission_assessment_count > 0:
++                admission_assessed_passes += 1
++            if summary.admission_recovery_occurred:
++                admission_recovery_passes += 1
++            admission_total_assessments += summary.admission_assessment_count
++            admission_admit_assessments += summary.admission_admit_assessment_count
++            admission_recovered_rejects += summary.admission_recovered_reject_count
++            admission_allowed_unknowns += summary.admission_allowed_unknown_count
++            candidate_limit = summary.minimum_recovered_admissible_items
++            if candidate_limit is not None:
++                minimum_recovered_admissible_items = (
++                    candidate_limit
++                    if minimum_recovered_admissible_items is None
++                    else min(minimum_recovered_admissible_items, candidate_limit)
++                )
+ 
+         latest_summary = self._records[-1] if self._records else None
+         status_counts_view: Mapping[StepStatus, int] = MappingProxyType(dict(status_counts))
+@@ -173,6 +202,13 @@ class RuntimePassHistory:
+             host_budget_pressure_shrink_passes=host_budget_pressure_shrink_passes,
+             device_budget_pressure_shrink_passes=device_budget_pressure_shrink_passes,
+             items_pressure_fallback_shrink_passes=items_pressure_fallback_shrink_passes,
++            admission_assessed_passes=admission_assessed_passes,
++            admission_recovery_passes=admission_recovery_passes,
++            admission_total_assessments=admission_total_assessments,
++            admission_admit_assessments=admission_admit_assessments,
++            admission_recovered_rejects=admission_recovered_rejects,
++            admission_allowed_unknowns=admission_allowed_unknowns,
++            minimum_recovered_admissible_items=minimum_recovered_admissible_items,
+         )
+ 
+     def _trim_records(self) -> None:
+@@ -199,6 +235,12 @@ def format_runtime_history_summary(summary: RuntimeHistorySummary) -> str:
+     latest_growth_suppressed = (
+         latest.growth_suppressed_by_pressure if latest is not None else False
+     )
++    latest_admission_recovery_occurred = (
++        latest.admission_recovery_occurred if latest is not None else False
++    )
++    latest_admission_recovered_reject_count = (
++        latest.admission_recovered_reject_count if latest is not None else 0
++    )
+     return "\n".join(
+         (
+             "Runtime history summary",
+@@ -210,6 +252,14 @@ def format_runtime_history_summary(summary: RuntimeHistorySummary) -> str:
+             f"recovered_oom_passes={summary.recovered_oom_passes}",
+             f"oom_passes={summary.oom_passes}",
+             f"budget_changed_passes={summary.budget_changed_passes}",
++            f"admission_assessed_passes={summary.admission_assessed_passes}",
++            f"admission_recovery_passes={summary.admission_recovery_passes}",
++            f"admission_total_assessments={summary.admission_total_assessments}",
++            f"admission_admit_assessments={summary.admission_admit_assessments}",
++            f"admission_recovered_rejects={summary.admission_recovered_rejects}",
++            f"admission_allowed_unknowns={summary.admission_allowed_unknowns}",
++            "minimum_recovered_admissible_items="
++            f"{_format_optional_int(summary.minimum_recovered_admissible_items)}",
+             f"pressure_assessed_passes={summary.pressure_assessed_passes}",
+             f"pressure_growth_suppressed_passes={summary.pressure_growth_suppressed_passes}",
+             f"peak_observed_pressure_ratio={_format_optional_ratio(summary.peak_observed_pressure_ratio)}",
+@@ -232,6 +282,10 @@ def format_runtime_history_summary(summary: RuntimeHistorySummary) -> str:
+             f"{summary.items_pressure_fallback_shrink_passes}",
+             f"latest_budget_changed={latest_budget_changed}",
+             f"latest_recovered_oom={latest_recovered_oom}",
++            "latest_admission_recovery_occurred="
++            f"{latest_admission_recovery_occurred}",
++            "latest_admission_recovered_reject_count="
++            f"{latest_admission_recovered_reject_count}",
+             f"latest_pressure_assessed={latest_pressure_summary is not None}",
+             f"latest_max_pressure_ratio={_format_optional_ratio(latest_max_pressure_ratio)}",
+             f"latest_growth_suppressed_by_pressure={latest_growth_suppressed}",
+@@ -243,6 +297,10 @@ def _format_optional_ratio(value: float | None) -> str:
+     return "unknown" if value is None else f"{value:.6g}"
+ 
+ 
++def _format_optional_int(value: int | None) -> str:
++    return "unknown" if value is None else str(value)
++
++
+ def _format_status_counts(status_counts: Mapping[StepStatus, int]) -> str:
+     parts = [
+         f"{status.value}={status_counts[status]}"
+diff --git a/tmp/enn831/enn_torch_dev/debug/runtime/test_admission_observability.py b/enn_torch_dev/debug/runtime/test_admission_observability.py
+new file mode 100644
+--- /dev/null
++++ b/enn_torch_dev/debug/runtime/test_admission_observability.py
+@@ -0,0 +1,471 @@
++from __future__ import annotations
++
++from dataclasses import fields
++
++import pytest
++import torch
++from tensordict import TensorDict
++
++from enn_torch_dev.data import KVBatch
++from enn_torch_dev.runtime import (
++    AdmissionSplitPolicy,
++    BatchBudget,
++    ConservativeRuntimeGovernor,
++    ConservativeRuntimeOrchestrator,
++    ConservativeRuntimeSession,
++    GovernorDecision,
++    ObservedCostCalibrationPolicy,
++    ObservedCostMetricProfile,
++    ObservedCostProfile,
++    PrePassAdmissionAssessment,
++    PrePassAdmissionPolicy,
++    PrePassAdmissionStatus,
++    ResourceCapacity,
++    ResourceSample,
++    RuntimeHistorySummary,
++    RuntimePassHistory,
++    RuntimePassResult,
++    RuntimePassSummary,
++    StepResult,
++    StepStatus,
++    format_runtime_history_summary,
++    format_runtime_pass_summary,
++    summarize_runtime_pass,
++)
++
++
++def _decision(
++    *,
++    statuses: tuple[StepStatus, ...] = (),
++) -> GovernorDecision:
++    budget = BatchBudget(max_items=4)
++    return GovernorDecision(
++        previous_budget=budget,
++        next_budget=budget,
++        reason="test decision",
++        statuses=statuses,
++        consecutive_successes=0,
++        consecutive_ooms=0,
++    )
++
++
++def _result(batch_size: int = 1) -> StepResult:
++    return StepResult(
++        status=StepStatus.SUCCESS,
++        phase=None,
++        batch_size=batch_size,
++        row_ids=torch.arange(batch_size),
++    )
++
++
++def _assessment(
++    status: PrePassAdmissionStatus,
++    *,
++    batch_size: int,
++    max_admissible_items: int | None = None,
++) -> PrePassAdmissionAssessment:
++    return PrePassAdmissionAssessment(
++        status=status,
++        batch_size=batch_size,
++        policy=PrePassAdmissionPolicy(),
++        profile_successful_samples=3,
++        cuda_device_index=None,
++        dimensions=(),
++        rejected_dimensions=("cpu_rss",)
++        if status is PrePassAdmissionStatus.REJECT
++        else (),
++        unknown_dimensions=("cpu_rss",)
++        if status is PrePassAdmissionStatus.UNKNOWN
++        else (),
++        max_admissible_items=max_admissible_items,
++        warnings=(),
++    )
++
++
++def _pass_result(
++    assessments: tuple[PrePassAdmissionAssessment, ...] = (),
++    *,
++    results: tuple[StepResult, ...] | None = None,
++    recovered_oom: bool = False,
++) -> RuntimePassResult:
++    resolved_results = results if results is not None else (_result(),)
++    return RuntimePassResult(
++        results=resolved_results,
++        decision=_decision(statuses=tuple(item.status for item in resolved_results)),
++        recovered_oom=recovered_oom,
++        admission_assessments=assessments,
++    )
++
++
++def _metric(value: int | None) -> ObservedCostMetricProfile:
++    return ObservedCostMetricProfile(
++        max_bytes_per_item=value,
++        known_samples=0 if value is None else 1,
++        unknown_samples=1 if value is None else 0,
++        zero_samples=1 if value == 0 else 0,
++        negative_deltas_clamped=0,
++    )
++
++
++def _profile(*, cpu: int | None = 100) -> ObservedCostProfile:
++    return ObservedCostProfile(
++        policy=ObservedCostCalibrationPolicy(),
++        total_observations=3,
++        successful_samples=3,
++        ignored_samples=0,
++        rejected_samples=0,
++        ignored_zero_batch_samples=0,
++        ignored_by_status=(),
++        min_batch_size=1,
++        max_batch_size=8,
++        cuda_device_index=None,
++        cpu_rss=_metric(cpu),
++        cuda_allocated=_metric(None),
++        cuda_reserved=_metric(None),
++        cuda_max_allocated=_metric(None),
++        cuda_max_reserved=_metric(None),
++        phase_costs=(),
++    )
++
++
++def _sample(cpu_rss_bytes: int | None) -> ResourceSample:
++    return ResourceSample(
++        timestamp_ns=1,
++        phase="before_admission",
++        cpu_rss_bytes=cpu_rss_bytes,
++    )
++
++
++def _batch(num_rows: int, *, offset: int = 0) -> KVBatch:
++    td = TensorDict(
++        {
++            "features": torch.arange(
++                offset,
++                offset + num_rows * 2,
++                dtype=torch.float32,
++            ).reshape(num_rows, 2),
++        },
++        batch_size=(num_rows,),
++    )
++    return KVBatch(
++        td=td,
++        row_ids=torch.arange(offset, offset + num_rows),
++        source_ids=torch.arange(100 + offset, 100 + offset + num_rows),
++        sample_ids=torch.arange(200 + offset, 200 + offset + num_rows),
++        schema_id="runtime.admission_observability",
++        shard_id=19,
++    )
++
++
++class SequenceSampleProvider:
++    def __init__(self, samples: tuple[ResourceSample, ...]) -> None:
++        self.samples = samples
++        self.calls: list[str] = []
++
++    def sample(self, phase: str) -> ResourceSample:
++        self.calls.append(phase)
++        return self.samples[len(self.calls) - 1]
++
++
++class SuccessRuntimeStep:
++    optimizer = None
++
++    def __init__(self) -> None:
++        self.calls: list[KVBatch] = []
++
++    def run(self, batch: KVBatch) -> StepResult:
++        self.calls.append(batch)
++        return StepResult(
++            status=StepStatus.SUCCESS,
++            phase=None,
++            batch_size=batch.batch_size,
++            row_ids=batch.row_ids.detach().cpu().clone(),
++        )
++
++
++def _recovered_orchestrator(
++    sample_provider: SequenceSampleProvider,
++) -> tuple[ConservativeRuntimeOrchestrator, SuccessRuntimeStep]:
++    step = SuccessRuntimeStep()
++    orchestrator = ConservativeRuntimeOrchestrator(
++        step,
++        ConservativeRuntimeGovernor(BatchBudget(max_items=4)),
++        resource_capacity=ResourceCapacity(cpu_total_bytes=1_000),
++        admission_profile=_profile(cpu=100),
++        admission_sample_provider=sample_provider,
++        admission_split_policy=AdmissionSplitPolicy(),
++    )
++    return orchestrator, step
++
++
++def test_runtime_pass_summary_appends_admission_fields_for_compatibility() -> None:
++    field_names = [field.name for field in fields(RuntimePassSummary)]
++
++    assert field_names[-6:] == [
++        "admission_assessment_count",
++        "admission_admit_assessment_count",
++        "admission_recovered_reject_count",
++        "admission_allowed_unknown_count",
++        "admission_recovery_occurred",
++        "minimum_recovered_admissible_items",
++    ]
++
++
++def test_runtime_history_summary_appends_admission_fields_for_compatibility() -> None:
++    field_names = [field.name for field in fields(RuntimeHistorySummary)]
++
++    assert field_names[-7:] == [
++        "admission_assessed_passes",
++        "admission_recovery_passes",
++        "admission_total_assessments",
++        "admission_admit_assessments",
++        "admission_recovered_rejects",
++        "admission_allowed_unknowns",
++        "minimum_recovered_admissible_items",
++    ]
++
++
++def test_summary_defaults_when_admission_is_disabled_or_pass_is_empty() -> None:
++    disabled = summarize_runtime_pass(_pass_result())
++    empty = summarize_runtime_pass(_pass_result(results=()))
++
++    for summary in (disabled, empty):
++        assert summary.admission_assessment_count == 0
++        assert summary.admission_admit_assessment_count == 0
++        assert summary.admission_recovered_reject_count == 0
++        assert summary.admission_allowed_unknown_count == 0
++        assert summary.admission_recovery_occurred is False
++        assert summary.minimum_recovered_admissible_items is None
++
++
++def test_summary_reduces_admission_assessments_to_scalar_provenance() -> None:
++    assessments = (
++        _assessment(PrePassAdmissionStatus.REJECT, batch_size=8, max_admissible_items=4),
++        _assessment(PrePassAdmissionStatus.ADMIT, batch_size=4),
++        _assessment(PrePassAdmissionStatus.REJECT, batch_size=4, max_admissible_items=2),
++        _assessment(PrePassAdmissionStatus.ADMIT, batch_size=2),
++        _assessment(PrePassAdmissionStatus.UNKNOWN, batch_size=2),
++    )
++
++    summary = summarize_runtime_pass(
++        _pass_result(assessments, recovered_oom=True)
++    )
++
++    assert summary.admission_assessment_count == 5
++    assert summary.admission_admit_assessment_count == 2
++    assert summary.admission_recovered_reject_count == 2
++    assert summary.admission_allowed_unknown_count == 1
++    assert summary.admission_recovery_occurred is True
++    assert summary.minimum_recovered_admissible_items == 2
++    assert summary.recovered_oom is True
++    assert all(value is not assessment for value in _field_values(summary) for assessment in assessments)
++
++
++@pytest.mark.parametrize("target", [None, 0, -1, 4, 5, True])
++def test_summary_rejects_inconsistent_completed_reject(target: object) -> None:
++    assessment = _assessment(
++        PrePassAdmissionStatus.REJECT,
++        batch_size=4,
++        max_admissible_items=target,  # type: ignore[arg-type]
++    )
++
++    with pytest.raises(ValueError, match="positive reducing"):
++        summarize_runtime_pass(_pass_result((assessment,)))
++
++
++def test_summary_rejects_non_assessment_entries() -> None:
++    pass_result = RuntimePassResult(
++        results=(_result(),),
++        decision=_decision(statuses=(StepStatus.SUCCESS,)),
++        admission_assessments=(object(),),  # type: ignore[arg-type]
++    )
++
++    with pytest.raises(TypeError, match="PrePassAdmissionAssessment"):
++        summarize_runtime_pass(pass_result)
++
++
++def test_pass_formatter_includes_admission_provenance() -> None:
++    summary = summarize_runtime_pass(
++        _pass_result(
++            (
++                _assessment(
++                    PrePassAdmissionStatus.REJECT,
++                    batch_size=4,
++                    max_admissible_items=2,
++                ),
++                _assessment(PrePassAdmissionStatus.ADMIT, batch_size=2),
++                _assessment(PrePassAdmissionStatus.UNKNOWN, batch_size=2),
++            )
++        )
++    )
++
++    text = format_runtime_pass_summary(summary)
++
++    for expected in (
++        "admission_assessment_count=3",
++        "admission_admit_assessment_count=1",
++        "admission_recovered_reject_count=1",
++        "admission_allowed_unknown_count=1",
++        "admission_recovery_occurred=True",
++        "minimum_recovered_admissible_items=2",
++    ):
++        assert expected in text
++
++
++def test_history_aggregates_admission_provenance_with_pass_counts() -> None:
++    history = RuntimePassHistory(max_records=5)
++    history.append_pass_result(
++        _pass_result((_assessment(PrePassAdmissionStatus.ADMIT, batch_size=2),))
++    )
++    aggregate = history.append_pass_result(
++        _pass_result(
++            (
++                _assessment(
++                    PrePassAdmissionStatus.REJECT,
++                    batch_size=8,
++                    max_admissible_items=4,
++                ),
++                _assessment(
++                    PrePassAdmissionStatus.REJECT,
++                    batch_size=4,
++                    max_admissible_items=2,
++                ),
++                _assessment(PrePassAdmissionStatus.ADMIT, batch_size=2),
++                _assessment(PrePassAdmissionStatus.UNKNOWN, batch_size=2),
++            )
++        )
++    )
++
++    assert aggregate.admission_assessed_passes == 2
++    assert aggregate.admission_recovery_passes == 1
++    assert aggregate.admission_total_assessments == 5
++    assert aggregate.admission_admit_assessments == 2
++    assert aggregate.admission_recovered_rejects == 2
++    assert aggregate.admission_allowed_unknowns == 1
++    assert aggregate.minimum_recovered_admissible_items == 2
++
++
++def test_history_admission_aggregation_respects_retained_window() -> None:
++    history = RuntimePassHistory(max_records=2)
++    history.append_pass_result(
++        _pass_result(
++            (
++                _assessment(
++                    PrePassAdmissionStatus.REJECT,
++                    batch_size=8,
++                    max_admissible_items=1,
++                ),
++                _assessment(PrePassAdmissionStatus.ADMIT, batch_size=1),
++            )
++        )
++    )
++    history.append_pass_result(
++        _pass_result((_assessment(PrePassAdmissionStatus.UNKNOWN, batch_size=2),))
++    )
++    aggregate = history.append_pass_result(
++        _pass_result(
++            (
++                _assessment(
++                    PrePassAdmissionStatus.REJECT,
++                    batch_size=4,
++                    max_admissible_items=2,
++                ),
++                _assessment(PrePassAdmissionStatus.ADMIT, batch_size=2),
++            )
++        )
++    )
++
++    assert len(history.records) == 2
++    assert aggregate.admission_assessed_passes == 2
++    assert aggregate.admission_recovery_passes == 1
++    assert aggregate.admission_total_assessments == 3
++    assert aggregate.admission_admit_assessments == 1
++    assert aggregate.admission_recovered_rejects == 1
++    assert aggregate.admission_allowed_unknowns == 1
++    assert aggregate.minimum_recovered_admissible_items == 2
++
++
++def test_history_formatter_includes_latest_admission_state() -> None:
++    history = RuntimePassHistory(max_records=2)
++    aggregate = history.append_pass_result(
++        _pass_result(
++            (
++                _assessment(
++                    PrePassAdmissionStatus.REJECT,
++                    batch_size=4,
++                    max_admissible_items=2,
++                ),
++                _assessment(PrePassAdmissionStatus.ADMIT, batch_size=2),
++            )
++        )
++    )
++
++    text = format_runtime_history_summary(aggregate)
++
++    for expected in (
++        "admission_assessed_passes=1",
++        "admission_recovery_passes=1",
++        "admission_total_assessments=2",
++        "admission_admit_assessments=1",
++        "admission_recovered_rejects=1",
++        "admission_allowed_unknowns=0",
++        "minimum_recovered_admissible_items=2",
++        "latest_admission_recovery_occurred=True",
++        "latest_admission_recovered_reject_count=1",
++    ):
++        assert expected in text
++
++
++def test_orchestrator_recovery_flows_into_summary_and_history() -> None:
++    provider = SequenceSampleProvider((_sample(700), _sample(100), _sample(100)))
++    orchestrator, step = _recovered_orchestrator(provider)
++    pass_result = orchestrator.run_pass((_batch(4),))
++
++    summary = summarize_runtime_pass(pass_result)
++    aggregate = RuntimePassHistory(max_records=2).append_pass_result(pass_result)
++
++    assert [batch.batch_size for batch in step.calls] == [2, 2]
++    assert summary.admission_assessment_count == 3
++    assert summary.admission_recovered_reject_count == 1
++    assert summary.admission_admit_assessment_count == 2
++    assert summary.minimum_recovered_admissible_items == 2
++    assert aggregate.admission_recovery_passes == 1
++    assert aggregate.admission_recovered_rejects == 1
++    assert provider.calls == ["before_admission"] * 3
++
++
++def test_session_propagates_admission_provenance_without_raw_assessments() -> None:
++    provider = SequenceSampleProvider((_sample(700), _sample(100), _sample(100)))
++    orchestrator, _ = _recovered_orchestrator(provider)
++    history = RuntimePassHistory(max_records=2)
++    session = ConservativeRuntimeSession(orchestrator, history, max_passes=1)
++
++    record = next(session.run_passes(((_batch(4),),)))
++
++    assert record.pass_summary.admission_recovery_occurred is True
++    assert record.pass_summary.admission_recovered_reject_count == 1
++    assert record.history_summary.admission_recovery_passes == 1
++    assert record.history_summary.admission_recovered_rejects == 1
++    assert all(
++        not isinstance(value, PrePassAdmissionAssessment)
++        for value in _field_values(record.pass_summary)
++    )
++
++
++def test_terminal_block_is_not_added_to_session_history() -> None:
++    provider = SequenceSampleProvider((_sample(700), _sample(850)))
++    orchestrator, _ = _recovered_orchestrator(provider)
++    history = RuntimePassHistory(max_records=2)
++    session = ConservativeRuntimeSession(orchestrator, history, max_passes=1)
++
++    with pytest.raises(RuntimeError):
++        next(session.run_passes(((_batch(4),),)))
++
++    assert history.records == ()
++    aggregate = history.summarize()
++    assert aggregate.admission_assessed_passes == 0
++    assert aggregate.admission_recovery_passes == 0
++
++
++def _field_values(instance: object) -> tuple[object, ...]:
++    return tuple(getattr(instance, field.name) for field in fields(instance))
+diff --git a/tmp/enn831/docs/dev_admission_observability.md b/docs/dev_admission_observability.md
+new file mode 100644
+--- /dev/null
++++ b/docs/dev_admission_observability.md
+@@ -0,0 +1,133 @@
++# Development Admission Summary and History Observability
++
++This document describes the development-only inspection layer that reduces
++completed pre-pass admission assessments into bounded scalar provenance.
++
++## Goal
++
++`RuntimePassResult.admission_assessments` preserves attempt-ordered evidence for a
++completed pass, including admitted candidates, explicitly allowed unknowns, and
++rejected parents recovered through bounded splitting. This slice makes that
++evidence visible through the existing summary and history layers:
++
++```text
++RuntimePassResult.admission_assessments
++  -> summarize_runtime_pass(...)
++  -> scalar RuntimePassSummary admission fields
++  -> bounded RuntimePassHistory retained-window aggregation
++```
++
++The inspection layer does not alter admission, retry, governor, source, or model
++execution behavior.
++
++## Pass summary contract
++
++`RuntimePassSummary` appends:
++
++```text
++admission_assessment_count
++admission_admit_assessment_count
++admission_recovered_reject_count
++admission_allowed_unknown_count
++admission_recovery_occurred
++minimum_recovered_admissible_items
++```
++
++The fields mean:
++
++- `admission_assessment_count`: every completed-pass admission assessment;
++- `admission_admit_assessment_count`: assessments with status `ADMIT`;
++- `admission_recovered_reject_count`: completed-pass `REJECT` assessments;
++- `admission_allowed_unknown_count`: completed-pass `UNKNOWN` assessments;
++- `admission_recovery_occurred`: whether at least one recovered reject exists;
++- `minimum_recovered_admissible_items`: the smallest positive reducing
++  `max_admissible_items` among recovered rejects, or `None`.
++
++A terminal block never produces a `RuntimePassResult`, so a valid completed-pass
++`REJECT` represents a parent recovered through the trusted bounded split path. A
++completed-pass `UNKNOWN` represents an explicitly allowed unknown assessment.
++
++`summarize_runtime_pass(...)` validates every entry as a
++`PrePassAdmissionAssessment`. A completed-pass reject must carry a bool-excluding
++positive integer target smaller than its assessed batch size. Invalid manually
++constructed pass results are rejected rather than silently described as recovered.
++
++## Reference safety
++
++The summary stores only integer counts, one boolean, and one optional integer. It
++does not retain:
++
++- `PrePassAdmissionAssessment` objects;
++- dimension records or warning tuples;
++- `PrePassAdmissionBlocked` or private split requests;
++- `KVBatch`, tensors, sources, stores, losses, or `ResourceSample` objects.
++
++The original `RuntimePassResult` remains caller-owned. The summary is a separate
++lightweight record.
++
++## History contract
++
++`RuntimeHistorySummary` appends retained-window aggregates:
++
++```text
++admission_assessed_passes
++admission_recovery_passes
++admission_total_assessments
++admission_admit_assessments
++admission_recovered_rejects
++admission_allowed_unknowns
++minimum_recovered_admissible_items
++```
++
++`admission_assessed_passes` counts retained summaries with at least one admission
++assessment. `admission_recovery_passes` counts retained summaries with one or more
++recovered rejects. Assessment counts are summed, while the minimum recovered item
++limit is the minimum known value in the retained window.
++
++`RuntimePassHistory` continues to recompute aggregates from the currently retained
++summary records. When `max_records` trimming removes a record, all of that record's
++admission contributions disappear from the aggregate.
++
++## Governor boundary
++
++Admission observability is evidence only. This slice does not:
++
++- shrink a budget after a recovered rejection;
++- suppress success-driven growth;
++- cap the next pass `max_items`;
++- create a new governor streak or decision reason;
++- reinterpret recovered rejection as `StepStatus` or OOM.
++
++The governor continues to observe only final `StepResult` objects plus existing
++OOM and pressure signals.
++
++## Failure boundary
++
++A terminal admission block still prevents creation of a pass result. Therefore it
++is not summarized or appended to history. Earlier work in the same pass is not
++rolled back, and no partial summary is created.
++
++## Out of scope
++
++- admission-driven governor feedback;
++- skipped-row records or reprocessing;
++- source replay or rollback;
++- raw assessment history retention;
++- persistent telemetry, JSONL, CSV, or dashboard export;
++- profile refresh or persistence;
++- multi-GPU or distributed aggregation;
++- stable `enn_torch` exposure;
++- new dependencies.
++
++## Validation
++
++```bash
++python -m pytest enn_torch_dev/debug/runtime/test_admission_observability.py -q
++python -m pytest enn_torch_dev/debug/runtime/test_runtime_summary.py -q
++python -m pytest enn_torch_dev/debug/runtime/test_runtime_history.py -q
++python -m pytest enn_torch_dev/debug/runtime/test_prepass_admission_split.py -q
++python -m pytest enn_torch_dev/debug/runtime/test_runtime_integration.py -q
++python -m pytest enn_torch_dev/debug/runtime -q
++python -m pytest enn_torch_dev/debug -q
++git diff --check
++```
+diff --git a/enn_torch_dev/debug/runtime/test_runtime_summary.py b/enn_torch_dev/debug/runtime/test_runtime_summary.py
+--- a/enn_torch_dev/debug/runtime/test_runtime_summary.py
++++ b/enn_torch_dev/debug/runtime/test_runtime_summary.py
+@@ -3,7 +3,7 @@ from dataclasses import fields
+ def test_runtime_pass_summary_appends_feedback_and_capacity_fields_for_compatibility() -> None:
+     field_names = [field.name for field in fields(RuntimePassSummary)]
+ 
+-    assert field_names[-12:] == [
++    assert field_names[-18:] == [
+         "pressure_summary",
+         "growth_suppressed_by_pressure",
+         "resource_capacity",
+@@ -16,4 +16,10 @@ def test_runtime_pass_summary_appends_feedback_and_capacity_fields_for_compatibi
+         "pressure_triggered_dimensions",
+         "pressure_selected_budget_fields",
+         "pressure_applied_shrink_factors",
++        "admission_assessment_count",
++        "admission_admit_assessment_count",
++        "admission_recovered_reject_count",
++        "admission_allowed_unknown_count",
++        "admission_recovery_occurred",
++        "minimum_recovered_admissible_items",
+     ]
+diff --git a/enn_torch_dev/debug/runtime/test_runtime_history.py b/enn_torch_dev/debug/runtime/test_runtime_history.py
+--- a/enn_torch_dev/debug/runtime/test_runtime_history.py
++++ b/enn_torch_dev/debug/runtime/test_runtime_history.py
+@@ -3,7 +3,7 @@ from dataclasses import fields
+ def test_runtime_history_summary_appends_pressure_fields_for_compatibility() -> None:
+     field_names = [field.name for field in fields(RuntimeHistorySummary)]
+ 
+-    assert field_names[-14:] == [
++    assert field_names[-21:] == [
+         "pressure_assessed_passes",
+         "pressure_growth_suppressed_passes",
+         "peak_observed_pressure_ratio",
+@@ -18,4 +18,11 @@ def test_runtime_history_summary_appends_pressure_fields_for_compatibility() ->
+         "host_budget_pressure_shrink_passes",
+         "device_budget_pressure_shrink_passes",
+         "items_pressure_fallback_shrink_passes",
++        "admission_assessed_passes",
++        "admission_recovery_passes",
++        "admission_total_assessments",
++        "admission_admit_assessments",
++        "admission_recovered_rejects",
++        "admission_allowed_unknowns",
++        "minimum_recovered_admissible_items",
+     ]
+diff --git a/docs/dev_runtime_summary.md b/docs/dev_runtime_summary.md
+--- a/docs/dev_runtime_summary.md
++++ b/docs/dev_runtime_summary.md
+@@ -1,26 +1,42 @@
+ - the structured high and triggered pressure dimensions;
+ - the budget fields selected for pressure adjustment;
+ - the ordered `(budget_field, factor)` pairs applied to selected fields.
++- total admission assessment count;
++- admitted assessment count;
++- completed-pass recovered-reject count;
++- explicitly allowed unknown count;
++- whether admission recovery occurred;
++- the smallest positive reducing recovered admission item limit, when available.
+ 
+ `summarize_runtime_pass(pass_result)` accepts only a finite `RuntimePassResult`.
+ It scans the pass result tuple and stores only lightweight summary fields. It does
+ not retain `StepResult` objects, raw `ResourceSample` objects, `store`, or `loss`
+ references. Copied `ResourcePressureSummary` and `ResourceCapacity` records contain
+-scalar values only.
++scalar values only. Admission assessments are reduced to counts, one boolean, and
++one optional integer; the summary does not retain `PrePassAdmissionAssessment`,
++dimension, warning, exception, batch, source, or tensor objects.
++
++A `REJECT` in a completed pass must carry a bool-excluding positive
++`max_admissible_items` smaller than its assessed batch size. Terminal blocks do
++not create a `RuntimePassResult`, so malformed manually constructed completed-pass
++rejects are refused rather than silently described as recovered.
+ 
+ `format_runtime_pass_summary(summary)` returns stable human-readable text for a
+ `RuntimePassSummary`. The formatter includes whether pressure was assessed, the
+ maximum known pressure ratio (or `unknown`), whether pressure suppressed growth,
+ the resolved capacity provenance, the compatibility aggregate, both dimension
+ streaks, structured pressure-decision provenance, and the pressure-adjusted field
+-tuple. It is
++tuple. It also includes admission assessment/recovery counts and the minimum
++recovered item limit. It is
+ intended for debug output and PR/report inspection, not for a stable machine
+ interchange format.
+ 
+ - ResourceMonitor feedback loops.
++- Admission-driven governor feedback or next-pass budget changes.
+ - Checkpoint/resume.
+ - Distributed coordination.
+ 
+ ```bash
++python -m pytest enn_torch_dev/debug/runtime/test_admission_observability.py -q
+ python -m pytest enn_torch_dev/debug/runtime/test_runtime_capacity_provider.py -q
+ python -m pytest enn_torch_dev/debug/runtime/test_runtime_summary.py -q
+diff --git a/docs/dev_runtime_history.md b/docs/dev_runtime_history.md
+--- a/docs/dev_runtime_history.md
++++ b/docs/dev_runtime_history.md
+@@ -2,28 +2,42 @@
+ - full pressure adjustment no-op pass count;
+ - trigger-without-matching-budget pass count;
+ - actual host-byte, device-byte, and `max_items` fallback shrink pass counts;
++- admission-assessed and admission-recovery pass counts;
++- total retained admission assessments;
++- retained admitted, recovered-reject, and allowed-unknown assessment counts;
++- the smallest recovered admissible item limit in the retained window;
+ - latest retained `RuntimePassSummary`, or `None` for an empty history.
+ 
+ `format_runtime_history_summary(summary)` returns stable human-readable text for
+ runtime history inspection, including retained-window pressure counts,
+ dimension-specific high/trigger counts, attempted/no-op adjustment counts,
+ field-specific actual shrink counts, peak ratio, and latest-pass pressure state.
+-It is not a stable machine interchange format.
++It also reports retained-window admission counts, the minimum recovered item
++limit, and latest-pass recovery state. It is not a stable machine interchange
++format.
+ 
+ selected field is not counted as a no-op. History does not infer structured
+ provenance from pressure ratios or OOM status when provenance tuples are empty.
++Admission aggregates follow the same retained-window rule: trimming removes every
++assessment count, recovery-pass contribution, and recovered-limit contribution
++from the discarded summary.
+ 
+ ## Reference Safety
+ 
+ Pressure aggregation uses only scalar ratios and immutable structured provenance
+ from each retained summary. That provenance includes high and triggered
+ dimensions, selected budget fields, and fields that actually shrank; it does not
+-require retaining any additional raw runtime objects.
++require retaining any additional raw runtime objects. Admission aggregation uses
++only scalar summary fields and does not retain raw admission assessments,
++dimension or warning tuples, exceptions, batches, samples, sources, stores,
++losses, or tensors.
+ 
+ - ResourceMonitor feedback loops.
++- Admission-driven governor feedback or next-pass budget changes.
+ - Checkpoint/resume.
+ - Distributed coordination.
+ 
+ ```bash
++python -m pytest enn_torch_dev/debug/runtime/test_admission_observability.py -q
+ python -m pytest enn_torch_dev/debug/runtime/test_runtime_history.py -q
+ python -m pytest enn_torch_dev/debug/runtime/test_runtime_summary.py -q
+diff --git a/docs/dev_prepass_admission_split.md b/docs/dev_prepass_admission_split.md
+--- a/docs/dev_prepass_admission_split.md
++++ b/docs/dev_prepass_admission_split.md
+@@ -1,12 +1,16 @@
+ `RuntimePassResult.admission_assessments` exposes the parent and child evidence for
+-immediate caller inspection. This slice does not add admission recovery fields to
+-`RuntimePassSummary` or `RuntimePassHistory`.
++immediate caller inspection. `summarize_runtime_pass(...)` reduces completed-pass
++admission evidence to lightweight counts, a recovery flag, and the minimum
++recovered item limit. `RuntimePassHistory` aggregates only those scalar summary
++fields inside its retained window. Neither layer retains raw admission assessment
++objects or feeds recovery back into the governor.
+ 
+ - source replay or transactional rollback;
+ - heuristic or learned split sizes;
+ - admission-based governor feedback;
+-- summary/history admission aggregation;
++- raw admission assessment retention or persistent telemetry export;
+ - automatic profile refresh or persistence;
+ 
+ ```bash
++python -m pytest enn_torch_dev/debug/runtime/test_admission_observability.py -q
+ python -m pytest enn_torch_dev/debug/runtime/test_prepass_admission_split.py -q
+diff --git a/docs/CURRENT_STATE.md b/docs/CURRENT_STATE.md
+--- a/docs/CURRENT_STATE.md
++++ b/docs/CURRENT_STATE.md
+@@ -1 +1 @@
+-| `enn_torch_dev/runtime` | ACTIVE DEVELOPMENT | Development namespace for loaders, runtime steps, fault/status records, model/resource cost probes, bounded observed-cost calibration, pure pre-pass admission assessment, opt-in per-attempt pre-pass admission enforcement with bounded assessment-directed reject splitting, device-resolved model/optimizer footprint, resource monitoring, resource capacity and pressure assessment, pure initial batch-budget recommendation, budgeted batching, OOM-class runtime retry, conservative StepResult-observing budget governance with opt-in pressure growth suppression, independent CPU/CUDA sustained-pressure streaks, per-dimension threshold/pass-count/factor overrides, and structured high/trigger/selection/factor provenance driving dimension-aware shrink, finite pass-level runtime orchestration with fixed or pass-scoped provider capacity assessment of all raw-attempt resource samples and per-pass capacity provenance, runtime pass summary inspection with pressure-feedback, structured provenance, pressure-shrink, adjusted-field, and per-dimension streak visibility, bounded in-memory runtime history aggregation of pressure assessment, growth suppression, structured CPU/CUDA high/trigger provenance, adjustment attempts/no-ops, and field-specific actual pressure shrink, bounded lazy multi-pass runtime sessions, fresh per-pass source factories, and end-to-end integration coverage for retry, budget transitions, history retention, identity order, and API boundaries. |
++| `enn_torch_dev/runtime` | ACTIVE DEVELOPMENT | Development namespace for loaders, runtime steps, fault/status records, model/resource cost probes, bounded observed-cost calibration, pure pre-pass admission assessment, opt-in per-attempt pre-pass admission enforcement with bounded assessment-directed reject splitting, lightweight admission assessment/recovery provenance in pass summaries and retained-window history, device-resolved model/optimizer footprint, resource monitoring, resource capacity and pressure assessment, pure initial batch-budget recommendation, budgeted batching, OOM-class runtime retry, conservative StepResult-observing budget governance with opt-in pressure growth suppression, independent CPU/CUDA sustained-pressure streaks, per-dimension threshold/pass-count/factor overrides, and structured high/trigger/selection/factor provenance driving dimension-aware shrink, finite pass-level runtime orchestration with fixed or pass-scoped provider capacity assessment of all raw-attempt resource samples and per-pass capacity provenance, runtime pass summary inspection with pressure-feedback, structured provenance, pressure-shrink, adjusted-field, per-dimension streak visibility, and scalar admission provenance, bounded in-memory runtime history aggregation of pressure assessment, growth suppression, structured CPU/CUDA high/trigger provenance, adjustment attempts/no-ops, field-specific actual pressure shrink, and retained-window admission counts, bounded lazy multi-pass runtime sessions, fresh per-pass source factories, and end-to-end integration coverage for retry, budget transitions, history retention, identity order, and API boundaries. |
+diff --git a/docs/runtime_development_workflow.md b/docs/runtime_development_workflow.md
+--- a/docs/runtime_development_workflow.md
++++ b/docs/runtime_development_workflow.md
+@@ -3,11 +3,20 @@ status or ratios never substitute for empty structured provenance. Each pass
+ summary also records the scalar capacity used for normalization. Raw
+ `ResourceSample` records are not retained by summary or history.
+ 
++Completed-pass admission assessments are reduced to scalar summary provenance:
++total assessments, admitted assessments, recovered rejects, explicitly allowed
++unknowns, a recovery flag, and the minimum recovered item limit. History aggregates
++those fields only inside its retained window. Summary and history do not retain raw
++admission assessments, dimensions, warnings, exceptions, batches, samples, or
++sources, and admission provenance does not change governor behavior in this slice.
++
+ - proof that an initial recommendation is safe for unobserved activation or allocator costs;
+ - persistent observed-cost profile storage;
+ - admission-driven skip, replay, rollback, or heuristic split sizes;
+-- admission-based governor, summary, or history feedback;
++- admission-based governor feedback or next-pass budget changes;
++- raw admission assessment retention or persistent admission telemetry export;
+ - automatic use of an `ObservedCostProfile` for governor updates;
+ 
+ ```bash
++python -m pytest enn_torch_dev/debug/runtime/test_admission_observability.py -q
+ python -m pytest enn_torch_dev/debug/runtime/test_prepass_admission_gate.py -q
+diff --git a/docs/TESTING.md b/docs/TESTING.md
+--- a/docs/TESTING.md
++++ b/docs/TESTING.md
+@@ -1,9 +1,11 @@
+ | Pre-pass admission assessment | `python -m pytest enn_torch_dev/debug/runtime/test_prepass_admission.py -q` | `enn_torch_dev/debug/runtime/test_prepass_admission.py` |
+ | Opt-in pre-pass admission gate | `python -m pytest enn_torch_dev/debug/runtime/test_prepass_admission_gate.py -q` | `enn_torch_dev/debug/runtime/test_prepass_admission_gate.py` |
+ | Bounded admission reject splitting | `python -m pytest enn_torch_dev/debug/runtime/test_prepass_admission_split.py -q` | `enn_torch_dev/debug/runtime/test_prepass_admission_split.py` |
++| Admission summary/history observability | `python -m pytest enn_torch_dev/debug/runtime/test_admission_observability.py -q` | `enn_torch_dev/debug/runtime/test_admission_observability.py` |
+ | Observed runtime-cost calibration | `python -m pytest enn_torch_dev/debug/runtime/test_observed_cost_calibration.py -q` | `enn_torch_dev/debug/runtime/test_observed_cost_calibration.py` |
+ 
+ python -m pytest enn_torch_dev/debug/runtime/test_prepass_admission.py -q
+ python -m pytest enn_torch_dev/debug/runtime/test_prepass_admission_gate.py -q
+ python -m pytest enn_torch_dev/debug/runtime/test_prepass_admission_split.py -q
++python -m pytest enn_torch_dev/debug/runtime/test_admission_observability.py -q
+ python -m pytest enn_torch_dev/debug/runtime/test_observed_cost_calibration.py -q
+diff --git a/docs/RUNTIME_SAFETY.md b/docs/RUNTIME_SAFETY.md
+index cd961d6..4bbf3ce 100644
+--- a/docs/RUNTIME_SAFETY.md
++++ b/docs/RUNTIME_SAFETY.md
+@@ -1,5 +1,8 @@
+ - Bound admission recovery independently from OOM retry with a non-negative split depth, positive `min_items`, and maximum parts per rejected parent. Refuse recovery when all rows cannot be partitioned into children within both the assessed target and `min_items`.
+ - Preserve row identity and order across admission splits. Reassess every child with a fresh baseline while keeping pass-scoped capacity fixed. Do not reuse OOM `split_factor` as an admission guess.
+ - Clear the traceback only for an internal block that is successfully converted into child recursion. Terminal blocks retain normal traceback behavior and must remain visible.
+-- Do not automatically skip, replay, rollback, or tune a blocked candidate. Do not feed recovered admission rejection into the governor, summary, or history in this slice.
++- Do not automatically skip, replay, rollback, or tune a blocked candidate. Do not feed recovered admission rejection into the governor; summary and history may record only bounded scalar provenance.
++- Reduce completed-pass admission evidence to scalar counts, a recovery flag, and an optional minimum recovered item limit before storing summaries or history. Do not retain raw admission assessments, dimensions, warnings, exceptions, batches, samples, sources, stores, losses, or tensors in summary/history records.
++- Validate that every completed-pass `REJECT` has a bool-excluding positive `max_admissible_items` smaller than its assessed batch size; terminal or malformed rejects must not be silently reported as recovered.
++- Recompute admission history aggregates only from the currently retained summary window. Admission provenance remains inspection-only and must not change governor behavior in this slice.
+ - Normalize CPU RSS against the smallest known physical or hierarchy-effective cgroup capacity; do not assume host physical memory or a leaf cgroup file is the process limit in containers.
+diff --git a/docs/CHANGE_CHECKLIST.md b/docs/CHANGE_CHECKLIST.md
+index b413bf7..95b3e36 100644
+--- a/docs/CHANGE_CHECKLIST.md
++++ b/docs/CHANGE_CHECKLIST.md
+@@ -1,9 +1,26 @@
+ - Record the rejected parent before child assessments in completed recovered pass
+   results. Terminal blocks must not update governor state or return partial pass
+-  results. Recovered rejection must not create governor, summary, or history
+-  feedback in this slice.
++  results. Recovered rejection must not create governor feedback; summary and
++  history may retain only bounded scalar admission provenance.
+ - Confirm internal recovered block tracebacks are cleared before recursion, while
+   terminal block traceback behavior and the documented custom-payload contract are
+   unchanged.
+ 
++## Admission summary and history observability changes
++
++- Check `summary.py`, `history.py`, and `test_admission_observability.py`.
++- Count completed-pass `ADMIT`, recovered `REJECT`, and explicitly allowed
++  `UNKNOWN` assessments separately. A terminal block must not create a summary or
++  history record.
++- Require completed-pass rejects to carry a bool-excluding positive reducing
++  `max_admissible_items`; reject malformed manually constructed pass results.
++- Keep summary fields append-only and scalar. Do not retain raw assessment,
++  dimension, warning, exception, batch, source, sample, tensor, store, or loss
++  objects.
++- Recompute history counts and the minimum recovered item limit only from the
++  currently retained window; trimming must remove every discarded contribution.
++- Confirm admission provenance does not alter governor decisions, pressure/OOM
++  counters, orchestration, retry, gate, or session execution behavior.
++- Confirm stable `enn_torch` exports remain unchanged.
++
+ ## Required final-report result
+diff --git a/docs/dev_prepass_admission_gate.md b/docs/dev_prepass_admission_gate.md
+index 8c02fcb..ed9faac 100644
+--- a/docs/dev_prepass_admission_gate.md
++++ b/docs/dev_prepass_admission_gate.md
+@@ -1,8 +1,10 @@
+ - source replay or rollback;
+ - automatic profile refresh or persistence;
+ - admission-driven governor changes;
+-- summary/history aggregation of admission outcomes;
++- raw admission assessment retention or persistent summary/history telemetry
++  export;
+ - per-dimension unknown policies;
+ 
+ ```bash
++python -m pytest enn_torch_dev/debug/runtime/test_admission_observability.py -q
+ python -m pytest enn_torch_dev/debug/runtime/test_prepass_admission_gate.py -q
