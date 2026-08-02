@@ -30,6 +30,8 @@ from enn_torch_dev.runtime import (
     RuntimePassResult,
     StepResult,
     StepStatus,
+    format_runtime_history_summary,
+    format_runtime_pass_summary,
     summarize_runtime_pass,
 )
 
@@ -238,6 +240,27 @@ def test_growth_guard_resets_success_streak_and_prevents_threshold_growth() -> N
     assert clean_two.next_budget == BatchBudget(max_items=16)
 
 
+def test_growth_guard_replaces_growth_reason_at_policy_maximum() -> None:
+    governor = ConservativeRuntimeGovernor(
+        BatchBudget(max_items=8),
+        policy=GovernorPolicy(
+            max_items=8,
+            grow_after_successes=1,
+            suppress_growth_after_admission_recovery=True,
+        ),
+    )
+
+    decision = governor.observe_results(
+        [_result()], admission_recovery_max_items=2
+    )
+
+    assert decision.next_budget == BatchBudget(max_items=8)
+    assert decision.consecutive_successes == 0
+    assert decision.growth_suppressed_by_admission_recovery is True
+    assert "growing configured budget fields" not in decision.reason
+    assert "suppressing success-streak growth" in decision.reason
+
+
 def test_yielded_oom_keeps_priority_over_admission_guard() -> None:
     governor = ConservativeRuntimeGovernor(
         BatchBudget(max_items=8),
@@ -439,6 +462,35 @@ def test_history_counts_only_retained_admission_growth_suppression() -> None:
 
     assert first.admission_growth_suppressed_passes == 1
     assert second.admission_growth_suppressed_passes == 0
+
+
+def test_admission_growth_guard_formatter_provenance() -> None:
+    assessment = _assessment(
+        PrePassAdmissionStatus.REJECT,
+        batch_size=4,
+        max_admissible_items=2,
+    )
+    pass_result = RuntimePassResult(
+        results=(_result(batch_size=2),),
+        decision=_decision(admission_recovery_max_items=2, suppressed=True),
+        admission_assessments=(
+            assessment,
+            _assessment(PrePassAdmissionStatus.ADMIT, batch_size=2),
+        ),
+    )
+    pass_summary = summarize_runtime_pass(pass_result)
+    pass_text = format_runtime_pass_summary(pass_summary)
+
+    history = RuntimePassHistory(max_records=1)
+    history_text = format_runtime_history_summary(
+        history.append_summary(pass_summary)
+    )
+
+    assert "growth_suppressed_by_admission_recovery=True" in pass_text
+    assert "governor_admission_recovery_max_items=2" in pass_text
+    assert "admission_growth_suppressed_passes=1" in history_text
+    assert "latest_growth_suppressed_by_admission_recovery=True" in history_text
+    assert "latest_governor_admission_recovery_max_items=2" in history_text
 
 
 def test_stable_namespace_is_unchanged() -> None:

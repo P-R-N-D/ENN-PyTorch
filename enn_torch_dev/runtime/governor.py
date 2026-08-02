@@ -473,6 +473,7 @@ class ConservativeRuntimeGovernor:
         pressure_selected_budget_fields: tuple[str, ...] = ()
         pressure_applied_shrink_factors: tuple[tuple[str, float], ...] = ()
         growth_suppressed_by_admission_recovery = False
+        success_growth_triggered = False
 
         if saw_oom or recovered_oom:
             next_budget = self._adjust_budget(previous_budget, mode="shrink")
@@ -691,6 +692,7 @@ class ConservativeRuntimeGovernor:
                 else:
                     consecutive_successes += 1
                     if consecutive_successes >= self.policy.grow_after_successes:
+                        success_growth_triggered = True
                         next_budget = self._adjust_budget(previous_budget, mode="grow")
                         consecutive_successes = 0
                         reason = "success threshold reached; growing configured budget fields"
@@ -718,7 +720,7 @@ class ConservativeRuntimeGovernor:
                 "suppressing success-streak growth; "
                 f"recovered max-items limit={admission_recovery_max_items}"
             )
-            if next_budget != previous_budget and not budget_shrunk_by_pressure:
+            if success_growth_triggered:
                 next_budget = previous_budget
                 reason = admission_reason
             else:
