@@ -59,6 +59,7 @@ or a success grow from decreasing one through clamping.
 - `max_pressure_ratio_for_growth` is optional; when configured it must be finite and satisfy `0 < value <= 1`.
 - `min_pressure_ratio_for_shrink` is optional; when configured it must be finite and satisfy `0 < value <= 1`.
 - `shrink_after_pressure_passes` must be a positive integer.
+- `suppress_growth_after_admission_recovery` must be a bool and defaults to `False`.
 - When both pressure thresholds are configured, the growth threshold must not exceed the shrink threshold.
 
 ## Adjustment Rules
@@ -73,11 +74,12 @@ field. The governor does not choose host or device bytes based on resource peaks
 
 ## Decision Rules
 
-`observe_results(results, *, recovered_oom=False, pressure_summary=None)` consumes an iterable of
-`StepResult` objects and returns a `GovernorDecision`. The method streams the
-iterable once and accumulates only statuses, resource peaks, and small decision
-flags. It does not keep a list or tuple of `StepResult` objects, so `store` and
-`loss` references from results are not preserved in the decision/state records.
+`observe_results(results, *, recovered_oom=False, pressure_summary=None,
+admission_recovery_max_items=None)` consumes an iterable of `StepResult` objects
+and returns a `GovernorDecision`. The method streams the iterable once and
+accumulates only statuses, resource peaks, and small decision flags. It does not
+keep a list or tuple of `StepResult` objects, so `store` and `loss` references from
+results are not preserved in the decision/state records.
 
 `recovered_oom=True` is an explicit signal from an outer retry layer that an
 OOM-class failure was recovered before the governor observed final results. It is
@@ -129,7 +131,10 @@ Decision priority is deliberately small and predictable:
 11. The success streak does not increase per successful `StepResult`.
 12. When `grow_after_successes` is reached, all configured budget fields grow and
    the success streak resets to zero.
-13. Non-OOM faults keep the current budget and reset success/OOM/high-pressure streaks.
+13. With `suppress_growth_after_admission_recovery=True`, a successful observation
+   carrying a positive recovered item limit resets the success streak and cancels
+   success-driven growth. OOM and pressure shrink retain priority.
+14. Non-OOM faults keep the current budget and reset success/OOM/high-pressure streaks.
 
 ## State and Decision Records
 
@@ -164,7 +169,9 @@ immutable tuples rather than requiring callers to parse `reason`:
   attempt, including minimum-bound no-ops;
 - `pressure_applied_shrink_factors`: ordered `(budget_field, factor)` pairs for the
   selected fields;
-- `pressure_shrunk_budget_fields`: selected fields whose values actually changed.
+- `pressure_shrunk_budget_fields`: selected fields whose values actually changed;
+- `admission_recovery_max_items`: minimum recovered limit supplied by orchestration;
+- `growth_suppressed_by_admission_recovery`: whether the opt-in guard reset clean-success growth.
 
 For compatibility with state constructed before dimension-specific streak fields
 existed, a positive legacy `consecutive_high_pressure_passes` value is inherited

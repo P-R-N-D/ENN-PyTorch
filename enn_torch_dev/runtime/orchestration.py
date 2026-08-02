@@ -5,7 +5,11 @@ from dataclasses import dataclass
 
 from enn_torch_dev.data import KVBatch
 
-from .admission import PrePassAdmissionAssessment, PrePassAdmissionPolicy
+from .admission import (
+    PrePassAdmissionAssessment,
+    PrePassAdmissionPolicy,
+    PrePassAdmissionStatus,
+)
 from .admission_gate import (
     AdmissionSplitPolicy,
     AdmissionUnknownAction,
@@ -300,10 +304,31 @@ class ConservativeRuntimeOrchestrator:
             if resolved_capacity is not None
             else None
         )
+        admission_recovery_max_items: int | None = None
+        if admission_step is not None:
+            recovered_limits: list[int] = []
+            for assessment in admission_step.assessments:
+                if assessment.status is not PrePassAdmissionStatus.REJECT:
+                    continue
+                target = assessment.max_admissible_items
+                if (
+                    not isinstance(target, int)
+                    or isinstance(target, bool)
+                    or target <= 0
+                    or target >= assessment.batch_size
+                ):
+                    raise RuntimeError(
+                        "Completed admission recovery assessment has an invalid "
+                        "max_admissible_items target."
+                    )
+                recovered_limits.append(target)
+            if recovered_limits:
+                admission_recovery_max_items = min(recovered_limits)
         decision = self.governor.observe_results(
             results,
             recovered_oom=recovered_oom,
             pressure_summary=pressure_summary,
+            admission_recovery_max_items=admission_recovery_max_items,
         )
         return RuntimePassResult(
             results=results,

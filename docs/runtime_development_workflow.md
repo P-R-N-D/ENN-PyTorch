@@ -359,7 +359,10 @@ wrapper forwards the configured runtime step's optimizer attribute so the
 existing training-time retry restriction is unchanged. Admission split depth and
 OOM retry depth are independent: on the trusted admission-wrapper path, splitting
 is pre-execution and may run with an optimizer, while post-execution OOM retry keeps its existing restriction.
-Recovered admission rejection does not directly affect governor feedback.
+Recovered admission rejection does not directly shrink or cap the budget. When the
+opt-in governor growth guard is enabled, its minimum recovered item limit resets
+clean-success growth for the completed pass without overriding OOM or pressure
+shrink decisions.
 
 The conservative governor then:
 

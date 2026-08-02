@@ -60,7 +60,9 @@ The stable `enn_torch` namespace does not expose this development summary API.
 - completed-pass recovered-reject count;
 - explicitly allowed unknown count;
 - whether admission recovery occurred;
-- the smallest positive reducing recovered admission item limit, when available.
+- the smallest positive reducing recovered admission item limit, when available;
+- whether the governor suppressed growth because of admission recovery;
+- the recovered item limit actually supplied to the governor.
 
 `summarize_runtime_pass(pass_result)` accepts only a finite `RuntimePassResult`.
 It scans the pass result tuple and stores only lightweight summary fields. It does

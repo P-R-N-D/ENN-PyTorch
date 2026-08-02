@@ -138,7 +138,7 @@ def test_capacity_provider_and_provenance_fields_are_appended_for_compatibility(
         "resource_capacity",
         "admission_assessments",
     ]
-    assert [field.name for field in fields(RuntimePassSummary)][-16:] == [
+    assert [field.name for field in fields(RuntimePassSummary)][-18:] == [
         "resource_capacity",
         "consecutive_high_pressure_passes",
         "budget_shrunk_by_pressure",
@@ -155,6 +155,8 @@ def test_capacity_provider_and_provenance_fields_are_appended_for_compatibility(
         "admission_allowed_unknown_count",
         "admission_recovery_occurred",
         "minimum_recovered_admissible_items",
+        "growth_suppressed_by_admission_recovery",
+        "governor_admission_recovery_max_items",
     ]
 
 
