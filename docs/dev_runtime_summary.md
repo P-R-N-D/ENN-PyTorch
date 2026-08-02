@@ -55,19 +55,33 @@ The stable `enn_torch` namespace does not expose this development summary API.
 - the structured high and triggered pressure dimensions;
 - the budget fields selected for pressure adjustment;
 - the ordered `(budget_field, factor)` pairs applied to selected fields.
+- total admission assessment count;
+- admitted assessment count;
+- completed-pass recovered-reject count;
+- explicitly allowed unknown count;
+- whether admission recovery occurred;
+- the smallest positive reducing recovered admission item limit, when available.
 
 `summarize_runtime_pass(pass_result)` accepts only a finite `RuntimePassResult`.
 It scans the pass result tuple and stores only lightweight summary fields. It does
 not retain `StepResult` objects, raw `ResourceSample` objects, `store`, or `loss`
 references. Copied `ResourcePressureSummary` and `ResourceCapacity` records contain
-scalar values only.
+scalar values only. Admission assessments are reduced to counts, one boolean, and
+one optional integer; the summary does not retain `PrePassAdmissionAssessment`,
+dimension, warning, exception, batch, source, or tensor objects.
+
+A `REJECT` in a completed pass must carry a bool-excluding positive
+`max_admissible_items` smaller than its assessed batch size. Terminal blocks do
+not create a `RuntimePassResult`, so malformed manually constructed completed-pass
+rejects are refused rather than silently described as recovered.
 
 `format_runtime_pass_summary(summary)` returns stable human-readable text for a
 `RuntimePassSummary`. The formatter includes whether pressure was assessed, the
 maximum known pressure ratio (or `unknown`), whether pressure suppressed growth,
 the resolved capacity provenance, the compatibility aggregate, both dimension
 streaks, structured pressure-decision provenance, and the pressure-adjusted field
-tuple. It is
+tuple. It also includes admission assessment/recovery counts and the minimum
+recovered item limit. It is
 intended for debug output and PR/report inspection, not for a stable machine
 interchange format.
 
@@ -93,12 +107,14 @@ inspection record and does not own retention policy, persistence, or export.
 - AutoGovernor behavior.
 - Learned or model-specific tuning.
 - ResourceMonitor feedback loops.
+- Admission-driven governor feedback or next-pass budget changes.
 - Checkpoint/resume.
 - Distributed coordination.
 
 ## Test Commands
 
 ```bash
+python -m pytest enn_torch_dev/debug/runtime/test_admission_observability.py -q
 python -m pytest enn_torch_dev/debug/runtime/test_runtime_capacity_provider.py -q
 python -m pytest enn_torch_dev/debug/runtime/test_runtime_summary.py -q
 python -m pytest enn_torch_dev/debug/runtime/test_runtime_orchestration.py -q

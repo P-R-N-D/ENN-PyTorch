@@ -58,7 +58,10 @@ Use this document before running code that can allocate accelerator memory, writ
 - Bound admission recovery independently from OOM retry with a non-negative split depth, positive `min_items`, and maximum parts per rejected parent. Refuse recovery when all rows cannot be partitioned into children within both the assessed target and `min_items`.
 - Preserve row identity and order across admission splits. Reassess every child with a fresh baseline while keeping pass-scoped capacity fixed. Do not reuse OOM `split_factor` as an admission guess.
 - Clear the traceback only for an internal block that is successfully converted into child recursion. Terminal blocks retain normal traceback behavior and must remain visible.
-- Do not automatically skip, replay, rollback, or tune a blocked candidate. Do not feed recovered admission rejection into the governor, summary, or history in this slice.
+- Do not automatically skip, replay, rollback, or tune a blocked candidate. Do not feed recovered admission rejection into the governor; summary and history may record only bounded scalar provenance.
+- Reduce completed-pass admission evidence to scalar counts, a recovery flag, and an optional minimum recovered item limit before storing summaries or history. Do not retain raw admission assessments, dimensions, warnings, exceptions, batches, samples, sources, stores, losses, or tensors in summary/history records.
+- Validate that every completed-pass `REJECT` has a bool-excluding positive `max_admissible_items` smaller than its assessed batch size; terminal or malformed rejects must not be silently reported as recovered.
+- Recompute admission history aggregates only from the currently retained summary window. Admission provenance remains inspection-only and must not change governor behavior in this slice.
 - Normalize CPU RSS against the smallest known physical or hierarchy-effective cgroup capacity; do not assume host physical memory or a leaf cgroup file is the process limit in containers.
 - Do not clamp pressure ratios to `1.0`; ratios above one must remain visible for diagnosis.
 - Feed pressure summaries into governor decisions through explicit opt-in policies. Missing or high pressure may suppress growth; pressure may shrink a future budget only when the effective sustained-pressure threshold and required pass count for that dimension are both met.

@@ -5,6 +5,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from types import MappingProxyType
 
+from .admission import PrePassAdmissionAssessment, PrePassAdmissionStatus
 from .batching import BatchBudget
 from .faults import StepResult, StepStatus
 from .governor import GovernorDecision
@@ -46,6 +47,12 @@ class RuntimePassSummary:
     pressure_triggered_dimensions: tuple[str, ...] = ()
     pressure_selected_budget_fields: tuple[str, ...] = ()
     pressure_applied_shrink_factors: tuple[tuple[str, float], ...] = ()
+    admission_assessment_count: int = 0
+    admission_admit_assessment_count: int = 0
+    admission_recovered_reject_count: int = 0
+    admission_allowed_unknown_count: int = 0
+    admission_recovery_occurred: bool = False
+    minimum_recovered_admissible_items: int | None = None
 
 
 def summarize_runtime_pass(pass_result: RuntimePassResult) -> RuntimePassSummary:
@@ -70,6 +77,45 @@ def summarize_runtime_pass(pass_result: RuntimePassResult) -> RuntimePassSummary
         status_counts[status] += 1
         total_batch_size += int(result.batch_size)
         total_rows += int(result.batch_size)
+
+    admission_admit_assessment_count = 0
+    admission_recovered_reject_count = 0
+    admission_allowed_unknown_count = 0
+    recovered_admissible_items: list[int] = []
+
+    for assessment in pass_result.admission_assessments:
+        if not isinstance(assessment, PrePassAdmissionAssessment):
+            raise TypeError(
+                "RuntimePassResult.admission_assessments must contain "
+                "PrePassAdmissionAssessment objects."
+            )
+        if assessment.status is PrePassAdmissionStatus.ADMIT:
+            admission_admit_assessment_count += 1
+        elif assessment.status is PrePassAdmissionStatus.UNKNOWN:
+            admission_allowed_unknown_count += 1
+        elif assessment.status is PrePassAdmissionStatus.REJECT:
+            target = assessment.max_admissible_items
+            batch_size = assessment.batch_size
+            if (
+                not isinstance(batch_size, int)
+                or isinstance(batch_size, bool)
+                or batch_size <= 0
+                or not isinstance(target, int)
+                or isinstance(target, bool)
+                or target <= 0
+                or target >= batch_size
+            ):
+                raise ValueError(
+                    "Completed RuntimePassResult REJECT assessments must describe "
+                    "a positive reducing max_admissible_items recovery target."
+                )
+            admission_recovered_reject_count += 1
+            recovered_admissible_items.append(target)
+        else:
+            raise TypeError(
+                "PrePassAdmissionAssessment.status must be a "
+                "PrePassAdmissionStatus."
+            )
 
     status_counts_view: Mapping[StepStatus, int] = MappingProxyType(dict(status_counts))
     return RuntimePassSummary(
@@ -103,6 +149,16 @@ def summarize_runtime_pass(pass_result: RuntimePassResult) -> RuntimePassSummary
         pressure_triggered_dimensions=decision.pressure_triggered_dimensions,
         pressure_selected_budget_fields=decision.pressure_selected_budget_fields,
         pressure_applied_shrink_factors=decision.pressure_applied_shrink_factors,
+        admission_assessment_count=len(pass_result.admission_assessments),
+        admission_admit_assessment_count=admission_admit_assessment_count,
+        admission_recovered_reject_count=admission_recovered_reject_count,
+        admission_allowed_unknown_count=admission_allowed_unknown_count,
+        admission_recovery_occurred=admission_recovered_reject_count > 0,
+        minimum_recovered_admissible_items=(
+            min(recovered_admissible_items)
+            if recovered_admissible_items
+            else None
+        ),
     )
 
 
@@ -128,6 +184,16 @@ def format_runtime_pass_summary(summary: RuntimePassSummary) -> str:
             f"statuses={status_text}",
             f"recovered_oom={summary.recovered_oom}",
             f"saw_oom={summary.saw_oom}",
+            f"admission_assessment_count={summary.admission_assessment_count}",
+            "admission_admit_assessment_count="
+            f"{summary.admission_admit_assessment_count}",
+            "admission_recovered_reject_count="
+            f"{summary.admission_recovered_reject_count}",
+            "admission_allowed_unknown_count="
+            f"{summary.admission_allowed_unknown_count}",
+            f"admission_recovery_occurred={summary.admission_recovery_occurred}",
+            "minimum_recovered_admissible_items="
+            f"{_format_optional_int(summary.minimum_recovered_admissible_items)}",
             f"budget_changed={summary.budget_changed}",
             f"previous_budget={summary.previous_budget!r}",
             f"next_budget={summary.next_budget!r}",
@@ -159,6 +225,10 @@ def format_runtime_pass_summary(summary: RuntimePassSummary) -> str:
 
 def _format_optional_ratio(value: float | None) -> str:
     return "unknown" if value is None else f"{value:.6g}"
+
+
+def _format_optional_int(value: int | None) -> str:
+    return "unknown" if value is None else str(value)
 
 
 def _format_status_counts(status_counts: Mapping[StepStatus, int]) -> str:

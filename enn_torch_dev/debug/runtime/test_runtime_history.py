@@ -133,7 +133,7 @@ def _field_values(instance: object) -> list[object]:
 def test_runtime_history_summary_appends_pressure_fields_for_compatibility() -> None:
     field_names = [field.name for field in fields(RuntimeHistorySummary)]
 
-    assert field_names[-14:] == [
+    assert field_names[-21:] == [
         "pressure_assessed_passes",
         "pressure_growth_suppressed_passes",
         "peak_observed_pressure_ratio",
@@ -148,6 +148,13 @@ def test_runtime_history_summary_appends_pressure_fields_for_compatibility() -> 
         "host_budget_pressure_shrink_passes",
         "device_budget_pressure_shrink_passes",
         "items_pressure_fallback_shrink_passes",
+        "admission_assessed_passes",
+        "admission_recovery_passes",
+        "admission_total_assessments",
+        "admission_admit_assessments",
+        "admission_recovered_rejects",
+        "admission_allowed_unknowns",
+        "minimum_recovered_admissible_items",
     ]
 
 

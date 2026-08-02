@@ -149,8 +149,11 @@ does not directly shrink, grow, or suppress the governor budget. The governor
 observes only the final `StepResult` sequence and existing OOM/pressure signals.
 
 `RuntimePassResult.admission_assessments` exposes the parent and child evidence for
-immediate caller inspection. This slice does not add admission recovery fields to
-`RuntimePassSummary` or `RuntimePassHistory`.
+immediate caller inspection. `summarize_runtime_pass(...)` reduces completed-pass
+admission evidence to lightweight counts, a recovery flag, and the minimum
+recovered item limit. `RuntimePassHistory` aggregates only those scalar summary
+fields inside its retained window. Neither layer retains raw admission assessment
+objects or feeds recovery back into the governor.
 
 ## Out of scope
 
@@ -160,7 +163,7 @@ This slice does not provide:
 - source replay or transactional rollback;
 - heuristic or learned split sizes;
 - admission-based governor feedback;
-- summary/history admission aggregation;
+- raw admission assessment retention or persistent telemetry export;
 - automatic profile refresh or persistence;
 - per-candidate capacity refresh;
 - multi-GPU or distributed coordination;
@@ -169,6 +172,7 @@ This slice does not provide:
 ## Validation
 
 ```bash
+python -m pytest enn_torch_dev/debug/runtime/test_admission_observability.py -q
 python -m pytest enn_torch_dev/debug/runtime/test_prepass_admission_split.py -q
 python -m pytest enn_torch_dev/debug/runtime/test_prepass_admission_gate.py -q
 python -m pytest enn_torch_dev/debug/runtime/test_runtime_retry.py -q

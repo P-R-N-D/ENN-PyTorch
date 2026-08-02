@@ -247,7 +247,7 @@ def test_summarize_runtime_pass_detects_budget_change_and_decision_metadata() ->
 def test_runtime_pass_summary_appends_feedback_and_capacity_fields_for_compatibility() -> None:
     field_names = [field.name for field in fields(RuntimePassSummary)]
 
-    assert field_names[-12:] == [
+    assert field_names[-18:] == [
         "pressure_summary",
         "growth_suppressed_by_pressure",
         "resource_capacity",
@@ -260,6 +260,12 @@ def test_runtime_pass_summary_appends_feedback_and_capacity_fields_for_compatibi
         "pressure_triggered_dimensions",
         "pressure_selected_budget_fields",
         "pressure_applied_shrink_factors",
+        "admission_assessment_count",
+        "admission_admit_assessment_count",
+        "admission_recovered_reject_count",
+        "admission_allowed_unknown_count",
+        "admission_recovery_occurred",
+        "minimum_recovered_admissible_items",
     ]
 
 
